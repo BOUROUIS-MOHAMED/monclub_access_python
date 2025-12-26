@@ -1,0 +1,11 @@
+{
+  "ip": "192.168.0.4",
+  "port": 4370,
+  "timeout_ms": 5000,
+  "password": "",
+  "template_version": 10,
+  "template_encoding": "base64",
+  "plcomm_dll_path": ".\\plcommpro.dll",
+  "zkfp_dll_path": ".\\libzkfp.dll",
+  "log_level": "DEBUG"
+}
