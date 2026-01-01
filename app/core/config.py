@@ -17,9 +17,16 @@ class AppConfig:
     password: str = ""  # comm password
 
     # -------------------------
-    # NEW: Selected MonClub device ID from sync_devices
+    # Selected MonClub device ID from sync_devices
     # -------------------------
     selected_device_id: Optional[int] = None
+
+    # -------------------------
+    # Local API (dashboard -> PC trigger)
+    # -------------------------
+    local_api_enabled: bool = True
+    local_api_host: str = "127.0.0.1"
+    local_api_port: int = 8788
 
     # -------------------------
     # Finger template
@@ -85,6 +92,20 @@ class AppConfig:
                 cfg.selected_device_id = int(cfg.selected_device_id)  # type: ignore[arg-type]
         except Exception:
             cfg.selected_device_id = None
+
+        # local api
+        cfg.local_api_enabled = bool(cfg.local_api_enabled) if cfg.local_api_enabled is not None else True
+        if cfg.local_api_host is None or not str(cfg.local_api_host).strip():
+            cfg.local_api_host = "127.0.0.1"
+        else:
+            cfg.local_api_host = str(cfg.local_api_host).strip()
+
+        try:
+            cfg.local_api_port = int(cfg.local_api_port) if cfg.local_api_port else 8788
+        except Exception:
+            cfg.local_api_port = 8788
+        if cfg.local_api_port < 1 or cfg.local_api_port > 65535:
+            cfg.local_api_port = 8788
 
         try:
             cfg.template_version = int(cfg.template_version) if cfg.template_version else 10

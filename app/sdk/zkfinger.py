@@ -191,10 +191,8 @@ class ZKFinger:
     Uses ZKFPM_* APIs (as in the SDK C-API guide).
     """
 
-    # C-API recommends MAX_TEMPLATE_SIZE = 2048, but some builds return larger.
     MAX_TEMPLATE_SIZE = 4096
 
-    # Param codes (C-API appendix)
     PARAM_IMAGE_WIDTH = 1
     PARAM_IMAGE_HEIGHT = 2
     PARAM_IMAGE_SIZE = 106
@@ -218,8 +216,6 @@ class ZKFinger:
 
         self._cached_params: Optional[Tuple[int, int, int]] = None  # (w,h,image_size)
 
-    # ---------- DLL discovery / loading ----------
-
     def _resolve(self) -> ZKFingerRuntime:
         p = Path(self._dll_name_or_path)
         if p.is_absolute() and p.exists():
@@ -241,7 +237,7 @@ class ZKFinger:
             app_root / "sdk" / "dlls" / "zkfinger" / self._dll_name_or_path,
             app_root / "dll" / self._dll_name_or_path,
             app_root / "libs" / self._dll_name_or_path,
-            app_root / "sdk" / self._dll_name_or_path,  # your case
+            app_root / "sdk" / self._dll_name_or_path,
         ]
 
         for c in candidates:
@@ -285,42 +281,30 @@ class ZKFinger:
             raise ZKFingerError(f"Function not found in DLL: {name}") from e
 
     def _bind(self) -> None:
-        """
-        Bind functions we use.
-        Signatures follow ZKFinger Reader SDK C API. :contentReference[oaicite:1]{index=1}
-        """
-        # int ZKFPM_Init();
         f = self._require("ZKFPM_Init")
         f.restype = ctypes.c_int
         f.argtypes = []
 
-        # int ZKFPM_Terminate();
         f = self._require("ZKFPM_Terminate")
         f.restype = ctypes.c_int
         f.argtypes = []
 
-        # int ZKFPM_GetDeviceCount();
         f = self._require("ZKFPM_GetDeviceCount")
         f.restype = ctypes.c_int
         f.argtypes = []
 
-        # HANDLE ZKFPM_OpenDevice(int index);
         f = self._require("ZKFPM_OpenDevice")
         f.restype = ctypes.c_void_p
         f.argtypes = [ctypes.c_int]
 
-        # int ZKFPM_CloseDevice(HANDLE hDevice);
         f = self._require("ZKFPM_CloseDevice")
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p]
 
-        # int ZKFPM_GetParameters(HANDLE, int, unsigned char*, unsigned int*);
         f = self._require("ZKFPM_GetParameters")
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_uint)]
 
-        # int ZKFPM_AcquireFingerprint(HANDLE, unsigned char* fpImage, unsigned int cbFPImage,
-        #                              unsigned char* fpTemplate, unsigned int* cbTemplate);
         f = self._require("ZKFPM_AcquireFingerprint")
         f.restype = ctypes.c_int
         f.argtypes = [
@@ -331,23 +315,18 @@ class ZKFinger:
             ctypes.POINTER(ctypes.c_uint),
         ]
 
-        # HANDLE ZKFPM_DBInit();
         f = self._require("ZKFPM_DBInit")
         f.restype = ctypes.c_void_p
         f.argtypes = []
 
-        # int ZKFPM_DBFree(HANDLE);
         f = self._require("ZKFPM_DBFree")
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p]
 
-        # int ZKFPM_DBClear(HANDLE);
         f = self._require("ZKFPM_DBClear")
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p]
 
-        # int ZKFPM_DBMerge(HANDLE, unsigned char* t1, unsigned char* t2, unsigned char* t3,
-        #                   unsigned char* regTemp, unsigned int* cbRegTemp);
         f = self._require("ZKFPM_DBMerge")
         f.restype = ctypes.c_int
         f.argtypes = [
@@ -359,13 +338,10 @@ class ZKFinger:
             ctypes.POINTER(ctypes.c_uint),
         ]
 
-        # int ZKFPM_DBAdd(HANDLE, unsigned int fid, unsigned char* fpTemplate, unsigned int cbTemplate);
         f = self._require("ZKFPM_DBAdd")
         f.restype = ctypes.c_int
         f.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_uint]
 
-        # int ZKFPM_DBIdentify(HANDLE, unsigned char* fpTemplate, unsigned int cbTemplate,
-        #                      unsigned int* FID, unsigned int* score);
         f = self._require("ZKFPM_DBIdentify")
         f.restype = ctypes.c_int
         f.argtypes = [
@@ -376,7 +352,6 @@ class ZKFinger:
             ctypes.POINTER(ctypes.c_uint),
         ]
 
-        # int ZKFPM_DBMatch(HANDLE, unsigned char* t1, unsigned int len1, unsigned char* t2, unsigned int len2);
         f = self._require("ZKFPM_DBMatch")
         f.restype = ctypes.c_int
         f.argtypes = [
@@ -428,8 +403,6 @@ class ZKFinger:
 
         self._bind()
 
-    # ---------- High-level API ----------
-
     def init(self) -> None:
         self.load()
         assert self._dll is not None
@@ -475,14 +448,12 @@ class ZKFinger:
         self._log.info("ZKFPM_GetDeviceCount rc=%s", rc)
         return rc
 
-    # --- compatibility with your UI ---
     def open_device(self, index: int = 0) -> None:
         self.open(index)
 
     def close_device(self) -> None:
         self.close()
 
-    # --- main open/close ---
     def open(self, index: int = 0) -> None:
         self.load()
         assert self._dll is not None
@@ -504,11 +475,9 @@ class ZKFinger:
         self.db_handle = ctypes.c_void_p(db)
         self._log.info("ZKFPM_DBInit handle=%s", self.db_handle.value)
 
-        # Clear cache to keep behavior similar to many demos
         rc = int(self._dll.ZKFPM_DBClear(self.db_handle))
         self._log.info("ZKFPM_DBClear rc=%s", rc)
 
-        # Cache device params (helps correct image buffer sizing)
         w, h2, img_sz = self.get_device_params()
         self._log.info("Device params: width=%s height=%s image_size=%s", w, h2, img_sz)
 
@@ -527,8 +496,6 @@ class ZKFinger:
             self.device_handle = None
 
         self._cached_params = None
-
-    # ---------- parameters ----------
 
     def _get_param_raw(self, code: int, buf_len: int = 4) -> bytes:
         if not self._dll or not self.device_handle:
@@ -558,8 +525,6 @@ class ZKFinger:
         self._cached_params = (w, h, img_sz)
         return self._cached_params
 
-    # ---------- helpers for bytes -> ctypes ----------
-
     @staticmethod
     def _ubytes(data: bytes) -> Tuple[ctypes.Array, int]:
         arr = (ctypes.c_ubyte * len(data))()
@@ -567,13 +532,7 @@ class ZKFinger:
             ctypes.memmove(arr, data, len(data))
         return arr, len(data)
 
-    # ---------- DB operations ----------
-
     def db_match(self, tpl1: bytes, tpl2: bytes) -> int:
-        """
-        Returns score >=0 if ok, <0 if error.
-        Signature requires template lengths. :contentReference[oaicite:2]{index=2}
-        """
         if not self._dll or not self.db_handle:
             raise ZKFingerError("DB not initialized (open device first)")
 
@@ -584,7 +543,6 @@ class ZKFinger:
             score = int(self._dll.ZKFPM_DBMatch(self.db_handle, a1, ctypes.c_uint(n1), a2, ctypes.c_uint(n2)))
             return score
         except OSError as e:
-            # If the vendor DLL still misbehaves, don't crash the whole app.
             self._log.warning("ZKFPM_DBMatch raised OSError (skipping match check): %s", e)
             return 1
 
@@ -605,36 +563,7 @@ class ZKFinger:
 
         return bytes(out[: out_len.value])
 
-    def db_add(self, fid: int, tpl: bytes) -> None:
-        if not self._dll or not self.db_handle:
-            raise ZKFingerError("DB not initialized (open device first)")
-
-        a, n = self._ubytes(tpl)
-        rc = int(self._dll.ZKFPM_DBAdd(self.db_handle, ctypes.c_uint(int(fid)), a, ctypes.c_uint(n)))
-        if rc != 0:
-            raise ZKFingerError(f"ZKFPM_DBAdd failed: {_rc_explain(rc)}")
-
-    def db_identify(self, tpl: bytes) -> Tuple[int, int, int]:
-        """
-        Returns (rc, fid, score)
-        """
-        if not self._dll or not self.db_handle:
-            raise ZKFingerError("DB not initialized (open device first)")
-
-        a, n = self._ubytes(tpl)
-        fid = ctypes.c_uint(0)
-        score = ctypes.c_uint(0)
-
-        rc = int(self._dll.ZKFPM_DBIdentify(self.db_handle, a, ctypes.c_uint(n), ctypes.byref(fid), ctypes.byref(score)))
-        return rc, int(fid.value), int(score.value)
-
-    # ---------- capture / enroll ----------
-
     def _acquire_once(self, img_buf: ctypes.Array, tpl_buf: ctypes.Array) -> Tuple[int, int]:
-        """
-        Calls AcquireFingerprint once.
-        Returns (rc, tpl_len)
-        """
         if not self._dll or not self.device_handle:
             raise ZKFingerError("Device not opened")
 
@@ -658,17 +587,19 @@ class ZKFinger:
         timeout_per_sample_s: float = 20.0,
         poll_sleep_s: float = 0.10,
         progress_cb: Optional[Callable[[str], None]] = None,
+        cancel_event=None,
     ) -> bytes:
         """
         Capture 3 templates then merge them into one registered template.
-        Logic matches common demos (AcquireFingerprint x3 + DBMerge). :contentReference[oaicite:3]{index=3}
+        Added:
+          - cancel_event support (threading.Event)
+          - friendlier progress messages (Put your finger 1/3...)
         """
         if not self.device_handle or not self.db_handle:
             raise ZKFingerError("Init + open device first.")
 
         w, h, img_sz = self.get_device_params()
 
-        # Allocate buffers once (avoid realloc while device thread is running)
         img_buf = (ctypes.c_ubyte * max(img_sz, 1))()
         tpl_buf = (ctypes.c_ubyte * self.MAX_TEMPLATE_SIZE)()
 
@@ -683,10 +614,13 @@ class ZKFinger:
         templates: List[bytes] = []
 
         for i in range(3):
-            report(f"Enroll: waiting for sample {i+1}/3 ... (img_buf={len(img_buf)} tpl_buf={len(tpl_buf)})")
+            report(f"Put your finger ({i+1}/3)...")
             start = time.time()
 
             while True:
+                if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                    raise ZKFingerError("Enroll cancelled by user.")
+
                 if time.time() - start > timeout_per_sample_s:
                     raise ZKFingerError(f"Timeout waiting for fingerprint sample {i+1}/3")
 
@@ -698,21 +632,20 @@ class ZKFinger:
                     if require_same_finger and templates:
                         score = self.db_match(templates[-1], tpl)
                         if score < match_threshold:
-                            report(f"Enroll: sample {i+1}/3 rejected (different finger?) score={score}. Try same finger.")
+                            report(f"Different finger detected (score={score}). Use the SAME finger again.")
                             time.sleep(0.6)
                             continue
 
                     templates.append(tpl)
-                    report(f"Enroll: sample {i+1}/3 captured ✅ (tpl={len(tpl)} bytes)")
-                    time.sleep(0.35)  # allow user to remove finger
+                    report(f"Captured sample {i+1}/3 ✅")
+                    time.sleep(0.35)
                     break
 
-                # rc = -8/-12 etc => just keep polling
                 time.sleep(poll_sleep_s)
 
-        report("Enroll: merging 3 samples ...")
+        report("Merging samples...")
         reg = self.db_merge(templates[0], templates[1], templates[2])
-        report(f"Enroll: merged ✅ (reg={len(reg)} bytes)")
+        report("Enroll done ✅")
         return reg
 
     def diagnostics(self) -> str:

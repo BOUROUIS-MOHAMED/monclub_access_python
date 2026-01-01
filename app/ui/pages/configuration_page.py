@@ -1,8 +1,9 @@
+# app/ui/pages/configuration_page.py
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 from app.core.db import list_sync_devices, get_sync_device
 from app.sdk.pullsdk import PullSDK
@@ -11,10 +12,53 @@ from app.sdk.zkfinger import ZKFinger
 
 def _safe_int(s: str, default: int) -> int:
     try:
-        x = int(str(s).strip())
-        return x
+        return int(str(s).strip())
     except Exception:
         return default
+
+
+class _Scrollable(ttk.Frame):
+    """
+    A vertical scrollable container for long pages inside ttk.Notebook tabs.
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+
+        self.inner = ttk.Frame(self.canvas)
+        self._win_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+
+        # keep scrollregion updated
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        # make inner width follow canvas width (so entries stretch nicely)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+    def _on_inner_configure(self, _e):
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, e):
+        try:
+            self.canvas.itemconfigure(self._win_id, width=e.width)
+        except Exception:
+            pass
+
+    def yview_scroll_units(self, units: int):
+        try:
+            self.canvas.yview_scroll(units, "units")
+        except Exception:
+            pass
 
 
 class ConfigurationPage(ttk.Frame):
@@ -22,7 +66,15 @@ class ConfigurationPage(ttk.Frame):
         super().__init__(parent)
         self.app = app
 
-        self.columnconfigure(1, weight=1)
+        # ---- make the whole page scrollable ----
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self._scroll = _Scrollable(self)
+        self._scroll.grid(row=0, column=0, sticky="nsew")
+
+        self.content = self._scroll.inner
+        self.content.columnconfigure(1, weight=1)
 
         self._devices: List[Dict] = []
         self._device_display_to_id: Dict[str, int] = {}
@@ -30,34 +82,34 @@ class ConfigurationPage(ttk.Frame):
         r = 0
 
         # -------------------------
-        # NEW: Select device from MonClub sync list
+        # Select device from MonClub sync list
         # -------------------------
-        ttk.Label(self, text="Select device from MonClub (last sync)", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="Select device from MonClub (last sync)", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(10, 5), columnspan=3
         )
         r += 1
 
         self.var_selected_device = tk.StringVar(value="")
-        ttk.Label(self, text="Device:").grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        ttk.Label(self.content, text="Device:").grid(row=r, column=0, sticky="w", padx=10, pady=4)
 
-        self.cmb_devices = ttk.Combobox(self, textvariable=self.var_selected_device, values=[], state="readonly")
+        self.cmb_devices = ttk.Combobox(self.content, textvariable=self.var_selected_device, values=[], state="readonly")
         self.cmb_devices.grid(row=r, column=1, sticky="ew", padx=10, pady=4)
         self.cmb_devices.bind("<<ComboboxSelected>>", lambda _e: self.on_apply_selected_device())
 
-        tools = ttk.Frame(self)
+        tools = ttk.Frame(self.content)
         tools.grid(row=r, column=2, sticky="w", padx=10, pady=4)
         ttk.Button(tools, text="Reload devices", command=self.reload_devices).pack(side="left", padx=(0, 8))
         ttk.Button(tools, text="Apply", command=self.on_apply_selected_device).pack(side="left", padx=(0, 0))
         r += 1
 
-        self.lbl_devices_hint = ttk.Label(self, text="Devices: 0 (sync first to load devices list)", foreground="#444")
+        self.lbl_devices_hint = ttk.Label(self.content, text="Devices: 0 (sync first to load devices list)", foreground="#444")
         self.lbl_devices_hint.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
         r += 1
 
         # -------------------------
         # Controller fields
         # -------------------------
-        ttk.Label(self, text="Controller connection (active device)", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="Controller connection (active device)", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(10, 5), columnspan=3
         )
         r += 1
@@ -75,7 +127,7 @@ class ConfigurationPage(ttk.Frame):
         # -------------------------
         # Fingerprint template settings
         # -------------------------
-        ttk.Label(self, text="Fingerprint template settings", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="Fingerprint template settings", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(16, 5), columnspan=3
         )
         r += 1
@@ -83,14 +135,14 @@ class ConfigurationPage(ttk.Frame):
         self.var_tpl_ver = tk.StringVar(value=str(self.app.cfg.template_version))
         self.var_tpl_enc = tk.StringVar(value=self.app.cfg.template_encoding)
 
-        ttk.Label(self, text="Template version (9/10):").grid(row=r, column=0, sticky="w", padx=10, pady=4)
-        ttk.Combobox(self, textvariable=self.var_tpl_ver, values=["9", "10"], width=10, state="readonly").grid(
+        ttk.Label(self.content, text="Template version (9/10):").grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        ttk.Combobox(self.content, textvariable=self.var_tpl_ver, values=["9", "10"], width=10, state="readonly").grid(
             row=r, column=1, sticky="w", padx=10, pady=4
         )
         r += 1
 
-        ttk.Label(self, text="Template encoding:").grid(row=r, column=0, sticky="w", padx=10, pady=4)
-        ttk.Combobox(self, textvariable=self.var_tpl_enc, values=["base64", "hex"], width=10, state="readonly").grid(
+        ttk.Label(self.content, text="Template encoding:").grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        ttk.Combobox(self.content, textvariable=self.var_tpl_enc, values=["base64", "hex"], width=10, state="readonly").grid(
             row=r, column=1, sticky="w", padx=10, pady=4
         )
         r += 1
@@ -98,7 +150,7 @@ class ConfigurationPage(ttk.Frame):
         # -------------------------
         # DLL paths
         # -------------------------
-        ttk.Label(self, text="DLL paths", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="DLL paths", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(16, 5), columnspan=3
         )
         r += 1
@@ -112,19 +164,23 @@ class ConfigurationPage(ttk.Frame):
         # -------------------------
         # MonClub API settings
         # -------------------------
-        ttk.Label(self, text="MonClub API settings", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="MonClub API settings", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(16, 5), columnspan=3
         )
         r += 1
 
-        self.var_api_login = tk.StringVar(value=self.app.cfg.api_login_url)
-        self.var_api_sync = tk.StringVar(value=self.app.cfg.api_sync_url)
-        self.var_sync_interval = tk.StringVar(value=str(self.app.cfg.sync_interval_sec))
-        self.var_max_login_age = tk.StringVar(value=str(self.app.cfg.max_login_age_minutes))
-        self.var_login_email = tk.StringVar(value=self.app.cfg.login_email or "")
+        self.var_api_login = tk.StringVar(value=getattr(self.app.cfg, "api_login_url", "") or "")
+        self.var_api_sync = tk.StringVar(value=getattr(self.app.cfg, "api_sync_url", "") or "")
+        self.var_api_create_fp = tk.StringVar(value=getattr(self.app.cfg, "api_create_user_fingerprint_url", "") or "")
+
+        self.var_sync_interval = tk.StringVar(value=str(getattr(self.app.cfg, "sync_interval_sec", 60)))
+        self.var_max_login_age = tk.StringVar(value=str(getattr(self.app.cfg, "max_login_age_minutes", 60)))
+        self.var_login_email = tk.StringVar(value=getattr(self.app.cfg, "login_email", "") or "")
 
         r = self._row_entry(r, "Login URL:", self.var_api_login)
         r = self._row_entry(r, "Sync URL:", self.var_api_sync)
+        r = self._row_entry(r, "Create fingerprint URL:", self.var_api_create_fp)
+
         r = self._row_entry(r, "Sync interval (sec):", self.var_sync_interval)
         r = self._row_entry(r, "Max login age (minutes):", self.var_max_login_age)
         r = self._row_entry(r, "Remembered login email:", self.var_login_email)
@@ -132,12 +188,12 @@ class ConfigurationPage(ttk.Frame):
         # -------------------------
         # Buttons
         # -------------------------
-        ttk.Label(self, text="Tools", font=("Segoe UI", 12, "bold")).grid(
+        ttk.Label(self.content, text="Tools", font=("Segoe UI", 12, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(16, 5), columnspan=3
         )
         r += 1
 
-        btns = ttk.Frame(self)
+        btns = ttk.Frame(self.content)
         btns.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=6)
         ttk.Button(btns, text="Save config", command=self.on_save).pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Sync now (fetch devices/users)", command=self.on_sync_now).pack(side="left", padx=(0, 8))
@@ -145,23 +201,56 @@ class ConfigurationPage(ttk.Frame):
         ttk.Button(btns, text="Check ZKFinger DLL", command=self.check_zkfinger).pack(side="left", padx=(0, 8))
 
         r += 1
-        self.lbl_status = ttk.Label(self, text="Status: ready", foreground="#444")
+        self.lbl_status = ttk.Label(self.content, text="Status: ready", foreground="#444")
         self.lbl_status.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=8)
 
         # initial load of devices list + select current config selection (if any)
         self.reload_devices()
 
+        # enable mouse wheel scrolling inside this tab
+        self._bind_mousewheel_recursive(self.content)
+
+    # -------------------------
+    # Mouse wheel scrolling
+    # -------------------------
+    def _bind_mousewheel_recursive(self, widget):
+        # Windows / macOS (delta), Linux (Button-4/5)
+        widget.bind("<MouseWheel>", self._on_mousewheel, add="+")
+        widget.bind("<Button-4>", self._on_mousewheel_linux_up, add="+")
+        widget.bind("<Button-5>", self._on_mousewheel_linux_down, add="+")
+        for ch in widget.winfo_children():
+            self._bind_mousewheel_recursive(ch)
+
+    def _on_mousewheel(self, e):
+        # On Windows: e.delta is +/-120 per notch
+        delta = int(e.delta)
+        if delta == 0:
+            return
+        units = -1 * (delta // 120)
+        if units == 0:
+            units = -1 if delta > 0 else 1
+        self._scroll.yview_scroll_units(units)
+
+    def _on_mousewheel_linux_up(self, _e):
+        self._scroll.yview_scroll_units(-1)
+
+    def _on_mousewheel_linux_down(self, _e):
+        self._scroll.yview_scroll_units(1)
+
+    # -------------------------
+    # UI helpers (place rows inside self.content)
+    # -------------------------
     def _row_entry(self, r, label, var, show=None):
-        ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=4)
-        e = ttk.Entry(self, textvariable=var, show=show)
+        ttk.Label(self.content, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        e = ttk.Entry(self.content, textvariable=var, show=show)
         e.grid(row=r, column=1, sticky="ew", padx=10, pady=4, columnspan=2)
         return r + 1
 
     def _row_path(self, r, label, var):
-        ttk.Label(self, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=4)
-        e = ttk.Entry(self, textvariable=var)
+        ttk.Label(self.content, text=label).grid(row=r, column=0, sticky="w", padx=10, pady=4)
+        e = ttk.Entry(self.content, textvariable=var)
         e.grid(row=r, column=1, sticky="ew", padx=10, pady=4)
-        ttk.Button(self, text="Browse", command=lambda: self._browse_dll(var)).grid(
+        ttk.Button(self.content, text="Browse", command=lambda: self._browse_dll(var)).grid(
             row=r, column=2, sticky="w", padx=10, pady=4
         )
         return r + 1
@@ -172,7 +261,7 @@ class ConfigurationPage(ttk.Frame):
             var.set(p)
 
     # -------------------------
-    # NEW: devices list selection logic
+    # Devices list selection logic
     # -------------------------
     def reload_devices(self):
         self._devices = list_sync_devices() or []
@@ -186,7 +275,14 @@ class ConfigurationPage(ttk.Frame):
             port = (d.get("port_number") or "").strip()
             model = (d.get("model") or "").strip()
 
-            label = f"[{did}] {name}"
+            if did is None:
+                continue
+            try:
+                did_int = int(did)
+            except Exception:
+                continue
+
+            label = f"[{did_int}] {name}"
             parts = []
             if ip:
                 parts.append(ip)
@@ -196,13 +292,6 @@ class ConfigurationPage(ttk.Frame):
                 label += " - " + "".join(parts)
             if model:
                 label += f" - {model}"
-
-            if did is None:
-                continue
-            try:
-                did_int = int(did)
-            except Exception:
-                continue
 
             values.append(label)
             self._device_display_to_id[label] = did_int
@@ -224,7 +313,6 @@ class ConfigurationPage(ttk.Frame):
                     self.var_selected_device.set(label)
                     break
         else:
-            # keep current combobox value if exists; otherwise empty
             if not self.var_selected_device.get():
                 self.var_selected_device.set("")
 
@@ -235,7 +323,7 @@ class ConfigurationPage(ttk.Frame):
             return
 
         did = self._device_display_to_id.get(label)
-        if not did:
+        if did is None:
             self.lbl_status.config(text="Status: invalid device selection")
             return
 
@@ -265,13 +353,11 @@ class ConfigurationPage(ttk.Frame):
             self.app.cfg.selected_device_id = None
 
     def on_sync_now(self):
-        # best effort: call app.request_sync_now (exists in your MainApp)
         try:
             self.app.request_sync_now()
             self.lbl_status.config(text="Status: sync requested ✅ (wait 1-2 sec then Reload devices)")
         except Exception:
             self.lbl_status.config(text="Status: sync requested (manual reload)")
-        # do not block; user can press Reload devices
 
     # -------------------------
     # Save config
@@ -282,31 +368,31 @@ class ConfigurationPage(ttk.Frame):
             label = (self.var_selected_device.get() or "").strip()
             if label:
                 did = self._device_display_to_id.get(label)
-                if did:
+                if did is not None:
                     self.app.cfg.selected_device_id = int(did)
 
             self.app.cfg.ip = self.var_ip.get().strip()
-            self.app.cfg.port = int(self.var_port.get().strip())
-            self.app.cfg.timeout_ms = int(self.var_timeout.get().strip())
+            self.app.cfg.port = _safe_int(self.var_port.get().strip(), 4370)
+            self.app.cfg.timeout_ms = _safe_int(self.var_timeout.get().strip(), 5000)
             self.app.cfg.password = self.var_passwd.get()
 
-            self.app.cfg.template_version = int(self.var_tpl_ver.get())
-            self.app.cfg.template_encoding = self.var_tpl_enc.get().strip()
+            self.app.cfg.template_version = _safe_int(self.var_tpl_ver.get(), 10)
+            self.app.cfg.template_encoding = (self.var_tpl_enc.get().strip() or "base64")
 
             self.app.cfg.plcomm_dll_path = self.var_plcomm.get().strip()
             self.app.cfg.zkfp_dll_path = self.var_zkfp.get().strip()
 
             self.app.cfg.api_login_url = self.var_api_login.get().strip()
             self.app.cfg.api_sync_url = self.var_api_sync.get().strip()
+            self.app.cfg.api_create_user_fingerprint_url = self.var_api_create_fp.get().strip()
 
-            self.app.cfg.sync_interval_sec = int(self.var_sync_interval.get().strip())
-            self.app.cfg.max_login_age_minutes = int(self.var_max_login_age.get().strip())
+            self.app.cfg.sync_interval_sec = _safe_int(self.var_sync_interval.get().strip(), 60)
+            self.app.cfg.max_login_age_minutes = _safe_int(self.var_max_login_age.get().strip(), 60)
 
             self.app.cfg.login_email = self.var_login_email.get().strip()
 
             self.app.persist_config()
 
-            # re-arm timer if app has it
             try:
                 self.app.reschedule_sync_timer()
             except Exception:

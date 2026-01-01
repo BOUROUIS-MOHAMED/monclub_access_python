@@ -1,9 +1,9 @@
+# app/api/monclub_api.py
 from __future__ import annotations
 
-import random
-import string
+import time
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -19,9 +19,29 @@ class MonClubApiError(RuntimeError):
     pass
 
 
-def _rand_alnum(n: int = 8) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
+def _now_epoch_ms() -> str:
+    # backend-friendly numeric timestamp (string)
+    return str(int(time.time() * 1000))
+
+
+def _extract_trace_info(txt: str) -> str:
+    """
+    Best-effort extraction of traceId/timestamp/path from the backend JSON error.
+    Doesn't throw.
+    """
+    try:
+        import json
+
+        j = json.loads(txt or "{}")
+        details = j.get("details") or {}
+        trace_id = details.get("traceId") or j.get("traceId")
+        ts = details.get("timestamp") or j.get("timestamp")
+        path = details.get("path") or j.get("path")
+        if trace_id or ts or path:
+            return f" | traceId={trace_id} | ts={ts} | path={path}"
+    except Exception:
+        pass
+    return ""
 
 
 class MonClubApi:
@@ -45,7 +65,8 @@ class MonClubApi:
 
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
-            raise MonClubApiError(f"Login failed: HTTP {r.status_code} -> {txt[:300]}")
+            extra = _extract_trace_info(txt)
+            raise MonClubApiError(f"Login failed: HTTP {r.status_code} -> {txt[:300]}{extra}")
 
         token = (r.text or "").strip()
         if not token:
@@ -58,13 +79,15 @@ class MonClubApi:
         if not url:
             raise MonClubApiError("Sync URL is empty (check Configuration).")
 
-        params = {"lastCheckTimeStamp": _rand_alnum(8)}
+        # IMPORTANT: backend expects numeric timestamp-like value
+        params = {"lastCheckTimeStamp": _now_epoch_ms()}
+
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
 
-        self.logger.info("API getSyncData -> %s (gymId removed)", url)
+        self.logger.info("API getSyncData -> %s params=%s", url, params)
         try:
             r = self._session.get(url, params=params, headers=headers, timeout=timeout)
         except Exception as e:
@@ -72,12 +95,15 @@ class MonClubApi:
 
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
-            raise MonClubApiError(f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}")
+            extra = _extract_trace_info(txt)
+            raise MonClubApiError(f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
 
         try:
             data = r.json()
         except Exception as e:
-            raise MonClubApiError(f"getSyncData returned non-JSON response: {e} -> {(r.text or '')[:300]}") from e
+            raise MonClubApiError(
+                f"getSyncData returned non-JSON response: {e} -> {(r.text or '')[:300]}"
+            ) from e
 
         if not isinstance(data, dict):
             raise MonClubApiError("getSyncData JSON is not an object/dict.")
@@ -102,12 +128,12 @@ class MonClubApi:
 
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
-            raise MonClubApiError(f"createUserFingerprint failed: HTTP {r.status_code} -> {txt[:500]}")
+            extra = _extract_trace_info(txt)
+            raise MonClubApiError(f"createUserFingerprint failed: HTTP {r.status_code} -> {txt[:500]}{extra}")
 
         try:
             data = r.json()
         except Exception:
-            # backend may return plain text sometimes
             data = {"raw": (r.text or "").strip()}
 
         if not isinstance(data, dict):
