@@ -47,7 +47,7 @@ class UsersPage(ttk.Frame):
 
         r = 0
         r = self._row(form, r, "CardNo (decimal):", self.var_card)
-        r = self._row(form, r, "Pin / UserID (ENTER = CardNo):", self.var_pin)
+        r = self._row(form, r, "Pin / UserID (8 digits) (ENTER = derived from CardNo):", self.var_pin)
         r = self._row(form, r, "Name (no commas):", self.var_name)
         r = self._row(form, r, "Group (default 0):", self.var_group)
         r = self._row(form, r, "Password (optional):", self.var_pass, show="*")
@@ -116,11 +116,45 @@ class UsersPage(ttk.Frame):
             raise RuntimeError("Connect to controller first.")
         return self.sdk
 
+    @staticmethod
+    def _derive_pin_8_from_card(cardno: str) -> str:
+        """
+        Derive an 8-digit pin from CardNo:
+        - if < 8 digits => left pad with zeros
+        - if > 8 digits => last 8 digits
+        """
+        c = (cardno or "").strip()
+        if not c.isdigit():
+            raise ValueError("CardNo must be numeric.")
+        if len(c) == 8:
+            return c
+        if len(c) < 8:
+            return c.zfill(8)
+        return c[-8:]
+
+    def _normalize_pin_8(self, pin_raw: str, cardno: str) -> str:
+        p = (pin_raw or "").strip()
+
+        # If user entered a pin: must be exactly 8 digits
+        if p:
+            if not p.isdigit():
+                raise ValueError("Pin must be numeric (8 digits).")
+            if len(p) != 8:
+                raise ValueError("Pin must be exactly 8 digits.")
+            return p
+
+        # If empty: derive from CardNo
+        pin = self._derive_pin_8_from_card(cardno)
+        self.app.logger.info(f"Pin was empty -> derived Pin={pin} from CardNo={cardno}")
+        return pin
+
     def _normalize_inputs(self):
         card = self.var_card.get().strip()
         if not card.isdigit():
             raise ValueError("CardNo must be numeric.")
-        pin = self.var_pin.get().strip() or card
+
+        pin = self._normalize_pin_8(self.var_pin.get(), card)
+
         name = (self.var_name.get().strip() or "").replace(",", " ")
         group = safe_int(self.var_group.get().strip(), 0)
         password = self.var_pass.get()

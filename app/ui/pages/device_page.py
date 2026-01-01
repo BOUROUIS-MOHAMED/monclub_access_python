@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from app.core.utils import dict_union_keys
-from app.sdk.pullsdk import PullSDK, PullSDKError
+from app.sdk.pullsdk import PullSDK
 
 
 TABLES = [
@@ -40,7 +40,7 @@ class DevicePage(ttk.Frame):
 
         ttk.Label(top, text="Fields:").pack(side="left", padx=(20, 5))
         self.var_fields = tk.StringVar(value="*")
-        ttk.Entry(top, textvariable=self.var_fields, width=18).pack(side="left")
+        ttk.Entry(top, textvariable=self.var_fields, width=28).pack(side="left")
 
         ttk.Label(top, text="Filter:").pack(side="left", padx=(20, 5))
         self.var_filter = tk.StringVar(value="")
@@ -95,11 +95,12 @@ class DevicePage(ttk.Frame):
             try:
                 cnt = self.sdk.get_device_data_count(table=table)
                 rows = self.sdk.get_device_data_rows(table=table, fields=fields, filter_expr=flt)
-                self.app.logger.info(f"Fetched table={table} count_hint={cnt} rows={len(rows)}")
+                self.app.logger.info(f"Fetched table={table} count_hint={cnt} rows={len(rows)} fields={fields}")
                 self.after(0, lambda: self._render(rows, table, cnt))
             except Exception as e:
                 self.app.logger.exception("Fetch failed")
-                self.after(0, lambda: messagebox.showerror("Fetch failed", str(e)))
+                msg = str(e)
+                self.after(0, lambda m=msg: messagebox.showerror("Fetch failed", m))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -123,7 +124,7 @@ class DevicePage(ttk.Frame):
             self.tree.heading(c, text=c)
             self.tree.column(c, width=140, anchor="w")
 
-        for r in rows[:5000]:  # safeguard
+        for r in rows[:5000]:
             vals = [r.get(c, "") for c in cols]
             self.tree.insert("", "end", values=vals)
 

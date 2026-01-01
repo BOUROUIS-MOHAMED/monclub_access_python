@@ -1,0 +1,26 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# PyCharm IDE
+.idea/
+
+# Runtime data (database, logs, config with credentials)
+data/app.db
+data/logs/
+data/config.json
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
