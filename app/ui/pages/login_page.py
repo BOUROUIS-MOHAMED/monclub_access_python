@@ -1,3 +1,5 @@
+# monclub_access_python/app/ui/pages/login_page.py
+
 from __future__ import annotations
 
 import threading

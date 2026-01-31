@@ -1,3 +1,4 @@
+# monclub_access_python/app/ui/app.py
 from __future__ import annotations
 
 import queue
@@ -5,7 +6,6 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from app.api.monclub_api import ApiEndpoints, MonClubApi
@@ -22,6 +22,11 @@ from app.core.db import (
 from app.core.logger import setup_logging
 from app.core.utils import ensure_dirs, to_b64, to_hex
 
+from app.core.device_sync import DeviceSyncEngine
+from app.core.realtime_agent import AgentRealtimeEngine
+
+from app.ui.tray import TrayController
+
 from app.ui.pages.configuration_page import ConfigurationPage
 from app.ui.pages.device_page import DevicePage
 from app.ui.pages.users_page import UsersPage
@@ -34,13 +39,15 @@ from app.ui.pages.local_db_page import LocalDatabasePage
 
 from app.ui.pages.device_info_page import DeviceInfoPage
 from app.ui.pages.popups.enroll_status_popup import EnrollStatusPopup
+from app.ui.pages.agent_realtime_page import AgentRealtimePage
+
 from app.sdk.zkfinger import ZKFinger, ZKFingerError
 
 
 def _parse_dt_any(s: str) -> datetime | None:
     if not s:
         return None
-    s = s.strip()
+    s = str(s).strip()
     if not s:
         return None
     if s.endswith("Z"):
@@ -74,7 +81,6 @@ class MainApp(tk.Tk):
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.cfg = load_config()
 
-        # Enforce 32-bit python (because DLLs are usually 32-bit)
         try:
             require_32bit_python_for_32bit_dll(self.cfg.plcomm_dll_path)
         except Exception as e:
@@ -86,23 +92,29 @@ class MainApp(tk.Tk):
         self.logger.info(f"Platform: {platform_summary()}")
 
         self._sync_after_id: str | None = None
-
-        # Local API server
         self._local_api: Optional[LocalAccessApiServer] = None
 
-        # Remote enroll state
         self._enroll_state_lock = threading.Lock()
         self._enroll_running: bool = False
 
-        # -------------------------
-        # Full-screen router layout
-        # -------------------------
+        self._device_sync_engine = DeviceSyncEngine(cfg=self.cfg, logger=self.logger)
+
+        # realtime agent engine (AGENT mode only)
+        self._agent_engine = AgentRealtimeEngine(cfg=self.cfg, logger=self.logger)
+
+        self._tray: Optional[TrayController] = None
+
+        # must be re-entrant (apply_realtime_agent_from_config calls start/stop which also lock)
+        self._agent_lock = threading.RLock()
+
+        # track which "root" view is currently shown to avoid tab forcing on every sync
+        self._active_view: str = "unknown"  # "login" | "restricted" | "app" | "unknown"
+
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
         self.container.rowconfigure(0, weight=1)
         self.container.columnconfigure(0, weight=1)
 
-        # Screen: APP (Notebook)
         self.screen_app = ttk.Frame(self.container)
         self.screen_app.grid(row=0, column=0, sticky="nsew")
         self.screen_app.rowconfigure(0, weight=1)
@@ -114,58 +126,198 @@ class MainApp(tk.Tk):
 
         self.page_config = ConfigurationPage(nb, app=self)
         self.page_device = DevicePage(nb, app=self)
+        self.page_device_info = DeviceInfoPage(nb, app=self)
         self.page_users = UsersPage(nb, app=self)
+        self.page_agent_rt = AgentRealtimePage(nb, app=self)
         self.page_enroll = EnrollPage(nb, app=self)
         self.page_local_db = LocalDatabasePage(nb, app=self)
         self.page_logs = LogsPage(nb, app=self)
 
-        self.page_device_info = DeviceInfoPage(nb, app=self)
+        self._tabs_device_mode: Optional[bool] = None
+        self._rebuild_tabs_from_mode()
 
-        nb.add(self.page_config, text="1) Configuration")
-        nb.add(self.page_device, text="2) Device")
-        nb.add(self.page_device_info, text="3) Device Info")
-        nb.add(self.page_users, text="4) Users")
-        nb.add(self.page_enroll, text="5) Enroll")
-        nb.add(self.page_local_db, text="6) Local DB")
-        nb.add(self.page_logs, text="7) Logs")
-
-        # Screen: LOGIN (full page)
         self.page_login = LoginPage(self.container, app=self)
         self.page_login.grid(row=0, column=0, sticky="nsew")
 
-        # Screen: RESTRICTED (full page)
         self.page_restricted = RestrictedPage(self.container, app=self)
         self.page_restricted.grid(row=0, column=0, sticky="nsew")
 
-        # Close hook
         self.protocol("WM_DELETE_WINDOW", self._on_close_app)
 
-        # Start background work
         self.after(200, self._poll_logs)
         self.after(400, self.start_local_api_server)
         self.after(500, self.reschedule_sync_timer)
         self.after(700, self.evaluate_access_and_redirect)
+        self.after(800, self._start_tray_if_enabled)
+
+        if bool(getattr(self.cfg, "start_minimized_to_tray", False)):
+            self.after(1200, self.hide_to_tray)
+
+    # Make Tkinter callback exceptions visible (instead of "hang / no response" feeling)
+    def report_callback_exception(self, exc, val, tb):
+        try:
+            if hasattr(self, "logger") and self.logger:
+                self.logger.exception("Unhandled UI exception", exc_info=(exc, val, tb))
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("Unhandled UI error", str(val))
+        except Exception:
+            pass
+
+    # ---------------- Mode helpers ----------------
+    def is_device_mode(self) -> bool:
+        return self.cfg.is_device_mode
+
+    def _tab_id_present(self, tab_id: str) -> bool:
+        try:
+            return tab_id in set(self.nb.tabs())
+        except Exception:
+            return False
+
+    def _safe_select_default_tab(self) -> None:
+        # prefer config tab (always exists)
+        try:
+            if self._is_tab_present(self.page_config):
+                self.nb.select(self.page_config)
+                return
+        except Exception:
+            pass
+
+        # fallback by mode
+        try:
+            if self.is_device_mode():
+                if self._is_tab_present(self.page_device):
+                    self.nb.select(self.page_device)
+            else:
+                if self._is_tab_present(self.page_agent_rt):
+                    self.nb.select(self.page_agent_rt)
+        except Exception:
+            pass
+
+    def apply_mode_from_config(self) -> None:
+        # keep current tab selection if still valid after rebuild
+        current_tab: Optional[str] = None
+        try:
+            current_tab = self.nb.select()
+        except Exception:
+            current_tab = None
+
+        try:
+            self._rebuild_tabs_from_mode()
+        except Exception:
+            pass
+
+        try:
+            if current_tab and self._tab_id_present(current_tab):
+                # keep user's current tab
+                pass
+            else:
+                self._safe_select_default_tab()
+        except Exception:
+            pass
+
+        self.apply_realtime_agent_from_config()
+
+    def _is_tab_present(self, widget: ttk.Frame) -> bool:
+        try:
+            return str(widget) in set(self.nb.tabs())
+        except Exception:
+            return False
+
+    def _rebuild_tabs_from_mode(self) -> None:
+        device_mode = self.is_device_mode()
+        if self._tabs_device_mode == device_mode:
+            return
+        self._tabs_device_mode = device_mode
+
+        try:
+            for tab_id in list(self.nb.tabs()):
+                self.nb.forget(tab_id)
+        except Exception:
+            pass
+
+        if device_mode:
+            self.nb.add(self.page_config, text="1) Configuration")
+            self.nb.add(self.page_device, text="2) Device")
+            self.nb.add(self.page_device_info, text="3) Device Info")
+            self.nb.add(self.page_users, text="4) Users")
+            self.nb.add(self.page_enroll, text="5) Enroll")
+            self.nb.add(self.page_local_db, text="6) Local DB")
+            self.nb.add(self.page_logs, text="7) Logs")
+            self.logger.info("UI mode: DEVICE (device tabs visible).")
+        else:
+            self.nb.add(self.page_config, text="1) Configuration")
+            self.nb.add(self.page_agent_rt, text="2) Agent realtime")
+            self.nb.add(self.page_users, text="3) Users")
+            self.nb.add(self.page_enroll, text="4) Enroll")
+            self.nb.add(self.page_local_db, text="5) Local DB")
+            self.nb.add(self.page_logs, text="6) Logs")
+            self.logger.info("UI mode: AGENT (realtime tab visible).")
 
     # ---------------- Utilities ----------------
-
     def _poll_logs(self):
         try:
             while True:
                 msg = self.log_queue.get_nowait()
-                self.page_logs.append_log(msg)
+                try:
+                    self.page_logs.append_log(msg)
+                except Exception:
+                    pass
         except Exception:
             pass
         self.after(200, self._poll_logs)
 
-    def _on_close_app(self):
+    def _start_tray_if_enabled(self):
+        if not bool(getattr(self.cfg, "tray_enabled", True)):
+            return
+        try:
+            self._tray = TrayController(app=self, logger=self.logger)
+            self._tray.start()
+        except Exception as e:
+            self.logger.warning(f"Tray init failed: {e}")
+            self._tray = None
+
+    def hide_to_tray(self):
+        try:
+            if self._tray and self._tray.available:
+                self.withdraw()
+                self.logger.info("Window hidden to tray (app still running).")
+        except Exception:
+            pass
+
+    def show_from_tray(self):
+        try:
+            self.deiconify()
+            self.lift()
+        except Exception:
+            pass
+
+    def quit_app(self):
+        try:
+            self.stop_realtime_agent()
+        except Exception:
+            pass
         try:
             self.stop_local_api_server()
+        except Exception:
+            pass
+        try:
+            if self._tray:
+                self._tray.stop()
         except Exception:
             pass
         try:
             self.destroy()
         except Exception:
             pass
+
+    def _on_close_app(self):
+        if bool(getattr(self.cfg, "tray_enabled", True)) and bool(getattr(self.cfg, "minimize_to_tray_on_close", True)):
+            if self._tray and self._tray.available:
+                self.hide_to_tray()
+                return
+        self.quit_app()
 
     def persist_config(self):
         save_config(self.cfg)
@@ -175,15 +327,26 @@ class MainApp(tk.Tk):
         if not load_auth_token():
             self.show_login()
             return
+        self._active_view = "app"
         self.screen_app.tkraise()
 
     def show_login(self):
+        try:
+            self.stop_realtime_agent()
+        except Exception:
+            pass
+        self._active_view = "login"
         self.page_login.tkraise()
 
     def show_restricted(self):
         if not load_auth_token():
             self.show_login()
             return
+        try:
+            self.stop_realtime_agent()
+        except Exception:
+            pass
+        self._active_view = "restricted"
         self.page_restricted.tkraise()
 
     def force_login(self):
@@ -194,7 +357,6 @@ class MainApp(tk.Tk):
         clear_auth_token()
 
     # ---------------- Local API server ----------------
-
     def start_local_api_server(self):
         enabled = bool(getattr(self.cfg, "local_api_enabled", True))
         if not enabled:
@@ -204,7 +366,6 @@ class MainApp(tk.Tk):
         host = str(getattr(self.cfg, "local_api_host", "127.0.0.1") or "127.0.0.1")
         port = int(getattr(self.cfg, "local_api_port", 8788) or 8788)
 
-        # restart if host/port changed
         if self._local_api:
             if self._local_api.host == host and self._local_api.port == port:
                 return
@@ -236,23 +397,23 @@ class MainApp(tk.Tk):
             "loggedIn": bool(auth and auth.token),
             "restricted": bool(reasons),
             "reasons": reasons,
+            "mode": "DEVICE" if self.is_device_mode() else "AGENT",
             "host": str(getattr(self.cfg, "local_api_host", "127.0.0.1")),
             "port": int(getattr(self.cfg, "local_api_port", 8788)),
         }
 
     # ---------------- API helpers ----------------
-
     def _api(self) -> MonClubApi:
-        login_url = getattr(self.cfg, "api_login_url", "https://monclubwigo.tn/api/v1/public/access/v1/gym/login")
+        login_url = getattr(self.cfg, "api_login_url", "http://localhost:5000/api/v1/public/access/v1/gym/login")
         sync_url = getattr(
             self.cfg,
             "api_sync_url",
-            "https://monclubwigo.tn/api/v1/manager/gym/access/v1/users/get_gym_users",
+            "http://localhost:5000/api/v1/manager/gym/access/v1/users/get_gym_users",
         )
         create_fp_url = getattr(
             self.cfg,
             "api_create_user_fingerprint_url",
-            "https://monclubwigo.tn/api/v1/manager/userFingerprint/create",
+            "http://localhost:5000/api/v1/manager/userFingerprint/create",
         )
         endpoints = ApiEndpoints(
             login_url=login_url,
@@ -262,7 +423,6 @@ class MainApp(tk.Tk):
         return MonClubApi(endpoints=endpoints, logger=self.logger)
 
     # ---------------- Sync timer ----------------
-
     def request_sync_now(self):
         self.after(50, self._sync_tick)
 
@@ -300,13 +460,34 @@ class MainApp(tk.Tk):
                     pass
             except Exception as ex:
                 self.logger.exception(f"getSyncData failed: {ex} (using cached data if available)")
-            finally:
-                self.after(0, self.evaluate_access_and_redirect)
+
+            try:
+                if self.is_device_mode() and bool(getattr(self.cfg, "device_sync_enabled", True)):
+                    reasons = self._restriction_reasons()
+                    if reasons:
+                        self.logger.warning("[DeviceSync] Skipped: restricted: " + " | ".join(reasons[:3]))
+                    else:
+                        cache = load_sync_cache()
+                        if cache:
+                            self._device_sync_engine.run_blocking(cache=cache, source="timer")
+                        else:
+                            self.logger.info("[DeviceSync] Skipped: no cache yet")
+                else:
+                    self.logger.debug("[DeviceSync] Skipped: mode=AGENT or device sync disabled.")
+            except Exception as ex:
+                self.logger.exception(f"[DeviceSync] Unexpected error: {ex}")
+
+            try:
+                if not self.is_device_mode() and self._agent_engine.is_running():
+                    self._agent_engine.refresh_devices()
+            except Exception:
+                pass
+
+            self.after(0, self.evaluate_access_and_redirect)
 
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- Access rules ----------------
-
     def _restriction_reasons(self) -> list[str]:
         reasons: list[str] = []
 
@@ -341,6 +522,8 @@ class MainApp(tk.Tk):
         return reasons
 
     def evaluate_access_and_redirect(self):
+        was_in_app = (self._active_view == "app")
+
         auth = load_auth_token()
         if not auth:
             self.show_login()
@@ -354,19 +537,56 @@ class MainApp(tk.Tk):
 
         self.page_restricted.set_reasons([])
         self.show_app()
-        try:
-            self.nb.select(self.page_device)
-        except Exception:
-            pass
+
+        # only auto-select a tab when entering the app view (login/restricted -> app)
+        if not was_in_app:
+            try:
+                if self.is_device_mode():
+                    if self._is_tab_present(self.page_device):
+                        self.nb.select(self.page_device)
+                else:
+                    if self._is_tab_present(self.page_agent_rt):
+                        self.nb.select(self.page_agent_rt)
+            except Exception:
+                pass
+
+        self.apply_realtime_agent_from_config()
+
+    # ---------------- Realtime agent engine control ----------------
+    def apply_realtime_agent_from_config(self) -> None:
+        with self._agent_lock:
+            try:
+                if self.is_device_mode():
+                    self.stop_realtime_agent()
+                    return
+
+                if not bool(getattr(self.cfg, "agent_realtime_enabled", True)):
+                    self.stop_realtime_agent()
+                    return
+
+                if self._restriction_reasons():
+                    self.stop_realtime_agent()
+                    return
+
+                self.start_realtime_agent()
+            except Exception:
+                pass
+
+    def start_realtime_agent(self) -> None:
+        with self._agent_lock:
+            if self.is_device_mode():
+                return
+            if self._agent_engine.is_running():
+                return
+            self._agent_engine.start()
+
+    def stop_realtime_agent(self) -> None:
+        with self._agent_lock:
+            if self._agent_engine.is_running():
+                self._agent_engine.stop()
 
     # ---------------- Remote enroll (Dashboard -> PC) ----------------
-
     def begin_remote_enroll(self, *, user_id: str, finger_id: str, full_name: str = "", device: str = "zk9500") -> Dict[str, Any]:
-        """
-        Called by LocalAccessApiServer handler thread.
-        Must return fast (do NOT block).
-        """
-        # Only support zk9500 for now
         dev = (device or "zk9500").strip().lower()
         if dev not in ("zk9500", "zkfinger", "zkfp"):
             return {"ok": False, "status": 400, "error": f"Unsupported device='{device}'. Use device=zk9500"}
@@ -389,7 +609,6 @@ class MainApp(tk.Tk):
                 return {"ok": False, "status": 409, "error": "Enroll already running on this PC"}
             self._enroll_running = True
 
-        # Schedule UI + worker on main thread
         self.after(0, lambda: self._start_remote_enroll(uid, fid, full_name, dev))
         return {"ok": True, "message": "Enroll started on PC", "userId": uid, "fingerId": fid, "device": dev}
 
@@ -415,12 +634,21 @@ class MainApp(tk.Tk):
             return None, None
         users = getattr(cache, "users", []) or []
         for u in users:
-            if isinstance(u, dict) and int(u.get("userId") or -1) == int(user_id):
-                mid = u.get("membershipId")
-                try:
-                    return int(mid) if mid is not None and str(mid).strip() != "" else None, u
-                except Exception:
-                    return None, u
+            try:
+                if not (isinstance(u, dict) and int(u.get("userId") or -1) == int(user_id)):
+                    continue
+            except Exception:
+                continue
+
+            am_id = u.get("activeMembershipId")
+            if am_id is None or str(am_id).strip() == "":
+                am_id = u.get("membershipId")
+
+            try:
+                return int(am_id) if am_id is not None and str(am_id).strip() != "" else None, u
+            except Exception:
+                return None, u
+
         return None, None
 
     def _remote_enroll_worker(self, pop: EnrollStatusPopup, user_id: int, finger_id: int, full_name: str, device: str):
@@ -442,16 +670,10 @@ class MainApp(tk.Tk):
                 return
             pop.log("Contract OK ✅")
 
-            # Make sure ZK dll path exists
-            pop.set_step("Checking DLL...")
-
-            pop.log(f"DLL OK")
-
-            # Ensure we can resolve membershipId (activeMembershipId)
-            pop.set_step("Resolving user membership...")
+            pop.set_step("Resolving active membership...")
             active_membership_id, user_obj = self._find_user_membership(user_id)
             if active_membership_id is None:
-                pop.log("User not found in cache or missing membershipId. Trying to sync now...")
+                pop.log("User not found in cache or missing activeMembershipId. Trying to sync now...")
                 try:
                     api = self._api()
                     data = api.get_sync_data(token=auth.token)
@@ -464,17 +686,12 @@ class MainApp(tk.Tk):
                 active_membership_id, user_obj = self._find_user_membership(user_id)
 
             if active_membership_id is None:
-                pop.fail("User has no membershipId (activeMembershipId). Cannot save fingerprint.")
+                pop.fail("User has no activeMembershipId. Cannot save fingerprint.")
                 return
 
             if user_obj and not full_name:
                 full_name = str(user_obj.get("fullName") or "").strip()
 
-            pop.log(f"userId={user_id}")
-            pop.log(f"activeMembershipId={active_membership_id}")
-            pop.log(f"fullName={full_name or '-'}")
-
-            # Start scanner
             pop.set_step("Initializing scanner (ZK9500)...")
             zk = ZKFinger(self.cfg.zkfp_dll_path, logger=self.logger)
             zk.init()
@@ -484,7 +701,6 @@ class MainApp(tk.Tk):
             zk.open_device(0)
             pop.log("Device opened ✅")
 
-            # Enroll (3 samples)
             pop.set_step("Enrollment...")
             tpl_bytes = zk.enroll_3_samples(
                 progress_cb=lambda msg: (pop.set_step(msg), pop.log(msg)),
@@ -495,7 +711,6 @@ class MainApp(tk.Tk):
                 pop.fail("Cancelled.")
                 return
 
-            # Encode
             pop.set_step("Encoding template...")
             tpl_ver = int(self.cfg.template_version)
             enc_cfg = (self.cfg.template_encoding or "base64").strip().lower()
@@ -506,7 +721,6 @@ class MainApp(tk.Tk):
             else:
                 tpl_text = to_b64(tpl_bytes)
 
-            # Save to backend
             pop.set_step("Saving to backend...")
             payload = {
                 "activeMembershipId": int(active_membership_id),
@@ -535,7 +749,6 @@ class MainApp(tk.Tk):
             pop.fail(str(e))
             self.logger.exception("Remote enroll failed (unexpected)")
         finally:
-            # Always close device
             try:
                 if zk:
                     pop.set_step("Closing device...")

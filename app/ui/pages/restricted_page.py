@@ -1,3 +1,4 @@
+# monclub_access_python/app/ui/pages/restricted_page.py
 from __future__ import annotations
 
 import tkinter as tk

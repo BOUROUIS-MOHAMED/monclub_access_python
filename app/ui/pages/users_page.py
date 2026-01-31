@@ -1,10 +1,11 @@
+# monclub_access_python/app/ui/pages/users_page.py
 from __future__ import annotations
 
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from app.core.db import list_fingerprints, get_fingerprint
+from app.core.db import list_fingerprints, get_fingerprint, load_sync_cache
 from app.core.utils import safe_int, from_b64, from_hex
 from app.sdk.pullsdk import PullSDK, PullSDKError
 
@@ -18,10 +19,29 @@ class UsersPage(ttk.Frame):
         super().__init__(parent)
         self.app = app
         self.sdk: PullSDK | None = None
+        self._connected_to: str = ""  # display label of selected device
+
+        # cached devices selector
+        self._device_display_to_obj: dict[str, dict] = {}
+        self.var_target_device = tk.StringVar(value="")
 
         # Top connect
         top = ttk.Frame(self)
         top.pack(fill="x", padx=10, pady=10)
+
+        # Device picker (from saved devices in sync cache)
+        ttk.Label(top, text="Target device:").pack(side="left")
+        self.cmb_target_device = ttk.Combobox(
+            top,
+            textvariable=self.var_target_device,
+            width=52,
+            state="readonly",
+        )
+        self.cmb_target_device.pack(side="left", padx=(8, 10))
+        self.cmb_target_device["values"] = []
+        self.cmb_target_device.bind("<<ComboboxSelected>>", self._on_target_device_changed)
+
+        ttk.Button(top, text="Reload devices", command=self.reload_devices).pack(side="left", padx=(0, 12))
 
         ttk.Button(top, text="Connect", command=self.connect).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="Disconnect", command=self.disconnect).pack(side="left", padx=(0, 8))
@@ -47,7 +67,7 @@ class UsersPage(ttk.Frame):
 
         r = 0
         r = self._row(form, r, "CardNo (decimal):", self.var_card)
-        r = self._row(form, r, "Pin / UserID (8 digits) (ENTER = derived from CardNo):", self.var_pin)
+        r = self._row(form, r, "Pin / UserID (<= 8 digits) (ENTER = derived from CardNo):", self.var_pin)
         r = self._row(form, r, "Name (no commas):", self.var_name)
         r = self._row(form, r, "Group (default 0):", self.var_group)
         r = self._row(form, r, "Password (optional):", self.var_pass, show="*")
@@ -69,10 +89,154 @@ class UsersPage(ttk.Frame):
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=10, pady=6)
 
-        ttk.Button(btns, text="Push user (Card + Authorize)", command=self.push_user_card_only).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="Push user + Fingerprint", command=self.push_user_with_fingerprint).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Push user (Card + Authorize)", command=self.push_user_card_only).pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(btns, text="Push user + Fingerprint", command=self.push_user_with_fingerprint).pack(
+            side="left", padx=(0, 8)
+        )
 
         self.refresh_fp_list()
+        self.reload_devices()
+
+    # ---------------- device selector ----------------
+
+    def _device_display(self, d: dict) -> str:
+        def _get(obj, *names, default=None):
+            if obj is None:
+                return default
+            if isinstance(obj, dict):
+                for n in names:
+                    if n in obj:
+                        return obj.get(n)
+                return default
+            for n in names:
+                if hasattr(obj, n):
+                    return getattr(obj, n)
+            return default
+
+        name = str(_get(d, "deviceName", "name", "DeviceName", default="") or "").strip()
+        platform = str(_get(d, "platform", "Platform", default="") or "").strip()
+
+        ip = str(_get(d, "ip", "ipAddress", "IPAddress", "ip_address", "deviceIp", "host", default="") or "").strip()
+        port = str(_get(d, "port", "Port", "tcpPort", "devicePort", default="") or "").strip()
+
+        left = name or platform or "device"
+        mid = platform if platform and platform.lower() not in (left or "").lower() else ""
+        addr = ""
+        if ip:
+            addr = ip + (f":{port}" if port else "")
+        parts = [p for p in [left, mid, addr] if p]
+        return " | ".join(parts) if parts else str(d)
+
+    def _select_best_device_display(self, values: list[str]) -> str:
+        cur = (self.var_target_device.get() or "").strip()
+        if cur and cur in values:
+            return cur
+
+        # Prefer your common test device markers if present
+        for v in values:
+            vv = v.lower()
+            if "asp 460" in vv or "zem560_inbio" in vv:
+                return v
+
+        return values[0] if values else ""
+
+    def reload_devices(self):
+        cache = load_sync_cache()
+        devs = []
+        if cache:
+            # best-effort: cache can be dict or object
+            if isinstance(cache, dict):
+                devs = cache.get("devices") or []
+            else:
+                devs = getattr(cache, "devices", []) or []
+
+        values: list[str] = []
+        mapping: dict[str, dict] = {}
+
+        if isinstance(devs, list):
+            for d in devs:
+                if not isinstance(d, dict):
+                    try:
+                        d = dict(d.__dict__)
+                    except Exception:
+                        continue
+                disp = self._device_display(d)
+                if not disp:
+                    continue
+                if disp in mapping:
+                    continue
+                values.append(disp)
+                mapping[disp] = d
+
+        self._device_display_to_obj = mapping
+        self.cmb_target_device["values"] = values
+        chosen = self._select_best_device_display(values)
+        self.var_target_device.set(chosen)
+
+    def _get_selected_device(self) -> dict | None:
+        key = (self.var_target_device.get() or "").strip()
+        if not key:
+            return None
+        return self._device_display_to_obj.get(key)
+
+    def _parse_int(self, v, default: int) -> int:
+        try:
+            return int(str(v).strip())
+        except Exception:
+            return default
+
+    def _resolve_target_conn(self) -> tuple[str, int, int, str, str]:
+        """
+        Returns (ip, port, timeout_ms, password, label)
+        Falls back to app.cfg if device info is missing.
+        """
+        d = self._get_selected_device()
+
+        ip = str(getattr(self.app.cfg, "ip", "") or "").strip()
+        port = self._parse_int(getattr(self.app.cfg, "port", 0) or 0, 0)
+        timeout_ms = self._parse_int(getattr(self.app.cfg, "timeout_ms", 3000) or 3000, 3000)
+        password = str(getattr(self.app.cfg, "password", "") or "")
+        label = "(config device)"
+
+        if d:
+            label = self._device_display(d)
+
+            ip2 = d.get("ip") or d.get("ipAddress") or d.get("IPAddress") or d.get("ip_address") or d.get("host")
+            if ip2:
+                ip = str(ip2).strip()
+
+            port2 = d.get("port") or d.get("Port") or d.get("tcpPort") or d.get("devicePort")
+            if port2 is not None and str(port2).strip() != "":
+                port = self._parse_int(port2, port)
+
+            pw2 = d.get("commPassword") or d.get("CommPassword") or d.get("password") or d.get("passwd") or d.get("Passwd")
+            if pw2 is not None and str(pw2).strip() != "":
+                password = str(pw2)
+
+            t2 = d.get("timeoutMs") or d.get("timeout_ms") or d.get("timeout")
+            if t2 is not None and str(t2).strip() != "":
+                timeout_ms = self._parse_int(t2, timeout_ms)
+
+        return ip, port, timeout_ms, password, label
+
+    def _require_device_selected_or_warn(self) -> bool:
+        if self.cmb_target_device["values"]:
+            if not self._get_selected_device():
+                messagebox.showwarning("Device", "Please select a device from the saved devices list.")
+                return False
+        return True
+
+    def _on_target_device_changed(self, _evt=None):
+        # If already connected, disconnect (avoid pushing to wrong device by accident)
+        try:
+            if self.sdk:
+                self.disconnect()
+        except Exception:
+            pass
+
+    # ---------------- UI helpers ----------------
 
     def _row(self, parent, row, label, var, show=None):
         parent.columnconfigure(1, weight=1)
@@ -81,16 +245,24 @@ class UsersPage(ttk.Frame):
         e.grid(row=row, column=1, sticky="ew", padx=10, pady=3)
         return row + 1
 
+    # ---------------- connect/disconnect ----------------
+
     def connect(self):
+        if not self._require_device_selected_or_warn():
+            return
+
         try:
+            ip, port, timeout_ms, password, label = self._resolve_target_conn()
+
             self.sdk = PullSDK(self.app.cfg.plcomm_dll_path, logger=self.app.logger)
             self.sdk.connect(
-                ip=self.app.cfg.ip,
-                port=self.app.cfg.port,
-                timeout_ms=self.app.cfg.timeout_ms,
-                password=self.app.cfg.password,
+                ip=ip,
+                port=port,
+                timeout_ms=timeout_ms,
+                password=password,
             )
-            self.lbl.config(text=f"Connected to {self.app.cfg.ip}:{self.app.cfg.port}")
+            self._connected_to = label
+            self.lbl.config(text=f"Connected to {label} ({ip}:{port})")
         except Exception as e:
             messagebox.showerror("Connect failed", str(e))
             self.app.logger.exception("Connect failed")
@@ -100,13 +272,19 @@ class UsersPage(ttk.Frame):
             if self.sdk:
                 self.sdk.disconnect()
             self.sdk = None
+            self._connected_to = ""
             self.lbl.config(text="Disconnected.")
         except Exception as e:
             messagebox.showerror("Disconnect failed", str(e))
 
+    # ---------------- fingerprints ----------------
+
     def refresh_fp_list(self):
         fps = list_fingerprints()
-        values = [f"#{f.id} | {f.created_at} | pin={f.pin} | card={f.card_no} | finger={f.finger_id} | v{f.template_version} | {f.label}" for f in fps]
+        values = [
+            f"#{f.id} | {f.created_at} | pin={f.pin} | card={f.card_no} | finger={f.finger_id} | v{f.template_version} | {f.label}"
+            for f in fps
+        ]
         self.fp_combo["values"] = values
         if values and not self.var_fp.get():
             self.var_fp.set(values[0])
@@ -116,31 +294,31 @@ class UsersPage(ttk.Frame):
             raise RuntimeError("Connect to controller first.")
         return self.sdk
 
+    # ---------------- business logic ----------------
+
     @staticmethod
     def _derive_pin_8_from_card(cardno: str) -> str:
         """
-        Derive an 8-digit pin from CardNo:
-        - if < 8 digits => left pad with zeros
+        Derive a pin (<= 8 digits) from CardNo:
+        - if <= 8 digits => use as-is
         - if > 8 digits => last 8 digits
         """
         c = (cardno or "").strip()
         if not c.isdigit():
             raise ValueError("CardNo must be numeric.")
-        if len(c) == 8:
+        if len(c) <= 8:
             return c
-        if len(c) < 8:
-            return c.zfill(8)
         return c[-8:]
 
     def _normalize_pin_8(self, pin_raw: str, cardno: str) -> str:
         p = (pin_raw or "").strip()
 
-        # If user entered a pin: must be exactly 8 digits
+        # If user entered a pin: must be numeric and <= 8 digits
         if p:
             if not p.isdigit():
-                raise ValueError("Pin must be numeric (8 digits).")
-            if len(p) != 8:
-                raise ValueError("Pin must be exactly 8 digits.")
+                raise ValueError("Pin must be numeric (<= 8 digits).")
+            if len(p) > 8:
+                raise ValueError("Pin must be <= 8 digits.")
             return p
 
         # If empty: derive from CardNo
@@ -162,6 +340,7 @@ class UsersPage(ttk.Frame):
 
         # Auto start/end like your script
         import datetime as dt
+
         today = dt.datetime.now()
         start = self.var_start.get().strip() or (today - dt.timedelta(days=1)).strftime("%Y%m%d")
         end = self.var_end.get().strip() or (today + dt.timedelta(days=7)).strftime("%Y%m%d")

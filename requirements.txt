@@ -1,2 +1,10 @@
+pystray
+pillow
+
+
+
+
 # Uses only Python stdlib (Tkinter, ctypes, sqlite3, logging).
 # Keep empty on purpose.
+
+winotify
