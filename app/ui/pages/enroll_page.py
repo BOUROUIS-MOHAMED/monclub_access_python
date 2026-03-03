@@ -488,6 +488,25 @@ class EnrollFingerprintPopup(tk.Toplevel):
     def _set_status(self, s: str):
         self.after(0, lambda: self.status.config(text=s or ""))
 
+    def _resolve_latest_release_url(self) -> str:
+        """
+        ApiEndpoints now requires latest_release_url.
+        We try multiple config attribute names to stay backward-compatible.
+        """
+        candidates = [
+            getattr(self.app.cfg, "api_latest_release_url", None),
+            getattr(self.app.cfg, "latest_release_url", None),
+            getattr(self.app.cfg, "update_latest_release_url", None),
+            getattr(self.app.cfg, "releases_url", None),
+        ]
+        for c in candidates:
+            s = (str(c).strip() if c is not None else "")
+            if s:
+                return s
+
+        # Fallback: pick a sensible default (adjust if your backend uses another route)
+        return "http://localhost:5000/api/v1/public/access/v1/latest_release"
+
     def enroll_and_save(self):
         if not self.zk or not self.zk_open:
             messagebox.showerror("Fingerprint reader", "The fingerprint reader is not ready. Retry opening it.")
@@ -518,11 +537,14 @@ class EnrollFingerprintPopup(tk.Toplevel):
             messagebox.showerror("Auth", "Not logged in. Please login first (token missing).")
             return
 
+
         api = MonClubApi(
             ApiEndpoints(
                 login_url=self.app.cfg.api_login_url,
                 sync_url=self.app.cfg.api_sync_url,
                 create_user_fingerprint_url=self.app.cfg.api_create_user_fingerprint_url,
+                latest_release_url=self._resolve_latest_release_url(),  # ✅ FIX
+
             ),
             logger=self.app.logger,
         )

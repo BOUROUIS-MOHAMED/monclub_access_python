@@ -127,6 +127,17 @@ class AppConfig:
     local_api_enabled: bool = True
     local_api_host: str = "127.0.0.1"
     local_api_port: int = 8788
+    # -------------------------
+    # Desktop auto-update
+    # -------------------------
+    api_latest_release_url: str = "http://localhost:5000/api/v1/manager/access/getLatestAccessSoftwareRelease"
+
+    update_enabled: bool = True
+    update_platform: str = "WINDOWS"   # request param (server returns "windows")
+    update_channel: str = "stable"     # stable for now
+   # update_check_interval_sec: int = 3 * 60 * 60  # 3 hours
+    update_check_interval_sec: int = 30
+    update_auto_download_zip: bool = True
 
     # -------------------------
     # Finger template
@@ -135,7 +146,7 @@ class AppConfig:
     template_encoding: str = "base64"
 
     # -------------------------
-    # DLL paths
+    # DLL paths (resource-relative recommended; resolved at runtime)
     # -------------------------
     plcomm_dll_path: str = r".\plcommpro.dll"
     zkfp_dll_path: str = r".\libzkfp.dll"
@@ -174,11 +185,12 @@ class AppConfig:
             "history_retention_days": 30,
             "event_queue_max": 5000,
             "decision_workers": 1,
-            "notification_queue_max": 2000,  # Added: consistent with UI
-            "history_queue_max": 5000,       # Added: consistent with UI
-            "decision_ema_alpha": 0.2,       # Added: consistent with UI
+            "notification_queue_max": 2000,
+            "history_queue_max": 5000,
+            "decision_ema_alpha": 0.2,
             "notification_service_enabled": True,
             "history_service_enabled": True,
+            # image cache (aliases supported)
             "image_cache_enabled": True,
             "image_cache_timeout_sec": 2.0,
             "image_cache_max_bytes": 5242880,  # 5MB
@@ -228,132 +240,105 @@ class AppConfig:
 
     @property
     def is_device_mode(self) -> bool:
+        """
+        DEPRECATED (Mar 2026): mode is now per device (GymDeviceDto.accessDataMode).
+        This property is kept for backward compatibility but should not be used
+        for branching logic. Use per-device accessDataMode instead.
+        """
         return _normalize_data_mode(self.data_mode) == "DEVICE"
 
     # -------------------------
-    # AGENT realtime helpers
+    # AGENT / global settings  (READ-ONLY from backend SQLite cache)
+    #
+    # IMPORTANT (Mar 2026):
+    #   Settings now come from GymAccessSoftwareSettingsDto (global) and
+    #   GymDeviceDto (per device), cached in local SQLite by save_sync_cache().
+    #   The local agent_global / agent_devices dicts in config.json are NO
+    #   LONGER the source of truth. These methods now read from SQLite and
+    #   fall back to safe defaults if the cache is empty.
     # -------------------------
     def get_agent_global(self) -> Dict[str, Any]:
-        g = dict(self.agent_global or {})
-        g["notification_rate_limit_per_minute"] = _clamp_int(
-            g.get("notification_rate_limit_per_minute", 30), 30, 0, 600
-        )
-        g["notification_dedupe_window_sec"] = _clamp_int(g.get("notification_dedupe_window_sec", 30), 30, 0, 600)
-        g["history_retention_days"] = _clamp_int(g.get("history_retention_days", 30), 30, 1, 3650)
-        g["event_queue_max"] = _clamp_int(g.get("event_queue_max", 5000), 5000, 100, 200000)
-        g["decision_workers"] = _clamp_int(g.get("decision_workers", 1), 1, 1, 16)
-        g["notification_queue_max"] = _clamp_int(g.get("notification_queue_max", 2000), 2000, 100, 20000)
-        g["history_queue_max"] = _clamp_int(g.get("history_queue_max", 5000), 5000, 100, 50000)
-        g["decision_ema_alpha"] = _clamp_float(g.get("decision_ema_alpha", 0.2), 0.2, 0.01, 1.0)
-        g["notification_service_enabled"] = _ensure_bool(g.get("notification_service_enabled", True), True)
-        g["history_service_enabled"] = _ensure_bool(g.get("history_service_enabled", True), True)
-        g["image_cache_enabled"] = _ensure_bool(g.get("image_cache_enabled", True), True)
-        g["image_cache_timeout_sec"] = _clamp_float(g.get("image_cache_timeout_sec", 2.0), 2.0, 0.1, 60.0)
-        g["image_cache_max_bytes"] = _clamp_int(g.get("image_cache_max_bytes", 5242880), 5242880, 1024, 104857600)  # 100MB max
-        g["image_cache_max_files"] = _clamp_int(g.get("image_cache_max_files", 1000), 1000, 1, 10000)
-        g["show_notifications"] = _ensure_bool(g.get("show_notifications", True), True)
-        return g
+        """
+        Returns normalized global settings from the backend
+        (GymAccessSoftwareSettingsDto cached in SQLite).
+        Falls back to safe defaults if no cache exists yet.
+        """
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+            return get_backend_global_settings()
+        except Exception:
+            # absolute fallback: return safe defaults
+            return {
+                "notification_rate_limit_per_minute": 30,
+                "notification_dedupe_window_sec": 30,
+                "history_retention_days": 30,
+                "event_queue_max": 5000,
+                "decision_workers": 1,
+                "notification_queue_max": 5000,
+                "history_queue_max": 5000,
+                "decision_ema_alpha": 0.2,
+                "notification_service_enabled": True,
+                "history_service_enabled": True,
+                "image_cache_enabled": True,
+                "image_cache_timeout_sec": 2.0,
+                "image_cache_max_bytes": 5242880,
+                "image_cache_max_files": 1000,
+                "show_notifications": True,
+            }
 
     def get_agent_device_settings(self, device_id: int) -> Dict[str, Any]:
-        did = str(int(device_id))
-        base = {
-            "enabled": True,
-            "adaptive_sleep": True,
-            "busy_sleep_min_ms": 0,
-            "busy_sleep_max_ms": 50,
-            "empty_sleep_min_ms": 200,
-            "empty_sleep_max_ms": 500,
-            "empty_backoff_factor": 1.35,
-            "empty_backoff_max_ms": 2000,
-            "platform": "",
-            "timeout_ms": int(self.device_timeout_ms),
-            "rtlog_table": "rtlog",
-            "door_entry_id": 1,
-            "door_close_id": None,
-            "pulse_time_ms": 3000,
-            "save_history": True,
-            "show_notifications": True,
-            "replay_block_window_seconds": 10,
-            "replay_lru_size": 2000,
-            "cmd_timeout_ms": 4000,
-            "poll_ema_alpha": 0.2,
-            "cmd_ema_alpha": 0.2,
-            "totp_enabled": True,
-            "totp_digits": 8,
-            "totp_period_seconds": 30,
-            "totp_drift_steps": 1,
-            "totp_max_past_age_seconds": 32,
-            "totp_max_future_skew_seconds": 3,
-            "totp_prefix": "9",
-            "rfid_enabled": True,
-            "rfid_digits": 8,
-        }
-
-        o = _ensure_dict((self.agent_devices or {}).get(did, {}))
-        out = dict(base)
-        out.update(o)
-
-        out["enabled"] = _ensure_bool(out.get("enabled"), True)
-        out["adaptive_sleep"] = _ensure_bool(out.get("adaptive_sleep"), True)
-        out["totp_enabled"] = _ensure_bool(out.get("totp_enabled"), True)
-        out["rfid_enabled"] = _ensure_bool(out.get("rfid_enabled"), True)
-
-        out["busy_sleep_min_ms"] = _clamp_int(out.get("busy_sleep_min_ms"), 0, 0, 500)
-        out["busy_sleep_max_ms"] = _clamp_int(out.get("busy_sleep_max_ms"), 50, 0, 2000)
-        if out["busy_sleep_max_ms"] < out["busy_sleep_min_ms"]:
-            out["busy_sleep_max_ms"] = out["busy_sleep_min_ms"]
-
-        out["empty_sleep_min_ms"] = _clamp_int(out.get("empty_sleep_min_ms"), 200, 0, 60000)
-        out["empty_sleep_max_ms"] = _clamp_int(out.get("empty_sleep_max_ms"), 500, 0, 60000)
-        if out["empty_sleep_max_ms"] < out["empty_sleep_min_ms"]:
-            out["empty_sleep_max_ms"] = out["empty_sleep_min_ms"]
-
-        out["empty_backoff_factor"] = _clamp_float(out.get("empty_backoff_factor"), 1.35, 1.0, 3.0)
-        out["empty_backoff_max_ms"] = _clamp_int(out.get("empty_backoff_max_ms"), 2000, 0, 120000)
-
-        out["timeout_ms"] = _clamp_int(out.get("timeout_ms"), int(self.device_timeout_ms), 500, 60000)
-
-        out["rtlog_table"] = _safe_str(out.get("rtlog_table"), "rtlog").strip() or "rtlog"
-        out["platform"] = _safe_str(out.get("platform"), "").strip()
-
-        out["door_entry_id"] = _clamp_int(out.get("door_entry_id"), 1, 1, 64)
-        dc = out.get("door_close_id", None)
-        if dc in ("", None):
-            out["door_close_id"] = None
-        else:
-            out["door_close_id"] = _clamp_int(dc, 1, 1, 64)
-
-        out["pulse_time_ms"] = _clamp_int(out.get("pulse_time_ms"), 3000, 100, 60000)
-
-        out["save_history"] = _ensure_bool(out.get("save_history"), True)
-        out["show_notifications"] = _ensure_bool(out.get("show_notifications"), True)
-
-        out["replay_block_window_seconds"] = _clamp_int(out.get("replay_block_window_seconds"), 10, 0, 3600)
-        out["replay_lru_size"] = _clamp_int(out.get("replay_lru_size"), 2000, 100, 200000)
-
-        out["cmd_timeout_ms"] = _clamp_int(out.get("cmd_timeout_ms"), 4000, 200, 60000)
-        
-        out["poll_ema_alpha"] = _clamp_float(out.get("poll_ema_alpha"), 0.2, 0.01, 1.0)
-        out["cmd_ema_alpha"] = _clamp_float(out.get("cmd_ema_alpha"), 0.2, 0.01, 1.0)
-        
-        out["totp_digits"] = _clamp_int(out.get("totp_digits"), 8, 4, 10)
-        out["totp_period_seconds"] = _clamp_int(out.get("totp_period_seconds"), 30, 10, 120)
-        out["totp_drift_steps"] = _clamp_int(out.get("totp_drift_steps"), 1, 0, 5)
-        out["totp_max_past_age_seconds"] = _clamp_int(out.get("totp_max_past_age_seconds"), 32, 1, 300)
-        out["totp_max_future_skew_seconds"] = _clamp_int(out.get("totp_max_future_skew_seconds"), 3, 0, 60)
-        out["totp_prefix"] = _safe_str(out.get("totp_prefix"), "9").strip()
-        if len(out["totp_prefix"]) != 1 or not out["totp_prefix"].isdigit():
-            out["totp_prefix"] = "9"
-        
-        out["rfid_digits"] = _clamp_int(out.get("rfid_digits"), 8, 4, 16)
-
-        return out
+        """
+        Returns normalized per-device settings from the backend
+        (GymDeviceDto cached in SQLite).
+        Falls back to safe defaults if no cache exists yet.
+        """
+        try:
+            from app.core.settings_reader import get_backend_device_settings
+            return get_backend_device_settings(int(device_id))
+        except Exception:
+            # absolute fallback: return safe defaults
+            return {
+                "enabled": True,
+                "adaptive_sleep": True,
+                "busy_sleep_min_ms": 0,
+                "busy_sleep_max_ms": 50,
+                "empty_sleep_min_ms": 200,
+                "empty_sleep_max_ms": 500,
+                "empty_backoff_factor": 1.35,
+                "empty_backoff_max_ms": 2000,
+                "platform": "",
+                "timeout_ms": int(self.device_timeout_ms),
+                "rtlog_table": "rtlog",
+                "door_entry_id": 1,
+                "pulse_time_ms": 3000,
+                "save_history": True,
+                "show_notifications": True,
+                "cmd_timeout_ms": 4000,
+                "totp_enabled": True,
+                "totp_digits": 7,
+                "rfid_enabled": True,
+                "rfid_min_digits": 1,
+                "rfid_max_digits": 16,
+                "totp_period_seconds": 30,
+                "totp_drift_steps": 1,
+                "totp_max_past_age_seconds": 32,
+                "totp_max_future_skew_seconds": 3,
+                "totp_prefix": "9",
+                "replay_block_window_seconds": 10,
+                "replay_lru_size": 2000,
+                "poll_ema_alpha": 0.2,
+                "cmd_ema_alpha": 0.2,
+            }
 
     def set_agent_device_override(self, device_id: int, override: Dict[str, Any]) -> None:
-        did = str(int(device_id))
-        if self.agent_devices is None or not isinstance(self.agent_devices, dict):
-            self.agent_devices = {}
-        self.agent_devices[did] = dict(override or {})
+        """
+        DEPRECATED (Mar 2026): device settings are now READ-ONLY from backend.
+        This method is kept temporarily for backward compatibility but has no
+        effect on the actual runtime settings. Use the backend dashboard to
+        change device settings.
+        """
+        # No-op: settings are read-only from backend SQLite cache.
+        pass
 
     # -------------------------
     # Internal: resolve selected device connection from local cache
@@ -475,13 +460,29 @@ class AppConfig:
 
         # tray options
         cfg.tray_enabled = bool(cfg.tray_enabled) if cfg.tray_enabled is not None else True
-        cfg.minimize_to_tray_on_close = (
-            bool(cfg.minimize_to_tray_on_close) if cfg.minimize_to_tray_on_close is not None else True
-        )
+        cfg.minimize_to_tray_on_close = bool(cfg.minimize_to_tray_on_close) if cfg.minimize_to_tray_on_close is not None else True
         cfg.start_minimized_to_tray = bool(cfg.start_minimized_to_tray) if cfg.start_minimized_to_tray is not None else False
 
         if cfg.login_email is None:
             cfg.login_email = ""
+        # update system
+        if not getattr(cfg, "api_latest_release_url", ""):
+            cfg.api_latest_release_url = AppConfig.api_latest_release_url
+
+        cfg.update_enabled = bool(getattr(cfg, "update_enabled", True)) if getattr(cfg, "update_enabled", None) is not None else True
+
+        cfg.update_platform = _safe_str(getattr(cfg, "update_platform", "WINDOWS"), "WINDOWS").strip().upper() or "WINDOWS"
+        cfg.update_channel = _safe_str(getattr(cfg, "update_channel", "stable"), "stable").strip().lower() or "stable"
+
+        try:
+          #  cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 3 * 60 * 60) or (3 * 60 * 60))
+            cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 30) or (30))
+        except Exception:
+            cfg.update_check_interval_sec = 3 * 60 * 60
+        if cfg.update_check_interval_sec < 60:
+            cfg.update_check_interval_sec = 60
+
+        cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", True), True)
 
         return cfg
 

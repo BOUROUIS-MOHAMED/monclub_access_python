@@ -15,6 +15,7 @@ from app.core.db import (
     create_device_door_preset,
     update_device_door_preset,
     delete_device_door_preset,
+    load_auth_token,  # ✅ NEW (for version check button)
 )
 from app.sdk.pullsdk import PullSDK
 from app.sdk.zkfinger import ZKFinger
@@ -149,6 +150,21 @@ class ConfigurationPage(ttk.Frame):
         # realtime engine global toggle (AGENT mode)
         self.var_agent_rt_enabled = tk.BooleanVar(value=bool(getattr(self.app.cfg, "agent_realtime_enabled", True)))
 
+        # --- Access rules (per device) ---
+        self.var_access_device = tk.StringVar(value="")
+        self.cmb_access_device: ttk.Combobox
+
+        self.var_totp_enabled_rule = tk.BooleanVar(value=True)
+        self.var_totp_prefix_rule = tk.StringVar(value="9")
+        self.var_totp_period_rule = tk.StringVar(value="30")
+        self.var_totp_drift_rule = tk.StringVar(value="1")
+        self.var_totp_max_past_rule = tk.StringVar(value="32")
+        self.var_totp_max_future_rule = tk.StringVar(value="3")
+
+        self.var_rfid_enabled_rule = tk.BooleanVar(value=True)
+        self.var_rfid_min_digits_rule = tk.StringVar(value="1")
+        self.var_rfid_max_digits_rule = tk.StringVar(value="16")
+
         self.var_preset_device = tk.StringVar(value="")
         self.var_preset_name = tk.StringVar(value="")
         self.var_preset_door = tk.StringVar(value="1")
@@ -179,7 +195,12 @@ class ConfigurationPage(ttk.Frame):
 
         self.var_api_login = tk.StringVar(value=_safe_str(getattr(self.app.cfg, "api_login_url", "") or ""))
         self.var_api_sync = tk.StringVar(value=_safe_str(getattr(self.app.cfg, "api_sync_url", "") or ""))
-        self.var_api_create_fp = tk.StringVar(value=_safe_str(getattr(self.app.cfg, "api_create_user_fingerprint_url", "") or ""))
+        self.var_api_create_fp = tk.StringVar(
+            value=_safe_str(getattr(self.app.cfg, "api_create_user_fingerprint_url", "") or "")
+        )
+        self.var_api_latest_release = tk.StringVar(  # ✅ NEW
+            value=_safe_str(getattr(self.app.cfg, "api_latest_release_url", "") or "")
+        )
 
         r = 0
 
@@ -364,6 +385,86 @@ class ConfigurationPage(ttk.Frame):
         ).grid(row=ar, column=0, columnspan=3, sticky="w", padx=10, pady=(4, 8))
         ar += 1
 
+        # -------------------------
+        # Access code rules (per device)
+        # -------------------------
+        ttk.Label(self.adv_frame, text="Access code rules (per device)", font=("Segoe UI", 11, "bold")).grid(
+            row=ar, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 6)
+        )
+        ar += 1
+
+        access_box = ttk.LabelFrame(self.adv_frame, text="TOTP QR + RFID rules for a device")
+        access_box.grid(row=ar, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 8))
+        access_box.columnconfigure(1, weight=1)
+        ar += 1
+
+        ttk.Label(access_box, text="Device:").grid(row=0, column=0, sticky="w", padx=10, pady=6)
+        self.cmb_access_device = ttk.Combobox(access_box, textvariable=self.var_access_device, values=[], state="readonly")
+        self.cmb_access_device.grid(row=0, column=1, sticky="ew", padx=10, pady=6, columnspan=2)
+        self.cmb_access_device.bind("<<ComboboxSelected>>", self._on_access_device_changed)
+
+        ttk.Label(
+            access_box,
+            text="QR format: 8 digits total = '9' + TOTP(7 digits).",
+            foreground="#444",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 8))
+
+        # TOTP block
+        ttk.Checkbutton(access_box, text="Enable TOTP QR", variable=self.var_totp_enabled_rule).grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6)
+        )
+
+        ttk.Label(access_box, text="TOTP prefix (1 digit):").grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_totp_prefix_rule, width=6).grid(
+            row=3, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(access_box, text="Period (sec):").grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_totp_period_rule, width=6).grid(
+            row=4, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(access_box, text="Drift steps (±):").grid(row=5, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_totp_drift_rule, width=6).grid(
+            row=5, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(access_box, text="Max past age (sec):").grid(row=6, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_totp_max_past_rule, width=6).grid(
+            row=6, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(access_box, text="Max future skew (sec):").grid(row=7, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_totp_max_future_rule, width=6).grid(
+            row=7, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Separator(access_box).grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
+
+        # RFID block
+        ttk.Checkbutton(access_box, text="Enable RFID cards", variable=self.var_rfid_enabled_rule).grid(
+            row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6)
+        )
+
+        ttk.Label(access_box, text="RFID min digits:").grid(row=10, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_rfid_min_digits_rule, width=6).grid(
+            row=10, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(access_box, text="RFID max digits:").grid(row=11, column=0, sticky="w", padx=10, pady=4)
+        ttk.Entry(access_box, textvariable=self.var_rfid_max_digits_rule, width=6).grid(
+            row=11, column=1, sticky="w", padx=10, pady=4
+        )
+
+        ttk.Label(
+            access_box,
+            text="Tip: set min=max=8 for gyms forcing 8-digit cards; keep max=16 for legacy 11-digit cards.",
+            foreground="#444",
+        ).grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 8))
+
+        # IMPORTANT: advance `ar` so next sections don't overlap
+        ar += 1
+
         ttk.Separator(self.adv_frame).grid(row=ar, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
         ar += 1
 
@@ -418,9 +519,9 @@ class ConfigurationPage(ttk.Frame):
         ar += 1
 
         ttk.Label(self.adv_frame, text="Template encoding:").grid(row=ar, column=0, sticky="w", padx=10, pady=4)
-        ttk.Combobox(self.adv_frame, textvariable=self.var_tpl_enc, values=["base64", "hex"], width=10, state="readonly").grid(
-            row=ar, column=1, sticky="w", padx=10, pady=4
-        )
+        ttk.Combobox(
+            self.adv_frame, textvariable=self.var_tpl_enc, values=["base64", "hex"], width=10, state="readonly"
+        ).grid(row=ar, column=1, sticky="w", padx=10, pady=4)
         ar += 1
 
         ttk.Separator(self.adv_frame).grid(row=ar, column=0, columnspan=3, sticky="ew", padx=10, pady=10)
@@ -445,6 +546,7 @@ class ConfigurationPage(ttk.Frame):
         ar = self._row_entry_adv(ar, "Login URL:", self.var_api_login)
         ar = self._row_entry_adv(ar, "Sync URL:", self.var_api_sync)
         ar = self._row_entry_adv(ar, "Create fingerprint URL:", self.var_api_create_fp)
+        ar = self._row_entry_adv(ar, "Latest release URL:", self.var_api_latest_release)  # ✅ NEW
 
         self._set_advanced_visible(False)
 
@@ -455,8 +557,13 @@ class ConfigurationPage(ttk.Frame):
 
         btns = ttk.Frame(self.content)
         btns.grid(row=r, column=0, columnspan=3, sticky="w", padx=10, pady=6)
+
         ttk.Button(btns, text="Save config", command=self.on_save).pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Sync now (fetch devices/users)", command=self.on_sync_now).pack(side="left", padx=(0, 8))
+
+        # ✅ NEW: Manual version check trigger (forces updater to re-check now)
+        ttk.Button(btns, text="Enforce version check", command=self.on_enforce_version_check).pack(side="left", padx=(0, 8))
+
         ttk.Button(btns, text="Check PullSDK DLL", command=self.check_pullsdk).pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Check ZKFinger DLL", command=self.check_zkfinger).pack(side="left", padx=(0, 8))
 
@@ -470,6 +577,119 @@ class ConfigurationPage(ttk.Frame):
         self._bind_mousewheel_recursive(self.content)
         self._sync_adv_button_state()
 
+    # ---------------- NEW: Version check button logic ----------------
+    def _try_invoke(self, obj, names: Tuple[str, ...], *args, **kwargs) -> bool:
+        """
+        Best-effort: tries calling obj.<name>(...) across multiple likely method names/signatures.
+        Returns True if we successfully invoked something (even if it runs async).
+        """
+        for name in names:
+            fn = getattr(obj, name, None)
+            if not callable(fn):
+                continue
+            # try: kwargs, then args, then no-args
+            try:
+                fn(*args, **kwargs)
+                return True
+            except TypeError:
+                pass
+            except Exception:
+                # invocation happened but failed immediately -> still count as "invoked"
+                return True
+
+            try:
+                fn(*args)
+                return True
+            except TypeError:
+                pass
+            except Exception:
+                return True
+
+            try:
+                fn()
+                return True
+            except Exception:
+                return True
+        return False
+
+    def on_enforce_version_check(self):
+        """
+        Forces a fresh update/version check immediately.
+        - If UpdateManager exposes a 'check' method, we trigger it.
+        - Otherwise we fallback to calling the API directly and show the latest release.
+        """
+        # Save first so latest_release_url changes take effect
+        try:
+            self.on_save()
+        except Exception:
+            pass
+
+        auth = load_auth_token()
+        token = (getattr(auth, "token", "") or "").strip()
+        if not token:
+            messagebox.showinfo("Version check", "You must login first (no token found).")
+            return
+
+        # 1) Preferred: trigger UpdateManager (so top-right Download/Update button updates)
+        um = getattr(self.app, "_update_manager", None)
+        if um:
+            invoked = self._try_invoke(
+                um,
+                (
+                    "check_now",
+                    "check_for_updates",
+                    "refresh",
+                    "tick",
+                    "request_check_now",
+                    "request_check",
+                    "trigger_check",
+                    "check",
+                ),
+                token=token,
+                force=True,
+            )
+            if not invoked:
+                invoked = self._try_invoke(
+                    um,
+                    (
+                        "check_now",
+                        "check_for_updates",
+                        "refresh",
+                        "tick",
+                        "request_check",
+                        "trigger_check",
+                        "check",
+                    ),
+                    token=token,
+                )
+            if invoked:
+                self.lbl_status.config(text="Status: version check requested ✅ (watch top-right update button)")
+                return
+
+        # 2) Fallback: call API directly and display what the backend says is latest
+        try:
+            if not hasattr(self.app, "_api"):
+                raise RuntimeError("App has no _api() factory; cannot check latest release.")
+            api = self.app._api()
+            data = api.get_latest_access_software_release(token=token, platform="WINDOWS", channel="stable")
+
+            rid = str(data.get("releaseId") or data.get("id") or "") or "(unknown)"
+            ver = str(data.get("version") or data.get("tag") or data.get("name") or "") or ""
+            mandatory = bool(data.get("mandatory") or data.get("forceUpdate") or data.get("required"))
+
+            msg = f"Latest release:\n- releaseId: {rid}"
+            if ver:
+                msg += f"\n- version: {ver}"
+            if mandatory:
+                msg += "\n\n⚠️ This release is marked as mandatory."
+
+            messagebox.showinfo("Version check", msg)
+            self.lbl_status.config(text="Status: version check done ✅")
+        except Exception as e:
+            messagebox.showerror("Version check failed", str(e))
+            self.lbl_status.config(text="Status: version check FAILED ❌")
+
+    # ---------------- Existing UI helpers ----------------
     def _sync_adv_button_state(self):
         try:
             if not self._advanced_unlocked:
@@ -598,6 +818,7 @@ class ConfigurationPage(ttk.Frame):
 
         self.cmb_devices["values"] = values
         self.cmb_preset_device["values"] = values
+        self.cmb_access_device["values"] = values
         self.lbl_devices_hint.config(text=f"Devices: {len(values)} (from local sync cache)")
 
         sel_id = getattr(self.app.cfg, "selected_device_id", None)
@@ -629,8 +850,75 @@ class ConfigurationPage(ttk.Frame):
             if not self.var_preset_device.get():
                 self.var_preset_device.set(values[0] if values else "")
 
+        # Default selection for Access rules device
+        if values:
+            # prefer selected main device if possible
+            chosen = None
+            if sel_id is not None:
+                for label in values:
+                    if self._device_display_to_id.get(label) == sel_id:
+                        chosen = label
+                        break
+            if chosen is None:
+                chosen = values[0]
+            self.var_access_device.set(chosen)
+
+        # Ensure UI fields reflect currently selected device settings
+        self._on_access_device_changed()
+
         self._preset_reload()
 
+    # ---------------- Access rules (per device) ----------------
+    def _get_selected_access_device_id(self) -> Optional[int]:
+        label = (self.var_access_device.get() or "").strip()
+        if not label:
+            return None
+        did = self._device_display_to_id.get(label)
+        if did is None:
+            return None
+        return int(did)
+
+    def _on_access_device_changed(self, _evt=None):
+        did = self._get_selected_access_device_id()
+        if did is None:
+            return
+
+        try:
+            s = self.app.cfg.get_agent_device_settings(int(did)) or {}
+        except Exception:
+            s = {}
+
+        # TOTP
+        self.var_totp_enabled_rule.set(bool(s.get("totp_enabled", True)))
+        self.var_totp_prefix_rule.set(str(s.get("totp_prefix", "9") or "9"))
+        self.var_totp_period_rule.set(str(s.get("totp_period_seconds", 30)))
+        self.var_totp_drift_rule.set(str(s.get("totp_drift_steps", 1)))
+        self.var_totp_max_past_rule.set(str(s.get("totp_max_past_age_seconds", 32)))
+        self.var_totp_max_future_rule.set(str(s.get("totp_max_future_skew_seconds", 3)))
+
+        # RFID
+        self.var_rfid_enabled_rule.set(bool(s.get("rfid_enabled", True)))
+
+        # If older configs only had rfid_digits, fall back to it
+        rmin = s.get("rfid_min_digits", None)
+        rmax = s.get("rfid_max_digits", None)
+        if rmin is None or rmax is None:
+            d = s.get("rfid_digits", 8)
+            rmin = d
+            rmax = d
+
+        self.var_rfid_min_digits_rule.set(str(rmin))
+        self.var_rfid_max_digits_rule.set(str(rmax))
+
+    def _apply_access_rules_override_for_selected_device(self) -> None:
+        """
+        DEPRECATED (Mar 2026): device settings are now READ-ONLY from backend.
+        This method is kept for backward compatibility but does nothing.
+        Use the backend dashboard to change device access rules.
+        """
+        pass
+
+    # ---------------- device selection ----------------
     def on_apply_selected_device(self):
         label = (self.var_selected_device.get() or "").strip()
         if not label:
@@ -657,6 +945,7 @@ class ConfigurationPage(ttk.Frame):
         self._refresh_active_device_summary()
         self.lbl_status.config(text=f"Status: main device set to [{did}] ✅")
 
+    # ---------------- presets ----------------
     def _get_selected_preset_device_id(self) -> Optional[int]:
         label = (self.var_preset_device.get() or "").strip()
         if not label:
@@ -780,6 +1069,7 @@ class ConfigurationPage(ttk.Frame):
         self._preset_reload()
         self._preset_clear()
 
+    # ---------------- tools ----------------
     def on_sync_now(self):
         try:
             self.app.request_sync_now()
@@ -792,6 +1082,7 @@ class ConfigurationPage(ttk.Frame):
             login_url = (self.var_api_login.get() or "").strip()
             sync_url = (self.var_api_sync.get() or "").strip()
             create_fp_url = (self.var_api_create_fp.get() or "").strip()
+            latest_release_url = (self.var_api_latest_release.get() or "").strip()  # ✅ NEW
 
             if login_url and not login_url.startswith(("http://", "https://")):
                 messagebox.showerror("Validation", "Login URL must start with http:// or https://")
@@ -801,6 +1092,9 @@ class ConfigurationPage(ttk.Frame):
                 return
             if create_fp_url and not create_fp_url.startswith(("http://", "https://")):
                 messagebox.showerror("Validation", "Create fingerprint URL must start with http:// or https://")
+                return
+            if latest_release_url and not latest_release_url.startswith(("http://", "https://")):
+                messagebox.showerror("Validation", "Latest release URL must start with http:// or https://")
                 return
 
             local_host = (self.var_local_host.get() or "").strip()
@@ -833,7 +1127,7 @@ class ConfigurationPage(ttk.Frame):
                 if did is not None:
                     self.app.cfg.selected_device_id = int(did)
 
-            self.app.cfg.data_mode = "DEVICE" if bool(self.var_mode_device_data.get()) else "AGENT"
+            # data_mode is now per-device from backend (GymDeviceDto.accessDataMode) — no longer saved locally
             self.app.cfg.agent_realtime_enabled = bool(self.var_agent_rt_enabled.get())
 
             self.app.cfg.device_timeout_ms = _safe_int(self.var_timeout.get().strip(), 5000)
@@ -861,6 +1155,10 @@ class ConfigurationPage(ttk.Frame):
             self.app.cfg.api_login_url = login_url
             self.app.cfg.api_sync_url = sync_url
             self.app.cfg.api_create_user_fingerprint_url = create_fp_url
+            self.app.cfg.api_latest_release_url = latest_release_url  # ✅ NEW
+
+            # Per-device access rules are now READ-ONLY from backend (GymDeviceDto).
+            # No local overrides are applied anymore.
 
             self.app.persist_config()
 

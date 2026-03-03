@@ -1,4 +1,4 @@
-# realtime_agent.py
+# app/core/realtime_agent.py
 import hashlib
 import hmac
 import struct
@@ -15,7 +15,6 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from app.core.db import (
-    list_sync_devices_payload,
     insert_access_history,
     prune_access_history,
     list_sync_users,
@@ -29,6 +28,8 @@ from app.core.utils import DB_PATH, ensure_dirs
 from app.sdk.pullsdk import PullSDKDevice
 
 
+# ===================== generic helpers =====================
+
 def _safe_int(v: Any, default: int = 0) -> int:
     try:
         if v is None:
@@ -38,6 +39,15 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(str(v).strip()))
     except Exception:
         return default  # type: ignore[return-value]
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(str(v).strip())
+    except Exception:
+        return default
 
 
 def _safe_str(v: Any, default: str = "") -> str:
@@ -105,6 +115,49 @@ def _parse_event_time_to_epoch(s: str) -> Optional[float]:
     return None
 
 
+def _boolish(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return int(v) != 0
+    s = _safe_str(v, "").strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
+    x = _safe_int(v, default)
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:
+    x = _safe_float(v, default)
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+# ===================== Read backend-driven settings from SQLite cache =====================
+
+# Delegate to shared module (avoids duplication across config.py / device_sync.py / UI)
+from app.core.settings_reader import (
+    read_sync_payload_json as _read_sync_payload_json,
+    extract_access_settings as _extract_access_settings,
+    extract_devices as _extract_devices,
+    normalize_global_settings as _normalize_global_settings,
+    normalize_device_settings as _normalize_device_settings,
+)
+
+
 # ===================== TOTP (QR) =====================
 
 def _totp_counter(unix_time: int, period: int) -> int:
@@ -150,7 +203,7 @@ class ImageCache:
         cache_dir: str,
         enabled: bool = True,
         timeout_sec: float = 2.0,
-        max_bytes: int = 5 * 1024 * 1024,   # 5MB
+        max_bytes: int = 5 * 1024 * 1024,
         max_files: int = 1000,
         prune_every_n: int = 200,
     ):
@@ -199,10 +252,7 @@ class ImageCache:
         try:
             req = urllib.request.Request(
                 url,
-                headers={
-                    "User-Agent": "MonClubAccess/1.0",
-                    "Accept": "*/*",
-                },
+                headers={"User-Agent": "MonClubAccess/1.0", "Accept": "*/*"},
             )
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
                 data = resp.read(self.max_bytes + 1)
@@ -305,6 +355,8 @@ class ImageCache:
         return target if ok else ""
 
 
+# ===================== dataclasses =====================
+
 @dataclass
 class AccessEvent:
     event_id: str
@@ -315,18 +367,6 @@ class AccessEvent:
     event_time: str
     raw: Dict[str, Any]
     poll_ms: float
-
-
-@dataclass
-class DecisionResult:
-    event_id: str
-    device_id: int
-    allowed: bool
-    reason: str
-    action: str  # OPEN_DOOR / NONE
-    door_id: Optional[int]
-    pulse_time_ms: int
-    decision_ms: float
 
 
 @dataclass
@@ -342,6 +382,7 @@ class NotificationRequest:
     title: str
     message: str
     image_path: str = ""  # can be URL or local path
+    popup_show_image: bool = True  # NEW: respect device.popupShowImage
 
 
 @dataclass
@@ -378,6 +419,8 @@ class DeviceStatus:
     cmd_ema: float = 0.0
 
 
+# ===================== EMA =====================
+
 class EMA:
     def __init__(self, alpha: float = 0.2):
         self.alpha = float(alpha)
@@ -393,6 +436,61 @@ class EMA:
         self.value = (self.alpha * x) + ((1.0 - self.alpha) * self.value)
 
 
+# ===================== Notification Gate (rate limit + dedupe) =====================
+
+class NotificationGate:
+    def __init__(self, *, global_settings: Callable[[], Dict[str, Any]]):
+        self.global_settings = global_settings
+        self._lock = threading.Lock()
+        self._times: Deque[float] = deque(maxlen=2000)  # timestamps (sec)
+        self._recent: Dict[str, float] = {}  # key -> last_time
+
+    def allow(self, *, key: str) -> bool:
+        """
+        key should represent "same notification" for dedupe (ex: sha1 of message).
+        """
+        now = time.time()
+        g = self.global_settings() or {}
+        rate = _safe_int(g.get("notification_rate_limit_per_minute"), 30)
+        dedupe = _safe_int(g.get("notification_dedupe_window_sec"), 30)
+
+        if rate < 0:
+            rate = 0
+        if dedupe < 0:
+            dedupe = 0
+
+        with self._lock:
+            # dedupe
+            if dedupe > 0:
+                last = self._recent.get(key)
+                if last is not None and (now - float(last)) < float(dedupe):
+                    return False
+                self._recent[key] = now
+
+                # prune old recent entries opportunistically
+                if len(self._recent) > 5000:
+                    cut = now - float(dedupe) - 5.0
+                    for k, t in list(self._recent.items())[:2000]:
+                        if t < cut:
+                            self._recent.pop(k, None)
+
+            # rate limit
+            if rate == 0:
+                return False
+
+            cutoff = now - 60.0
+            while self._times and self._times[0] < cutoff:
+                self._times.popleft()
+
+            if len(self._times) >= rate:
+                return False
+
+            self._times.append(now)
+            return True
+
+
+# ===================== Command bus =====================
+
 class DeviceCommandBus:
     def __init__(self, *, workers_provider: Callable[[int], "DeviceWorker"]):
         self._workers_provider = workers_provider
@@ -406,6 +504,8 @@ class DeviceCommandBus:
         except Exception as e:
             return CommandResult(ok=False, error=str(e), cmd_ms=0.0)
 
+
+# ===================== Device worker (poll rtlog) =====================
 
 class DeviceWorker(threading.Thread):
     def __init__(
@@ -455,14 +555,17 @@ class DeviceWorker(threading.Thread):
         self._polls = 0
         self._events = 0
         self._reconnects = 0
-        
+
         # EMA tracking for performance
         self._poll_ema = EMA(alpha=0.2)
         self._cmd_ema = EMA(alpha=0.2)
-        
-        # Exponential backoff tracking
+
+        # Exponential backoff tracking (connect)
         self._reconnect_backoff = 0.25
         self._max_reconnect_backoff = 30.0
+
+        # Adaptive empty sleep
+        self._empty_sleep_ms = 0.0
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -505,7 +608,6 @@ class DeviceWorker(threading.Thread):
         return False
 
     def _is_old_by_cursor(self, *, event_id: str, event_time_str: str) -> bool:
-        # Hard stop on exact last_event_id
         if self._last_event_id and event_id == self._last_event_id:
             return True
 
@@ -513,11 +615,9 @@ class DeviceWorker(threading.Thread):
         if epoch is None or self._last_event_epoch is None:
             return False
 
-        # Older than last accepted time => skip
         if epoch < self._last_event_epoch:
             return True
 
-        # Same second: allow (duplicates blocked by access_history_exists / seen)
         return False
 
     def _maybe_flush_state(self) -> None:
@@ -556,10 +656,10 @@ class DeviceWorker(threading.Thread):
     def run(self) -> None:
         reconnect_count = 0
         last_error = ""
-        empty_sleep_ms = 0.0
 
         while not self.stop_event.is_set():
             settings = self.settings_provider(self.device_id)
+
             enabled = bool(settings.get("enabled", True))
             if not enabled:
                 try:
@@ -570,6 +670,13 @@ class DeviceWorker(threading.Thread):
                 self.wake_event.wait(timeout=0.5)
                 self.wake_event.clear()
                 continue
+
+            # keep EMA alpha adjustable (future fields)
+            try:
+                self._poll_ema.alpha = float(settings.get("poll_ema_alpha", 0.2))
+                self._cmd_ema.alpha = float(settings.get("cmd_ema_alpha", 0.2))
+            except Exception:
+                pass
 
             if not self._device.is_connected:
                 ok = False
@@ -583,8 +690,7 @@ class DeviceWorker(threading.Thread):
                     self._reconnects += 1
                     last_error = "connect failed"
                     self._emit_status(enabled=True, connected=False, last_error=last_error)
-                    
-                    # Exponential backoff with cap
+
                     backoff = min(self._max_reconnect_backoff, self._reconnect_backoff * (2 ** reconnect_count))
                     time.sleep(backoff)
                     continue
@@ -601,15 +707,58 @@ class DeviceWorker(threading.Thread):
                 self._polls += 1
                 self._poll_ema.add(poll_ms)
 
+                # adaptive sleep knobs
+                adaptive_sleep = bool(settings.get("adaptive_sleep", True))
+                busy_min = float(_safe_int(settings.get("busy_sleep_min_ms"), 0))
+                busy_max = float(_safe_int(settings.get("busy_sleep_max_ms"), 50))
+                if busy_max < busy_min:
+                    busy_max = busy_min
+
+                empty_min = float(_safe_int(settings.get("empty_sleep_min_ms"), 200))
+                empty_max = float(_safe_int(settings.get("empty_sleep_max_ms"), 500))
+                if empty_max < empty_min:
+                    empty_max = empty_min
+
+                empty_factor = float(_safe_float(settings.get("empty_backoff_factor"), 1.35))
+                if empty_factor < 1.0:
+                    empty_factor = 1.0
+                if empty_factor > 3.0:
+                    empty_factor = 3.0
+
+                empty_backoff_max = float(_safe_int(settings.get("empty_backoff_max_ms"), 2000))
+                if empty_backoff_max < 0:
+                    empty_backoff_max = 0.0
+
                 if not rows:
-                    empty_sleep_ms = float(settings.get("empty_sleep_ms", 150.0))
+                    # no events => grow empty sleep
+                    if not adaptive_sleep:
+                        sleep_ms = max(50.0, empty_min)
+                        self._empty_sleep_ms = sleep_ms
+                    else:
+                        if self._empty_sleep_ms <= 0.0:
+                            self._empty_sleep_ms = max(0.0, empty_min)
+                        else:
+                            self._empty_sleep_ms = self._empty_sleep_ms * empty_factor
+
+                        # ensure at least empty_min, and allow it to grow beyond empty_max up to empty_backoff_max
+                        if self._empty_sleep_ms < empty_min:
+                            self._empty_sleep_ms = empty_min
+                        if self._empty_sleep_ms < empty_max:
+                            # keep within base range initially
+                            pass
+                        if empty_backoff_max > 0:
+                            self._empty_sleep_ms = min(self._empty_sleep_ms, empty_backoff_max)
+
                     self._emit_status(enabled=True, connected=True, last_error=last_error, last_poll_ms=poll_ms)
                     self._maybe_flush_state()
-                    self.wake_event.wait(timeout=max(0.05, empty_sleep_ms / 1000.0))
+
+                    timeout_s = max(0.05, float(self._empty_sleep_ms) / 1000.0)
+                    self.wake_event.wait(timeout=timeout_s)
                     self.wake_event.clear()
                     continue
 
-                empty_sleep_ms = 0.0
+                # rows exist => reset empty sleep
+                self._empty_sleep_ms = 0.0
 
                 for r in rows:
                     try:
@@ -617,11 +766,9 @@ class DeviceWorker(threading.Thread):
                         if not event_id:
                             continue
 
-                        # persisted duplicate protection
                         if access_history_exists(event_id):
                             continue
 
-                        # in-memory LRU
                         if self._replay_seen(event_id):
                             continue
 
@@ -645,7 +792,6 @@ class DeviceWorker(threading.Thread):
                         except Exception:
                             pass
 
-                        # update persisted cursor (best-effort)
                         self._last_event_id = event_id
                         self._last_event_at_str = event_time_str or self._last_event_at_str
                         ep = _parse_event_time_to_epoch(event_time_str)
@@ -665,6 +811,13 @@ class DeviceWorker(threading.Thread):
                         continue
 
                 self._maybe_flush_state()
+
+                # optional busy sleep to avoid tight looping
+                if adaptive_sleep and busy_max > 0:
+                    sleep_ms = max(0.0, min(busy_max, max(busy_min, busy_min)))
+                    if sleep_ms > 0:
+                        self.wake_event.wait(timeout=max(0.0, sleep_ms / 1000.0))
+                        self.wake_event.clear()
 
             except Exception as e:
                 last_error = str(e)
@@ -688,27 +841,33 @@ class DeviceWorker(threading.Thread):
         self._emit_status(enabled=False, connected=False, last_error="stopped")
 
 
+# ===================== Decision service =====================
+
 class DecisionService(threading.Thread):
     def __init__(
         self,
         *,
-        cfg,
         logger,
         event_queue: "queue.Queue[AccessEvent]",
         command_bus: DeviceCommandBus,
         notify_q: "queue.Queue[NotificationRequest]",
+        popup_q: "queue.Queue[NotificationRequest]",
         history_q: "queue.Queue[HistoryRecord]",
         settings_provider: Callable[[int], Dict[str, Any]],
+        global_settings: Callable[[], Dict[str, Any]],
+        notify_gate: NotificationGate,
         decision_ema: EMA,
     ):
         super().__init__(daemon=True)
-        self.cfg = cfg
         self.logger = logger
         self.event_queue = event_queue
         self.command_bus = command_bus
         self.notify_q = notify_q
+        self.popup_q = popup_q
         self.history_q = history_q
         self.settings_provider = settings_provider
+        self.global_settings = global_settings
+        self.notify_gate = notify_gate
         self.decision_ema = decision_ema
 
         self._cache_lock = threading.Lock()
@@ -744,7 +903,7 @@ class DecisionService(threading.Thread):
         def add_cards_from_obj(idx: Dict[str, List[Dict[str, Any]]], obj: Any, u: Dict[str, Any]) -> None:
             if not isinstance(obj, dict):
                 return
-            for k in ("cardId", "secondCardId", "cardNo", "rfid", "rfidCard", "rfidCardNo", "cardNumber"):
+            for k in ("firstCardId", "cardId", "secondCardId", "cardNo", "rfid", "rfidCard", "rfidCardNo", "cardNumber"):
                 if k in obj:
                     add_card(idx, obj.get(k), u)
 
@@ -813,8 +972,6 @@ class DecisionService(threading.Thread):
                 "user": None,
             }
 
-        card_digits = _safe_int(settings.get("rfid_digits"), 8)
-
         code = (scanned or "").strip()
         if (not code) or (not code.isdigit()):
             return {
@@ -825,12 +982,24 @@ class DecisionService(threading.Thread):
                 "user": None,
             }
 
-        if int(card_digits) > 0 and len(code) != int(card_digits):
+        # Backend supports 1..16 digits
+        min_len = _safe_int(settings.get("rfid_min_digits"), 1)
+        max_len = _safe_int(settings.get("rfid_max_digits"), 16)
+
+        if min_len < 1:
+            min_len = 1
+        if max_len > 16:
+            max_len = 16
+        if max_len < min_len:
+            max_len = min_len
+
+        if not (min_len <= len(code) <= max_len):
             return {
                 "allowed": False,
                 "reason": "INVALID_CARD_LENGTH",
                 "scanMode": "RFID_CARD",
-                "expectedDigits": int(card_digits),
+                "minDigits": int(min_len),
+                "maxDigits": int(max_len),
                 "tookMs": (time.perf_counter() - t0) * 1000.0,
                 "user": None,
             }
@@ -883,7 +1052,7 @@ class DecisionService(threading.Thread):
         t0 = time.perf_counter()
 
         totp_enabled = bool(settings.get("totp_enabled", True))
-        digits = _safe_int(settings.get("totp_digits"), 8)
+
         period = _safe_int(settings.get("totp_period_seconds", 30))
         drift = _safe_int(settings.get("totp_drift_steps", 1))
         max_past_age = _safe_int(settings.get("totp_max_past_age_seconds", 32))
@@ -892,6 +1061,14 @@ class DecisionService(threading.Thread):
         prefix = _safe_str(settings.get("totp_prefix", "9"), "9").strip()
         if (len(prefix) != 1) or (not prefix.isdigit()):
             prefix = "9"
+
+        digits = _safe_int(settings.get("totp_digits", 7))
+        if digits < 4:
+            digits = 4
+        if digits > 10:
+            digits = 10
+
+        expected_len = 1 + int(digits)  # prefix + digits
 
         raw = (scanned or "").strip()
 
@@ -904,159 +1081,158 @@ class DecisionService(threading.Thread):
                 "user": None,
             }
 
-        card_digits = _safe_int(settings.get("rfid_digits"), 8)
-        if raw.isdigit() and len(raw) == int(card_digits):
-            return self._verify_card(scanned=raw, settings=settings, users_by_card=users_by_card)
-
-        if raw.isdigit() and len(raw) == (int(digits) + 1) and raw.startswith(prefix):
-            code = raw[1:]
-
-            now = int(time.time())
-            cur = _totp_counter(now, period)
-            allowed_ctrs = list(range(cur - int(drift), cur + int(drift) + 1))
-
-            hits: List[Dict[str, Any]] = []
-            for c in creds_payload:
-                if not isinstance(c, dict):
-                    continue
-                if not bool(c.get("enabled", False)):
-                    continue
-
-                cred_id = c.get("id")
-                account_id = c.get("accountId")
-                secret_hex = (c.get("secretHex") or "").strip()
-                grants = c.get("grantedActiveMembershipIds") or []
-
-                if cred_id in (None, "", 0) or account_id in (None, "", 0):
-                    continue
-                if not secret_hex or (not _totp_is_hex(secret_hex)):
-                    continue
-                if not isinstance(grants, list) or not grants:
-                    continue
-
-                try:
-                    secret = _totp_hex_to_bytes(secret_hex)
-                except Exception:
-                    continue
-
-                for ctr in allowed_ctrs:
-                    try:
-                        if _totp_hotp(secret, ctr, digits) == code:
-                            hits.append(
-                                {
-                                    "credId": str(cred_id),
-                                    "accountId": str(account_id),
-                                    "counter": int(ctr),
-                                    "grants": list(grants),
-                                }
-                            )
-                    except Exception:
-                        continue
-
-            if hits:
-                uniq_creds = sorted(set(h["credId"] for h in hits))
-                if len(uniq_creds) != 1:
-                    return {
-                        "allowed": False,
-                        "reason": "DENY_COLLISION",
-                        "scanMode": "QR_TOTP",
-                        "tookMs": (time.perf_counter() - t0) * 1000.0,
-                        "user": None,
-                    }
-
-                cred_id = uniq_creds[0]
-                counters = sorted(set(int(h["counter"]) for h in hits if h["credId"] == cred_id))
-                if len(counters) != 1:
-                    return {
-                        "allowed": False,
-                        "reason": "DENY_AMBIGUOUS_COUNTER",
-                        "scanMode": "QR_TOTP",
-                        "tookMs": (time.perf_counter() - t0) * 1000.0,
-                        "user": None,
-                    }
-
-                matched_ctr = int(counters[0])
-                age = int(now - (matched_ctr * int(period)))
-
-                if age < -int(max_future_skew):
-                    return {
-                        "allowed": False,
-                        "reason": "DENY_FUTURE_SKEW",
-                        "scanMode": "QR_TOTP",
-                        "credId": cred_id,
-                        "matchedCounter": matched_ctr,
-                        "ageSeconds": age,
-                        "tookMs": (time.perf_counter() - t0) * 1000.0,
-                        "user": None,
-                    }
-
-                if age > int(max_past_age):
-                    return {
-                        "allowed": False,
-                        "reason": "DENY_EXPIRED",
-                        "scanMode": "QR_TOTP",
-                        "credId": cred_id,
-                        "matchedCounter": matched_ctr,
-                        "ageSeconds": age,
-                        "tookMs": (time.perf_counter() - t0) * 1000.0,
-                        "user": None,
-                    }
-
-                hit0 = hits[0]
-                account_id = str(hit0.get("accountId") or "")
-                grants = hit0.get("grants") or []
-
-                user: Optional[Dict[str, Any]] = None
-                chosen_am_id: Optional[int] = None
-                for gid in grants:
-                    try:
-                        am = int(str(gid).strip())
-                    except Exception:
-                        continue
-                    if am in users_by_am:
-                        user = users_by_am.get(am)
-                        chosen_am_id = am
-                        break
-                    if chosen_am_id is None:
-                        chosen_am_id = am
-
-                return {
-                    "allowed": True,
-                    "reason": "ALLOW",
-                    "scanMode": "QR_TOTP",
-                    "accountId": account_id,
-                    "credId": cred_id,
-                    "matchedCounter": matched_ctr,
-                    "ageSeconds": age,
-                    "activeMembershipId": chosen_am_id,
-                    "user": user,
-                    "tookMs": (time.perf_counter() - t0) * 1000.0,
-                }
-
-            vr_card = self._verify_card(scanned=raw, settings=settings, users_by_card=users_by_card)
-            if bool(vr_card.get("allowed", False)):
-                vr_card["scanMode"] = "CARD_FALLBACK_AFTER_TOTP_FAIL"
-                vr_card["reason"] = "ALLOW_CARD_FALLBACK"
-                return vr_card
-
+        if (not raw) or (not raw.isdigit()):
             return {
                 "allowed": False,
-                "reason": "DENY_NO_MATCH",
-                "scanMode": "QR_TOTP",
+                "reason": "INVALID_FORMAT",
+                "scanMode": "UNKNOWN",
                 "tookMs": (time.perf_counter() - t0) * 1000.0,
                 "user": None,
             }
 
-        if raw.isdigit():
+        # If code doesn't match expected QR format => treat as RFID directly
+        if len(raw) != expected_len or (not raw.startswith(prefix)):
             vr = self._verify_card(scanned=raw, settings=settings, users_by_card=users_by_card)
             if bool(vr.get("allowed", False)):
-                vr["scanMode"] = "NUMERIC_AS_CARD"
+                vr["scanMode"] = "RFID_DIRECT"
             return vr
+
+        # QR TOTP format => use LAST 'digits'
+        code = raw[-digits:]
+
+        now = int(time.time())
+        cur = _totp_counter(now, period)
+        allowed_ctrs = list(range(cur - int(drift), cur + int(drift) + 1))
+
+        hits: List[Dict[str, Any]] = []
+        for c in creds_payload:
+            if not isinstance(c, dict):
+                continue
+            if not bool(c.get("enabled", False)):
+                continue
+
+            cred_id = c.get("id")
+            account_id = c.get("accountId")
+            secret_hex = (c.get("secretHex") or "").strip()
+            grants = c.get("grantedActiveMembershipIds") or []
+
+            if cred_id in (None, "", 0) or account_id in (None, "", 0):
+                continue
+            if not secret_hex or (not _totp_is_hex(secret_hex)):
+                continue
+            if not isinstance(grants, list) or not grants:
+                continue
+
+            try:
+                secret = _totp_hex_to_bytes(secret_hex)
+            except Exception:
+                continue
+
+            for ctr in allowed_ctrs:
+                try:
+                    if _totp_hotp(secret, ctr, digits) == code:
+                        hits.append(
+                            {
+                                "credId": str(cred_id),
+                                "accountId": str(account_id),
+                                "counter": int(ctr),
+                                "grants": list(grants),
+                            }
+                        )
+                except Exception:
+                    continue
+
+        if hits:
+            uniq_creds = sorted(set(h["credId"] for h in hits))
+            if len(uniq_creds) != 1:
+                return {
+                    "allowed": False,
+                    "reason": "DENY_COLLISION",
+                    "scanMode": "QR_TOTP",
+                    "tookMs": (time.perf_counter() - t0) * 1000.0,
+                    "user": None,
+                }
+
+            cred_id = uniq_creds[0]
+            counters = sorted(set(int(h["counter"]) for h in hits if h["credId"] == cred_id))
+            if len(counters) != 1:
+                return {
+                    "allowed": False,
+                    "reason": "DENY_AMBIGUOUS_COUNTER",
+                    "scanMode": "QR_TOTP",
+                    "tookMs": (time.perf_counter() - t0) * 1000.0,
+                    "user": None,
+                }
+
+            matched_ctr = int(counters[0])
+            age = int(now - (matched_ctr * int(period)))
+
+            if age < -int(max_future_skew):
+                return {
+                    "allowed": False,
+                    "reason": "DENY_FUTURE_SKEW",
+                    "scanMode": "QR_TOTP",
+                    "credId": cred_id,
+                    "matchedCounter": matched_ctr,
+                    "ageSeconds": age,
+                    "tookMs": (time.perf_counter() - t0) * 1000.0,
+                    "user": None,
+                }
+
+            if age > int(max_past_age):
+                return {
+                    "allowed": False,
+                    "reason": "DENY_EXPIRED",
+                    "scanMode": "QR_TOTP",
+                    "credId": cred_id,
+                    "matchedCounter": matched_ctr,
+                    "ageSeconds": age,
+                    "tookMs": (time.perf_counter() - t0) * 1000.0,
+                    "user": None,
+                }
+
+            hit0 = hits[0]
+            account_id = str(hit0.get("accountId") or "")
+            grants = hit0.get("grants") or []
+
+            user: Optional[Dict[str, Any]] = None
+            chosen_am_id: Optional[int] = None
+            for gid in grants:
+                try:
+                    am = int(str(gid).strip())
+                except Exception:
+                    continue
+                if am in users_by_am:
+                    user = users_by_am.get(am)
+                    chosen_am_id = am
+                    break
+                if chosen_am_id is None:
+                    chosen_am_id = am
+
+            return {
+                "allowed": True,
+                "reason": "ALLOW",
+                "scanMode": "QR_TOTP",
+                "accountId": account_id,
+                "credId": cred_id,
+                "matchedCounter": matched_ctr,
+                "ageSeconds": age,
+                "activeMembershipId": chosen_am_id,
+                "user": user,
+                "tookMs": (time.perf_counter() - t0) * 1000.0,
+            }
+
+        # TOTP failed => fallback to RFID
+        vr_card = self._verify_card(scanned=raw, settings=settings, users_by_card=users_by_card)
+        if bool(vr_card.get("allowed", False)):
+            vr_card["scanMode"] = "CARD_FALLBACK_AFTER_TOTP_FAIL"
+            vr_card["reason"] = "ALLOW_CARD_FALLBACK"
+            return vr_card
 
         return {
             "allowed": False,
-            "reason": "INVALID_FORMAT",
-            "scanMode": "UNKNOWN",
+            "reason": "DENY_NO_MATCH",
+            "scanMode": "QR_TOTP",
             "tookMs": (time.perf_counter() - t0) * 1000.0,
             "user": None,
         }
@@ -1141,71 +1317,90 @@ class DecisionService(threading.Thread):
                 except Exception:
                     pass
 
-            if bool(settings.get("show_notifications", True)):
-                user = vr.get("user") if isinstance(vr, dict) else None
-                user_name = _safe_str((user or {}).get("fullName"), "-") if isinstance(user, dict) else "-"
-                user_phone = _safe_str((user or {}).get("phone"), "") if isinstance(user, dict) else ""
-                user_id = _safe_str((user or {}).get("userId"), "") if isinstance(user, dict) else ""
-                user_image = _safe_str((user or {}).get("image"), "") if isinstance(user, dict) else ""
-                am_id = vr.get("activeMembershipId")
-                age = vr.get("ageSeconds")
-                took = vr.get("tookMs")
+            # Per-device notifications (backend controlled)
+            if not bool(settings.get("show_notifications", True)):
+                continue
 
-                title = f"Access {'OK' if allowed and cmd_res.ok else 'DENY'}"
+            user = vr.get("user") if isinstance(vr, dict) else None
+            user_name = _safe_str((user or {}).get("fullName"), "-") if isinstance(user, dict) else "-"
+            user_phone = _safe_str((user or {}).get("phone"), "") if isinstance(user, dict) else ""
+            user_id = _safe_str((user or {}).get("userId"), "") if isinstance(user, dict) else ""
+            user_image = _safe_str((user or {}).get("image"), "") if isinstance(user, dict) else ""
+            am_id = vr.get("activeMembershipId")
+            age = vr.get("ageSeconds")
+            took = vr.get("tookMs")
 
-                if allowed:
-                    msg = f"{user_name}"
-                    if user_phone:
-                        msg += f" | phone={user_phone}"
-                    if user_id:
-                        msg += f" | userId={user_id}"
-                    if am_id not in (None, "", 0):
-                        msg += f" | amId={am_id}"
-                    msg += f" | deviceId={ev.device_id} door={door_id}"
-                    if scan_mode:
-                        msg += f" | mode={scan_mode}"
-                    if age is not None:
-                        msg += f" | age={age}s"
-                    if took is not None:
-                        try:
-                            msg += f" | checkMs={float(took):.1f}"
-                        except Exception:
-                            msg += f" | checkMs={took}"
+            title = f"Access {'OK' if allowed and cmd_res.ok else 'DENY'}"
+
+            if allowed:
+                msg = f"{user_name}"
+                if user_phone:
+                    msg += f" | phone={user_phone}"
+                if user_id:
+                    msg += f" | userId={user_id}"
+                if am_id not in (None, "", 0):
+                    msg += f" | amId={am_id}"
+                msg += f" | deviceId={ev.device_id} door={door_id}"
+                if scan_mode:
+                    msg += f" | mode={scan_mode}"
+                if age is not None:
+                    msg += f" | age={age}s"
+                if took is not None:
                     try:
-                        msg += f" | pollMs={float(ev.poll_ms):.1f} decisionMs={float(decision_ms):.1f} cmdMs={float(cmd_res.cmd_ms):.1f}"
+                        msg += f" | checkMs={float(took):.1f}"
                     except Exception:
-                        pass
-                else:
-                    msg = f"reason={reason} | deviceId={ev.device_id} door={door_id} | code={ev.card_no or '-'}"
-                    if scan_mode:
-                        msg += f" | mode={scan_mode}"
-                    took2 = vr.get("tookMs")
-                    if took2 is not None:
-                        try:
-                            msg += f" | checkMs={float(took2):.1f}"
-                        except Exception:
-                            msg += f" | checkMs={took2}"
-                    try:
-                        msg += f" | pollMs={float(ev.poll_ms):.1f} decisionMs={float(decision_ms):.1f} cmdMs={float(cmd_res.cmd_ms):.1f}"
-                    except Exception:
-                        pass
-
-                if not cmd_res.ok and cmd_res.error:
-                    msg += f" | cmdError={cmd_res.error}"
-
+                        msg += f" | checkMs={took}"
                 try:
-                    self.notify_q.put(
-                        NotificationRequest(
-                            event_id=ev.event_id,
-                            title=title,
-                            message=msg,
-                            image_path=user_image if allowed else "",
-                        ),
-                        timeout=0.05,
-                    )
+                    msg += f" | pollMs={float(ev.poll_ms):.1f} decisionMs={float(decision_ms):.1f} cmdMs={float(cmd_res.cmd_ms):.1f}"
+                except Exception:
+                    pass
+            else:
+                msg = f"reason={reason} | deviceId={ev.device_id} door={door_id} | code={ev.card_no or '-'}"
+                if scan_mode:
+                    msg += f" | mode={scan_mode}"
+                took2 = vr.get("tookMs")
+                if took2 is not None:
+                    try:
+                        msg += f" | checkMs={float(took2):.1f}"
+                    except Exception:
+                        msg += f" | checkMs={took2}"
+                try:
+                    msg += f" | pollMs={float(ev.poll_ms):.1f} decisionMs={float(decision_ms):.1f} cmdMs={float(cmd_res.cmd_ms):.1f}"
                 except Exception:
                     pass
 
+            if not cmd_res.ok and cmd_res.error:
+                msg += f" | cmdError={cmd_res.error}"
+
+            # global dedupe/rate limit (backend controlled, gym-scoped)
+            dedupe_key = hashlib.sha1((title + "|" + msg).encode("utf-8", errors="ignore")).hexdigest()
+            if not self.notify_gate.allow(key=dedupe_key):
+                continue
+
+            req = NotificationRequest(
+                event_id=ev.event_id,
+                title=title,
+                message=msg,
+                image_path=user_image if allowed else "",
+                popup_show_image=bool(settings.get("popup_show_image", True)),
+            )
+
+            # Windows notification (per-device winNotifyEnabled)
+            if bool(settings.get("win_notify_enabled", True)):
+                try:
+                    self.notify_q.put(req, timeout=0.05)
+                except Exception:
+                    pass
+
+            # Popup (Tkinter) (per-device popupEnabled)
+            if bool(settings.get("popup_enabled", True)):
+                try:
+                    self.popup_q.put(req, timeout=0.05)
+                except Exception:
+                    pass
+
+
+# ===================== Notification service (Windows) =====================
 
 class NotificationService(threading.Thread):
     def __init__(self, *, logger, notify_q: "queue.Queue[NotificationRequest]", global_settings: Callable[[], Dict[str, Any]]):
@@ -1223,24 +1418,8 @@ class NotificationService(threading.Thread):
         base_dir = os.path.dirname(DB_PATH) if DB_PATH else os.getcwd()
         cache_dir = os.path.join(base_dir, "cache", "images")
 
-        try:
-            gs = global_settings() or {}
-        except Exception:
-            gs = {}
-
-        cache_enabled = bool(gs.get("image_cache_enabled", True))
-        timeout_sec = float(gs.get("image_cache_timeout_sec", 2.0))
-        max_bytes = int(gs.get("image_cache_max_bytes", 5 * 1024 * 1024))
-        max_files = int(gs.get("image_cache_max_files", 1000))
-
-        self._img_cache = ImageCache(
-            cache_dir=cache_dir,
-            enabled=cache_enabled,
-            timeout_sec=timeout_sec,
-            max_bytes=max_bytes,
-            max_files=max_files,
-            prune_every_n=200,
-        )
+        # create cache with defaults; runtime will update .enabled/.timeout/.limits from backend settings
+        self._img_cache = ImageCache(cache_dir=cache_dir)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1264,21 +1443,27 @@ class NotificationService(threading.Thread):
                 continue
 
             try:
-                g = self.global_settings()
-                # Check if notification service is enabled globally
+                g = self.global_settings() or {}
                 if not bool(g.get("notification_service_enabled", True)):
-                    continue
-                # Check if notifications should be shown
-                if not bool(g.get("show_notifications", True)):
                     continue
 
                 if not Notification:
                     continue
 
+                # apply backend cache knobs dynamically
+                try:
+                    self._img_cache.enabled = bool(g.get("image_cache_enabled", True))
+                    self._img_cache.timeout_sec = float(g.get("image_cache_timeout_sec", 2.0))
+                    self._img_cache.max_bytes = int(g.get("image_cache_max_bytes", 5 * 1024 * 1024))
+                    self._img_cache.max_files = int(g.get("image_cache_max_files", 1000))
+                except Exception:
+                    pass
+
                 icon_path = ""
                 if r.image_path:
                     icon_path = self._img_cache.resolve(r.image_path)
 
+                # respect per-device popupShowImage only for popups; Windows toast can still show icon
                 n = Notification(app_id="MonClub Access", title=r.title, msg=r.message, icon=icon_path or "")
                 try:
                     if audio:
@@ -1289,6 +1474,8 @@ class NotificationService(threading.Thread):
             except Exception as e:
                 self.logger.debug(f"[RT][notify failed] {e}")
 
+
+# ===================== History service =====================
 
 class HistoryService(threading.Thread):
     def __init__(self, *, logger, history_q: "queue.Queue[HistoryRecord]", global_settings: Callable[[], Dict[str, Any]]):
@@ -1332,7 +1519,7 @@ class HistoryService(threading.Thread):
             self._writes += 1
             if self._writes % 200 == 0:
                 try:
-                    g = self.global_settings()
+                    g = self.global_settings() or {}
                     days = _safe_int(g.get("history_retention_days"), 30)
                     deleted = prune_access_history(retention_days=days)
                     if deleted > 0:
@@ -1341,43 +1528,91 @@ class HistoryService(threading.Thread):
                     pass
 
 
+# ===================== Agent realtime engine =====================
+
 class AgentRealtimeEngine:
+    """
+    IMPORTANT CHANGE (Mar 2026):
+    - No more local config.json for agent_global / agent_devices settings.
+    - Everything (global + per-device) is read from backend DTOs cached in SQLite:
+      - GymAccessSoftwareSettingsDto (global)
+      - GymDeviceDto (per device)
+    - Data mode is PER DEVICE (GymDevice.accessDataMode). This engine only runs on devices with accessDataMode=AGENT.
+    """
+
     def __init__(self, *, cfg, logger):
-        self.cfg = cfg
+        self.cfg = cfg  # kept for legacy; not used for settings anymore
         self.logger = logger
 
         self._lock = threading.Lock()
         self._running = False
 
-        g = cfg.get_agent_global()
-        self._event_q: "queue.Queue[AccessEvent]" = queue.Queue(
-            maxsize=int(g.get("event_queue_max", 5000))
-        )
-        self._notify_q: "queue.Queue[NotificationRequest]" = queue.Queue(
-            maxsize=int(g.get("notification_queue_max", 2000))
-        )
-        self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(
-            maxsize=int(g.get("history_queue_max", 5000))
-        )
+        # built at start() using backend global settings
+        self._event_q: "queue.Queue[AccessEvent]" = queue.Queue(maxsize=5000)
+        self._notify_q: "queue.Queue[NotificationRequest]" = queue.Queue(maxsize=5000)
+        self._popup_q: "queue.Queue[NotificationRequest]" = queue.Queue(maxsize=5000)
+        self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(maxsize=5000)
 
         self._statuses: Dict[int, DeviceStatus] = {}
         self._workers: Dict[int, DeviceWorker] = {}
+        self._devices_by_id: Dict[int, Dict[str, Any]] = {}
 
-        self._decision_ema = EMA(alpha=float(g.get("decision_ema_alpha", 0.2)))
+        self._decision_ema = EMA(alpha=0.2)
 
-        self._notif = NotificationService(
-            logger=self.logger,
-            notify_q=self._notify_q,
-            global_settings=self.cfg.get_agent_global,
-        )
-        self._hist = HistoryService(
-            logger=self.logger,
-            history_q=self._history_q,
-            global_settings=self.cfg.get_agent_global,
-        )
+        self._notif: Optional[NotificationService] = None
+        self._hist: Optional[HistoryService] = None
 
         self._cmd_bus = DeviceCommandBus(workers_provider=self._get_worker)
         self._deciders: List[DecisionService] = []
+        self._notify_gate = NotificationGate(global_settings=self.get_global_settings)
+
+        # cache payload/settings (avoid hitting sqlite too often)
+        self._payload_cache_at = 0.0
+        self._payload_cache: Dict[str, Any] = {}
+        self._payload_cache_ttl_sec = 1.0
+
+        self._global_cache_at = 0.0
+        self._global_cache: Dict[str, Any] = {}
+        self._global_cache_ttl_sec = 2.0
+
+    # ---------- settings providers (SQLite cached) ----------
+
+    def _load_payload_cached(self) -> Dict[str, Any]:
+        now_s = time.time()
+        if (now_s - float(self._payload_cache_at)) < float(self._payload_cache_ttl_sec) and self._payload_cache:
+            return dict(self._payload_cache)
+        p = _read_sync_payload_json()
+        self._payload_cache = p if isinstance(p, dict) else {}
+        self._payload_cache_at = now_s
+        return dict(self._payload_cache)
+
+    def get_global_settings(self) -> Dict[str, Any]:
+        """
+        Returns normalized global settings (snake_case) from GymAccessSoftwareSettingsDto.
+        """
+        now_s = time.time()
+        if (now_s - float(self._global_cache_at)) < float(self._global_cache_ttl_sec) and self._global_cache:
+            return dict(self._global_cache)
+
+        payload = self._load_payload_cached()
+        raw = _extract_access_settings(payload)
+        gs = _normalize_global_settings(raw)
+        self._global_cache = gs
+        self._global_cache_at = now_s
+        return dict(gs)
+
+    def _device_settings(self, device_id: int) -> Dict[str, Any]:
+        did = int(device_id)
+        with self._lock:
+            dev = self._devices_by_id.get(did)
+
+        gs = self.get_global_settings()
+        if not isinstance(dev, dict):
+            # safe defaults if device not found
+            return _normalize_device_settings({"id": did, "active": False, "accessDevice": False}, gs)
+        return _normalize_device_settings(dev, gs)
+
+    # ---------- engine info ----------
 
     def is_running(self) -> bool:
         with self._lock:
@@ -1391,6 +1626,9 @@ class AgentRealtimeEngine:
 
     def get_avg_decision_ms(self) -> float:
         return float(self._decision_ema.value if self._decision_ema.ready else 0.0)
+
+    def get_popup_queue(self) -> "queue.Queue[NotificationRequest]":
+        return self._popup_q
 
     def get_status_snapshot(self) -> Dict[int, Dict[str, Any]]:
         with self._lock:
@@ -1420,22 +1658,14 @@ class AgentRealtimeEngine:
         with self._lock:
             self._statuses[int(st.device_id)] = st
 
-    def _device_settings(self, device_id: int) -> Dict[str, Any]:
-        return self.cfg.get_agent_device_settings(int(device_id))
-
     def apply_device_settings(self, device_id: int) -> None:
-        """Apply updated settings to a running device worker."""
         did = int(device_id)
         with self._lock:
             worker = self._workers.get(did)
-        
         if worker:
-            # Update EMA alphas based on new settings
-            settings = self._device_settings(did)
-            worker._poll_ema.alpha = float(settings.get("poll_ema_alpha", 0.2))
-            worker._cmd_ema.alpha = float(settings.get("cmd_ema_alpha", 0.2))
-            # Wake up the worker to apply new sleep settings
             worker.wake_event.set()
+
+    # ---------- lifecycle ----------
 
     def start(self) -> None:
         with self._lock:
@@ -1443,10 +1673,31 @@ class AgentRealtimeEngine:
                 return
             self._running = True
 
-        self.logger.info("[RT] AgentRealtimeEngine starting...")
+        self.logger.info("[RT] AgentRealtimeEngine starting (backend-driven settings)...")
 
-        # Start notification service if enabled
-        g = self.cfg.get_agent_global()
+        g = self.get_global_settings()
+
+        # rebuild queues using backend sizes (safe because start() happens before workers exist)
+        self._event_q = queue.Queue(maxsize=int(g.get("event_queue_max", 5000)))
+        self._notify_q = queue.Queue(maxsize=int(g.get("notification_queue_max", 5000)))
+        self._popup_q = queue.Queue(maxsize=int(g.get("popup_queue_max", g.get("notification_queue_max", 5000))))
+        self._history_q = queue.Queue(maxsize=int(g.get("history_queue_max", 5000)))
+
+        self._decision_ema = EMA(alpha=float(g.get("decision_ema_alpha", 0.2)))
+
+        self._notify_gate = NotificationGate(global_settings=self.get_global_settings)
+
+        self._notif = NotificationService(
+            logger=self.logger,
+            notify_q=self._notify_q,
+            global_settings=self.get_global_settings,
+        )
+        self._hist = HistoryService(
+            logger=self.logger,
+            history_q=self._history_q,
+            global_settings=self.get_global_settings,
+        )
+
         if bool(g.get("notification_service_enabled", True)):
             try:
                 self._notif.start()
@@ -1454,9 +1705,8 @@ class AgentRealtimeEngine:
             except Exception as e:
                 self.logger.error(f"[RT] Failed to start notification service: {e}")
         else:
-            self.logger.info("[RT] Notification service disabled by config")
+            self.logger.info("[RT] Notification service disabled by backend settings")
 
-        # Start history service if enabled
         if bool(g.get("history_service_enabled", True)):
             try:
                 self._hist.start()
@@ -1464,22 +1714,24 @@ class AgentRealtimeEngine:
             except Exception as e:
                 self.logger.error(f"[RT] Failed to start history service: {e}")
         else:
-            self.logger.info("[RT] History service disabled by config")
+            self.logger.info("[RT] History service disabled by backend settings")
 
-        try:
-            decider_count = _safe_int(self.cfg.get_agent_global().get("decision_workers", 1), 1)
-        except Exception:
+        decider_count = _safe_int(g.get("decision_workers", 1), 1)
+        if decider_count < 1:
             decider_count = 1
 
-        for _ in range(max(1, int(decider_count))):
+        self._deciders = []
+        for _ in range(int(decider_count)):
             d = DecisionService(
-                cfg=self.cfg,
                 logger=self.logger,
                 event_queue=self._event_q,
                 command_bus=self._cmd_bus,
                 notify_q=self._notify_q,
+                popup_q=self._popup_q,
                 history_q=self._history_q,
                 settings_provider=self._device_settings,
+                global_settings=self.get_global_settings,
+                notify_gate=self._notify_gate,
                 decision_ema=self._decision_ema,
             )
             self._deciders.append(d)
@@ -1498,6 +1750,9 @@ class AgentRealtimeEngine:
 
         with self._lock:
             workers = list(self._workers.values())
+            deciders = list(self._deciders)
+            self._workers = {}
+            self._devices_by_id = {}
 
         for w in workers:
             try:
@@ -1505,94 +1760,105 @@ class AgentRealtimeEngine:
             except Exception:
                 pass
 
-        for d in self._deciders:
+        for d in deciders:
             try:
                 d.stop()
             except Exception:
                 pass
 
         try:
-            self._notif.stop()
-            self._notif.join(timeout=2.0)
+            if self._notif:
+                self._notif.stop()
+                self._notif.join(timeout=2.0)
         except Exception:
             pass
         try:
-            self._hist.stop()
-            self._hist.join(timeout=2.0)
+            if self._hist:
+                self._hist.stop()
+                self._hist.join(timeout=2.0)
         except Exception:
             pass
 
-        # Clean up workers
         for w in workers:
             try:
                 w.join(timeout=1.0)
             except Exception:
                 pass
 
-        for d in self._deciders:
+        for d in deciders:
             try:
                 d.join(timeout=1.0)
             except Exception:
                 pass
 
+        self._deciders = []
+        self._notif = None
+        self._hist = None
+
+    # ---------- device orchestration (per-device mode) ----------
+
     def refresh_devices(self) -> None:
-        payload = list_sync_devices_payload()
-        if not isinstance(payload, list):
-            payload = []
+        """
+        Build workers ONLY for devices where:
+          - active == true
+          - accessDevice == true
+          - accessDataMode == "AGENT"
+        Devices in DEVICE mode are ignored here.
+        """
+        payload = self._load_payload_cached()
+        devices = _extract_devices(payload)
 
-        with self._lock:
-            existing_ids = set(self._workers.keys())
-
-        seen_ids = set()
-        for dev in payload:
-            if not isinstance(dev, dict):
-                continue
+        # index by id
+        devices_by_id: Dict[int, Dict[str, Any]] = {}
+        for dev in devices:
             did = _safe_int(dev.get("id"), 0)
             if did <= 0:
                 continue
-            seen_ids.add(did)
+            devices_by_id[int(did)] = dev
 
-            settings = self._device_settings(did)
-            enabled = bool(settings.get("enabled", True))
+        # Determine which ids should run in AGENT mode
+        desired_agent_ids: set[int] = set()
+        for did, dev in devices_by_id.items():
+            if not _boolish(dev.get("active"), True):
+                continue
+            if not _boolish(dev.get("accessDevice"), True):
+                continue
 
+            mode = _safe_str(dev.get("accessDataMode"), "DEVICE").strip().upper()
+            if mode != "AGENT":
+                continue
+
+            desired_agent_ids.add(int(did))
+
+        with self._lock:
+            existing_ids = set(self._workers.keys())
+            # update device payload cache
+            self._devices_by_id = devices_by_id
+
+        # Start / keep workers
+        for did in sorted(desired_agent_ids):
             w = self._get_worker(did)
-            if enabled:
-                if not w:
-                    w = DeviceWorker(
-                        device_payload=dev,
-                        logger=self.logger,
-                        event_queue=self._event_q,
-                        status_cb=self._status_update,
-                        settings_provider=self._device_settings,
-                    )
-                    with self._lock:
-                        self._workers[did] = w
-                    try:
-                        w.start()
-                    except Exception:
-                        pass
-                else:
-                    w.wake_event.set()
+            if not w:
+                dev = devices_by_id.get(did) or {"id": did, "name": f"device-{did}"}
+                w = DeviceWorker(
+                    device_payload=dev,
+                    logger=self.logger,
+                    event_queue=self._event_q,
+                    status_cb=self._status_update,
+                    settings_provider=self._device_settings,
+                )
+                with self._lock:
+                    self._workers[did] = w
+                try:
+                    w.start()
+                except Exception:
+                    pass
             else:
-                if w:
-                    try:
-                        w.stop()
-                    except Exception:
-                        pass
-                    with self._lock:
-                        self._workers.pop(did, None)
-                    self._status_update(
-                        DeviceStatus(
-                            device_id=did,
-                            name=w.device_name,
-                            enabled=False,
-                            connected=False,
-                            last_error="disabled",
-                        )
-                    )
+                w.wake_event.set()
 
-        removed = existing_ids - seen_ids
-        for did in removed:
+        # Stop workers removed / not in AGENT anymore
+        to_remove = existing_ids - desired_agent_ids
+        for did in sorted(to_remove):
             w = self._get_worker(did)
             if w:
                 try:
@@ -1604,35 +1870,38 @@ class AgentRealtimeEngine:
                 self._status_update(
                     DeviceStatus(
                         device_id=did,
-                        name=w.device_name,
+                        name=getattr(w, "device_name", f"device-{did}"),
                         enabled=False,
                         connected=False,
-                        last_error="removed",
+                        last_error="removed_or_not_agent_mode",
                     )
                 )
 
     def set_device_enabled(self, device_id: int, enabled: bool) -> None:
+        """
+        This still exists for UI toggles, but the source of truth is backend 'active' + 'accessDataMode'.
+        - If enabled=True: we just refresh devices (if backend says it should run, it will).
+        - If enabled=False: we stop local worker (temporary), but next refresh will recreate it unless backend changes.
+        """
         did = int(device_id)
-        w = self._get_worker(did)
         if enabled:
-            if not w:
-                self.refresh_devices()
-            else:
-                w.wake_event.set()
-        else:
-            if w:
-                try:
-                    w.stop()
-                except Exception:
-                    pass
-                with self._lock:
-                    self._workers.pop(did, None)
-                self._status_update(
-                    DeviceStatus(
-                        device_id=did,
-                        name=w.device_name,
-                        enabled=False,
-                        connected=False,
-                        last_error="disabled",
-                    )
+            self.refresh_devices()
+            return
+
+        w = self._get_worker(did)
+        if w:
+            try:
+                w.stop()
+            except Exception:
+                pass
+            with self._lock:
+                self._workers.pop(did, None)
+            self._status_update(
+                DeviceStatus(
+                    device_id=did,
+                    name=getattr(w, "device_name", f"device-{did}"),
+                    enabled=False,
+                    connected=False,
+                    last_error="disabled_locally",
                 )
+            )

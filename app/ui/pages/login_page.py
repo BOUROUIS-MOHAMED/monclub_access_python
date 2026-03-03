@@ -1,5 +1,4 @@
 # monclub_access_python/app/ui/pages/login_page.py
-
 from __future__ import annotations
 
 import threading
@@ -55,11 +54,31 @@ class LoginPage(ttk.Frame):
         )
         info.grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
+    def _resolve_latest_release_url(self) -> str:
+        """
+        ApiEndpoints now requires latest_release_url.
+        We try multiple config attribute names to stay backward-compatible.
+        """
+        candidates = [
+            getattr(self.app.cfg, "api_latest_release_url", None),
+            getattr(self.app.cfg, "latest_release_url", None),
+            getattr(self.app.cfg, "update_latest_release_url", None),
+            getattr(self.app.cfg, "releases_url", None),
+        ]
+        for c in candidates:
+            s = (str(c).strip() if c is not None else "")
+            if s:
+                return s
+
+        # Fallback: pick a sensible default (adjust if your backend uses another route)
+        return "http://localhost:5000/api/v1/public/access/v1/latest_release"
+
     def _api(self) -> MonClubApi:
         endpoints = ApiEndpoints(
             login_url=self.app.cfg.api_login_url,
             sync_url=self.app.cfg.api_sync_url,
-            create_user_fingerprint_url=self.app.cfg.api_create_user_fingerprint_url,  # ✅ FIX
+            create_user_fingerprint_url=self.app.cfg.api_create_user_fingerprint_url,
+            latest_release_url=self._resolve_latest_release_url(),  # ✅ FIX
         )
         return MonClubApi(endpoints=endpoints, logger=self.app.logger)
 

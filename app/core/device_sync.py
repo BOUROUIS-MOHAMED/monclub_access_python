@@ -154,11 +154,18 @@ class DeviceSyncEngine:
         allowed = g("allowedMemberships", "allowed_memberships", default=None)
         doors = g("doorIds", "door_ids", default=None)
 
+        # accessDataMode: per-device mode (DEVICE or AGENT)
+        adm_raw = g("accessDataMode", "access_data_mode", default="DEVICE")
+        adm = str(adm_raw or "").strip().upper()
+        if adm not in ("DEVICE", "AGENT"):
+            adm = "DEVICE"
+
         return {
             "id": g("id"),
             "name": g("name", default=""),
             "active": _boolish(g("active", default=True), default=True),
             "accessDevice": _boolish(g("accessDevice", "access_device", default=True), default=True),
+            "accessDataMode": adm,
             "ipAddress": g("ipAddress", "ip_address", default=""),
             "portNumber": g("portNumber", "port_number", default=4370),
             "password": g("password", default=""),
@@ -652,6 +659,10 @@ class DeviceSyncEngine:
             if not _boolish(d.get("active"), default=True):
                 continue
             if not _boolish(d.get("accessDevice"), default=True):
+                continue
+            # Only sync DEVICE-mode devices; AGENT-mode devices are handled by AgentRealtimeEngine
+            if d.get("accessDataMode", "DEVICE") != "DEVICE":
+                self.logger.debug(f"[DeviceSync] Skip device id={d.get('id')} name={d.get('name')!r}: accessDataMode={d.get('accessDataMode')}")
                 continue
             try:
                 self._sync_one_device(device=d, users=users, local_fp_index=local_fp_index)

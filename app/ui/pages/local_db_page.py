@@ -349,8 +349,15 @@ class LocalDatabasePage(ttk.Frame):
     # ---------------- Mode gate ----------------
     def _is_device_mode(self) -> bool:
         """
-        Only in DEVICE mode we are allowed to connect to controllers (PullSDK).
+        Returns True when we have at least one DEVICE-mode device,
+        so PullSDK controller tools remain accessible.
+        Works in DEVICE_ONLY, MIXED, or legacy fallback.
         """
+        try:
+            mode = self.app.get_access_global_mode()
+            return mode in ("DEVICE_ONLY", "MIXED")
+        except Exception:
+            pass
         try:
             return bool(self.app.is_device_mode())
         except Exception:
@@ -1640,7 +1647,7 @@ class LocalDatabasePage(ttk.Frame):
                     fields="Pin",
                     filter_expr="",
                     options="",
-                    initial_size=1_048_576,
+                    initial_size=1048576,
                 )
                 pins = set()
                 for r in dev_rows:

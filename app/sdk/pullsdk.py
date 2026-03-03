@@ -1,4 +1,3 @@
-# monclub_access_python/app/sdk/pullsdk.py
 from __future__ import annotations
 
 import ctypes
@@ -60,6 +59,16 @@ class PullSDK:
                 self._dll.ControlDevice.argtypes = [c_void_p, c_int, c_int, c_int, c_int, c_int, c_char_p]
                 self._dll.ControlDevice.restype = c_int
 
+            # int GetRTLog(void *handle,char *Buffer, int BufferSize)
+            if hasattr(self._dll, "GetRTLog"):
+                self._dll.GetRTLog.argtypes = [c_void_p, c_void_p, c_int]
+                self._dll.GetRTLog.restype = c_int
+
+            # int GetRTLogExt(void *handle,char *Buffer, int BufferSize)
+            if hasattr(self._dll, "GetRTLogExt"):
+                self._dll.GetRTLogExt.argtypes = [c_void_p, c_void_p, c_int]
+                self._dll.GetRTLogExt.restype = c_int
+
             self._dll.PullLastError.argtypes = []
             self._dll.PullLastError.restype = c_int
 
@@ -88,10 +97,8 @@ class PullSDK:
             f"ipaddress={ip}",
             f"port={port}",
             f"timeout={timeout_ms}",
-            f"passwd={password}",
+            f"passwd={''}",
         ]
-        if platform and str(platform).strip():
-            parts.append(f"platform={str(platform).strip()}")
 
         conn_str = ",".join(parts)
 
@@ -133,39 +140,168 @@ class PullSDK:
 
     @staticmethod
     def _normalize_fields(fields: str) -> str:
+        # PullSDK v2.2+ expects FieldNames separated by '\t' when not '*'
         f = (fields or "").strip()
         if not f:
             return "*"
         if f == "*":
             return "*"
-
-        tmp = f.replace(";", ",").replace("\t", ",")
-        parts = [p.strip() for p in tmp.split(",") if p.strip()]
+        tmp = f.replace(";", "\t").replace(",", "\t").replace("  ", " ").strip()
+        parts = [p.strip() for p in tmp.split("\t") if p.strip()]
         return "\t".join(parts) if parts else "*"
 
     @staticmethod
     def _normalize_filter(filter_expr: str) -> str:
+        # v2.2: multiple conditions separated by '\t'
         s = (filter_expr or "").strip()
         if not s:
             return ""
-
         s = s.replace(" = ", "=").replace("= ", "=").replace(" =", "=")
         s = s.replace(", ", ",")
+        # allow user to pass either comma-separated or tab-separated conditions
         s = s.replace(",", "\t")
         while "\t\t" in s:
             s = s.replace("\t\t", "\t")
         return s
 
+    # -------------------- low-level buffer helpers --------------------
+
+    def _call_with_growing_buffer(
+            self,
+            *,
+            fn_name: str,
+            call: Any,
+            sizes: List[int],
+            debug_label: str,
+    ) -> Tuple[int, str]:
+        """
+        Execute a PullSDK function that writes into a buffer.
+        Returns (rc, text).
+        """
+        last_rc: Optional[int] = None
+        last_err: Optional[int] = None
+
+        for attempt, sz in enumerate(sizes, start=1):
+            buf = ctypes.create_string_buffer(sz)
+            rc = int(call(buf, sz))
+
+            if rc >= 0:
+                text = buf.value.decode("mbcs", errors="replace")
+                self.logger.debug(f"{fn_name} OK rc={rc} size={sz} attempt={attempt} {debug_label}")
+                return rc, text
+
+            # PullLastError is often 0 here; rc itself is what matters.
+            err = self.pull_last_error()
+            last_rc, last_err = rc, err
+            self.logger.warning(f"{fn_name} rc={rc} err={err} size={sz} attempt={attempt} {debug_label}")
+
+            # Buffer-related (documented): -3 buffer insufficient, -112 recv buffer insufficient.
+            # Some firmwares return other negative codes for "need more buffer"; include -114/-115 (observed in the wild).
+            if rc in (-3, -112, -114, -115):
+                continue
+
+            raise PullSDKError(f"{fn_name} FAILED rc={rc} PullLastError={err} {debug_label}")
+
+        raise PullSDKError(f"{fn_name} FAILED after max size last_rc={last_rc} PullLastError={last_err} {debug_label}")
+
+    # -------------------- GetRTLog / GetRTLogExt --------------------
+
+    def supports_get_rtlog(self) -> bool:
+        self.load()
+        return self._dll is not None and hasattr(self._dll, "GetRTLog")
+
+    def supports_get_rtlog_ext(self) -> bool:
+        self.load()
+        return self._dll is not None and hasattr(self._dll, "GetRTLogExt")
+
+    def get_rtlog_text(self, *, initial_size: int | None = None) -> Tuple[int, str]:
+        h = self._require_handle()
+        self.load()
+        if self._dll is None or not hasattr(self._dll, "GetRTLog"):
+            raise PullSDKError("GetRTLog not available in this plcommpro.dll build.")
+
+        sizes = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024]
+        if initial_size and initial_size > 0:
+            sizes = [initial_size] + [s for s in sizes if s > initial_size]
+
+        def _do(buf: Any, sz: int) -> int:
+            return int(self._dll.GetRTLog(c_void_p(h), ctypes.cast(buf, c_void_p), c_int(sz)))
+
+        return self._call_with_growing_buffer(
+            fn_name="GetRTLog",
+            call=_do,
+            sizes=sizes,
+            debug_label="",
+        )
+
+    def get_rtlog_ext_text(self, *, initial_size: int | None = None) -> Tuple[int, str]:
+        h = self._require_handle()
+        self.load()
+        if self._dll is None or not hasattr(self._dll, "GetRTLogExt"):
+            raise PullSDKError("GetRTLogExt not available in this plcommpro.dll build.")
+
+        sizes = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024]
+        if initial_size and initial_size > 0:
+            sizes = [initial_size] + [s for s in sizes if s > initial_size]
+
+        def _do(buf: Any, sz: int) -> int:
+            return int(self._dll.GetRTLogExt(c_void_p(h), ctypes.cast(buf, c_void_p), c_int(sz)))
+
+        return self._call_with_growing_buffer(
+            fn_name="GetRTLogExt",
+            call=_do,
+            sizes=sizes,
+            debug_label="",
+        )
+
+    @staticmethod
+    def _parse_rtlogext(text: str) -> List[Dict[str, str]]:
+        """
+        Parse PUSH-format lines:
+          type=rtlog\ttime=...\tpin=...\tcardno=...\teventaddr=...\tevent=...\tinoutstatus=...\tverifytype=...
+          type=rtstate\t...
+        """
+        out: List[Dict[str, str]] = []
+        if not text:
+            return out
+
+        # records separated by CRLF
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines:
+            parts = [p for p in ln.split("\t") if p]
+            d: Dict[str, str] = {}
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    d[k.strip()] = v.strip()
+                else:
+                    # tolerate weird tokens
+                    d[p.strip()] = ""
+            if d:
+                out.append(d)
+        return out
+
+    def get_rtlogext_records(self) -> List[Dict[str, str]]:
+        """
+        Returns parsed records from GetRTLogExt. May contain:
+          - type=rtlog (event)
+          - type=rtstate (door/alarm state)
+        """
+        rc, text = self.get_rtlog_ext_text()
+        if rc <= 0 or not text.strip():
+            return []
+        return self._parse_rtlogext(text)
+
     # -------------------- GetDeviceData --------------------
 
     def get_device_data_text(
-        self,
-        *,
-        table: str,
-        fields: str = "*",
-        filter_expr: str = "",
-        options: str = "",
-        initial_size: int | None = None,
+            self,
+            *,
+            table: str,
+            fields: str = "*",
+            filter_expr: str = "",
+            options: str = "",
+            initial_size: int | None = None,
     ) -> Tuple[int, str]:
         h = self._require_handle()
         if self._dll is None:
@@ -176,12 +312,12 @@ class PullSDK:
 
         self.logger.debug(f"GetDeviceData(table={table}, fields={fields_n}, filter={filter_n}, options={options})")
 
-        sizes = [1_048_576, 2_097_152, 4_194_304, 8_388_608, 16_777_216, 33_554_432, 50_331_648]
+        sizes = [1_048_576, 2_097_152, 4_194_304, 8_388_608]
         if initial_size and initial_size > 0:
             sizes = [initial_size] + [s for s in sizes if s > initial_size]
 
-        last_err = None
-        last_rc = None
+        last_rc: Optional[int] = None
+        last_err: Optional[int] = None
 
         for attempt, sz in enumerate(sizes, start=1):
             buf = ctypes.create_string_buffer(sz)
@@ -203,27 +339,26 @@ class PullSDK:
                 return rc, text
 
             err = self.pull_last_error()
-            last_err = err
-            last_rc = rc
+            last_rc, last_err = rc, err
             self.logger.warning(f"GetDeviceData rc={rc} err={err} size={sz} attempt={attempt}")
 
-            if rc in (-102, -114):
+            # buffer-related / controller-quirk codes
+            if rc in (-3, -112, -114, -115):
                 continue
 
             raise PullSDKError(f"GetDeviceData FAILED table={table} rc={rc} PullLastError={err}")
 
         raise PullSDKError(
-            f"GetDeviceData FAILED after max size. table={table} last_rc={last_rc} PullLastError={last_err}"
-        )
+            f"GetDeviceData FAILED after max size. table={table} last_rc={last_rc} PullLastError={last_err}")
 
     def get_device_data_rows(
-        self,
-        *,
-        table: str,
-        fields: str = "*",
-        filter_expr: str = "",
-        options: str = "",
-        initial_size: int | None = None,
+            self,
+            *,
+            table: str,
+            fields: str = "*",
+            filter_expr: str = "",
+            options: str = "",
+            initial_size: int | None = None,
     ) -> List[Dict[str, str]]:
         rc, text = self.get_device_data_text(
             table=table,
@@ -242,7 +377,8 @@ class PullSDK:
             return -1
 
         filter_n = self._normalize_filter(filter_expr)
-        rc = int(self._dll.GetDeviceDataCount(c_void_p(h), encode_ansi(table), encode_ansi(filter_n), encode_ansi(options)))
+        rc = int(
+            self._dll.GetDeviceDataCount(c_void_p(h), encode_ansi(table), encode_ansi(filter_n), encode_ansi(options)))
         self.logger.debug(f"GetDeviceDataCount(table={table}, filter={filter_n}) => {rc}")
         return rc
 
@@ -282,14 +418,14 @@ class PullSDK:
         return self._dll is not None and hasattr(self._dll, "ControlDevice")
 
     def control_device(
-        self,
-        *,
-        operation_id: int,
-        param1: int,
-        param2: int,
-        param3: int,
-        param4: int,
-        options: str = "",
+            self,
+            *,
+            operation_id: int,
+            param1: int,
+            param2: int,
+            param3: int,
+            param4: int,
+            options: str = "",
     ) -> int:
         h = self._require_handle()
         self.load()
@@ -320,10 +456,18 @@ class PullSDK:
             seconds = 1
         if seconds > 60:
             seconds = 60
-        return self.control_device(operation_id=1, param1=int(door), param2=1, param3=int(seconds), param4=0, options="")
+        return self.control_device(operation_id=1, param1=int(door), param2=1, param3=int(seconds), param4=0,
+                                   options="")
 
     def set_door_normal_open(self, *, door: int, enabled: bool) -> int:
-        return self.control_device(operation_id=4, param1=int(door), param2=(1 if enabled else 0), param3=0, param4=0, options="")
+        return self.control_device(
+            operation_id=4,
+            param1=int(door),
+            param2=(1 if enabled else 0),
+            param3=0,
+            param4=0,
+            options="",
+        )
 
     def cancel_alarm(self) -> int:
         return self.control_device(operation_id=2, param1=0, param2=0, param3=0, param4=0, options="")
@@ -372,7 +516,7 @@ class PullSDK:
             last_rc = rc
             self.logger.warning(f"GetDeviceParam rc={rc} err={err} size={sz} attempt={attempt}")
 
-            if rc in (-102, -114):
+            if rc in (-3, -112, -114, -115):
                 continue
 
             raise PullSDKError(f"GetDeviceParam FAILED rc={rc} PullLastError={err}")
@@ -388,8 +532,6 @@ class PullSDKDevice:
       - ensure_connected / disconnect
       - poll_rtlog_once (normalized event rows)
       - open_door
-
-    This fixes: `from app.sdk.pullsdk import PullSDKDevice`
     """
 
     def __init__(self, device_payload: Dict[str, Any], logger=None):
@@ -409,19 +551,6 @@ class PullSDKDevice:
 
         self._sdk: Optional[PullSDK] = None
         self._connected = False
-
-        # in-memory cursor (keeps reads incremental inside one process)
-        self._last_id = 0
-
-        # rtlog read strategy (fallbacks)
-        self._rtlog_candidates = [
-            # common in controllers
-            ("rtlog", "id,time,cardno,eventtype,doorid", "id", "time", "cardno", "doorid", "eventtype"),
-            ("rtlog", "id,Time,CardNo,EventType,DoorID", "id", "Time", "CardNo", "DoorID", "EventType"),
-            # common in attendance devices / some firmwares
-            ("transaction", "id,time,cardno,eventtype,doorid", "id", "time", "cardno", "doorid", "eventtype"),
-            ("transaction", "id,Time,CardNo,EventType,DoorID", "id", "Time", "CardNo", "DoorID", "EventType"),
-        ]
 
     @property
     def is_connected(self) -> bool:
@@ -444,8 +573,8 @@ class PullSDKDevice:
                 ip=str(self.ip),
                 port=int(self.port),
                 timeout_ms=int(self.timeout_ms),
-                password=str(self.password),
-                platform=str(self.platform).strip() or None,
+                password=str(self.password or ""),
+                platform=str(self.platform or "") if (self.platform or "").strip() else None,
             )
             self._connected = True
             return True
@@ -485,65 +614,98 @@ class PullSDKDevice:
 
     def poll_rtlog_once(self) -> List[Dict[str, Any]]:
         """
-        Reads new RTLog rows and returns normalized dicts containing:
-          eventId, doorId, eventType, cardNo, eventTime
+        Preferred: GetRTLogExt (PUSH format, easy parsing).
+        Fallback: GetDeviceData(transaction, Options="new record").
+
+        Returns normalized dicts:
+          eventId, doorId, eventType, cardNo, eventTime, table, rawRow
         """
         if not self.ensure_connected():
             return []
 
         assert self._sdk is not None
 
-        last_err: Optional[Exception] = None
-        for table, fields, id_k, time_k, card_k, door_k, type_k in self._rtlog_candidates:
-            try:
-                filter_expr = f"{id_k}>{int(self._last_id)}" if int(self._last_id) > 0 else ""
-                rows = self._sdk.get_device_data_rows(table=table, fields=fields, filter_expr=filter_expr, options="")
-                if not rows:
+        # 1) Preferred: RTLogExt
+        try:
+            if self._sdk.supports_get_rtlog_ext():
+                recs = self._sdk.get_rtlogext_records()
+                if not recs:
                     return []
 
                 out: List[Dict[str, Any]] = []
-                max_id = int(self._last_id)
-
-                for r in rows:
-                    if not isinstance(r, dict):
+                for r in recs:
+                    rtype = (r.get("type") or "").strip().lower()
+                    if rtype != "rtlog":
+                        # rtstate (door/alarm state) or unknown => ignore for access events
                         continue
 
-                    rid_raw = self._get_any(r, [id_k, "id", "ID", "LogID", "logid", "recordid"])
-                    rid_int = self._safe_int(rid_raw, 0)
+                    event_time = (r.get("time") or "").strip()
+                    card_no = (r.get("cardno") or "").strip()
+                    event_code = (r.get("event") or "").strip()
+                    event_addr = (r.get("eventaddr") or "").strip()  # door number / point number
+                    inout = (r.get("inoutstatus") or "").strip()
+                    verify = (r.get("verifytype") or "").strip()
+                    pin = (r.get("pin") or "").strip()
 
-                    if rid_int > 0 and rid_int <= int(self._last_id):
-                        continue
+                    # Create a stable synthetic eventId (device does not provide an id in rtlogext)
+                    event_id = f"{event_time}|{card_no}|{event_code}|{event_addr}|{pin}|{inout}|{verify}"
 
-                    card_no = self._safe_str(self._get_any(r, [card_k, "cardno", "CardNo", "CARDNO", "Card", "card"]), "")
-                    event_time = self._safe_str(self._get_any(r, [time_k, "time", "Time", "EventTime", "eventtime"]), "")
-                    door_id = self._get_any(r, [door_k, "doorid", "DoorID", "Door", "door"])
-                    event_type = self._safe_str(self._get_any(r, [type_k, "eventtype", "EventType", "Type", "type"]), "RTLOG")
-
-                    norm = {
-                        "eventId": str(rid_int) if rid_int > 0 else "",
-                        "doorId": str(self._safe_int(door_id, 0)) if door_id is not None else None,
-                        "eventType": str(event_type),
-                        "cardNo": str(card_no),
-                        "eventTime": str(event_time),
-                        "table": table,
-                        "rawRow": r,
-                    }
-                    out.append(norm)
-
-                    if rid_int > max_id:
-                        max_id = rid_int
-
-                if max_id > int(self._last_id):
-                    self._last_id = max_id
+                    out.append(
+                        {
+                            "eventId": event_id,
+                            "doorId": event_addr or None,
+                            "eventType": event_code or "RTLOG",
+                            "cardNo": card_no,
+                            "eventTime": event_time,
+                            "table": "rtlogext",
+                            "rawRow": r,
+                        }
+                    )
 
                 return out
-            except Exception as e:
-                last_err = e
-                continue
+        except Exception as e:
+            # Don't disconnect here; just fall back
+            try:
+                self.logger.debug(f"[PullSDKDevice][{self.device_id}] GetRTLogExt failed, fallback to transaction: {e}")
+            except Exception:
+                pass
 
-        if last_err:
-            raise last_err
-        return []
+        # 2) Fallback: transaction "new record"
+        try:
+            rows = self._sdk.get_device_data_rows(
+                table="transaction",
+                fields="*",
+                filter_expr="",
+                options="new record",
+            )
+            if not rows:
+                return []
+
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                # common keys
+                event_time = self._safe_str(self._get_any(r, ["time", "Time"]), "")
+                card_no = self._safe_str(self._get_any(r, ["cardno", "CardNo"]), "")
+                door_id = self._safe_str(self._get_any(r, ["doorid", "DoorID", "eventaddr", "EventAddr"]), "")
+                event_type = self._safe_str(self._get_any(r, ["eventtype", "EventType", "event", "Event"]), "TX")
+
+                event_id = f"{event_time}|{card_no}|{event_type}|{door_id}"
+
+                out.append(
+                    {
+                        "eventId": event_id,
+                        "doorId": door_id or None,
+                        "eventType": event_type,
+                        "cardNo": card_no,
+                        "eventTime": event_time,
+                        "table": "transaction",
+                        "rawRow": r,
+                    }
+                )
+            return out
+        except Exception as e:
+            # At this point, something is genuinely wrong; let upper layers decide reconnect policy
+            raise e
 
     # -------------------- helpers --------------------
 
@@ -573,7 +735,6 @@ class PullSDKDevice:
             s = self._safe_str(v, "").strip()
             if s:
                 return s
-        # case-insensitive
         lm = {str(k).lower(): k for k in (self.payload or {}).keys()}
         for k in keys:
             kk = lm.get(str(k).lower())

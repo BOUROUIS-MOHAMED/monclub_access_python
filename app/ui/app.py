@@ -6,6 +6,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from app.api.monclub_api import ApiEndpoints, MonClubApi
@@ -20,7 +21,15 @@ from app.core.db import (
     save_sync_cache,
 )
 from app.core.logger import setup_logging
-from app.core.utils import ensure_dirs, to_b64, to_hex
+from app.core.update_manager import UpdateManager, UpdateStatus
+from app.core.utils import (
+    APP_NAME,
+    ensure_dirs,
+    to_b64,
+    to_hex,
+    resolve_resource_path,
+    add_windows_dll_search_paths,
+)
 
 from app.core.device_sync import DeviceSyncEngine
 from app.core.realtime_agent import AgentRealtimeEngine
@@ -70,10 +79,24 @@ def _encoding_to_backend(enc: str) -> str:
 
 
 class MainApp(tk.Tk):
+    """
+    IMPORTANT CHANGE (Mar 2026):
+    - "mode" is no longer global (no cfg.data_mode driving UI/engines).
+    - accessDataMode is PER DEVICE (DEVICE/AGENT) from backend cache (SQLite).
+    - Therefore: UI shows BOTH device + agent tabs, and engines run based on per-device filtering
+      (device_sync.py filters DEVICE devices; realtime_agent.py filters AGENT devices).
+    """
+
     def __init__(self):
         super().__init__()
-        self.title("ZK Turnstile Manager (PullSDK + ZK9500)")
+        self.title(APP_NAME)
         self.geometry("1250x780")
+
+        # Add DLL search paths ASAP (Windows/Python 3.8+)
+        try:
+            add_windows_dll_search_paths()
+        except Exception:
+            pass
 
         ensure_dirs()
         init_db()
@@ -81,6 +104,18 @@ class MainApp(tk.Tk):
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.cfg = load_config()
 
+        # Resolve SDK DLLs robustly (dev + frozen + stale-absolute handling)
+        try:
+            self.cfg.plcomm_dll_path = self._resolve_sdk_dll(self.cfg.plcomm_dll_path)
+            self.cfg.zkfp_dll_path = self._resolve_sdk_dll(self.cfg.zkfp_dll_path)
+        except Exception as e:
+            messagebox.showerror(
+                "SDK resource error",
+                f"Failed to resolve required SDK DLLs.\n\n{e}\n\nPlatform: {platform_summary()}",
+            )
+            raise
+
+        # Enforce 32-bit requirement for 32-bit DLLs
         try:
             require_32bit_python_for_32bit_dll(self.cfg.plcomm_dll_path)
         except Exception as e:
@@ -90,6 +125,12 @@ class MainApp(tk.Tk):
         self.logger = setup_logging(self.cfg.log_level, ui_queue=self.log_queue)
         self.logger.info("App started.")
         self.logger.info(f"Platform: {platform_summary()}")
+        self.logger.info("Data root is managed by app.core.utils (ProgramData/LocalAppData).")
+        self.logger.info(f"PullSDK DLL: {self.cfg.plcomm_dll_path}")
+        self.logger.info(f"ZKFP DLL  : {self.cfg.zkfp_dll_path}")
+
+        self._update_manager = UpdateManager(app=self, cfg=self.cfg, logger=self.logger, api_factory=self._api)
+        self._update_status: Optional[UpdateStatus] = None
 
         self._sync_after_id: str | None = None
         self._local_api: Optional[LocalAccessApiServer] = None
@@ -99,7 +140,7 @@ class MainApp(tk.Tk):
 
         self._device_sync_engine = DeviceSyncEngine(cfg=self.cfg, logger=self.logger)
 
-        # realtime agent engine (AGENT mode only)
+        # realtime agent engine (per-device AGENT mode)
         self._agent_engine = AgentRealtimeEngine(cfg=self.cfg, logger=self.logger)
 
         self._tray: Optional[TrayController] = None
@@ -124,6 +165,17 @@ class MainApp(tk.Tk):
         nb.grid(row=0, column=0, sticky="nsew")
         self.nb = nb
 
+        # Global overlay buttons (visible on login/restricted/app)
+        # Update button (shown when update is available, not only when downloaded)
+        self._update_btn = ttk.Button(self, text="⬇ Download", command=self._on_click_update)
+        self._update_btn.place(relx=1.0, x=-12, y=8, anchor="ne")
+        self._update_btn.place_forget()
+
+        # Logout button (shown when logged-in, hidden on login)
+        self._logout_btn = ttk.Button(self, text="⎋ Logout", command=self._on_click_logout)
+        self._logout_btn.place(relx=1.0, x=-120, y=8, anchor="ne")  # left of update button
+        self._logout_btn.place_forget()
+
         self.page_config = ConfigurationPage(nb, app=self)
         self.page_device = DevicePage(nb, app=self)
         self.page_device_info = DeviceInfoPage(nb, app=self)
@@ -133,8 +185,9 @@ class MainApp(tk.Tk):
         self.page_local_db = LocalDatabasePage(nb, app=self)
         self.page_logs = LogsPage(nb, app=self)
 
-        self._tabs_device_mode: Optional[bool] = None
-        self._rebuild_tabs_from_mode()
+        # NEW: tabs are no longer rebuilt from a global mode (DEVICE/AGENT).
+        self._tabs_built: bool = False
+        self._rebuild_tabs_from_mode()  # kept name for backward compatibility
 
         self.page_login = LoginPage(self.container, app=self)
         self.page_login.grid(row=0, column=0, sticky="nsew")
@@ -147,11 +200,271 @@ class MainApp(tk.Tk):
         self.after(200, self._poll_logs)
         self.after(400, self.start_local_api_server)
         self.after(500, self.reschedule_sync_timer)
+
+        # NEW: run update check at app startup (if token exists)
+        self.after(650, lambda: self._ensure_update_manager_started(check_now=True))
+
         self.after(700, self.evaluate_access_and_redirect)
         self.after(800, self._start_tray_if_enabled)
 
         if bool(getattr(self.cfg, "start_minimized_to_tray", False)):
             self.after(1200, self.hide_to_tray)
+
+    # ---------------- Update Manager bootstrap ----------------
+    def _ensure_update_manager_started(self, *, check_now: bool) -> None:
+        """
+        Start update checks when a saved token exists.
+        Stop when no token exists (logout / first install).
+        """
+        try:
+            auth = load_auth_token()
+            tok = getattr(auth, "token", None) if auth else None
+            tok = str(tok or "").strip()
+            if tok:
+                # check_now=True only at startup (or if you explicitly want)
+                self._update_manager.start(token=tok, check_now=check_now)
+            else:
+                self._update_manager.stop()
+        except Exception:
+            pass
+
+    # ---------------- Update UI hooks (called by UpdateManager) ----------------
+    def on_update_status_changed(self, st: UpdateStatus) -> None:
+        # called on UI thread
+        self._update_status = st
+
+        # Show button whenever update is available (downloaded OR not).
+        # Text/state adapts to downloading vs ready.
+        try:
+            update_available = bool(getattr(st, "update_available", False))
+            downloaded = bool(getattr(st, "downloaded", False))
+            downloading = bool(getattr(st, "downloading", False))
+
+            # progress may be named differently across implementations; keep robust
+            progress = getattr(st, "progress", None)
+            if progress is None:
+                progress = getattr(st, "download_progress", None)
+            if progress is None:
+                progress = getattr(st, "progress_percent", None)
+
+            if update_available:
+                if downloaded:
+                    self._update_btn.configure(text="⬆ Update")
+                    try:
+                        self._update_btn.state(["!disabled"])
+                    except Exception:
+                        pass
+                else:
+                    if downloading:
+                        txt = "⬇ Downloading…"
+                        try:
+                            if progress is not None:
+                                txt = f"⬇ Downloading… {int(progress)}%"
+                        except Exception:
+                            pass
+                        self._update_btn.configure(text=txt)
+                        try:
+                            self._update_btn.state(["disabled"])
+                        except Exception:
+                            pass
+                    else:
+                        self._update_btn.configure(text="⬇ Download")
+                        try:
+                            self._update_btn.state(["!disabled"])
+                        except Exception:
+                            pass
+
+                self._update_btn.place(relx=1.0, x=-12, y=8, anchor="ne")
+                try:
+                    self._update_btn.lift()
+                except Exception:
+                    pass
+            else:
+                self._update_btn.place_forget()
+        except Exception:
+            pass
+
+    def on_update_ready(self, st: UpdateStatus) -> None:
+        # one-time notification per releaseId (handled by manager too)
+        try:
+            rid = str((st.latest_release or {}).get("releaseId") or "")
+            messagebox.showinfo(
+                "Update ready",
+                f"A new update is ready.\n\nRelease: {rid}\n\nClick ⬆ Update to restart and install.",
+            )
+        except Exception:
+            pass
+
+    def on_update_error(self, msg: str) -> None:
+        # silent-ish: log only; don’t spam messageboxes
+        try:
+            self.logger.warning("[Update] %s", msg)
+        except Exception:
+            pass
+
+    def _request_update_download_best_effort(self) -> bool:
+        """
+        Try common method names across possible UpdateManager implementations.
+        Returns True if we successfully invoked a callable.
+        """
+        um = getattr(self, "_update_manager", None)
+        if not um:
+            return False
+
+        for name in (
+            "request_download",
+            "start_download",
+            "download_update",
+            "download_latest",
+            "download_if_needed",
+            "ensure_download",
+            "begin_download",
+            "trigger_download",
+        ):
+            fn = getattr(um, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return True
+                except Exception:
+                    return False
+        return False
+
+    def _on_click_update(self):
+        st = self._update_status
+        if not st or not bool(getattr(st, "update_available", False)):
+            return
+
+        downloaded = bool(getattr(st, "downloaded", False))
+        downloading = bool(getattr(st, "downloading", False))
+
+        if downloading and not downloaded:
+            return
+
+        if not downloaded:
+            ok = messagebox.askyesno("Download update", "An update is available.\n\nDownload it now?")
+            if not ok:
+                return
+
+            started = self._request_update_download_best_effort()
+            if started:
+                try:
+                    self.logger.info("[Update] Download requested by user.")
+                except Exception:
+                    pass
+                try:
+                    messagebox.showinfo("Update", "Downloading update in the background…")
+                except Exception:
+                    pass
+            else:
+                messagebox.showinfo(
+                    "Update",
+                    "An update is available.\n\nIt will be downloaded automatically, or your updater doesn't expose a manual download trigger.",
+                )
+            return
+
+        rid = ""
+        try:
+            rid = str((st.latest_release or {}).get("releaseId") or "")
+        except Exception:
+            rid = ""
+
+        ok = messagebox.askyesno(
+            "Install update",
+            f"A new update is ready ({rid}).\n\nRestart MonClub Access to install it now?",
+        )
+        if not ok:
+            return
+
+        try:
+            self._update_manager.launch_updater_and_exit()
+        except Exception as e:
+            messagebox.showerror("Update failed", str(e))
+            return
+
+        self.quit_app()
+
+    # ---------------- Logout ----------------
+    def _refresh_logout_btn(self) -> None:
+        """Show logout button when a token exists (even if restricted)."""
+        try:
+            auth = load_auth_token()
+            logged_in = bool(auth and getattr(auth, "token", None))
+            if logged_in:
+                self._logout_btn.place(relx=1.0, x=-120, y=8, anchor="ne")
+                try:
+                    self._logout_btn.lift()
+                except Exception:
+                    pass
+            else:
+                self._logout_btn.place_forget()
+        except Exception:
+            pass
+
+    def _on_click_logout(self) -> None:
+        auth = load_auth_token()
+        if not auth or not getattr(auth, "token", None):
+            self._refresh_logout_btn()
+            return
+
+        ok = messagebox.askyesno(
+            "Logout",
+            "Logout from this PC?\n\nThis will remove the saved token and return you to the login screen.",
+        )
+        if not ok:
+            return
+
+        try:
+            self.stop_realtime_agent()
+        except Exception:
+            pass
+
+        try:
+            clear_auth_token()
+        except Exception:
+            pass
+
+        # stop update checks too (no token anymore)
+        try:
+            self._update_manager.stop()
+        except Exception:
+            pass
+
+        # Optional best-effort: clear cached sync (safe if db layer doesn't accept None)
+        try:
+            save_sync_cache(None)  # if not supported, exception is caught
+        except Exception:
+            pass
+
+        try:
+            self.logger.info("Logout OK: token cleared.")
+        except Exception:
+            pass
+
+        self._refresh_logout_btn()
+        self.evaluate_access_and_redirect()
+
+    def _resolve_sdk_dll(self, configured_path: str) -> str:
+        """
+        Resolve a DLL path using resolve_resource_path(). Also handles cases where the config
+        contains an old absolute path that no longer exists (user moved the folder).
+        """
+        s = (configured_path or "").strip()
+        if not s:
+            raise FileNotFoundError("Empty DLL path in config")
+
+        # 1) Try as-is
+        try:
+            return str(resolve_resource_path(s, must_exist=True))
+        except Exception:
+            pass
+
+        # 2) If it looks like an absolute path but is stale, retry by filename only
+        name = Path(s).name
+        try:
+            return str(resolve_resource_path(name, must_exist=True))
+        except Exception as e:
+            raise FileNotFoundError(f"Could not resolve DLL '{s}'. Tried by name '{name}' as well. ({e})")
 
     # Make Tkinter callback exceptions visible (instead of "hang / no response" feeling)
     def report_callback_exception(self, exc, val, tb):
@@ -165,18 +478,67 @@ class MainApp(tk.Tk):
         except Exception:
             pass
 
-    # ---------------- Mode helpers ----------------
-    def is_device_mode(self) -> bool:
-        return self.cfg.is_device_mode
+    # ---------------- Per-device mode helpers (NEW) ----------------
+    def get_access_mode_summary(self) -> Dict[str, int]:
+        """
+        Returns counts based on cached devices (SQLite sync cache).
+        DEVICE/AGENT is now per device (GymDeviceDto.accessDataMode).
+        """
+        cache = load_sync_cache()
+        devices = getattr(cache, "devices", []) if cache else []
+        dev = 0
+        ag = 0
+        unk = 0
+        for d in devices or []:
+            if not isinstance(d, dict):
+                continue
+            m = str(d.get("accessDataMode") or "").strip().upper()
+            if m == "DEVICE":
+                dev += 1
+            elif m == "AGENT":
+                ag += 1
+            else:
+                unk += 1
+        return {"DEVICE": dev, "AGENT": ag, "UNKNOWN": unk}
 
+    def get_access_global_mode(self) -> str:
+        s = self.get_access_mode_summary()
+        has_dev = s["DEVICE"] > 0
+        has_ag = s["AGENT"] > 0
+        if has_dev and has_ag:
+            return "MIXED"
+        if has_dev:
+            return "DEVICE_ONLY"
+        if has_ag:
+            return "AGENT_ONLY"
+        return "UNKNOWN"
+
+    # Legacy helper (kept so older pages don’t crash).
+    # True ONLY when the gym has DEVICE devices and no AGENT devices.
+    def is_device_mode(self) -> bool:
+        return self.get_access_global_mode() == "DEVICE_ONLY"
+
+    # ---------------- Tab helpers ----------------
     def _tab_id_present(self, tab_id: str) -> bool:
         try:
             return tab_id in set(self.nb.tabs())
         except Exception:
             return False
 
+    def _is_tab_present(self, widget: ttk.Frame) -> bool:
+        try:
+            return str(widget) in set(self.nb.tabs())
+        except Exception:
+            return False
+
     def _safe_select_default_tab(self) -> None:
-        # prefer config tab (always exists)
+        # Prefer Device tab if present, else Configuration.
+        try:
+            if self._is_tab_present(self.page_device):
+                self.nb.select(self.page_device)
+                return
+        except Exception:
+            pass
         try:
             if self._is_tab_present(self.page_config):
                 self.nb.select(self.page_config)
@@ -184,18 +546,12 @@ class MainApp(tk.Tk):
         except Exception:
             pass
 
-        # fallback by mode
-        try:
-            if self.is_device_mode():
-                if self._is_tab_present(self.page_device):
-                    self.nb.select(self.page_device)
-            else:
-                if self._is_tab_present(self.page_agent_rt):
-                    self.nb.select(self.page_agent_rt)
-        except Exception:
-            pass
-
     def apply_mode_from_config(self) -> None:
+        """
+        Backward compatible entrypoint used by some pages.
+        Previously: rebuilt tabs based on cfg.data_mode.
+        Now: tabs are fixed; only start/stop realtime engine based on auth + restrictions + cfg.agent_realtime_enabled.
+        """
         # keep current tab selection if still valid after rebuild
         current_tab: Optional[str] = None
         try:
@@ -210,7 +566,6 @@ class MainApp(tk.Tk):
 
         try:
             if current_tab and self._tab_id_present(current_tab):
-                # keep user's current tab
                 pass
             else:
                 self._safe_select_default_tab()
@@ -219,17 +574,14 @@ class MainApp(tk.Tk):
 
         self.apply_realtime_agent_from_config()
 
-    def _is_tab_present(self, widget: ttk.Frame) -> bool:
-        try:
-            return str(widget) in set(self.nb.tabs())
-        except Exception:
-            return False
-
     def _rebuild_tabs_from_mode(self) -> None:
-        device_mode = self.is_device_mode()
-        if self._tabs_device_mode == device_mode:
+        """
+        Name preserved for backward compatibility.
+        Tabs are ALWAYS shown now (since mode is per device).
+        """
+        if self._tabs_built:
             return
-        self._tabs_device_mode = device_mode
+        self._tabs_built = True
 
         try:
             for tab_id in list(self.nb.tabs()):
@@ -237,23 +589,25 @@ class MainApp(tk.Tk):
         except Exception:
             pass
 
-        if device_mode:
-            self.nb.add(self.page_config, text="1) Configuration")
-            self.nb.add(self.page_device, text="2) Device")
-            self.nb.add(self.page_device_info, text="3) Device Info")
-            self.nb.add(self.page_users, text="4) Users")
-            self.nb.add(self.page_enroll, text="5) Enroll")
-            self.nb.add(self.page_local_db, text="6) Local DB")
-            self.nb.add(self.page_logs, text="7) Logs")
-            self.logger.info("UI mode: DEVICE (device tabs visible).")
-        else:
-            self.nb.add(self.page_config, text="1) Configuration")
-            self.nb.add(self.page_agent_rt, text="2) Agent realtime")
-            self.nb.add(self.page_users, text="3) Users")
-            self.nb.add(self.page_enroll, text="4) Enroll")
-            self.nb.add(self.page_local_db, text="5) Local DB")
-            self.nb.add(self.page_logs, text="6) Logs")
-            self.logger.info("UI mode: AGENT (realtime tab visible).")
+        self.nb.add(self.page_config, text="1) Configuration")
+        self.nb.add(self.page_device, text="2) Device")
+        self.nb.add(self.page_device_info, text="3) Device Info")
+        self.nb.add(self.page_agent_rt, text="4) Agent realtime")
+        self.nb.add(self.page_users, text="5) Users")
+        self.nb.add(self.page_enroll, text="6) Enroll")
+        self.nb.add(self.page_local_db, text="7) Local DB")
+        self.nb.add(self.page_logs, text="8) Logs")
+
+        try:
+            self.logger.info("UI mode: MIXED (tabs are always visible; mode is per device).")
+        except Exception:
+            pass
+
+        # default tab selection
+        try:
+            self._safe_select_default_tab()
+        except Exception:
+            pass
 
     # ---------------- Utilities ----------------
     def _poll_logs(self):
@@ -303,6 +657,10 @@ class MainApp(tk.Tk):
         except Exception:
             pass
         try:
+            self._update_manager.stop()
+        except Exception:
+            pass
+        try:
             if self._tray:
                 self._tray.stop()
         except Exception:
@@ -321,7 +679,7 @@ class MainApp(tk.Tk):
 
     def persist_config(self):
         save_config(self.cfg)
-        self.logger.info("Config saved to data/config.json")
+        self.logger.info("Config saved to config.json (ProgramData/LocalAppData data root).")
 
     def show_app(self):
         if not load_auth_token():
@@ -333,6 +691,11 @@ class MainApp(tk.Tk):
     def show_login(self):
         try:
             self.stop_realtime_agent()
+        except Exception:
+            pass
+        # no token => no updates
+        try:
+            self._update_manager.stop()
         except Exception:
             pass
         self._active_view = "login"
@@ -351,10 +714,20 @@ class MainApp(tk.Tk):
 
     def force_login(self):
         clear_auth_token()
+        self._refresh_logout_btn()
+        try:
+            self._update_manager.stop()
+        except Exception:
+            pass
         self.show_login()
 
     def clear_auth(self):
         clear_auth_token()
+        self._refresh_logout_btn()
+        try:
+            self._update_manager.stop()
+        except Exception:
+            pass
 
     # ---------------- Local API server ----------------
     def start_local_api_server(self):
@@ -392,12 +765,14 @@ class MainApp(tk.Tk):
     def get_local_api_health(self) -> Dict[str, Any]:
         auth = load_auth_token()
         reasons = self._restriction_reasons()
+        summary = self.get_access_mode_summary()
         return {
             "ok": True,
             "loggedIn": bool(auth and auth.token),
             "restricted": bool(reasons),
             "reasons": reasons,
-            "mode": "DEVICE" if self.is_device_mode() else "AGENT",
+            "mode": self.get_access_global_mode(),
+            "modeSummary": summary,
             "host": str(getattr(self.cfg, "local_api_host", "127.0.0.1")),
             "port": int(getattr(self.cfg, "local_api_port", 8788)),
         }
@@ -415,10 +790,19 @@ class MainApp(tk.Tk):
             "api_create_user_fingerprint_url",
             "http://localhost:5000/api/v1/manager/userFingerprint/create",
         )
+        latest_release_url = (
+            getattr(self.cfg, "api_latest_release_url", None)
+            or getattr(self.cfg, "latest_release_url", None)
+            or getattr(self.cfg, "update_latest_release_url", None)
+            or getattr(self.cfg, "releases_url", None)
+            or "http://localhost:5000/api/v1/public/access/v1/latest_release"
+        )
+
         endpoints = ApiEndpoints(
             login_url=login_url,
             sync_url=sync_url,
             create_user_fingerprint_url=create_fp_url,
+            latest_release_url=str(latest_release_url),
         )
         return MonClubApi(endpoints=endpoints, logger=self.logger)
 
@@ -461,8 +845,9 @@ class MainApp(tk.Tk):
             except Exception as ex:
                 self.logger.exception(f"getSyncData failed: {ex} (using cached data if available)")
 
+            # Device sync (DEVICE-mode devices only) – engine will filter internally (after you update device_sync.py)
             try:
-                if self.is_device_mode() and bool(getattr(self.cfg, "device_sync_enabled", True)):
+                if bool(getattr(self.cfg, "device_sync_enabled", True)):
                     reasons = self._restriction_reasons()
                     if reasons:
                         self.logger.warning("[DeviceSync] Skipped: restricted: " + " | ".join(reasons[:3]))
@@ -473,12 +858,13 @@ class MainApp(tk.Tk):
                         else:
                             self.logger.info("[DeviceSync] Skipped: no cache yet")
                 else:
-                    self.logger.debug("[DeviceSync] Skipped: mode=AGENT or device sync disabled.")
+                    self.logger.debug("[DeviceSync] Skipped: device sync disabled.")
             except Exception as ex:
                 self.logger.exception(f"[DeviceSync] Unexpected error: {ex}")
 
+            # Realtime agent refresh (AGENT-mode devices only) – engine will filter internally (after you update realtime_agent.py)
             try:
-                if not self.is_device_mode() and self._agent_engine.is_running():
+                if self._agent_engine.is_running():
                     self._agent_engine.refresh_devices()
             except Exception:
                 pass
@@ -525,9 +911,22 @@ class MainApp(tk.Tk):
         was_in_app = (self._active_view == "app")
 
         auth = load_auth_token()
+        self._refresh_logout_btn()
+
         if not auth:
+            # ensure updates stopped (no token)
+            try:
+                self._update_manager.stop()
+            except Exception:
+                pass
             self.show_login()
             return
+
+        # ensure updater keeps running with current token (NO forced check here)
+        try:
+            self._ensure_update_manager_started(check_now=False)
+        except Exception:
+            pass
 
         reasons = self._restriction_reasons()
         if reasons:
@@ -541,12 +940,10 @@ class MainApp(tk.Tk):
         # only auto-select a tab when entering the app view (login/restricted -> app)
         if not was_in_app:
             try:
-                if self.is_device_mode():
-                    if self._is_tab_present(self.page_device):
-                        self.nb.select(self.page_device)
+                if self._is_tab_present(self.page_device):
+                    self.nb.select(self.page_device)
                 else:
-                    if self._is_tab_present(self.page_agent_rt):
-                        self.nb.select(self.page_agent_rt)
+                    self._safe_select_default_tab()
             except Exception:
                 pass
 
@@ -554,9 +951,18 @@ class MainApp(tk.Tk):
 
     # ---------------- Realtime agent engine control ----------------
     def apply_realtime_agent_from_config(self) -> None:
+        """
+        No global mode anymore.
+        Start realtime engine if:
+          - logged in
+          - not restricted
+          - cfg.agent_realtime_enabled is true
+        The engine itself will filter devices by accessDataMode=AGENT from SQLite cache.
+        """
         with self._agent_lock:
             try:
-                if self.is_device_mode():
+                auth = load_auth_token()
+                if not auth or not getattr(auth, "token", None):
                     self.stop_realtime_agent()
                     return
 
@@ -574,8 +980,6 @@ class MainApp(tk.Tk):
 
     def start_realtime_agent(self) -> None:
         with self._agent_lock:
-            if self.is_device_mode():
-                return
             if self._agent_engine.is_running():
                 return
             self._agent_engine.start()
@@ -586,7 +990,9 @@ class MainApp(tk.Tk):
                 self._agent_engine.stop()
 
     # ---------------- Remote enroll (Dashboard -> PC) ----------------
-    def begin_remote_enroll(self, *, user_id: str, finger_id: str, full_name: str = "", device: str = "zk9500") -> Dict[str, Any]:
+    def begin_remote_enroll(
+        self, *, user_id: str, finger_id: str, full_name: str = "", device: str = "zk9500"
+    ) -> Dict[str, Any]:
         dev = (device or "zk9500").strip().lower()
         if dev not in ("zk9500", "zkfinger", "zkfp"):
             return {"ok": False, "status": 400, "error": f"Unsupported device='{device}'. Use device=zk9500"}
@@ -651,7 +1057,9 @@ class MainApp(tk.Tk):
 
         return None, None
 
-    def _remote_enroll_worker(self, pop: EnrollStatusPopup, user_id: int, finger_id: int, full_name: str, device: str):
+    def _remote_enroll_worker(
+        self, pop: EnrollStatusPopup, user_id: int, finger_id: int, full_name: str, device: str
+    ):
         zk: Optional[ZKFinger] = None
         try:
             pop.set_step("Checking login...")
@@ -763,5 +1171,11 @@ class MainApp(tk.Tk):
 
 
 def run_app():
+    # Also safe to call here (in case entrypoint imports happen before MainApp())
+    try:
+        add_windows_dll_search_paths()
+    except Exception:
+        pass
+
     app = MainApp()
     app.mainloop()

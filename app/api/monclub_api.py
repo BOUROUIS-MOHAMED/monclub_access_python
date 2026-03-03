@@ -13,6 +13,7 @@ class ApiEndpoints:
     login_url: str
     sync_url: str
     create_user_fingerprint_url: str
+    latest_release_url: str  # NEW
 
 
 class MonClubApiError(RuntimeError):
@@ -139,3 +140,53 @@ class MonClubApi:
         if not isinstance(data, dict):
             return {"raw": data}
         return data
+
+
+
+    def get_latest_access_software_release(
+        self,
+        *,
+        token: str,
+        platform: str = "WINDOWS",
+        channel: str = "stable",
+        release_id: Optional[str] = None,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = (self.endpoints.latest_release_url or "").strip()
+        if not url:
+            raise MonClubApiError("Latest release URL is empty (check Configuration).")
+
+        params: Dict[str, Any] = {}
+        if platform:
+            params["platform"] = platform
+        if channel:
+            params["channel"] = channel
+        if release_id:
+            params["releaseId"] = release_id
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        self.logger.info("API getLatestAccessSoftwareRelease -> %s params=%s", url, params)
+        try:
+            r = self._session.get(url, params=params, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"getLatestAccessSoftwareRelease request failed: {e}") from e
+
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            extra = _extract_trace_info(txt)
+            raise MonClubApiError(f"getLatestAccessSoftwareRelease failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
+
+        try:
+            data = r.json()
+        except Exception as e:
+            raise MonClubApiError(f"getLatestAccessSoftwareRelease returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
+
+        if not isinstance(data, dict):
+            raise MonClubApiError("getLatestAccessSoftwareRelease JSON is not an object/dict.")
+
+        return data
+
