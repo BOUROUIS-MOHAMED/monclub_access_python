@@ -13,10 +13,12 @@ from app.core.db import (
     delete_device_sync_state,
     prune_device_sync_state,
 )
+from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
 from app.sdk.pullsdk import PullSDK, PullSDKError
 
-# Fallback if a device has no doorIds configured
-DEFAULT_AUTHORIZE_DOOR_ID = 15
+
+# Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
+DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK = 15
 
 
 def _parse_dt_any(s: str) -> datetime | None:
@@ -69,6 +71,18 @@ def _to_int(v, default: int | None = None) -> int | None:
         return default
 
 
+def _to_float(v, default: float | None = None) -> float | None:
+    try:
+        if v is None:
+            return default
+        x = str(v).strip()
+        if x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
 def _boolish(v, default: bool = True) -> bool:
     if v is None:
         return default
@@ -103,7 +117,8 @@ def _norm_int_list(xs: List[Any]) -> List[int]:
         xi = _to_int(x, default=None)
         if xi is None:
             continue
-        out.append(int(xi))
+        if int(xi) > 0:
+            out.append(int(xi))
     out = sorted(set(out))
     return out
 
@@ -112,11 +127,11 @@ class DeviceSyncEngine:
     """
     Synchronizes ZKTeco controllers (PullSDK) from cached backend payload.
 
-    Incremental rules:
-    - Compute a per-device+pin desired_hash based on what we actually write (user+authorize+templates).
-    - Compare with last applied desired_hash stored in SQLite.
-    - Only touch pins whose desired_hash changed or is new.
-    - Stale pins removal stays "safe": delete only pins that are known-from-server but no longer desired for this device.
+    IMPORTANT CHANGE (Mar 2026):
+    - accessDataMode is PER DEVICE.
+    - This engine only syncs devices where accessDataMode == DEVICE.
+    - Global defaults (default_authorize_door_id, sdk_read_initial_bytes, etc.) come from
+      GymAccessSoftwareSettingsDto cached in SQLite, via settings_reader.get_backend_global_settings().
     """
 
     def __init__(self, *, cfg, logger):
@@ -144,6 +159,37 @@ class DeviceSyncEngine:
 
     # ---------------- internal ----------------
 
+    def _global_defaults(self) -> Dict[str, Any]:
+        """
+        Backend-driven global settings (snake_case). Never raises.
+        """
+        try:
+            g = get_backend_global_settings() or {}
+            return g if isinstance(g, dict) else {}
+        except Exception:
+            return {}
+
+    def _default_authorize_door_id(self) -> int:
+        g = self._global_defaults()
+        v = _to_int(g.get("default_authorize_door_id"), default=DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK)
+        if v is None or int(v) < 1:
+            return int(DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK)
+        return int(v)
+
+    def _sdk_read_initial_bytes(self) -> int:
+        """
+        Backend-driven knob used when reading device data (PullSDK initial_size).
+        Falls back to 1 MiB.
+        """
+        g = self._global_defaults()
+        v = _to_int(g.get("sdk_read_initial_bytes"), default=1_048_576) or 1_048_576
+        # clamp: [64KiB, 16MiB]
+        if v < 64 * 1024:
+            v = 64 * 1024
+        if v > 16 * 1024 * 1024:
+            v = 16 * 1024 * 1024
+        return int(v)
+
     def _normalize_device(self, d: Dict[str, Any]) -> Dict[str, Any]:
         def g(*keys, default=None):
             for k in keys:
@@ -160,6 +206,13 @@ class DeviceSyncEngine:
         if adm not in ("DEVICE", "AGENT"):
             adm = "DEVICE"
 
+        # per-device timezone/policy (used for userauthorize)
+        tz_id = _to_int(g("authorizeTimezoneId", "authorize_timezone_id", default=1), default=1) or 1
+        if tz_id < 1:
+            tz_id = 1
+
+        pushing_policy = g("pushingToDevicePolicy", "pushing_to_device_policy", default=None)
+
         return {
             "id": g("id"),
             "name": g("name", default=""),
@@ -171,15 +224,22 @@ class DeviceSyncEngine:
             "password": g("password", default=""),
             "allowedMemberships": _as_list(allowed),
             "doorIds": _as_list(doors),
+
+            # NEW (from backend/device DTO)
+            "authorizeTimezoneId": int(tz_id),
+            "pushingToDevicePolicy": pushing_policy,
         }
 
-    def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
+
         Filters:
         - allowedMemberships (if provided) uses user.membershipId
         - validFrom/validTo (if provided)
         - pin must be digits (controllers expect numeric Pin)
+
+        Also ensures device has a usable doorIds list (fallback to default_door_id).
         """
         allowed_raw = device.get("allowedMemberships") or []
         allowed_set: Set[int] = set()
@@ -188,10 +248,10 @@ class DeviceSyncEngine:
             if xi is not None:
                 allowed_set.add(int(xi))
 
-        door_ids = device.get("doorIds") or []
+        door_ids = _norm_int_list(device.get("doorIds") or [])
         if not door_ids:
-            door_ids = [DEFAULT_AUTHORIZE_DOOR_ID]
-        device["doorIds"] = door_ids
+            door_ids = [int(default_door_id)]
+        device["doorIds"] = door_ids  # keep for downstream use
 
         now = datetime.now()
         out: Dict[str, Dict[str, Any]] = {}
@@ -203,7 +263,6 @@ class DeviceSyncEngine:
             pin = _pin_str(u.get("activeMembershipId"))
             if not pin:
                 continue
-
             if not pin.isdigit():
                 continue
 
@@ -233,6 +292,7 @@ class DeviceSyncEngine:
         Priority:
           1) user['fingerprints'] from cache
           2) local SQLite fingerprints table (newest per finger_id)
+
         Output items:
           { fingerId:int, templateVersion:int, templateData:str, templateSize:int }
         """
@@ -282,30 +342,41 @@ class DeviceSyncEngine:
             if not td:
                 continue
             try:
-                tv_i = int(getattr(r, "template_version"))
+                tmpl_version_i = int(getattr(r, "template_version"))
             except Exception:
-                tv_i = 10
+                tmpl_version_i = 10
             try:
                 ts_i = int(getattr(r, "template_size"))
             except Exception:
                 ts_i = len(td)
             best_local[fid_i] = {
                 "fingerId": fid_i,
-                "templateVersion": tv_i,
+                "templateVersion": tmpl_version_i,
                 "templateData": td,
                 "templateSize": ts_i,
             }
 
         return [best_local[k] for k in sorted(best_local.keys())]
 
-    def _push_userauthorize(self, sdk: PullSDK, *, pin: str, door_ids: List[int]) -> Tuple[int, str | None]:
+    def _push_userauthorize(
+        self,
+        sdk: PullSDK,
+        *,
+        pin: str,
+        door_ids: List[int],
+        authorize_timezone_id: int,
+    ) -> Tuple[int, str | None]:
         if not door_ids:
-            door_ids = [DEFAULT_AUTHORIZE_DOOR_ID]
+            door_ids = [self._default_authorize_door_id()]
+
+        tz = int(authorize_timezone_id or 1)
+        if tz < 1:
+            tz = 1
 
         patterns = [
-            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZone=1",
-            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZoneID=1",
-            lambda door: f"Pin={pin}\tAuthorizeDoorId={door}\tAuthorizeTimezoneId=1",
+            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZone={tz}",
+            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZoneID={tz}",
+            lambda door: f"Pin={pin}\tAuthorizeDoorId={door}\tAuthorizeTimezoneId={tz}",
         ]
 
         last_err = None
@@ -443,10 +514,12 @@ class DeviceSyncEngine:
         user: Dict[str, Any],
         door_ids: List[int],
         templates: List[Dict[str, Any]],
+        authorize_timezone_id: int,
     ) -> str:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
         doors_norm = ",".join(str(x) for x in _norm_int_list(door_ids))
+        tz = int(authorize_timezone_id or 1)
 
         tpl_parts: List[str] = []
         for t in templates or []:
@@ -462,7 +535,11 @@ class DeviceSyncEngine:
             tpl_parts.append(f"{fid}:{tv}:{ts}:{td}")
         tpl_blob = "|".join(tpl_parts)
 
-        payload = f"pin={pin}\nname={full_name}\ncard={card}\ndoors={doors_norm}\ntemplates={tpl_blob}\n"
+        payload = (
+            f"pin={pin}\nname={full_name}\ncard={card}\n"
+            f"doors={doors_norm}\nauthorizeTimezoneId={tz}\n"
+            f"templates={tpl_blob}\n"
+        )
         return _sha1_hex(payload)
 
     def _sync_one_device(
@@ -471,6 +548,7 @@ class DeviceSyncEngine:
         device: Dict[str, Any],
         users: List[Dict[str, Any]],
         local_fp_index: Dict[str, List[Any]],
+        default_door_id: int,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
@@ -478,10 +556,14 @@ class DeviceSyncEngine:
         port = _to_int(device.get("portNumber"), default=4370) or 4370
         pwd = device.get("password") or ""
 
+        authorize_timezone_id = _to_int(device.get("authorizeTimezoneId"), default=1) or 1
+        if authorize_timezone_id < 1:
+            authorize_timezone_id = 1
+
         door_ids_raw = device.get("doorIds") or []
         door_ids = _norm_int_list(door_ids_raw)
         if not door_ids:
-            door_ids = [DEFAULT_AUTHORIZE_DOOR_ID]
+            door_ids = [int(default_door_id)]
 
         if dev_id is None:
             self.logger.warning(f"[DeviceSync] Skip device name={dev_name!r}: missing id")
@@ -495,7 +577,7 @@ class DeviceSyncEngine:
             self.logger.warning(f"[DeviceSync] Skip device id={dev_id} name={dev_name!r}: missing ipAddress")
             return
 
-        desired = self._filter_users_for_device(users=users, device=device)
+        desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
         desired_pins = set(desired.keys())
 
         known_server_pins: Set[str] = set()
@@ -512,14 +594,20 @@ class DeviceSyncEngine:
 
         for pin, u in desired.items():
             templates = self._collect_templates_for_pin(user=u, pin=pin, local_fp_index=local_fp_index)
-            dh = self._compute_desired_hash(pin=pin, user=u, door_ids=door_ids, templates=templates)
+            dh = self._compute_desired_hash(
+                pin=pin,
+                user=u,
+                door_ids=door_ids,
+                templates=templates,
+                authorize_timezone_id=authorize_timezone_id,
+            )
             desired_hashes[pin] = dh
             if prev_hashes.get(pin) != dh:
                 pins_to_sync.add(pin)
                 templates_for_sync[pin] = templates
 
         self.logger.info(
-            f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} desired={len(desired_pins)} to_sync={len(pins_to_sync)} doors={door_ids}"
+            f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} desired={len(desired_pins)} to_sync={len(pins_to_sync)} doors={door_ids} tz={authorize_timezone_id}"
         )
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
@@ -536,7 +624,7 @@ class DeviceSyncEngine:
                 fields="Pin",
                 filter_expr="",
                 options="",
-                initial_size=1_048_576,
+                initial_size=self._sdk_read_initial_bytes(),  # ✅ backend-driven knob
             )
             device_pins: Set[str] = set()
             for r in rows:
@@ -582,9 +670,14 @@ class DeviceSyncEngine:
                     sdk.set_device_data(table="user", data="\t".join(pairs) + "\r\n", options="")
                     pushed_users += 1
 
-                    # 2) authorize
+                    # 2) authorize (respect backend timezone id)
                     try:
-                        _, auth_err = self._push_userauthorize(sdk, pin=pin, door_ids=door_ids)
+                        _, auth_err = self._push_userauthorize(
+                            sdk,
+                            pin=pin,
+                            door_ids=door_ids,
+                            authorize_timezone_id=int(authorize_timezone_id),
+                        )
                         if auth_err:
                             self.logger.debug(f"[DeviceSync] Pin={pin} authorize warn: {auth_err}")
                     except Exception as ex:
@@ -636,7 +729,10 @@ class DeviceSyncEngine:
             self.logger.info("[DeviceSync] No cache -> skip")
             return
 
+        # Users are already normalized to payload-ish dicts by db.load_sync_cache()
         users = getattr(cache, "users", []) or []
+
+        # Devices may be snake_case rows (from normalized table) OR camelCase (fallback payload)
         devices_raw = getattr(cache, "devices", []) or []
         devices = [self._normalize_device(d) for d in devices_raw if isinstance(d, dict)]
 
@@ -655,17 +751,23 @@ class DeviceSyncEngine:
             self.logger.info("[DeviceSync] No devices in cache -> skip")
             return
 
+        default_door_id = self._default_authorize_door_id()
+
         for d in devices:
             if not _boolish(d.get("active"), default=True):
                 continue
             if not _boolish(d.get("accessDevice"), default=True):
                 continue
+
             # Only sync DEVICE-mode devices; AGENT-mode devices are handled by AgentRealtimeEngine
-            if d.get("accessDataMode", "DEVICE") != "DEVICE":
-                self.logger.debug(f"[DeviceSync] Skip device id={d.get('id')} name={d.get('name')!r}: accessDataMode={d.get('accessDataMode')}")
+            if str(d.get("accessDataMode", "DEVICE")).strip().upper() != "DEVICE":
+                self.logger.debug(
+                    f"[DeviceSync] Skip device id={d.get('id')} name={d.get('name')!r}: accessDataMode={d.get('accessDataMode')}"
+                )
                 continue
+
             try:
-                self._sync_one_device(device=d, users=users, local_fp_index=local_fp_index)
+                self._sync_one_device(device=d, users=users, local_fp_index=local_fp_index, default_door_id=default_door_id)
             except PullSDKError as ex:
                 self.logger.warning(f"[DeviceSync] Device id={d.get('id')} sync failed (PullSDK): {ex}")
             except Exception as ex:

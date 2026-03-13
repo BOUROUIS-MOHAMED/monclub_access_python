@@ -96,5 +96,8 @@ Write-Host "StageDir : $stageDir" -ForegroundColor Cyan
 Write-Host ("Updater  : {0} ({1:N2} MB)" -f $updaterExe, $sizeMb) -ForegroundColor Cyan
 
 & "$iscc" ".\installer\MonClubAccess.iss" "/DReleaseId=$releaseId" "/DStageDir=$stageDir"
+if ($LASTEXITCODE -ne 0) {
+  throw "ISCC compile failed with exit code $LASTEXITCODE"
+}
 
-Write-Host "Installer built in .\release (MonClubAccessSetup-$releaseId.exe) ✅" -ForegroundColor Green
+Write-Host "Installer built in .\release (MonClubAccessSetup-$releaseId.exe) OK" -ForegroundColor Green

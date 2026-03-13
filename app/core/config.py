@@ -127,15 +127,15 @@ class AppConfig:
     local_api_enabled: bool = True
     local_api_host: str = "127.0.0.1"
     local_api_port: int = 8788
+
     # -------------------------
     # Desktop auto-update
     # -------------------------
-    api_latest_release_url: str = "http://localhost:5000/api/v1/manager/access/getLatestAccessSoftwareRelease"
+    api_latest_release_url: str = "http://monclubwigo.tn/api/v1/manager/access/getLatestAccessSoftwareRelease"
 
     update_enabled: bool = True
-    update_platform: str = "WINDOWS"   # request param (server returns "windows")
-    update_channel: str = "stable"     # stable for now
-   # update_check_interval_sec: int = 3 * 60 * 60  # 3 hours
+    update_platform: str = "WINDOWS"  # request param (server returns "windows")
+    update_channel: str = "stable"
     update_check_interval_sec: int = 30
     update_auto_download_zip: bool = True
 
@@ -159,15 +159,20 @@ class AppConfig:
     # -------------------------
     # MonClub API
     # -------------------------
-    api_login_url: str = "http://localhost:5000/api/v1/public/access/v1/gym/login"
-    api_sync_url: str = "http://localhost:5000/api/v1/manager/gym/access/v1/users/get_gym_users"
-    api_create_user_fingerprint_url: str = "http://localhost:5000/api/v1/manager/userFingerprint/create"
-
+    api_login_url: str = "http://monclubwigo.tn/api/v1/public/access/v1/gym/login"
+    api_sync_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/users/get_gym_users"
+    api_create_user_fingerprint_url: str = "http://monclubwigo.tn/api/v1/manager/userFingerprint/create"
+    api_access_create_membership_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/activeMembership/create"
+    api_access_create_account_membership_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/account-and-activeMembership/create"
+    api_tv_snapshot_latest_url: str = "http://monclubwigo.tn/api/v1/manager/tv/screens/{screenId}/snapshots/latest"
+    api_tv_snapshot_manifest_url: str = "http://monclubwigo.tn/api/v1/manager/tv/snapshots/{snapshotId}/asset-manifest"
+    api_tv_ad_tasks_fetch_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks"
+    api_tv_ad_task_confirm_ready_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/confirm-ready"
     # -------------------------
     # Sync schedule (seconds)
     # -------------------------
     sync_interval_sec: int = 60
-    max_login_age_minutes: int = 60
+    max_login_age_minutes: int = 43200
 
     # Enable controller sync engine (DEVICE mode only)
     device_sync_enabled: bool = True
@@ -180,7 +185,7 @@ class AppConfig:
     # Global settings for realtime engine (persisted in config.json)
     agent_global: Dict[str, Any] = field(
         default_factory=lambda: {
-            "notification_rate_limit_per_minute": 30,  # toasts/min
+            "notification_rate_limit_per_minute": 30,
             "notification_dedupe_window_sec": 30,
             "history_retention_days": 30,
             "event_queue_max": 5000,
@@ -190,10 +195,9 @@ class AppConfig:
             "decision_ema_alpha": 0.2,
             "notification_service_enabled": True,
             "history_service_enabled": True,
-            # image cache (aliases supported)
             "image_cache_enabled": True,
             "image_cache_timeout_sec": 2.0,
-            "image_cache_max_bytes": 5242880,  # 5MB
+            "image_cache_max_bytes": 5242880,
             "image_cache_max_files": 1000,
             "show_notifications": True,
         }
@@ -249,13 +253,6 @@ class AppConfig:
 
     # -------------------------
     # AGENT / global settings  (READ-ONLY from backend SQLite cache)
-    #
-    # IMPORTANT (Mar 2026):
-    #   Settings now come from GymAccessSoftwareSettingsDto (global) and
-    #   GymDeviceDto (per device), cached in local SQLite by save_sync_cache().
-    #   The local agent_global / agent_devices dicts in config.json are NO
-    #   LONGER the source of truth. These methods now read from SQLite and
-    #   fall back to safe defaults if the cache is empty.
     # -------------------------
     def get_agent_global(self) -> Dict[str, Any]:
         """
@@ -265,9 +262,9 @@ class AppConfig:
         """
         try:
             from app.core.settings_reader import get_backend_global_settings
+
             return get_backend_global_settings()
         except Exception:
-            # absolute fallback: return safe defaults
             return {
                 "notification_rate_limit_per_minute": 30,
                 "notification_dedupe_window_sec": 30,
@@ -294,9 +291,9 @@ class AppConfig:
         """
         try:
             from app.core.settings_reader import get_backend_device_settings
+
             return get_backend_device_settings(int(device_id))
         except Exception:
-            # absolute fallback: return safe defaults
             return {
                 "enabled": True,
                 "adaptive_sleep": True,
@@ -337,7 +334,6 @@ class AppConfig:
         effect on the actual runtime settings. Use the backend dashboard to
         change device settings.
         """
-        # No-op: settings are read-only from backend SQLite cache.
         pass
 
     # -------------------------
@@ -433,6 +429,18 @@ class AppConfig:
             cfg.api_sync_url = AppConfig.api_sync_url
         if not cfg.api_create_user_fingerprint_url:
             cfg.api_create_user_fingerprint_url = AppConfig.api_create_user_fingerprint_url
+        if not cfg.api_access_create_membership_url:
+            cfg.api_access_create_membership_url = AppConfig.api_access_create_membership_url
+        if not cfg.api_access_create_account_membership_url:
+            cfg.api_access_create_account_membership_url = AppConfig.api_access_create_account_membership_url
+        if not cfg.api_tv_snapshot_latest_url:
+            cfg.api_tv_snapshot_latest_url = AppConfig.api_tv_snapshot_latest_url
+        if not cfg.api_tv_snapshot_manifest_url:
+            cfg.api_tv_snapshot_manifest_url = AppConfig.api_tv_snapshot_manifest_url
+        if not cfg.api_tv_ad_tasks_fetch_url:
+            cfg.api_tv_ad_tasks_fetch_url = AppConfig.api_tv_ad_tasks_fetch_url
+        if not cfg.api_tv_ad_task_confirm_ready_url:
+            cfg.api_tv_ad_task_confirm_ready_url = AppConfig.api_tv_ad_task_confirm_ready_url
 
         # sync interval
         try:
@@ -444,11 +452,14 @@ class AppConfig:
 
         # max login age
         try:
-            cfg.max_login_age_minutes = int(cfg.max_login_age_minutes) if cfg.max_login_age_minutes else 60
+            cfg.max_login_age_minutes = int(cfg.max_login_age_minutes) if cfg.max_login_age_minutes else 43200
         except Exception:
-            cfg.max_login_age_minutes = 60
+            cfg.max_login_age_minutes = 43200
         if cfg.max_login_age_minutes < 1:
-            cfg.max_login_age_minutes = 1
+            cfg.max_login_age_minutes = 43200
+        if cfg.max_login_age_minutes == 60:
+            # migrate old 1h default to 30 days
+            cfg.max_login_age_minutes = 43200
 
         # device_sync_enabled
         cfg.device_sync_enabled = bool(cfg.device_sync_enabled) if cfg.device_sync_enabled is not None else True
@@ -465,6 +476,7 @@ class AppConfig:
 
         if cfg.login_email is None:
             cfg.login_email = ""
+
         # update system
         if not getattr(cfg, "api_latest_release_url", ""):
             cfg.api_latest_release_url = AppConfig.api_latest_release_url
@@ -475,8 +487,7 @@ class AppConfig:
         cfg.update_channel = _safe_str(getattr(cfg, "update_channel", "stable"), "stable").strip().lower() or "stable"
 
         try:
-          #  cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 3 * 60 * 60) or (3 * 60 * 60))
-            cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 30) or (30))
+            cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 30) or 30)
         except Exception:
             cfg.update_check_interval_sec = 3 * 60 * 60
         if cfg.update_check_interval_sec < 60:
@@ -496,3 +507,10 @@ def load_config() -> AppConfig:
 
 def save_config(cfg: AppConfig) -> None:
     save_json(CONFIG_PATH, cfg.to_dict())
+
+
+
+
+
+
+

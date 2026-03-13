@@ -1,0 +1,782 @@
+
+def _load_tv_player_state_row(conn, binding_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute("SELECT * FROM tv_player_state WHERE binding_id=? LIMIT 1", (int(binding_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def _insert_tv_player_event(
+    conn,
+    *,
+    binding_id: int,
+    event_type: str,
+    severity: str = "INFO",
+    message: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO tv_player_event (binding_id, event_type, severity, message, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            int(binding_id),
+            _safe_str(event_type, "UNKNOWN"),
+            _safe_str(severity, "INFO") or "INFO",
+            _safe_str(message, "") or None,
+            _json(payload or {}),
+            now_iso(),
+        ),
+    )
+
+
+def list_tv_player_events(*, binding_id: int, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+    ensure_tv_local_schema()
+    bid = int(binding_id)
+    lim = max(1, min(int(limit or 100), 500))
+    off = max(0, int(offset or 0))
+    with get_conn() as conn:
+        total_row = conn.execute("SELECT COUNT(*) AS c FROM tv_player_event WHERE binding_id=?", (bid,)).fetchone()
+        rows = conn.execute(
+            "SELECT * FROM tv_player_event WHERE binding_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (bid, lim, off),
+        ).fetchall()
+    return {"total": int((total_row["c"] if total_row else 0) or 0), "rows": [dict(r) for r in rows]}
+
+
+def load_tv_player_state(*, binding_id: int) -> Dict[str, Any]:
+    ensure_tv_local_schema()
+    bid = int(binding_id)
+    if bid <= 0:
+        return {}
+    with get_conn() as conn:
+        row = _load_tv_player_state_row(conn, bid)
+        if row:
+            return row
+        b = _load_binding_row(conn, bid)
+        if not b:
+            return {}
+        sid = _safe_int(b.get("screen_id"), 0)
+    return {
+        "binding_id": bid,
+        "screen_id": sid,
+        "active_snapshot_id": None,
+        "active_snapshot_version": None,
+        "current_day_of_week": None,
+        "current_minute_of_day": None,
+        "current_visual_item_id": None,
+        "current_audio_item_id": None,
+        "current_visual_asset_id": None,
+        "current_audio_asset_id": None,
+        "current_visual_asset_path": None,
+        "current_audio_asset_path": None,
+        "player_state": PLAYER_STATE_IDLE,
+        "render_mode": PLAYER_RENDER_IDLE_FALLBACK,
+        "fallback_reason": None,
+        "video_muted_by_audio": 0,
+        "last_render_error_code": None,
+        "last_render_error_message": None,
+        "last_tick_at": None,
+        "last_snapshot_check_at": None,
+        "last_state_change_at": None,
+        "updated_at": None,
+    }
+
+
+def _parse_minute_of_day(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        minute = int(value)
+        if 0 <= minute <= 1440:
+            return minute
+        return None
+    s = _safe_str(value, "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        minute = _safe_int(s, -1)
+        if 0 <= minute <= 1440:
+            return minute
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if not m:
+        return None
+    h = _safe_int(m.group(1), -1)
+    mm = _safe_int(m.group(2), -1)
+    if h == 24 and mm == 0:
+        return 1440
+    if not (0 <= h <= 23 and 0 <= mm <= 59):
+        return None
+    return h * 60 + mm
+
+
+def _normalize_timeline_type(value: Any) -> str:
+    s = _safe_str(value, "").strip().upper()
+    if s in ("VISUAL", "AUDIO"):
+        return s
+    if s in ("VIDEO", "IMAGE"):
+        return "VISUAL"
+    return ""
+
+
+def _normalize_timeline_item(raw: Dict[str, Any], default_timeline: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    timeline = _normalize_timeline_type(_first(raw, "timelineType", "timeline_type", "timeline", "type")) or _normalize_timeline_type(default_timeline)
+    if timeline not in ("VISUAL", "AUDIO"):
+        return None
+
+    start = _parse_minute_of_day(_first(raw, "startMinuteOfDay", "start_minute_of_day", "startMinute", "start_minute", "startTime", "start"))
+    end = _parse_minute_of_day(_first(raw, "endMinuteOfDay", "end_minute_of_day", "endMinute", "end_minute", "endTime", "end"))
+    if start is None or end is None or start < 0 or end > 1440 or end <= start:
+        return None
+
+    media_obj = raw.get("mediaAsset") if isinstance(raw.get("mediaAsset"), dict) else {}
+    media_asset_id = _safe_str(_first(raw, "mediaAssetId", "media_asset_id", "assetId", "asset_id", "mediaId", "media_id"), "")
+    if not media_asset_id:
+        media_asset_id = _safe_str(_first(media_obj, "id", "mediaAssetId", "media_asset_id", "assetId"), "")
+    if not media_asset_id:
+        return None
+
+    item_id = _safe_str(_first(raw, "id", "itemId", "item_id", "presetItemId", "preset_item_id", "sourcePresetItemId", "source_preset_item_id"), "")
+    if not item_id:
+        item_id = f"{timeline}:{media_asset_id}:{start}-{end}"
+
+    media_type = _safe_str(_first(raw, "mediaType", "media_type", "type"), "") or _safe_str(_first(media_obj, "mediaType", "media_type", "type"), "")
+    media_type = media_type.upper().strip()
+
+    return {
+        "itemId": item_id,
+        "timelineType": timeline,
+        "mediaAssetId": media_asset_id,
+        "startMinuteOfDay": int(start),
+        "endMinuteOfDay": int(end),
+        "mediaType": media_type,
+        "title": _safe_str(_first(raw, "title", "label", "name"), "") or _safe_str(_first(media_obj, "title", "name"), ""),
+        "videoAudioEnabled": _binding_bool(_first(raw, "videoAudioEnabled", "video_audio_enabled", "audioEnabled", "audio_enabled")),
+    }
+
+
+def _extract_timeline_items(payload: Dict[str, Any], timeline_type: str) -> List[Dict[str, Any]]:
+    wanted = _normalize_timeline_type(timeline_type)
+    if wanted not in ("VISUAL", "AUDIO"):
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+
+    for key in ("timelineItems", "timeline_items", "resolvedTimelineItems", "resolved_timeline_items", "items"):
+        arr = payload.get(key)
+        if isinstance(arr, list):
+            for raw in arr:
+                item = _normalize_timeline_item(raw if isinstance(raw, dict) else {}, "")
+                if item and item.get("timelineType") == wanted:
+                    candidates.append(item)
+
+    for key in ("visualTimelineItems", "visual_timeline_items"):
+        arr = payload.get(key)
+        if wanted == "VISUAL" and isinstance(arr, list):
+            for raw in arr:
+                item = _normalize_timeline_item(raw if isinstance(raw, dict) else {}, "VISUAL")
+                if item:
+                    candidates.append(item)
+
+    for key in ("audioTimelineItems", "audio_timeline_items"):
+        arr = payload.get(key)
+        if wanted == "AUDIO" and isinstance(arr, list):
+            for raw in arr:
+                item = _normalize_timeline_item(raw if isinstance(raw, dict) else {}, "AUDIO")
+                if item:
+                    candidates.append(item)
+
+    for key in ("timelines", "resolvedTimelines", "resolved_timelines", "resolvedTimeline", "resolved_timeline"):
+        obj = payload.get(key)
+        if not isinstance(obj, dict):
+            continue
+        src = obj.get("visual") if wanted == "VISUAL" else obj.get("audio")
+        if src is None:
+            src = obj.get("VISUAL") if wanted == "VISUAL" else obj.get("AUDIO")
+        if isinstance(src, dict):
+            arr = src.get("items")
+            if isinstance(arr, list):
+                for raw in arr:
+                    item = _normalize_timeline_item(raw if isinstance(raw, dict) else {}, wanted)
+                    if item:
+                        candidates.append(item)
+        elif isinstance(src, list):
+            for raw in src:
+                item = _normalize_timeline_item(raw if isinstance(raw, dict) else {}, wanted)
+                if item:
+                    candidates.append(item)
+
+    dedup: Dict[str, Dict[str, Any]] = {}
+    for item in candidates:
+        k = f"{item.get('timelineType')}|{item.get('itemId')}|{item.get('mediaAssetId')}|{item.get('startMinuteOfDay')}|{item.get('endMinuteOfDay')}"
+        dedup[k] = item
+
+    rows = list(dedup.values())
+    rows.sort(key=lambda x: (_safe_int(x.get("startMinuteOfDay"), 0), _safe_int(x.get("endMinuteOfDay"), 0), _safe_str(x.get("itemId"), "")))
+    return rows
+
+
+def _resolve_player_timezone(snapshot_payload: Dict[str, Any], snapshot_row: Dict[str, Any]) -> str:
+    candidates = [
+        _first(snapshot_payload, "timezone", "timeZone"),
+    ]
+    if isinstance(snapshot_payload.get("screen"), dict):
+        candidates.append(_first(snapshot_payload.get("screen"), "timezone", "timeZone"))
+    if isinstance(snapshot_payload.get("metadata"), dict):
+        candidates.append(_first(snapshot_payload.get("metadata"), "timezone", "timeZone"))
+    if isinstance(snapshot_row, dict):
+        candidates.append(_first(snapshot_row, "timezone", "time_zone"))
+
+    for c in candidates:
+        tz = _safe_str(c, "").strip()
+        if not tz:
+            continue
+        if ZoneInfo is None:
+            return tz
+        try:
+            ZoneInfo(tz)
+            return tz
+        except Exception:
+            continue
+
+    try:
+        return datetime.now().astimezone().tzinfo.key  # type: ignore[attr-defined]
+    except Exception:
+        return "UTC"
+
+
+def _clock_for_timezone(tz_name: str, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    if now_dt is None:
+        now_dt = datetime.now()
+    if ZoneInfo is not None:
+        try:
+            now_dt = now_dt.astimezone(ZoneInfo(_safe_str(tz_name, "UTC") or "UTC"))
+        except Exception:
+            now_dt = datetime.now().astimezone()
+    else:
+        now_dt = now_dt.astimezone()
+    return {
+        "iso": now_dt.isoformat(),
+        "dayOfWeek": now_dt.strftime("%A").upper(),
+        "minuteOfDay": int(now_dt.hour) * 60 + int(now_dt.minute),
+    }
+
+
+def _asset_path_from_row(row: Dict[str, Any]) -> str:
+    p = _safe_str(row.get("local_file_path"), "").strip()
+    if p:
+        return p
+    return _safe_str(row.get("expected_local_path"), "").strip()
+
+
+def _path_is_readable(path_str: str) -> bool:
+    p = Path(_safe_str(path_str, "").strip())
+    if not p.exists() or not p.is_file():
+        return False
+    try:
+        with p.open("rb") as f:
+            _ = f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+def _select_current_timeline_item(items: List[Dict[str, Any]], minute_of_day: int) -> Optional[Dict[str, Any]]:
+    minute = int(minute_of_day)
+    matches = [
+        item
+        for item in items
+        if _safe_int(item.get("startMinuteOfDay"), -1) <= minute < _safe_int(item.get("endMinuteOfDay"), -1)
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda x: (_safe_int(x.get("startMinuteOfDay"), 0), _safe_str(x.get("itemId"), "")))
+    return matches[0]
+
+
+def _present_timeline_item(item: Dict[str, Any], asset_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    asset = asset_row or {}
+    candidate_path = _asset_path_from_row(asset)
+    readable = _path_is_readable(candidate_path) if candidate_path else False
+    asset_state = _safe_str(asset.get("asset_state"), "")
+    renderable = asset_state == ASSET_STATE_VALID and readable
+    return {
+        "itemId": _safe_str(item.get("itemId"), ""),
+        "timelineType": _safe_str(item.get("timelineType"), ""),
+        "mediaAssetId": _safe_str(item.get("mediaAssetId"), ""),
+        "mediaType": _safe_str(item.get("mediaType"), _safe_str(asset.get("media_type"), "")).upper(),
+        "title": _safe_str(item.get("title"), "") or _safe_str(asset.get("title"), ""),
+        "startMinuteOfDay": _safe_int(item.get("startMinuteOfDay"), 0),
+        "endMinuteOfDay": _safe_int(item.get("endMinuteOfDay"), 0),
+        "videoAudioEnabled": bool(item.get("videoAudioEnabled")),
+        "assetPath": candidate_path or None,
+        "assetState": asset_state or None,
+        "assetRenderable": bool(renderable),
+        "stateReason": _safe_str(asset.get("state_reason"), "") or None,
+    }
+
+
+def _decide_player_mode(current_visual: Optional[Dict[str, Any]], current_audio: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    v_exists = bool(current_visual)
+    a_exists = bool(current_audio)
+    v_ok = bool((current_visual or {}).get("assetRenderable"))
+    a_ok = bool((current_audio or {}).get("assetRenderable"))
+
+    if not v_exists and not a_exists:
+        return {
+            "playerState": PLAYER_STATE_BLOCKED_NO_RENDERABLE_ITEM,
+            "renderMode": PLAYER_RENDER_IDLE_FALLBACK,
+            "fallbackReason": PLAYER_FALLBACK_NO_CURRENT_ITEM,
+            "errorCode": None,
+            "errorMessage": None,
+        }
+
+    if v_ok and a_ok:
+        return {
+            "playerState": PLAYER_STATE_RENDERING,
+            "renderMode": PLAYER_RENDER_VISUAL_AND_AUDIO,
+            "fallbackReason": None,
+            "errorCode": None,
+            "errorMessage": None,
+        }
+
+    if v_ok and not a_exists:
+        return {
+            "playerState": PLAYER_STATE_RENDERING,
+            "renderMode": PLAYER_RENDER_VISUAL_ONLY,
+            "fallbackReason": None,
+            "errorCode": None,
+            "errorMessage": None,
+        }
+
+    if a_ok and not v_exists:
+        return {
+            "playerState": PLAYER_STATE_RENDERING,
+            "renderMode": PLAYER_RENDER_AUDIO_ONLY,
+            "fallbackReason": None,
+            "errorCode": None,
+            "errorMessage": None,
+        }
+
+    if v_ok and a_exists and not a_ok:
+        return {
+            "playerState": PLAYER_STATE_FALLBACK_RENDERING,
+            "renderMode": PLAYER_RENDER_VISUAL_ONLY,
+            "fallbackReason": PLAYER_FALLBACK_AUDIO_ASSET_INVALID,
+            "errorCode": None,
+            "errorMessage": "Current audio asset is invalid/unreadable.",
+        }
+
+    if a_ok and v_exists and not v_ok:
+        return {
+            "playerState": PLAYER_STATE_FALLBACK_RENDERING,
+            "renderMode": PLAYER_RENDER_AUDIO_ONLY,
+            "fallbackReason": PLAYER_FALLBACK_VISUAL_ASSET_INVALID,
+            "errorCode": None,
+            "errorMessage": "Current visual asset is invalid/unreadable.",
+        }
+
+    reason = PLAYER_FALLBACK_BOTH_ASSETS_INVALID if v_exists and a_exists else (PLAYER_FALLBACK_VISUAL_ASSET_INVALID if v_exists else PLAYER_FALLBACK_AUDIO_ASSET_INVALID)
+    return {
+        "playerState": PLAYER_STATE_ERROR,
+        "renderMode": PLAYER_RENDER_ERROR_FALLBACK,
+        "fallbackReason": reason,
+        "errorCode": "ASSET_INVALID",
+        "errorMessage": "Current render asset is invalid or unreadable.",
+    }
+
+
+def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    ensure_tv_local_schema()
+    bid = int(binding_id)
+    if bid <= 0:
+        return {
+            "ok": False,
+            "bindingId": bid,
+            "screenId": None,
+            "playerState": PLAYER_STATE_BLOCKED_NO_BINDING,
+            "renderMode": PLAYER_RENDER_IDLE_FALLBACK,
+            "fallbackReason": PLAYER_FALLBACK_BINDING_NOT_FOUND,
+            "error": "BINDING_NOT_FOUND",
+        }
+
+    with get_conn() as conn:
+        b = _load_binding_row(conn, bid)
+        if not b:
+            return {
+                "ok": False,
+                "bindingId": bid,
+                "screenId": None,
+                "playerState": PLAYER_STATE_BLOCKED_NO_BINDING,
+                "renderMode": PLAYER_RENDER_IDLE_FALLBACK,
+                "fallbackReason": PLAYER_FALLBACK_BINDING_NOT_FOUND,
+                "error": "BINDING_NOT_FOUND",
+            }
+
+        sid = _safe_int(b.get("screen_id"), 0)
+        if not _binding_bool(b.get("enabled")):
+            return {
+                "ok": True,
+                "bindingId": bid,
+                "screenId": sid,
+                "bindingEnabled": False,
+                "activeSnapshotId": None,
+                "activeSnapshotVersion": None,
+                "timezone": "UTC",
+                "currentDayOfWeek": None,
+                "currentMinuteOfDay": None,
+                "visualItems": [],
+                "audioItems": [],
+                "currentVisual": None,
+                "currentAudio": None,
+                "playerState": PLAYER_STATE_BLOCKED_BINDING_DISABLED,
+                "renderMode": PLAYER_RENDER_IDLE_FALLBACK,
+                "fallbackReason": PLAYER_FALLBACK_BINDING_DISABLED,
+                "lastRenderErrorCode": None,
+                "lastRenderErrorMessage": None,
+                "videoMutedByAudio": False,
+                "evaluatedAt": now_iso(),
+            }
+
+        activation = _build_activation_status(screen_id=sid)
+        state = (activation or {}).get("state") or {}
+        active_snapshot_id = _safe_str(state.get("active_snapshot_id"), "")
+        active_snapshot_version = _safe_int(state.get("active_snapshot_version"), 0)
+
+        if not active_snapshot_id or active_snapshot_version <= 0:
+            return {
+                "ok": True,
+                "bindingId": bid,
+                "screenId": sid,
+                "bindingEnabled": True,
+                "activeSnapshotId": None,
+                "activeSnapshotVersion": None,
+                "timezone": "UTC",
+                "currentDayOfWeek": None,
+                "currentMinuteOfDay": None,
+                "visualItems": [],
+                "audioItems": [],
+                "currentVisual": None,
+                "currentAudio": None,
+                "playerState": PLAYER_STATE_BLOCKED_NO_ACTIVE_SNAPSHOT,
+                "renderMode": PLAYER_RENDER_IDLE_FALLBACK,
+                "fallbackReason": PLAYER_FALLBACK_NO_ACTIVE_SNAPSHOT,
+                "lastRenderErrorCode": None,
+                "lastRenderErrorMessage": None,
+                "videoMutedByAudio": False,
+                "evaluatedAt": now_iso(),
+            }
+
+        row = conn.execute(
+            "SELECT * FROM tv_snapshot_cache WHERE screen_id=? AND snapshot_id=? LIMIT 1",
+            (sid, active_snapshot_id),
+        ).fetchone()
+        if not row:
+            return {
+                "ok": True,
+                "bindingId": bid,
+                "screenId": sid,
+                "bindingEnabled": True,
+                "activeSnapshotId": active_snapshot_id,
+                "activeSnapshotVersion": active_snapshot_version,
+                "timezone": "UTC",
+                "currentDayOfWeek": None,
+                "currentMinuteOfDay": None,
+                "visualItems": [],
+                "audioItems": [],
+                "currentVisual": None,
+                "currentAudio": None,
+                "playerState": PLAYER_STATE_ERROR,
+                "renderMode": PLAYER_RENDER_ERROR_FALLBACK,
+                "fallbackReason": PLAYER_FALLBACK_SNAPSHOT_INVALID,
+                "lastRenderErrorCode": "SNAPSHOT_NOT_FOUND",
+                "lastRenderErrorMessage": "Active snapshot row is missing locally.",
+                "videoMutedByAudio": False,
+                "evaluatedAt": now_iso(),
+            }
+
+        snap_row = dict(row)
+        try:
+            payload = json.loads(snap_row.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+
+        if _safe_str(snap_row.get("manifest_status"), "") != MANIFEST_STATUS_COMPLETE:
+            return {
+                "ok": True,
+                "bindingId": bid,
+                "screenId": sid,
+                "bindingEnabled": True,
+                "activeSnapshotId": active_snapshot_id,
+                "activeSnapshotVersion": active_snapshot_version,
+                "timezone": "UTC",
+                "currentDayOfWeek": None,
+                "currentMinuteOfDay": None,
+                "visualItems": [],
+                "audioItems": [],
+                "currentVisual": None,
+                "currentAudio": None,
+                "playerState": PLAYER_STATE_ERROR,
+                "renderMode": PLAYER_RENDER_ERROR_FALLBACK,
+                "fallbackReason": PLAYER_FALLBACK_SNAPSHOT_INVALID,
+                "lastRenderErrorCode": "MANIFEST_INCOMPLETE",
+                "lastRenderErrorMessage": "Active snapshot manifest is not complete.",
+                "videoMutedByAudio": False,
+                "evaluatedAt": now_iso(),
+            }
+
+        tz_name = _resolve_player_timezone(payload if isinstance(payload, dict) else {}, snap_row)
+        clock = _clock_for_timezone(tz_name, now_dt)
+        minute = _safe_int(clock.get("minuteOfDay"), 0)
+
+        visual_items = _extract_timeline_items(payload if isinstance(payload, dict) else {}, "VISUAL")
+        audio_items = _extract_timeline_items(payload if isinstance(payload, dict) else {}, "AUDIO")
+
+        asset_rows = conn.execute(
+            "SELECT * FROM tv_local_asset_state WHERE snapshot_id=? ORDER BY media_asset_id ASC",
+            (active_snapshot_id,),
+        ).fetchall()
+        asset_map: Dict[str, Dict[str, Any]] = {}
+        for ar in asset_rows:
+            d = dict(ar)
+            asset_map[_safe_str(d.get("media_asset_id"), "")] = d
+
+    visual_presented = [_present_timeline_item(item, asset_map.get(_safe_str(item.get("mediaAssetId"), ""))) for item in visual_items]
+    audio_presented = [_present_timeline_item(item, asset_map.get(_safe_str(item.get("mediaAssetId"), ""))) for item in audio_items]
+
+    current_visual = _select_current_timeline_item(visual_presented, minute)
+    current_audio = _select_current_timeline_item(audio_presented, minute)
+
+    decision = _decide_player_mode(current_visual, current_audio)
+
+    video_muted = False
+    if current_visual and _safe_str(current_visual.get("mediaType"), "").upper() == "VIDEO":
+        if bool((current_audio or {}).get("assetRenderable")):
+            video_muted = True
+        else:
+            video_muted = not bool(current_visual.get("videoAudioEnabled"))
+
+    return {
+        "ok": True,
+        "bindingId": bid,
+        "screenId": sid,
+        "bindingEnabled": True,
+        "activeSnapshotId": active_snapshot_id,
+        "activeSnapshotVersion": active_snapshot_version,
+        "timezone": tz_name,
+        "currentDayOfWeek": _safe_str(clock.get("dayOfWeek"), "") or None,
+        "currentMinuteOfDay": minute,
+        "visualItems": visual_presented,
+        "audioItems": audio_presented,
+        "currentVisual": current_visual,
+        "currentAudio": current_audio,
+        "playerState": decision.get("playerState"),
+        "renderMode": decision.get("renderMode"),
+        "fallbackReason": decision.get("fallbackReason"),
+        "lastRenderErrorCode": decision.get("errorCode"),
+        "lastRenderErrorMessage": decision.get("errorMessage"),
+        "videoMutedByAudio": bool(video_muted),
+        "evaluatedAt": _safe_str(clock.get("iso"), now_iso()),
+    }
+
+
+def _player_state_payload_from_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    current_visual = (context or {}).get("currentVisual") if isinstance((context or {}).get("currentVisual"), dict) else {}
+    current_audio = (context or {}).get("currentAudio") if isinstance((context or {}).get("currentAudio"), dict) else {}
+    return {
+        "screen_id": _safe_int(context.get("screenId"), 0) or None,
+        "active_snapshot_id": _safe_str(context.get("activeSnapshotId"), "") or None,
+        "active_snapshot_version": _safe_int(context.get("activeSnapshotVersion"), 0) or None,
+        "current_day_of_week": _safe_str(context.get("currentDayOfWeek"), "") or None,
+        "current_minute_of_day": _safe_int(context.get("currentMinuteOfDay"), -1),
+        "current_visual_item_id": _safe_str(current_visual.get("itemId"), "") or None,
+        "current_audio_item_id": _safe_str(current_audio.get("itemId"), "") or None,
+        "current_visual_asset_id": _safe_str(current_visual.get("mediaAssetId"), "") or None,
+        "current_audio_asset_id": _safe_str(current_audio.get("mediaAssetId"), "") or None,
+        "current_visual_asset_path": _safe_str(current_visual.get("assetPath"), "") or None,
+        "current_audio_asset_path": _safe_str(current_audio.get("assetPath"), "") or None,
+        "player_state": _safe_str(context.get("playerState"), PLAYER_STATE_IDLE) or PLAYER_STATE_IDLE,
+        "render_mode": _safe_str(context.get("renderMode"), PLAYER_RENDER_IDLE_FALLBACK) or PLAYER_RENDER_IDLE_FALLBACK,
+        "fallback_reason": _safe_str(context.get("fallbackReason"), "") or None,
+        "video_muted_by_audio": 1 if _binding_bool(context.get("videoMutedByAudio")) else 0,
+        "last_render_error_code": _safe_str(context.get("lastRenderErrorCode"), "") or None,
+        "last_render_error_message": _safe_str(context.get("lastRenderErrorMessage"), "") or None,
+        "last_tick_at": _safe_str(context.get("evaluatedAt"), now_iso()),
+        "last_snapshot_check_at": now_iso(),
+    }
+
+
+def _player_meaningful_change(prev: Dict[str, Any], new_payload: Dict[str, Any]) -> bool:
+    keys = [
+        "active_snapshot_id",
+        "active_snapshot_version",
+        "current_visual_item_id",
+        "current_audio_item_id",
+        "current_visual_asset_path",
+        "current_audio_asset_path",
+        "player_state",
+        "render_mode",
+        "fallback_reason",
+        "last_render_error_code",
+        "last_render_error_message",
+        "video_muted_by_audio",
+    ]
+    for key in keys:
+        if _safe_str(prev.get(key), "") != _safe_str(new_payload.get(key), ""):
+            return True
+    return False
+
+
+def report_tv_player_state(
+    *,
+    binding_id: int,
+    payload: Dict[str, Any],
+    event_type: str = PLAYER_EVENT_STATE_CHANGED,
+    force: bool = False,
+    freshness_seconds: int = PLAYER_STATE_FRESHNESS_SECONDS,
+) -> Dict[str, Any]:
+    ensure_tv_local_schema()
+    bid = int(binding_id)
+    now = now_iso()
+
+    with get_conn() as conn:
+        b = _load_binding_row(conn, bid)
+        if not b:
+            raise ValueError("BINDING_NOT_FOUND")
+
+        existing = _load_tv_player_state_row(conn, bid) or {}
+        row_payload = dict(payload or {})
+        row_payload["screen_id"] = _safe_int(row_payload.get("screen_id"), _safe_int(b.get("screen_id"), 0))
+        row_payload["current_minute_of_day"] = _safe_int(row_payload.get("current_minute_of_day"), -1)
+        if row_payload["current_minute_of_day"] < 0:
+            row_payload["current_minute_of_day"] = None
+        changed = _player_meaningful_change(existing, row_payload)
+
+        freshness_due = True
+        if existing.get("updated_at") and freshness_seconds > 0:
+            try:
+                last_ts = datetime.fromisoformat(_safe_str(existing.get("updated_at"), "").replace("Z", "+00:00"))
+                freshness_due = (datetime.now(last_ts.tzinfo) - last_ts).total_seconds() >= float(freshness_seconds)
+            except Exception:
+                freshness_due = True
+
+        should_write = bool(force or changed or freshness_due or not existing)
+        if not should_write:
+            return {"updated": False, "changed": False, "row": existing}
+
+        state_change_at = now if (changed or not existing) else _safe_str(existing.get("last_state_change_at"), "") or None
+
+        conn.execute(
+            """
+            INSERT INTO tv_player_state (
+                binding_id, screen_id, active_snapshot_id, active_snapshot_version,
+                current_day_of_week, current_minute_of_day,
+                current_visual_item_id, current_audio_item_id,
+                current_visual_asset_id, current_audio_asset_id,
+                current_visual_asset_path, current_audio_asset_path,
+                player_state, render_mode, fallback_reason,
+                video_muted_by_audio,
+                last_render_error_code, last_render_error_message,
+                last_tick_at, last_snapshot_check_at, last_state_change_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(binding_id) DO UPDATE SET
+                screen_id=excluded.screen_id,
+                active_snapshot_id=excluded.active_snapshot_id,
+                active_snapshot_version=excluded.active_snapshot_version,
+                current_day_of_week=excluded.current_day_of_week,
+                current_minute_of_day=excluded.current_minute_of_day,
+                current_visual_item_id=excluded.current_visual_item_id,
+                current_audio_item_id=excluded.current_audio_item_id,
+                current_visual_asset_id=excluded.current_visual_asset_id,
+                current_audio_asset_id=excluded.current_audio_asset_id,
+                current_visual_asset_path=excluded.current_visual_asset_path,
+                current_audio_asset_path=excluded.current_audio_asset_path,
+                player_state=excluded.player_state,
+                render_mode=excluded.render_mode,
+                fallback_reason=excluded.fallback_reason,
+                video_muted_by_audio=excluded.video_muted_by_audio,
+                last_render_error_code=excluded.last_render_error_code,
+                last_render_error_message=excluded.last_render_error_message,
+                last_tick_at=excluded.last_tick_at,
+                last_snapshot_check_at=excluded.last_snapshot_check_at,
+                last_state_change_at=excluded.last_state_change_at,
+                updated_at=excluded.updated_at
+            """,
+            (
+                bid,
+                _safe_int(row_payload.get("screen_id"), 0),
+                _safe_str(row_payload.get("active_snapshot_id"), "") or None,
+                _safe_int(row_payload.get("active_snapshot_version"), 0) or None,
+                _safe_str(row_payload.get("current_day_of_week"), "") or None,
+                row_payload.get("current_minute_of_day"),
+                _safe_str(row_payload.get("current_visual_item_id"), "") or None,
+                _safe_str(row_payload.get("current_audio_item_id"), "") or None,
+                _safe_str(row_payload.get("current_visual_asset_id"), "") or None,
+                _safe_str(row_payload.get("current_audio_asset_id"), "") or None,
+                _safe_str(row_payload.get("current_visual_asset_path"), "") or None,
+                _safe_str(row_payload.get("current_audio_asset_path"), "") or None,
+                _safe_str(row_payload.get("player_state"), PLAYER_STATE_IDLE) or PLAYER_STATE_IDLE,
+                _safe_str(row_payload.get("render_mode"), PLAYER_RENDER_IDLE_FALLBACK) or PLAYER_RENDER_IDLE_FALLBACK,
+                _safe_str(row_payload.get("fallback_reason"), "") or None,
+                1 if _binding_bool(row_payload.get("video_muted_by_audio")) else 0,
+                _safe_str(row_payload.get("last_render_error_code"), "") or None,
+                _safe_str(row_payload.get("last_render_error_message"), "") or None,
+                _safe_str(row_payload.get("last_tick_at"), now) or now,
+                _safe_str(row_payload.get("last_snapshot_check_at"), now) or now,
+                state_change_at,
+                now,
+            ),
+        )
+
+        if changed or not existing:
+            _insert_tv_player_event(
+                conn,
+                binding_id=bid,
+                event_type=event_type,
+                severity="ERROR" if _safe_str(row_payload.get("player_state"), "").upper() == PLAYER_STATE_ERROR else "INFO",
+                message=_safe_str(row_payload.get("last_render_error_message"), "") or _safe_str(row_payload.get("fallback_reason"), "") or None,
+                payload={
+                    "playerState": _safe_str(row_payload.get("player_state"), ""),
+                    "renderMode": _safe_str(row_payload.get("render_mode"), ""),
+                    "fallbackReason": _safe_str(row_payload.get("fallback_reason"), ""),
+                    "activeSnapshotVersion": _safe_int(row_payload.get("active_snapshot_version"), 0) or None,
+                },
+            )
+
+        conn.commit()
+        row = _load_tv_player_state_row(conn, bid) or {}
+
+    return {"updated": True, "changed": bool(changed or not existing), "row": row}
+
+
+def get_tv_player_render_context(*, binding_id: int, persist: bool = False) -> Dict[str, Any]:
+    context = _build_player_render_context(binding_id=int(binding_id))
+    if persist and bool(context.get("ok")):
+        payload = _player_state_payload_from_context(context)
+        try:
+            report_tv_player_state(binding_id=int(binding_id), payload=payload, event_type=PLAYER_EVENT_REEVALUATED)
+        except Exception:
+            pass
+    return context
+
+
+def reevaluate_tv_player(*, binding_id: int, persist: bool = True) -> Dict[str, Any]:
+    context = get_tv_player_render_context(binding_id=int(binding_id), persist=persist)
+    return {"ok": bool(context.get("ok")), "context": context}
+
+
+def reload_tv_player(*, binding_id: int, persist: bool = True) -> Dict[str, Any]:
+    context = get_tv_player_render_context(binding_id=int(binding_id), persist=False)
+    if persist and bool(context.get("ok")):
+        payload = _player_state_payload_from_context(context)
+        report_tv_player_state(binding_id=int(binding_id), payload=payload, event_type=PLAYER_EVENT_RELOADED, force=True)
+    return {"ok": bool(context.get("ok")), "context": context}
+
+
+def load_tv_player_status(*, binding_id: int) -> Dict[str, Any]:
+    ensure_tv_local_schema()
+    bid = int(binding_id)
+    binding = get_tv_screen_binding(binding_id=bid)
+    if not binding:
+        return {"ok": False, "error": "BINDING_NOT_FOUND", "binding": None, "playerState": None}
+    player_state = load_tv_player_state(binding_id=bid)
+    return {"ok": True, "binding": binding, "playerState": player_state}

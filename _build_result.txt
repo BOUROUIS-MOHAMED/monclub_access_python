@@ -1,0 +1,3 @@
+EXE exists: True size=13.1MB
+MSI: C:\Users\mohaa\Desktop\monclub_access_python\tauri-ui\src-tauri\target\release\bundle\msi\MonClub Access_0.1.0_x64_en-US.msi (4.6MB)
+NSIS: C:\Users\mohaa\Desktop\monclub_access_python\tauri-ui\src-tauri\target\release\bundle\nsis\MonClub Access_0.1.0_x64-setup.exe (3.2MB)

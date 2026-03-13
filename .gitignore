@@ -20,6 +20,10 @@ data/config.json
 Thumbs.db
 desktop.ini
 
+tauri-ui/node_modules
+tauri-ui/dist
+.venv
+tauri-ui/src-tauri/target
 # Distribution / packaging
 *.egg-info/
 dist/

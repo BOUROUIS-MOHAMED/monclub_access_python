@@ -148,13 +148,10 @@ def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:
 
 # ===================== Read backend-driven settings from SQLite cache =====================
 
-# Delegate to shared module (avoids duplication across config.py / device_sync.py / UI)
 from app.core.settings_reader import (
-    read_sync_payload_json as _read_sync_payload_json,
-    extract_access_settings as _extract_access_settings,
-    extract_devices as _extract_devices,
-    normalize_global_settings as _normalize_global_settings,
-    normalize_device_settings as _normalize_device_settings,
+    get_backend_global_settings as _get_backend_global_settings,   # ✅ normalized-table source of truth
+    normalize_device_settings as _normalize_device_settings,       # ✅ works with camelCase GymDeviceDto dicts
+    normalize_access_data_mode as _normalize_access_data_mode,     # ✅ DEVICE/AGENT
 )
 
 
@@ -383,6 +380,21 @@ class NotificationRequest:
     message: str
     image_path: str = ""  # can be URL or local path
     popup_show_image: bool = True  # NEW: respect device.popupShowImage
+    # ── enriched user/device data for Tauri popup screen ──
+    user_full_name: str = ""
+    user_image: str = ""
+    user_valid_from: str = ""
+    user_valid_to: str = ""
+    user_membership_id: Optional[int] = None
+    user_phone: str = ""
+    device_id: int = 0
+    device_name: str = ""
+    allowed: bool = False
+    reason: str = ""
+    scan_mode: str = ""
+    popup_duration_sec: int = 3
+    popup_enabled: bool = True
+    win_notify_enabled: bool = True
 
 
 @dataclass
@@ -857,6 +869,7 @@ class DecisionService(threading.Thread):
         global_settings: Callable[[], Dict[str, Any]],
         notify_gate: NotificationGate,
         decision_ema: EMA,
+        device_name_provider: Optional[Callable[[int], str]] = None,
     ):
         super().__init__(daemon=True)
         self.logger = logger
@@ -869,6 +882,7 @@ class DecisionService(threading.Thread):
         self.global_settings = global_settings
         self.notify_gate = notify_gate
         self.decision_ema = decision_ema
+        self.device_name_provider = device_name_provider or (lambda did: f"device-{did}")
 
         self._cache_lock = threading.Lock()
         self._cache_ttl_sec = 2.0
@@ -1383,6 +1397,21 @@ class DecisionService(threading.Thread):
                 message=msg,
                 image_path=user_image if allowed else "",
                 popup_show_image=bool(settings.get("popup_show_image", True)),
+                # enriched fields for Tauri popup
+                user_full_name=user_name,
+                user_image=user_image,
+                user_valid_from=_safe_str((user or {}).get("validFrom", (user or {}).get("valid_from")), "") if isinstance(user, dict) else "",
+                user_valid_to=_safe_str((user or {}).get("validTo", (user or {}).get("valid_to")), "") if isinstance(user, dict) else "",
+                user_membership_id=_safe_int(am_id, 0) if am_id else None,
+                user_phone=user_phone,
+                device_id=int(ev.device_id),
+                device_name=self.device_name_provider(int(ev.device_id)),
+                allowed=bool(allowed and cmd_res.ok),
+                reason=reason,
+                scan_mode=scan_mode or "",
+                popup_duration_sec=_safe_int(settings.get("popup_duration_sec"), 3),
+                popup_enabled=bool(settings.get("popup_enabled", True)),
+                win_notify_enabled=bool(settings.get("win_notify_enabled", True)),
             )
 
             # Windows notification (per-device winNotifyEnabled)
@@ -1566,10 +1595,10 @@ class AgentRealtimeEngine:
         self._deciders: List[DecisionService] = []
         self._notify_gate = NotificationGate(global_settings=self.get_global_settings)
 
-        # cache payload/settings (avoid hitting sqlite too often)
-        self._payload_cache_at = 0.0
-        self._payload_cache: Dict[str, Any] = {}
-        self._payload_cache_ttl_sec = 1.0
+        # cache devices list (avoid hitting sqlite too often)
+        self._devices_cache_at = 0.0
+        self._devices_cache: List[Dict[str, Any]] = []
+        self._devices_cache_ttl_sec = 1.0
 
         self._global_cache_at = 0.0
         self._global_cache: Dict[str, Any] = {}
@@ -1577,26 +1606,62 @@ class AgentRealtimeEngine:
 
     # ---------- settings providers (SQLite cached) ----------
 
-    def _load_payload_cached(self) -> Dict[str, Any]:
+
+    def _load_devices_cached(self) -> List[Dict[str, Any]]:
+        """
+        Primary: normalized table -> list_sync_devices_payload() (GymDeviceDto-shaped dicts).
+        Fallback: raw sync_cache.payload_json (older DBs / before first sync).
+        """
         now_s = time.time()
-        if (now_s - float(self._payload_cache_at)) < float(self._payload_cache_ttl_sec) and self._payload_cache:
-            return dict(self._payload_cache)
-        p = _read_sync_payload_json()
-        self._payload_cache = p if isinstance(p, dict) else {}
-        self._payload_cache_at = now_s
-        return dict(self._payload_cache)
+        if (now_s - float(self._devices_cache_at)) < float(self._devices_cache_ttl_sec) and self._devices_cache:
+            return [dict(x) for x in self._devices_cache]
+
+        devs: List[Dict[str, Any]] = []
+
+        # Primary source of truth: normalized tables -> GymDeviceDto payload
+        try:
+            from app.core.db import list_sync_devices_payload
+            rows = list_sync_devices_payload()
+            if isinstance(rows, list):
+                devs = [d for d in rows if isinstance(d, dict)]
+        except Exception:
+            devs = []
+
+        # Fallback: raw payload_json (only if normalized tables empty)
+        if not devs:
+            try:
+                from app.core.db import get_conn
+                with get_conn() as conn:
+                    r = conn.execute("SELECT payload_json FROM sync_cache WHERE id=1").fetchone()
+                    if r:
+                        raw = r["payload_json"]  # type: ignore[index]
+                        data = json.loads(raw or "{}")
+                        rows = data.get("devices") or data.get("device") or []
+                        if isinstance(rows, list):
+                            devs = [d for d in rows if isinstance(d, dict)]
+            except Exception:
+                devs = []
+
+        self._devices_cache = devs
+        self._devices_cache_at = now_s
+        return [dict(x) for x in devs]
 
     def get_global_settings(self) -> Dict[str, Any]:
         """
         Returns normalized global settings (snake_case) from GymAccessSoftwareSettingsDto.
+        Source of truth: sync_access_software_settings (SQLite).
         """
         now_s = time.time()
         if (now_s - float(self._global_cache_at)) < float(self._global_cache_ttl_sec) and self._global_cache:
             return dict(self._global_cache)
 
-        payload = self._load_payload_cached()
-        raw = _extract_access_settings(payload)
-        gs = _normalize_global_settings(raw)
+        try:
+            gs = _get_backend_global_settings() or {}
+            if not isinstance(gs, dict):
+                gs = {}
+        except Exception:
+            gs = {}
+
         self._global_cache = gs
         self._global_cache_at = now_s
         return dict(gs)
@@ -1611,6 +1676,15 @@ class AgentRealtimeEngine:
             # safe defaults if device not found
             return _normalize_device_settings({"id": did, "active": False, "accessDevice": False}, gs)
         return _normalize_device_settings(dev, gs)
+
+    def _resolve_device_name(self, device_id: int) -> str:
+        """Resolve device name from cached device payloads."""
+        did = int(device_id)
+        with self._lock:
+            dev = self._devices_by_id.get(did)
+        if isinstance(dev, dict):
+            return _safe_str(dev.get("name") or dev.get("deviceName"), f"device-{did}")
+        return f"device-{did}"
 
     # ---------- engine info ----------
 
@@ -1733,6 +1807,7 @@ class AgentRealtimeEngine:
                 global_settings=self.get_global_settings,
                 notify_gate=self._notify_gate,
                 decision_ema=self._decision_ema,
+                device_name_provider=self._resolve_device_name,
             )
             self._deciders.append(d)
             try:
@@ -1805,8 +1880,7 @@ class AgentRealtimeEngine:
           - accessDataMode == "AGENT"
         Devices in DEVICE mode are ignored here.
         """
-        payload = self._load_payload_cached()
-        devices = _extract_devices(payload)
+        devices = self._load_devices_cached()
 
         # index by id
         devices_by_id: Dict[int, Dict[str, Any]] = {}
@@ -1816,15 +1890,17 @@ class AgentRealtimeEngine:
                 continue
             devices_by_id[int(did)] = dev
 
-        # Determine which ids should run in AGENT mode
         desired_agent_ids: set[int] = set()
         for did, dev in devices_by_id.items():
-            if not _boolish(dev.get("active"), True):
-                continue
-            if not _boolish(dev.get("accessDevice"), True):
+            # support both keys (but payload from list_sync_devices_payload is camelCase)
+            if not _boolish(dev.get("active", True), True):
                 continue
 
-            mode = _safe_str(dev.get("accessDataMode"), "DEVICE").strip().upper()
+            access_device_val = dev.get("accessDevice", dev.get("access_device", True))
+            if not _boolish(access_device_val, True):
+                continue
+
+            mode = _normalize_access_data_mode(dev.get("accessDataMode") or dev.get("access_data_mode"))
             if mode != "AGENT":
                 continue
 
@@ -1832,7 +1908,6 @@ class AgentRealtimeEngine:
 
         with self._lock:
             existing_ids = set(self._workers.keys())
-            # update device payload cache
             self._devices_by_id = devices_by_id
 
         # Start / keep workers

@@ -207,7 +207,35 @@ if (-not (Test-Path $DIST_EXE)) {
   throw "Build failed: EXE not found at $DIST_EXE"
 }
 
-Write-Host "`nBuild OK ✅" -ForegroundColor Green
+# Bundle Tauri UI executable in release payload (standalone installer runtime)
+$TAURI_UI_RELEASE = Join-Path $ROOT "tauri-ui\src-tauri\target\release\monclub-access-ui.exe"
+$TAURI_UI_DEBUG = Join-Path $ROOT "tauri-ui\src-tauri\target\debug\monclub-access-ui.exe"
+$TAURI_UI_EXE = $null
+
+if (Test-Path $TAURI_UI_RELEASE) {
+  $TAURI_UI_EXE = $TAURI_UI_RELEASE
+} elseif (Test-Path $TAURI_UI_DEBUG) {
+  $TAURI_UI_EXE = $TAURI_UI_DEBUG
+}
+
+if ([string]::IsNullOrWhiteSpace($TAURI_UI_EXE)) {
+  throw @"
+Tauri UI executable not found.
+Build it first from tauri-ui:
+  npm run tauri build
+Expected file:
+  tauri-ui\src-tauri\target\release\monclub-access-ui.exe
+"@
+}
+
+$DIST_UI_DIR = Join-Path $DIST_APP_DIR "ui"
+New-Item -ItemType Directory -Force $DIST_UI_DIR | Out-Null
+$DIST_TAURI_EXE = Join-Path $DIST_UI_DIR "monclub-access-ui.exe"
+Copy-Item -LiteralPath $TAURI_UI_EXE -Destination $DIST_TAURI_EXE -Force
+Write-Host "Bundled Tauri UI: $DIST_TAURI_EXE" -ForegroundColor Green
+
+
+Write-Host "`nBuild OK" -ForegroundColor Green
 Write-Host "EXE: $DIST_EXE"
 
 # ----------------------------
@@ -336,7 +364,7 @@ $manifest = [ordered]@{
 $manifestJson = ($manifest | ConvertTo-Json -Depth 10)
 [System.IO.File]::WriteAllText($MANIFEST_PATH, $manifestJson, [System.Text.Encoding]::UTF8)
 
-Write-Host "`nRelease OK ✅" -ForegroundColor Green
+Write-Host "`nRelease OK" -ForegroundColor Green
 Write-Host "ZIP      : $ZIP_PATH"
 Write-Host "MANIFEST : $MANIFEST_PATH"
 Write-Host "`nZIP SHA256:" -ForegroundColor Cyan

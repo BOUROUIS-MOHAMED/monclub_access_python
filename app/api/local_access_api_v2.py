@@ -1,0 +1,3295 @@
+# app/api/local_access_api_v2.py
+"""
+Local HTTP API v2 for Tauri+React UI.
+
+Binds to 127.0.0.1.  All endpoints under /api/v2/*.
+Backward-compatible v1 endpoints are kept with Deprecation headers.
+
+SSE endpoints:
+  - GET /api/v2/logs/stream
+  - GET /api/v2/agent/events
+  - GET /api/v2/enroll/events
+"""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import threading
+import time
+import traceback
+from dataclasses import asdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+from app.core.tv_local_cache import (
+    ensure_tv_local_schema,
+    list_tv_cache_assets,
+    load_latest_tv_sync_run,
+    load_tv_latest_readiness,
+    load_tv_latest_snapshot,
+    load_tv_previous_ready_snapshot,
+    load_tv_screen_binding,
+    load_tv_screen_binding_by_id,
+    list_tv_screen_bindings,
+    get_tv_screen_binding,
+    create_tv_screen_binding,
+    update_tv_screen_binding,
+    delete_tv_screen_binding,
+    load_tv_snapshot_by_id,
+    load_tv_snapshot_manifest,
+    save_tv_screen_binding,
+    list_tv_host_monitors,
+    replace_tv_host_monitors,
+    start_tv_screen_binding,
+    stop_tv_screen_binding,
+    restart_tv_screen_binding,
+    record_tv_screen_binding_runtime_event,
+    list_tv_screen_binding_events,
+    sync_latest_snapshot_for_screen,
+    run_tv_download_batch,
+    load_tv_latest_download_batch,
+    list_tv_download_jobs,
+    retry_tv_download_job,
+    fetch_tv_ad_tasks_for_host,
+    prepare_tv_ad_tasks,
+    process_tv_ad_ready_confirm_outbox,
+    run_tv_ad_task_cycle,
+    list_tv_ad_task_cache,
+    retry_tv_ad_task_prepare,
+    retry_tv_ad_task_ready_confirm,
+    list_tv_ad_task_runtime,
+    load_tv_ad_task_runtime,
+    load_tv_gym_ad_runtime,
+    inject_tv_ad_task_now,
+    load_tv_latest_ready_snapshot,
+    load_tv_activation_status,
+    evaluate_tv_activation,
+    activate_tv_latest_ready_snapshot,
+    list_tv_activation_attempts,
+    load_tv_player_status,
+    get_tv_player_render_context,
+    reevaluate_tv_player,
+    reload_tv_player,
+    report_tv_player_state,
+    list_tv_player_events,
+    load_tv_binding_support_summary,
+    run_tv_binding_support_action,
+    list_tv_support_action_logs,
+    get_tv_observability_overview,
+    list_tv_observability_fleet_health,
+    get_tv_observability_screen_details,
+    get_tv_observability_screen_timeline,
+    list_tv_observability_heartbeats,
+    list_tv_observability_runtime_events,
+    list_tv_observability_proof_events,
+    get_tv_observability_proof_stats,
+    get_tv_observability_runtime_stats,
+    run_tv_startup_reconciliation,
+    load_tv_startup_reconciliation_latest,
+    list_tv_startup_reconciliation_runs,
+    get_tv_retention_policy,
+    run_tv_retention_maintenance,
+    run_tv_query_responsiveness_checks,
+    audit_tv_correlation_propagation,
+    run_tv_deployment_preflight,
+)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _json_bytes(obj: Any) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _safe_str(v: Any, default: str = "") -> str:
+    if v is None:
+        return default
+    try:
+        return str(v)
+    except Exception:
+        return default
+
+
+
+def _safe_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = _safe_str(v, "").strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+
+def _split_csv_upper(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in _safe_str(raw, "").replace(";", ",").split(","):
+        s = _safe_str(part, "").strip().upper()
+        if s and s not in out:
+            out.append(s)
+    return out
+def _qs_first(qs: Dict[str, List[str]], *names: str, default: str = "") -> str:
+    for n in names:
+        v = qs.get(n)
+        if v and len(v) > 0:
+            return (v[0] or "").strip()
+    return default
+
+
+def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
+    length = int(handler.headers.get("Content-Length") or "0")
+    if length <= 0:
+        return {}
+    raw = handler.rfile.read(length)
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
+
+_ALLOWED_ORIGIN = "tauri://localhost"
+
+def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
+    # In production: restrict to Tauri origin.  For dev: allow localhost variants.
+    origin = handler.headers.get("Origin", "")
+    allowed = (
+        origin.startswith("tauri://")
+        or origin.startswith("https://tauri.localhost")
+        or origin.startswith("http://localhost")
+        or origin.startswith("http://127.0.0.1")
+    )
+    if allowed and origin:
+        handler.send_header("Access-Control-Allow-Origin", origin)
+    else:
+        # Fallback for non-browser callers (curl, Tauri sidecar, etc.)
+        handler.send_header("Access-Control-Allow-Origin", "http://localhost")
+    handler.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Local-Token")
+    handler.send_header("Access-Control-Max-Age", "86400")
+
+
+# ---------------------------------------------------------------------------
+# HTTP Server wrapper
+# ---------------------------------------------------------------------------
+
+class _AppHTTPServerV2(ThreadingHTTPServer):
+    def __init__(self, server_address, handler_class, *, app, router: "_Router"):
+        super().__init__(server_address, handler_class)
+        self.app = app
+        self.router = router
+
+
+class _Router:
+    """Simple path-based router with path param extraction."""
+
+    def __init__(self) -> None:
+        self._routes: List[Tuple[str, str, Callable]] = []  # (method, pattern, handler)
+
+    def add(self, method: str, pattern: str, handler: Callable) -> None:
+        self._routes.append((method.upper(), pattern, handler))
+
+    def match(self, method: str, path: str) -> Tuple[Optional[Callable], Dict[str, str]]:
+        for route_method, pattern, handler in self._routes:
+            if route_method != method.upper():
+                continue
+            params = self._match_pattern(pattern, path)
+            if params is not None:
+                return handler, params
+        return None, {}
+
+    @staticmethod
+    def _match_pattern(pattern: str, path: str) -> Optional[Dict[str, str]]:
+        p_parts = [p for p in pattern.split("/") if p]
+        u_parts = [p for p in path.split("/") if p]
+        if len(p_parts) != len(u_parts):
+            return None
+        params: Dict[str, str] = {}
+        for pp, up in zip(p_parts, u_parts):
+            if pp.startswith("{") and pp.endswith("}"):
+                params[pp[1:-1]] = up
+            elif pp != up:
+                return None
+        return params
+
+
+# ---------------------------------------------------------------------------
+# Request context
+# ---------------------------------------------------------------------------
+
+class _Ctx:
+    """Convenience wrapper around a request."""
+
+    def __init__(self, handler: BaseHTTPRequestHandler, params: Dict[str, str], qs: Dict[str, List[str]], app):
+        self.handler = handler
+        self.params = params
+        self.qs = qs
+        self.app = app
+        self._body: Optional[Dict[str, Any]] = None
+
+    def body(self) -> Dict[str, Any]:
+        if self._body is None:
+            try:
+                self._body = _read_json_body(self.handler)
+            except Exception:
+                self._body = {}
+        return self._body
+
+    def q(self, *names: str, default: str = "") -> str:
+        return _qs_first(self.qs, *names, default=default)
+
+    def q_int(self, *names: str, default: int = 0) -> int:
+        return _safe_int(self.q(*names, default=str(default)), default)
+
+    def param(self, name: str) -> str:
+        return self.params.get(name, "")
+
+    def param_int(self, name: str, default: int = 0) -> int:
+        return _safe_int(self.params.get(name, ""), default)
+
+    def send_json(self, status: int, payload: Any) -> None:
+        body = _json_bytes(payload)
+        self.handler.send_response(status)
+        _cors_headers(self.handler)
+        self.handler.send_header("Content-Type", "application/json; charset=utf-8")
+        self.handler.send_header("Content-Length", str(len(body)))
+        self.handler.end_headers()
+        self.handler.wfile.write(body)
+
+    def send_sse_start(self) -> None:
+        self.handler.send_response(200)
+        _cors_headers(self.handler)
+        self.handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.handler.send_header("Cache-Control", "no-cache")
+        self.handler.send_header("Connection", "keep-alive")
+        self.handler.end_headers()
+
+    def send_sse_event(self, event: str, data: Any) -> bool:
+        """Returns False if the connection is broken."""
+        try:
+            payload = json.dumps(data, ensure_ascii=False, default=str)
+            msg = f"event: {event}\ndata: {payload}\n\n"
+            self.handler.wfile.write(msg.encode("utf-8"))
+            self.handler.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Route handlers
+# ---------------------------------------------------------------------------
+
+# ==================== 1) HEALTH / STATUS ====================
+
+def _handle_health(ctx: _Ctx) -> None:
+    info = ctx.app.get_local_api_health()
+    # augment with version info
+    try:
+        um = getattr(ctx.app, "_update_manager", None)
+        if um:
+            info["currentReleaseId"] = um.get_current_release_id()
+    except Exception:
+        pass
+    ctx.send_json(200, info)
+
+
+def _handle_platform(ctx: _Ctx) -> None:
+    from app.core.arch import platform_summary
+    from app.core.utils import is_frozen, DATA_ROOT
+    import sys
+    ctx.send_json(200, {
+        "platform": platform_summary(),
+        "pythonBits": 8 * (8 if sys.maxsize > 2**32 else 4),
+        "frozen": is_frozen(),
+        "dataRoot": str(DATA_ROOT),
+    })
+
+
+# ==================== 1.5) UNIFIED STATUS ====================
+
+def _handle_status(ctx: _Ctx) -> None:
+    """Unified status snapshot for Tauri dashboard â€” single call."""
+    from app.core.db import load_auth_token, load_sync_cache
+
+    auth = load_auth_token()
+    reasons = []
+    try:
+        reasons = ctx.app._restriction_reasons() if auth else []
+    except Exception:
+        pass
+    cache = load_sync_cache()
+
+    session = {
+        "loggedIn": bool(auth and auth.token),
+        "restricted": bool(reasons),
+        "reasons": reasons,
+        "email": (auth.email if auth else None),
+        "lastLoginAt": (auth.last_login_at if auth else None),
+        "contractStatus": bool(cache and cache.contract_status),
+        "contractEndDate": (cache.contract_end_date if cache else None),
+    }
+
+    # Add expiry warnings
+    try:
+        expiry = ctx.app._compute_expiry_warnings()
+        session["loginDaysRemaining"] = expiry.get("loginDaysRemaining")
+        session["loginWarning"] = expiry.get("loginWarning", False)
+        session["contractDaysRemaining"] = expiry.get("contractDaysRemaining")
+        session["contractWarning"] = expiry.get("contractWarning", False)
+    except Exception:
+        session["loginDaysRemaining"] = None
+        session["loginWarning"] = False
+        session["contractDaysRemaining"] = None
+        session["contractWarning"] = False
+
+    devices = list(cache.devices) if cache else []
+    dev_count = 0
+    agent_count = 0
+    for d in devices:
+        if isinstance(d, dict):
+            adm = str(d.get("accessDataMode") or d.get("access_data_mode") or "").upper()
+            if adm == "DEVICE":
+                dev_count += 1
+            elif adm == "AGENT":
+                agent_count += 1
+    unknown_count = len(devices) - dev_count - agent_count
+    if dev_count > 0 and agent_count > 0:
+        gm = "MIXED"
+    elif agent_count > 0:
+        gm = "AGENT_ONLY"
+    else:
+        gm = "DEVICE_ONLY"
+
+    mode = {"globalMode": gm, "summary": {"DEVICE": dev_count, "AGENT": agent_count, "UNKNOWN": unknown_count}}
+
+    sync = {
+        "running": False,
+        "lastSyncAt": (cache.updated_at if cache else None),
+        "lastOk": bool(cache),
+        "lastError": None,
+    }
+
+    pullsdk: Dict[str, Any] = {"connected": False, "deviceId": None, "ip": None, "since": None, "lastError": None}
+    with _device_sdk_lock:
+        if _device_sdk_pool:
+            first_id = next(iter(_device_sdk_pool))
+            pullsdk["connected"] = True
+            pullsdk["deviceId"] = first_id
+
+    eng = getattr(ctx.app, "_agent_engine", None)
+    agent_running = bool(eng and eng.is_running())
+    agent = {
+        "running": agent_running,
+        "eventQueueDepth": eng.get_queue_depth() if agent_running else 0,
+        "avgDecisionMs": round(eng.get_avg_decision_ms(), 2) if agent_running else 0.0,
+    }
+
+    um = getattr(ctx.app, "_update_manager", None)
+    st = getattr(ctx.app, "_update_status", None)
+    updates: Dict[str, Any] = {
+        "updateAvailable": False, "downloaded": False, "downloading": False,
+        "progress": None, "currentReleaseId": None, "lastCheckAt": None, "lastError": None,
+    }
+    if um:
+        updates["currentReleaseId"] = um.get_current_release_id()
+    if st:
+        updates["updateAvailable"] = bool(getattr(st, "update_available", False))
+        updates["downloaded"] = bool(getattr(st, "downloaded", False))
+        updates["downloading"] = bool(getattr(st, "downloading", False))
+        updates["progress"] = getattr(st, "progress_percent", None)
+        updates["lastCheckAt"] = getattr(st, "last_check_at", None)
+        updates["lastError"] = getattr(st, "last_error", None)
+
+    ctx.send_json(200, {
+        "ok": True,
+        "session": session,
+        "mode": mode,
+        "sync": sync,
+        "deviceSync": {"lastRunAt": None, "lastOk": True, "lastError": None},
+        "pullsdk": pullsdk,
+        "agent": agent,
+        "updates": updates,
+    })
+
+
+# ==================== 2) AUTH ====================
+
+def _handle_auth_login(ctx: _Ctx) -> None:
+    body = ctx.body()
+    email = _safe_str(body.get("email"), "").strip()
+    password = _safe_str(body.get("password"), "")
+    if not email or not password:
+        ctx.send_json(400, {"ok": False, "error": "email and password are required"})
+        return
+
+    try:
+        api = ctx.app._api()
+        token = api.login(email=email, password=password)
+
+        from app.core.db import save_auth_token
+        save_auth_token(email=email, token=token)
+
+        ctx.app.cfg.login_email = email
+        ctx.app.persist_config()
+        ctx.app.logger.info("Login OK via API v2.")
+
+        # trigger sync + redirect evaluation on main thread
+        try:
+            ctx.app.after(0, ctx.app.request_sync_now)
+            ctx.app.after(100, ctx.app.evaluate_access_and_redirect)
+        except Exception:
+            pass
+
+        ctx.send_json(200, {"ok": True, "token": token[:8] + "..." if len(token) > 8 else "***"})
+    except Exception as e:
+        ctx.app.logger.exception("Login failed via API v2")
+        ctx.send_json(401, {"ok": False, "error": str(e)})
+
+
+def _handle_auth_status(ctx: _Ctx) -> None:
+    from app.core.db import load_auth_token
+    auth = load_auth_token()
+    reasons = ctx.app._restriction_reasons() if auth else []
+    ctx.send_json(200, {
+        "loggedIn": bool(auth and auth.token),
+        "restricted": bool(reasons),
+        "reasons": reasons,
+        "lastLoginAt": (auth.last_login_at if auth else None),
+        "email": (auth.email if auth else None),
+    })
+
+
+def _handle_auth_logout(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app._on_click_logout.__wrapped__ if hasattr(ctx.app._on_click_logout, '__wrapped__') else lambda: None)
+    except Exception:
+        pass
+    # Direct logout (don't wait for Tk confirmation)
+    try:
+        ctx.app.stop_realtime_agent()
+    except Exception:
+        pass
+    from app.core.db import clear_auth_token
+    clear_auth_token()
+    try:
+        ctx.app._update_manager.stop()
+    except Exception:
+        pass
+    try:
+        from app.core.db import save_sync_cache
+        save_sync_cache(None)
+    except Exception:
+        pass
+    ctx.app.logger.info("Logout via API v2.")
+    try:
+        ctx.app.after(0, ctx.app.evaluate_access_and_redirect)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+# ==================== 3) CONFIG ====================
+
+_CONFIG_SENSITIVE = {"password", "commPassword", "comm_password"}
+_CONFIG_WRITABLE = {
+    "api_login_url", "api_sync_url", "api_create_user_fingerprint_url",
+    "api_access_create_membership_url", "api_access_create_account_membership_url",
+    "api_latest_release_url", "api_tv_snapshot_latest_url", "api_tv_snapshot_manifest_url",
+    "api_tv_ad_tasks_fetch_url", "api_tv_ad_task_confirm_ready_url", "sync_interval_sec", "max_login_age_minutes",
+    "log_level", "template_version", "template_encoding", "device_timeout_ms",
+    "local_api_enabled", "local_api_host", "local_api_port",
+    "tray_enabled", "minimize_to_tray_on_close", "start_minimized_to_tray",
+    "agent_realtime_enabled", "device_sync_enabled", "login_email",
+    "data_mode", "selected_device_id",
+    "update_enabled", "update_platform", "update_channel",
+    "update_check_interval_sec", "update_auto_download_zip",
+}
+
+def _handle_config_get(ctx: _Ctx) -> None:
+    d = ctx.app.cfg.to_dict()
+    # mask sensitive paths but keep DLL paths for display
+    ctx.send_json(200, d)
+
+
+def _handle_config_patch(ctx: _Ctx) -> None:
+    body = ctx.body()
+    if not body:
+        ctx.send_json(400, {"ok": False, "error": "empty body"})
+        return
+    changed = {}
+    for k, v in body.items():
+        if k not in _CONFIG_WRITABLE:
+            continue
+        try:
+            setattr(ctx.app.cfg, k, v)
+            changed[k] = v
+        except Exception:
+            pass
+    if changed:
+        ctx.app.persist_config()
+        ctx.app.logger.info("Config patched via API v2: %s", list(changed.keys()))
+    ctx.send_json(200, {"ok": True, "changed": changed, "config": ctx.app.cfg.to_dict()})
+
+
+def _handle_config_restart_api(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.restart_local_api_server)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True, "message": "Local API restart scheduled"})
+
+
+# ==================== 4) SYNC + CACHE ====================
+
+def _handle_sync_now(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.request_sync_now)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True, "message": "sync triggered"})
+
+
+def _handle_sync_cache_meta(ctx: _Ctx) -> None:
+    from app.core.db import load_sync_cache
+    cache = load_sync_cache()
+    if not cache:
+        ctx.send_json(200, {"hasSyncData": False})
+        return
+    ctx.send_json(200, {
+        "hasSyncData": True,
+        "contractStatus": cache.contract_status,
+        "contractEndDate": cache.contract_end_date,
+        "lastSyncAt": getattr(cache, "updated_at", None),
+        "userCount": len(cache.users),
+        "deviceCount": len(cache.devices),
+        "membershipCount": len(cache.membership),
+        "infrastructureCount": len(cache.infrastructures),
+        "credentialCount": len(cache.gym_access_credentials),
+    })
+
+
+def _handle_sync_cache_users(ctx: _Ctx) -> None:
+    from app.core.db import load_sync_cache
+    cache = load_sync_cache()
+    users = list(cache.users) if cache else []
+    limit = ctx.q_int("limit", default=0)
+    offset = ctx.q_int("offset", default=0)
+    total = len(users)
+    if offset > 0:
+        users = users[offset:]
+    if limit > 0:
+        users = users[:limit]
+    ctx.send_json(200, {"users": users, "total": total})
+
+
+def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
+    from app.core.db import load_sync_cache
+    cache = load_sync_cache()
+    ctx.send_json(200, {"memberships": list(cache.membership) if cache else []})
+
+
+def _handle_sync_cache_devices(ctx: _Ctx) -> None:
+    from app.core.db import load_sync_cache
+    cache = load_sync_cache()
+    ctx.send_json(200, {"devices": list(cache.devices) if cache else []})
+
+
+def _handle_sync_cache_infrastructures(ctx: _Ctx) -> None:
+    from app.core.db import load_sync_cache
+    cache = load_sync_cache()
+    ctx.send_json(200, {"infrastructures": list(cache.infrastructures) if cache else []})
+
+
+def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
+    from app.core.db import list_sync_gym_access_credentials
+    creds = list_sync_gym_access_credentials()
+    # mask secret hex for safety
+    for c in creds:
+        if isinstance(c, dict) and "secretHex" in c:
+            sh = c["secretHex"]
+            if sh and len(sh) > 8:
+                c["secretHex"] = sh[:4] + "..." + sh[-4:]
+    ctx.send_json(200, {"credentials": creds})
+
+
+
+# ==================== 4.4) TV SYNC / CACHE / READINESS ====================
+
+def _tv_snapshot_view(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    out = dict(row)
+    out["is_latest"] = bool(int(out.get("is_latest") or 0))
+    out["is_previous_ready"] = bool(int(out.get("is_previous_ready") or 0))
+    out["is_fully_ready"] = bool(int(out.get("is_fully_ready") or 0)) if "is_fully_ready" in out else None
+    for key in ("payload_json", "manifest_json"):
+        if key in out:
+            try:
+                out[key.replace("_json", "")] = json.loads(out.get(key) or "{}")
+            except Exception:
+                out[key.replace("_json", "")] = {}
+    return out
+
+
+def _tv_resolve_binding_id(ctx: _Ctx, body: Optional[Dict[str, Any]] = None) -> int:
+    bid = ctx.q_int("bindingId", "binding_id", default=0)
+    if bid <= 0 and isinstance(body, dict):
+        bid = _safe_int(body.get("bindingId") or body.get("binding_id"), 0)
+    if bid <= 0:
+        b = load_tv_screen_binding()
+        bid = _safe_int(b.get("bindingId"), 0)
+    return bid
+
+
+def _tv_resolve_screen_id(ctx: _Ctx, body: Optional[Dict[str, Any]] = None) -> int:
+    sid = ctx.q_int("screenId", "screen_id", default=0)
+    if sid <= 0 and isinstance(body, dict):
+        sid = _safe_int(body.get("screenId") or body.get("screen_id"), 0)
+    if sid > 0:
+        return sid
+    bid = _tv_resolve_binding_id(ctx, body)
+    if bid > 0:
+        b = load_tv_screen_binding_by_id(binding_id=bid)
+        sid = _safe_int((b or {}).get("screen_id"), 0)
+    if sid <= 0:
+        b = load_tv_screen_binding()
+        sid = _safe_int(b.get("screenId"), 0)
+    return sid
+
+
+def _handle_tv_binding_get(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    binding = load_tv_screen_binding()
+    ctx.send_json(200, {"ok": True, "binding": binding})
+
+
+def _handle_tv_binding_patch(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _safe_int(body.get("screenId") or body.get("screen_id"), 0)
+    name = _safe_str(body.get("screenName") or body.get("screen_name"), "").strip()
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required and must be > 0"})
+        return
+    updated = save_tv_screen_binding(screen_id=sid, screen_name=name or None)
+    ctx.send_json(200, {"ok": True, "binding": updated})
+
+
+
+def _handle_tv_host_monitors_get(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    rows = list_tv_host_monitors()
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
+
+
+def _handle_tv_host_monitors_refresh(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    monitors = []
+    if isinstance(body, list):
+        monitors = body
+    elif isinstance(body, dict):
+        monitors = body.get("monitors") if isinstance(body.get("monitors"), list) else []
+    rows = replace_tv_host_monitors(monitors=monitors)
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
+
+
+def _handle_tv_host_bindings_get(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    rows = list_tv_screen_bindings()
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
+
+
+def _handle_tv_host_bindings_post(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _safe_int(body.get("screenId") or body.get("screen_id"), 0)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required and must be > 0"})
+        return
+    try:
+        row = create_tv_screen_binding(
+            screen_id=sid,
+            screen_name=_safe_str(body.get("screenName") or body.get("screen_name"), "") or None,
+            monitor_id=_safe_str(body.get("monitorId") or body.get("monitor_id"), "") or None,
+            monitor_label=_safe_str(body.get("monitorLabel") or body.get("monitor_label"), "") or None,
+            monitor_index=_safe_int(body.get("monitorIndex") or body.get("monitor_index"), 0) if (body.get("monitorIndex") is not None or body.get("monitor_index") is not None) else None,
+            enabled=_safe_bool(body.get("enabled"), default=True),
+            autostart=_safe_bool(body.get("autostart"), default=False),
+            fullscreen=_safe_bool(body.get("fullscreen"), default=True),
+        )
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_patch(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    try:
+        row = update_tv_screen_binding(
+            binding_id=bid,
+            screen_name=_safe_str(body.get("screenName") or body.get("screen_name"), "") if ("screenName" in body or "screen_name" in body) else None,
+            monitor_id=_safe_str(body.get("monitorId") or body.get("monitor_id"), "") if ("monitorId" in body or "monitor_id" in body) else None,
+            monitor_label=_safe_str(body.get("monitorLabel") or body.get("monitor_label"), "") if ("monitorLabel" in body or "monitor_label" in body) else None,
+            monitor_index=_safe_int(body.get("monitorIndex") or body.get("monitor_index"), 0) if ("monitorIndex" in body or "monitor_index" in body) else None,
+            enabled=_safe_bool(body.get("enabled"), default=False) if "enabled" in body else None,
+            autostart=_safe_bool(body.get("autostart"), default=False) if "autostart" in body else None,
+            fullscreen=_safe_bool(body.get("fullscreen"), default=True) if "fullscreen" in body else None,
+        )
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_delete(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    try:
+        ok = delete_tv_screen_binding(binding_id=bid)
+        if not ok:
+            ctx.send_json(404, {"ok": False, "error": "Binding not found"})
+            return
+        ctx.send_json(200, {"ok": True})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_start(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    try:
+        row = start_tv_screen_binding(binding_id=bid)
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_stop(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    try:
+        row = stop_tv_screen_binding(binding_id=bid)
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_restart(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    try:
+        row = restart_tv_screen_binding(binding_id=bid)
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_host_binding_status(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    row = get_tv_screen_binding(binding_id=bid)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Binding not found"})
+        return
+    ctx.send_json(200, {"ok": True, "binding": row})
+
+
+def _handle_tv_host_binding_events(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    rows = list_tv_screen_binding_events(binding_id=bid, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "rows": rows.get("rows") or [], "total": int(rows.get("total") or 0)})
+
+
+
+def _handle_tv_host_binding_support_summary(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    summary = load_tv_binding_support_summary(binding_id=bid)
+    if not bool(summary.get("ok")):
+        ctx.send_json(404, {"ok": False, "error": summary.get("error") or "BINDING_NOT_FOUND"})
+        return
+    ctx.send_json(200, summary)
+
+
+def _handle_tv_host_binding_support_action_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    action_type = _safe_str(body.get("actionType") or body.get("action_type"), "").strip()
+    if not action_type:
+        ctx.send_json(400, {"ok": False, "error": "actionType is required"})
+        return
+    options = body.get("options") if isinstance(body.get("options"), dict) else {}
+    confirm = _safe_bool(body.get("confirm"), default=False)
+    triggered_by = _safe_str(body.get("triggeredBy") or body.get("triggered_by"), "").strip() or "LOCAL_OPERATOR"
+
+    result = run_tv_binding_support_action(
+        app=ctx.app,
+        binding_id=bid,
+        action_type=action_type,
+        options=options,
+        confirm=confirm,
+        triggered_by=triggered_by,
+    )
+    code = 200
+    if not bool(result.get("ok")) and _safe_str(result.get("error"), "") == "BINDING_NOT_FOUND":
+        code = 404
+    ctx.send_json(code, result)
+
+
+def _handle_tv_host_binding_support_action_history(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    rows = list_tv_support_action_logs(binding_id=bid, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "rows": rows.get("rows") or [], "total": int(rows.get("total") or 0)})
+def _handle_tv_host_binding_runtime_event(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    evt = _safe_str(body.get("eventType") or body.get("event_type"), "").strip()
+    if not evt:
+        ctx.send_json(400, {"ok": False, "error": "eventType is required"})
+        return
+    try:
+        row = record_tv_screen_binding_runtime_event(
+            binding_id=bid,
+            event_type=evt,
+            window_id=_safe_str(body.get("windowId") or body.get("window_id"), "") or None,
+            error_code=_safe_str(body.get("errorCode") or body.get("error_code"), "") or None,
+            error_message=_safe_str(body.get("errorMessage") or body.get("error_message"), "") or None,
+            correlation_id=_safe_str(body.get("correlationId") or body.get("correlation_id"), "") or None,
+        )
+        ctx.send_json(200, {"ok": True, "binding": row})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_player_status(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    status = load_tv_player_status(binding_id=bid)
+    if not bool(status.get("ok")):
+        ctx.send_json(404, {"ok": False, "error": status.get("error") or "BINDING_NOT_FOUND"})
+        return
+    ctx.send_json(200, status)
+
+
+def _handle_tv_player_render_context(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    persist = _safe_bool(ctx.q("persist", default="0"), default=False)
+    context = get_tv_player_render_context(binding_id=bid, persist=persist)
+    code = 200 if bool(context.get("ok")) else 404
+    ctx.send_json(code, context)
+
+
+def _handle_tv_player_reevaluate(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    persist = _safe_bool(body.get("persist"), default=True)
+    result = reevaluate_tv_player(binding_id=bid, persist=persist)
+    code = 200 if bool(result.get("ok")) else 404
+    ctx.send_json(code, result)
+
+
+def _handle_tv_player_reload(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    persist = _safe_bool(body.get("persist"), default=True)
+    try:
+        result = reload_tv_player(binding_id=bid, persist=persist)
+        code = 200 if bool(result.get("ok")) else 404
+        ctx.send_json(code, result)
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_player_state_report(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    body = ctx.body()
+    payload = body.get("state") if isinstance(body.get("state"), dict) else body
+    event_type = _safe_str(body.get("eventType") or body.get("event_type"), "").strip() or "PLAYER_STATE_CHANGED"
+    force = _safe_bool(body.get("force"), default=False)
+    freshness = _safe_int(body.get("freshnessSeconds"), 20)
+    try:
+        out = report_tv_player_state(
+            binding_id=bid,
+            payload=payload if isinstance(payload, dict) else {},
+            event_type=event_type,
+            force=force,
+            freshness_seconds=max(0, freshness),
+        )
+        ctx.send_json(200, {"ok": True, **out})
+    except ValueError as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_player_events(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_player_events(binding_id=bid, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+def _handle_tv_sync_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _tv_resolve_screen_id(ctx, body)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    resolve_at = _safe_str(body.get("resolveAt") or body.get("resolve_at") or ctx.q("resolveAt", "resolve_at", default=""), "").strip()
+    result = sync_latest_snapshot_for_screen(app=ctx.app, screen_id=sid, resolve_at=(resolve_at or None))
+    code = 200 if bool(result.get("ok")) else 502
+    ctx.send_json(code, result)
+
+
+def _handle_tv_sync_status(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(200, {"ok": True, "screenId": None, "binding": load_tv_screen_binding(), "lastRun": None, "latestSnapshot": None, "latestReadySnapshot": None, "previousReadySnapshot": None, "latestReadiness": None, "latestDownloadBatch": None, "activation": None})
+        return
+    ctx.send_json(200, {
+        "ok": True,
+        "screenId": sid,
+        "binding": load_tv_screen_binding(),
+        "lastRun": load_latest_tv_sync_run(screen_id=sid),
+        "latestSnapshot": _tv_snapshot_view(load_tv_latest_snapshot(screen_id=sid)),
+        "latestReadySnapshot": _tv_snapshot_view(load_tv_latest_ready_snapshot(screen_id=sid)),
+        "previousReadySnapshot": _tv_snapshot_view(load_tv_previous_ready_snapshot(screen_id=sid)),
+        "latestReadiness": load_tv_latest_readiness(screen_id=sid),
+        "latestDownloadBatch": load_tv_latest_download_batch(screen_id=sid),
+        "activation": load_tv_activation_status(screen_id=sid),
+    })
+
+
+def _handle_tv_snapshot_latest(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    ctx.send_json(200, {
+        "ok": True,
+        "screenId": sid,
+        "latest": _tv_snapshot_view(load_tv_latest_snapshot(screen_id=sid)),
+        "latestReady": _tv_snapshot_view(load_tv_latest_ready_snapshot(screen_id=sid)),
+        "previousReady": _tv_snapshot_view(load_tv_previous_ready_snapshot(screen_id=sid)),
+    })
+
+
+def _handle_tv_snapshot_by_id(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    snapshot_id = _safe_str(ctx.param("snapshotId"), "").strip()
+    if not snapshot_id:
+        ctx.send_json(400, {"ok": False, "error": "snapshotId is required"})
+        return
+    row = load_tv_snapshot_by_id(snapshot_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Snapshot not found"})
+        return
+    ctx.send_json(200, {"ok": True, "snapshot": _tv_snapshot_view(row)})
+
+
+def _handle_tv_snapshot_manifest_by_id(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    snapshot_id = _safe_str(ctx.param("snapshotId"), "").strip()
+    if not snapshot_id:
+        ctx.send_json(400, {"ok": False, "error": "snapshotId is required"})
+        return
+    row = load_tv_snapshot_by_id(snapshot_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Snapshot not found"})
+        return
+    ctx.send_json(200, {"ok": True, "snapshotId": snapshot_id, "manifest": load_tv_snapshot_manifest(snapshot_id)})
+
+
+def _handle_tv_readiness_latest(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    readiness = load_tv_latest_readiness(screen_id=sid)
+    ctx.send_json(200, {
+        "ok": True,
+        "screenId": sid,
+        "readiness": readiness,
+        "latestSnapshot": _tv_snapshot_view(load_tv_latest_snapshot(screen_id=sid)),
+        "previousReadySnapshot": _tv_snapshot_view(load_tv_previous_ready_snapshot(screen_id=sid)),
+    })
+
+
+def _handle_tv_cache_assets(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+
+    version_raw = ctx.q("snapshotVersion", "snapshot_version", default="").strip()
+    snapshot_version = _safe_int(version_raw, 0) if version_raw else None
+    if snapshot_version is not None and snapshot_version <= 0:
+        snapshot_version = None
+
+    states_raw = ctx.q("states", "assetStates", default="")
+    states: List[str] = []
+    for part in states_raw.replace(";", ",").split(","):
+        s = _safe_str(part, "").strip().upper()
+        if s and s not in states:
+            states.append(s)
+
+    limit = max(1, min(ctx.q_int("limit", default=5000), 20000))
+    offset = max(0, ctx.q_int("offset", default=0))
+
+    assets = list_tv_cache_assets(
+        screen_id=sid,
+        snapshot_version=snapshot_version,
+        states=states,
+        limit=limit,
+        offset=offset,
+    )
+
+    ctx.send_json(200, {
+        "ok": True,
+        "screenId": sid,
+        "snapshotVersion": assets.get("snapshotVersion"),
+        "rows": assets.get("rows") or [],
+        "total": int(assets.get("total") or 0),
+        "latestReadiness": load_tv_latest_readiness(screen_id=sid),
+        "latestSnapshot": _tv_snapshot_view(load_tv_latest_snapshot(screen_id=sid)),
+    })
+
+def _handle_tv_downloads_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _tv_resolve_screen_id(ctx, body)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+
+    snapshot_version = _safe_int(body.get("snapshotVersion") or body.get("snapshot_version"), 0)
+    if snapshot_version <= 0:
+        snapshot_version = 0
+    run_bg = _safe_bool(body.get("runInBackground") if "runInBackground" in body else body.get("background"), default=False)
+    retry_failed_only = _safe_bool(body.get("retryFailedOnly"), default=False)
+    force = _safe_bool(body.get("force"), default=False)
+    media_asset_id = _safe_str(body.get("mediaAssetId") or body.get("media_asset_id"), "").strip() or None
+    max_attempts = max(1, min(_safe_int(body.get("maxAttempts"), 3), 5))
+    max_concurrency = max(1, min(_safe_int(body.get("maxConcurrency"), 1), 4))
+
+    result = run_tv_download_batch(
+        screen_id=sid,
+        snapshot_version=(snapshot_version if snapshot_version > 0 else None),
+        trigger_source="MANUAL",
+        retry_failed_only=retry_failed_only,
+        media_asset_id=media_asset_id,
+        force=force,
+        max_attempts=max_attempts,
+        run_in_background=run_bg,
+        max_concurrency=max_concurrency,
+    )
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+
+
+def _handle_tv_downloads_latest_batch(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(200, {"ok": True, "screenId": None, "batch": None})
+        return
+    batch = load_tv_latest_download_batch(screen_id=sid)
+    ctx.send_json(200, {"ok": True, "screenId": sid, "batch": batch})
+
+
+def _handle_tv_downloads_jobs(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+
+    version_raw = ctx.q("snapshotVersion", "snapshot_version", default="").strip()
+    snapshot_version = _safe_int(version_raw, 0) if version_raw else None
+    if snapshot_version is not None and snapshot_version <= 0:
+        snapshot_version = None
+
+    batch_id = _safe_str(ctx.q("batchId", "batch_id", default=""), "").strip() or None
+    states_raw = ctx.q("states", "state", default="")
+    states: List[str] = []
+    for part in states_raw.replace(";", ",").split(","):
+        s = _safe_str(part, "").strip().upper()
+        if s and s not in states:
+            states.append(s)
+
+    limit = max(1, min(ctx.q_int("limit", default=500), 5000))
+    offset = max(0, ctx.q_int("offset", default=0))
+
+    jobs = list_tv_download_jobs(
+        screen_id=sid,
+        snapshot_version=snapshot_version,
+        batch_id=batch_id,
+        states=states,
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(200, {
+        "ok": True,
+        "screenId": sid,
+        "rows": jobs.get("rows") or [],
+        "total": int(jobs.get("total") or 0),
+        "latestBatch": load_tv_latest_download_batch(screen_id=sid),
+        "latestReadiness": load_tv_latest_readiness(screen_id=sid),
+    })
+
+
+
+def _handle_tv_ad_tasks_list(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = _safe_int(ctx.q("gymId", "gym_id", default=""), 0)
+    remote_statuses = _split_csv_upper(ctx.q("remoteStatuses", "remoteStatus", "status", default=""))
+    local_states = _split_csv_upper(ctx.q("localStates", "localState", "localPreparationStates", default=""))
+    q = _safe_str(ctx.q("q", "query", default=""), "").strip() or None
+    limit = max(1, min(ctx.q_int("limit", default=300), 5000))
+    offset = max(0, ctx.q_int("offset", default=0))
+
+    data = list_tv_ad_task_cache(
+        gym_id=(gym_id if gym_id > 0 else None),
+        remote_statuses=remote_statuses,
+        local_states=local_states,
+        q=q,
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(
+        200,
+        {
+            "ok": True,
+            "rows": data.get("rows") or [],
+            "total": int(data.get("total") or 0),
+            "limit": int(data.get("limit") or limit),
+            "offset": int(data.get("offset") or offset),
+        },
+    )
+
+
+def _handle_tv_ad_tasks_fetch(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    force = _safe_bool(body.get("force") if isinstance(body, dict) else False, default=False)
+    limit = max(1, min(_safe_int((body.get("limit") if isinstance(body, dict) else 1000), 1000), 2000))
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+
+    result = fetch_tv_ad_tasks_for_host(
+        app=ctx.app,
+        force=force,
+        limit=limit,
+        correlation_id=correlation_id,
+    )
+    code = 200 if bool(result.get("ok")) else 502
+    ctx.send_json(code, result)
+
+
+def _handle_tv_ad_tasks_prepare(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    campaign_task_id = _safe_int((body.get("campaignTaskId") if isinstance(body, dict) else 0), 0)
+    force = _safe_bool(body.get("force") if isinstance(body, dict) else False, default=False)
+    limit = max(1, min(_safe_int((body.get("limit") if isinstance(body, dict) else 300), 300), 2000))
+    process_confirm = _safe_bool(body.get("processConfirm") if isinstance(body, dict) else True, default=True)
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+
+    prepare = prepare_tv_ad_tasks(
+        app=ctx.app,
+        campaign_task_id=(campaign_task_id if campaign_task_id > 0 else None),
+        force=force,
+        limit=limit,
+        correlation_id=correlation_id,
+    )
+    confirm: Dict[str, Any] = {"ok": True, "skipped": "NOT_REQUESTED"}
+    if process_confirm:
+        confirm = process_tv_ad_ready_confirm_outbox(app=ctx.app, force=False, limit=200, correlation_id=correlation_id)
+
+    ok = bool(prepare.get("ok")) and bool(confirm.get("ok"))
+    code = 200 if ok else 502
+    ctx.send_json(code, {"ok": ok, "prepare": prepare, "confirm": confirm})
+
+
+def _handle_tv_ad_tasks_cycle(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    force_fetch = _safe_bool(body.get("forceFetch") if isinstance(body, dict) else False, default=False)
+    force_prepare = _safe_bool(body.get("forcePrepare") if isinstance(body, dict) else False, default=False)
+    force_confirm = _safe_bool(body.get("forceConfirm") if isinstance(body, dict) else False, default=False)
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = run_tv_ad_task_cycle(
+        app=ctx.app,
+        force_fetch=force_fetch,
+        force_prepare=force_prepare,
+        force_confirm=force_confirm,
+        correlation_id=correlation_id,
+    )
+    code = 200 if bool(result.get("ok")) else 502
+    ctx.send_json(code, result)
+
+
+def _handle_tv_ad_tasks_retry_prepare(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    task_id = _safe_int(ctx.param("taskId"), 0)
+    if task_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "taskId is required"})
+        return
+    body = ctx.body()
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = retry_tv_ad_task_prepare(app=ctx.app, campaign_task_id=task_id, correlation_id=correlation_id)
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+
+
+def _handle_tv_ad_tasks_retry_confirm(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    task_id = _safe_int(ctx.param("taskId"), 0)
+    if task_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "taskId is required"})
+        return
+    body = ctx.body()
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = retry_tv_ad_task_ready_confirm(app=ctx.app, campaign_task_id=task_id, correlation_id=correlation_id)
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+def _handle_tv_ad_tasks_runtime_list(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = _safe_int(ctx.q("gymId", "gym_id", default=""), 0)
+    task_id = _safe_int(ctx.q("taskId", "campaignTaskId", "campaign_task_id", default=""), 0)
+    limit = max(1, min(ctx.q_int("limit", default=300), 5000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_ad_task_runtime(
+        gym_id=(gym_id if gym_id > 0 else None),
+        campaign_task_id=(task_id if task_id > 0 else None),
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0), "limit": int(data.get("limit") or limit), "offset": int(data.get("offset") or offset)})
+
+
+def _handle_tv_ad_tasks_runtime_one(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    task_id = _safe_int(ctx.param("taskId"), 0)
+    if task_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "taskId is required"})
+        return
+    row = load_tv_ad_task_runtime(campaign_task_id=task_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Task runtime not found"})
+        return
+    ctx.send_json(200, {"ok": True, "runtime": row})
+
+
+def _handle_tv_gym_ad_runtime_one(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = _safe_int(ctx.param("gymId"), 0)
+    if gym_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "gymId is required"})
+        return
+    row = load_tv_gym_ad_runtime(gym_id=gym_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Gym ad runtime not found"})
+        return
+    ctx.send_json(200, {"ok": True, "runtime": row})
+
+
+def _handle_tv_ad_tasks_inject_now(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    task_id = _safe_int(ctx.param("taskId"), 0)
+    if task_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "taskId is required"})
+        return
+    body = ctx.body()
+    support_confirm = _safe_bool(body.get("support") if isinstance(body, dict) else False, default=False) or _safe_bool(body.get("confirm") if isinstance(body, dict) else False, default=False)
+    if not support_confirm:
+        ctx.send_json(403, {"ok": False, "error": "SUPPORT_CONFIRM_REQUIRED"})
+        return
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = inject_tv_ad_task_now(campaign_task_id=task_id, correlation_id=correlation_id)
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+
+
+def _handle_tv_activation_status(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    status = load_tv_activation_status(screen_id=sid)
+    ctx.send_json(200, {"ok": True, "screenId": sid, "activation": status})
+
+
+def _handle_tv_activation_evaluate(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _tv_resolve_screen_id(ctx, body)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    auto_activate = _safe_bool(body.get("autoActivate") if isinstance(body, dict) else True, default=True)
+    recheck = _safe_bool(body.get("recheckReadiness") if isinstance(body, dict) else True, default=True)
+    result = evaluate_tv_activation(
+        screen_id=sid,
+        trigger_source="MANUAL_EVALUATE",
+        auto_activate=auto_activate,
+        manual=False,
+        recheck_readiness=recheck,
+    )
+    code = 200 if bool(result.get("ok", True)) else 500
+    ctx.send_json(code, result)
+
+
+def _handle_tv_activation_activate_latest_ready(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    sid = _tv_resolve_screen_id(ctx, body)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    result = activate_tv_latest_ready_snapshot(screen_id=sid)
+    code = 200 if bool(result.get("ok", True)) else 500
+    ctx.send_json(code, result)
+
+
+def _handle_tv_activation_history(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _tv_resolve_screen_id(ctx)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "No bound screen. Set /api/v2/tv/binding first."})
+        return
+    limit = max(1, min(ctx.q_int("limit", default=50), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    hist = list_tv_activation_attempts(screen_id=sid, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "screenId": sid, "rows": hist.get("rows") or [], "total": int(hist.get("total") or 0)})
+
+
+# ==================== 4.45) TV OBSERVABILITY ====================
+
+def _handle_tv_observability_overview(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    data = get_tv_observability_overview(gym_id=(gym_id if gym_id > 0 else None))
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_observability_fleet_health(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    health = ctx.q("health", default="")
+    runtime_state = ctx.q("runtimeState", "runtime_state", default="")
+    q = ctx.q("q", "query", default="")
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_observability_fleet_health(
+        health=health or None,
+        runtime_state=runtime_state or None,
+        q=q or None,
+        limit=limit,
+        offset=offset,
+        gym_id=(gym_id if gym_id > 0 else None),
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+
+
+def _handle_tv_observability_screen_details(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _safe_int(ctx.param("screenId"), 0)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required"})
+        return
+    data = get_tv_observability_screen_details(screen_id=sid)
+    if not bool(data.get("ok")):
+        ctx.send_json(404, {"ok": False, "error": data.get("error") or "SCREEN_NOT_FOUND"})
+        return
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_screen_timeline(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    sid = _safe_int(ctx.param("screenId"), 0)
+    if sid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required"})
+        return
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = get_tv_observability_screen_timeline(screen_id=sid, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+
+
+def _handle_tv_observability_heartbeats(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    screen_id = ctx.q_int("screenId", "screen_id", default=0)
+    binding_id = ctx.q_int("bindingId", "binding_id", default=0)
+    from_utc = _safe_str(ctx.q("fromUtc", "from_utc", default=""), "").strip() or None
+    to_utc = _safe_str(ctx.q("toUtc", "to_utc", default=""), "").strip() or None
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_observability_heartbeats(
+        screen_id=(screen_id if screen_id > 0 else None),
+        binding_id=(binding_id if binding_id > 0 else None),
+        from_utc=from_utc,
+        to_utc=to_utc,
+        limit=limit,
+        offset=offset,
+        gym_id=(gym_id if gym_id > 0 else None),
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+
+
+def _handle_tv_observability_runtime_events(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    screen_id = ctx.q_int("screenId", "screen_id", default=0)
+    binding_id = ctx.q_int("bindingId", "binding_id", default=0)
+    severities = _safe_str(ctx.q("severities", "severity", default=""), "").strip() or None
+    event_types = _safe_str(ctx.q("eventTypes", "event_types", "types", default=""), "").strip() or None
+    from_utc = _safe_str(ctx.q("fromUtc", "from_utc", default=""), "").strip() or None
+    to_utc = _safe_str(ctx.q("toUtc", "to_utc", default=""), "").strip() or None
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_observability_runtime_events(
+        screen_id=(screen_id if screen_id > 0 else None),
+        binding_id=(binding_id if binding_id > 0 else None),
+        severities=severities,
+        event_types=event_types,
+        from_utc=from_utc,
+        to_utc=to_utc,
+        limit=limit,
+        offset=offset,
+        gym_id=(gym_id if gym_id > 0 else None),
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+
+
+def _handle_tv_observability_proof_events(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    screen_id = ctx.q_int("screenId", "screen_id", default=0)
+    binding_id = ctx.q_int("bindingId", "binding_id", default=0)
+    snapshot_version = ctx.q_int("snapshotVersion", "snapshot_version", default=0)
+    timeline_types = _safe_str(ctx.q("timelineTypes", "timeline_types", default=""), "").strip() or None
+    statuses = _safe_str(ctx.q("statuses", "status", default=""), "").strip() or None
+    from_utc = _safe_str(ctx.q("fromUtc", "from_utc", default=""), "").strip() or None
+    to_utc = _safe_str(ctx.q("toUtc", "to_utc", default=""), "").strip() or None
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_observability_proof_events(
+        screen_id=(screen_id if screen_id > 0 else None),
+        binding_id=(binding_id if binding_id > 0 else None),
+        snapshot_version=(snapshot_version if snapshot_version > 0 else None),
+        timeline_types=timeline_types,
+        statuses=statuses,
+        from_utc=from_utc,
+        to_utc=to_utc,
+        limit=limit,
+        offset=offset,
+        gym_id=(gym_id if gym_id > 0 else None),
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0)})
+
+
+def _handle_tv_observability_proof_stats(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    screen_id = ctx.q_int("screenId", "screen_id", default=0)
+    from_utc = _safe_str(ctx.q("fromUtc", "from_utc", default=""), "").strip() or None
+    to_utc = _safe_str(ctx.q("toUtc", "to_utc", default=""), "").strip() or None
+    bucket = _safe_str(ctx.q("bucket", default="HOUR"), "HOUR").strip().upper()
+    if bucket not in {"HOUR", "DAY"}:
+        bucket = "HOUR"
+    data = get_tv_observability_proof_stats(
+        screen_id=(screen_id if screen_id > 0 else None),
+        from_utc=from_utc,
+        to_utc=to_utc,
+        gym_id=(gym_id if gym_id > 0 else None),
+        bucket=bucket,
+    )
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_observability_runtime_stats(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    screen_id = ctx.q_int("screenId", "screen_id", default=0)
+    from_utc = _safe_str(ctx.q("fromUtc", "from_utc", default=""), "").strip() or None
+    to_utc = _safe_str(ctx.q("toUtc", "to_utc", default=""), "").strip() or None
+    data = get_tv_observability_runtime_stats(
+        screen_id=(screen_id if screen_id > 0 else None),
+        from_utc=from_utc,
+        to_utc=to_utc,
+        gym_id=(gym_id if gym_id > 0 else None),
+    )
+    ctx.send_json(200, {"ok": True, **data})
+
+# ==================== 4.46) TV HARDENING / RECOVERY ====================
+
+def _handle_tv_hardening_startup_latest(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    data = load_tv_startup_reconciliation_latest()
+    code = 200 if bool(data.get("ok")) else 404
+    ctx.send_json(code, data)
+
+
+def _handle_tv_hardening_startup_runs(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = ctx.q_int("limit", default=20)
+    offset = ctx.q_int("offset", default=0)
+    data = list_tv_startup_reconciliation_runs(limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_hardening_startup_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body_json()
+    trigger_source = _safe_str(body.get("triggerSource") or body.get("trigger_source"), "API_MANUAL").strip() or "API_MANUAL"
+    corr = _safe_str(body.get("correlationId") or body.get("correlation_id"), "").strip() or None
+    monitors = body.get("monitors")
+    if not isinstance(monitors, list):
+        monitors = None
+    data = run_tv_startup_reconciliation(
+        trigger_source=trigger_source,
+        monitors=monitors,
+        correlation_id=corr,
+    )
+    if not bool(data.get("ok")) and _safe_str(data.get("result"), "").upper() == "BLOCKED":
+        ctx.send_json(409, data)
+        return
+    ctx.send_json(200, data)
+
+
+def _handle_tv_hardening_retention_policy(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    ctx.send_json(200, {"ok": True, "retentionDays": get_tv_retention_policy()})
+
+
+def _handle_tv_hardening_retention_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body_json()
+    dry_run = _safe_bool(body.get("dryRun"), default=False)
+    include_checks = _safe_bool(body.get("includeQueryChecks"), default=True)
+    data = run_tv_retention_maintenance(dry_run=dry_run, include_query_checks=include_checks)
+    ctx.send_json(200, data)
+
+
+def _handle_tv_hardening_query_checks(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = ctx.q_int("limit", default=200)
+    data = run_tv_query_responsiveness_checks(limit=limit)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+
+def _handle_tv_hardening_preflight(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    include_checks = _safe_bool(ctx.q("includeQueryChecks", "include_query_checks", default="0"), default=False)
+    data = run_tv_deployment_preflight(include_query_checks=include_checks)
+    code = 200 if bool(data.get("ok")) else 503
+    ctx.send_json(code, data)
+
+def _handle_tv_hardening_correlation_audit(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    correlation_id = _safe_str(ctx.q("correlationId", "correlation_id", default=""), "").strip()
+    if not correlation_id:
+        ctx.send_json(400, {"ok": False, "error": "correlationId is required"})
+        return
+    data = audit_tv_correlation_propagation(correlation_id=correlation_id)
+    ctx.send_json(200, data)
+
+# ==================== 4.5) OFFLINE CREATION QUEUE ====================
+
+_OFFLINE_ACTIVE_STATES = ("pending", "processing", "failed_retryable", "blocked_auth")
+_OFFLINE_HISTORY_STATES = ("succeeded", "reconciled", "cancelled", "failed_terminal", "archived")
+
+
+def _split_state_filter(raw: str) -> List[str]:
+    allowed = set(_OFFLINE_ACTIVE_STATES + _OFFLINE_HISTORY_STATES)
+    out: List[str] = []
+    for part in (raw or "").replace(";", ",").split(","):
+        s = (part or "").strip().lower()
+        if s and s in allowed and s not in out:
+            out.append(s)
+    return out
+
+
+def _queue_payload_from_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    payload = body.get("payload")
+    if isinstance(payload, dict):
+        return dict(payload)
+    # fallback: allow flat payload body from callers
+    out = dict(body or {})
+    for k in ("creationKind", "creation_kind", "failure", "failureType", "failureCode", "lastHttpStatus", "error"):
+        out.pop(k, None)
+    return out
+
+
+def _handle_offline_creations_active(ctx: _Ctx) -> None:
+    from app.core.db import list_offline_creations, count_offline_creations
+
+    raw_state = ctx.q("state", "states", default="")
+    states = _split_state_filter(raw_state) or list(_OFFLINE_ACTIVE_STATES)
+    states = [s for s in states if s in _OFFLINE_ACTIVE_STATES]
+    if not states:
+        states = list(_OFFLINE_ACTIVE_STATES)
+
+    limit = ctx.q_int("limit", default=200)
+    offset = ctx.q_int("offset", default=0)
+    rows = list_offline_creations(states=states, include_archived=False, limit=limit, offset=offset)
+    total = count_offline_creations(states=states, include_archived=False)
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": total, "states": states})
+
+
+def _handle_offline_creations_history(ctx: _Ctx) -> None:
+    from app.core.db import list_offline_creations, count_offline_creations
+
+    raw_state = ctx.q("state", "states", default="")
+    states = _split_state_filter(raw_state) or list(_OFFLINE_HISTORY_STATES)
+    states = [s for s in states if s in _OFFLINE_HISTORY_STATES]
+    if not states:
+        states = list(_OFFLINE_HISTORY_STATES)
+
+    limit = ctx.q_int("limit", default=200)
+    offset = ctx.q_int("offset", default=0)
+    rows = list_offline_creations(states=states, include_archived=True, limit=limit, offset=offset)
+    total = count_offline_creations(states=states, include_archived=True)
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": total, "states": states})
+
+
+def _handle_offline_creation_get(ctx: _Ctx) -> None:
+    from app.core.db import get_offline_creation
+
+    local_id = ctx.param("localId")
+    row = get_offline_creation(local_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found"})
+        return
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_offline_creation_attempt(ctx: _Ctx) -> None:
+    body = ctx.body()
+    creation_kind = _safe_str(body.get("creationKind") or body.get("creation_kind"), "membership_only")
+    payload = _queue_payload_from_body(body)
+    client_request_id = _safe_str(body.get("clientRequestId") or body.get("client_request_id"), "")
+
+    result = ctx.app.attempt_offline_creation(
+        creation_kind=creation_kind,
+        payload=payload,
+        client_request_id=client_request_id or None,
+    )
+    # Keep 200 with ok=false so UI can decide modify vs save-later without transport errors.
+    ctx.send_json(200, result)
+
+
+def _handle_offline_creation_queue(ctx: _Ctx) -> None:
+    body = ctx.body()
+    creation_kind = _safe_str(body.get("creationKind") or body.get("creation_kind"), "membership_only")
+    payload = _queue_payload_from_body(body)
+    failure = body.get("failure")
+    if not isinstance(failure, dict):
+        failure = {
+            "failureType": body.get("failureType"),
+            "failureCode": body.get("failureCode"),
+            "lastHttpStatus": body.get("lastHttpStatus"),
+            "error": body.get("error"),
+        }
+
+    try:
+        row = ctx.app.queue_offline_creation(creation_kind=creation_kind, payload=payload, failure=failure)
+        ctx.send_json(201, {"ok": True, "row": row})
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_offline_creation_patch(ctx: _Ctx) -> None:
+    from app.core.db import get_offline_creation, update_offline_creation_payload
+
+    local_id = ctx.param("localId")
+    body = ctx.body()
+    payload = body.get("payload")
+    if not isinstance(payload, dict):
+        payload = _queue_payload_from_body(body)
+
+    try_to_create_val = body.get("tryToCreate")
+    if try_to_create_val is None:
+        try_to_create_val = body.get("try_to_create")
+    try_to_create: Optional[bool] = None
+    if try_to_create_val is not None:
+        try_to_create = _safe_bool(try_to_create_val, default=True)
+
+    existing = get_offline_creation(local_id)
+    if not existing:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found"})
+        return
+
+    row = update_offline_creation_payload(local_id, payload=payload, try_to_create=try_to_create)
+    if not row:
+        ctx.send_json(409, {"ok": False, "error": "row is read-only or final"})
+        return
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_offline_creation_toggle(ctx: _Ctx) -> None:
+    from app.core.db import set_offline_creation_try_to_create
+
+    local_id = ctx.param("localId")
+    body = ctx.body()
+    enabled = _safe_bool(body.get("enabled", True), default=True)
+    row = set_offline_creation_try_to_create(local_id, enabled=enabled)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found or not mutable"})
+        return
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_offline_creation_retry(ctx: _Ctx) -> None:
+    local_id = ctx.param("localId")
+    res = ctx.app.process_offline_creation_row(local_id, source="manual_retry", force=True)
+    if not bool(res.get("ok")):
+        ctx.send_json(409, {"ok": False, "error": res.get("error") or "retry failed", "result": res})
+        return
+    ctx.send_json(200, {"ok": True, "result": res})
+
+
+def _handle_offline_creation_cancel(ctx: _Ctx) -> None:
+    from app.core.db import cancel_offline_creation
+
+    local_id = ctx.param("localId")
+    body = ctx.body()
+    reason = _safe_str(body.get("reason"), "")
+    row = cancel_offline_creation(local_id, reason=reason or None)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found or not cancellable"})
+        return
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_offline_creation_duplicate(ctx: _Ctx) -> None:
+    from app.core.db import duplicate_offline_creation
+
+    local_id = ctx.param("localId")
+    row = duplicate_offline_creation(local_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found"})
+        return
+    ctx.send_json(201, {"ok": True, "row": row})
+
+
+def _handle_offline_creation_archive(ctx: _Ctx) -> None:
+    from app.core.db import archive_offline_creation
+
+    local_id = ctx.param("localId")
+    row = archive_offline_creation(local_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "offline row not found"})
+        return
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_offline_creations_process_due(ctx: _Ctx) -> None:
+    limit = ctx.q_int("limit", default=100)
+    summary = ctx.app.process_due_offline_creations(source="manual", limit=limit)
+    if not bool(summary.get("ok")):
+        ctx.send_json(409, {"ok": False, "error": summary.get("error") or "process failed", "summary": summary})
+        return
+    ctx.send_json(200, {"ok": True, "summary": summary})
+
+
+# ==================== 5) DEVICES (PullSDK) ====================
+
+# Keep a small pool of per-device SDK connections for session-like use.
+_device_sdk_pool: Dict[int, Any] = {}
+_device_sdk_lock = threading.Lock()
+
+
+def _get_device_conn_params(ctx: _Ctx, device_id: int) -> Tuple[str, int, int, str]:
+    """Resolve connection params from sync cache + optional overrides."""
+    from app.core.db import get_sync_device
+    d = get_sync_device(device_id) or {}
+
+    def pick(d, *keys, default=None):
+        for k in keys:
+            if isinstance(d, dict) and k in d and d[k] not in (None, ""):
+                return d[k]
+        return default
+
+    ip = _safe_str(pick(d, "ipAddress", "ip_address", "ip", "host"), "").strip()
+    port = _safe_int(pick(d, "portNumber", "port_number", "port"), 4370)
+    timeout_ms = _safe_int(pick(d, "timeout_ms", "timeoutMs"), 5000)
+    password = _safe_str(pick(d, "password", "commPassword", "comm_password"), "")
+
+    # Allow body overrides
+    try:
+        body = ctx.body()
+        if body.get("ip"):
+            ip = str(body["ip"]).strip()
+        if body.get("port"):
+            port = _safe_int(body["port"], port)
+        if body.get("password") is not None:
+            password = str(body["password"])
+        if body.get("timeoutMs"):
+            timeout_ms = _safe_int(body["timeoutMs"], timeout_ms)
+    except Exception:
+        pass
+
+    return ip, port, timeout_ms, password
+
+
+def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
+    """Connect to a device, returns (sdk, error_or_none)."""
+    from app.sdk.pullsdk import PullSDK
+    ip, port, timeout_ms, password = _get_device_conn_params(ctx, device_id)
+    if not ip:
+        return None, "Device has no IP address"
+
+    try:
+        sdk = PullSDK(ctx.app.cfg.plcomm_dll_path, logger=ctx.app.logger)
+        sdk.connect(ip=ip, port=port, timeout_ms=timeout_ms, password=password)
+        return sdk, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _handle_device_connect(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    with _device_sdk_lock:
+        old = _device_sdk_pool.pop(did, None)
+        if old:
+            try: old.disconnect()
+            except Exception: pass
+        _device_sdk_pool[did] = sdk
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_device_disconnect(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    with _device_sdk_lock:
+        sdk = _device_sdk_pool.pop(did, None)
+    if sdk:
+        try: sdk.disconnect()
+        except Exception: pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_device_info(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    try:
+        params = {}
+        raw = ""
+        items = ctx.q("items", default=(
+            "DeviceName,SerialNumber,ProductTime,FirmwareVersion,Platform,DeviceType,"
+            "LockCount,ReaderCount,DoorCount,IPAddress,NetMask,Gateway,MAC"
+        ))
+        if sdk.supports_get_device_param():
+            raw = sdk.get_device_param(items=items, initial_size=65536)
+            for part in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                for seg in part.split(","):
+                    seg = seg.strip()
+                    if "=" in seg:
+                        k, v = seg.split("=", 1)
+                        params[k.strip()] = v.strip()
+        counts = {}
+        for t in ["user", "userauthorize", "transaction", "templatev10", "timezone", "holiday"]:
+            try:
+                c = sdk.get_device_data_count(table=t)
+                if c >= 0:
+                    counts[t] = c
+            except Exception:
+                pass
+        ctx.send_json(200, {"ok": True, "params": params, "counts": counts, "raw": raw})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_table(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    table_name = ctx.param("tableName")
+    fields = ctx.q("fields", default="*")
+    flt = ctx.q("filter", default="")
+    max_rows = ctx.q_int("maxRows", default=10000)
+
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    try:
+        rows = sdk.get_device_data_rows(table=table_name, fields=fields, filter_expr=flt, options="")
+        count = len(rows)
+        if max_rows > 0:
+            rows = rows[:max_rows]
+        ctx.send_json(200, {"ok": True, "table": table_name, "rows": rows, "count": count})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_door_open(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    body = ctx.body()
+    door = _safe_int(body.get("doorNumber"), 1)
+    pulse_sec = _safe_int(body.get("pulseSeconds"), 3)
+    if door < 1: door = 1
+    if pulse_sec < 1: pulse_sec = 1
+    if pulse_sec > 60: pulse_sec = 60
+
+    # Try agent engine first (for AGENT-mode devices)
+    eng = getattr(ctx.app, "_agent_engine", None)
+    if eng and eng.is_running():
+        try:
+            res = eng._cmd_bus.open_door(
+                device_id=did, door_id=door,
+                pulse_time_ms=pulse_sec * 1000,
+                timeout_ms=4000,
+            )
+            if res.ok:
+                ctx.send_json(200, {"ok": True, "rc": 0, "source": "agent"})
+                return
+        except Exception:
+            pass
+
+    # Fallback: direct PullSDK connect
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    try:
+        rc = sdk.door_pulse_open(door=door, seconds=pulse_sec)
+        ctx.send_json(200, {"ok": True, "rc": rc})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_users_push(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    body = ctx.body()
+    pin = _safe_str(body.get("pin"), "").strip()
+    name = _safe_str(body.get("name"), "").strip()
+    card_no = _safe_str(body.get("cardNo"), "").strip()
+    door_ids = body.get("doorIds") or [15]
+    templates = body.get("templates") or []
+
+    if not pin:
+        ctx.send_json(400, {"ok": False, "error": "pin is required"})
+        return
+
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+
+    try:
+        # Push user
+        pairs = [f"Pin={pin}"]
+        if name: pairs.append(f"Name={name}")
+        if card_no: pairs.append(f"CardNo={card_no}")
+        user_data = "\t".join(pairs) + "\r\n"
+        sdk.set_device_data(table="user", data=user_data, options="")
+
+        # Push authorize
+        auth_result = "OK"
+        for door in door_ids:
+            try:
+                auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={int(door)}\r\n"
+                sdk.set_device_data(table="userauthorize", data=auth_data, options="")
+            except Exception as ex:
+                auth_result = str(ex)
+
+        # Push templates
+        tpl_ok = 0
+        tpl_errors: List[str] = []
+        for t in templates:
+            fid = _safe_int(t.get("fingerId"), 0)
+            ver = _safe_int(t.get("templateVersion"), 10)
+            size = _safe_int(t.get("templateSize"), 0)
+            tpl_data = _safe_str(t.get("templateData"), "").strip()
+            if not tpl_data:
+                continue
+            table = "templatev10" if ver >= 10 else "template"
+            tpl_line = f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl_data}\r\n"
+            try:
+                sdk.set_device_data(table=table, data=tpl_line, options="")
+                tpl_ok += 1
+            except Exception as ex:
+                tpl_errors.append(f"FingerID={fid}: {ex}")
+
+        ctx.send_json(200, {
+            "ok": True,
+            "authResult": auth_result,
+            "templateResult": f"{tpl_ok}/{len(templates)} pushed",
+            "errors": tpl_errors,
+        })
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_users_list(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    try:
+        rows = sdk.get_device_data_rows(table="user", fields="Pin;Name;CardNo", filter_expr="", options="")
+        users = []
+        for r in rows:
+            users.append({
+                "pin": _safe_str(r.get("Pin") or r.get("pin"), ""),
+                "name": _safe_str(r.get("Name") or r.get("name"), ""),
+                "cardNo": _safe_str(r.get("CardNo") or r.get("cardno"), ""),
+            })
+        ctx.send_json(200, {"ok": True, "users": users})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_users_delete(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    body = ctx.body()
+    pin = _safe_str(body.get("pin"), "").strip()
+    if not pin:
+        ctx.send_json(400, {"ok": False, "error": "pin is required"})
+        return
+
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        ctx.send_json(500, {"ok": False, "error": err})
+        return
+    try:
+        cond = f"Pin={pin}"
+        for table in ["templatev10", "template", "userauthorize", "user"]:
+            try:
+                if sdk.supports_delete_device_data():
+                    sdk.delete_device_data(table=table, data=cond, options="")
+            except Exception:
+                pass
+        ctx.send_json(200, {"ok": True})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _handle_device_door_presets_list(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    from app.core.db import list_device_door_presets
+    presets = list_device_door_presets(did)
+    ctx.send_json(200, {"presets": [
+        {"id": p.id, "deviceId": p.device_id, "doorNumber": p.door_number,
+         "pulseSeconds": p.pulse_seconds, "doorName": p.door_name}
+        for p in presets
+    ]})
+
+
+def _handle_device_door_presets_create(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    body = ctx.body()
+    from app.core.db import create_device_door_preset
+    try:
+        pid = create_device_door_preset(
+            device_id=did,
+            door_number=_safe_int(body.get("doorNumber"), 1),
+            pulse_seconds=_safe_int(body.get("pulseSeconds"), 3),
+            door_name=_safe_str(body.get("doorName"), "").strip(),
+        )
+        ctx.send_json(201, {"ok": True, "id": pid})
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_device_door_presets_delete(ctx: _Ctx) -> None:
+    preset_id = ctx.param_int("presetId")
+    from app.core.db import delete_device_door_preset
+    try:
+        delete_device_door_preset(preset_id)
+        ctx.send_json(200, {"ok": True})
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+# ==================== 6) AGENT REALTIME ====================
+
+def _handle_agent_status(ctx: _Ctx) -> None:
+    eng = getattr(ctx.app, "_agent_engine", None)
+    running = bool(eng and eng.is_running())
+    data: Dict[str, Any] = {"running": running, "eventQueueDepth": 0, "avgDecisionMs": 0.0}
+    if eng and running:
+        data["eventQueueDepth"] = eng.get_queue_depth()
+        data["avgDecisionMs"] = round(eng.get_avg_decision_ms(), 2)
+
+        # service status
+        notif = getattr(eng, "_notif", None)
+        hist = getattr(eng, "_hist", None)
+        deciders = getattr(eng, "_deciders", [])
+        data["notificationServiceAlive"] = bool(notif and notif.is_alive())
+        data["historyServiceAlive"] = bool(hist and hist.is_alive())
+        data["decisionWorkersActive"] = sum(1 for d in deciders if d.is_alive())
+        data["decisionWorkersTotal"] = len(deciders)
+    ctx.send_json(200, data)
+
+
+def _handle_agent_start(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.start_realtime_agent)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_agent_stop(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.stop_realtime_agent)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_agent_refresh_devices(ctx: _Ctx) -> None:
+    eng = getattr(ctx.app, "_agent_engine", None)
+    if eng and eng.is_running():
+        try:
+            eng.refresh_devices()
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_agent_devices(ctx: _Ctx) -> None:
+    eng = getattr(ctx.app, "_agent_engine", None)
+    snap = {}
+    if eng and eng.is_running():
+        try:
+            snap = eng.get_status_snapshot()
+        except Exception:
+            pass
+    ctx.send_json(200, {"devices": snap})
+
+
+def _handle_agent_device_enable(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    eng = getattr(ctx.app, "_agent_engine", None)
+    if eng:
+        try:
+            eng.set_device_enabled(did, True)
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_agent_device_disable(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    eng = getattr(ctx.app, "_agent_engine", None)
+    if eng:
+        try:
+            eng.set_device_enabled(did, False)
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_agent_events_sse(ctx: _Ctx) -> None:
+    """SSE stream: agent events (access decisions, device status, popups)."""
+    eng = getattr(ctx.app, "_agent_engine", None)
+    ctx.send_sse_start()
+
+    # send initial status
+    ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+
+    last_snap: Dict[int, Dict[str, Any]] = {}
+    while True:
+        try:
+            time.sleep(0.25)
+
+            if not eng or not eng.is_running():
+                eng = getattr(ctx.app, "_agent_engine", None)
+                alive = ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+                if not alive:
+                    return
+                time.sleep(1.0)
+                continue
+
+            # device status changes
+            try:
+                snap = eng.get_status_snapshot()
+                if snap != last_snap:
+                    alive = ctx.send_sse_event("device_status", snap)
+                    if not alive:
+                        return
+                    last_snap = snap
+            except Exception:
+                pass
+
+            # drain popup queue for React
+            popup_q = eng.get_popup_queue()
+            for _ in range(10):
+                try:
+                    req = popup_q.get_nowait()
+                    alive = ctx.send_sse_event("popup", {
+                        "eventId": req.event_id,
+                        "title": req.title,
+                        "message": req.message,
+                        "imagePath": req.image_path,
+                        "popupShowImage": req.popup_show_image,
+                        "userFullName": getattr(req, "user_full_name", ""),
+                        "userImage": getattr(req, "user_image", ""),
+                        "userValidFrom": getattr(req, "user_valid_from", ""),
+                        "userValidTo": getattr(req, "user_valid_to", ""),
+                        "userMembershipId": getattr(req, "user_membership_id", None),
+                        "userPhone": getattr(req, "user_phone", ""),
+                        "deviceId": getattr(req, "device_id", 0),
+                        "deviceName": getattr(req, "device_name", ""),
+                        "allowed": getattr(req, "allowed", False),
+                        "reason": getattr(req, "reason", ""),
+                        "scanMode": getattr(req, "scan_mode", ""),
+                        "popupDurationSec": getattr(req, "popup_duration_sec", 3),
+                        "popupEnabled": getattr(req, "popup_enabled", True),
+                        "winNotifyEnabled": getattr(req, "win_notify_enabled", True),
+                    })
+                    if not alive:
+                        return
+                except Exception:
+                    break
+
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception:
+            return
+
+
+def _handle_agent_settings_global(ctx: _Ctx) -> None:
+    settings = ctx.app.cfg.get_agent_global()
+    ctx.send_json(200, settings)
+
+
+def _handle_agent_settings_device(ctx: _Ctx) -> None:
+    did = ctx.param_int("deviceId")
+    settings = ctx.app.cfg.get_agent_device_settings(did)
+    ctx.send_json(200, settings)
+
+
+# ==================== 7) ENROLLMENT ====================
+
+# Global enroll state (shared with main app's _enroll_state_lock)
+_enroll_logs: List[str] = []
+_enroll_step: str = ""
+_enroll_result: Optional[str] = None  # "success" | "failed" | "cancelled" | None
+_enroll_lock = threading.Lock()
+_enroll_event = threading.Event()  # signaled on each update
+
+
+def _enroll_reset() -> None:
+    global _enroll_logs, _enroll_step, _enroll_result
+    with _enroll_lock:
+        _enroll_logs = []
+        _enroll_step = ""
+        _enroll_result = None
+        _enroll_event.clear()
+
+
+def _enroll_set_step(s: str) -> None:
+    global _enroll_step
+    with _enroll_lock:
+        _enroll_step = s
+        _enroll_event.set()
+
+
+def _enroll_add_log(line: str) -> None:
+    global _enroll_logs
+    with _enroll_lock:
+        _enroll_logs.append(line)
+        _enroll_event.set()
+
+
+def _enroll_set_result(r: str) -> None:
+    global _enroll_result
+    with _enroll_lock:
+        _enroll_result = r
+        _enroll_event.set()
+
+
+def _handle_enroll_start(ctx: _Ctx) -> None:
+    body = ctx.body()
+
+    # accept either "type" or "target" from frontend
+    enroll_type = _safe_str(body.get("type"), "").strip().upper()
+    target = _safe_str(body.get("target"), "").strip().lower()
+    if not target:
+        target = "backend" if enroll_type in ("BACKEND", "") else "local"
+
+    user_id = _safe_str(body.get("userId"), "").strip()
+    finger_id = _safe_str(body.get("fingerId"), "").strip()
+    full_name = _safe_str(body.get("fullName"), "").strip()
+    device = _safe_str(body.get("device"), "zk9500").strip()
+
+    # Reset FIRST (no race)
+    _enroll_reset()
+    _enroll_add_log("Enroll requestedâ€¦")
+
+    # Your current implementation only supports backend enroll
+    if target != "backend":
+        _enroll_set_result("failed")
+        ctx.send_json(400, {"ok": False, "error": "LOCAL enroll not implemented. Use type=BACKEND."})
+        return
+
+    result = ctx.app.begin_remote_enroll(
+        user_id=user_id,
+        finger_id=finger_id,
+        full_name=full_name,
+        device=device or "zk9500",
+    )
+
+    if result.get("ok"):
+        _enroll_add_log("Enroll started âœ…")
+        ctx.send_json(202, result)
+    else:
+        code = int(result.get("status") or 400)
+        _enroll_add_log("Enroll start failed âŒ")
+        _enroll_set_result("failed")
+        ctx.send_json(code, result)
+
+
+def _handle_enroll_cancel(ctx: _Ctx) -> None:
+    # Set SSE result + app cancel event to actually stop the scanner
+    _enroll_set_result("cancelled")
+    try:
+        ctx.app.cancel_enroll()
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_enroll_status(ctx: _Ctx) -> None:
+    with _enroll_lock:
+        running = getattr(ctx.app, "_enroll_running", False)
+        ctx.send_json(200, {
+            "running": running,
+            "step": _enroll_step,
+            "logs": list(_enroll_logs),
+            "result": _enroll_result,
+        })
+
+
+def _handle_enroll_events_sse(ctx: _Ctx) -> None:
+    """SSE stream: enrollment progress. Sends initial snapshot immediately."""
+    ctx.send_sse_start()
+
+    last_log_idx = 0
+    last_step = ""
+    sent_result = False
+    last_ping = time.time()
+
+    def send_snapshot() -> bool:
+        nonlocal last_log_idx, last_step, sent_result
+        with _enroll_lock:
+            step = _enroll_step
+            logs = list(_enroll_logs)
+            result = _enroll_result
+
+        # send all existing logs
+        for i in range(0, len(logs)):
+            if not ctx.send_sse_event("log", {"line": logs[i]}):
+                return False
+        last_log_idx = len(logs)
+
+        # send current step
+        if step:
+            if not ctx.send_sse_event("step", {"step": step}):
+                return False
+            last_step = step
+
+        # send current result once (but keep stream open)
+        if result:
+            if not ctx.send_sse_event(result, {"result": result}):
+                return False
+            sent_result = True
+
+        return True
+
+    if not send_snapshot():
+        return
+
+    while True:
+        try:
+            _enroll_event.wait(timeout=0.5)
+            _enroll_event.clear()
+
+            with _enroll_lock:
+                step = _enroll_step
+                logs = list(_enroll_logs)
+                result = _enroll_result
+
+            # detect reset (new enroll)
+            if len(logs) < last_log_idx:
+                last_log_idx = 0
+            if result is None:
+                sent_result = False
+
+            for i in range(last_log_idx, len(logs)):
+                if not ctx.send_sse_event("log", {"line": logs[i]}):
+                    return
+            last_log_idx = len(logs)
+
+            if step and step != last_step:
+                if not ctx.send_sse_event("step", {"step": step}):
+                    return
+                last_step = step
+
+            if result and not sent_result:
+                if not ctx.send_sse_event(result, {"result": result}):
+                    return
+                sent_result = True
+
+            if time.time() - last_ping > 15:
+                if not ctx.send_sse_event("ping", {"t": int(time.time())}):
+                    return
+                last_ping = time.time()
+
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception:
+            return
+
+
+def _handle_fingerprints_list(ctx: _Ctx) -> None:
+    from app.core.db import list_fingerprints
+    fps = list_fingerprints()
+    ctx.send_json(200, {"fingerprints": [
+        {"id": f.id, "createdAt": f.created_at, "pin": f.pin, "cardNo": f.card_no,
+         "fingerId": f.finger_id, "templateVersion": f.template_version,
+         "templateEncoding": f.template_encoding, "templateSize": f.template_size,
+         "label": f.label}
+        for f in fps
+    ]})
+
+
+def _handle_fingerprints_delete(ctx: _Ctx) -> None:
+    fp_id = ctx.param_int("id")
+    from app.core.db import delete_fingerprint
+    try:
+        delete_fingerprint(fp_id)
+        ctx.send_json(200, {"ok": True})
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+# ==================== 8) LOGS ====================
+
+def _handle_logs_recent(ctx: _Ctx) -> None:
+    page = getattr(ctx.app, "page_logs", None)
+    if not page or not hasattr(page, "_buffer"):
+        ctx.send_json(200, {"lines": [], "total": 0})
+        return
+    level = ctx.q("level", default="ALL").upper()
+    limit = ctx.q_int("limit", default=500)
+
+    try:
+        buf = list(page._buffer)  # copy for safety
+    except Exception:
+        buf = []
+    if level not in ("", "ALL"):
+        buf = [(lvl, line) for lvl, line in buf if lvl == level]
+    total = len(buf)
+    if limit > 0:
+        buf = buf[-limit:]
+    ctx.send_json(200, {
+        "lines": [{"level": lvl, "text": line} for lvl, line in buf],
+        "total": total,
+    })
+
+
+def _handle_logs_stream_sse(ctx: _Ctx) -> None:
+    """SSE stream: real-time log tail."""
+    ctx.send_sse_start()
+    level = ctx.q("level", default="ALL").upper()
+    log_q = getattr(ctx.app, "log_queue", None)
+
+    # We create a secondary queue listener by reading from the page buffer tail
+    page = getattr(ctx.app, "page_logs", None)
+    last_len = len(page._buffer) if page else 0
+
+    while True:
+        try:
+            time.sleep(0.2)
+            if not page:
+                page = getattr(ctx.app, "page_logs", None)
+                continue
+
+            buf = page._buffer
+            cur_len = len(buf)
+            if cur_len > last_len:
+                new_entries = buf[last_len:cur_len]
+                for lvl, line in new_entries:
+                    if level in ("", "ALL") or lvl == level:
+                        alive = ctx.send_sse_event("log", {"level": lvl, "text": line})
+                        if not alive:
+                            return
+                last_len = cur_len
+            elif cur_len < last_len:
+                # buffer was cleared
+                last_len = cur_len
+
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception:
+            return
+
+
+def _handle_logs_open_dir(ctx: _Ctx) -> None:
+    from app.core.utils import LOG_DIR
+    path = str(LOG_DIR)
+    try:
+        os.startfile(path)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True, "path": path})
+
+
+# ==================== 9) UPDATES ====================
+
+def _handle_update_status(ctx: _Ctx) -> None:
+    um = getattr(ctx.app, "_update_manager", None)
+    st = getattr(ctx.app, "_update_status", None)
+    data: Dict[str, Any] = {"updateAvailable": False}
+    if um:
+        data["currentReleaseId"] = um.get_current_release_id()
+    if st:
+        data["updateAvailable"] = bool(getattr(st, "update_available", False))
+        data["downloaded"] = bool(getattr(st, "downloaded", False))
+        data["downloading"] = bool(getattr(st, "downloading", False))
+        data["progressPercent"] = getattr(st, "progress_percent", None)
+        data["lastCheckAt"] = getattr(st, "last_check_at", 0)
+        data["lastError"] = getattr(st, "last_error", None)
+        lr = getattr(st, "latest_release", None)
+        if isinstance(lr, dict):
+            data["latestRelease"] = {
+                "releaseId": lr.get("releaseId"),
+                "publishDate": lr.get("publishDate") or lr.get("publish_date") or lr.get("createdAt"),
+                "channel": lr.get("channel"),
+                "platform": lr.get("platform"),
+                "version": lr.get("version"),
+                "notes": lr.get("notes") or lr.get("releaseNotes"),
+            }
+    ctx.send_json(200, data)
+
+
+def _handle_update_check(ctx: _Ctx) -> None:
+    um = getattr(ctx.app, "_update_manager", None)
+    if um:
+        try:
+            um.request_check_now()
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_update_download(ctx: _Ctx) -> None:
+    um = getattr(ctx.app, "_update_manager", None)
+    if um:
+        try:
+            um.request_download()
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_update_install(ctx: _Ctx) -> None:
+    um = getattr(ctx.app, "_update_manager", None)
+    if not um:
+        ctx.send_json(400, {"ok": False, "error": "update manager not available"})
+        return
+    can, reason = um.can_install_now()
+    if not can:
+        ctx.send_json(400, {"ok": False, "error": reason})
+        return
+    ctx.send_json(200, {"ok": True, "message": "launching updater and exiting"})
+    # Schedule quit after response is sent
+    def _do_install():
+        try:
+            um.launch_updater_and_exit()
+        except Exception:
+            pass
+        try:
+            ctx.app.after(0, ctx.app.quit_app)
+        except Exception:
+            pass
+    threading.Timer(0.5, _do_install).start()
+
+
+# ==================== 10) LOCAL DB TOOLS ====================
+
+def _handle_db_tables(ctx: _Ctx) -> None:
+    from app.core.db import get_conn
+    from app.core.utils import DB_PATH
+    tables = []
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            for r in rows:
+                name = r[0]
+                count = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
+                tables.append({"name": name, "rowCount": count})
+    except Exception:
+        pass
+
+    db_size = 0
+    try:
+        db_size = os.path.getsize(str(DB_PATH))
+    except Exception:
+        pass
+
+    ctx.send_json(200, {"tables": tables, "dbSizeBytes": db_size})
+
+
+def _handle_db_table_query(ctx: _Ctx) -> None:
+    table_name = ctx.param("tableName")
+    limit = ctx.q_int("limit", default=500)
+    offset = ctx.q_int("offset", default=0)
+    if limit > 10000:
+        limit = 10000
+
+    from app.core.db import get_conn
+    try:
+        with get_conn() as conn:
+            total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
+            cursor = conn.execute(f"SELECT * FROM [{table_name}] LIMIT ? OFFSET ?", (limit, offset))
+            columns = [d[0] for d in cursor.description]
+            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        ctx.send_json(200, {"rows": rows, "columns": columns, "total": total})
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_db_access_history(ctx: _Ctx) -> None:
+    from app.core.db import get_recent_access_history
+    limit = ctx.q_int("limit", default=50)
+    records = get_recent_access_history(limit=limit)
+    ctx.send_json(200, {"records": [
+        {
+            "eventId": r.event_id,
+            "deviceId": r.device_id,
+            "doorId": r.door_id,
+            "cardNo": r.card_no,
+            "eventTime": r.event_time,
+            "eventType": r.event_type,
+            "allowed": r.allowed,
+            "reason": r.reason,
+            "pollMs": r.poll_ms,
+            "decisionMs": r.decision_ms,
+            "cmdMs": r.cmd_ms,
+            "cmdOk": r.cmd_ok,
+            "cmdError": r.cmd_error,
+            "createdAt": r.created_at,
+        }
+        for r in records
+    ]})
+
+
+def _handle_db_export(ctx: _Ctx) -> None:
+    from app.core.db import get_conn
+    from app.core.utils import now_iso
+    export: Dict[str, Any] = {}
+    tables_to_export = [
+        "sync_users", "sync_memberships", "sync_devices", "sync_infrastructures",
+        "sync_gym_access_credentials", "fingerprints", "device_door_presets",
+        "agent_rtlog_state", "access_history", "device_sync_state", "auth_state",
+    ]
+    try:
+        with get_conn() as conn:
+            for t in tables_to_export:
+                try:
+                    cursor = conn.execute(f"SELECT * FROM [{t}] LIMIT 10000")
+                    cols = [d[0] for d in cursor.description]
+                    export[t] = [dict(zip(cols, row)) for row in cursor.fetchall()]
+                except Exception:
+                    export[t] = []
+    except Exception:
+        pass
+
+    export["_metadata"] = {
+        "exportDate": now_iso(),
+        "totalRecords": sum(len(export.get(t, [])) for t in tables_to_export),
+    }
+    ctx.send_json(200, export)
+
+
+def _handle_db_stats(ctx: _Ctx) -> None:
+    from app.core.db import get_conn
+    from app.core.utils import DB_PATH
+    info: Dict[str, Any] = {}
+    try:
+        with get_conn() as conn:
+            tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            info["tableCount"] = len(tables)
+            sizes = {}
+            for t in tables:
+                name = t[0]
+                c = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
+                sizes[name] = c
+            info["tableSizes"] = sizes
+        info["dbSizeBytes"] = os.path.getsize(str(DB_PATH))
+    except Exception as e:
+        info["error"] = str(e)
+    ctx.send_json(200, info)
+
+
+# ==================== 11) APP / TRAY COMMANDS ====================
+
+def _handle_app_show(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.show_from_tray)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_app_hide(ctx: _Ctx) -> None:
+    try:
+        ctx.app.after(0, ctx.app.hide_to_tray)
+    except Exception:
+        pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_app_quit(ctx: _Ctx) -> None:
+    ctx.send_json(200, {"ok": True})
+    threading.Timer(0.3, lambda: ctx.app.after(0, ctx.app.quit_app)).start()
+
+
+# ==================== DEPRECATED V1 ENDPOINTS ====================
+
+def _handle_v1_health(ctx: _Ctx) -> None:
+    """Deprecated: use GET /api/v2/health"""
+    ctx.handler.send_header("Deprecation", "true")
+    ctx.handler.send_header("Sunset", "2026-06-01")
+    ctx.handler.send_header("Link", "</api/v2/health>; rel=\"successor-version\"")
+    _handle_health(ctx)
+
+
+def _handle_v1_enroll(ctx: _Ctx) -> None:
+    """Deprecated: use POST /api/v2/enroll/start"""
+    user_id = ctx.q("id", "userId", "user_id")
+    finger_id = ctx.q("fingerId", "finger_id")
+    full_name = ctx.q("fullName", "fullname", "name")
+    device = ctx.q("device", "scanner")
+
+    if not device and full_name and "?device=" in full_name:
+        left, right = full_name.split("?device=", 1)
+        full_name = left
+        device = right.strip()
+
+    result = ctx.app.begin_remote_enroll(
+        user_id=user_id,
+        finger_id=finger_id,
+        full_name=full_name,
+        device=device or "zk9500",
+    )
+
+    ctx.handler.send_header("Deprecation", "true")
+    ctx.handler.send_header("Sunset", "2026-06-01")
+    ctx.handler.send_header("Link", "</api/v2/enroll/start>; rel=\"successor-version\"")
+
+    if result.get("ok"):
+        ctx.send_json(202, result)
+    else:
+        code = int(result.get("status") or 400)
+        ctx.send_json(code, result)
+
+
+# ---------------------------------------------------------------------------
+# Router setup
+# ---------------------------------------------------------------------------
+
+def _build_router() -> _Router:
+    r = _Router()
+
+    # ---- 1) Health / Status
+    r.add("GET", "/api/v2/health", _handle_health)
+    r.add("GET", "/api/v2/platform", _handle_platform)
+    r.add("GET", "/api/v2/status", _handle_status)
+
+    # ---- 2) Auth
+    r.add("POST", "/api/v2/auth/login", _handle_auth_login)
+    r.add("GET", "/api/v2/auth/status", _handle_auth_status)
+    r.add("POST", "/api/v2/auth/logout", _handle_auth_logout)
+
+    # ---- 3) Config
+    r.add("GET", "/api/v2/config", _handle_config_get)
+    r.add("PATCH", "/api/v2/config", _handle_config_patch)
+    r.add("POST", "/api/v2/config/restart-local-api", _handle_config_restart_api)
+
+    # ---- 4) Sync + Cache
+    r.add("POST", "/api/v2/sync/now", _handle_sync_now)
+    r.add("GET", "/api/v2/sync/cache/meta", _handle_sync_cache_meta)
+    r.add("GET", "/api/v2/sync/cache/users", _handle_sync_cache_users)
+    r.add("GET", "/api/v2/sync/cache/memberships", _handle_sync_cache_memberships)
+    r.add("GET", "/api/v2/sync/cache/devices", _handle_sync_cache_devices)
+    r.add("GET", "/api/v2/sync/cache/infrastructures", _handle_sync_cache_infrastructures)
+    r.add("GET", "/api/v2/sync/cache/credentials", _handle_sync_cache_credentials)
+
+    # ---- 4.4) TV Sync / Cache / Readiness
+    r.add("GET", "/api/v2/tv/binding", _handle_tv_binding_get)
+    r.add("PATCH", "/api/v2/tv/binding", _handle_tv_binding_patch)
+    r.add("GET", "/api/v2/tv/host/monitors", _handle_tv_host_monitors_get)
+    r.add("POST", "/api/v2/tv/host/monitors/refresh", _handle_tv_host_monitors_refresh)
+    r.add("GET", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_get)
+    r.add("POST", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_post)
+    r.add("PATCH", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_patch)
+    r.add("DELETE", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_delete)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/status", _handle_tv_host_binding_status)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/events", _handle_tv_host_binding_events)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/runtime-event", _handle_tv_host_binding_runtime_event)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/start", _handle_tv_host_binding_start)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/stop", _handle_tv_host_binding_stop)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/restart", _handle_tv_host_binding_restart)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-summary", _handle_tv_host_binding_support_summary)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/support-actions/run", _handle_tv_host_binding_support_action_run)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-actions/history", _handle_tv_host_binding_support_action_history)
+    r.add("GET", "/api/v2/tv/player/{bindingId}/status", _handle_tv_player_status)
+    r.add("GET", "/api/v2/tv/player/{bindingId}/render-context", _handle_tv_player_render_context)
+    r.add("POST", "/api/v2/tv/player/{bindingId}/reevaluate", _handle_tv_player_reevaluate)
+    r.add("POST", "/api/v2/tv/player/{bindingId}/reload", _handle_tv_player_reload)
+    r.add("POST", "/api/v2/tv/player/{bindingId}/state", _handle_tv_player_state_report)
+    r.add("GET", "/api/v2/tv/player/{bindingId}/events", _handle_tv_player_events)
+    r.add("POST", "/api/v2/tv/sync/run", _handle_tv_sync_run)
+    r.add("GET", "/api/v2/tv/sync/status", _handle_tv_sync_status)
+    r.add("GET", "/api/v2/tv/snapshots/latest", _handle_tv_snapshot_latest)
+    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}", _handle_tv_snapshot_by_id)
+    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}/manifest", _handle_tv_snapshot_manifest_by_id)
+    r.add("GET", "/api/v2/tv/readiness/latest", _handle_tv_readiness_latest)
+    r.add("GET", "/api/v2/tv/cache/assets", _handle_tv_cache_assets)
+    r.add("POST", "/api/v2/tv/downloads/run", _handle_tv_downloads_run)
+    r.add("GET", "/api/v2/tv/downloads/batches/latest", _handle_tv_downloads_latest_batch)
+    r.add("GET", "/api/v2/tv/downloads/jobs", _handle_tv_downloads_jobs)
+    r.add("POST", "/api/v2/tv/downloads/jobs/{jobId}/retry", _handle_tv_downloads_retry_job)
+    r.add("GET", "/api/v2/tv/ad-tasks", _handle_tv_ad_tasks_list)
+    r.add("POST", "/api/v2/tv/ad-tasks/fetch", _handle_tv_ad_tasks_fetch)
+    r.add("POST", "/api/v2/tv/ad-tasks/prepare", _handle_tv_ad_tasks_prepare)
+    r.add("POST", "/api/v2/tv/ad-tasks/cycle", _handle_tv_ad_tasks_cycle)
+    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/retry-prepare", _handle_tv_ad_tasks_retry_prepare)
+    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/retry-confirm", _handle_tv_ad_tasks_retry_confirm)
+    r.add("GET", "/api/v2/tv/ad-tasks/runtime", _handle_tv_ad_tasks_runtime_list)
+    r.add("GET", "/api/v2/tv/ad-tasks/{taskId}/runtime", _handle_tv_ad_tasks_runtime_one)
+    r.add("GET", "/api/v2/tv/gym-ad-runtime/{gymId}", _handle_tv_gym_ad_runtime_one)
+    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/inject-now", _handle_tv_ad_tasks_inject_now)
+    r.add("GET", "/api/v2/tv/activation/status", _handle_tv_activation_status)
+    r.add("POST", "/api/v2/tv/activation/evaluate", _handle_tv_activation_evaluate)
+    r.add("POST", "/api/v2/tv/activation/activate-latest-ready", _handle_tv_activation_activate_latest_ready)
+    r.add("GET", "/api/v2/tv/activation/history", _handle_tv_activation_history)
+
+    # ---- 4.45) TV Observability
+    r.add("GET", "/api/v2/tv/observability/overview", _handle_tv_observability_overview)
+    r.add("GET", "/api/v2/tv/observability/fleet-health", _handle_tv_observability_fleet_health)
+    r.add("GET", "/api/v2/tv/observability/screens/{screenId}", _handle_tv_observability_screen_details)
+    r.add("GET", "/api/v2/tv/observability/screens/{screenId}/timeline", _handle_tv_observability_screen_timeline)
+    r.add("GET", "/api/v2/tv/observability/heartbeats", _handle_tv_observability_heartbeats)
+    r.add("GET", "/api/v2/tv/observability/runtime-events", _handle_tv_observability_runtime_events)
+    r.add("GET", "/api/v2/tv/observability/proof-events", _handle_tv_observability_proof_events)
+    r.add("GET", "/api/v2/tv/observability/stats/proof", _handle_tv_observability_proof_stats)
+    r.add("GET", "/api/v2/tv/observability/stats/runtime", _handle_tv_observability_runtime_stats)
+    # ---- 4.46) TV hardening / recovery
+    r.add("GET", "/api/v2/tv/hardening/preflight", _handle_tv_hardening_preflight)
+    r.add("GET", "/api/v2/tv/hardening/startup/latest", _handle_tv_hardening_startup_latest)
+    r.add("GET", "/api/v2/tv/hardening/startup/runs", _handle_tv_hardening_startup_runs)
+    r.add("POST", "/api/v2/tv/hardening/startup/run", _handle_tv_hardening_startup_run)
+    r.add("GET", "/api/v2/tv/hardening/retention-policy", _handle_tv_hardening_retention_policy)
+    r.add("POST", "/api/v2/tv/hardening/retention/run", _handle_tv_hardening_retention_run)
+    r.add("GET", "/api/v2/tv/hardening/query-checks", _handle_tv_hardening_query_checks)
+    r.add("GET", "/api/v2/tv/hardening/correlation-audit", _handle_tv_hardening_correlation_audit)
+
+    # ---- 4.5) Offline creation queue
+    r.add("GET", "/api/v2/offline-creations/active", _handle_offline_creations_active)
+    r.add("GET", "/api/v2/offline-creations/history", _handle_offline_creations_history)
+    r.add("GET", "/api/v2/offline-creations/{localId}", _handle_offline_creation_get)
+    r.add("POST", "/api/v2/offline-creations/attempt", _handle_offline_creation_attempt)
+    r.add("POST", "/api/v2/offline-creations/queue", _handle_offline_creation_queue)
+    r.add("PATCH", "/api/v2/offline-creations/{localId}", _handle_offline_creation_patch)
+    r.add("POST", "/api/v2/offline-creations/{localId}/toggle", _handle_offline_creation_toggle)
+    r.add("POST", "/api/v2/offline-creations/{localId}/retry", _handle_offline_creation_retry)
+    r.add("POST", "/api/v2/offline-creations/{localId}/cancel", _handle_offline_creation_cancel)
+    r.add("POST", "/api/v2/offline-creations/{localId}/duplicate", _handle_offline_creation_duplicate)
+    r.add("POST", "/api/v2/offline-creations/{localId}/archive", _handle_offline_creation_archive)
+    r.add("POST", "/api/v2/offline-creations/process-due", _handle_offline_creations_process_due)
+    # ---- 5) Devices (PullSDK)
+    r.add("POST", "/api/v2/devices/{deviceId}/connect", _handle_device_connect)
+    r.add("POST", "/api/v2/devices/{deviceId}/disconnect", _handle_device_disconnect)
+    r.add("GET", "/api/v2/devices/{deviceId}/info", _handle_device_info)
+    r.add("GET", "/api/v2/devices/{deviceId}/table/{tableName}", _handle_device_table)
+    r.add("POST", "/api/v2/devices/{deviceId}/door/open", _handle_device_door_open)
+    r.add("POST", "/api/v2/devices/{deviceId}/users/push", _handle_device_users_push)
+    r.add("GET", "/api/v2/devices/{deviceId}/users", _handle_device_users_list)
+    r.add("POST", "/api/v2/devices/{deviceId}/users/delete", _handle_device_users_delete)
+    r.add("GET", "/api/v2/devices/{deviceId}/door-presets", _handle_device_door_presets_list)
+    r.add("POST", "/api/v2/devices/{deviceId}/door-presets", _handle_device_door_presets_create)
+    r.add("DELETE", "/api/v2/devices/{deviceId}/door-presets/{presetId}", _handle_device_door_presets_delete)
+
+    # ---- 6) Agent Realtime
+    r.add("GET", "/api/v2/agent/status", _handle_agent_status)
+    r.add("POST", "/api/v2/agent/start", _handle_agent_start)
+    r.add("POST", "/api/v2/agent/stop", _handle_agent_stop)
+    r.add("POST", "/api/v2/agent/refresh-devices", _handle_agent_refresh_devices)
+    r.add("GET", "/api/v2/agent/devices", _handle_agent_devices)
+    r.add("POST", "/api/v2/agent/devices/{deviceId}/enable", _handle_agent_device_enable)
+    r.add("POST", "/api/v2/agent/devices/{deviceId}/disable", _handle_agent_device_disable)
+    r.add("GET", "/api/v2/agent/events", _handle_agent_events_sse)
+    r.add("GET", "/api/v2/agent/settings/global", _handle_agent_settings_global)
+    r.add("GET", "/api/v2/agent/settings/device/{deviceId}", _handle_agent_settings_device)
+
+    # ---- 7) Enrollment
+    r.add("POST", "/api/v2/enroll/start", _handle_enroll_start)
+    r.add("POST", "/api/v2/enroll/cancel", _handle_enroll_cancel)
+    r.add("GET", "/api/v2/enroll/status", _handle_enroll_status)
+    r.add("GET", "/api/v2/enroll/events", _handle_enroll_events_sse)
+    r.add("GET", "/api/v2/fingerprints", _handle_fingerprints_list)
+    r.add("DELETE", "/api/v2/fingerprints/{id}", _handle_fingerprints_delete)
+
+    # ---- 8) Logs
+    r.add("GET", "/api/v2/logs/recent", _handle_logs_recent)
+    r.add("GET", "/api/v2/logs/stream", _handle_logs_stream_sse)
+    r.add("POST", "/api/v2/logs/open-dir", _handle_logs_open_dir)
+
+    # ---- 9) Updates
+    r.add("GET", "/api/v2/update/status", _handle_update_status)
+    r.add("POST", "/api/v2/update/check", _handle_update_check)
+    r.add("POST", "/api/v2/update/download", _handle_update_download)
+    r.add("POST", "/api/v2/update/install", _handle_update_install)
+
+    # ---- 10) Local DB Tools
+    r.add("GET", "/api/v2/db/tables", _handle_db_tables)
+    r.add("GET", "/api/v2/db/table/{tableName}", _handle_db_table_query)
+    r.add("GET", "/api/v2/db/access-history", _handle_db_access_history)
+    r.add("POST", "/api/v2/db/export", _handle_db_export)
+    r.add("GET", "/api/v2/db/stats", _handle_db_stats)
+
+    # ---- 11) App / Tray commands
+    r.add("POST", "/api/v2/app/show", _handle_app_show)
+    r.add("POST", "/api/v2/app/hide", _handle_app_hide)
+    r.add("POST", "/api/v2/app/quit", _handle_app_quit)
+
+    # ---- Deprecated V1 (backward compat)
+    r.add("GET", "/api/v1/access/health", _handle_v1_health)
+    r.add("GET", "/api/v1/access/enroll", _handle_v1_enroll)
+
+    return r
+
+
+# ---------------------------------------------------------------------------
+# Server class (public interface)
+# ---------------------------------------------------------------------------
+
+class LocalAccessApiServerV2:
+    """
+    Local REST + SSE server for Tauri+React UI.
+
+    Drop-in replacement for LocalAccessApiServer.
+    Includes all v1 endpoints (deprecated) + full v2 API.
+    """
+
+    def __init__(self, *, app, host: str = "127.0.0.1", port: int = 8788):
+        self.app = app
+        self.host = host
+        self.port = int(port)
+        self._httpd: Optional[_AppHTTPServerV2] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._httpd is not None:
+            return
+
+        router = _build_router()
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _dispatch(self, method: str) -> None:
+                try:
+                    parsed = urlparse(self.path)
+                    path = parsed.path or ""
+                    qs = parse_qs(parsed.query or "")
+
+                    handler_fn, params = router.match(method, path)
+                    if handler_fn is None:
+                        body = _json_bytes({"ok": False, "error": "Not found", "path": path})
+                        self.send_response(404)
+                        _cors_headers(self)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+
+                    ctx = _Ctx(self, params, qs, server.app)
+                    handler_fn(ctx)
+                except Exception as e:
+                    try:
+                        body = _json_bytes({"ok": False, "error": str(e)})
+                        self.send_response(500)
+                        _cors_headers(self)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    except Exception:
+                        pass
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                _cors_headers(self)
+                self.end_headers()
+
+            def do_GET(self):
+                self._dispatch("GET")
+
+            def do_POST(self):
+                self._dispatch("POST")
+
+            def do_PATCH(self):
+                self._dispatch("PATCH")
+
+            def do_PUT(self):
+                self._dispatch("PUT")
+
+            def do_DELETE(self):
+                self._dispatch("DELETE")
+
+            def log_message(self, fmt, *args):
+                try:
+                    server.app.logger.debug("[LocalAPI v2] " + fmt, *args)
+                except Exception:
+                    pass
+
+        self._httpd = _AppHTTPServerV2(
+            (self.host, self.port), Handler, app=self.app, router=router
+        )
+
+        t = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        t.start()
+        self._thread = t
+
+        try:
+            self.app.logger.info(
+                "LocalAccessApiServerV2 started on http://%s:%s", self.host, self.port
+            )
+        except Exception:
+            pass
+
+        def _run_startup_reconciliation_bg() -> None:
+            try:
+                ensure_tv_local_schema()
+                preflight = run_tv_deployment_preflight(include_query_checks=False)
+                try:
+                    self.app.logger.info(
+                        "TV preflight at startup: status=%s blockers=%s warnings=%s",
+                        preflight.get("status"),
+                        len(preflight.get("blockers") or []),
+                        len(preflight.get("warnings") or []),
+                    )
+                except Exception:
+                    pass
+
+                if not bool(preflight.get("ok")):
+                    try:
+                        self.app.logger.error("TV startup reconciliation skipped due to preflight blockers: %s", preflight.get("blockers"))
+                    except Exception:
+                        pass
+                    return
+
+                out = run_tv_startup_reconciliation(trigger_source="SERVER_START")
+                try:
+                    if bool(out.get("ok")):
+                        self.app.logger.info(
+                            "TV startup reconciliation completed: status=%s failedPhases=%s",
+                            out.get("status"),
+                            out.get("failedPhaseCount"),
+                        )
+                    else:
+                        self.app.logger.warning("TV startup reconciliation blocked/failed: %s", out)
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    self.app.logger.exception("TV startup reconciliation error: %s", e)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run_startup_reconciliation_bg, daemon=True).start()
+
+    def stop(self) -> None:
+        if not self._httpd:
+            return
+        try:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+        except Exception:
+            pass
+        self._httpd = None
+        self._thread = None
+        # Clean up SDK pool
+        with _device_sdk_lock:
+            for sdk in _device_sdk_pool.values():
+                try:
+                    sdk.disconnect()
+                except Exception:
+                    pass
+            _device_sdk_pool.clear()
+        try:
+            self.app.logger.info("LocalAccessApiServerV2 stopped.")
+        except Exception:
+            pass
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

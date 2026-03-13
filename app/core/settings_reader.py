@@ -1,21 +1,28 @@
 # app/core/settings_reader.py
 """
-Shared helpers to read backend-driven settings from SQLite cache.
+Shared helpers to read backend-driven settings from SQLite.
 
-These settings originate from GymAccessSoftwareSettingsDto and GymDeviceDto,
-stored in the local SQLite DB by save_sync_cache().  They are READ-ONLY:
-the desktop app must not modify them — only the backend can.
+Source of truth:
+- Global settings come from GymAccessSoftwareSettingsDto stored in SQLite table:
+  `sync_access_software_settings` (single row, id=1).
+- Per-device settings come from GymDeviceDto stored in SQLite table:
+  `sync_devices`.
 
-Functions are extracted here so they can be consumed by config.py, app.py,
-realtime_agent.py, device_sync.py, and UI pages without circular imports.
+These settings are READ-ONLY from the desktop app perspective:
+only the backend can modify them; the desktop app only consumes them.
+
+This module provides normalization/clamping so config.py, app.py, realtime_agent.py,
+device_sync.py, and UI pages can consume consistent snake_case settings without
+circular imports.
 """
+
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, List, Optional
 
 
-# --------------- generic helpers (duplicated locally to avoid circular imports) ---------------
+# --------------- generic helpers (local to avoid circular imports) ---------------
 
 def _safe_int(v: Any, default: int = 0) -> int:
     try:
@@ -77,11 +84,14 @@ def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:
     return x
 
 
-# --------------- SQLite cache readers ---------------
+# --------------- raw payload fallback (ONLY as a fallback) ---------------
 
-def read_sync_payload_json() -> Dict[str, Any]:
+def _read_sync_payload_json_fallback() -> Dict[str, Any]:
     """
-    Reads the raw cached ActiveMemberResponse payload_json from sync_cache (SQLite).
+    Fallback reader: raw ActiveMemberResponse payload_json from sync_cache.
+
+    NOTE: This is NOT the primary source of truth anymore. We only use it if the
+    normalized tables aren't populated (older DBs / before first sync).
     """
     try:
         from app.core.db import get_conn
@@ -98,16 +108,14 @@ def read_sync_payload_json() -> Dict[str, Any]:
         return {}
 
 
-def extract_access_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract GymAccessSoftwareSettingsDto from the cached payload."""
+def _extract_access_settings_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
     v = payload.get("accessSoftwareSettings") or payload.get("access_software_settings") or payload.get("settings")
     return v if isinstance(v, dict) else {}
 
 
-def extract_devices(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Extract the devices list from the cached payload."""
+def _extract_devices_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
     devs = payload.get("devices") or payload.get("device") or []
@@ -116,12 +124,21 @@ def extract_devices(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
+# --------------- normalization ---------------
+
+def normalize_access_data_mode(v: Any) -> str:
+    """Strictly normalize accessDataMode to 'DEVICE' or 'AGENT'."""
+    s = _safe_str(v, "DEVICE").strip().upper()
+    return "AGENT" if s == "AGENT" else "DEVICE"
+
+
 def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize GymAccessSoftwareSettingsDto into internal snake_case keys.
+    Normalize GymAccessSoftwareSettingsDto (camelCase) into internal snake_case keys.
+
     Safe to call with an empty dict — returns reasonable defaults.
     """
-    out = {
+    return {
         "access_server_host": _safe_str(raw.get("accessServerHost"), ""),
         "access_server_port": _safe_int(raw.get("accessServerPort"), 8788),
         "access_server_enabled": _boolish(raw.get("accessServerEnabled"), True),
@@ -152,21 +169,26 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
 
         "sdk_read_initial_bytes": _clamp_int(raw.get("sdkReadInitialBytes"), 1_048_576, 64 * 1024, 16 * 1024 * 1024),
 
-        # extra keys consumed by UI / config compat
+        # compat keys used by UI/config patterns
         "show_notifications": _boolish(raw.get("showNotifications", raw.get("notificationServiceEnabled")), True),
+
+        # global popup defaults (per-device override exists)
+        "popup_enabled": _boolish(raw.get("popupEnabled"), True),
+        "popup_duration_sec": _clamp_int(raw.get("popupDurationSec"), 3, 1, 60),
     }
-    return out
 
 
 def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Normalize a GymDeviceDto dict into internal snake_case keys used by engines.
-    ``gs`` is the global settings dict (for fallback defaults like default_authorize_door_id).
-    Safe to call with an empty dict — returns reasonable defaults.
+    Normalize a GymDeviceDto dict (camelCase) into internal snake_case keys used by engines.
+
+    ``gs`` is the global settings dict (fallback defaults like default_authorize_door_id).
+    Safe to call with an empty dict — returns safe defaults.
     """
     if gs is None:
         gs = {}
 
+    # door ids list
     door_ids_raw = dev.get("doorIds") or dev.get("door_ids") or []
     door_ids: List[int] = []
     if isinstance(door_ids_raw, list):
@@ -178,9 +200,24 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     default_door = _safe_int(gs.get("default_authorize_door_id"), 15)
     door_entry_id = door_ids[0] if door_ids else default_door
 
+    # per-device data mode (CRITICAL)
+    access_data_mode = normalize_access_data_mode(dev.get("accessDataMode") or dev.get("access_data_mode"))
+
+    # per-device toggles
+    active = _boolish(dev.get("active"), True)
+    access_device = _boolish(dev.get("accessDevice"), True)
+    enabled = bool(active and access_device)
+
+    show_notifications = _boolish(dev.get("showNotifications"), True)
+    win_notify_enabled = _boolish(dev.get("winNotifyEnabled"), True)
+    popup_enabled = _boolish(dev.get("popupEnabled"), True)
+    popup_duration_sec = _clamp_int(dev.get("popupDurationSec"), 3, 1, 60)
+    popup_show_image = _boolish(dev.get("popupShowImage"), True)
+
+    # sleep/backoff
     adaptive_sleep = _boolish(dev.get("adaptiveSleep"), True)
     busy_min = _clamp_int(dev.get("busySleepMinMs"), 0, 0, 60000)
-    busy_max = _clamp_int(dev.get("busySleepMaxMs"), 50, 0, 60000)
+    busy_max = _clamp_int(dev.get("busySleepMaxMs"), 500, 0, 60000)
     if busy_max < busy_min:
         busy_max = busy_min
 
@@ -192,12 +229,7 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     empty_factor = _clamp_float(dev.get("emptyBackoffFactor"), 1.35, 1.0, 3.0)
     empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 2000, 0, 120000)
 
-    show_notifications = _boolish(dev.get("showNotifications"), True)
-    win_notify_enabled = _boolish(dev.get("winNotifyEnabled"), True)
-    popup_enabled = _boolish(dev.get("popupEnabled"), True)
-    popup_duration_sec = _clamp_int(dev.get("popupDurationSec"), 3, 1, 60)
-    popup_show_image = _boolish(dev.get("popupShowImage"), True)
-
+    # TOTP/RFID
     totp_enabled = _boolish(dev.get("totpEnabled"), True)
     rfid_enabled = _boolish(dev.get("rfidEnabled"), True)
 
@@ -216,21 +248,41 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     if rfid_max_digits < rfid_min_digits:
         rfid_max_digits = rfid_min_digits
 
+    # timings
     pulse_time_ms = _clamp_int(dev.get("pulseTimeMs"), 3000, 100, 60000)
     cmd_timeout_ms = _clamp_int(dev.get("cmdTimeoutMs"), 4000, 200, 60000)
     timeout_ms = _clamp_int(dev.get("timeoutMs"), 5000, 500, 60000)
 
+    # misc
     rtlog_table = _safe_str(dev.get("rtlogTable"), "rtlog").strip() or "rtlog"
     platform = _safe_str(dev.get("platform"), "").strip()
-
     save_history = _boolish(dev.get("saveHistory"), True)
 
-    active = _boolish(dev.get("active"), True)
-    access_device = _boolish(dev.get("accessDevice"), True)
+    # device capability flags
+    fingerprint_enabled = _boolish(dev.get("fingerprintEnabled"), False)
+    face_id_enabled = _boolish(dev.get("faceIdEnabled"), False)
+
+    # policy/timezone
+    authorize_timezone_id = _safe_int(dev.get("authorizeTimezoneId"), 1)
+    pushing_to_device_policy = _safe_str(dev.get("pushingToDevicePolicy"), "").strip()
 
     return {
-        "enabled": bool(active and access_device),
+        "enabled": enabled,
 
+        # NEW: per-device mode from backend
+        "access_data_mode": access_data_mode,
+
+        # NEW: policy/timezone/capabilities
+        "authorize_timezone_id": int(authorize_timezone_id),
+        "pushing_to_device_policy": pushing_to_device_policy,
+        "fingerprint_enabled": bool(fingerprint_enabled),
+        "face_id_enabled": bool(face_id_enabled),
+
+        # ids
+        "door_ids": list(door_ids),
+        "door_entry_id": int(door_entry_id),
+
+        # sleep/backoff
         "adaptive_sleep": bool(adaptive_sleep),
         "busy_sleep_min_ms": int(busy_min),
         "busy_sleep_max_ms": int(busy_max),
@@ -239,14 +291,14 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "empty_backoff_factor": float(empty_factor),
         "empty_backoff_max_ms": int(empty_backoff_max),
 
+        # timing/platform
         "platform": platform,
         "timeout_ms": int(timeout_ms),
         "rtlog_table": rtlog_table,
-
-        "door_entry_id": int(door_entry_id),
         "pulse_time_ms": int(pulse_time_ms),
         "cmd_timeout_ms": int(cmd_timeout_ms),
 
+        # notifications
         "save_history": bool(save_history),
         "show_notifications": bool(show_notifications),
         "win_notify_enabled": bool(win_notify_enabled),
@@ -254,6 +306,7 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "popup_duration_sec": int(popup_duration_sec),
         "popup_show_image": bool(popup_show_image),
 
+        # totp/rfid
         "totp_enabled": bool(totp_enabled),
         "totp_digits": int(totp_digits),
         "totp_period_seconds": int(totp_period_seconds),
@@ -274,51 +327,67 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     }
 
 
-def normalize_access_data_mode(v: Any) -> str:
-    """Strictly normalize accessDataMode to 'DEVICE' or 'AGENT'."""
-    s = _safe_str(v, "DEVICE").strip().upper()
-    if s == "AGENT":
-        return "AGENT"
-    return "DEVICE"
-
-
-# --------------- Convenience: full reads ---------------
+# --------------- Convenience: full reads (normalized tables first) ---------------
 
 def get_backend_global_settings() -> Dict[str, Any]:
     """
-    One-call helper: read payload from SQLite → extract accessSoftwareSettings → normalize.
-    Returns defaults if SQLite has no data yet.
+    One-call helper:
+    - Primary: read from normalized table sync_access_software_settings (via db.py)
+    - Fallback: read from sync_cache.payload_json (older DB / before first sync)
     """
-    payload = read_sync_payload_json()
-    raw = extract_access_settings(payload)
+    raw: Dict[str, Any] = {}
+    try:
+        from app.core.db import load_sync_access_software_settings
+        v = load_sync_access_software_settings()
+        if isinstance(v, dict):
+            raw = v
+    except Exception:
+        raw = {}
+
+    if not raw:
+        payload = _read_sync_payload_json_fallback()
+        raw = _extract_access_settings_from_payload(payload)
+
     return normalize_global_settings(raw)
-
-
-def get_backend_device_settings(device_id: int) -> Dict[str, Any]:
-    """
-    One-call helper: read payload from SQLite → find device by id → normalize.
-    Returns disabled-defaults if the device is not found.
-    """
-    payload = read_sync_payload_json()
-    gs = normalize_global_settings(extract_access_settings(payload))
-    devices = extract_devices(payload)
-    for dev in devices:
-        did = _safe_int(dev.get("id"), 0)
-        if did == int(device_id):
-            return normalize_device_settings(dev, gs)
-    # device not found → return safe disabled defaults
-    return normalize_device_settings({"id": device_id, "active": False, "accessDevice": False}, gs)
 
 
 def get_backend_device_raw(device_id: int) -> Optional[Dict[str, Any]]:
     """
-    Returns the raw camelCase device dict from payload, or None.
+    One-call helper:
+    - Primary: read from normalized table sync_devices (via db.py payload coercion)
+    - Fallback: find device in sync_cache.payload_json
     """
-    payload = read_sync_payload_json()
-    devices = extract_devices(payload)
-    for dev in devices:
-        did = _safe_int(dev.get("id"), 0)
-        if did == int(device_id):
+    did = int(device_id)
+
+    # primary
+    try:
+        from app.core.db import get_sync_device_payload
+        v = get_sync_device_payload(did)
+        if isinstance(v, dict):
+            return v
+    except Exception:
+        pass
+
+    # fallback
+    payload = _read_sync_payload_json_fallback()
+    for dev in _extract_devices_from_payload(payload):
+        if _safe_int(dev.get("id"), 0) == did:
             return dev
+
     return None
 
+
+def get_backend_device_settings(device_id: int) -> Dict[str, Any]:
+    """
+    One-call helper:
+    - reads global settings (normalized)
+    - reads device raw (normalized table first)
+    - normalizes/clamps device settings
+    """
+    gs = get_backend_global_settings()
+    dev = get_backend_device_raw(device_id)
+    if dev:
+        return normalize_device_settings(dev, gs)
+
+    # device not found -> safe disabled defaults
+    return normalize_device_settings({"id": int(device_id), "active": False, "accessDevice": False}, gs)

@@ -2,21 +2,33 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from app.core.utils import DB_PATH, ensure_dirs, now_iso
 
 # -----------------------------
 # SQLite connection helpers
 # -----------------------------
-def get_conn() -> sqlite3.Connection:
+@contextmanager
+def get_conn() -> Iterator[sqlite3.Connection]:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # -----------------------------
@@ -180,6 +192,7 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             image TEXT,
             fingerprints_json TEXT,
             face_id TEXT,
+            account_username_id TEXT,
             qr_code_payload TEXT
         );
         """
@@ -197,7 +210,7 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             full_name, phone, email, valid_from, valid_to,
             first_card_id, second_card_id, image,
             fingerprints_json,
-            face_id, qr_code_payload
+            face_id, account_username_id, qr_code_payload
         )
         SELECT
             {sel("user_id")},
@@ -213,6 +226,7 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             {sel("image")},
             {fps_expr},
             {sel("face_id")},
+            {sel("account_username_id")},
             {sel("qr_code_payload")}
         FROM sync_users;
         """
@@ -220,6 +234,7 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
 
     conn.execute("DROP TABLE sync_users;")
     conn.execute("ALTER TABLE sync_users_new RENAME TO sync_users;")
+
 
 
 # -----------------------------
@@ -307,6 +322,7 @@ def init_db() -> None:
                 image TEXT,
                 fingerprints_json TEXT,
                 face_id TEXT,
+                account_username_id TEXT,
                 qr_code_payload TEXT
             );
             """
@@ -314,6 +330,7 @@ def init_db() -> None:
 
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
+        _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception:
@@ -653,6 +670,77 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_device_sync_state_device ON device_sync_state(device_id);")
+
+        # -----------------------------
+        # offline creation queue (access-only)
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offline_creation_queue (
+                local_id TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL,
+                creation_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT,
+                state TEXT NOT NULL DEFAULT 'pending',
+                created INTEGER NOT NULL DEFAULT 0,
+                try_to_create INTEGER NOT NULL DEFAULT 1,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                failure_type TEXT,
+                failure_code TEXT,
+                last_http_status INTEGER,
+                last_error_message TEXT,
+                failed_reason TEXT,
+                last_attempt_at TEXT,
+                next_retry_at TEXT,
+                processing_started_at TEXT,
+                processing_lock_token TEXT,
+                processing_lock_expires_at TEXT,
+                succeeded_at TEXT,
+                reconciled_at TEXT,
+                cancelled_at TEXT,
+                archived_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        _ensure_column(conn, "offline_creation_queue", "payload_hash", "payload_hash TEXT")
+        _ensure_column(conn, "offline_creation_queue", "state", "state TEXT NOT NULL DEFAULT 'pending'")
+        _ensure_column(conn, "offline_creation_queue", "created", "created INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "offline_creation_queue", "try_to_create", "try_to_create INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "offline_creation_queue", "attempt_count", "attempt_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "offline_creation_queue", "failure_count", "failure_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "offline_creation_queue", "failure_type", "failure_type TEXT")
+        _ensure_column(conn, "offline_creation_queue", "failure_code", "failure_code TEXT")
+        _ensure_column(conn, "offline_creation_queue", "last_http_status", "last_http_status INTEGER")
+        _ensure_column(conn, "offline_creation_queue", "last_error_message", "last_error_message TEXT")
+        _ensure_column(conn, "offline_creation_queue", "failed_reason", "failed_reason TEXT")
+        _ensure_column(conn, "offline_creation_queue", "last_attempt_at", "last_attempt_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "next_retry_at", "next_retry_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "processing_started_at", "processing_started_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "processing_lock_token", "processing_lock_token TEXT")
+        _ensure_column(conn, "offline_creation_queue", "processing_lock_expires_at", "processing_lock_expires_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "succeeded_at", "succeeded_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "reconciled_at", "reconciled_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "cancelled_at", "cancelled_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "archived_at", "archived_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "created_at", "created_at TEXT")
+        _ensure_column(conn, "offline_creation_queue", "updated_at", "updated_at TEXT")
+
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_offline_creation_client_request_id ON offline_creation_queue(client_request_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_active_retry ON offline_creation_queue(state, try_to_create, next_retry_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_processing_lock ON offline_creation_queue(state, processing_lock_expires_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_history_state ON offline_creation_queue(state, updated_at);")
+
+        # Backfill state defaults for legacy rows if they exist
+        conn.execute("UPDATE offline_creation_queue SET created_at = COALESCE(created_at, updated_at, datetime('now')) WHERE created_at IS NULL OR created_at = '';")
+        conn.execute("UPDATE offline_creation_queue SET updated_at = COALESCE(updated_at, created_at, datetime('now')) WHERE updated_at IS NULL OR updated_at = '';")
+        conn.execute("UPDATE offline_creation_queue SET state = 'succeeded', succeeded_at = COALESCE(succeeded_at, updated_at, created_at) WHERE created = 1 AND (state IS NULL OR state = '' OR state IN ('pending','processing','failed_retryable','blocked_auth'));")
+        conn.execute("UPDATE offline_creation_queue SET state = 'failed_terminal' WHERE created = 0 AND (try_to_create = 0 OR try_to_create = '0') AND (state IS NULL OR state = '' OR state IN ('pending','failed_retryable'));")
+        conn.execute("UPDATE offline_creation_queue SET state = 'pending' WHERE state IS NULL OR state = '';")
 
         conn.commit()
 
@@ -1156,8 +1244,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json,
-                    face_id, qr_code_payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    face_id, account_username_id, qr_code_payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -1173,6 +1261,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("image"),
                     json.dumps(fps, ensure_ascii=False),
                     u.get("faceId"),
+                    u.get("accountUsernameId") or u.get("account_username_id"),
                     u.get("qrCodePayload"),
                 ),
             )
@@ -1443,6 +1532,7 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "image": g("image"),
         "fingerprints": fps,
         "faceId": g("faceId", "face_id"),
+        "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
         "qrCodePayload": g("qrCodePayload", "qr_code_payload"),
     }
 
@@ -1727,6 +1817,10 @@ def load_sync_cache() -> SyncCacheState | None:
                 if isinstance(u, dict):
                     norm_users.append(_coerce_user_row_to_payload(u))
 
+            try:
+                norm_users.extend(list_projected_offline_users(base_users=norm_users))
+            except Exception:
+                pass
             devs = list(data.get("devices") or [])
             creds = list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or [])
 
@@ -1750,6 +1844,10 @@ def load_sync_cache() -> SyncCacheState | None:
 
         users_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_users").fetchall()]
         users = [_coerce_user_row_to_payload(u) for u in users_rows]
+        try:
+            users.extend(list_projected_offline_users(base_users=users))
+        except Exception:
+            pass
 
         membership = [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
 
@@ -2140,3 +2238,867 @@ def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
             d = dict(r)
             out.append(AccessHistoryRow(**d))
         return out
+
+
+
+
+
+
+
+
+
+# -----------------------------
+# Offline creation queue (access-only)
+# -----------------------------
+
+OFFLINE_QUEUE_ACTIVE_STATES = ("pending", "processing", "failed_retryable", "blocked_auth")
+OFFLINE_QUEUE_FINAL_STATES = ("succeeded", "reconciled", "cancelled", "failed_terminal", "archived")
+
+
+def _utc_now_iso() -> str:
+    try:
+        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    except Exception:
+        return now_iso()
+
+
+def _hash_payload(payload: Dict[str, Any]) -> str:
+    try:
+        raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        raw = "{}"
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _normalize_creation_kind(kind: str) -> str:
+    k = str(kind or "").strip().lower()
+    if k in ("membership", "membership_only", "active_membership", "active_membership_only"):
+        return "membership_only"
+    if k in ("account", "account_plus_membership", "create_account"):
+        return "account_plus_membership"
+    return "membership_only"
+
+
+def _normalize_queue_state(state: str, *, default: str = "pending") -> str:
+    s = str(state or "").strip().lower()
+    allowed = {
+        "pending", "processing", "failed_retryable", "blocked_auth",
+        "succeeded", "reconciled", "cancelled", "failed_terminal", "archived",
+    }
+    return s if s in allowed else default
+
+
+def _failure_is_countable(failure_type: str) -> bool:
+    ft = str(failure_type or "").strip().lower()
+    return ft in ("validation", "conflict")
+
+
+def _failure_retry_delay_minutes(failure_type: str) -> int:
+    ft = str(failure_type or "").strip().lower()
+    if ft == "network":
+        return 5
+    if ft == "server":
+        return 15
+    if ft == "auth":
+        return 60
+    return 60
+
+
+def _next_retry_iso(minutes: int) -> str:
+    try:
+        mins = int(minutes)
+    except Exception:
+        mins = 60
+    if mins < 1:
+        mins = 1
+    return (datetime.utcnow() + timedelta(minutes=mins)).replace(microsecond=0).isoformat() + "Z"
+
+
+def _parse_iso_date(v: Any) -> datetime | None:
+    s = str(v or "").strip()
+    if not s:
+        return None
+    if len(s) >= 10:
+        s = s[:10]
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def _simple_email_ok(v: Any) -> bool:
+    s = str(v or "").strip()
+    return ("@" in s) and ("." in s.split("@")[-1]) and (len(s) >= 5)
+
+
+def _norm_text(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def _norm_text_l(v: Any) -> str:
+    return _norm_text(v).lower()
+
+
+def _synthetic_negative_id(local_id: str, salt: str) -> int:
+    lid = str(local_id or "").strip() or "0"
+    h = hashlib.sha1(f"{salt}:{lid}".encode("utf-8", errors="ignore")).hexdigest()
+    n = int(h[:8], 16) % 2000000000
+    if n <= 0:
+        n = 1
+    return -n
+
+
+def _row_payload_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("payload_json")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            return {}
+    return {}
+
+
+def _queue_row_to_dict(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row)
+    payload = _row_payload_dict(d)
+    d["payload"] = payload
+    d["creation_kind"] = _normalize_creation_kind(d.get("creation_kind"))
+    d["state"] = _normalize_queue_state(d.get("state"), default="pending")
+    d["created"] = bool(int(d.get("created") or 0))
+    d["try_to_create"] = bool(int(d.get("try_to_create") or 0))
+    d["attempt_count"] = int(d.get("attempt_count") or 0)
+    d["failure_count"] = int(d.get("failure_count") or 0)
+    return d
+
+
+def insert_offline_creation(
+    *,
+    creation_kind: str,
+    payload: Dict[str, Any],
+    local_id: str | None = None,
+    client_request_id: str | None = None,
+    state: str = "pending",
+    try_to_create: bool = True,
+    created: bool = False,
+    failure_type: str | None = None,
+    failure_code: str | None = None,
+    last_http_status: int | None = None,
+    last_error_message: str | None = None,
+    failed_reason: str | None = None,
+    next_retry_at: str | None = None,
+) -> Dict[str, Any]:
+    lid = str(local_id or uuid.uuid4())
+    rid = str(client_request_id or uuid.uuid4())
+    kind = _normalize_creation_kind(creation_kind)
+    st = _normalize_queue_state(state, default="pending")
+    now = _utc_now_iso()
+    payload_obj = payload if isinstance(payload, dict) else {}
+    payload_json = json.dumps(payload_obj, ensure_ascii=False)
+    payload_hash = _hash_payload(payload_obj)
+
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO offline_creation_queue (
+                    local_id, client_request_id, creation_kind,
+                    payload_json, payload_hash,
+                    state, created, try_to_create,
+                    attempt_count, failure_count,
+                    failure_type, failure_code, last_http_status,
+                    last_error_message, failed_reason,
+                    last_attempt_at, next_retry_at,
+                    processing_started_at, processing_lock_token, processing_lock_expires_at,
+                    succeeded_at, reconciled_at, cancelled_at, archived_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lid, rid, kind,
+                    payload_json, payload_hash,
+                    st,
+                    1 if created else 0,
+                    1 if try_to_create else 0,
+                    0, 0,
+                    _norm_text(failure_type) or None,
+                    _norm_text(failure_code) or None,
+                    int(last_http_status) if last_http_status is not None else None,
+                    _norm_text(last_error_message)[:1000] or None,
+                    _norm_text(failed_reason)[:1000] or None,
+                    None,
+                    _norm_text(next_retry_at) or None,
+                    None, None, None,
+                    (now if st == "succeeded" else None),
+                    (now if st == "reconciled" else None),
+                    (now if st == "cancelled" else None),
+                    (now if st == "archived" else None),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Stable client_request_id should return the existing logical row.
+            ex = conn.execute(
+                "SELECT local_id FROM offline_creation_queue WHERE client_request_id=? LIMIT 1",
+                (rid,),
+            ).fetchone()
+            if ex:
+                existing_id = str(ex["local_id"])  # type: ignore[index]
+                existing = get_offline_creation(existing_id)
+                if existing:
+                    return existing
+            raise
+
+    row = get_offline_creation(lid)
+    if not row:
+        raise RuntimeError("Failed to insert offline creation row")
+    return row
+
+def get_offline_creation(local_id: str) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM offline_creation_queue WHERE local_id=? LIMIT 1", (lid,)).fetchone()
+        if not r:
+            return None
+        return _queue_row_to_dict(r)
+
+
+def list_offline_creations(
+    *,
+    states: List[str] | None = None,
+    include_archived: bool = False,
+    limit: int = 500,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    lim = max(1, min(int(limit or 500), 5000))
+    off = max(0, int(offset or 0))
+
+    where: List[str] = []
+    args: List[Any] = []
+
+    norm_states: List[str] = []
+    if states:
+        for s in states:
+            ns = _normalize_queue_state(s, default="")
+            if ns:
+                norm_states.append(ns)
+    if norm_states:
+        q = ",".join(["?"] * len(norm_states))
+        where.append(f"state IN ({q})")
+        args.extend(norm_states)
+    elif not include_archived:
+        where.append("state <> 'archived'")
+
+    sql = "SELECT * FROM offline_creation_queue"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY updated_at DESC, created_at DESC LIMIT ? OFFSET ?"
+    args.extend([lim, off])
+
+    with get_conn() as conn:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        return [_queue_row_to_dict(r) for r in rows]
+
+def count_offline_creations(
+    *,
+    states: List[str] | None = None,
+    include_archived: bool = False,
+) -> int:
+    where: List[str] = []
+    args: List[Any] = []
+
+    norm_states: List[str] = []
+    if states:
+        for s in states:
+            ns = _normalize_queue_state(s, default="")
+            if ns:
+                norm_states.append(ns)
+    if norm_states:
+        q = ",".join(["?"] * len(norm_states))
+        where.append(f"state IN ({q})")
+        args.extend(norm_states)
+    elif not include_archived:
+        where.append("state <> 'archived'")
+
+    sql = "SELECT COUNT(*) AS c FROM offline_creation_queue"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    with get_conn() as conn:
+        r = conn.execute(sql, tuple(args)).fetchone()
+        if not r:
+            return 0
+        return int(r["c"] or 0)
+
+def list_offline_creations_due_for_retry(*, now_iso_value: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    now_v = _norm_text(now_iso_value) or _utc_now_iso()
+    lim = max(1, min(int(limit or 100), 500))
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM offline_creation_queue
+            WHERE created = 0
+              AND try_to_create = 1
+              AND state IN ('pending','failed_retryable','blocked_auth')
+              AND (next_retry_at IS NULL OR next_retry_at = '' OR next_retry_at <= ?)
+              AND (processing_lock_expires_at IS NULL OR processing_lock_expires_at = '' OR processing_lock_expires_at <= ?)
+            ORDER BY COALESCE(next_retry_at, ''), updated_at, created_at
+            LIMIT ?
+            """,
+            (now_v, now_v, lim),
+        ).fetchall()
+        return [_queue_row_to_dict(r) for r in rows]
+
+
+def update_offline_creation_payload(
+    local_id: str,
+    *,
+    payload: Dict[str, Any],
+    try_to_create: bool | None = None,
+) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+    if row.get("state") in OFFLINE_QUEUE_FINAL_STATES or row.get("created"):
+        return None
+
+    payload_obj = payload if isinstance(payload, dict) else {}
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET payload_json=?,
+                payload_hash=?,
+                state='pending',
+                failure_type=NULL,
+                failure_code=NULL,
+                last_http_status=NULL,
+                last_error_message=NULL,
+                failed_reason=NULL,
+                failure_count=0,
+                next_retry_at=NULL,
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                updated_at=?,
+                try_to_create=COALESCE(?, try_to_create)
+            WHERE local_id=?
+            """,
+            (
+                json.dumps(payload_obj, ensure_ascii=False),
+                _hash_payload(payload_obj),
+                now,
+                (1 if bool(try_to_create) else 0) if try_to_create is not None else None,
+                lid,
+            ),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def set_offline_creation_try_to_create(local_id: str, enabled: bool) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+    if row.get("state") in ("succeeded", "reconciled", "cancelled", "archived"):
+        return None
+
+    now = _utc_now_iso()
+    new_state = row.get("state") or "pending"
+    if enabled and new_state == "failed_terminal":
+        new_state = "failed_retryable"
+    if not enabled and new_state not in OFFLINE_QUEUE_FINAL_STATES:
+        if row.get("state") == "blocked_auth":
+            new_state = "blocked_auth"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET try_to_create=?, state=?,
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (1 if enabled else 0, _normalize_queue_state(new_state), now, lid),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def cancel_offline_creation(local_id: str, *, reason: str | None = None) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+    if row.get("state") in ("succeeded", "reconciled", "archived"):
+        return None
+
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET state='cancelled',
+                created=0,
+                try_to_create=0,
+                cancelled_at=?,
+                failed_reason=COALESCE(?, failed_reason),
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (now, _norm_text(reason)[:1000] or None, now, lid),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def archive_offline_creation(local_id: str) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET state='archived',
+                archived_at=?,
+                try_to_create=0,
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (now, now, lid),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def duplicate_offline_creation(local_id: str) -> Dict[str, Any] | None:
+    src = get_offline_creation(local_id)
+    if not src:
+        return None
+    payload = src.get("payload") if isinstance(src.get("payload"), dict) else {}
+    return insert_offline_creation(
+        creation_kind=str(src.get("creation_kind") or "membership_only"),
+        payload=payload,
+        local_id=str(uuid.uuid4()),
+        client_request_id=str(uuid.uuid4()),
+        state="pending",
+        try_to_create=True,
+        created=False,
+    )
+
+
+def claim_offline_creation_for_processing(local_id: str, *, lock_ttl_sec: int = 300, force: bool = False) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+
+    now = _utc_now_iso()
+    expires = (datetime.utcnow() + timedelta(seconds=max(30, int(lock_ttl_sec or 300)))).replace(microsecond=0).isoformat() + "Z"
+    token = str(uuid.uuid4())
+
+    where = (
+        "local_id=? AND created=0 AND "
+        "(processing_lock_expires_at IS NULL OR processing_lock_expires_at='' OR processing_lock_expires_at<=?)"
+    )
+    args: List[Any] = [lid, now]
+    if not force:
+        where += " AND try_to_create=1 AND state IN ('pending','failed_retryable','blocked_auth')"
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE offline_creation_queue
+            SET state='processing',
+                attempt_count = COALESCE(attempt_count, 0) + 1,
+                last_attempt_at=?,
+                processing_started_at=?,
+                processing_lock_token=?,
+                processing_lock_expires_at=?,
+                updated_at=?
+            WHERE {where}
+            """,
+            (now, now, token, expires, now, *args),
+        )
+        conn.commit()
+        if int(cur.rowcount or 0) <= 0:
+            return None
+
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+    row["processing_lock_token"] = token
+    return row
+
+
+def mark_offline_creation_success(
+    local_id: str,
+    *,
+    reconciled: bool,
+    result: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+
+    now = _utc_now_iso()
+    state = "reconciled" if bool(reconciled) else "succeeded"
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET state=?,
+                created=1,
+                try_to_create=0,
+                failure_type=NULL,
+                failure_code=NULL,
+                last_http_status=NULL,
+                last_error_message=NULL,
+                failed_reason=NULL,
+                next_retry_at=NULL,
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                succeeded_at=CASE WHEN ?='succeeded' THEN ? ELSE succeeded_at END,
+                reconciled_at=CASE WHEN ?='reconciled' THEN ? ELSE reconciled_at END,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (state, state, now, state, now, now, lid),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def mark_offline_creation_failure(
+    local_id: str,
+    *,
+    failure_type: str,
+    failure_code: str | None,
+    http_status: int | None,
+    message: str,
+    retry_delay_min: int | None = None,
+    max_countable_failures: int = 5,
+) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+
+    row = get_offline_creation(lid)
+    if not row:
+        return None
+
+    ft = _norm_text_l(failure_type) or "server"
+    countable = _failure_is_countable(ft)
+    prev_count = int(row.get("failure_count") or 0)
+    new_count = prev_count + (1 if countable else 0)
+
+    next_state = "failed_retryable"
+    next_try = True
+    if ft == "auth":
+        next_state = "blocked_auth"
+    elif countable and new_count >= max(1, int(max_countable_failures or 5)):
+        next_state = "failed_terminal"
+        next_try = False
+
+    delay = int(retry_delay_min) if retry_delay_min is not None else _failure_retry_delay_minutes(ft)
+    nr = _next_retry_iso(delay)
+    if next_state == "failed_terminal":
+        nr = None
+
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET state=?,
+                created=0,
+                try_to_create=?,
+                failure_count=?,
+                failure_type=?,
+                failure_code=?,
+                last_http_status=?,
+                last_error_message=?,
+                failed_reason=?,
+                next_retry_at=?,
+                processing_started_at=NULL,
+                processing_lock_token=NULL,
+                processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (
+                next_state,
+                1 if next_try else 0,
+                new_count,
+                ft,
+                _norm_text(failure_code)[:200] or None,
+                int(http_status) if http_status is not None else None,
+                _norm_text(message)[:1000] or None,
+                _norm_text(message)[:1000] or None,
+                nr,
+                now,
+                lid,
+            ),
+        )
+        conn.commit()
+    return get_offline_creation(lid)
+
+
+def classify_failure(*, http_status: int | None, message: str | None) -> Dict[str, Any]:
+    msg = _norm_text_l(message)
+    hs = int(http_status) if http_status is not None else None
+
+    if hs in (401, 403):
+        return {
+            "failure_type": "auth",
+            "failure_code": "AUTH_REQUIRED",
+            "recommendation": "save_later",
+            "countable": False,
+        }
+    if hs == 409:
+        return {
+            "failure_type": "conflict",
+            "failure_code": "BUSINESS_CONFLICT",
+            "recommendation": "modify",
+            "countable": True,
+        }
+    if hs in (400, 404, 422):
+        return {
+            "failure_type": "validation",
+            "failure_code": "VALIDATION_ERROR",
+            "recommendation": "modify",
+            "countable": True,
+        }
+    if hs is not None and hs >= 500:
+        return {
+            "failure_type": "server",
+            "failure_code": "SERVER_UNAVAILABLE",
+            "recommendation": "save_later",
+            "countable": False,
+        }
+
+    net_markers = (
+        "connection", "timeout", "timed out", "dns", "name or service", "failed to establish",
+        "network", "unreachable", "forcibly closed", "connection aborted", "max retries exceeded",
+    )
+    for m in net_markers:
+        if m in msg:
+            return {
+                "failure_type": "network",
+                "failure_code": "NETWORK_ERROR",
+                "recommendation": "save_later",
+                "countable": False,
+            }
+
+    return {
+        "failure_type": "server",
+        "failure_code": "SERVER_UNKNOWN",
+        "recommendation": "save_later",
+        "countable": False,
+    }
+
+
+def _base_sync_users_payload_only() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM sync_users").fetchall()]
+    return [_coerce_user_row_to_payload(r) for r in rows]
+
+
+def _payload_get(payload: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in payload:
+            return payload.get(k)
+    return None
+
+
+def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
+    users = list(base_users or [])
+
+    by_username: Dict[str, Dict[str, Any]] = {}
+    email_set: set[str] = set()
+    card_set: set[str] = set()
+    membership_link_set: set[tuple[str, str]] = set()
+
+    for u in users:
+        un = _norm_text_l(u.get("accountUsernameId"))
+        if un:
+            by_username[un] = u
+        em = _norm_text_l(u.get("email"))
+        if em:
+            email_set.add(em)
+        c1 = _norm_text_l(u.get("firstCardId"))
+        c2 = _norm_text_l(u.get("secondCardId"))
+        if c1:
+            card_set.add(c1)
+        if c2:
+            card_set.add(c2)
+        mid = _norm_text(u.get("membershipId"))
+        if un and mid:
+            membership_link_set.add((un, mid))
+
+    candidates = list_offline_creations(states=["pending", "processing", "failed_retryable", "blocked_auth"], include_archived=False, limit=5000)
+    out: List[Dict[str, Any]] = []
+
+    for r in candidates:
+        if not bool(r.get("try_to_create")):
+            continue
+        if bool(r.get("created")):
+            continue
+        if _normalize_queue_state(r.get("state")) in OFFLINE_QUEUE_FINAL_STATES:
+            continue
+
+        kind = _normalize_creation_kind(r.get("creation_kind"))
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+
+        start_v = _payload_get(payload, "startDate", "start_date", "validFrom", "valid_from")
+        end_v = _payload_get(payload, "endDate", "end_date", "validTo", "valid_to")
+        dt_start = _parse_iso_date(start_v)
+        dt_end = _parse_iso_date(end_v)
+        if dt_start is None or dt_end is None or dt_end < dt_start:
+            continue
+
+        membership_id = _norm_text(_payload_get(payload, "membershipId", "membership_id"))
+        card1 = _norm_text_l(_payload_get(payload, "cardId", "card_id", "firstCardId", "first_card_id"))
+        card2 = _norm_text_l(_payload_get(payload, "secondCardId", "second_card_id"))
+        if card1 and card1 in card_set:
+            continue
+        if card2 and card2 in card_set:
+            continue
+
+        if kind == "membership_only":
+            account_username = _norm_text_l(_payload_get(payload, "accountUsernameId", "account_username_id"))
+            if not account_username or not membership_id:
+                continue
+            user_src = by_username.get(account_username)
+            if not user_src:
+                continue
+            if (account_username, membership_id) in membership_link_set:
+                continue
+
+            am_id = _synthetic_negative_id(str(r.get("local_id")), "am")
+            proj = {
+                "userId": user_src.get("userId"),
+                "activeMembershipId": am_id,
+                "membershipId": _to_int_or_none(membership_id) or membership_id,
+                "fullName": user_src.get("fullName") or "unavailable in offline mode",
+                "phone": user_src.get("phone") or "unavailable in offline mode",
+                "email": user_src.get("email") or "unavailable in offline mode",
+                "validFrom": _norm_text(start_v),
+                "validTo": _norm_text(end_v),
+                "firstCardId": _payload_get(payload, "cardId", "card_id", "firstCardId", "first_card_id") or user_src.get("firstCardId"),
+                "secondCardId": _payload_get(payload, "secondCardId", "second_card_id") or user_src.get("secondCardId"),
+                "image": user_src.get("image"),
+                "fingerprints": user_src.get("fingerprints") or [],
+                "faceId": user_src.get("faceId"),
+                "qrCodePayload": user_src.get("qrCodePayload"),
+                "accountUsernameId": user_src.get("accountUsernameId") or account_username,
+                "offlinePending": True,
+                "offlinePendingLocalId": r.get("local_id"),
+                "offlinePendingState": r.get("state"),
+                "offlinePendingKind": kind,
+                "offlineModeNote": "unavailable in offline mode",
+            }
+            out.append(proj)
+            if card1:
+                card_set.add(card1)
+            if card2:
+                card_set.add(card2)
+            membership_link_set.add((account_username, membership_id))
+            continue
+
+        # account_plus_membership (stricter)
+        email = _norm_text_l(_payload_get(payload, "email"))
+        first = _norm_text(_payload_get(payload, "firstname", "firstName", "first_name"))
+        last = _norm_text(_payload_get(payload, "lastname", "lastName", "last_name"))
+        phone = _norm_text(_payload_get(payload, "phone"))
+        password = _norm_text(_payload_get(payload, "password"))
+        if not membership_id or not email or not first or not last or not phone:
+            continue
+        if len(password) < 8:
+            continue
+        if not _simple_email_ok(email):
+            continue
+        if email in email_set:
+            continue
+
+        provided_username = _norm_text_l(_payload_get(payload, "accountUsernameId", "account_username_id"))
+        if provided_username and provided_username in by_username:
+            continue
+
+        am_id = _synthetic_negative_id(str(r.get("local_id")), "am")
+        uid = _synthetic_negative_id(str(r.get("local_id")), "user")
+        acc_username = provided_username or ("pending-" + _norm_text(str(r.get("local_id")))[:8])
+
+        proj = {
+            "userId": uid,
+            "activeMembershipId": am_id,
+            "membershipId": _to_int_or_none(membership_id) or membership_id,
+            "fullName": (first + " " + last).strip(),
+            "phone": phone,
+            "email": email,
+            "validFrom": _norm_text(start_v),
+            "validTo": _norm_text(end_v),
+            "firstCardId": _payload_get(payload, "cardId", "card_id", "firstCardId", "first_card_id"),
+            "secondCardId": _payload_get(payload, "secondCardId", "second_card_id"),
+            "image": None,
+            "fingerprints": [],
+            "faceId": None,
+            "qrCodePayload": None,
+            "accountUsernameId": acc_username,
+            "offlinePending": True,
+            "offlinePendingLocalId": r.get("local_id"),
+            "offlinePendingState": r.get("state"),
+            "offlinePendingKind": kind,
+            "offlineModeNote": "unavailable in offline mode",
+        }
+        out.append(proj)
+
+        email_set.add(email)
+        if acc_username:
+            by_username[acc_username] = proj
+        if card1:
+            card_set.add(card1)
+        if card2:
+            card_set.add(card2)
+
+    return out
+
+
+
+
+
+
+
+

@@ -255,6 +255,17 @@ class ZKFinger:
 
         self._cached_params: Optional[Tuple[int, int, int]] = None  # (w,h,image_size)
 
+    def _loaded_module_path_by_name(self, dll_name: str) -> Optional[str]:
+        """Return actual loaded path of a DLL module in current process, if loaded."""
+        try:
+            h = ctypes.windll.kernel32.GetModuleHandleW(ctypes.c_wchar_p(dll_name))
+            if not h:
+                return None
+            buf = ctypes.create_unicode_buffer(32768)
+            n = ctypes.windll.kernel32.GetModuleFileNameW(ctypes.c_void_p(h), buf, len(buf))
+            return buf.value if n else None
+        except Exception:
+            return None
     # ---------- DLL discovery / loading ----------
 
     def _resolve(self) -> ZKFingerRuntime:
@@ -542,6 +553,17 @@ class ZKFinger:
 
         try:
             self._dll = ctypes.WinDLL(str(rt.dll_path))
+            # Report where Windows actually loaded vendor DLLs from (after preloads)
+            try:
+                _all_imports, vendor_imports = self._vendor_imports(rt)
+                if vendor_imports:
+                    self._log.info("ZKFinger: loaded module paths (vendor deps):")
+                    for name in vendor_imports:
+                        p = self._loaded_module_path_by_name(name)
+                        self._log.info("  - %s -> %s", name, p or "(not loaded)")
+            except Exception:
+                pass
+
         except OSError as e:
             raise ZKFingerError(
                 f"Failed to load {rt.dll_path}: {e}\n"
