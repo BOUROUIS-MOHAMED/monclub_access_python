@@ -63,6 +63,12 @@ from app.core.tv_local_cache import (
     load_tv_ad_task_runtime,
     load_tv_gym_ad_runtime,
     inject_tv_ad_task_now,
+    abort_tv_ad_task_now,
+    reconcile_all_active_gyms,
+    list_tv_ad_proof_outbox,
+    load_tv_ad_proof,
+    process_tv_ad_proof_outbox,
+    retry_tv_ad_proof,
     load_tv_latest_ready_snapshot,
     load_tv_activation_status,
     evaluate_tv_activation,
@@ -1392,6 +1398,81 @@ def _handle_tv_ad_tasks_inject_now(ctx: _Ctx) -> None:
         return
     correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
     result = inject_tv_ad_task_now(campaign_task_id=task_id, correlation_id=correlation_id)
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+
+
+def _handle_tv_ad_tasks_abort(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    task_id = _safe_int(ctx.param("taskId"), 0)
+    if task_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "taskId is required"})
+        return
+    body = ctx.body()
+    support_confirm = _safe_bool(body.get("support") if isinstance(body, dict) else False, default=False) or _safe_bool(body.get("confirm") if isinstance(body, dict) else False, default=False)
+    if not support_confirm:
+        ctx.send_json(403, {"ok": False, "error": "SUPPORT_CONFIRM_REQUIRED"})
+        return
+    reason = _safe_str((body.get("reason") if isinstance(body, dict) else ""), "").strip() or "MANUAL_ABORT"
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = abort_tv_ad_task_now(campaign_task_id=task_id, reason=reason, correlation_id=correlation_id)
+    code = 200 if bool(result.get("ok")) else 400
+    ctx.send_json(code, result)
+
+
+def _handle_tv_ad_reconcile_all(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    result = reconcile_all_active_gyms()
+    ctx.send_json(200, result)
+
+
+def _handle_tv_ad_proofs_list(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = _safe_int(ctx.q("gymId", "gym_id", default=""), 0)
+    task_id = _safe_int(ctx.q("taskId", "campaignTaskId", "campaign_task_id", default=""), 0)
+    states_raw = _safe_str(ctx.q("outboxStates", "outbox_states", default=""), "").strip()
+    states = [s.strip().upper() for s in states_raw.split(",") if s.strip()] if states_raw else None
+    limit = max(1, min(ctx.q_int("limit", default=300), 5000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_ad_proof_outbox(
+        gym_id=(gym_id if gym_id > 0 else None),
+        campaign_task_id=(task_id if task_id > 0 else None),
+        outbox_states=states,
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(200, {"ok": True, "rows": data.get("rows") or [], "total": int(data.get("total") or 0), "limit": int(data.get("limit") or limit), "offset": int(data.get("offset") or offset)})
+
+
+def _handle_tv_ad_proofs_one(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    proof_id = _safe_int(ctx.param("proofId"), 0)
+    if proof_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "proofId is required"})
+        return
+    row = load_tv_ad_proof(local_proof_id=proof_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Proof not found"})
+        return
+    ctx.send_json(200, {"ok": True, "proof": row})
+
+
+def _handle_tv_ad_proofs_process_outbox(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    limit = max(1, min(_safe_int((body.get("limit") if isinstance(body, dict) else 50), 50), 200))
+    correlation_id = _safe_str((body.get("correlationId") if isinstance(body, dict) else ""), "").strip() or None
+    result = process_tv_ad_proof_outbox(app=ctx.app, limit=limit, correlation_id=correlation_id)
+    ctx.send_json(200, result)
+
+
+def _handle_tv_ad_proofs_retry(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    proof_id = _safe_int(ctx.param("proofId"), 0)
+    if proof_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "proofId is required"})
+        return
+    result = retry_tv_ad_proof(app=ctx.app, local_proof_id=proof_id)
     code = 200 if bool(result.get("ok")) else 400
     ctx.send_json(code, result)
 
@@ -2983,6 +3064,12 @@ def _build_router() -> _Router:
     r.add("GET", "/api/v2/tv/ad-tasks/{taskId}/runtime", _handle_tv_ad_tasks_runtime_one)
     r.add("GET", "/api/v2/tv/gym-ad-runtime/{gymId}", _handle_tv_gym_ad_runtime_one)
     r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/inject-now", _handle_tv_ad_tasks_inject_now)
+    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/abort", _handle_tv_ad_tasks_abort)
+    r.add("POST", "/api/v2/tv/ad-tasks/reconcile-all", _handle_tv_ad_reconcile_all)
+    r.add("GET", "/api/v2/tv/ad-proofs", _handle_tv_ad_proofs_list)
+    r.add("GET", "/api/v2/tv/ad-proofs/{proofId}", _handle_tv_ad_proofs_one)
+    r.add("POST", "/api/v2/tv/ad-proofs/process-outbox", _handle_tv_ad_proofs_process_outbox)
+    r.add("POST", "/api/v2/tv/ad-proofs/{proofId}/retry", _handle_tv_ad_proofs_retry)
     r.add("GET", "/api/v2/tv/activation/status", _handle_tv_activation_status)
     r.add("POST", "/api/v2/tv/activation/evaluate", _handle_tv_activation_evaluate)
     r.add("POST", "/api/v2/tv/activation/activate-latest-ready", _handle_tv_activation_activate_latest_ready)

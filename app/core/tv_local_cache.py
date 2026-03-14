@@ -14,6 +14,7 @@ import marshal
 import os
 import pathlib
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from  app.api.local_access_api_v2 import *
@@ -67,6 +68,25 @@ _F23_TERMINAL_DISPLAY_STATES = {
 
 _F23_GYM_LOCKS: Dict[int, threading.Lock] = {}
 _F23_GYM_LOCKS_GUARD = threading.Lock()
+
+# ── F24: Proof + Completion Feedback constants ──────────────────────
+_F24_COMPLETION_TOLERANCE_SEC = 2
+_F24_OUTBOX_MAX_ATTEMPTS = 50
+_F24_OUTBOX_BACKOFF_SCHEDULE = [30, 60, 120, 300, 600, 1800, 3600]  # seconds
+
+_F24_DISPLAY_STATE_TO_RESULT = {
+    _F23_DISPLAY_COMPLETED: "COMPLETED",
+    _F23_DISPLAY_ABORTED: "ABORTED",
+    _F23_DISPLAY_SKIPPED: "FAILED_TO_START",
+    _F23_DISPLAY_CANCELLED: "CANCELLED_REMOTE",
+    _F23_DISPLAY_EXPIRED: "EXPIRED_REMOTE",
+}
+
+_F24_OUTBOX_QUEUED = "QUEUED"
+_F24_OUTBOX_SENDING = "SENDING"
+_F24_OUTBOX_SENT = "SENT"
+_F24_OUTBOX_FAILED_RETRYABLE = "FAILED_RETRYABLE"
+_F24_OUTBOX_FAILED_TERMINAL = "FAILED_TERMINAL"
 
 
 def _f23_now_utc() -> datetime:
@@ -222,6 +242,42 @@ def _f23_ensure_schema_extensions() -> None:
         _f23_add_column(conn, "tv_player_state", "ad_audio_override_active", "INTEGER NOT NULL DEFAULT 0")
         _f23_add_column(conn, "tv_player_state", "ad_runtime_state", "TEXT")
         _f23_add_column(conn, "tv_player_state", "ad_runtime_message", "TEXT")
+
+        # F24: Proof outbox
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tv_ad_proof_outbox (
+                local_proof_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_task_id INTEGER NOT NULL,
+                campaign_id INTEGER,
+                gym_id INTEGER NOT NULL,
+                ad_media_id TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                started_at TEXT,
+                finished_at TEXT,
+                displayed_duration_sec INTEGER,
+                expected_duration_sec INTEGER,
+                completed_fully INTEGER NOT NULL DEFAULT 0,
+                countable INTEGER NOT NULL DEFAULT 0,
+                result_status TEXT NOT NULL,
+                reason_if_not_countable TEXT,
+                correlation_id TEXT,
+                participating_binding_count INTEGER,
+                failed_binding_count INTEGER,
+                outbox_state TEXT NOT NULL DEFAULT 'QUEUED',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT,
+                last_error TEXT,
+                backend_proof_id INTEGER,
+                backend_task_status TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tv_ad_proof_outbox_task ON tv_ad_proof_outbox(campaign_task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tv_ad_proof_outbox_state ON tv_ad_proof_outbox(outbox_state, next_attempt_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tv_ad_proof_outbox_gym ON tv_ad_proof_outbox(gym_id)")
         conn.commit()
 
 
@@ -455,7 +511,7 @@ def _f23_apply_remote_terminal_precedence(conn: Any, gym_id: int, now_iso: str) 
         return
     participants = _f23_json_load(gym_runtime.get("participating_binding_ids_json"), [])
     failed = _f23_json_load(gym_runtime.get("failed_binding_ids_json"), [])
-    _f23_upsert_task_runtime(
+    task_rt = _f23_upsert_task_runtime(
         conn,
         task,
         local_display_state=terminal_state,
@@ -464,6 +520,10 @@ def _f23_apply_remote_terminal_precedence(conn: Any, gym_id: int, now_iso: str) 
         display_abort_reason=f"REMOTE_STATUS_{_f23_safe_str(task.get('remote_status'), '').upper()}",
         participating_binding_ids=participants,
         failed_binding_ids=failed,
+    )
+    _f24_create_proof_from_terminal(
+        conn, task=task, task_runtime=task_rt, gym_runtime=gym_runtime,
+        terminal_display_state=terminal_state,
     )
     _f23_clear_gym_runtime(conn, gym_id)
 
@@ -494,7 +554,7 @@ def _f23_mark_missed_due_tasks(conn: Any, gym_id: int, now_dt: datetime) -> None
             continue
         if now_dt <= scheduled + timedelta(seconds=_F23_DUE_GRACE_SECONDS):
             continue
-        _f23_upsert_task_runtime(
+        skipped_rt = _f23_upsert_task_runtime(
             conn,
             task,
             local_display_state=_F23_DISPLAY_SKIPPED,
@@ -503,6 +563,10 @@ def _f23_mark_missed_due_tasks(conn: Any, gym_id: int, now_dt: datetime) -> None
             display_abort_reason="MISSED_DUE_WINDOW",
             participating_binding_ids=[],
             failed_binding_ids=[],
+        )
+        _f24_create_proof_from_terminal(
+            conn, task=task, task_runtime=skipped_rt, gym_runtime={},
+            terminal_display_state=_F23_DISPLAY_SKIPPED,
         )
 
 def _f23_pick_due_task(conn: Any, gym_id: int, now_dt: datetime, force_task_id: Optional[int]) -> Dict[str, Any]:
@@ -559,7 +623,7 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
             if not valid:
                 participants = _f23_json_load(gym_runtime.get("participating_binding_ids_json"), [])
                 failed = sorted(set(_f23_json_load(gym_runtime.get("failed_binding_ids_json"), []) + participants))
-                _f23_upsert_task_runtime(
+                aborted_rt = _f23_upsert_task_runtime(
                     conn,
                     task,
                     local_display_state=_F23_DISPLAY_ABORTED,
@@ -568,6 +632,10 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
                     display_abort_reason=reason,
                     participating_binding_ids=participants,
                     failed_binding_ids=failed,
+                )
+                _f24_create_proof_from_terminal(
+                    conn, task=task, task_runtime=aborted_rt, gym_runtime=gym_runtime,
+                    terminal_display_state=_F23_DISPLAY_ABORTED,
                 )
                 _f23_clear_gym_runtime(conn, gym_id)
             else:
@@ -583,7 +651,7 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
                     if pid not in healthy_set and pid not in failed:
                         failed.append(pid)
                 if now_dt >= expected_finish_dt:
-                    _f23_upsert_task_runtime(
+                    completed_rt = _f23_upsert_task_runtime(
                         conn,
                         task,
                         local_display_state=_F23_DISPLAY_COMPLETED,
@@ -591,6 +659,10 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
                         display_finished_at=now_iso,
                         participating_binding_ids=participants,
                         failed_binding_ids=failed,
+                    )
+                    _f24_create_proof_from_terminal(
+                        conn, task=task, task_runtime=completed_rt, gym_runtime=gym_runtime,
+                        terminal_display_state=_F23_DISPLAY_COMPLETED,
                     )
                     _f23_clear_gym_runtime(conn, gym_id)
                 else:
@@ -634,7 +706,7 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
 
     valid, reason, strength = _f23_validate_ad_asset(winner)
     if not valid:
-        _f23_upsert_task_runtime(
+        winner_aborted_rt = _f23_upsert_task_runtime(
             conn,
             winner,
             local_display_state=_F23_DISPLAY_ABORTED,
@@ -643,6 +715,10 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
             display_abort_reason=reason,
             participating_binding_ids=[],
             failed_binding_ids=[],
+        )
+        _f24_create_proof_from_terminal(
+            conn, task=winner, task_runtime=winner_aborted_rt, gym_runtime={},
+            terminal_display_state=_F23_DISPLAY_ABORTED,
         )
         return {"gymRuntime": gym_runtime, "task": winner, "runtime": _f23_load_task_runtime_row(conn, _f23_safe_int(winner.get("campaign_task_id"), 0)), "healthyBindingIds": healthy_binding_ids, "reason": reason}
 
@@ -675,6 +751,165 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
         "healthyBindingIds": healthy_binding_ids,
         "validationStrength": strength,
     }
+
+# ── F24: Proof creation + outbox internals ──────────────────────────
+
+def _f24_proof_exists(conn: Any, campaign_task_id: int, correlation_id: str) -> bool:
+    """Check if a proof row already exists for this task + correlation combo."""
+    key = f"{campaign_task_id}:{correlation_id}"
+    row = conn.execute(
+        "SELECT 1 FROM tv_ad_proof_outbox WHERE idempotency_key=? LIMIT 1", (key,)
+    ).fetchone()
+    return row is not None
+
+
+def _f24_compute_displayed_duration(started_at: Optional[str], finished_at: Optional[str]) -> int:
+    """Compute displayed duration in seconds from gym-level timestamps."""
+    start = _f23_parse_utc(started_at)
+    end = _f23_parse_utc(finished_at)
+    if start is None or end is None:
+        return 0
+    diff = (end - start).total_seconds()
+    return max(0, int(diff))
+
+
+def _f24_create_proof_from_terminal(
+    conn: Any,
+    *,
+    task: Dict[str, Any],
+    task_runtime: Dict[str, Any],
+    gym_runtime: Dict[str, Any],
+    terminal_display_state: str,
+) -> Optional[Dict[str, Any]]:
+    """Create a proof outbox row when a task reaches terminal display state.
+
+    Uses gym-level timing (from gym_runtime or task_runtime).
+    Exactly one proof per gym-level task attempt. Idempotent by campaignTaskId:correlationId.
+    """
+    campaign_task_id = _f23_safe_int(task.get("campaign_task_id"), 0)
+    if campaign_task_id <= 0:
+        return None
+
+    # Derive correlation_id from the display session
+    correlation_id = (
+        _f23_safe_str(task_runtime.get("correlation_id"), "").strip()
+        or _f23_safe_str(gym_runtime.get("correlation_id"), "").strip()
+        or _f23_safe_str(task.get("correlation_id"), "").strip()
+    )
+    if not correlation_id:
+        correlation_id = str(uuid.uuid4())
+
+    idempotency_key = f"{campaign_task_id}:{correlation_id}"
+
+    # Idempotency guard: do not create duplicate local proof
+    if _f24_proof_exists(conn, campaign_task_id, correlation_id):
+        return None
+
+    # Gym-level timing truth
+    started_at = (
+        _f23_safe_str(gym_runtime.get("started_at"), "").strip()
+        or _f23_safe_str(task_runtime.get("display_started_at"), "").strip()
+    )
+    finished_at = (
+        _f23_safe_str(task_runtime.get("display_finished_at"), "").strip()
+        or _f23_safe_str(task_runtime.get("display_aborted_at"), "").strip()
+        or _f23_iso_utc()
+    )
+
+    displayed_duration_sec = _f24_compute_displayed_duration(started_at, finished_at)
+    expected_duration_sec = _f23_safe_int(task.get("display_duration_sec"), 0)
+
+    # Result status from display state
+    result_status = _F24_DISPLAY_STATE_TO_RESULT.get(terminal_display_state, "ABORTED")
+
+    # Completion and countability
+    completed_fully = (terminal_display_state == _F23_DISPLAY_COMPLETED)
+    countable = (
+        completed_fully
+        and result_status == "COMPLETED"
+        and displayed_duration_sec >= max(0, expected_duration_sec - _F24_COMPLETION_TOLERANCE_SEC)
+        and expected_duration_sec > 0
+    )
+
+    reason_if_not_countable = None
+    if not countable:
+        if not completed_fully:
+            if terminal_display_state == _F23_DISPLAY_SKIPPED:
+                reason_if_not_countable = "MISSED_DISPLAY_WINDOW"
+            elif terminal_display_state == _F23_DISPLAY_CANCELLED:
+                reason_if_not_countable = "CANCELLED_REMOTE"
+            elif terminal_display_state == _F23_DISPLAY_EXPIRED:
+                reason_if_not_countable = "EXPIRED_REMOTE"
+            else:
+                reason_if_not_countable = _f23_safe_str(
+                    task_runtime.get("display_abort_reason"), "DISPLAY_NOT_COMPLETED"
+                )
+        elif displayed_duration_sec < max(0, expected_duration_sec - _F24_COMPLETION_TOLERANCE_SEC):
+            reason_if_not_countable = "PARTIAL_DISPLAY"
+        else:
+            reason_if_not_countable = "UNKNOWN"
+
+    # Support metadata
+    participants_json = (
+        task_runtime.get("participating_binding_ids_json")
+        or gym_runtime.get("participating_binding_ids_json")
+        or "[]"
+    )
+    failed_json = (
+        task_runtime.get("failed_binding_ids_json")
+        or gym_runtime.get("failed_binding_ids_json")
+        or "[]"
+    )
+    participating_binding_count = len(_f23_json_load(participants_json, []))
+    failed_binding_count = len(_f23_json_load(failed_json, []))
+
+    now_iso = _f23_iso_utc()
+    conn.execute(
+        """
+        INSERT INTO tv_ad_proof_outbox (
+            campaign_task_id, campaign_id, gym_id, ad_media_id,
+            idempotency_key, started_at, finished_at,
+            displayed_duration_sec, expected_duration_sec,
+            completed_fully, countable, result_status, reason_if_not_countable,
+            correlation_id, participating_binding_count, failed_binding_count,
+            outbox_state, attempt_count, next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """,
+        (
+            campaign_task_id,
+            _f23_safe_int(task.get("campaign_id"), 0) or None,
+            _f23_safe_int(task.get("gym_id"), 0),
+            _f23_safe_str(task.get("ad_media_id"), "") or None,
+            idempotency_key,
+            started_at or None,
+            finished_at or None,
+            displayed_duration_sec,
+            expected_duration_sec,
+            1 if completed_fully else 0,
+            1 if countable else 0,
+            result_status,
+            reason_if_not_countable,
+            correlation_id,
+            participating_binding_count,
+            failed_binding_count,
+            _F24_OUTBOX_QUEUED,
+            now_iso,  # next_attempt_at = now (send immediately)
+            now_iso,
+            now_iso,
+        ),
+    )
+
+    row = conn.execute(
+        "SELECT * FROM tv_ad_proof_outbox WHERE idempotency_key=? LIMIT 1", (idempotency_key,)
+    ).fetchone()
+    return _f23_row_dict(row)
+
+
+def _f24_compute_next_attempt(attempt_count: int) -> str:
+    idx = min(attempt_count, len(_F24_OUTBOX_BACKOFF_SCHEDULE) - 1)
+    delay = _F24_OUTBOX_BACKOFF_SCHEDULE[idx]
+    return _f23_iso_utc(_f23_now_utc() + timedelta(seconds=delay))
+
 
 def _f23_enrich_binding_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not rows:
@@ -801,6 +1036,26 @@ def list_tv_ad_task_cache(*, gym_id: Optional[int] = None, remote_statuses: Opti
             row["failed_binding_ids"] = _f23_json_load(rt.get("failed_binding_ids_json"), [])
             row["gym_coordination_state"] = gr.get("coordination_state")
             row["gym_current_task_id"] = gr.get("current_campaign_task_id")
+        # F24: Enrich with proof outbox data
+        proof_map: Dict[int, Dict[str, Any]] = {}
+        if task_ids:
+            placeholders = ",".join("?" for _ in task_ids)
+            for raw in conn.execute(
+                f"SELECT * FROM tv_ad_proof_outbox WHERE campaign_task_id IN ({placeholders}) ORDER BY created_at DESC",
+                tuple(task_ids),
+            ).fetchall():
+                tid = _f23_safe_int(raw["campaign_task_id"], 0)
+                if tid not in proof_map:  # keep latest proof per task
+                    proof_map[tid] = _f23_row_dict(raw)
+        for row in rows:
+            task_id = _f23_safe_int(row.get("campaign_task_id"), 0)
+            pf = proof_map.get(task_id, {})
+            row["proof_result_status"] = pf.get("result_status")
+            row["proof_countable"] = _f23_safe_bool(pf.get("countable"), False) if pf else None
+            row["proof_outbox_state"] = pf.get("outbox_state")
+            row["proof_displayed_duration_sec"] = pf.get("displayed_duration_sec")
+            row["proof_expected_duration_sec"] = pf.get("expected_duration_sec")
+            row["proof_reason_if_not_countable"] = pf.get("reason_if_not_countable")
     data["rows"] = rows
     return data
 
@@ -1030,3 +1285,302 @@ def inject_tv_ad_task_now(*, campaign_task_id: int, correlation_id: Optional[str
             "correlationId": correlation_id,
             "validationStrength": strength,
         }
+
+
+def abort_tv_ad_task_now(*, campaign_task_id: int, reason: str = "MANUAL_ABORT", correlation_id: Optional[str] = None) -> Dict[str, Any]:
+    """Abort a currently-displaying ad task from support/admin UI."""
+    ensure_tv_local_schema()
+    if campaign_task_id <= 0:
+        return {"ok": False, "error": "INVALID_TASK_ID"}
+    with get_conn() as conn:
+        task = _f23_load_task_cache_row(conn, campaign_task_id)
+        if not task:
+            return {"ok": False, "error": "TASK_NOT_FOUND"}
+        gym_id = _f23_safe_int(task.get("gym_id"), 0)
+        if gym_id <= 0:
+            return {"ok": False, "error": "TASK_GYM_NOT_RESOLVED"}
+
+        lock = _f23_get_gym_lock(gym_id)
+        with lock:
+            rt = _f23_load_task_runtime_row(conn, campaign_task_id)
+            rt_state = _f23_safe_str(rt.get("local_display_state"), "")
+            if rt_state in _F23_TERMINAL_DISPLAY_STATES:
+                return {"ok": False, "error": "TASK_ALREADY_TERMINAL", "localDisplayState": rt_state}
+
+            gym_runtime = _f23_load_gym_runtime_row(conn, gym_id)
+            current_task_id = _f23_safe_int(gym_runtime.get("current_campaign_task_id"), 0)
+            now_iso = _f23_iso_utc()
+            participants = _f23_json_load(rt.get("participating_binding_ids_json"), []) if rt else []
+            failed = _f23_json_load(rt.get("failed_binding_ids_json"), []) if rt else []
+
+            abort_rt = _f23_upsert_task_runtime(
+                conn,
+                task,
+                local_display_state=_F23_DISPLAY_ABORTED,
+                currently_injected=False,
+                display_aborted_at=now_iso,
+                display_abort_reason=reason,
+                participating_binding_ids=participants,
+                failed_binding_ids=failed,
+            )
+            _f24_create_proof_from_terminal(
+                conn, task=task, task_runtime=abort_rt, gym_runtime=gym_runtime,
+                terminal_display_state=_F23_DISPLAY_ABORTED,
+            )
+            if current_task_id == campaign_task_id:
+                _f23_clear_gym_runtime(conn, gym_id)
+            conn.commit()
+
+    return {
+        "ok": True,
+        "result": "ABORTED",
+        "campaignTaskId": campaign_task_id,
+        "gymId": gym_id,
+        "reason": reason,
+        "runtime": load_tv_ad_task_runtime(campaign_task_id=campaign_task_id),
+        "gymRuntime": load_tv_gym_ad_runtime(gym_id=gym_id),
+        "correlationId": correlation_id,
+    }
+
+
+def reconcile_all_active_gyms() -> Dict[str, Any]:
+    """Tick function: reconcile ad runtime for every gym that has active or pending ad tasks.
+
+    Should be called periodically (e.g. every 10-30s) to advance display states,
+    mark completed/missed tasks, and handle remote terminal precedence without
+    waiting for a render context request.
+    """
+    ensure_tv_local_schema()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT gym_id FROM (
+                SELECT gym_id FROM tv_gym_ad_runtime WHERE coordination_state != 'IDLE'
+                UNION
+                SELECT gym_id FROM tv_ad_task_runtime WHERE local_display_state NOT IN ('DISPLAY_COMPLETED_LOCAL','DISPLAY_ABORTED_LOCAL','SKIPPED_WINDOW_MISSED','CANCELLED_REMOTE','EXPIRED_REMOTE')
+                UNION
+                SELECT gym_id FROM tv_ad_task_cache WHERE remote_status NOT IN ('CANCELLED','EXPIRED','DONE','FAILED')
+            )
+            """,
+        ).fetchall()
+    gym_ids = sorted({_f23_safe_int(r[0] if isinstance(r, (tuple, list)) else (r.get("gym_id") if isinstance(r, dict) else r), 0) for r in rows})
+    gym_ids = [g for g in gym_ids if g > 0]
+    results: List[Dict[str, Any]] = []
+    for gym_id in gym_ids:
+        lock = _f23_get_gym_lock(gym_id)
+        with lock:
+            with get_conn() as conn:
+                resolved = _f23_reconcile_gym_runtime(conn, gym_id=gym_id)
+                conn.commit()
+        gym_runtime = _f23_row_dict(resolved.get("gymRuntime"))
+        task = _f23_row_dict(resolved.get("task"))
+        results.append({
+            "gymId": gym_id,
+            "coordinationState": gym_runtime.get("coordination_state"),
+            "activeTaskId": _f23_safe_int(task.get("campaign_task_id"), 0) or None,
+        })
+    return {"ok": True, "gymsReconciled": len(results), "results": results}
+
+
+# ── F24: Public proof / outbox functions ────────────────────────────
+
+def list_tv_ad_proof_outbox(
+    *,
+    gym_id: Optional[int] = None,
+    campaign_task_id: Optional[int] = None,
+    outbox_states: Optional[List[str]] = None,
+    limit: int = 300,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """List local proof outbox rows with optional filters."""
+    ensure_tv_local_schema()
+    clauses: List[str] = []
+    params: List[Any] = []
+    if gym_id and gym_id > 0:
+        clauses.append("p.gym_id=?")
+        params.append(gym_id)
+    if campaign_task_id and campaign_task_id > 0:
+        clauses.append("p.campaign_task_id=?")
+        params.append(campaign_task_id)
+    if outbox_states:
+        placeholders = ",".join("?" for _ in outbox_states)
+        clauses.append(f"p.outbox_state IN ({placeholders})")
+        params.extend(outbox_states)
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    lim = max(1, min(int(limit or 300), 5000))
+    off = max(0, int(offset or 0))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT p.* FROM tv_ad_proof_outbox p {where_sql} ORDER BY p.created_at DESC LIMIT ? OFFSET ?",
+            tuple(params + [lim, off]),
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM tv_ad_proof_outbox p {where_sql}", tuple(params)
+        ).fetchone()[0]
+    out_rows = [_f23_row_dict(r) for r in rows]
+    return {"rows": out_rows, "total": int(total or 0), "limit": lim, "offset": off}
+
+
+def load_tv_ad_proof(*, local_proof_id: int) -> Optional[Dict[str, Any]]:
+    """Load a single proof outbox row by local ID."""
+    ensure_tv_local_schema()
+    if local_proof_id <= 0:
+        return None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM tv_ad_proof_outbox WHERE local_proof_id=? LIMIT 1",
+            (local_proof_id,),
+        ).fetchone()
+    return _f23_row_dict(row) or None
+
+
+def _f24_build_proof_payload(proof: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the JSON payload to send to the backend proof endpoint."""
+    return {
+        "idempotencyKey": _f23_safe_str(proof.get("idempotency_key"), ""),
+        "correlationId": _f23_safe_str(proof.get("correlation_id"), ""),
+        "startedAt": proof.get("started_at"),
+        "finishedAt": proof.get("finished_at"),
+        "displayedDurationSec": _f23_safe_int(proof.get("displayed_duration_sec"), 0),
+        "expectedDurationSec": _f23_safe_int(proof.get("expected_duration_sec"), 0),
+        "completedFully": _f23_safe_bool(proof.get("completed_fully"), False),
+        "countable": _f23_safe_bool(proof.get("countable"), False),
+        "resultStatus": _f23_safe_str(proof.get("result_status"), "ABORTED"),
+        "reasonIfNotCountable": proof.get("reason_if_not_countable"),
+        "participatingBindingCount": _f23_safe_int(proof.get("participating_binding_count"), 0) or None,
+        "failedBindingCount": _f23_safe_int(proof.get("failed_binding_count"), 0) or None,
+    }
+
+
+def _f24_send_single_proof(app: Any, proof: Dict[str, Any]) -> Dict[str, Any]:
+    """Try to send a single proof to the backend. Returns {ok, retryable, error?}."""
+    local_proof_id = _f23_safe_int(proof.get("local_proof_id"), 0)
+    campaign_task_id = _f23_safe_int(proof.get("campaign_task_id"), 0)
+    if local_proof_id <= 0 or campaign_task_id <= 0:
+        return {"ok": False, "retryable": False, "error": "INVALID_IDS"}
+
+    now_iso = _f23_iso_utc()
+
+    # Mark as SENDING
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE tv_ad_proof_outbox SET outbox_state=?, updated_at=? WHERE local_proof_id=?",
+            (_F24_OUTBOX_SENDING, now_iso, local_proof_id),
+        )
+        conn.commit()
+
+    payload = _f24_build_proof_payload(proof)
+
+    try:
+        token = app.get_token() if hasattr(app, "get_token") else ""
+        api = app.api if hasattr(app, "api") else None
+        if api is None:
+            raise RuntimeError("app.api not available")
+
+        result = api.submit_tv_ad_task_proof(
+            token=token,
+            task_id=campaign_task_id,
+            payload=payload,
+            timeout=20,
+        )
+
+        # Success
+        with get_conn() as conn:
+            conn.execute(
+                """UPDATE tv_ad_proof_outbox
+                   SET outbox_state=?, backend_proof_id=?, backend_task_status=?,
+                       attempt_count=attempt_count+1, last_error=NULL, updated_at=?
+                   WHERE local_proof_id=?""",
+                (
+                    _F24_OUTBOX_SENT,
+                    result.get("proofId"),
+                    result.get("taskStatus"),
+                    _f23_iso_utc(),
+                    local_proof_id,
+                ),
+            )
+            conn.commit()
+        return {"ok": True, "result": result}
+
+    except Exception as e:
+        error_str = str(e)[:500]
+        status_code = getattr(e, "status_code", 0)
+        retryable = True
+        if isinstance(status_code, int) and 400 <= status_code < 500:
+            retryable = False
+
+        attempt_count = _f23_safe_int(proof.get("attempt_count"), 0) + 1
+        if attempt_count >= _F24_OUTBOX_MAX_ATTEMPTS:
+            retryable = False
+
+        new_state = _F24_OUTBOX_FAILED_RETRYABLE if retryable else _F24_OUTBOX_FAILED_TERMINAL
+        next_at = _f24_compute_next_attempt(attempt_count) if retryable else None
+
+        with get_conn() as conn:
+            conn.execute(
+                """UPDATE tv_ad_proof_outbox
+                   SET outbox_state=?, attempt_count=?, next_attempt_at=?,
+                       last_error=?, updated_at=?
+                   WHERE local_proof_id=?""",
+                (new_state, attempt_count, next_at, error_str, _f23_iso_utc(), local_proof_id),
+            )
+            conn.commit()
+        return {"ok": False, "retryable": retryable, "error": error_str}
+
+
+def process_tv_ad_proof_outbox(
+    *,
+    app: Any,
+    limit: int = 50,
+    correlation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Process pending proof outbox rows: send to backend with retry."""
+    ensure_tv_local_schema()
+    now_iso = _f23_iso_utc()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM tv_ad_proof_outbox
+               WHERE outbox_state IN (?, ?)
+                 AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+               ORDER BY created_at ASC
+               LIMIT ?""",
+            (_F24_OUTBOX_QUEUED, _F24_OUTBOX_FAILED_RETRYABLE, now_iso, max(1, min(limit, 200))),
+        ).fetchall()
+
+    proofs = [_f23_row_dict(r) for r in rows]
+    sent = 0
+    failed = 0
+    for proof in proofs:
+        result = _f24_send_single_proof(app, proof)
+        if result.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+
+    return {
+        "ok": True,
+        "processed": len(proofs),
+        "sent": sent,
+        "failed": failed,
+        "correlationId": correlation_id,
+    }
+
+
+def retry_tv_ad_proof(*, app: Any, local_proof_id: int) -> Dict[str, Any]:
+    """Retry sending a single proof row (even if FAILED_TERMINAL)."""
+    ensure_tv_local_schema()
+    if local_proof_id <= 0:
+        return {"ok": False, "error": "INVALID_PROOF_ID"}
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM tv_ad_proof_outbox WHERE local_proof_id=? LIMIT 1",
+            (local_proof_id,),
+        ).fetchone()
+    proof = _f23_row_dict(row)
+    if not proof:
+        return {"ok": False, "error": "PROOF_NOT_FOUND"}
+    if _f23_safe_str(proof.get("outbox_state"), "") == _F24_OUTBOX_SENT:
+        return {"ok": True, "alreadySent": True}
+
+    result = _f24_send_single_proof(app, proof)
+    return {"ok": result.get("ok", False), "sendResult": result}

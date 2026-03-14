@@ -21,6 +21,7 @@ class ApiEndpoints:
     tv_snapshot_manifest_url: str = ""
     tv_ad_tasks_fetch_url: str = ""
     tv_ad_task_confirm_ready_url: str = ""
+    tv_ad_task_submit_proof_url: str = ""
 
 class MonClubApiError(RuntimeError):
     pass
@@ -450,6 +451,55 @@ class MonClubApi:
             extra = _extract_trace_info(txt)
             raise MonClubApiHttpError(
                 f"confirmTvAdTaskReady failed: HTTP {r.status_code} -> {txt[:500]}{extra}",
+                status_code=r.status_code,
+                body=txt,
+            )
+
+        try:
+            data = r.json()
+        except Exception:
+            raw = (r.text or "").strip()
+            if not raw:
+                return {"ok": True}
+            return {"ok": True, "raw": raw}
+
+        if isinstance(data, dict):
+            return data
+        return {"ok": True, "raw": data}
+
+    def submit_tv_ad_task_proof(
+        self,
+        *,
+        token: str,
+        task_id: int,
+        payload: Dict[str, Any],
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = self._format_url_template(
+            self.endpoints.tv_ad_task_submit_proof_url,
+            taskId=task_id,
+            task_id=task_id,
+        )
+        if not url:
+            raise MonClubApiError("TV ad task submit-proof URL is empty (check Configuration).")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        self.logger.info("API submitTvAdTaskProof -> %s", url)
+        try:
+            r = self._session.post(url, json=(payload or {}), headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"submitTvAdTaskProof request failed: {e}") from e
+
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            extra = _extract_trace_info(txt)
+            raise MonClubApiHttpError(
+                f"submitTvAdTaskProof failed: HTTP {r.status_code} -> {txt[:500]}{extra}",
                 status_code=r.status_code,
                 body=txt,
             )
