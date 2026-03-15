@@ -17,7 +17,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from  app.api.local_access_api_v2 import *
+from app.core.db import get_conn
 
 
 def _load_compiled_baseline() -> None:
@@ -48,8 +48,12 @@ _F23_DUE_GRACE_SECONDS = 30
 _F23_REMOTE_TERMINAL = {"CANCELLED", "EXPIRED", "DONE", "FAILED"}
 _F23_TASK_READY_LOCAL = {"READY_LOCAL", "READY_CONFIRM_PENDING", "READY_CONFIRMED"}
 _F23_COORD_IDLE = "IDLE"
+_F23_COORD_INJECTING = "INJECTING"
 _F23_COORD_DISPLAYING = "DISPLAYING"
+_F23_COORD_COMPLETING = "COMPLETING"
 _F23_COORD_COMPLETED = "COMPLETED"
+_F23_COORD_ABORTED = "ABORTED"
+_F23_COORD_ERROR = "ERROR"
 
 _F23_DISPLAY_READY = "READY_TO_DISPLAY_LOCAL"
 _F23_DISPLAYING = "DISPLAYING"
@@ -242,6 +246,20 @@ def _f23_ensure_schema_extensions() -> None:
         _f23_add_column(conn, "tv_player_state", "ad_audio_override_active", "INTEGER NOT NULL DEFAULT 0")
         _f23_add_column(conn, "tv_player_state", "ad_runtime_state", "TEXT")
         _f23_add_column(conn, "tv_player_state", "ad_runtime_message", "TEXT")
+        _f23_add_column(conn, "tv_player_state", "ad_fallback_reason", "TEXT")
+
+        # F23 schema hardening: add missing runtime fields (idempotent via _f23_add_column)
+        _f23_add_column(conn, "tv_ad_task_runtime", "binding_scope_count", "INTEGER NOT NULL DEFAULT 0")
+        _f23_add_column(conn, "tv_ad_task_runtime", "correlation_id", "TEXT")
+        _f23_add_column(conn, "tv_ad_task_runtime", "injected_layout", "TEXT")
+        _f23_add_column(conn, "tv_ad_task_runtime", "display_abort_message", "TEXT")
+
+        # F23 gym runtime hardening: add missing fields
+        _f23_add_column(conn, "tv_gym_ad_runtime", "active_binding_count", "INTEGER NOT NULL DEFAULT 0")
+        _f23_add_column(conn, "tv_gym_ad_runtime", "failed_binding_count", "INTEGER NOT NULL DEFAULT 0")
+        _f23_add_column(conn, "tv_gym_ad_runtime", "audio_override_active", "INTEGER NOT NULL DEFAULT 0")
+        _f23_add_column(conn, "tv_gym_ad_runtime", "last_error_code", "TEXT")
+        _f23_add_column(conn, "tv_gym_ad_runtime", "last_error_message", "TEXT")
 
         # F24: Proof outbox
         conn.execute(
@@ -387,17 +405,25 @@ def _f23_upsert_task_runtime(
     display_finished_at: Optional[str] = None,
     display_aborted_at: Optional[str] = None,
     display_abort_reason: Optional[str] = None,
+    display_abort_message: Optional[str] = None,
     participating_binding_ids: Optional[Sequence[int]] = None,
     failed_binding_ids: Optional[Sequence[int]] = None,
+    correlation_id: Optional[str] = None,
+    injected_layout: Optional[str] = None,
+    binding_scope_count: int = 0,
 ) -> Dict[str, Any]:
     now_iso = _f23_iso_utc()
+    part_ids = list(participating_binding_ids or [])
+    scope_count = binding_scope_count if binding_scope_count > 0 else len(part_ids)
+    layout_val = injected_layout or _f23_safe_str(task.get("layout"), "") or None
     conn.execute(
         """
         INSERT INTO tv_ad_task_runtime (
             campaign_task_id, campaign_id, gym_id, ad_media_id, layout, display_duration_sec, scheduled_at,
             local_display_state, currently_injected, display_started_at, display_finished_at, display_aborted_at,
-            display_abort_reason, participating_binding_ids_json, failed_binding_ids_json, last_event_at, updated_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            display_abort_reason, display_abort_message, participating_binding_ids_json, failed_binding_ids_json,
+            correlation_id, injected_layout, binding_scope_count, last_event_at, updated_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(campaign_task_id) DO UPDATE SET
             campaign_id=excluded.campaign_id,
             gym_id=excluded.gym_id,
@@ -411,8 +437,12 @@ def _f23_upsert_task_runtime(
             display_finished_at=COALESCE(excluded.display_finished_at, tv_ad_task_runtime.display_finished_at),
             display_aborted_at=COALESCE(excluded.display_aborted_at, tv_ad_task_runtime.display_aborted_at),
             display_abort_reason=COALESCE(excluded.display_abort_reason, tv_ad_task_runtime.display_abort_reason),
+            display_abort_message=COALESCE(excluded.display_abort_message, tv_ad_task_runtime.display_abort_message),
             participating_binding_ids_json=excluded.participating_binding_ids_json,
             failed_binding_ids_json=excluded.failed_binding_ids_json,
+            correlation_id=COALESCE(excluded.correlation_id, tv_ad_task_runtime.correlation_id),
+            injected_layout=COALESCE(excluded.injected_layout, tv_ad_task_runtime.injected_layout),
+            binding_scope_count=excluded.binding_scope_count,
             last_event_at=excluded.last_event_at,
             updated_at=excluded.updated_at
         """,
@@ -430,8 +460,12 @@ def _f23_upsert_task_runtime(
             display_finished_at,
             display_aborted_at,
             display_abort_reason,
-            _f23_json_dump(list(participating_binding_ids or [])),
+            display_abort_message,
+            _f23_json_dump(part_ids),
             _f23_json_dump(list(failed_binding_ids or [])),
+            correlation_id,
+            layout_val,
+            scope_count,
             now_iso,
             now_iso,
             now_iso,
@@ -450,14 +484,22 @@ def _f23_upsert_gym_runtime(
     expected_finish_at: Optional[str] = None,
     participating_binding_ids: Optional[Sequence[int]] = None,
     failed_binding_ids: Optional[Sequence[int]] = None,
+    audio_override_active: bool = False,
+    last_error_code: Optional[str] = None,
+    last_error_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     now_iso = _f23_iso_utc()
+    part_ids = list(participating_binding_ids or [])
+    fail_ids = list(failed_binding_ids or [])
     conn.execute(
         """
         INSERT INTO tv_gym_ad_runtime (
             gym_id, current_campaign_task_id, coordination_state, started_at, expected_finish_at,
-            participating_binding_ids_json, failed_binding_ids_json, last_event_at, updated_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            participating_binding_ids_json, failed_binding_ids_json,
+            active_binding_count, failed_binding_count,
+            audio_override_active, last_error_code, last_error_message,
+            last_event_at, updated_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(gym_id) DO UPDATE SET
             current_campaign_task_id=excluded.current_campaign_task_id,
             coordination_state=excluded.coordination_state,
@@ -465,6 +507,11 @@ def _f23_upsert_gym_runtime(
             expected_finish_at=excluded.expected_finish_at,
             participating_binding_ids_json=excluded.participating_binding_ids_json,
             failed_binding_ids_json=excluded.failed_binding_ids_json,
+            active_binding_count=excluded.active_binding_count,
+            failed_binding_count=excluded.failed_binding_count,
+            audio_override_active=excluded.audio_override_active,
+            last_error_code=COALESCE(excluded.last_error_code, tv_gym_ad_runtime.last_error_code),
+            last_error_message=COALESCE(excluded.last_error_message, tv_gym_ad_runtime.last_error_message),
             last_event_at=excluded.last_event_at,
             updated_at=excluded.updated_at
         """,
@@ -474,8 +521,13 @@ def _f23_upsert_gym_runtime(
             coordination_state,
             started_at,
             expected_finish_at,
-            _f23_json_dump(list(participating_binding_ids or [])),
-            _f23_json_dump(list(failed_binding_ids or [])),
+            _f23_json_dump(part_ids),
+            _f23_json_dump(fail_ids),
+            len(part_ids),
+            len(fail_ids),
+            1 if audio_override_active else 0,
+            last_error_code,
+            last_error_message,
             now_iso,
             now_iso,
             now_iso,
@@ -494,6 +546,9 @@ def _f23_clear_gym_runtime(conn: Any, gym_id: int) -> None:
         expected_finish_at=None,
         participating_binding_ids=[],
         failed_binding_ids=[],
+        audio_override_active=False,
+        last_error_code=None,
+        last_error_message=None,
     )
 
 
@@ -674,6 +729,8 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
                         display_started_at=_f23_iso_utc(start_dt),
                         participating_binding_ids=participants,
                         failed_binding_ids=failed,
+                        injected_layout=_f23_safe_str(task.get("layout"), "") or None,
+                        binding_scope_count=len(participants),
                     )
                     _f23_upsert_gym_runtime(
                         conn,
@@ -684,6 +741,7 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
                         expected_finish_at=_f23_iso_utc(expected_finish_dt),
                         participating_binding_ids=participants,
                         failed_binding_ids=failed,
+                        audio_override_active=True,
                     )
 
     gym_runtime = _f23_load_gym_runtime_row(conn, gym_id)
@@ -733,6 +791,8 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
         display_started_at=now_iso,
         participating_binding_ids=participants,
         failed_binding_ids=[],
+        injected_layout=_f23_safe_str(winner.get("layout"), "") or None,
+        binding_scope_count=len(participants),
     )
     _f23_upsert_gym_runtime(
         conn,
@@ -743,6 +803,7 @@ def _f23_reconcile_gym_runtime(conn: Any, *, gym_id: int, force_task_id: Optiona
         expected_finish_at=_f23_iso_utc(expected_finish_dt),
         participating_binding_ids=participants,
         failed_binding_ids=[],
+        audio_override_active=True,
     )
     return {
         "gymRuntime": _f23_load_gym_runtime_row(conn, gym_id),
@@ -1343,6 +1404,85 @@ def abort_tv_ad_task_now(*, campaign_task_id: int, reason: str = "MANUAL_ABORT",
     }
 
 
+def startup_recover_ad_runtime() -> Dict[str, Any]:
+    """F27: Startup recovery for ad runtime state after crash or restart.
+
+    Repairs transient states that were left mid-flight:
+    - SENDING proof outbox rows reset to FAILED_RETRYABLE (safe retry on restart)
+    - Gym runtimes in INJECTING state (not yet displaying) reset to IDLE
+    - Gym runtimes in COMPLETING state are checked for existing proof; if missing, proof outbox
+      rows are queued for retry; gym is then cleared to IDLE
+    All actions are safe and idempotent.
+    """
+    ensure_tv_local_schema()
+    now_iso = _f23_iso_utc()
+    result: Dict[str, Any] = {"proofSendingReset": 0, "injectingReset": 0, "completingRecovered": 0}
+
+    with get_conn() as conn:
+        # 1. Reset SENDING → FAILED_RETRYABLE so proof outbox retries after crash
+        cur = conn.execute(
+            "UPDATE tv_ad_proof_outbox SET outbox_state=?, next_attempt_at=?, updated_at=? WHERE outbox_state=?",
+            (_F24_OUTBOX_FAILED_RETRYABLE, now_iso, now_iso, _F24_OUTBOX_SENDING),
+        )
+        result["proofSendingReset"] = cur.rowcount
+
+        # 2. Reset INJECTING gym runtimes to IDLE — we never started displaying
+        injecting_rows = conn.execute(
+            "SELECT * FROM tv_gym_ad_runtime WHERE coordination_state=?",
+            (_F23_COORD_INJECTING,),
+        ).fetchall()
+        for raw in injecting_rows:
+            gym = _f23_row_dict(raw)
+            gym_id = _f23_safe_int(gym.get("gym_id"), 0)
+            if gym_id > 0:
+                _f23_clear_gym_runtime(conn, gym_id)
+                result["injectingReset"] += 1
+
+        # 3. For COMPLETING gym runtimes — display finished but proof may not have been created yet.
+        # Check if proof exists; if not, mark the task runtime ABORTED so proof is created on next reconcile.
+        completing_rows = conn.execute(
+            "SELECT * FROM tv_gym_ad_runtime WHERE coordination_state=?",
+            (_F23_COORD_COMPLETING,),
+        ).fetchall()
+        for raw in completing_rows:
+            gym = _f23_row_dict(raw)
+            gym_id = _f23_safe_int(gym.get("gym_id"), 0)
+            task_id = _f23_safe_int(gym.get("current_campaign_task_id"), 0)
+            if gym_id <= 0 or task_id <= 0:
+                if gym_id > 0:
+                    _f23_clear_gym_runtime(conn, gym_id)
+                continue
+            existing_proof = conn.execute(
+                "SELECT 1 FROM tv_ad_proof_outbox WHERE campaign_task_id=? LIMIT 1", (task_id,)
+            ).fetchone()
+            if not existing_proof:
+                # Proof not yet created — mark task runtime as aborted so next reconcile creates proof
+                task = _f23_load_task_cache_row(conn, task_id)
+                rt = _f23_load_task_runtime_row(conn, task_id)
+                if task and rt and _f23_safe_str(rt.get("local_display_state"), "") not in _F23_TERMINAL_DISPLAY_STATES:
+                    abort_rt = _f23_upsert_task_runtime(
+                        conn, task,
+                        local_display_state=_F23_DISPLAY_ABORTED,
+                        currently_injected=False,
+                        display_aborted_at=now_iso,
+                        display_abort_reason="STARTUP_RECOVERY_COMPLETING",
+                        display_abort_message="Crash during COMPLETING state; proof re-created on recovery",
+                        participating_binding_ids=_f23_json_load(rt.get("participating_binding_ids_json"), []),
+                        failed_binding_ids=_f23_json_load(rt.get("failed_binding_ids_json"), []),
+                        correlation_id=_f23_safe_str(rt.get("correlation_id"), "") or None,
+                    )
+                    _f24_create_proof_from_terminal(
+                        conn, task=task, task_runtime=abort_rt, gym_runtime=gym,
+                        terminal_display_state=_F23_DISPLAY_ABORTED,
+                    )
+            _f23_clear_gym_runtime(conn, gym_id)
+            result["completingRecovered"] += 1
+
+        conn.commit()
+
+    return {"ok": True, **result}
+
+
 def reconcile_all_active_gyms() -> Dict[str, Any]:
     """Tick function: reconcile ad runtime for every gym that has active or pending ad tasks.
 
@@ -1355,7 +1495,7 @@ def reconcile_all_active_gyms() -> Dict[str, Any]:
         rows = conn.execute(
             """
             SELECT DISTINCT gym_id FROM (
-                SELECT gym_id FROM tv_gym_ad_runtime WHERE coordination_state != 'IDLE'
+                SELECT gym_id FROM tv_gym_ad_runtime WHERE coordination_state NOT IN ('IDLE')
                 UNION
                 SELECT gym_id FROM tv_ad_task_runtime WHERE local_display_state NOT IN ('DISPLAY_COMPLETED_LOCAL','DISPLAY_ABORTED_LOCAL','SKIPPED_WINDOW_MISSED','CANCELLED_REMOTE','EXPIRED_REMOTE')
                 UNION

@@ -65,6 +65,7 @@ from app.core.tv_local_cache import (
     inject_tv_ad_task_now,
     abort_tv_ad_task_now,
     reconcile_all_active_gyms,
+    startup_recover_ad_runtime,
     list_tv_ad_proof_outbox,
     load_tv_ad_proof,
     process_tv_ad_proof_outbox,
@@ -1424,6 +1425,13 @@ def _handle_tv_ad_reconcile_all(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
     result = reconcile_all_active_gyms()
     ctx.send_json(200, result)
+
+
+def _handle_tv_ad_startup_recover(ctx: _Ctx) -> None:
+    """F27: Startup recovery — reset transient ad runtime states after crash."""
+    result = startup_recover_ad_runtime()
+    code = 200 if bool(result.get("ok")) else 500
+    ctx.send_json(code, result)
 
 
 def _handle_tv_ad_proofs_list(ctx: _Ctx) -> None:
@@ -3066,6 +3074,7 @@ def _build_router() -> _Router:
     r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/inject-now", _handle_tv_ad_tasks_inject_now)
     r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/abort", _handle_tv_ad_tasks_abort)
     r.add("POST", "/api/v2/tv/ad-tasks/reconcile-all", _handle_tv_ad_reconcile_all)
+    r.add("POST", "/api/v2/tv/ad-tasks/startup-recover", _handle_tv_ad_startup_recover)
     r.add("GET", "/api/v2/tv/ad-proofs", _handle_tv_ad_proofs_list)
     r.add("GET", "/api/v2/tv/ad-proofs/{proofId}", _handle_tv_ad_proofs_one)
     r.add("POST", "/api/v2/tv/ad-proofs/process-outbox", _handle_tv_ad_proofs_process_outbox)
