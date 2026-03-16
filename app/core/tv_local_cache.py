@@ -2,7 +2,7 @@
 """TV local cache module with F23 ad-injection wrappers.
 
 This file bootstraps the previously compiled implementation from
-``__pycache__/tv_local_cache.cpython-313.pyc`` and then layers
+``__pycache__/tv_local_cache.cpython-<ver>.pyc`` (resolved at runtime) and then layers
 Functionality 23 runtime coordination logic on top.
 """
 
@@ -13,6 +13,7 @@ import json
 import marshal
 import os
 import pathlib
+import sys
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,13 +22,24 @@ from app.core.db import get_conn
 
 
 def _load_compiled_baseline() -> None:
-    pyc_path = pathlib.Path(__file__).resolve().parent / "__pycache__" / "tv_local_cache.cpython-313.pyc"
+    vi = sys.version_info
+    pyc_name = f"tv_local_cache.cpython-{vi.major}{vi.minor}.pyc"
+    pyc_path = pathlib.Path(__file__).resolve().parent / "__pycache__" / pyc_name
     if not pyc_path.exists():
         raise RuntimeError(f"Missing compiled baseline module: {pyc_path}")
     with pyc_path.open("rb") as fh:
         fh.read(16)
         code = marshal.load(fh)
-    exec(code, globals(), globals())
+    # The compiled bytecode itself may contain a module-level _load_compiled_baseline()
+    # call (it was compiled from a file that had one).  Neutralise it before exec so
+    # we don't recurse infinitely, then restore the real function afterward.
+    _real = globals().get("_load_compiled_baseline")
+    globals()["_load_compiled_baseline"] = lambda: None
+    try:
+        exec(code, globals(), globals())
+    finally:
+        if _real is not None:
+            globals()["_load_compiled_baseline"] = _real
 
 
 _load_compiled_baseline()
