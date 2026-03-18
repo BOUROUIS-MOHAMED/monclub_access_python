@@ -28,3 +28,5 @@ tauri-ui/src-tauri/target
 *.egg-info/
 dist/
 build/
+release/
+tmp/
