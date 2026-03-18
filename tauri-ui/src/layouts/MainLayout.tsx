@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Outlet, NavLink, useLocation } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
 import { useTrayIntegration } from "@/hooks/useTrayIntegration";
@@ -16,8 +16,6 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
-import { getTvHostBindings, postTvHostBindingRuntimeEvent, refreshTvHostMonitors } from "@/api/tv";
-import { closeBindingWindow, detectHostMonitors, openBindingWindow } from "@/lib/tv-host-orchestrator";
 import {
   LayoutDashboard,
   Router,
@@ -31,18 +29,12 @@ import {
   Menu,
   ChevronLeft,
   AlertTriangle,
-  Monitor,
+  MonitorPlay,
 } from "lucide-react";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/tv/overview", label: "TV Overview", icon: Monitor },
-  { to: "/tv/fleet-health", label: "TV Fleet Health", icon: Monitor },
-  { to: "/tv/proof", label: "TV Proof / Stats", icon: FileText },
-  { to: "/tv/runtime", label: "TV Runtime", icon: FileText },
-  { to: "/tv/cache", label: "TV Cache", icon: Database },
-  { to: "/tv/snapshots", label: "TV Snapshots", icon: FileText },
-  { to: "/tv/ad-tasks", label: "TV Ad Tasks", icon: FileText },
+  { to: "/tv-overview", label: "TV & Écrans", icon: MonitorPlay },
   { to: "/devices", label: "Appareils", icon: Router },
   { to: "/users", label: "Utilisateurs", icon: Users },
   { to: "/enroll", label: "Enrôlement", icon: Fingerprint },
@@ -50,7 +42,6 @@ const NAV = [
   { to: "/logs", label: "Logs", icon: FileText },
   { to: "/config", label: "Configuration", icon: Settings },
   { to: "/local-db", label: "Base locale", icon: Database },
-
 ] as const;
 
 export default function MainLayout() {
@@ -60,62 +51,6 @@ export default function MainLayout() {
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const runHostOrchestration = async () => {
-      try {
-        const monitors = await detectHostMonitors();
-        if (cancelled) return;
-        await refreshTvHostMonitors(monitors);
-        const res = await getTvHostBindings();
-        const rows = (res.rows || []) as Array<Record<string, any>>;
-
-        for (const row of rows) {
-          const id = Number(row.id || 0);
-          if (!(id > 0)) continue;
-          const enabled = !!row.enabled;
-          const autostart = !!row.autostart;
-          const desired = String(row.desired_state || "").toUpperCase();
-          const runtime = String(row.runtime_state || "").toUpperCase();
-
-          if (enabled && autostart && desired === "RUNNING" && runtime !== "RUNNING") {
-            const opened = await openBindingWindow(row as any, monitors.find((m) => m.monitorId === String(row.monitor_id || "")) || null);
-            if (opened.ok) {
-              await postTvHostBindingRuntimeEvent(id, { eventType: "WINDOW_LAUNCHED", windowId: opened.windowId });
-            } else {
-              await postTvHostBindingRuntimeEvent(id, {
-                eventType: "WINDOW_LAUNCH_FAILED",
-                errorCode: opened.error === "MONITOR_NOT_FOUND" ? "MONITOR_NOT_FOUND" : "WINDOW_LAUNCH_FAILED",
-                errorMessage: opened.error || "WINDOW_LAUNCH_FAILED",
-              });
-            }
-            continue;
-          }
-
-          if ((!enabled || desired === "STOPPED") && !!row.window_exists) {
-            const closed = await closeBindingWindow(row as any);
-            if (closed.ok) {
-              await postTvHostBindingRuntimeEvent(id, { eventType: "WINDOW_CLOSED", windowId: closed.windowId });
-            }
-          }
-        }
-      } catch {
-        // host orchestration is best-effort here
-      }
-    };
-
-    void runHostOrchestration();
-    const timerId = window.setInterval(() => {
-      void runHostOrchestration();
-    }, 15000);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(timerId);
-    };
-  }, []);
 
   const s = status?.session;
   const hasLoginWarning = s?.loginWarning && (s?.loginDaysRemaining ?? 99) > 0;

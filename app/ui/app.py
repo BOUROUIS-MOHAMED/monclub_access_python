@@ -689,10 +689,6 @@ class MainApp:
                                 "http://monclubwigo.tn/api/v1/manager/userFingerprint/create")
         access_create_membership_url = getattr(self.cfg, "api_access_create_membership_url", "http://monclubwigo.tn/api/v1/manager/gym/access/v1/activeMembership/create")
         access_create_account_membership_url = getattr(self.cfg, "api_access_create_account_membership_url", "http://monclubwigo.tn/api/v1/manager/gym/access/v1/account-and-activeMembership/create")
-        tv_snapshot_latest_url = getattr(self.cfg, "api_tv_snapshot_latest_url", "http://monclubwigo.tn/api/v1/manager/tv/screens/{screenId}/snapshots/latest")
-        tv_snapshot_manifest_url = getattr(self.cfg, "api_tv_snapshot_manifest_url", "http://monclubwigo.tn/api/v1/manager/tv/snapshots/{snapshotId}/asset-manifest")
-        tv_ad_tasks_fetch_url = getattr(self.cfg, "api_tv_ad_tasks_fetch_url", "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks")
-        tv_ad_task_confirm_ready_url = getattr(self.cfg, "api_tv_ad_task_confirm_ready_url", "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/confirm-ready")
         latest_release_url = (
             getattr(self.cfg, "api_latest_release_url", None)
             or getattr(self.cfg, "latest_release_url", None)
@@ -700,16 +696,17 @@ class MainApp:
             or getattr(self.cfg, "releases_url", None)
             or "http://monclubwigo.tn/api/v1/public/access/v1/latest_release"
         )
+        tv_ad_task_submit_proof_url = (
+            getattr(self.cfg, "api_tv_ad_task_submit_proof_url", None)
+            or "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/submit-proof"
+        )
         endpoints = ApiEndpoints(
             login_url=login_url, sync_url=sync_url,
             create_user_fingerprint_url=create_fp_url,
             latest_release_url=str(latest_release_url),
             access_create_membership_url=str(access_create_membership_url),
             access_create_account_membership_url=str(access_create_account_membership_url),
-            tv_snapshot_latest_url=str(tv_snapshot_latest_url),
-            tv_snapshot_manifest_url=str(tv_snapshot_manifest_url),
-            tv_ad_tasks_fetch_url=str(tv_ad_tasks_fetch_url),
-            tv_ad_task_confirm_ready_url=str(tv_ad_task_confirm_ready_url),
+            tv_ad_task_submit_proof_url=str(tv_ad_task_submit_proof_url),
         )
         return MonClubApi(endpoints=endpoints, logger=self.logger)
 
@@ -968,14 +965,6 @@ class MainApp:
             except Exception:
                 pass
 
-            try:
-                from app.core.tv_local_cache import run_tv_ad_task_cycle
-
-                ad_cycle = run_tv_ad_task_cycle(app=self)
-                if not bool(ad_cycle.get("ok")):
-                    self.logger.warning("[TV-ADS] cycle finished with non-ok result: %s", ad_cycle)
-            except Exception as ex:
-                self.logger.exception("[TV-ADS] cycle failed: %s", ex)
 
 
             self.after(0, self.evaluate_access_and_redirect)

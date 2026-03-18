@@ -15,15 +15,9 @@ import ConfigPage from "./pages/ConfigPage";
 import LocalDbPage from "./pages/LocalDbPage";
 import RestrictedPage from "./pages/RestrictedPage";
 import PopupWindow from "./pages/PopupWindow";
-import TvOverviewPage from "./pages/TvOverviewPage";
-import TvMediaCachePage from "./pages/TvMediaCachePage";
-import TvSnapshotSupportPage from "./pages/TvSnapshotSupportPage";
-import TvAdTasksPage from "./pages/TvAdTasksPage";
-import TvFleetHealthPage from "./pages/TvFleetHealthPage";
-import TvScreenDiagnosticsPage from "./pages/TvScreenDiagnosticsPage";
-import TvProofStatsPage from "./pages/TvProofStatsPage";
-import TvRuntimeDiagnosticsPage from "./pages/TvRuntimeDiagnosticsPage";
 import TvPlayerWindowPage from "./pages/TvPlayerWindowPage";
+import TvOverviewPage from "./pages/TvOverviewPage";
+import { TvOrchestrator } from "./components/TvOrchestrator";
 
 function AppRoutes() {
   const { status, loading, error } = useApp();
@@ -70,14 +64,7 @@ function AppRoutes() {
         <Route path="logs" element={<LogsPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="local-db" element={<LocalDbPage />} />
-        <Route path="tv/overview" element={<TvOverviewPage />} />
-        <Route path="tv/fleet-health" element={<TvFleetHealthPage />} />
-        <Route path="tv/screens/:screenId/diagnostics" element={<TvScreenDiagnosticsPage />} />
-        <Route path="tv/proof" element={<TvProofStatsPage />} />
-        <Route path="tv/runtime" element={<TvRuntimeDiagnosticsPage />} />
-        <Route path="tv/cache" element={<TvMediaCachePage />} />
-        <Route path="tv/snapshots" element={<TvSnapshotSupportPage />} />
-        <Route path="tv/ad-tasks" element={<TvAdTasksPage />} />
+        <Route path="tv-overview" element={<TvOverviewPage />} />
 
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
@@ -92,9 +79,9 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
-            <Route path="/tv/player" element={<TvPlayerWindowPage />} />
+            <Route path="/tv-player" element={<TvPlayerWindowPage />} />
 
-            <Route path="*" element={<AppProvider><AppRoutes /></AppProvider>} />
+            <Route path="*" element={<AppProvider><TvOrchestrator /><AppRoutes /></AppProvider>} />
           </Routes>
         </BrowserRouter>
       </TooltipProvider>

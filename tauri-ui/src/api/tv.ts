@@ -1,670 +1,360 @@
-import { del, get, patch, post } from "@/api/client";
+// TV Player API — A6: binding-scoped player runtime
+import { ApiError, get, post } from "./client";
 import type {
-  TvActivationAttemptRow,
-  TvActivationStatusPayload,
-  TvCacheAssetsResponse,
-  TvDownloadBatchSummary,
-  TvDownloadJobRow,
-  TvAdTaskListResponse,
-  TvReadinessRow,
-  TvScreenBinding,
-  TvSnapshotCacheRow,
-  TvSyncStatusResponse,
-  TvHostBindingEventsResponse,
-  TvHostBindingResponse,
-  TvHostBindingsResponse,
-  TvHostMonitorsResponse,
-  TvPlayerActionResponse,
-  TvPlayerEventsResponse,
-  TvPlayerRenderContextResponse,
-  TvPlayerStateReportResponse,
+  TvPlayerRenderContext,
   TvPlayerStatusResponse,
-  TvBindingSupportSummaryResponse,
-  TvSupportActionRunResponse,
-  TvSupportActionHistoryResponse,
-  TvObservabilityOverviewResponse,
-  TvObservabilityFleetHealthResponse,
-  TvObservabilityScreenDetailsResponse,
-  TvObservabilityTimelineResponse,
-  TvObservabilityHeartbeatsResponse,
-  TvObservabilityRuntimeEventsResponse,
-  TvObservabilityProofEventsResponse,
-  TvObservabilityProofStatsResponse,
-  TvObservabilityRuntimeStatsResponse,
-  TvHardeningStartupLatestResponse,
-  TvHardeningStartupRunsResponse,
-  TvHardeningQueryChecksResponse,
-  TvHardeningRetentionPolicyResponse,
-  TvHardeningRetentionRunResponse,
-  TvHardeningCorrelationAuditResponse,
-  TvHardeningPreflightResponse,
-  TvAdTaskInjectNowResponse,
-  TvGymAdRuntimeResponse,
-  TvAdTaskRuntimeOneResponse,
-  TvAdTaskRuntimeListResponse,
-} from "@/api/types";
+  TvPlayerEventsResponse,
+} from "./types";
 
-export interface TvBindingResponse {
-  ok: boolean;
-  binding: TvScreenBinding;
+// GET /api/v2/tv/player/{bindingId}/status
+export function getTvPlayerStatus(bindingId: number): Promise<TvPlayerStatusResponse> {
+  return get<TvPlayerStatusResponse>(`/tv/player/${bindingId}/status`);
 }
 
-export interface TvSyncRunResponse {
-  ok: boolean;
-  screenId: number;
-  syncStatus: string;
-  snapshotId?: string;
-  snapshotVersion?: number;
-  warnings?: string[];
-  error?: string;
-  readiness?: Record<string, any>;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  previousReadySnapshot?: TvSnapshotCacheRow | null;
-  activation?: TvActivationStatusPayload | null;
+// GET /api/v2/tv/player/{bindingId}/render-context
+export function getTvPlayerRenderContext(
+  bindingId: number,
+  persist = false,
+): Promise<TvPlayerRenderContext> {
+  return get<TvPlayerRenderContext>(`/tv/player/${bindingId}/render-context`, {
+    persist: persist ? "1" : "0",
+  });
 }
 
-export interface TvSnapshotLatestResponse {
-  ok: boolean;
-  screenId: number;
-  latest: TvSnapshotCacheRow | null;
-  latestReady?: TvSnapshotCacheRow | null;
-  previousReady: TvSnapshotCacheRow | null;
+// POST /api/v2/tv/player/{bindingId}/reevaluate
+export function reevaluateTvPlayer(
+  bindingId: number,
+  persist = true,
+): Promise<{ ok: boolean; context: TvPlayerRenderContext }> {
+  return post(`/tv/player/${bindingId}/reevaluate`, { persist });
 }
 
-export interface TvSnapshotByIdResponse {
-  ok: boolean;
-  snapshot: TvSnapshotCacheRow;
+// POST /api/v2/tv/player/{bindingId}/reload
+export function reloadTvPlayer(
+  bindingId: number,
+  persist = true,
+): Promise<{ ok: boolean; context: TvPlayerRenderContext }> {
+  return post(`/tv/player/${bindingId}/reload`, { persist });
 }
 
-export interface TvSnapshotManifestResponse {
-  ok: boolean;
-  snapshotId: string;
-  manifest: Record<string, any>;
+// POST /api/v2/tv/player/{bindingId}/state
+export function reportTvPlayerState(
+  bindingId: number,
+  state: Record<string, unknown>,
+  options?: { eventType?: string; force?: boolean; freshnessSeconds?: number },
+): Promise<{ ok: boolean; updated: boolean; changed: boolean }> {
+  return post(`/tv/player/${bindingId}/state`, {
+    state,
+    eventType: options?.eventType ?? "PLAYER_STATE_CHANGED",
+    force: options?.force ?? false,
+    freshnessSeconds: options?.freshnessSeconds ?? 20,
+  });
 }
 
-export interface TvLatestReadinessResponse {
-  ok: boolean;
-  screenId: number;
-  readiness: TvReadinessRow | null;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  previousReadySnapshot?: TvSnapshotCacheRow | null;
+// GET /api/v2/tv/player/{bindingId}/events
+export function getTvPlayerEvents(
+  bindingId: number,
+  limit = 100,
+  offset = 0,
+): Promise<TvPlayerEventsResponse> {
+  return get<TvPlayerEventsResponse>(`/tv/player/${bindingId}/events`, {
+    limit: String(limit),
+    offset: String(offset),
+  });
 }
 
-export interface TvDownloadRunResponse {
-  ok: boolean;
-  error?: string;
-  batchId?: string;
-  screenId?: number;
-  snapshotId?: string;
-  snapshotVersion?: number;
-  counts?: Record<string, number>;
-  totalJobs?: number;
-  queued?: number;
-  skipped?: number;
-  concurrency?: number;
-  background?: boolean;
-  status?: string;
-  latestReadiness?: TvReadinessRow | null;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  previousReadySnapshot?: TvSnapshotCacheRow | null;
-  activation?: TvActivationStatusPayload | null;
-}
+// ─── Ad Runtime (A7) ─────────────────────────────────────────────────────────
 
-export interface TvLatestDownloadBatchResponse {
-  ok: boolean;
-  screenId: number | null;
-  batch: TvDownloadBatchSummary | null;
-}
-
-export interface TvDownloadJobsResponse {
-  ok: boolean;
-  screenId: number;
-  rows: TvDownloadJobRow[];
-  total: number;
-  latestBatch?: TvDownloadBatchSummary | null;
-  latestReadiness?: TvReadinessRow | null;
-}
-
-export interface TvActivationStatusResponse {
-  ok: boolean;
-  screenId: number;
-  activation: TvActivationStatusPayload;
-}
-
-export interface TvActivationRunResponse {
-  ok: boolean;
-  screenId: number;
-  result: string;
-  failureReason?: string;
-  failureMessage?: string;
-  error?: string;
-  activation?: TvActivationStatusPayload;
-}
-
-export interface TvActivationHistoryResponse {
-  ok: boolean;
-  screenId: number;
-  rows: TvActivationAttemptRow[];
-  total: number;
-}
-
-export function getTvBinding() {
-  return get<TvBindingResponse>("/tv/binding");
-}
-
-export function patchTvBinding(payload: { screenId: number; screenName?: string }) {
-  return patch<TvBindingResponse>("/tv/binding", payload);
-}
-
-export function runTvSync(payload?: { screenId?: number; resolveAt?: string }) {
-  return post<TvSyncRunResponse>("/tv/sync/run", payload || {});
-}
-
-export function getTvSyncStatus(screenId?: number) {
-  return get<TvSyncStatusResponse>("/tv/sync/status", screenId ? { screenId: String(screenId) } : undefined);
-}
-
-export function getTvLatestSnapshot(screenId?: number) {
-  return get<TvSnapshotLatestResponse>("/tv/snapshots/latest", screenId ? { screenId: String(screenId) } : undefined);
-}
-
-export function getTvSnapshotById(snapshotId: string) {
-  return get<TvSnapshotByIdResponse>(`/tv/snapshots/${encodeURIComponent(snapshotId)}`);
-}
-
-export function getTvSnapshotManifest(snapshotId: string) {
-  return get<TvSnapshotManifestResponse>(`/tv/snapshots/${encodeURIComponent(snapshotId)}/manifest`);
-}
-
-export function getTvLatestReadiness(screenId?: number) {
-  return get<TvLatestReadinessResponse>("/tv/readiness/latest", screenId ? { screenId: String(screenId) } : undefined);
-}
-
-export function getTvCacheAssets(params?: {
-  screenId?: number;
-  snapshotVersion?: number;
-  states?: string;
-  limit?: number;
-  offset?: number;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.snapshotVersion != null) q.snapshotVersion = String(params.snapshotVersion);
-  if (params?.states) q.states = params.states;
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvCacheAssetsResponse>("/tv/cache/assets", q);
-}
-
-export function runTvDownloads(payload?: {
-  screenId?: number;
-  snapshotVersion?: number;
-  runInBackground?: boolean;
-  retryFailedOnly?: boolean;
-  force?: boolean;
-  mediaAssetId?: string;
-  maxAttempts?: number;
-  maxConcurrency?: number;
-}) {
-  return post<TvDownloadRunResponse>("/tv/downloads/run", payload || {});
-}
-
-export function getTvLatestDownloadBatch(screenId?: number) {
-  return get<TvLatestDownloadBatchResponse>(
-    "/tv/downloads/batches/latest",
-    screenId ? { screenId: String(screenId) } : undefined
-  );
-}
-
-export function getTvDownloadJobs(params?: {
-  screenId?: number;
-  snapshotVersion?: number;
-  batchId?: string;
-  states?: string;
-  limit?: number;
-  offset?: number;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.snapshotVersion != null) q.snapshotVersion = String(params.snapshotVersion);
-  if (params?.batchId) q.batchId = params.batchId;
-  if (params?.states) q.states = params.states;
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvDownloadJobsResponse>("/tv/downloads/jobs", q);
-}
-
-export function retryTvDownloadJob(jobId: number, payload?: { runInBackground?: boolean }) {
-  return post<TvDownloadRunResponse>(`/tv/downloads/jobs/${encodeURIComponent(String(jobId))}/retry`, payload || {});
-}
-export interface TvAdTaskFetchResponse {
-  ok: boolean;
-  fetched?: number;
-  rows?: Array<Record<string, any>>;
-  gymIds?: number[];
-  updatedAfter?: string | null;
-  serverTimeUtc?: string;
-  stats?: Record<string, number>;
-  error?: string;
-}
-
-export interface TvAdTaskPrepareResponse {
-  ok: boolean;
-  prepare?: Record<string, any>;
-  confirm?: Record<string, any>;
-  error?: string;
-}
-
-export interface TvAdTaskCycleResponse {
-  ok: boolean;
-  fetch?: Record<string, any>;
-  prepare?: Record<string, any>;
-  confirm?: Record<string, any>;
-  error?: string;
-}
-
+// GET /api/v2/tv/ad-runtime/tasks
 export function getTvAdTasks(params?: {
   gymId?: number;
-  remoteStatuses?: string;
-  localStates?: string;
-  q?: string;
   limit?: number;
   offset?: number;
-}) {
+}): Promise<{ ok: boolean; rows: import("./types").TvAdTaskCache[]; total: number }> {
   const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.remoteStatuses) q.remoteStatuses = params.remoteStatuses;
-  if (params?.localStates) q.localStates = params.localStates;
-  if (params?.q) q.q = params.q;
+  if (params?.gymId) q.gymId = String(params.gymId);
   if (params?.limit != null) q.limit = String(params.limit);
   if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvAdTaskListResponse>("/tv/ad-tasks", q);
+  return get(`/tv/ad-runtime/tasks`, q);
 }
 
-export function fetchTvAdTasks(payload?: { force?: boolean; limit?: number; correlationId?: string }) {
-  return post<TvAdTaskFetchResponse>("/tv/ad-tasks/fetch", payload || {});
+// GET /api/v2/tv/ad-runtime/tasks/{taskId}
+export function getTvAdTaskRuntime(
+  taskId: string,
+): Promise<{ ok: boolean; runtime: import("./types").TvAdTaskRuntime | null }> {
+  return get(`/tv/ad-runtime/tasks/${taskId}`);
 }
 
-export function prepareTvAdTasks(payload?: {
-  campaignTaskId?: number;
-  force?: boolean;
-  limit?: number;
-  processConfirm?: boolean;
-  correlationId?: string;
-}) {
-  return post<TvAdTaskPrepareResponse>("/tv/ad-tasks/prepare", payload || {});
+// GET /api/v2/tv/ad-runtime/gyms/{gymId}
+export function getTvGymAdRuntime(
+  gymId: number,
+): Promise<{ ok: boolean; runtime: import("./types").TvGymAdRuntime | null }> {
+  return get(`/tv/ad-runtime/gyms/${gymId}`);
 }
 
-export function runTvAdTasksCycle(payload?: {
-  forceFetch?: boolean;
-  forcePrepare?: boolean;
-  forceConfirm?: boolean;
-  correlationId?: string;
-}) {
-  return post<TvAdTaskCycleResponse>("/tv/ad-tasks/cycle", payload || {});
+// POST /api/v2/tv/ad-runtime/evaluate
+export function evaluateTvAdRuntime(): Promise<import("./types").TvAdEvaluateResponse> {
+  return post(`/tv/ad-runtime/evaluate`, {});
 }
 
-export function retryTvAdTaskPrepare(taskId: number, payload?: { correlationId?: string }) {
-  return post<TvAdTaskPrepareResponse>(`/tv/ad-tasks/${encodeURIComponent(String(taskId))}/retry-prepare`, payload || {});
+// POST /api/v2/tv/ad-runtime/tasks/{taskId}/inject-now
+export function injectTvAdNow(
+  taskId: string,
+  support = true,
+): Promise<{ ok: boolean; error?: string }> {
+  return post(`/tv/ad-runtime/tasks/${taskId}/inject-now`, { support, confirm: true });
 }
 
-export function retryTvAdTaskConfirm(taskId: number, payload?: { correlationId?: string }) {
-  return post<TvAdTaskPrepareResponse>(`/tv/ad-tasks/${encodeURIComponent(String(taskId))}/retry-confirm`, payload || {});
+// POST /api/v2/tv/ad-runtime/tasks/{taskId}/abort
+export function abortTvAd(
+  taskId: string,
+  reason = "MANUAL_ABORT",
+  support = true,
+): Promise<{ ok: boolean; error?: string }> {
+  return post(`/tv/ad-runtime/tasks/${taskId}/abort`, { support, confirm: true, reason });
 }
 
+// ─── Host Orchestration (A9) ──────────────────────────────────────────────────
 
-export function getTvAdTaskRuntime(params?: { gymId?: number; campaignTaskId?: number; limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.campaignTaskId != null) q.campaignTaskId = String(params.campaignTaskId);
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvAdTaskRuntimeListResponse>("/tv/ad-tasks/runtime", q);
+export function getTvHostMonitors(): Promise<{ ok: boolean; rows: import("./types").TvHostMonitor[] }> {
+  return get(`/tv/host/monitors`);
 }
 
-export function getTvAdTaskRuntimeById(taskId: number) {
-  return get<TvAdTaskRuntimeOneResponse>(`/tv/ad-tasks/${encodeURIComponent(String(taskId))}/runtime`);
+export function refreshTvHostMonitors(
+  monitors: import("./types").TvHostMonitorsRefreshRequest["monitors"]
+): Promise<{ ok: boolean; replaced: number }> {
+  return post(`/tv/host/monitors/refresh`, { monitors });
 }
 
-export function getTvGymAdRuntime(gymId: number) {
-  return get<TvGymAdRuntimeResponse>(`/tv/gym-ad-runtime/${encodeURIComponent(String(gymId))}`);
+export function getTvHostBindings(): Promise<{ ok: boolean; rows: import("./types").TvScreenBinding[] }> {
+  return get(`/tv/host/bindings`);
 }
 
-export function injectTvAdTaskNow(taskId: number, payload?: { support?: boolean; confirm?: boolean; correlationId?: string }) {
-  return post<TvAdTaskInjectNowResponse>(`/tv/ad-tasks/${encodeURIComponent(String(taskId))}/inject-now`, payload || {});
+export function createTvHostBinding(
+  body: Partial<import("./types").TvScreenBinding>
+): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return post(`/tv/host/bindings`, body);
 }
 
-export function getTvActivationStatus(screenId?: number) {
-  return get<TvActivationStatusResponse>("/tv/activation/status", screenId ? { screenId: String(screenId) } : undefined);
+export function updateTvHostBinding(
+  bindingId: number,
+  body: Partial<import("./types").TvScreenBinding>
+): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return import("./client").then((c) => c.patch(`/tv/host/bindings/${bindingId}`, body));
 }
 
-export function evaluateTvActivation(payload?: { screenId?: number; autoActivate?: boolean; recheckReadiness?: boolean }) {
-  return post<TvActivationRunResponse>("/tv/activation/evaluate", payload || {});
+export function deleteTvHostBinding(bindingId: number): Promise<{ ok: boolean }> {
+  return import("./client").then((c) => c.del(`/tv/host/bindings/${bindingId}`));
 }
 
-export function activateTvLatestReady(payload?: { screenId?: number }) {
-  return post<TvActivationRunResponse>("/tv/activation/activate-latest-ready", payload || {});
+export function startTvHostBinding(bindingId: number): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return post(`/tv/host/bindings/${bindingId}/start`);
 }
 
-export function getTvActivationHistory(params?: { screenId?: number; limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvActivationHistoryResponse>("/tv/activation/history", q);
+export function stopTvHostBinding(bindingId: number): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return post(`/tv/host/bindings/${bindingId}/stop`);
 }
 
-
-export function getTvHostMonitors() {
-  return get<TvHostMonitorsResponse>("/tv/host/monitors");
+export function restartTvHostBinding(bindingId: number): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return post(`/tv/host/bindings/${bindingId}/restart`);
 }
 
-export function refreshTvHostMonitors(monitors: Array<Record<string, any>>) {
-  return post<TvHostMonitorsResponse>("/tv/host/monitors/refresh", { monitors });
+export function getTvBindingStatus(bindingId: number): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return get(`/tv/host/bindings/${bindingId}/status`);
 }
 
-export function getTvHostBindings() {
-  return get<TvHostBindingsResponse>("/tv/host/bindings");
+export function getTvBindingEvents(
+  bindingId: number,
+  limit = 100,
+  offset = 0
+): Promise<{ ok: boolean; rows: import("./types").TvPlayerEvent[]; total: number }> {
+  return get(`/tv/host/bindings/${bindingId}/events`, {
+    limit: String(limit),
+    offset: String(offset),
+  });
 }
 
-export function createTvHostBinding(payload: {
-  screenId: number;
-  screenName?: string;
-  monitorId?: string;
-  monitorLabel?: string;
-  monitorIndex?: number;
-  enabled?: boolean;
-  autostart?: boolean;
-  fullscreen?: boolean;
-}) {
-  return post<TvHostBindingResponse>("/tv/host/bindings", payload);
+export function getTvBindingSupportSummary(
+  bindingId: number,
+): Promise<import("./types").TvBindingSupportSummaryResponse> {
+  return get(`/tv/host/bindings/${bindingId}/support-summary`);
 }
 
-export function updateTvHostBinding(bindingId: number, payload: {
-  screenName?: string;
-  monitorId?: string;
-  monitorLabel?: string;
-  monitorIndex?: number;
-  enabled?: boolean;
-  autostart?: boolean;
-  fullscreen?: boolean;
-}) {
-  return patch<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}`, payload);
+export function runTvBindingSupportAction(
+  bindingId: number,
+  body: {
+    actionType: import("./types").TvBindingSupportActionType;
+    options?: Record<string, unknown>;
+    confirm?: boolean;
+    triggeredBy?: string;
+  },
+): Promise<{
+  ok: boolean;
+  correlationId: string;
+  result: import("./types").TvBindingSupportActionResult;
+  message?: string;
+  errorCode?: string | null;
+  metadata?: Record<string, unknown>;
+}> {
+  return post(`/tv/host/bindings/${bindingId}/support-actions/run`, body);
 }
 
-export function deleteTvHostBinding(bindingId: number) {
-  return del<{ ok: boolean }>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}`);
+export function getTvBindingSupportHistory(
+  bindingId: number,
+  limit = 100,
+  offset = 0,
+): Promise<{ ok: boolean; rows: import("./types").TvSupportActionLogRow[]; total: number }> {
+  return get(`/tv/host/bindings/${bindingId}/support-actions/history`, {
+    limit: String(limit),
+    offset: String(offset),
+  });
 }
 
-export function getTvHostBindingStatus(bindingId: number) {
-  return get<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/status`);
+export function postTvBindingRuntimeEvent(
+  bindingId: number,
+  body: {
+    eventType: string;
+    windowId?: string;
+    errorCode?: string;
+    errorMessage?: string;
+    correlationId?: string;
+  },
+): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
+  return post(`/tv/host/bindings/${bindingId}/runtime-event`, body);
 }
 
-export function getTvHostBindingEvents(bindingId: number, params?: { limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvHostBindingEventsResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/events`, q);
+export function getTvObservabilityOverview(
+  gymId?: number,
+): Promise<import("./types").TvObservabilityOverviewResponse> {
+  return get(`/tv/observability/overview`, gymId ? { gymId: String(gymId) } : undefined);
 }
 
-export function postTvHostBindingRuntimeEvent(bindingId: number, payload: {
-  eventType: string;
-  windowId?: string;
-  errorCode?: string;
-  errorMessage?: string;
-  correlationId?: string;
-}) {
-  return post<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/runtime-event`, payload);
-}
-
-export function getTvHostBindingSupportSummary(bindingId: number) {
-  return get<TvBindingSupportSummaryResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/support-summary`);
-}
-
-export function runTvHostBindingSupportAction(bindingId: number, payload: {
-  actionType: string;
-  options?: Record<string, any>;
-  confirm?: boolean;
-  triggeredBy?: string;
-}) {
-  return post<TvSupportActionRunResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/support-actions/run`, payload);
-}
-
-export function getTvHostBindingSupportActionHistory(bindingId: number, params?: { limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvSupportActionHistoryResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/support-actions/history`, q);
-}
-
-export function startTvHostBinding(bindingId: number) {
-  return post<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/start`, {});
-}
-
-export function stopTvHostBinding(bindingId: number) {
-  return post<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/stop`, {});
-}
-
-export function restartTvHostBinding(bindingId: number) {
-  return post<TvHostBindingResponse>(`/tv/host/bindings/${encodeURIComponent(String(bindingId))}/restart`, {});
-}
-
-
-export function getTvPlayerStatus(bindingId: number) {
-  return get<TvPlayerStatusResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/status`);
-}
-
-export function getTvPlayerRenderContext(bindingId: number, params?: { persist?: boolean }) {
-  const q: Record<string, string> = {};
-  if (params?.persist != null) q.persist = params.persist ? "1" : "0";
-  return get<TvPlayerRenderContextResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/render-context`, q);
-}
-
-export function reevaluateTvPlayer(bindingId: number, payload?: { persist?: boolean }) {
-  return post<TvPlayerActionResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/reevaluate`, payload || {});
-}
-
-export function reloadTvPlayer(bindingId: number, payload?: { persist?: boolean }) {
-  return post<TvPlayerActionResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/reload`, payload || {});
-}
-
-export function reportTvPlayerState(bindingId: number, payload: {
-  state?: Record<string, any>;
-  eventType?: string;
-  force?: boolean;
-  freshnessSeconds?: number;
-}) {
-  return post<TvPlayerStateReportResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/state`, payload);
-}
-
-export function getTvPlayerEvents(bindingId: number, params?: { limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvPlayerEventsResponse>(`/tv/player/${encodeURIComponent(String(bindingId))}/events`, q);
-}
-
-
-
-export function getTvObservabilityOverview(params?: { gymId?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  return get<TvObservabilityOverviewResponse>("/tv/observability/overview", q);
-}
-
-export function getTvObservabilityFleetHealth(params?: {
+export function getTvObservabilityBindings(params?: {
   gymId?: number;
   health?: string;
   runtimeState?: string;
   q?: string;
+  problemOnly?: boolean;
   limit?: number;
   offset?: number;
-}) {
-  const qv: Record<string, string> = {};
-  if (params?.gymId != null) qv.gymId = String(params.gymId);
-  if (params?.health) qv.health = params.health;
-  if (params?.runtimeState) qv.runtimeState = params.runtimeState;
-  if (params?.q) qv.q = params.q;
-  if (params?.limit != null) qv.limit = String(params.limit);
-  if (params?.offset != null) qv.offset = String(params.offset);
-  return get<TvObservabilityFleetHealthResponse>("/tv/observability/fleet-health", qv);
+}): Promise<{ ok: boolean; rows: import("./types").TvObservabilityBindingSummary[]; total: number; limit: number; offset: number }> {
+  const query: Record<string, string> = {};
+  if (params?.gymId) query.gymId = String(params.gymId);
+  if (params?.health) query.health = params.health;
+  if (params?.runtimeState) query.runtimeState = params.runtimeState;
+  if (params?.q) query.q = params.q;
+  if (params?.problemOnly != null) query.problemOnly = params.problemOnly ? "1" : "0";
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/observability/bindings`, query);
 }
 
-export function getTvObservabilityScreenDetails(screenId: number) {
-  return get<TvObservabilityScreenDetailsResponse>(`/tv/observability/screens/${encodeURIComponent(String(screenId))}`);
+export function getTvObservabilityBinding(
+  bindingId: number,
+  params?: { eventLimit?: number; historyLimit?: number },
+): Promise<import("./types").TvObservabilityBindingDetail> {
+  const query: Record<string, string> = {};
+  if (params?.eventLimit != null) query.eventLimit = String(params.eventLimit);
+  if (params?.historyLimit != null) query.historyLimit = String(params.historyLimit);
+  return get(`/tv/observability/bindings/${bindingId}`, query);
 }
 
-export function getTvObservabilityScreenTimeline(screenId: number, params?: { limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvObservabilityTimelineResponse>(`/tv/observability/screens/${encodeURIComponent(String(screenId))}/timeline`, q);
+export function getTvObservabilityGyms(
+  params?: { limit?: number; offset?: number },
+): Promise<{ ok: boolean; rows: import("./types").TvObservabilityGymDetail[]; total: number; limit: number; offset: number }> {
+  const query: Record<string, string> = {};
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/observability/gyms`, query);
 }
 
-export function getTvObservabilityHeartbeats(params?: {
+export function getTvObservabilityGym(
+  gymId: number,
+): Promise<import("./types").TvObservabilityGymDetail> {
+  return get(`/tv/observability/gyms/${gymId}`);
+}
+
+export function getTvObservabilityProofs(params?: {
   gymId?: number;
-  screenId?: number;
   bindingId?: number;
-  fromUtc?: string;
-  toUtc?: string;
+  outboxStates?: string[];
+  resultStatus?: string;
+  countable?: boolean;
   limit?: number;
   offset?: number;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.bindingId != null) q.bindingId = String(params.bindingId);
-  if (params?.fromUtc) q.fromUtc = params.fromUtc;
-  if (params?.toUtc) q.toUtc = params.toUtc;
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvObservabilityHeartbeatsResponse>("/tv/observability/heartbeats", q);
+}): Promise<import("./types").TvObservabilityProofsResponse> {
+  const query: Record<string, string> = {};
+  if (params?.gymId) query.gymId = String(params.gymId);
+  if (params?.bindingId) query.bindingId = String(params.bindingId);
+  if (params?.outboxStates?.length) query.outboxStates = params.outboxStates.join(",");
+  if (params?.resultStatus) query.resultStatus = params.resultStatus;
+  if (params?.countable != null) query.countable = params.countable ? "1" : "0";
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/observability/proofs`, query);
 }
 
-export function getTvObservabilityRuntimeEvents(params?: {
-  gymId?: number;
-  screenId?: number;
+export function getTvObservabilityRetention(): Promise<import("./types").TvObservabilityRetentionResponse> {
+  return get(`/tv/observability/retention`);
+}
+
+export function runTvObservabilityRetention(body?: {
+  dryRun?: boolean;
+  includeQueryChecks?: boolean;
+}): Promise<import("./types").TvObservabilityRetentionRunResponse> {
+  return post(`/tv/observability/retention/run`, body ?? {});
+}
+
+export function getTvObservabilityEvents(params?: {
   bindingId?: number;
-  severities?: string;
-  eventTypes?: string;
-  fromUtc?: string;
-  toUtc?: string;
+  gymId?: number;
+  sources?: string[];
   limit?: number;
   offset?: number;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.bindingId != null) q.bindingId = String(params.bindingId);
-  if (params?.severities) q.severities = params.severities;
-  if (params?.eventTypes) q.eventTypes = params.eventTypes;
-  if (params?.fromUtc) q.fromUtc = params.fromUtc;
-  if (params?.toUtc) q.toUtc = params.toUtc;
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvObservabilityRuntimeEventsResponse>("/tv/observability/runtime-events", q);
+}): Promise<{ ok: boolean; rows: import("./types").TvObservabilityEventRow[]; total: number; limit: number; offset: number }> {
+  const query: Record<string, string> = {};
+  if (params?.bindingId) query.bindingId = String(params.bindingId);
+  if (params?.gymId) query.gymId = String(params.gymId);
+  if (params?.sources?.length) query.sources = params.sources.join(",");
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/observability/events`, query);
 }
 
-export function getTvObservabilityProofEvents(params?: {
-  gymId?: number;
-  screenId?: number;
-  bindingId?: number;
-  snapshotVersion?: number;
-  timelineTypes?: string;
-  statuses?: string;
-  fromUtc?: string;
-  toUtc?: string;
-  limit?: number;
-  offset?: number;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.bindingId != null) q.bindingId = String(params.bindingId);
-  if (params?.snapshotVersion != null) q.snapshotVersion = String(params.snapshotVersion);
-  if (params?.timelineTypes) q.timelineTypes = params.timelineTypes;
-  if (params?.statuses) q.statuses = params.statuses;
-  if (params?.fromUtc) q.fromUtc = params.fromUtc;
-  if (params?.toUtc) q.toUtc = params.toUtc;
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvObservabilityProofEventsResponse>("/tv/observability/proof-events", q);
+export async function getTvStartupLatest(): Promise<import("./types").TvStartupLatestResponse | null> {
+  try {
+    return await get(`/tv/startup/latest`);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
 }
 
-export function getTvObservabilityProofStats(params?: {
-  gymId?: number;
-  screenId?: number;
-  fromUtc?: string;
-  toUtc?: string;
-  bucket?: "HOUR" | "DAY";
-}) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.fromUtc) q.fromUtc = params.fromUtc;
-  if (params?.toUtc) q.toUtc = params.toUtc;
-  if (params?.bucket) q.bucket = params.bucket;
-  return get<TvObservabilityProofStatsResponse>("/tv/observability/stats/proof", q);
+export function getTvStartupRuns(
+  limit = 20,
+  offset = 0,
+): Promise<import("./types").TvStartupRunsResponse> {
+  return get(`/tv/startup/runs`, {
+    limit: String(limit),
+    offset: String(offset),
+  });
 }
 
-export function getTvObservabilityRuntimeStats(params?: {
-  gymId?: number;
-  screenId?: number;
-  fromUtc?: string;
-  toUtc?: string;
-}) {
-  const q: Record<string, string> = {};
-  if (params?.gymId != null) q.gymId = String(params.gymId);
-  if (params?.screenId != null) q.screenId = String(params.screenId);
-  if (params?.fromUtc) q.fromUtc = params.fromUtc;
-  if (params?.toUtc) q.toUtc = params.toUtc;
-  return get<TvObservabilityRuntimeStatsResponse>("/tv/observability/stats/runtime", q);
-}
-
-export function getTvHardeningPreflight(params?: { includeQueryChecks?: boolean }) {
-  const q: Record<string, string> = {};
-  if (params?.includeQueryChecks) q.includeQueryChecks = "1";
-  return get<TvHardeningPreflightResponse>("/tv/hardening/preflight", q);
-}
-export function getTvHardeningStartupLatest() {
-  return get<TvHardeningStartupLatestResponse>("/tv/hardening/startup/latest");
-}
-
-export function getTvHardeningStartupRuns(params?: { limit?: number; offset?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  if (params?.offset != null) q.offset = String(params.offset);
-  return get<TvHardeningStartupRunsResponse>("/tv/hardening/startup/runs", q);
-}
-
-export function runTvHardeningStartupReconciliation(payload?: {
+export function runTvStartupReconciliation(body?: {
   triggerSource?: string;
   correlationId?: string;
-  monitors?: Array<Record<string, any>>;
-}) {
-  return post<TvHardeningStartupLatestResponse>("/tv/hardening/startup/run", payload || {});
+  includeQueryChecks?: boolean;
+  monitors?: import("./types").TvHostMonitorsRefreshRequest["monitors"];
+}): Promise<import("./types").TvStartupRunResponse> {
+  return post(`/tv/startup/run`, body ?? {});
 }
 
-export function getTvHardeningRetentionPolicy() {
-  return get<TvHardeningRetentionPolicyResponse>("/tv/hardening/retention-policy");
+export function getTvStartupPreflight(
+  includeQueryChecks = false,
+): Promise<import("./types").TvStartupPreflightResponse> {
+  return get(`/tv/startup/preflight`, {
+    includeQueryChecks: includeQueryChecks ? "1" : "0",
+  });
 }
-
-export function runTvHardeningRetention(payload?: { dryRun?: boolean; includeQueryChecks?: boolean }) {
-  return post<TvHardeningRetentionRunResponse>("/tv/hardening/retention/run", payload || {});
-}
-
-export function getTvHardeningQueryChecks(params?: { limit?: number }) {
-  const q: Record<string, string> = {};
-  if (params?.limit != null) q.limit = String(params.limit);
-  return get<TvHardeningQueryChecksResponse>("/tv/hardening/query-checks", q);
-}
-
-export function getTvHardeningCorrelationAudit(correlationId: string) {
-  return get<TvHardeningCorrelationAuditResponse>("/tv/hardening/correlation-audit", { correlationId });
-}
-
-
-
-
-
-

@@ -93,8 +93,6 @@ export interface AppConfig {
   api_sync_url: string;
   api_create_user_fingerprint_url: string;
   api_latest_release_url: string;
-  api_tv_snapshot_latest_url: string;
-  api_tv_snapshot_manifest_url: string;
   update_enabled: boolean;
   update_check_interval_sec: number;
   update_auto_download_zip: boolean;
@@ -309,6 +307,201 @@ export interface AccessHistoryRecord {
   createdAt: string;
 }
 
+// ─── L) TV Player (A6) ───
+
+export type TvPlayerState =
+  | "IDLE"
+  | "LOADING_BINDING"
+  | "LOADING_ACTIVE_SNAPSHOT"
+  | "RENDERING"
+  | "FALLBACK_RENDERING"
+  | "BLOCKED_NO_BINDING"
+  | "BLOCKED_BINDING_DISABLED"
+  | "BLOCKED_NO_ACTIVE_SNAPSHOT"
+  | "BLOCKED_NO_RENDERABLE_ITEM"
+  | "ERROR";
+
+export type TvRenderMode =
+  | "VISUAL_ONLY"
+  | "AUDIO_ONLY"
+  | "VISUAL_AND_AUDIO"
+  | "IDLE_FALLBACK"
+  | "ERROR_FALLBACK";
+
+export type TvFallbackReason =
+  | "NO_ACTIVE_SNAPSHOT"
+  | "NO_CURRENT_ITEM"
+  | "VISUAL_ASSET_INVALID"
+  | "AUDIO_ASSET_INVALID"
+  | "BOTH_ASSETS_INVALID"
+  | "SNAPSHOT_INVALID"
+  | "BINDING_DISABLED"
+  | "BINDING_NOT_FOUND"
+  | "INTERNAL_ERROR"
+  | null;
+
+export interface TvTimelineItemPresented {
+  itemId: string;
+  timelineType: "VISUAL" | "AUDIO";
+  mediaAssetId: string;
+  mediaType: string;
+  title: string;
+  startMinuteOfDay: number;
+  endMinuteOfDay: number;
+  videoAudioEnabled: boolean;
+  assetPath: string | null;
+  assetState: string | null;
+  assetRenderable: boolean;
+  stateReason: string | null;
+}
+
+export interface TvPlayerRenderContext {
+  ok: boolean;
+  bindingId: number;
+  screenId: number | null;
+  bindingEnabled: boolean;
+  activeSnapshotId: string | null;
+  activeSnapshotVersion: number | null;
+  timezone: string;
+  currentDayOfWeek: string | null;
+  currentMinuteOfDay: number | null;
+  visualItems: TvTimelineItemPresented[];
+  audioItems: TvTimelineItemPresented[];
+  currentVisual: TvTimelineItemPresented | null;
+  currentAudio: TvTimelineItemPresented | null;
+  playerState: TvPlayerState;
+  renderMode: TvRenderMode;
+  fallbackReason: TvFallbackReason;
+  lastRenderErrorCode: string | null;
+  lastRenderErrorMessage: string | null;
+  videoMutedByAudio: boolean;
+  evaluatedAt: string;
+  // A7 ad overlay fields
+  adOverrideActive?: boolean;
+  currentAdTaskId?: string | null;
+  currentAdMediaId?: string | null;
+  currentAdLayout?: string | null;
+  adAssetPath?: string | null;
+  adMimeType?: string | null;
+  adAudioOverrideActive?: boolean;
+  adDisplayDurationSec?: number | null;
+  error?: string;
+}
+
+export interface TvPlayerStateRow {
+  binding_id: number;
+  screen_id: number | null;
+  active_snapshot_id: string | null;
+  active_snapshot_version: number | null;
+  current_minute_of_day: number | null;
+  current_day_of_week: string | null;
+  current_visual_item_id: string | null;
+  current_audio_item_id: string | null;
+  current_visual_asset_id: string | null;
+  current_audio_asset_id: string | null;
+  current_visual_asset_path: string | null;
+  current_audio_asset_path: string | null;
+  player_state: TvPlayerState;
+  render_mode: TvRenderMode | null;
+  fallback_reason: TvFallbackReason;
+  video_muted_by_audio: number;
+  last_render_error_code: string | null;
+  last_render_error_message: string | null;
+  last_tick_at: string | null;
+  last_snapshot_check_at: string | null;
+  last_state_change_at: string | null;
+  updated_at: string;
+}
+
+export interface TvPlayerStatusResponse {
+  ok: boolean;
+  binding: Record<string, unknown> | null;
+  playerState: TvPlayerStateRow | null;
+  error?: string;
+}
+
+export interface TvPlayerEvent {
+  id: number;
+  binding_id: number;
+  event_type: string;
+  severity: string;
+  message: string | null;
+  metadata_json: string | null;
+  created_at: string;
+}
+
+export interface TvPlayerEventsResponse {
+  ok: boolean;
+  rows: TvPlayerEvent[];
+  total: number;
+}
+
+// ─── M) Ad Runtime (A7) ───
+
+export interface TvAdTaskCache {
+  campaign_task_id: string;
+  campaign_id: string | null;
+  gym_id: number;
+  ad_media_id: string | null;
+  ad_download_link: string | null;
+  ad_checksum_sha256: string | null;
+  ad_size_bytes: number | null;
+  ad_mime_type: string | null;
+  scheduled_at: string | null;
+  layout: string;
+  display_duration_sec: number;
+  remote_status: string | null;
+  generation_batch_no: number | null;
+  remote_updated_at: string | null;
+  local_file_path: string | null;
+  local_file_state: string;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+export interface TvAdTaskRuntime {
+  campaign_task_id: string;
+  gym_id: number;
+  binding_scope_count: number;
+  local_display_state: string;
+  due_at: string | null;
+  display_started_at: string | null;
+  display_finished_at: string | null;
+  display_aborted_at: string | null;
+  display_abort_reason: string | null;
+  display_abort_message: string | null;
+  injected_layout: string | null;
+  active_binding_ids_json: string | null;
+  failed_binding_ids_json: string | null;
+  correlation_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TvGymAdRuntime {
+  gym_id: number;
+  coordination_state: string;
+  current_campaign_task_id: string | null;
+  started_at: string | null;
+  expected_finish_at: string | null;
+  active_binding_count: number;
+  failed_binding_count: number;
+  audio_override_active: number;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  updated_at: string;
+}
+
+export interface TvAdEvaluateResponse {
+  ok: boolean;
+  reconciled: number;
+  injected: number;
+  completed: number;
+  skipped: number;
+  errors: number;
+}
+
 // ─── K) Popup / Notification events (SSE) ───
 export interface PopupEvent {
   eventId: string;
@@ -334,244 +527,65 @@ export interface PopupEvent {
   receivedAt?: number;
 }
 
+// ─── N) Host Monitor & Binding (A9) ───
 
-// --- L) TV local sync/cache/readiness ---
-export type TvAssetState =
-  | "NOT_PRESENT"
-  | "PRESENT_UNCHECKED"
-  | "VALID"
-  | "INVALID_SIZE"
-  | "INVALID_CHECKSUM"
-  | "INVALID_UNREADABLE"
-  | "STALE"
-  | "ERROR";
-
-export type TvReadinessState = "READY" | "PARTIALLY_READY" | "NOT_READY" | "EMPTY" | "ERROR";
-export type TvValidationMode = "STRONG" | "WEAK";
-export type TvDownloadJobState =
-  | "QUEUED"
-  | "DOWNLOADING"
-  | "VALIDATING"
-  | "SUCCEEDED"
-  | "FAILED"
-  | "CANCELLED"
-  | "SKIPPED_ALREADY_VALID"
-  | "RETRY_WAIT";
-export type TvDownloadFailureReason =
-  | "MISSING_DOWNLOAD_LINK"
-  | "INVALID_URL"
-  | "HTTP_ERROR"
-  | "TIMEOUT"
-  | "NETWORK_ERROR"
-  | "WRITE_ERROR"
-  | "TEMPFILE_ERROR"
-  | "ATOMIC_RENAME_FAILED"
-  | "SIZE_MISMATCH"
-  | "CHECKSUM_MISMATCH"
-  | "UNREADABLE_FILE"
-  | "UNKNOWN_ERROR";
+export interface TvHostMonitor {
+  id: number;
+  monitor_id: string;
+  monitor_label: string;
+  monitor_index: number;
+  is_connected: boolean;
+  width: number;
+  height: number;
+  offset_x: number;
+  offset_y: number;
+  scale_factor: number;
+  is_primary: boolean;
+  last_seen_at: string;
+}
 
 export interface TvScreenBinding {
-  screenId: number | null;
-  screenName: string | null;
-  updatedAt: string;
-}
-
-export type TvHostBindingDesiredState = "RUNNING" | "STOPPED";
-export type TvHostBindingRuntimeState = "STOPPED" | "STARTING" | "RUNNING" | "STOPPING" | "CRASHED" | "ERROR";
-
-export type TvPlayerState =
-  | "IDLE"
-  | "LOADING_BINDING"
-  | "LOADING_ACTIVE_SNAPSHOT"
-  | "RENDERING"
-  | "FALLBACK_RENDERING"
-  | "BLOCKED_NO_BINDING"
-  | "BLOCKED_BINDING_DISABLED"
-  | "BLOCKED_NO_ACTIVE_SNAPSHOT"
-  | "BLOCKED_NO_RENDERABLE_ITEM"
-  | "ERROR";
-
-export type TvPlayerRenderMode =
-  | "VISUAL_ONLY"
-  | "AUDIO_ONLY"
-  | "VISUAL_AND_AUDIO"
-  | "IDLE_FALLBACK"
-  | "ERROR_FALLBACK";
-
-export type TvPlayerFallbackReason =
-  | "NO_ACTIVE_SNAPSHOT"
-  | "NO_CURRENT_ITEM"
-  | "VISUAL_ASSET_INVALID"
-  | "AUDIO_ASSET_INVALID"
-  | "BOTH_ASSETS_INVALID"
-  | "SNAPSHOT_INVALID"
-  | "BINDING_DISABLED"
-  | "BINDING_NOT_FOUND"
-  | "INTERNAL_ERROR";
-
-export interface TvHostMonitorRow {
-  monitor_id: string;
-  monitor_label?: string | null;
-  monitor_index?: number | null;
-  x?: number | null;
-  y?: number | null;
-  width?: number | null;
-  height?: number | null;
-  scale_factor?: number | null;
-  is_primary?: number | boolean | null;
-  available?: number | boolean | null;
-  updated_at?: string | null;
-}
-
-export interface TvHostBindingRow {
   id: number;
   screen_id: number;
-  screen_name?: string | null;
-  monitor_id?: string | null;
-  monitor_label?: string | null;
-  monitor_index?: number | null;
-  enabled: number | boolean;
-  autostart: number | boolean;
-  desired_state: TvHostBindingDesiredState | string;
-  fullscreen: number | boolean;
-  window_label?: string | null;
-  window_id?: string | null;
-  window_exists?: number | boolean;
-  runtime_state?: TvHostBindingRuntimeState | string;
-  blocked_reason?: string | null;
-  launch_outcome?: string | null;
-  launch_error_code?: string | null;
-  launch_error_message?: string | null;
-  last_started_at?: string | null;
-  last_closed_at?: string | null;
+  screen_label: string;
+  gym_id: number | null;
+  gym_label: string | null;
+  monitor_id: string | null;
+  monitor_label: string | null;
+  monitor_index: number | null;
+  enabled: boolean;
+  autostart: boolean;
+  desired_state: string;
+  fullscreen: boolean;
+  window_label: string | null;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  runtime?: TvScreenBindingRuntime | null;
+}
+
+export interface TvScreenBindingRuntime {
+  binding_id: number;
+  runtime_state: string;
+  window_id: string | null;
+  tauri_window_label?: string | null;
+  last_started_at: string | null;
+  last_stopped_at: string | null;
+  crash_count: number;
   last_crashed_at?: string | null;
-  latest_snapshot_version?: number | null;
-  latest_ready_snapshot_version?: number | null;
-  active_snapshot_version?: number | null;
-  latest_readiness_state?: TvReadinessState | string | null;
-  monitor_available?: number | boolean;
-  player_state?: TvPlayerState | string | null;
-  player_render_mode?: TvPlayerRenderMode | string | null;
-  player_fallback_reason?: TvPlayerFallbackReason | string | null;
-  player_visual_item_id?: string | null;
-  player_audio_item_id?: string | null;
-  player_last_error_code?: string | null;
-  player_last_error_message?: string | null;
-  player_updated_at?: string | null;
-  created_at?: string;
-  updated_at?: string;
+  last_crash_at?: string | null;
+  last_exit_reason?: string | null;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  updated_at: string;
 }
 
-export interface TvHostMonitorsResponse {
-  ok: boolean;
-  rows: TvHostMonitorRow[];
-  total: number;
+export interface TvHostMonitorsRefreshRequest {
+  monitors: Omit<TvHostMonitor, "id" | "last_seen_at">[];
 }
 
-export interface TvHostBindingsResponse {
-  ok: boolean;
-  rows: TvHostBindingRow[];
-  total: number;
-}
-
-export interface TvHostBindingResponse {
-  ok: boolean;
-  binding: TvHostBindingRow;
-}
-
-export interface TvHostBindingEventsResponse {
-  ok: boolean;
-  rows: Array<Record<string, any>>;
-  total: number;
-}
-
-export interface TvPlayerTimelineItem {
-  itemId?: string | null;
-  timelineType?: "VISUAL" | "AUDIO" | string;
-  mediaAssetId?: string | null;
-  mediaType?: string | null;
-  title?: string | null;
-  startMinuteOfDay?: number | null;
-  endMinuteOfDay?: number | null;
-  videoAudioEnabled?: boolean;
-  assetPath?: string | null;
-  assetState?: string | null;
-  assetRenderable?: boolean;
-  stateReason?: string | null;
-}
-
-export interface TvPlayerRenderContext {
-  ok: boolean;
-  bindingId: number;
-  screenId: number | null;
-  bindingEnabled?: boolean;
-  activeSnapshotId?: string | null;
-  activeSnapshotVersion?: number | null;
-  timezone?: string | null;
-  currentDayOfWeek?: string | null;
-  currentMinuteOfDay?: number | null;
-  visualItems?: TvPlayerTimelineItem[];
-  audioItems?: TvPlayerTimelineItem[];
-  currentVisual?: TvPlayerTimelineItem | null;
-  currentAudio?: TvPlayerTimelineItem | null;
-  playerState?: TvPlayerState | string | null;
-  renderMode?: TvPlayerRenderMode | string | null;
-  fallbackReason?: TvPlayerFallbackReason | string | null;
-  lastRenderErrorCode?: string | null;
-  lastRenderErrorMessage?: string | null;
-  videoMutedByAudio?: boolean;
-  evaluatedAt?: string | null;
-  adOverrideActive?: boolean;
-  adAudioOverrideActive?: boolean;
-  currentAdTaskId?: number | null;
-  currentAdMediaId?: string | null;
-  adLayout?: string | null;
-  adAssetPath?: string | null;
-  adDisplayState?: string | null;
-  adDisplayStartedAt?: string | null;
-  adExpectedFinishAt?: string | null;
-  adValidationStrength?: TvValidationMode | string | null;
-  adParticipatingBindingIds?: number[];
-  adFailedBindingIds?: number[];
-  adFallbackReason?: string | null;
-  gymAdRuntime?: Record<string, any> | null;
-  error?: string;
-}
-
-export interface TvPlayerStatusResponse {
-  ok: boolean;
-  error?: string;
-  binding?: TvHostBindingRow | null;
-  playerState?: Record<string, any> | null;
-}
-
-export interface TvPlayerRenderContextResponse extends TvPlayerRenderContext {}
-
-export interface TvPlayerActionResponse {
-  ok: boolean;
-  context?: TvPlayerRenderContext;
-  error?: string;
-}
-
-export interface TvPlayerStateReportResponse {
-  ok: boolean;
-  updated?: boolean;
-  changed?: boolean;
-  row?: Record<string, any>;
-  error?: string;
-}
-
-export interface TvPlayerEventsResponse {
-  ok: boolean;
-  rows: Array<Record<string, any>>;
-  total: number;
-}
-
-
-export type TvBindingHealthSummary = "HEALTHY" | "WARNING" | "DEGRADED" | "ERROR" | "STOPPED";
-
-export type TvSupportActionType =
+export type TvBindingSupportActionType =
   | "RUN_SYNC"
   | "RECOMPUTE_READINESS"
   | "RETRY_FAILED_DOWNLOADS"
@@ -586,614 +600,435 @@ export type TvSupportActionType =
   | "RESTART_PLAYER_WINDOW"
   | "RESET_TRANSIENT_PLAYER_STATE";
 
-export type TvSupportActionResult = "STARTED" | "SUCCEEDED" | "FAILED" | "SKIPPED" | "BLOCKED";
+export type TvBindingSupportActionResult =
+  | "STARTED"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "SKIPPED"
+  | "BLOCKED";
+
+export type TvBindingHealthSummary =
+  | "HEALTHY"
+  | "WARNING"
+  | "DEGRADED"
+  | "ERROR"
+  | "STOPPED";
+
+export interface TvSupportActionLogRow {
+  id: number;
+  binding_id: number | null;
+  gym_id: number | null;
+  correlation_id: string;
+  action_type: TvBindingSupportActionType;
+  result: TvBindingSupportActionResult;
+  message: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  metadata_json?: string | null;
+  metadata?: Record<string, unknown> | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TvSupportActionAvailability {
+  actionType: TvBindingSupportActionType;
+  allowed: boolean;
+  blockedCode: string | null;
+  blockedReason: string | null;
+  requiresConfirmation: boolean;
+  destructive: boolean;
+  requiredOptions?: string[];
+}
+
+export interface TvBindingSupportFacts {
+  binding: TvScreenBinding;
+  runtime: TvScreenBindingRuntime | null;
+  monitor: {
+    row: TvHostMonitor | null;
+    available: boolean;
+  };
+  playerState: TvPlayerStateRow | null;
+  latestSnapshot: Record<string, unknown> | null;
+  latestReadiness: Record<string, unknown> | null;
+  activation: Record<string, unknown> | null;
+  latestReadySnapshot: Record<string, unknown> | null;
+  previousReadySnapshot: Record<string, unknown> | null;
+  adRuntime: Record<string, unknown> | null;
+  downloadFailures: {
+    count: number;
+    rows: Array<Record<string, unknown>>;
+  };
+  proofFailures: {
+    retryableCount: number;
+    terminalCount: number;
+    rows: Array<Record<string, unknown>>;
+  };
+  latestSupportAction: TvSupportActionLogRow | null;
+  activeSupportAction: {
+    bindingId: number;
+    actionType: TvBindingSupportActionType;
+    correlationId: string;
+    startedAt: string;
+  } | null;
+}
 
 export interface TvBindingSupportSummaryResponse {
   ok: boolean;
-  error?: string;
-  binding?: TvHostBindingRow;
-  screenId?: number;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  latestReadySnapshot?: TvSnapshotCacheRow | null;
-  activation?: TvActivationStatusPayload | null;
-  readiness?: TvReadinessRow | null;
-  playerState?: Record<string, any> | null;
-  failedDownloadCount?: number;
-  latestDownloadBatch?: TvDownloadBatchSummary | null;
-  health?: TvBindingHealthSummary | string;
-  healthReasons?: string[];
-  healthIndicators?: Record<string, any>;
-  supportActions?: {
-    rows: Array<Record<string, any>>;
-    total: number;
-  };
-}
-
-export interface TvSupportActionRunResponse {
-  ok: boolean;
   bindingId: number;
-  screenId?: number;
-  actionType: TvSupportActionType | string;
-  correlationId: string;
-  logId?: number;
-  result: TvSupportActionResult | string;
-  errorCode?: string | null;
-  message?: string | null;
-  data?: Record<string, any>;
-  summary?: TvBindingSupportSummaryResponse;
-}
-
-export interface TvSupportActionHistoryResponse {
-  ok: boolean;
-  rows: Array<Record<string, any>>;
-  total: number;
-}
-export interface TvReadinessRow {
-  id?: number;
-  screen_id?: number;
-  screenId?: number;
-  snapshot_id?: string;
-  snapshotId?: string;
-  snapshot_version?: number;
-  snapshotVersion?: number;
-  readiness_state?: TvReadinessState;
-  readinessState?: TvReadinessState;
-  is_fully_ready?: number | boolean;
-  isFullyReady?: number | boolean;
-  total_required_assets?: number;
-  totalRequiredAssets?: number;
-  ready_asset_count?: number;
-  readyAssetCount?: number;
-  missing_asset_count?: number;
-  missingAssetCount?: number;
-  invalid_asset_count?: number;
-  invalidAssetCount?: number;
-  stale_asset_count?: number;
-  staleAssetCount?: number;
-  computed_at?: string;
-  computedAt?: string;
-  warning_count?: number;
-  warningCount?: number;
-}
-
-export interface TvSnapshotCacheRow {
-  id?: number;
-  screen_id?: number;
-  screenId?: number;
-  snapshot_id?: string;
-  snapshotId?: string;
-  snapshot_version?: number;
-  snapshotVersion?: number;
-  generated_at?: string;
-  generatedAt?: string;
-  fetched_at?: string;
-  fetchedAt?: string;
-  resolved_day_of_week?: string;
-  resolvedDayOfWeek?: string;
-  resolved_preset_id?: string;
-  resolvedPresetId?: string;
-  resolved_layout_preset_id?: string;
-  resolvedLayoutPresetId?: string;
-  resolved_policy_id?: string;
-  resolvedPolicyId?: string;
-  manifest_status?: string;
-  manifestStatus?: string;
-  sync_status?: string;
-  syncStatus?: string;
-  warning_count?: number;
-  warningCount?: number;
-  error_message?: string;
-  errorMessage?: string;
-  is_latest?: boolean;
-  is_previous_ready?: boolean;
-  is_fully_ready?: boolean;
-  readiness_state?: TvReadinessState;
-  total_required_assets?: number;
-  ready_asset_count?: number;
-  missing_asset_count?: number;
-  invalid_asset_count?: number;
-  stale_asset_count?: number;
-  payload?: Record<string, any>;
-  manifest?: Record<string, any>;
-}
-
-export interface TvSyncStatusResponse {
-  ok: boolean;
   screenId: number | null;
-  binding?: TvScreenBinding;
-  lastRun?: Record<string, any> | null;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  latestReadySnapshot?: TvSnapshotCacheRow | null;
-  previousReadySnapshot?: TvSnapshotCacheRow | null;
-  latestReadiness?: TvReadinessRow | null;
-  latestDownloadBatch?: TvDownloadBatchSummary | null;
-  activation?: TvActivationStatusPayload | null;
+  gymId: number | null;
+  health: TvBindingHealthSummary;
+  reasons: string[];
+  facts: TvBindingSupportFacts;
+  actionAvailability: Record<TvBindingSupportActionType, TvSupportActionAvailability>;
+  lastCorrelationId: string | null;
+  latestSupportAction: TvSupportActionLogRow | null;
+  activeAction: {
+    bindingId: number;
+    actionType: TvBindingSupportActionType;
+    correlationId: string;
+    startedAt: string;
+  } | null;
 }
 
-export interface TvCacheAssetRow {
-  media_asset_id: string;
-  expected_local_path: string;
-  local_file_path?: string;
-  file_exists: number;
-  local_size_bytes?: number;
-  local_checksum_sha256?: string;
-  asset_state: TvAssetState;
-  state_reason?: string;
-  last_checked_at: string;
-  media_type?: string;
-  title?: string;
-  download_link?: string;
-  snapshot_version?: number;
-  validation_mode?: TvValidationMode | string | null;
-  download_state?: TvDownloadJobState | string | null;
-  download_attempt_count?: number;
-  last_download_attempt_at?: string | null;
-  last_download_success_at?: string | null;
-  last_download_error_reason?: TvDownloadFailureReason | string | null;
-  last_download_error_message?: string | null;
-  last_download_http_status?: number | null;
-  download_bytes_downloaded?: number | null;
-  download_bytes_total?: number | null;
-  download_updated_at?: string | null;
-  last_download_batch_id?: string | null;
-}
-
-export interface TvCacheAssetsResponse {
-  ok: boolean;
-  screenId: number;
-  snapshotVersion: number | null;
-  rows: TvCacheAssetRow[];
-  total: number;
-  latestReadiness?: TvReadinessRow | null;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-}
-
-
-export interface TvDownloadBatchSummary {
-  batchId: string;
-  screenId: number;
-  snapshotId?: string;
-  snapshotVersion?: number;
-  counts: Record<string, number>;
-  totalJobs: number;
-  latestReadiness?: TvReadinessRow | null;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  previousReadySnapshot?: TvSnapshotCacheRow | null;
-  queued?: number;
-  skipped?: number;
-  concurrency?: number;
-  background?: boolean;
-  status?: string;
-}
-
-export interface TvDownloadJobRow {
-  id: number;
-  batch_id: string;
-  screen_id: number;
-  snapshot_id: string;
-  snapshot_version: number;
-  media_asset_id: string;
-  expected_local_path: string;
-  download_link?: string | null;
-  state: TvDownloadJobState | string;
-  failure_reason?: TvDownloadFailureReason | string | null;
-  failure_message?: string | null;
-  retriable?: number | boolean;
-  http_status?: number | null;
-  attempt_no?: number;
-  max_attempts?: number;
-  bytes_downloaded?: number | null;
-  bytes_total?: number | null;
-  trigger_source?: string;
-  queued_at?: string;
-  started_at?: string | null;
-  finished_at?: string | null;
-  next_retry_at?: string | null;
-  updated_at?: string;
-}
-export type TvAdTaskRemoteStatus =
-  | "PREPARATION_PHASE"
-  | "READY_TO_DISPLAY"
-  | "DISPLAYING"
-  | "DONE"
-  | "FAILED"
-  | "CANCELLED"
-  | "EXPIRED";
-
-export type TvAdTaskLocalPreparationState =
-  | "DISCOVERED"
-  | "DOWNLOADING"
-  | "READY_LOCAL"
-  | "READY_CONFIRM_PENDING"
-  | "READY_CONFIRMED"
-  | "FAILED"
-  | "CANCELLED"
-  | "EXPIRED";
-
-export type TvAdTaskDisplayState =
-  | "READY_TO_DISPLAY_LOCAL"
-  | "DISPLAYING"
-  | "DISPLAY_COMPLETED_LOCAL"
-  | "DISPLAY_ABORTED_LOCAL"
-  | "SKIPPED_WINDOW_MISSED"
-  | "CANCELLED_REMOTE"
-  | "EXPIRED_REMOTE";
-
-export type TvAdTaskOutboxState =
-  | "NOT_QUEUED"
-  | "QUEUED"
-  | "SENDING"
-  | "SENT"
-  | "FAILED_RETRYABLE"
-  | "FAILED_TERMINAL";
-
-export interface TvAdTaskOutboxRow {
-  state?: TvAdTaskOutboxState | string;
-  attempt_count?: number;
-  last_http_status?: number | null;
-  last_error_code?: string | null;
-  last_error_message?: string | null;
-  next_attempt_at?: string | null;
-  sent_at?: string | null;
-  updated_at?: string | null;
-}
-
-export interface TvAdTaskRow {
-  id?: number;
-  campaign_task_id: number;
-  campaign_id: number;
+export interface TvAdProofOutboxRow {
+  local_proof_id: number;
+  campaign_task_id: string;
+  campaign_id: string | null;
   gym_id: number;
-  ad_media_id: string;
-  ad_download_link_snapshot?: string | null;
-  ad_checksum_sha256?: string | null;
-  ad_size_bytes?: number | null;
-  ad_mime_type?: string | null;
-  scheduled_at: string;
-  layout?: string | null;
-  display_duration_sec?: number | null;
-  remote_status: TvAdTaskRemoteStatus | string;
-  remote_updated_at?: string | null;
-  expected_local_path?: string | null;
-  local_asset_state?: TvAssetState | string | null;
-  validation_strength?: TvValidationMode | string | null;
-  local_preparation_state?: TvAdTaskLocalPreparationState | string | null;
-  ready_confirm_outbox_state?: TvAdTaskOutboxState | string | null;
-  ready_confirmed_at?: string | null;
-  last_fetched_at?: string;
-  last_prepare_attempt_at?: string | null;
-  last_prepare_success_at?: string | null;
-  last_error_code?: string | null;
-  last_error_message?: string | null;
-  last_ready_confirm_attempt_at?: string | null;
-  correlation_id?: string | null;
-  generation_batch_no?: number | null;
-  created_at?: string;
-  updated_at?: string;
-  outbox?: TvAdTaskOutboxRow | null;
-  local_display_state?: TvAdTaskDisplayState | string | null;
-  display_started_at?: string | null;
-  display_finished_at?: string | null;
-  display_aborted_at?: string | null;
-  display_abort_reason?: string | null;
-  currently_injected?: boolean | number;
-  participating_binding_ids?: number[];
-  failed_binding_ids?: number[];
-  gym_coordination_state?: string | null;
-  gym_current_task_id?: number | null;
+  ad_media_id: string | null;
+  idempotency_key: string;
+  started_at: string | null;
+  finished_at: string | null;
+  displayed_duration_sec: number | null;
+  expected_duration_sec: number | null;
+  completed_fully: number;
+  countable: number;
+  result_status: string;
+  reason_if_not_countable: string | null;
+  correlation_id: string | null;
+  participating_binding_count: number;
+  failed_binding_count: number;
+  outbox_state: string;
+  attempt_count: number;
+  next_attempt_at: string | null;
+  last_error: string | null;
+  backend_proof_id: string | null;
+  backend_task_status: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface TvAdTaskListResponse {
-  ok: boolean;
-  rows: TvAdTaskRow[];
-  total: number;
-  limit: number;
-  offset: number;
+export interface TvObservabilityBindingSummary {
+  bindingId: number;
+  screenId: number | null;
+  gymId: number | null;
+  screenLabel: string;
+  binding: TvScreenBinding;
+  runtime: TvScreenBindingRuntime | null;
+  health: TvBindingHealthSummary;
+  reasons: string[];
+  desiredState: string;
+  runtimeState: string;
+  monitorAvailable: boolean;
+  failedAssetCount: number;
+  proofRetryableCount: number;
+  proofTerminalCount: number;
+  playerState: string | null;
+  readinessState: string | null;
+  activationState: string | null;
+  lastSupportAction: TvSupportActionLogRow | null;
+  activeSupportAction: {
+    bindingId: number;
+    actionType: TvBindingSupportActionType;
+    correlationId: string;
+    startedAt: string;
+  } | null;
+  stale: boolean;
+  problem: boolean;
 }
 
-
-
-export interface TvAdTaskRuntimeListResponse {
-  ok: boolean;
-  rows: Array<Record<string, any>>;
-  total: number;
-  limit: number;
-  offset: number;
-}
-
-export interface TvAdTaskRuntimeOneResponse {
-  ok: boolean;
-  runtime?: Record<string, any>;
-  error?: string;
-}
-
-export interface TvGymAdRuntimeResponse {
-  ok: boolean;
-  runtime?: Record<string, any>;
-  error?: string;
-}
-
-export interface TvAdTaskInjectNowResponse {
-  ok: boolean;
-  result?: string;
-  campaignTaskId?: number;
-  gymId?: number;
-  runtime?: Record<string, any>;
-  gymRuntime?: Record<string, any>;
-  error?: string;
-  reason?: string;
-}
-
-export type TvActivationState =
-  | "NO_ACTIVE_SNAPSHOT"
-  | "ACTIVE_CURRENT"
-  | "ACTIVE_OLDER_THAN_LATEST"
-  | "BLOCKED_WAITING_FOR_READY"
-  | "BLOCKED_PREREQUISITE"
-  | "ERROR";
-
-export type TvActivationResult =
-  | "ACTIVATED"
-  | "SKIPPED_ALREADY_ACTIVE"
-  | "SKIPPED_NO_SNAPSHOT"
-  | "SKIPPED_NOT_READY"
-  | "SKIPPED_LATEST_NOT_NEWER"
-  | "SKIPPED_SINGLE_FLIGHT_BUSY"
-  | "FAILED";
-
-export interface TvActivationStateRow {
-  screen_id?: number;
-  latest_snapshot_id?: string | null;
-  latest_snapshot_version?: number | null;
-  latest_ready_snapshot_id?: string | null;
-  latest_ready_snapshot_version?: number | null;
-  active_snapshot_id?: string | null;
-  active_snapshot_version?: number | null;
-  previous_active_snapshot_id?: string | null;
-  previous_active_snapshot_version?: number | null;
-  blocked_reason?: string | null;
-  activation_state?: TvActivationState | string;
-  last_decision_at?: string | null;
-  last_activation_at?: string | null;
-  last_attempt_id?: number | null;
-  updated_at?: string | null;
-}
-
-export interface TvActivationStatusPayload {
-  screenId: number;
-  state: TvActivationStateRow;
-  latestSnapshot?: TvSnapshotCacheRow | null;
-  latestReadySnapshot?: TvSnapshotCacheRow | null;
-  activeSnapshot?: TvSnapshotCacheRow | null;
-  previousActiveSnapshot?: TvSnapshotCacheRow | null;
-}
-
-export interface TvActivationAttemptRow {
-  id: number;
-  screen_id: number;
-  trigger_source: string;
-  target_snapshot_id?: string | null;
-  target_snapshot_version?: number | null;
-  result: TvActivationResult | string;
-  failure_reason?: string | null;
-  failure_message?: string | null;
-  precheck_readiness_state?: string | null;
-  precheck_manifest_status?: string | null;
-  active_snapshot_id_before?: string | null;
-  active_snapshot_version_before?: number | null;
-  started_at: string;
-  finished_at: string;
-}
-
-
-// --- M) TV Observability ---
-export type TvObservabilityHealth =
-  | "UNKNOWN"
-  | "OFFLINE"
-  | "ERROR"
-  | "DEGRADED"
-  | "WARNING"
-  | "HEALTHY";
-
-export interface TvObservabilityFleetRow {
-  screenId: number;
-  bindingId?: number;
-  screenName?: string | null;
-  monitorId?: string | null;
-  monitorLabel?: string | null;
-  enabled?: boolean;
-  desiredState?: string | null;
-  runtimeState?: string | null;
-  playerState?: string | null;
-  playerRenderMode?: string | null;
-  playerFallbackReason?: string | null;
-  readinessState?: TvReadinessState | string | null;
-  activationState?: TvActivationState | string | null;
-  latestSnapshotVersion?: number | null;
-  latestReadySnapshotVersion?: number | null;
-  activeSnapshotVersion?: number | null;
-  latestHeartbeatAtUtc?: string | null;
-  heartbeatAgeSec?: number | null;
-  latestProofAtUtc?: string | null;
-  proofAgeSec?: number | null;
-  proofExpected?: boolean;
-  runtimeErrors15m?: number;
-  runtimeWarnings15m?: number;
-  failedDownloadCount?: number;
-  health: TvObservabilityHealth | string;
-  healthReasons: string[];
-  monitorAvailable?: boolean;
-  lastUpdatedAt?: string | null;
-}
-
-export interface TvObservabilityPaged<T> {
-  rows: T[];
-  total: number;
+export interface TvObservabilityEventRow {
+  id: number | null;
+  source: "BINDING_EVENT" | "PLAYER_EVENT" | "SUPPORT_ACTION";
+  bindingId: number | null;
+  gymId: number | null;
+  createdAt: string | null;
+  eventType: string | null;
+  severity: string | null;
+  message: string | null;
+  correlationId: string | null;
+  metadata: Record<string, unknown> | null;
+  result?: string | null;
 }
 
 export interface TvObservabilityOverviewResponse {
   ok: boolean;
-  totalScreens: number;
-  onlineScreens: number;
-  healthCounts: Record<string, number>;
-  fleet: TvObservabilityPaged<TvObservabilityFleetRow>;
-  recentRuntimeIncidents: TvObservabilityPaged<Record<string, any>>;
-  recentProofEvents: TvObservabilityPaged<Record<string, any>>;
-  recentSupportActions: TvObservabilityPaged<Record<string, any>>;
+  generatedAt: string;
+  totals: {
+    totalBindings: number;
+    healthyBindings: number;
+    warningBindings: number;
+    degradedBindings: number;
+    errorBindings: number;
+    stoppedBindings: number;
+    activeMonitors: number;
+    activePlayerWindows: number;
+    activeGymAdRuntimes: number;
+    queuedOrRetryableProofCount: number;
+    recentFailedDownloadsCount: number;
+    recentSupportActionsCount: number;
+    staleProblemBindingsCount: number;
+  };
+  problemBindings: Array<{
+    bindingId: number;
+    screenLabel: string;
+    health: TvBindingHealthSummary;
+    reasons: string[];
+    stale: boolean;
+  }>;
+  recentSupportWindowHours: number;
 }
 
-export interface TvObservabilityFleetHealthResponse {
+export interface TvObservabilityBindingDetail extends TvObservabilityBindingSummary {
   ok: boolean;
-  rows: TvObservabilityFleetRow[];
-  total: number;
-}
-
-export interface TvObservabilityScreenDetailsResponse {
-  ok: boolean;
-  error?: string;
-  screen?: TvObservabilityFleetRow;
-  heartbeats?: TvObservabilityPaged<Record<string, any>>;
-  runtimeEvents?: TvObservabilityPaged<Record<string, any>>;
-  proofEvents?: TvObservabilityPaged<Record<string, any>>;
-  supportActions?: TvObservabilityPaged<Record<string, any>>;
-  activationAttempts?: TvObservabilityPaged<TvActivationAttemptRow>;
-}
-
-export interface TvObservabilityTimelineItem {
-  source: "HEARTBEAT" | "RUNTIME_EVENT" | "PROOF_EVENT" | "SUPPORT_ACTION" | "ACTIVATION_ATTEMPT" | string;
-  timestampUtc?: string | null;
-  severity?: string | null;
-  title?: string | null;
-  message?: string | null;
-  correlationId?: string | null;
-  row?: Record<string, any>;
-}
-
-export interface TvObservabilityTimelineResponse {
-  ok: boolean;
-  rows: TvObservabilityTimelineItem[];
-  total: number;
-}
-
-export interface TvObservabilityHeartbeatsResponse {
-  ok: boolean;
-  rows: Record<string, any>[];
-  total: number;
-}
-
-export interface TvObservabilityRuntimeEventsResponse {
-  ok: boolean;
-  rows: Record<string, any>[];
-  total: number;
-}
-
-export interface TvObservabilityProofEventsResponse {
-  ok: boolean;
-  rows: Record<string, any>[];
-  total: number;
-}
-
-export interface TvObservabilityProofStatsResponse {
-  ok: boolean;
-  totalProofEvents: number;
-  statusCounts: Record<string, number>;
-  timelineCounts: Record<string, number>;
-  series: Array<{ bucket: string; count: number }>;
-  topScreens: Array<{ screenId: number; count: number }>;
-  topAssets: Array<{ mediaAssetId: string; count: number }>;
-}
-
-export interface TvObservabilityRuntimeStatsResponse {
-  ok: boolean;
-  totalRuntimeEvents: number;
-  severityCounts: Record<string, number>;
-  eventTypeCounts: Record<string, number>;
-  errorCodeCounts: Record<string, number>;
-}
-
-// --- N) TV Hardening ---
-export interface TvStartupReconciliationRunRow {
-  id: number;
-  correlation_id?: string | null;
-  trigger_source?: string | null;
-  status?: string | null;
-  started_at?: string | null;
-  finished_at?: string | null;
-  summary?: Record<string, any>;
-}
-
-export interface TvStartupReconciliationPhaseRow {
-  id: number;
-  run_id: number;
-  phase_name: string;
-  status?: string | null;
-  message?: string | null;
-  metadata?: Record<string, any>;
-  started_at?: string | null;
-  finished_at?: string | null;
-}
-
-export interface TvHardeningStartupLatestResponse {
-  ok: boolean;
-  error?: string;
-  run?: TvStartupReconciliationRunRow;
-  phases?: TvStartupReconciliationPhaseRow[];
-}
-
-export interface TvHardeningStartupRunsResponse {
-  ok: boolean;
-  rows: TvStartupReconciliationRunRow[];
-  total: number;
-}
-
-export interface TvHardeningQueryChecksResponse {
-  ok: boolean;
-  limit: number;
-  checksMs: Record<string, number>;
-}
-
-export interface TvHardeningRetentionPolicyResponse {
-  ok: boolean;
-  retentionDays: Record<string, number>;
-}
-
-export interface TvHardeningRetentionRunResponse {
-  ok: boolean;
-  dryRun: boolean;
-  retentionDays: Record<string, number>;
-  scannedRows: Record<string, number>;
-  deletedRows: Record<string, number>;
-  ranAt: string;
-  queryChecks?: {
+  bindingConfig: TvScreenBinding;
+  monitor: {
+    row: TvHostMonitor | null;
+    available: boolean;
+  };
+  readiness: Record<string, unknown> | null;
+  activation: Record<string, unknown> | null;
+  playerStateRow: TvPlayerStateRow | null;
+  adRuntime: TvGymAdRuntime | null;
+  failedAssets: {
+    count: number;
+    rows: Array<Record<string, unknown>>;
+  };
+  proofBacklog: {
+    queuedCount: number;
+    sendingCount: number;
+    retryableCount: number;
+    terminalCount: number;
+    sentCount: number;
+    rows: TvAdProofOutboxRow[];
+    total: number;
+  };
+  lastSupportAction: TvSupportActionLogRow | null;
+  supportSummary: TvBindingSupportSummaryResponse;
+  supportHistory: {
+    rows: TvSupportActionLogRow[];
+    total: number;
     limit: number;
-    checksMs: Record<string, number>;
+    offset: number;
+  };
+  bindingEvents: {
+    rows: Array<Record<string, unknown>>;
+    total: number;
+  };
+  playerEvents: {
+    rows: TvPlayerEvent[];
+    total: number;
+  };
+  syncRuns: {
+    rows: Array<Record<string, unknown>>;
+    total: number;
+  };
+  activationAttempts: {
+    rows: Array<Record<string, unknown>>;
+    total: number;
+  };
+  recentEvents: {
+    rows: TvObservabilityEventRow[];
+    total: number;
+    limit: number;
+    offset: number;
+  };
+  gymDiagnostics: TvObservabilityGymDetail | null;
+}
+
+export interface TvObservabilityGymDetail {
+  ok: boolean;
+  gymId: number;
+  runtime: TvGymAdRuntime | null;
+  currentTaskId: string | null;
+  currentTask: TvAdTaskCache | null;
+  coordinationState: string;
+  activeBindingCount: number;
+  failedBindingCount: number;
+  audioOverrideActive: boolean;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  bindingHealthCounts: Record<TvBindingHealthSummary, number>;
+  proofBacklog: {
+    queuedCount: number;
+    sendingCount: number;
+    retryableCount: number;
+    terminalCount: number;
+    sentCount: number;
+    rows: TvAdProofOutboxRow[];
+    total: number;
+  };
+  recentTaskRuntime: {
+    rows: TvAdTaskRuntime[];
+    total: number;
+    limit: number;
+    offset: number;
+  };
+  bindings: TvObservabilityBindingSummary[];
+  updatedAt: string | null;
+}
+
+export interface TvObservabilityProofsResponse {
+  ok: boolean;
+  rows: TvAdProofOutboxRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  bindingId: number | null;
+  gymId: number | null;
+  summary: {
+    queuedCount: number;
+    sendingCount: number;
+    retryableCount: number;
+    terminalCount: number;
+    sentCount: number;
   };
 }
 
-export interface TvHardeningCorrelationAuditResponse {
+export interface TvObservabilityRetentionResponse {
+  ok: boolean;
+  generatedAt: string;
+  policy: {
+    bindingEventDays: number;
+    playerEventDays: number;
+    syncRunDays: number;
+    activationAttemptDays: number;
+    supportLogDays: number;
+    adTaskRuntimeDays: number;
+    proofTerminalDays: number;
+    disconnectedMonitorDays: number;
+  };
+  tables: Array<{
+    table: string;
+    totalRows: number;
+    eligibleRows: number;
+    rule: string;
+    cutoffAt: string | null;
+  }>;
+  eligibleDeleteCount: number;
+}
+
+export interface TvObservabilityRetentionRunResponse {
+  ok: boolean;
+  dryRun: boolean;
+  includeQueryChecks: boolean;
+  policy: TvObservabilityRetentionResponse["policy"];
+  deletedRows: number;
+  tables: Array<{
+    table: string;
+    deletedRows: number;
+    eligibleRows?: number;
+  }>;
+  summaryAfter: TvObservabilityRetentionResponse;
+}
+
+export type TvStartupCheckSeverity = "BLOCKER" | "WARNING" | "INFO";
+export type TvStartupCheckResult = "PASSED" | "FAILED" | "SKIPPED" | "REPAIRED";
+export type TvStartupOverallResult = "SUCCESS" | "SUCCESS_WITH_WARNINGS" | "FAILED";
+
+export interface TvStartupCheckItem {
+  code: string;
+  severity: TvStartupCheckSeverity;
+  status: TvStartupCheckResult;
+  message: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface TvStartupReconciliationPhase {
+  id: number;
+  runId: number;
+  phaseName: string | null;
+  result: TvStartupCheckResult | null;
+  message: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string | null;
+}
+
+export interface TvStartupReconciliationRun {
+  id: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  overallResult: TvStartupOverallResult | null;
+  status: TvStartupOverallResult | string | null;
+  blockerCount: number;
+  warningCount: number;
+  infoCount: number;
+  message: string | null;
+  metadata: Record<string, unknown>;
+  triggerSource: string | null;
+  correlationId: string | null;
+  checks: TvStartupCheckItem[];
+  blockers: TvStartupCheckItem[];
+  warnings: TvStartupCheckItem[];
+  infos: TvStartupCheckItem[];
+  createdAt: string | null;
+  updatedAt: string | null;
+  phases: TvStartupReconciliationPhase[];
+}
+
+export interface TvStartupLatestResponse extends Partial<TvStartupReconciliationRun> {
   ok: boolean;
   error?: string;
-  correlationId?: string;
-  counts?: Record<string, number>;
-  present?: string[];
-  missing?: string[];
-  isCompleteCorePath?: boolean;
 }
 
-export interface TvHardeningPreflightIssue {
-  code: string;
-  severity: string;
-  message: string;
-  details?: Record<string, any>;
-}
-
-export interface TvHardeningPreflightResponse {
+export interface TvStartupRunsResponse {
   ok: boolean;
-  status: "PASS" | "WARN" | "FAIL" | string;
-  generatedAt: string;
-  blockers: TvHardeningPreflightIssue[];
-  warnings: TvHardeningPreflightIssue[];
-  infos: TvHardeningPreflightIssue[];
-  checks: Record<string, any>;
+  rows: TvStartupReconciliationRun[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
+export interface TvStartupPreflightResponse {
+  ok: boolean;
+  status: TvStartupOverallResult;
+  overallResult: TvStartupOverallResult;
+  generatedAt: string;
+  message: string;
+  checks: TvStartupCheckItem[];
+  blockers: TvStartupCheckItem[];
+  warnings: TvStartupCheckItem[];
+  infos: TvStartupCheckItem[];
+  counts: {
+    blockerCount: number;
+    warningCount: number;
+    infoCount: number;
+  };
+  metadata: Record<string, unknown>;
+}
 
+export interface TvStartupRunResponse {
+  ok: boolean;
+  result?: "BLOCKED";
+  status: TvStartupOverallResult | "BLOCKED";
+  overallResult?: TvStartupOverallResult;
+  error?: string;
+  message?: string;
+  runId?: number;
+  failedPhaseCount?: number;
+  warningCount?: number;
+  blockerCount?: number;
+  infoCount?: number;
+  latest?: TvStartupLatestResponse;
+  activeRun?: {
+    runId?: number;
+    triggerSource?: string;
+    correlationId?: string;
+    startedAt?: string;
+  } | null;
+}

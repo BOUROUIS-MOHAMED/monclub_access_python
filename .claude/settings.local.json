@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -c \":*)",
+      "Bash(py -m py_compile app/api/local_access_api_v2.py)",
+      "Bash(py -m py_compile app/core/tv_local_cache.py app/api/local_access_api_v2.py)",
+      "Bash(npm run:*)",
+      "Bash(py tmp/test_a6_player.py)",
+      "Bash(\"C:/Users/mohaa/Desktop/monclub_access_python/MONCLUB_TV_ACCESS_REBUILD_PROGRESS.md\":*)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(python -c \":*)",
+      "Bash(py tmp/test_a7_ad_runtime.py)",
+      "Bash(py -X utf8 tmp/test_a7_ad_runtime.py)",
+      "Bash(py -X utf8 -c \":*)",
+      "Bash(echo \"COMPILE_EXIT:$?\")",
+      "Bash(python tmp/test_a7_ad_runtime.py)",
+      "Bash(python -u tmp/test_a7_ad_runtime.py)",
+      "Bash(python -c \"import sys; sys.stdout.buffer.write\\(sys.stdin.buffer.read\\(\\)\\)\")",
+      "Bash(xargs grep:*)",
+      "Bash(python -m py_compile app/core/tv_local_cache.py app/api/local_access_api_v2.py app/ui/app.py)",
+      "Bash(python -u tmp/test_a8_proofs.py)"
+    ]
+  }
+}

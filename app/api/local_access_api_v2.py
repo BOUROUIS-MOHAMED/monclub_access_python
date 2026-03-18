@@ -23,85 +23,60 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from app.core.tv_local_cache import (
+# TV local cache — imported at module level so all TV handlers can reference functions directly
+from app.core.tv_local_cache import (  # noqa: E402
     ensure_tv_local_schema,
-    list_tv_cache_assets,
-    load_latest_tv_sync_run,
-    load_tv_latest_readiness,
-    load_tv_latest_snapshot,
-    load_tv_previous_ready_snapshot,
-    load_tv_screen_binding,
-    load_tv_screen_binding_by_id,
-    list_tv_screen_bindings,
-    get_tv_screen_binding,
-    create_tv_screen_binding,
-    update_tv_screen_binding,
-    delete_tv_screen_binding,
-    load_tv_snapshot_by_id,
-    load_tv_snapshot_manifest,
-    save_tv_screen_binding,
-    list_tv_host_monitors,
-    replace_tv_host_monitors,
-    start_tv_screen_binding,
-    stop_tv_screen_binding,
-    restart_tv_screen_binding,
+    # Screen bindings
+    load_tv_screen_binding, load_tv_screen_binding_by_id, save_tv_screen_binding,
+    create_tv_screen_binding, delete_tv_screen_binding,
+    start_tv_screen_binding, stop_tv_screen_binding, restart_tv_screen_binding,
+    update_tv_screen_binding, get_tv_screen_binding, list_tv_screen_bindings,
+    # Host monitors
+    list_tv_host_monitors, replace_tv_host_monitors,
+    # Binding runtime / events
+    upsert_tv_screen_binding_runtime, load_tv_screen_binding_runtime,
+    record_tv_screen_binding_event, list_tv_screen_binding_events,
     record_tv_screen_binding_runtime_event,
-    list_tv_screen_binding_events,
-    sync_latest_snapshot_for_screen,
-    run_tv_download_batch,
-    load_tv_latest_download_batch,
-    list_tv_download_jobs,
-    retry_tv_download_job,
-    fetch_tv_ad_tasks_for_host,
-    prepare_tv_ad_tasks,
-    process_tv_ad_ready_confirm_outbox,
-    run_tv_ad_task_cycle,
-    list_tv_ad_task_cache,
-    retry_tv_ad_task_prepare,
-    retry_tv_ad_task_ready_confirm,
-    list_tv_ad_task_runtime,
-    load_tv_ad_task_runtime,
-    load_tv_gym_ad_runtime,
-    inject_tv_ad_task_now,
-    abort_tv_ad_task_now,
-    reconcile_all_active_gyms,
-    startup_recover_ad_runtime,
-    list_tv_ad_proof_outbox,
-    load_tv_ad_proof,
-    process_tv_ad_proof_outbox,
-    retry_tv_ad_proof,
-    load_tv_latest_ready_snapshot,
-    load_tv_activation_status,
-    evaluate_tv_activation,
-    activate_tv_latest_ready_snapshot,
-    list_tv_activation_attempts,
-    load_tv_player_status,
-    get_tv_player_render_context,
-    reevaluate_tv_player,
-    reload_tv_player,
-    report_tv_player_state,
-    list_tv_player_events,
-    load_tv_binding_support_summary,
-    run_tv_binding_support_action,
-    list_tv_support_action_logs,
-    get_tv_observability_overview,
-    list_tv_observability_fleet_health,
-    get_tv_observability_screen_details,
-    get_tv_observability_screen_timeline,
-    list_tv_observability_heartbeats,
-    list_tv_observability_runtime_events,
-    list_tv_observability_proof_events,
-    get_tv_observability_proof_stats,
-    get_tv_observability_runtime_stats,
-    run_tv_startup_reconciliation,
-    load_tv_startup_reconciliation_latest,
-    list_tv_startup_reconciliation_runs,
-    get_tv_retention_policy,
-    run_tv_retention_maintenance,
-    run_tv_query_responsiveness_checks,
-    audit_tv_correlation_propagation,
-    run_tv_deployment_preflight,
+    # Snapshot cache
+    load_tv_latest_snapshot, load_tv_snapshot_by_id, list_tv_snapshot_cache,
+    load_tv_snapshot_manifest, load_tv_latest_ready_snapshot, load_tv_previous_ready_snapshot,
+    # Asset state
+    load_tv_local_asset_state, list_tv_cache_assets,
+    # Readiness
+    load_tv_latest_readiness,
+    # Activation
+    evaluate_tv_activation, activate_tv_latest_ready_snapshot,
+    load_tv_activation_status, list_tv_activation_attempts,
+    # Downloads
+    load_tv_latest_download_batch, list_tv_download_jobs,
+    # Player
+    load_tv_player_status, get_tv_player_render_context,
+    reevaluate_tv_player, reload_tv_player,
+    report_tv_player_state, list_tv_player_events,
+    # Player state persistence
+    load_tv_player_state,
+    # Support / observability
+    load_tv_binding_support_summary, run_tv_binding_support_action, list_tv_support_action_logs,
+    get_tv_retention_policy, run_tv_retention_maintenance,
+    get_tv_observability_overview, list_tv_observability_bindings, get_tv_observability_binding,
+    list_tv_observability_gyms, get_tv_observability_gym,
+    list_tv_observability_proofs, get_tv_observability_retention, list_tv_observability_events,
+    run_tv_startup_reconciliation, run_tv_deployment_preflight,
+    load_tv_startup_reconciliation_latest, list_tv_startup_reconciliation_runs,
+    # Ad runtime (A7)
+    list_tv_ad_task_cache, upsert_tv_ad_task_cache, load_tv_ad_task_cache_one,
+    list_tv_ad_task_runtime, load_tv_ad_task_runtime, upsert_tv_ad_task_runtime,
+    load_tv_gym_ad_runtime, upsert_tv_gym_ad_runtime,
+    inject_tv_ad_task_now, abort_tv_ad_task_now,
+    complete_tv_ad_display, abort_tv_ad_display,
+    reconcile_all_active_gyms, startup_recover_ad_runtime,
+    # A8: Ad proof outbox
+    create_tv_ad_proof,
+    list_tv_ad_proof_outbox, load_tv_ad_proof, process_tv_ad_proof_outbox,
+    retry_tv_ad_proof, startup_recover_proof_outbox,
 )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +696,12 @@ def _handle_tv_host_monitors_refresh(ctx: _Ctx) -> None:
 
 def _handle_tv_host_bindings_get(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
-    rows = list_tv_screen_bindings()
+    rows = []
+    for row in list_tv_screen_bindings():
+        binding = dict(row)
+        bid = _safe_int(binding.get("id"), 0)
+        binding["runtime"] = load_tv_screen_binding_runtime(binding_id=bid) if bid > 0 else None
+        rows.append(binding)
     ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
 
 
@@ -927,6 +907,120 @@ def _handle_tv_host_binding_runtime_event(ctx: _Ctx) -> None:
         ctx.send_json(200, {"ok": True, "binding": row})
     except ValueError as e:
         ctx.send_json(400, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_observability_bindings(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = max(1, min(ctx.q_int("limit", default=200), 2000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    health = _safe_str(ctx.q("health", default=""), "").strip() or None
+    runtime_state = _safe_str(ctx.q("runtimeState", "runtime_state", default=""), "").strip() or None
+    q = _safe_str(ctx.q("q", "query", default=""), "").strip() or None
+    problem_only = _safe_bool(ctx.q("problemOnly", "problem_only", default="0"), default=False)
+    data = list_tv_observability_bindings(
+        health=health,
+        gym_id=(gym_id if gym_id > 0 else None),
+        runtime_state=runtime_state,
+        q=q,
+        problem_only=problem_only,
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_binding_detail(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    bid = _safe_int(ctx.param("bindingId"), 0)
+    if bid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required"})
+        return
+    event_limit = max(1, min(ctx.q_int("eventLimit", "event_limit", default=40), 500))
+    history_limit = max(1, min(ctx.q_int("historyLimit", "history_limit", default=20), 200))
+    data = get_tv_observability_binding(binding_id=bid, event_limit=event_limit, history_limit=history_limit)
+    if not bool(data.get("ok")):
+        ctx.send_json(404, {"ok": False, "error": data.get("error") or "BINDING_NOT_FOUND"})
+        return
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_gyms(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = max(1, min(ctx.q_int("limit", default=100), 1000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_observability_gyms(limit=limit, offset=offset)
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_gym_detail(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    gym_id = _safe_int(ctx.param("gymId"), 0)
+    if gym_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "gymId is required"})
+        return
+    data = get_tv_observability_gym(gym_id=gym_id)
+    if not bool(data.get("ok")):
+        ctx.send_json(404, {"ok": False, "error": data.get("error") or "GYM_NOT_FOUND"})
+        return
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_proofs_v2(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = max(1, min(ctx.q_int("limit", default=200), 1000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    binding_id = ctx.q_int("bindingId", "binding_id", default=0)
+    outbox_states = _split_csv_upper(ctx.q("outboxStates", "outbox_states", default=""))
+    result_status = _safe_str(ctx.q("resultStatus", "result_status", default=""), "").strip() or None
+    countable_raw = _safe_str(ctx.q("countable", default=""), "").strip().lower()
+    countable = None
+    if countable_raw in {"1", "true", "yes"}:
+        countable = True
+    elif countable_raw in {"0", "false", "no"}:
+        countable = False
+    data = list_tv_observability_proofs(
+        gym_id=(gym_id if gym_id > 0 else None),
+        binding_id=(binding_id if binding_id > 0 else None),
+        outbox_states=(outbox_states or None),
+        result_status=result_status,
+        countable=countable,
+        limit=limit,
+        offset=offset,
+    )
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_retention(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    ctx.send_json(200, get_tv_observability_retention())
+
+
+def _handle_tv_observability_retention_run(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    dry_run = _safe_bool(body.get("dryRun"), default=False)
+    include_checks = _safe_bool(body.get("includeQueryChecks"), default=False)
+    data = run_tv_retention_maintenance(dry_run=dry_run, include_query_checks=include_checks)
+    ctx.send_json(200, data)
+
+
+def _handle_tv_observability_events_v2(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    limit = max(1, min(ctx.q_int("limit", default=100), 1000))
+    offset = max(0, ctx.q_int("offset", default=0))
+    binding_id = ctx.q_int("bindingId", "binding_id", default=0)
+    gym_id = ctx.q_int("gymId", "gym_id", default=0)
+    sources = _split_csv_upper(ctx.q("sources", "source", default=""))
+    data = list_tv_observability_events(
+        binding_id=(binding_id if binding_id > 0 else None),
+        gym_id=(gym_id if gym_id > 0 else None),
+        limit=limit,
+        offset=offset,
+        sources=(sources or None),
+    )
+    ctx.send_json(200, {"ok": True, **data})
 
 
 def _handle_tv_player_status(ctx: _Ctx) -> None:
@@ -1427,6 +1521,14 @@ def _handle_tv_ad_reconcile_all(ctx: _Ctx) -> None:
     ctx.send_json(200, result)
 
 
+def _handle_tv_ad_evaluate(ctx: _Ctx) -> None:
+    """POST /api/v2/tv/ad-runtime/evaluate — trigger due-task evaluation and injection cycle."""
+    ensure_tv_local_schema()
+    result = reconcile_all_active_gyms()
+    ctx.send_json(200, result)
+
+
+
 def _handle_tv_ad_startup_recover(ctx: _Ctx) -> None:
     """F27: Startup recovery — reset transient ad runtime states after crash."""
     result = startup_recover_ad_runtime()
@@ -1483,6 +1585,12 @@ def _handle_tv_ad_proofs_retry(ctx: _Ctx) -> None:
     result = retry_tv_ad_proof(app=ctx.app, local_proof_id=proof_id)
     code = 200 if bool(result.get("ok")) else 400
     ctx.send_json(code, result)
+
+
+def _handle_tv_ad_proofs_startup_recover(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    result = startup_recover_proof_outbox()
+    ctx.send_json(200, result)
 
 
 def _handle_tv_activation_status(ctx: _Ctx) -> None:
@@ -1717,9 +1825,10 @@ def _handle_tv_hardening_startup_runs(ctx: _Ctx) -> None:
 
 def _handle_tv_hardening_startup_run(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
-    body = ctx.body_json()
+    body = ctx.body()
     trigger_source = _safe_str(body.get("triggerSource") or body.get("trigger_source"), "API_MANUAL").strip() or "API_MANUAL"
     corr = _safe_str(body.get("correlationId") or body.get("correlation_id"), "").strip() or None
+    include_checks = _safe_bool(body.get("includeQueryChecks") or body.get("include_query_checks"), default=False)
     monitors = body.get("monitors")
     if not isinstance(monitors, list):
         monitors = None
@@ -1727,6 +1836,7 @@ def _handle_tv_hardening_startup_run(ctx: _Ctx) -> None:
         trigger_source=trigger_source,
         monitors=monitors,
         correlation_id=corr,
+        include_query_checks=include_checks,
     )
     if not bool(data.get("ok")) and _safe_str(data.get("result"), "").upper() == "BLOCKED":
         ctx.send_json(409, data)
@@ -1741,7 +1851,7 @@ def _handle_tv_hardening_retention_policy(ctx: _Ctx) -> None:
 
 def _handle_tv_hardening_retention_run(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
-    body = ctx.body_json()
+    body = ctx.body()
     dry_run = _safe_bool(body.get("dryRun"), default=False)
     include_checks = _safe_bool(body.get("includeQueryChecks"), default=True)
     data = run_tv_retention_maintenance(dry_run=dry_run, include_query_checks=include_checks)
@@ -1760,8 +1870,7 @@ def _handle_tv_hardening_preflight(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
     include_checks = _safe_bool(ctx.q("includeQueryChecks", "include_query_checks", default="0"), default=False)
     data = run_tv_deployment_preflight(include_query_checks=include_checks)
-    code = 200 if bool(data.get("ok")) else 503
-    ctx.send_json(code, data)
+    ctx.send_json(200, data)
 
 def _handle_tv_hardening_correlation_audit(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
@@ -2996,6 +3105,263 @@ def _handle_v1_enroll(ctx: _Ctx) -> None:
         ctx.send_json(code, result)
 
 
+
+# ---------------------------------------------------------------------------
+# TV Snapshot Sync handlers (A2)
+# ---------------------------------------------------------------------------
+
+def _handle_tv_snapshots_list(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_snapshot_cache
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    limit = max(1, min(ctx.q_int("limit", default=50), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_snapshot_cache(screen_id=screen_id, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_snapshots_latest(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import (ensure_tv_local_schema,
+        load_tv_latest_snapshot, list_tv_screen_bindings)
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    if screen_id <= 0:
+        # return latest for all screens
+        bindings = list_tv_screen_bindings()
+        results = []
+        for b in bindings:
+            sid = int(b.get("screen_id") or 0)
+            if sid > 0:
+                snap = load_tv_latest_snapshot(screen_id=sid)
+                if snap:
+                    results.append(snap)
+        ctx.send_json(200, {"ok": True, "snapshots": results})
+        return
+    snap = load_tv_latest_snapshot(screen_id=screen_id)
+    ctx.send_json(200, {"ok": True, "snapshot": snap})
+
+
+def _handle_tv_snapshot_assets(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import (ensure_tv_local_schema,
+        list_tv_snapshot_required_assets)
+    ensure_tv_local_schema()
+    snapshot_id = str(ctx.param("snapshotId") or "").strip()
+    if not snapshot_id:
+        ctx.send_json(400, {"ok": False, "error": "snapshotId is required"})
+        return
+    assets = list_tv_snapshot_required_assets(snapshot_id=snapshot_id)
+    ctx.send_json(200, {"ok": True, "assets": assets, "total": len(assets)})
+
+
+def _handle_tv_snapshots_sync(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_snapshot_sync
+    ensure_tv_local_schema()
+    import threading as _thr
+
+    def _run():
+        try:
+            result = run_tv_snapshot_sync(app=ctx.app)
+            ctx.app.logger.info("[TvSync] Manual sync result: ok=%s synced=%s",
+                                result.get("ok"), result.get("synced"))
+        except Exception as e:
+            ctx.app.logger.exception("[TvSync] Manual sync failed: %s", e)
+
+    _thr.Thread(target=_run, daemon=True).start()
+    ctx.send_json(202, {"ok": True, "message": "Snapshot sync started in background"})
+
+
+def _handle_tv_sync_runs(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_sync_run_logs
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0) or None
+    limit = max(1, min(ctx.q_int("limit", default=50), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_sync_run_logs(screen_id=screen_id, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+# ---------------------------------------------------------------------------
+# TV Asset Download handlers (A3)
+# ---------------------------------------------------------------------------
+
+def _handle_tv_assets_list(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import (ensure_tv_local_schema,
+        list_tv_cache_assets)
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    snapshot_id = str(ctx.param("snapshotId") or "").strip()
+    asset_state = str(ctx.param("state") or "").strip()
+    media_asset_id = str(ctx.param("mediaAssetId") or "").strip()
+    limit = max(1, min(ctx.q_int("limit", default=50), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_cache_assets(
+        screen_id=screen_id, snapshot_id=snapshot_id,
+        asset_state=asset_state, media_asset_id=media_asset_id,
+        limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_assets_download(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_asset_download
+    ensure_tv_local_schema()
+    import threading as _thr
+
+    body = ctx.body() if hasattr(ctx, "body_json") else {}
+    screen_id = ctx.q_int("screenId", default=0) or int(body.get("screenId") or 0) if isinstance(body, dict) else 0
+    snapshot_id = str(ctx.param("snapshotId") or "").strip()
+    if not snapshot_id and isinstance(body, dict):
+        snapshot_id = str(body.get("snapshotId") or "").strip()
+
+    def _run():
+        try:
+            result = run_tv_asset_download(
+                snapshot_id=snapshot_id, screen_id=screen_id, app=ctx.app)
+            ctx.app.logger.info(
+                "[TvDownload] Manual download result: ok=%s total=%s downloaded=%s",
+                result.get("ok"), result.get("total"), result.get("downloaded"))
+        except Exception as e:
+            ctx.app.logger.exception("[TvDownload] Manual download failed: %s", e)
+
+    _thr.Thread(target=_run, daemon=True).start()
+    ctx.send_json(202, {"ok": True, "message": "Asset download started in background"})
+
+
+def _handle_tv_asset_detail(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import (ensure_tv_local_schema,
+        load_tv_local_asset_state)
+    ensure_tv_local_schema()
+    media_asset_id = str(ctx.param("mediaAssetId") or "").strip()
+    if not media_asset_id:
+        ctx.send_json(400, {"ok": False, "error": "mediaAssetId is required"})
+        return
+    row = load_tv_local_asset_state(media_asset_id=media_asset_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "asset not found"})
+        return
+    ctx.send_json(200, {"ok": True, "asset": row})
+
+
+# ---------------------------------------------------------------------------
+# TV Readiness Engine (A4)
+# ---------------------------------------------------------------------------
+
+def _handle_tv_readiness_list(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_snapshot_readiness
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    data = list_tv_snapshot_readiness(screen_id=screen_id, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, **data})
+
+
+def _handle_tv_readiness_latest(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, load_tv_latest_readiness
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required"})
+        return
+    row = load_tv_latest_readiness(screen_id=screen_id)
+    if not row:
+        ctx.send_json(404, {"ok": False, "error": "Readiness state not found for screen."})
+        return
+    ctx.send_json(200, {"ok": True, "readiness": row})
+
+
+def _handle_tv_readiness_recompute(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_readiness_computation
+    import threading as _thr
+    ensure_tv_local_schema()
+    body = ctx.body() if hasattr(ctx, "body_json") else {}
+    screen_id = ctx.q_int("screenId", default=0) or int(body.get("screenId") or 0) if isinstance(body, dict) else 0
+
+    def _run():
+        try:
+            res = run_tv_readiness_computation(screen_id=screen_id)
+            ctx.app.logger.info("[TvReadiness] Batch recompute complete. Computed %s screens.", res.get("computed_count"))
+        except Exception as e:
+            ctx.app.logger.exception("[TvReadiness] Recompute failed: %s", e)
+
+    _thr.Thread(target=_run, daemon=True).start()
+    ctx.send_json(202, {"ok": True, "message": "Readiness engine recompute started in background."})
+
+
+# ---------------------------------------------------------------------------
+# TV Activation Engine (A5)
+# ---------------------------------------------------------------------------
+
+def _handle_tv_activation_list(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_activation_states
+    ensure_tv_local_schema()
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    states = list_tv_activation_states(limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "limit": limit, "offset": offset, "activation_states": states})
+
+
+def _handle_tv_activation_latest(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, load_tv_activation_state
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required"})
+        return
+    st = load_tv_activation_state(screen_id=screen_id)
+    if not st:
+        ctx.send_json(404, {"ok": False, "error": "Activation state not found for screen."})
+        return
+    ctx.send_json(200, {"ok": True, "state": st})
+
+
+def _handle_tv_activation_evaluate(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_activation_evaluation
+    import threading as _thr
+    ensure_tv_local_schema()
+    body = ctx.body() if hasattr(ctx, "body_json") else {}
+    screen_id = ctx.q_int("screenId", default=0) or int(body.get("screenId") or 0) if isinstance(body, dict) else 0
+
+    def _run():
+        try:
+            res = run_tv_activation_evaluation(screen_id=screen_id)
+            ctx.app.logger.info("[TvActivation] Evaluation complete: %s evaluated.", res.get("evaluated_count"))
+        except Exception as e:
+            ctx.app.logger.exception("[TvActivation] Evaluation failed: %s", e)
+
+    _thr.Thread(target=_run, daemon=True).start()
+    ctx.send_json(202, {"ok": True, "message": "Activation evaluation started in background."})
+
+
+def _handle_tv_activation_activate_latest_ready(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, activate_tv_ready_snapshot
+    ensure_tv_local_schema()
+    
+    body = ctx.body() if hasattr(ctx, "body_json") else {}
+    screen_id = ctx.q_int("screenId", default=0) or int(body.get("screenId") or 0) if isinstance(body, dict) else 0
+    
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId is required"})
+        return
+        
+    try:
+        res = activate_tv_ready_snapshot(screen_id=screen_id, trigger_source="API_MANUAL")
+        status_code = 200 if res["ok"] else 400
+        ctx.send_json(status_code, res)
+    except Exception as e:
+        ctx.app.logger.exception(f"[TvActivation] Error activating for screen {screen_id}")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_activation_attempts(ctx: _Ctx) -> None:
+    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_activation_attempts
+    ensure_tv_local_schema()
+    screen_id = ctx.q_int("screenId", default=0)
+    limit = max(1, min(ctx.q_int("limit", default=100), 500))
+    offset = max(0, ctx.q_int("offset", default=0))
+    rows = list_tv_activation_attempts(screen_id=screen_id, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "limit": limit, "offset": offset, "attempts": rows})
+
+
 # ---------------------------------------------------------------------------
 # Router setup
 # ---------------------------------------------------------------------------
@@ -3027,82 +3393,91 @@ def _build_router() -> _Router:
     r.add("GET", "/api/v2/sync/cache/infrastructures", _handle_sync_cache_infrastructures)
     r.add("GET", "/api/v2/sync/cache/credentials", _handle_sync_cache_credentials)
 
-    # ---- 4.4) TV Sync / Cache / Readiness
-    r.add("GET", "/api/v2/tv/binding", _handle_tv_binding_get)
-    r.add("PATCH", "/api/v2/tv/binding", _handle_tv_binding_patch)
+    # ---- TV Host orchestration (A9)
     r.add("GET", "/api/v2/tv/host/monitors", _handle_tv_host_monitors_get)
     r.add("POST", "/api/v2/tv/host/monitors/refresh", _handle_tv_host_monitors_refresh)
     r.add("GET", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_get)
     r.add("POST", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_post)
     r.add("PATCH", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_patch)
     r.add("DELETE", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_delete)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/status", _handle_tv_host_binding_status)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/events", _handle_tv_host_binding_events)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/runtime-event", _handle_tv_host_binding_runtime_event)
     r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/start", _handle_tv_host_binding_start)
     r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/stop", _handle_tv_host_binding_stop)
     r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/restart", _handle_tv_host_binding_restart)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/status", _handle_tv_host_binding_status)
+    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/events", _handle_tv_host_binding_events)
+    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/runtime-event", _handle_tv_host_binding_runtime_event)
+
+    # ---- TV Support / Recovery (A10)
     r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-summary", _handle_tv_host_binding_support_summary)
     r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/support-actions/run", _handle_tv_host_binding_support_action_run)
     r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-actions/history", _handle_tv_host_binding_support_action_history)
+
+    # ---- TV Observability / Retention (A11)
+    r.add("GET", "/api/v2/tv/observability/overview", _handle_tv_observability_overview)
+    r.add("GET", "/api/v2/tv/observability/bindings", _handle_tv_observability_bindings)
+    r.add("GET", "/api/v2/tv/observability/bindings/{bindingId}", _handle_tv_observability_binding_detail)
+    r.add("GET", "/api/v2/tv/observability/gyms", _handle_tv_observability_gyms)
+    r.add("GET", "/api/v2/tv/observability/gyms/{gymId}", _handle_tv_observability_gym_detail)
+    r.add("GET", "/api/v2/tv/observability/proofs", _handle_tv_observability_proofs_v2)
+    r.add("GET", "/api/v2/tv/observability/retention", _handle_tv_observability_retention)
+    r.add("POST", "/api/v2/tv/observability/retention/run", _handle_tv_observability_retention_run)
+    r.add("GET", "/api/v2/tv/observability/events", _handle_tv_observability_events_v2)
+
+    # ---- TV Startup / Preflight (A12)
+    r.add("GET", "/api/v2/tv/startup/latest", _handle_tv_hardening_startup_latest)
+    r.add("GET", "/api/v2/tv/startup/runs", _handle_tv_hardening_startup_runs)
+    r.add("POST", "/api/v2/tv/startup/run", _handle_tv_hardening_startup_run)
+    r.add("GET", "/api/v2/tv/startup/preflight", _handle_tv_hardening_preflight)
+
+    # ---- TV Snapshot Sync (A2)
+    r.add("GET", "/api/v2/tv/snapshots", _handle_tv_snapshots_list)
+    r.add("GET", "/api/v2/tv/snapshots/latest", _handle_tv_snapshots_latest)
+    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}/assets", _handle_tv_snapshot_assets)
+    r.add("POST", "/api/v2/tv/snapshots/sync", _handle_tv_snapshots_sync)
+    r.add("GET", "/api/v2/tv/sync-runs", _handle_tv_sync_runs)
+
+    # ---- TV Asset Download (A3)
+    r.add("GET", "/api/v2/tv/assets", _handle_tv_assets_list)
+    r.add("POST", "/api/v2/tv/assets/download", _handle_tv_assets_download)
+    r.add("GET", "/api/v2/tv/assets/{mediaAssetId}", _handle_tv_asset_detail)
+
+    # ---- TV Readiness Engine (A4)
+    r.add("GET", "/api/v2/tv/readiness", _handle_tv_readiness_list)
+    r.add("GET", "/api/v2/tv/readiness/latest", _handle_tv_readiness_latest)
+    r.add("POST", "/api/v2/tv/readiness/recompute", _handle_tv_readiness_recompute)
+
+    # ---- TV Activation Engine (A5)
+    r.add("GET", "/api/v2/tv/activation", _handle_tv_activation_list)
+    r.add("GET", "/api/v2/tv/activation/latest", _handle_tv_activation_latest)
+    r.add("POST", "/api/v2/tv/activation/evaluate", _handle_tv_activation_evaluate)
+    r.add("POST", "/api/v2/tv/activation/activate-latest-ready", _handle_tv_activation_activate_latest_ready)
+    r.add("GET", "/api/v2/tv/activation/attempts", _handle_tv_activation_attempts)
+
+    # ---- TV Player Runtime (A6)
     r.add("GET", "/api/v2/tv/player/{bindingId}/status", _handle_tv_player_status)
     r.add("GET", "/api/v2/tv/player/{bindingId}/render-context", _handle_tv_player_render_context)
     r.add("POST", "/api/v2/tv/player/{bindingId}/reevaluate", _handle_tv_player_reevaluate)
     r.add("POST", "/api/v2/tv/player/{bindingId}/reload", _handle_tv_player_reload)
     r.add("POST", "/api/v2/tv/player/{bindingId}/state", _handle_tv_player_state_report)
     r.add("GET", "/api/v2/tv/player/{bindingId}/events", _handle_tv_player_events)
-    r.add("POST", "/api/v2/tv/sync/run", _handle_tv_sync_run)
-    r.add("GET", "/api/v2/tv/sync/status", _handle_tv_sync_status)
-    r.add("GET", "/api/v2/tv/snapshots/latest", _handle_tv_snapshot_latest)
-    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}", _handle_tv_snapshot_by_id)
-    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}/manifest", _handle_tv_snapshot_manifest_by_id)
-    r.add("GET", "/api/v2/tv/readiness/latest", _handle_tv_readiness_latest)
-    r.add("GET", "/api/v2/tv/cache/assets", _handle_tv_cache_assets)
-    r.add("POST", "/api/v2/tv/downloads/run", _handle_tv_downloads_run)
-    r.add("GET", "/api/v2/tv/downloads/batches/latest", _handle_tv_downloads_latest_batch)
-    r.add("GET", "/api/v2/tv/downloads/jobs", _handle_tv_downloads_jobs)
-    r.add("POST", "/api/v2/tv/downloads/jobs/{jobId}/retry", _handle_tv_downloads_retry_job)
-    r.add("GET", "/api/v2/tv/ad-tasks", _handle_tv_ad_tasks_list)
-    r.add("POST", "/api/v2/tv/ad-tasks/fetch", _handle_tv_ad_tasks_fetch)
-    r.add("POST", "/api/v2/tv/ad-tasks/prepare", _handle_tv_ad_tasks_prepare)
-    r.add("POST", "/api/v2/tv/ad-tasks/cycle", _handle_tv_ad_tasks_cycle)
-    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/retry-prepare", _handle_tv_ad_tasks_retry_prepare)
-    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/retry-confirm", _handle_tv_ad_tasks_retry_confirm)
-    r.add("GET", "/api/v2/tv/ad-tasks/runtime", _handle_tv_ad_tasks_runtime_list)
-    r.add("GET", "/api/v2/tv/ad-tasks/{taskId}/runtime", _handle_tv_ad_tasks_runtime_one)
-    r.add("GET", "/api/v2/tv/gym-ad-runtime/{gymId}", _handle_tv_gym_ad_runtime_one)
-    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/inject-now", _handle_tv_ad_tasks_inject_now)
-    r.add("POST", "/api/v2/tv/ad-tasks/{taskId}/abort", _handle_tv_ad_tasks_abort)
-    r.add("POST", "/api/v2/tv/ad-tasks/reconcile-all", _handle_tv_ad_reconcile_all)
-    r.add("POST", "/api/v2/tv/ad-tasks/startup-recover", _handle_tv_ad_startup_recover)
-    r.add("GET", "/api/v2/tv/ad-proofs", _handle_tv_ad_proofs_list)
-    r.add("GET", "/api/v2/tv/ad-proofs/{proofId}", _handle_tv_ad_proofs_one)
-    r.add("POST", "/api/v2/tv/ad-proofs/process-outbox", _handle_tv_ad_proofs_process_outbox)
-    r.add("POST", "/api/v2/tv/ad-proofs/{proofId}/retry", _handle_tv_ad_proofs_retry)
-    r.add("GET", "/api/v2/tv/activation/status", _handle_tv_activation_status)
-    r.add("POST", "/api/v2/tv/activation/evaluate", _handle_tv_activation_evaluate)
-    r.add("POST", "/api/v2/tv/activation/activate-latest-ready", _handle_tv_activation_activate_latest_ready)
-    r.add("GET", "/api/v2/tv/activation/history", _handle_tv_activation_history)
 
-    # ---- 4.45) TV Observability
-    r.add("GET", "/api/v2/tv/observability/overview", _handle_tv_observability_overview)
-    r.add("GET", "/api/v2/tv/observability/fleet-health", _handle_tv_observability_fleet_health)
-    r.add("GET", "/api/v2/tv/observability/screens/{screenId}", _handle_tv_observability_screen_details)
-    r.add("GET", "/api/v2/tv/observability/screens/{screenId}/timeline", _handle_tv_observability_screen_timeline)
-    r.add("GET", "/api/v2/tv/observability/heartbeats", _handle_tv_observability_heartbeats)
-    r.add("GET", "/api/v2/tv/observability/runtime-events", _handle_tv_observability_runtime_events)
-    r.add("GET", "/api/v2/tv/observability/proof-events", _handle_tv_observability_proof_events)
-    r.add("GET", "/api/v2/tv/observability/stats/proof", _handle_tv_observability_proof_stats)
-    r.add("GET", "/api/v2/tv/observability/stats/runtime", _handle_tv_observability_runtime_stats)
-    # ---- 4.46) TV hardening / recovery
-    r.add("GET", "/api/v2/tv/hardening/preflight", _handle_tv_hardening_preflight)
-    r.add("GET", "/api/v2/tv/hardening/startup/latest", _handle_tv_hardening_startup_latest)
-    r.add("GET", "/api/v2/tv/hardening/startup/runs", _handle_tv_hardening_startup_runs)
-    r.add("POST", "/api/v2/tv/hardening/startup/run", _handle_tv_hardening_startup_run)
-    r.add("GET", "/api/v2/tv/hardening/retention-policy", _handle_tv_hardening_retention_policy)
-    r.add("POST", "/api/v2/tv/hardening/retention/run", _handle_tv_hardening_retention_run)
-    r.add("GET", "/api/v2/tv/hardening/query-checks", _handle_tv_hardening_query_checks)
-    r.add("GET", "/api/v2/tv/hardening/correlation-audit", _handle_tv_hardening_correlation_audit)
+    # ---- TV Ad Runtime (A7)
+    r.add("GET",  "/api/v2/tv/ad-runtime/tasks",                     _handle_tv_ad_tasks_list)
+    r.add("GET",  "/api/v2/tv/ad-runtime/tasks/{taskId}",             _handle_tv_ad_tasks_runtime_one)
+    r.add("GET",  "/api/v2/tv/ad-runtime/gyms/{gymId}",               _handle_tv_gym_ad_runtime_one)
+    r.add("POST", "/api/v2/tv/ad-runtime/evaluate",                   _handle_tv_ad_evaluate)
+    r.add("POST", "/api/v2/tv/ad-runtime/tasks/{taskId}/inject-now",  _handle_tv_ad_tasks_inject_now)
+    r.add("POST", "/api/v2/tv/ad-runtime/tasks/{taskId}/abort",       _handle_tv_ad_tasks_abort)
+    r.add("GET",  "/api/v2/tv/ad-runtime/runtime/list",               _handle_tv_ad_tasks_runtime_list)
+    r.add("GET",  "/api/v2/tv/ad-runtime/runtime/{taskId}",           _handle_tv_ad_tasks_runtime_one)
+    r.add("POST", "/api/v2/tv/ad-runtime/startup-recover",            _handle_tv_ad_startup_recover)
+
+    # ---- TV Ad Proofs / Outbox (A8)
+    r.add("GET",  "/api/v2/tv/ad-proofs",                             _handle_tv_ad_proofs_list)
+    r.add("GET",  "/api/v2/tv/ad-proofs/{proofId}",                   _handle_tv_ad_proofs_one)
+    r.add("POST", "/api/v2/tv/ad-proofs/process-outbox",              _handle_tv_ad_proofs_process_outbox)
+    r.add("POST", "/api/v2/tv/ad-proofs/{proofId}/retry",             _handle_tv_ad_proofs_retry)
+    r.add("POST", "/api/v2/tv/ad-proofs/startup-recover",             _handle_tv_ad_proofs_startup_recover)
 
     # ---- 4.5) Offline creation queue
     r.add("GET", "/api/v2/offline-creations/active", _handle_offline_creations_active)
