@@ -2692,7 +2692,7 @@ def load_tv_ad_proof(*, local_proof_id: int = 0, **kwargs) -> Optional[Dict[str,
 
 def _send_one_proof(*, proof: Dict[str, Any]) -> Dict[str, Any]:
     """Attempt to submit one proof row to the backend. Returns result dict."""
-    from app.api.monclub_api import MonClubApiHttpError
+    from shared.api.monclub_api import MonClubApiHttpError
     task_id_str = str(proof.get("campaign_task_id") or "")
     try:
         task_id_int = int(task_id_str)
@@ -3001,7 +3001,7 @@ def _save_snapshot(*args, **kwargs): pass
 def _build_tv_api():
     """Build a MonClubApi instance with TV snapshot URLs from config."""
     from app.core.config import load_config
-    from app.api.monclub_api import MonClubApi, ApiEndpoints
+    from shared.api.monclub_api import MonClubApi, ApiEndpoints
 
     cfg = load_config()
     login_url = getattr(cfg, "api_login_url", "")

@@ -18,7 +18,7 @@ def safe_collect_submodules(pkg: str):
 # Since build_release.ps1 sets CWD to repo root, we use Path.cwd().
 ROOT = Path.cwd().resolve()
 
-APP_ENTRY = str(ROOT / "app" / "main.py")
+APP_ENTRY = str(ROOT / "access" / "main.py")
 SDK_DIR = ROOT / "app" / "sdk"
 
 # --------------------------
@@ -65,6 +65,10 @@ hiddenimports += safe_collect_submodules("app.ui")
 hiddenimports += safe_collect_submodules("app.ui.pages")
 hiddenimports += safe_collect_submodules("app.ui.pages.popups")
 hiddenimports += safe_collect_submodules("app.sdk")
+hiddenimports += safe_collect_submodules("access")
+hiddenimports += safe_collect_submodules("shared")
+hiddenimports += safe_collect_submodules("shared.api")
+hiddenimports += safe_collect_submodules("tv")
 
 a = Analysis(
     [APP_ENTRY],

@@ -19,8 +19,8 @@ faulthandler.enable(all_threads=True)
 print("step 1: starting main.py", flush=True)
 
 if __name__ == "__main__":
-    print("step 2: before importing run_app", flush=True)
-    from app.ui.app import run_app
-    print("step 3: after importing run_app", flush=True)
-    run_app()
-    print("step 4: after run_app()", flush=True)
+    print("step 2: before importing access.main", flush=True)
+    from access.main import main
+    print("step 3: after importing access.main", flush=True)
+    main()
+    print("step 4: after access.main()", flush=True)

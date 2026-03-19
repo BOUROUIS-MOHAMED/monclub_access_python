@@ -3,9 +3,9 @@ setlocal
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" -m app.main
+  ".venv\Scripts\python.exe" -m access.main
 ) else (
-  python -m app.main
+  python -m access.main
 )
 
 pause

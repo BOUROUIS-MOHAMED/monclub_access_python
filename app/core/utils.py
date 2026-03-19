@@ -98,6 +98,23 @@ VERSIONS_DIR = DATA_ROOT / "versions"
 CONFIG_PATH = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "app.db"
 
+# Phase 1 split-ready storage scaffolding. The live runtime still uses the
+# legacy combined paths above until later migration phases move data into
+# separate Access/TV databases and config files.
+ACCESS_DATA_DIR = DATA_ROOT / "access"
+TV_DATA_DIR = DATA_ROOT / "tv"
+SHARED_DATA_DIR = DATA_ROOT / "shared"
+
+ACCESS_LOG_DIR = ACCESS_DATA_DIR / "logs"
+TV_LOG_DIR = TV_DATA_DIR / "logs"
+
+ACCESS_CONFIG_PATH = ACCESS_DATA_DIR / "config.json"
+TV_CONFIG_PATH = TV_DATA_DIR / "config.json"
+SHARED_INSTALL_CONFIG_PATH = SHARED_DATA_DIR / "install.json"
+
+ACCESS_DB_PATH = ACCESS_DATA_DIR / "access.db"
+TV_DB_PATH = TV_DATA_DIR / "tv.db"
+
 
 def _dir_has_any_files(p: Path) -> bool:
     try:
@@ -127,7 +144,19 @@ def ensure_dirs() -> None:
 
     _migrate_legacy_data_if_needed()
 
-    for p in (DATA_DIR, LOG_DIR, CACHE_DIR, IMAGES_CACHE_DIR, BACKUP_DIR, VERSIONS_DIR):
+    for p in (
+        DATA_DIR,
+        LOG_DIR,
+        CACHE_DIR,
+        IMAGES_CACHE_DIR,
+        BACKUP_DIR,
+        VERSIONS_DIR,
+        ACCESS_DATA_DIR,
+        ACCESS_LOG_DIR,
+        TV_DATA_DIR,
+        TV_LOG_DIR,
+        SHARED_DATA_DIR,
+    ):
         try:
             p.mkdir(parents=True, exist_ok=True)
         except Exception:

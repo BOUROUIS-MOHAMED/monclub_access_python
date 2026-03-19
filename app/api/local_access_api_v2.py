@@ -23,8 +23,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-# TV local cache — imported at module level so all TV handlers can reference functions directly
-from app.core.tv_local_cache import (  # noqa: E402
+# TV boundary — imported through the phase 1 TV facade so new code does not
+# depend on the legacy implementation module directly.
+from tv.api import (  # noqa: E402
     ensure_tv_local_schema,
     # Screen bindings
     load_tv_screen_binding, load_tv_screen_binding_by_id, save_tv_screen_binding,
@@ -294,7 +295,7 @@ def _handle_health(ctx: _Ctx) -> None:
 
 
 def _handle_platform(ctx: _Ctx) -> None:
-    from app.core.arch import platform_summary
+    from shared.platform import platform_summary
     from app.core.utils import is_frozen, DATA_ROOT
     import sys
     ctx.send_json(200, {
@@ -2929,7 +2930,7 @@ def _handle_update_install(ctx: _Ctx) -> None:
 
 def _handle_db_tables(ctx: _Ctx) -> None:
     from app.core.db import get_conn
-    from app.core.utils import DB_PATH
+    from access.storage import current_access_runtime_db_path
     tables = []
     try:
         with get_conn() as conn:
@@ -2943,7 +2944,7 @@ def _handle_db_tables(ctx: _Ctx) -> None:
 
     db_size = 0
     try:
-        db_size = os.path.getsize(str(DB_PATH))
+        db_size = os.path.getsize(str(current_access_runtime_db_path()))
     except Exception:
         pass
 
@@ -3024,7 +3025,7 @@ def _handle_db_export(ctx: _Ctx) -> None:
 
 def _handle_db_stats(ctx: _Ctx) -> None:
     from app.core.db import get_conn
-    from app.core.utils import DB_PATH
+    from access.storage import current_access_runtime_db_path
     info: Dict[str, Any] = {}
     try:
         with get_conn() as conn:
@@ -3036,7 +3037,7 @@ def _handle_db_stats(ctx: _Ctx) -> None:
                 c = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
                 sizes[name] = c
             info["tableSizes"] = sizes
-        info["dbSizeBytes"] = os.path.getsize(str(DB_PATH))
+        info["dbSizeBytes"] = os.path.getsize(str(current_access_runtime_db_path()))
     except Exception as e:
         info["error"] = str(e)
     ctx.send_json(200, info)
@@ -3111,7 +3112,7 @@ def _handle_v1_enroll(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_tv_snapshots_list(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_snapshot_cache
+    from tv.api import ensure_tv_local_schema, list_tv_snapshot_cache
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
     limit = max(1, min(ctx.q_int("limit", default=50), 500))
@@ -3121,7 +3122,7 @@ def _handle_tv_snapshots_list(ctx: _Ctx) -> None:
 
 
 def _handle_tv_snapshots_latest(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import (ensure_tv_local_schema,
+    from tv.api import (ensure_tv_local_schema,
         load_tv_latest_snapshot, list_tv_screen_bindings)
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
@@ -3142,7 +3143,7 @@ def _handle_tv_snapshots_latest(ctx: _Ctx) -> None:
 
 
 def _handle_tv_snapshot_assets(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import (ensure_tv_local_schema,
+    from tv.api import (ensure_tv_local_schema,
         list_tv_snapshot_required_assets)
     ensure_tv_local_schema()
     snapshot_id = str(ctx.param("snapshotId") or "").strip()
@@ -3154,7 +3155,7 @@ def _handle_tv_snapshot_assets(ctx: _Ctx) -> None:
 
 
 def _handle_tv_snapshots_sync(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_snapshot_sync
+    from tv.api import ensure_tv_local_schema, run_tv_snapshot_sync
     ensure_tv_local_schema()
     import threading as _thr
 
@@ -3171,7 +3172,7 @@ def _handle_tv_snapshots_sync(ctx: _Ctx) -> None:
 
 
 def _handle_tv_sync_runs(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_sync_run_logs
+    from tv.api import ensure_tv_local_schema, list_tv_sync_run_logs
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0) or None
     limit = max(1, min(ctx.q_int("limit", default=50), 500))
@@ -3185,7 +3186,7 @@ def _handle_tv_sync_runs(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_tv_assets_list(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import (ensure_tv_local_schema,
+    from tv.api import (ensure_tv_local_schema,
         list_tv_cache_assets)
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
@@ -3202,7 +3203,7 @@ def _handle_tv_assets_list(ctx: _Ctx) -> None:
 
 
 def _handle_tv_assets_download(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_asset_download
+    from tv.api import ensure_tv_local_schema, run_tv_asset_download
     ensure_tv_local_schema()
     import threading as _thr
 
@@ -3227,7 +3228,7 @@ def _handle_tv_assets_download(ctx: _Ctx) -> None:
 
 
 def _handle_tv_asset_detail(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import (ensure_tv_local_schema,
+    from tv.api import (ensure_tv_local_schema,
         load_tv_local_asset_state)
     ensure_tv_local_schema()
     media_asset_id = str(ctx.param("mediaAssetId") or "").strip()
@@ -3246,7 +3247,7 @@ def _handle_tv_asset_detail(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_tv_readiness_list(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_snapshot_readiness
+    from tv.api import ensure_tv_local_schema, list_tv_snapshot_readiness
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
     limit = max(1, min(ctx.q_int("limit", default=100), 500))
@@ -3256,7 +3257,7 @@ def _handle_tv_readiness_list(ctx: _Ctx) -> None:
 
 
 def _handle_tv_readiness_latest(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, load_tv_latest_readiness
+    from tv.api import ensure_tv_local_schema, load_tv_latest_readiness
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
     if screen_id <= 0:
@@ -3270,7 +3271,7 @@ def _handle_tv_readiness_latest(ctx: _Ctx) -> None:
 
 
 def _handle_tv_readiness_recompute(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_readiness_computation
+    from tv.api import ensure_tv_local_schema, run_tv_readiness_computation
     import threading as _thr
     ensure_tv_local_schema()
     body = ctx.body() if hasattr(ctx, "body_json") else {}
@@ -3292,7 +3293,7 @@ def _handle_tv_readiness_recompute(ctx: _Ctx) -> None:
 # ---------------------------------------------------------------------------
 
 def _handle_tv_activation_list(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_activation_states
+    from tv.api import ensure_tv_local_schema, list_tv_activation_states
     ensure_tv_local_schema()
     limit = max(1, min(ctx.q_int("limit", default=100), 500))
     offset = max(0, ctx.q_int("offset", default=0))
@@ -3301,7 +3302,7 @@ def _handle_tv_activation_list(ctx: _Ctx) -> None:
 
 
 def _handle_tv_activation_latest(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, load_tv_activation_state
+    from tv.api import ensure_tv_local_schema, load_tv_activation_state
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
     if screen_id <= 0:
@@ -3315,7 +3316,7 @@ def _handle_tv_activation_latest(ctx: _Ctx) -> None:
 
 
 def _handle_tv_activation_evaluate(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, run_tv_activation_evaluation
+    from tv.api import ensure_tv_local_schema, run_tv_activation_evaluation
     import threading as _thr
     ensure_tv_local_schema()
     body = ctx.body() if hasattr(ctx, "body_json") else {}
@@ -3333,7 +3334,7 @@ def _handle_tv_activation_evaluate(ctx: _Ctx) -> None:
 
 
 def _handle_tv_activation_activate_latest_ready(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, activate_tv_ready_snapshot
+    from tv.api import ensure_tv_local_schema, activate_tv_ready_snapshot
     ensure_tv_local_schema()
     
     body = ctx.body() if hasattr(ctx, "body_json") else {}
@@ -3353,7 +3354,7 @@ def _handle_tv_activation_activate_latest_ready(ctx: _Ctx) -> None:
 
 
 def _handle_tv_activation_attempts(ctx: _Ctx) -> None:
-    from app.core.tv_local_cache import ensure_tv_local_schema, list_tv_activation_attempts
+    from tv.api import ensure_tv_local_schema, list_tv_activation_attempts
     ensure_tv_local_schema()
     screen_id = ctx.q_int("screenId", default=0)
     limit = max(1, min(ctx.q_int("limit", default=100), 500))
