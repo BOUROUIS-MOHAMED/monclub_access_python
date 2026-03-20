@@ -78,9 +78,6 @@
   }
 
   body[data-desktop-role="tv"] {
-    background:
-      radial-gradient(circle at top left, rgba(6, 182, 212, 0.18), transparent 34%),
-      radial-gradient(circle at top right, rgba(245, 158, 11, 0.18), transparent 28%),
-      linear-gradient(180deg, #07111f 0%, #0f172a 52%, #101826 100%);
+    background: #131418;
   }
 }

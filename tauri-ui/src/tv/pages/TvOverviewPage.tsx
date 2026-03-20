@@ -81,6 +81,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { TvOverviewSectionId } from "@/tv/navigation";
+import { ensureTvPlayerWindow } from "@/tv/runtime/playerWindows";
 
 const SAFE_ACTIONS: TvBindingSupportActionType[] = [
   "RUN_SYNC",
@@ -126,17 +127,17 @@ const ACTION_DESCRIPTIONS: Partial<Record<TvBindingSupportActionType, string>> =
 function healthBadgeClass(health: TvBindingHealthSummary | undefined) {
   switch (health) {
     case "HEALTHY":
-      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-400";
     case "WARNING":
-      return "border-amber-200 bg-amber-50 text-amber-700";
+      return "border-amber-500/30 bg-amber-500/10 text-amber-400";
     case "DEGRADED":
-      return "border-orange-200 bg-orange-50 text-orange-700";
+      return "border-orange-500/30 bg-orange-500/10 text-orange-400";
     case "ERROR":
-      return "border-red-200 bg-red-50 text-red-700";
+      return "border-red-500/30 bg-red-500/10 text-red-400";
     case "STOPPED":
-      return "border-slate-200 bg-slate-50 text-slate-700";
+      return "border-border bg-muted text-muted-foreground";
     default:
-      return "border-slate-200 bg-slate-50 text-slate-700";
+      return "border-border bg-muted text-muted-foreground";
   }
 }
 
@@ -144,22 +145,22 @@ function startupBadgeClass(status: string | null | undefined) {
   switch (status) {
     case "SUCCESS":
     case "PASSED":
-      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+      return "border-emerald-500/30 bg-emerald-500/10 text-emerald-400";
     case "SUCCESS_WITH_WARNINGS":
     case "WARNING":
     case "REPAIRED":
-      return "border-amber-200 bg-amber-50 text-amber-700";
+      return "border-amber-500/30 bg-amber-500/10 text-amber-400";
     case "BLOCKER":
     case "FAILED":
     case "ERROR":
-      return "border-red-200 bg-red-50 text-red-700";
+      return "border-red-500/30 bg-red-500/10 text-red-400";
     case "INFO":
-      return "border-sky-200 bg-sky-50 text-sky-700";
+      return "border-sky-500/30 bg-sky-500/10 text-sky-400";
     case "SKIPPED":
     case "BLOCKED":
-      return "border-slate-200 bg-slate-50 text-slate-700";
+      return "border-border bg-muted text-muted-foreground";
     default:
-      return "border-slate-200 bg-slate-50 text-slate-700";
+      return "border-border bg-muted text-muted-foreground";
   }
 }
 
@@ -207,8 +208,8 @@ const TV_SECTION_ELEMENT_IDS: Record<TvOverviewSectionId, string> = {
 
 function sectionShellClass(sectionId: TvOverviewSectionId, focusSection: TvOverviewSectionId) {
   return cn(
-    "scroll-mt-6 rounded-[2rem] transition-all duration-300",
-    focusSection === sectionId && "ring-1 ring-cyan-300/35 ring-offset-4 ring-offset-transparent",
+    "scroll-mt-6 rounded-xl transition-all duration-200",
+    focusSection === sectionId && "ring-1 ring-primary/30 ring-offset-2 ring-offset-background",
   );
 }
 
@@ -416,11 +417,19 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
   const handleStart = useCallback(async (bindingId: number) => {
     try {
       await startTvHostBinding(bindingId);
+      const binding = bindings.find((item) => item.id === bindingId) ?? null;
+      if (binding) {
+        const monitorList = await availableMonitors();
+        const result = await ensureTvPlayerWindow(binding, monitorList);
+        if (!result.ok) {
+          setError(result.reason);
+        }
+      }
       await fetchData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start binding.");
     }
-  }, [fetchData]);
+  }, [bindings, fetchData]);
 
   const handleStop = useCallback(async (bindingId: number) => {
     try {
@@ -434,11 +443,16 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
   const handleRestart = useCallback(async (bindingId: number) => {
     try {
       await restartTvHostBinding(bindingId);
+      const binding = bindings.find((item) => item.id === bindingId) ?? null;
+      if (binding) {
+        const monitorList = await availableMonitors();
+        await ensureTvPlayerWindow(binding, monitorList);
+      }
       await fetchData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to restart binding.");
     }
-  }, [fetchData]);
+  }, [bindings, fetchData]);
 
   const handleDelete = useCallback(async (bindingId: number) => {
     if (!window.confirm("Delete this binding?")) {
@@ -570,64 +584,67 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
 
   return (
     <div className="space-y-6 text-foreground">
-      <div className="relative overflow-hidden rounded-[2rem] border border-white/10 bg-[linear-gradient(135deg,rgba(8,24,44,0.96),rgba(14,23,38,0.92)_46%,rgba(11,77,94,0.84)_100%)] p-6 text-white shadow-[0_30px_80px_rgba(2,8,23,0.45)] md:p-8">
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(34,211,238,0.18),transparent_34%),radial-gradient(circle_at_80%_20%,rgba(245,158,11,0.14),transparent_28%)]" />
-        <div className="relative space-y-6">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-            <div className="space-y-3">
-              <div className="inline-flex items-center gap-2 rounded-full border border-cyan-300/20 bg-cyan-300/10 px-3 py-1 text-xs font-medium tracking-[0.18em] text-cyan-100 uppercase">
-                <Monitor className="h-3.5 w-3.5" />
-                MonClub TV Host Console
-              </div>
-              <div className="space-y-2">
-                <h2 className="text-2xl font-semibold tracking-tight md:text-3xl">Modern supervision for bindings, startup safety, and TV runtime recovery.</h2>
-                <p className="max-w-3xl text-sm leading-6 text-slate-200/85 md:text-base">
-                  Navigate like a real operations dashboard: global health on top, dedicated routes for updates and startup diagnostics, and quick access to every binding support action.
-                </p>
+      <div className="rounded-xl border border-border bg-card p-5 md:p-6">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+          <div className="space-y-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <div className="inline-flex items-center gap-1.5 rounded-md border border-primary/25 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary uppercase tracking-wide">
+                <Monitor className="h-3 w-3" />
+                Host Console
               </div>
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                className="border-white/[0.15] bg-white/[0.05] text-white hover:bg-white/[0.10] hover:text-white"
-                onClick={() => void fetchData()}
-                disabled={loading}
-              >
-                <RefreshCw className={cn("mr-2 h-3.5 w-3.5", loading && "animate-spin")} />
-                Refresh Host
-              </Button>
-              <Button
-                size="sm"
-                className="bg-white text-slate-950 hover:bg-white/90"
-                onClick={() => void handleCreateNew()}
-              >
-                Create Binding
-              </Button>
-            </div>
+            <h2 className="text-xl font-semibold tracking-tight text-foreground">
+              TV Command Center
+            </h2>
+            <p className="text-[13px] leading-5 text-muted-foreground max-w-2xl">
+              Global health, binding pressure, and quick operator actions for the signage runtime.
+            </p>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.08] p-4 backdrop-blur-sm">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Bindings</div>
-              <div className="mt-3 text-3xl font-semibold">{overview?.totals.totalBindings ?? bindings.length}</div>
-              <div className="mt-2 text-sm text-slate-300">Healthy {overview?.totals.healthyBindings ?? 0} · attention {attentionBindingCount}</div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void fetchData()}
+              disabled={loading}
+            >
+              <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", loading && "animate-spin")} />
+              Refresh
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => void handleCreateNew()}
+            >
+              Create Binding
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-5 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-lg border border-border bg-muted/40 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Bindings</div>
+            <div className="mt-2 text-2xl font-semibold text-foreground">{overview?.totals.totalBindings ?? bindings.length}</div>
+            <div className="mt-1 text-[12px] text-muted-foreground">
+              {overview?.totals.healthyBindings ?? 0} healthy · {attentionBindingCount} need attention
             </div>
-            <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.08] p-4 backdrop-blur-sm">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Displays</div>
-              <div className="mt-3 text-3xl font-semibold">{connectedMonitorCount}</div>
-              <div className="mt-2 text-sm text-slate-300">{monitors.length} detected monitor(s) on this host</div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Displays</div>
+            <div className="mt-2 text-2xl font-semibold text-foreground">{connectedMonitorCount}</div>
+            <div className="mt-1 text-[12px] text-muted-foreground">{monitors.length} monitor(s) detected on this host</div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Startup Safety</div>
+            <div className="mt-2 text-2xl font-semibold text-foreground">{startupPreflight?.counts.blockerCount ?? 0}</div>
+            <div className="mt-1 text-[12px] text-muted-foreground">
+              Blocker(s) · latest {startupLatest?.status ?? "NO_RUN"}
             </div>
-            <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.08] p-4 backdrop-blur-sm">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Startup Safety</div>
-              <div className="mt-3 text-3xl font-semibold">{startupPreflight?.counts.blockerCount ?? 0}</div>
-              <div className="mt-2 text-sm text-slate-300">Blocker(s) · latest run {startupLatest?.status ?? "NO_RUN"}</div>
-            </div>
-            <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.08] p-4 backdrop-blur-sm">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-slate-300">Updater</div>
-              <div className="mt-3 text-3xl font-semibold">{updateStatus?.updateAvailable ? "Ready" : "Current"}</div>
-              <div className="mt-2 text-sm text-slate-300">{updateStatus?.componentDisplayName || "MonClub TV"} · {updateStatus?.channel || "stable"}</div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Updater</div>
+            <div className="mt-2 text-2xl font-semibold text-foreground">{updateStatus?.updateAvailable ? "Ready" : "Current"}</div>
+            <div className="mt-1 text-[12px] text-muted-foreground">
+              {updateStatus?.componentDisplayName || "MonClub TV"} · {updateStatus?.channel || "stable"}
             </div>
           </div>
         </div>
@@ -643,63 +660,65 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       {showOverviewPage && (
       <section id={TV_SECTION_ELEMENT_IDS.overview} className={sectionShellClass("overview", focusSection)}>
         {overview && (
-        <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <HeartPulse className="h-4 w-4" />
+        <Card className="border-border bg-card shadow-none">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-[15px]">
+              <HeartPulse className="h-4 w-4 text-primary" />
               Host Observability
             </CardTitle>
-            <CardDescription>Derived host-level health, proof backlog, and stale/problem signals from factual TV runtime state.</CardDescription>
+            <CardDescription className="text-[13px]">
+              Derived host-level health, proof backlog, and stale/problem signals from factual TV runtime state.
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
-              <div className="rounded-2xl border bg-card p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Bindings</div>
-                <div className="mt-2 text-2xl font-semibold">{overview.totals.totalBindings}</div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  Healthy {overview.totals.healthyBindings} · Warning {overview.totals.warningBindings} · Degraded {overview.totals.degradedBindings} · Error {overview.totals.errorBindings} · Stopped {overview.totals.stoppedBindings}
+            <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-5">
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-3">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Bindings</div>
+                <div className="mt-2 text-xl font-semibold text-foreground">{overview.totals.totalBindings}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground leading-4">
+                  {overview.totals.healthyBindings} healthy · {overview.totals.warningBindings} warn · {overview.totals.errorBindings} error
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Runtime</div>
-                <div className="mt-2 text-2xl font-semibold">{overview.totals.activePlayerWindows}</div>
-                <div className="mt-2 text-xs text-muted-foreground">
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-3">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Runtime</div>
+                <div className="mt-2 text-xl font-semibold text-foreground">{overview.totals.activePlayerWindows}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground leading-4">
                   Player windows · {overview.totals.activeMonitors} active monitor(s)
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Ad / Proof</div>
-                <div className="mt-2 text-2xl font-semibold">{overview.totals.queuedOrRetryableProofCount}</div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  Queued or retryable proofs · {overview.totals.activeGymAdRuntimes} active gym ad runtime(s)
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-3">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Ad / Proof</div>
+                <div className="mt-2 text-xl font-semibold text-foreground">{overview.totals.queuedOrRetryableProofCount}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground leading-4">
+                  Queued · {overview.totals.activeGymAdRuntimes} gym ad runtime(s)
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Recovery Load</div>
-                <div className="mt-2 text-2xl font-semibold">{overview.totals.recentFailedDownloadsCount}</div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  Failed asset(s) · {overview.totals.recentSupportActionsCount} support action(s) in the last {overview.recentSupportWindowHours}h
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-3">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Recovery</div>
+                <div className="mt-2 text-xl font-semibold text-foreground">{overview.totals.recentFailedDownloadsCount}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground leading-4">
+                  Failed asset(s) · {overview.totals.recentSupportActionsCount} actions in {overview.recentSupportWindowHours}h
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Problem Bindings</div>
-                <div className="mt-2 text-2xl font-semibold">{overview.totals.staleProblemBindingsCount}</div>
-                <div className="mt-2 text-xs text-muted-foreground">
-                  Bindings with stale or unhealthy runtime signals
+              <div className="rounded-lg border border-border bg-muted/40 px-3 py-3">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">Problems</div>
+                <div className="mt-2 text-xl font-semibold text-foreground">{overview.totals.staleProblemBindingsCount}</div>
+                <div className="mt-1 text-[11px] text-muted-foreground leading-4">
+                  Stale or unhealthy bindings
                 </div>
               </div>
             </div>
             {overview.problemBindings.length > 0 && (
               <div className="space-y-2">
-                <div className="text-sm font-medium">Bindings needing attention</div>
+                <div className="text-[13px] font-medium text-foreground">Bindings needing attention</div>
                 <div className="grid gap-2 md:grid-cols-2">
                   {overview.problemBindings.slice(0, 4).map((row) => (
-                    <div key={row.bindingId} className="rounded-2xl border px-3 py-2 text-sm">
+                    <div key={row.bindingId} className="rounded-lg border border-border bg-muted/30 px-3 py-2">
                       <div className="flex items-center justify-between gap-2">
-                        <span className="font-medium">{row.screenLabel}</span>
-                        <Badge className={cn("border", healthBadgeClass(row.health))}>{row.health}</Badge>
+                        <span className="text-[13px] font-medium text-foreground">{row.screenLabel}</span>
+                        <Badge className={cn("border text-[11px]", healthBadgeClass(row.health))}>{row.health}</Badge>
                       </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
+                      <div className="mt-1 text-[11px] text-muted-foreground">
                         {row.reasons[0] || (row.stale ? "Runtime is stale." : "Needs operator attention.")}
                       </div>
                     </div>
@@ -716,14 +735,14 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       {showUpdatesPage && (
       <section id={TV_SECTION_ELEMENT_IDS.updates} className={sectionShellClass("updates", focusSection)}>
         {updateStatus ? (
-        <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
-          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <Card className="border-border bg-card shadow-none">
+          <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-3">
             <div>
-              <CardTitle className="flex items-center gap-2">
-                <Download className="h-4 w-4" />
+              <CardTitle className="flex items-center gap-2 text-[15px]">
+                <Download className="h-4 w-4 text-primary" />
                 TV Updates
               </CardTitle>
-              <CardDescription>
+              <CardDescription className="text-[13px]">
                 TV-owned update runtime state for the standalone signage component.
               </CardDescription>
             </div>
@@ -758,21 +777,21 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Component</div>
                 <div className="mt-2 text-base font-semibold">{updateStatus.componentDisplayName || "MonClub TV"}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   {updateStatus.mainExecutable || "MonClubTV.exe"} · {updateStatus.channel || "stable"}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Current Release</div>
                 <div className="mt-2 text-base font-semibold">{updateStatus.currentReleaseId || "dev"}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Last check {formatEpochSeconds(updateStatus.lastCheckAt)}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Availability</div>
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <Badge variant={updateStatus.updateAvailable ? "warning" : "outline"}>
@@ -784,7 +803,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                   {updateStatus.latestRelease?.releaseId || "No newer TV release detected."}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Updater</div>
                 <div className="mt-2 text-base font-semibold">
                   {updateStatus.updaterInstalled ? "Ready" : "Missing"}
@@ -807,7 +826,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           </CardContent>
         </Card>
         ) : (
-          <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+          <Card className="border-border bg-card shadow-none">
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <Download className="h-4 w-4" />
@@ -823,7 +842,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       {showStartupPage && (
       <section id={TV_SECTION_ELEMENT_IDS.startup} className={sectionShellClass("startup", focusSection)}>
         {(startupPreflight || startupLatest || startupRuns.length > 0) ? (
-        <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+        <Card className="border-border bg-card shadow-none">
           <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="flex items-center gap-2">
@@ -839,7 +858,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Latest Run</div>
                 <div className="mt-2 flex items-center gap-2">
                   <Badge className={cn("border", startupBadgeClass(startupLatest?.status))}>
@@ -850,21 +869,21 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                   {startupLatest?.finishedAt ? `Finished ${formatTimestamp(startupLatest.finishedAt)}` : "No recorded startup reconciliation yet."}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Preflight Blockers</div>
                 <div className="mt-2 text-2xl font-semibold">{startupPreflight?.counts.blockerCount ?? 0}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Warning {startupPreflight?.counts.warningCount ?? 0} · Info {startupPreflight?.counts.infoCount ?? 0}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Startup Correlation</div>
                 <div className="mt-2 text-sm font-medium">{startupLatest?.correlationId || "n/a"}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Trigger {startupLatest?.triggerSource || "unknown"}
                 </div>
               </div>
-              <div className="rounded-2xl border bg-card p-4">
+              <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Phase Health</div>
                 <div className="mt-2 text-2xl font-semibold">{startupLatest?.phases?.length ?? 0}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
@@ -893,7 +912,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                       <div className="text-sm text-muted-foreground">No current blocker or warning signals.</div>
                     ) : (
                       startupSignalItems.map((item) => (
-                        <div key={`${item.severity}-${item.code}`} className="rounded-2xl border p-3">
+                        <div key={`${item.severity}-${item.code}`} className="rounded-lg border border-border p-3">
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge variant="outline">{item.code}</Badge>
                             <Badge className={cn("border", startupBadgeClass(item.status))}>{item.status}</Badge>
@@ -939,7 +958,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                       <div className="text-sm text-muted-foreground">No startup phase history recorded yet.</div>
                     ) : (
                       startupLatest.phases.map((phase) => (
-                        <div key={`${phase.id}-${phase.phaseName}`} className="rounded-2xl border p-3">
+                        <div key={`${phase.id}-${phase.phaseName}`} className="rounded-lg border border-border p-3">
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge variant="outline">{phase.phaseName}</Badge>
                             <Badge className={cn("border", startupBadgeClass(phase.result))}>{phase.result || "PENDING"}</Badge>
@@ -964,7 +983,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                       <div className="text-sm text-muted-foreground">No startup runs recorded yet.</div>
                     ) : (
                       startupRuns.map((run) => (
-                        <div key={run.id} className="rounded-2xl border p-3">
+                        <div key={run.id} className="rounded-lg border border-border p-3">
                           <div className="flex flex-wrap items-center gap-2">
                             <Badge variant="outline">Run #{run.id}</Badge>
                             <Badge className={cn("border", startupBadgeClass(run.status))}>{run.status || "UNKNOWN"}</Badge>
@@ -983,7 +1002,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           </CardContent>
         </Card>
         ) : (
-          <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+          <Card className="border-border bg-card shadow-none">
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
                 <ShieldAlert className="h-4 w-4" />
@@ -999,7 +1018,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       {showOperationsPage && (
       <section id={TV_SECTION_ELEMENT_IDS.operations} className={sectionShellClass("operations", focusSection)}>
         {retention && (
-        <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+        <Card className="border-border bg-card shadow-none">
           <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="flex items-center gap-2">
@@ -1027,7 +1046,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
             )}
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               {retention.tables.map((row) => (
-                <div key={row.table} className="rounded-2xl border bg-card p-3">
+                <div key={row.table} className="rounded-lg border border-border bg-muted/40 p-3">
                   <div className="font-mono text-xs">{row.table}</div>
                   <div className="mt-2 text-lg font-semibold">{row.eligibleRows}</div>
                   <div className="text-xs text-muted-foreground">
@@ -1041,7 +1060,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
         </Card>
         )}
 
-      <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+      <Card className="border-border bg-card shadow-none">
         <CardHeader>
           <CardTitle>Detected Monitors</CardTitle>
           <CardDescription>Physical monitors reported by the TV host runtime.</CardDescription>
@@ -1049,13 +1068,13 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
         <CardContent>
           <div className="grid gap-4 md:grid-cols-3">
             {monitors.map((monitor) => (
-              <div key={monitor.id} className="rounded-2xl border bg-card p-4 shadow-sm">
+              <div key={monitor.id} className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="font-medium">{monitor.monitor_label}</div>
                     <div className="text-xs text-muted-foreground">{monitor.monitor_id}</div>
                   </div>
-                  <Badge className={cn("border", monitor.is_connected ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-slate-50 text-slate-700")}>
+                  <Badge className={cn("border", monitor.is_connected ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400" : "border-border bg-muted text-muted-foreground")}>
                     {monitor.is_connected ? "Connected" : "Disconnected"}
                   </Badge>
                 </div>
@@ -1077,7 +1096,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
 
       {showBindingsPage && (
       <section id={TV_SECTION_ELEMENT_IDS.bindings} className={sectionShellClass("bindings", focusSection)}>
-      <Card className="border-white/10 bg-card/95 shadow-[0_24px_80px_rgba(15,23,42,0.14)] backdrop-blur-sm">
+      <Card className="border-border bg-card shadow-none">
         <CardHeader>
           <CardTitle>Bindings</CardTitle>
           <CardDescription>Each binding maps one logical screen to one host runtime.</CardDescription>
@@ -1092,7 +1111,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
               const summary = supportByBinding[binding.id];
               const runtime = binding.runtime?.runtime_state || "UNKNOWN";
               return (
-                <div key={binding.id} className="rounded-[1.5rem] border bg-background p-4 shadow-sm">
+                <div key={binding.id} className="rounded-lg border border-border bg-muted/30 p-4">
                   <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
                     <div className="space-y-3">
                       <div className="flex flex-wrap items-center gap-2">
@@ -1163,10 +1182,10 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       )}
 
       <Dialog open={previewBindingId !== null} onOpenChange={(open) => { if (!open) setPreviewBindingId(null); }}>
-        <DialogContent className="max-w-5xl border-white/10 bg-slate-950 text-slate-50">
+        <DialogContent className="max-w-4xl border-border bg-card text-foreground">
           <DialogHeader>
             <DialogTitle>Screen Preview</DialogTitle>
-            <DialogDescription className="text-slate-300">
+            <DialogDescription>
               {previewBinding
                 ? `${previewBinding.screen_label} (binding #${previewBinding.id})`
                 : "TV screen preview"}
@@ -1176,36 +1195,33 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           {previewBinding && (
             <div className="space-y-4">
               <div className="flex flex-wrap gap-2">
-                <Badge className="border-cyan-300/30 bg-cyan-300/12 text-cyan-100">Preview only</Badge>
+                <Badge className="border-primary/25 bg-primary/10 text-primary">Preview only</Badge>
                 <Badge variant="outline">Screen #{previewBinding.screen_id}</Badge>
                 <Badge variant="outline">{previewBinding.monitor_label || previewBinding.monitor_id || "Unassigned monitor"}</Badge>
-                <Badge variant="outline">{previewBinding.fullscreen ? "Fullscreen binding" : "Windowed binding"}</Badge>
+                <Badge variant="outline">{previewBinding.fullscreen ? "Fullscreen" : "Windowed"}</Badge>
                 {previewMonitor && (
-                  <Badge variant="outline">
-                    {previewMonitor.width}x{previewMonitor.height}
-                  </Badge>
+                  <Badge variant="outline">{previewMonitor.width}x{previewMonitor.height}</Badge>
                 )}
               </div>
 
-              <div className="overflow-hidden rounded-[2rem] border border-white/10 bg-[linear-gradient(145deg,rgba(8,24,44,0.96),rgba(15,23,42,0.95)_48%,rgba(13,148,136,0.80)_100%)] p-4">
+              <div className="overflow-hidden rounded-lg border border-border bg-background p-3">
                 <div
-                  className="relative mx-auto flex max-w-4xl items-center justify-center overflow-hidden rounded-[1.5rem] border border-white/10 bg-black/40 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]"
+                  className="relative mx-auto flex max-w-4xl items-center justify-center overflow-hidden rounded-md border border-border bg-muted/30"
                   style={{
                     aspectRatio: previewMonitor && previewMonitor.width > 0 && previewMonitor.height > 0
                       ? `${previewMonitor.width} / ${previewMonitor.height}`
                       : "16 / 9",
                   }}
                 >
-                  <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(34,211,238,0.18),transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.04),transparent)]" />
-                  <div className="relative flex h-full w-full flex-col gap-3 p-4 md:p-6">
-                    <div className="flex items-center justify-between rounded-[1.35rem] border border-white/10 bg-white/[0.06] px-4 py-3">
+                  <div className="relative flex h-full w-full flex-col gap-3 p-4">
+                    <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2">
                       <div>
-                        <div className="text-[11px] uppercase tracking-[0.2em] text-cyan-100/80">MonClub TV Preview</div>
-                        <div className="mt-1 text-lg font-semibold text-white">{previewBinding.screen_label}</div>
+                        <div className="text-[10px] uppercase tracking-widest text-muted-foreground">MonClub TV Preview</div>
+                        <div className="mt-0.5 text-sm font-semibold text-foreground">{previewBinding.screen_label}</div>
                       </div>
-                      <div className="text-right text-xs text-slate-300">
+                      <div className="text-right text-[11px] text-muted-foreground">
                         <div>{previewBinding.window_label || `Screen ${previewBinding.screen_id}`}</div>
-                        <div className="mt-1 text-slate-400">{previewMonitor ? `${previewMonitor.width}x${previewMonitor.height}` : "Default 16:9 ratio"}</div>
+                        <div>{previewMonitor ? `${previewMonitor.width}x${previewMonitor.height}` : "16:9"}</div>
                       </div>
                     </div>
 
@@ -1215,50 +1231,42 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                         ? "grid-rows-[1.1fr_0.9fr]"
                         : "lg:grid-cols-[1.3fr_0.7fr]",
                     )}>
-                      <div className="relative overflow-hidden rounded-[1.5rem] border border-cyan-300/20 bg-[linear-gradient(160deg,rgba(11,18,32,0.96),rgba(14,23,38,0.86)_52%,rgba(6,182,212,0.24)_100%)]">
-                        <div className="absolute inset-x-0 top-0 h-16 border-b border-white/8 bg-white/[0.04]" />
-                        <div className="absolute inset-x-6 top-5 flex items-center justify-between text-xs text-slate-300">
-                          <span>Header zone</span>
-                          <span>{previewBinding.fullscreen ? "Fullscreen" : "Windowed"}</span>
-                        </div>
-                        <div className="absolute inset-x-6 bottom-6 top-24 flex items-center justify-center rounded-[1.5rem] border border-dashed border-white/15 bg-black/15 px-6 text-center">
-                          <div>
-                            <div className="text-4xl font-semibold tracking-tight text-white md:text-5xl">{previewBinding.screen_label}</div>
-                            <div className="mt-3 max-w-xl text-sm leading-6 text-slate-200 md:text-base">
-                              Non-live screen mock. Use this preview to validate layout feel and screen framing without touching the real signage player runtime.
-                            </div>
+                      <div className="relative flex items-center justify-center overflow-hidden rounded-md border border-dashed border-border bg-muted/20 px-6 text-center">
+                        <div>
+                          <div className="text-2xl font-semibold tracking-tight text-foreground">{previewBinding.screen_label}</div>
+                          <div className="mt-2 text-[12px] text-muted-foreground">
+                            Non-live preview. Layout and framing reference only.
                           </div>
+                          <div className="mt-1 text-[11px] text-muted-foreground">{previewBinding.fullscreen ? "Fullscreen" : "Windowed"}</div>
                         </div>
                       </div>
 
-                      <div className="grid gap-3">
-                        <div className="rounded-[1.35rem] border border-white/10 bg-white/[0.06] p-4">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Binding</div>
-                          <div className="mt-2 text-lg font-semibold text-white">#{previewBinding.id}</div>
-                          <div className="mt-1 text-sm text-slate-300">Desired {previewBinding.desired_state}</div>
+                      <div className="grid gap-2">
+                        <div className="rounded-md border border-border bg-card px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Binding</div>
+                          <div className="mt-1 text-sm font-semibold text-foreground">#{previewBinding.id}</div>
+                          <div className="text-[11px] text-muted-foreground">Desired {previewBinding.desired_state}</div>
                         </div>
-                        <div className="rounded-[1.35rem] border border-white/10 bg-white/[0.06] p-4">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Player State</div>
-                          <div className="mt-2 text-lg font-semibold text-white">{previewBinding.runtime?.runtime_state || "UNKNOWN"}</div>
-                          <div className="mt-1 text-sm text-slate-300">{previewBinding.monitor_label || previewBinding.monitor_id || "Monitor not assigned yet"}</div>
+                        <div className="rounded-md border border-border bg-card px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Player State</div>
+                          <div className="mt-1 text-sm font-semibold text-foreground">{previewBinding.runtime?.runtime_state || "UNKNOWN"}</div>
+                          <div className="text-[11px] text-muted-foreground">{previewBinding.monitor_label || previewBinding.monitor_id || "No monitor"}</div>
                         </div>
-                        <div className="rounded-[1.35rem] border border-white/10 bg-white/[0.06] p-4">
-                          <div className="text-[11px] uppercase tracking-[0.18em] text-slate-400">Canvas Ratio</div>
-                          <div className="mt-2 text-lg font-semibold text-white">
-                            {previewMonitor
-                              ? `${previewMonitor.width}:${previewMonitor.height}`
-                              : "16:9"}
+                        <div className="rounded-md border border-border bg-card px-3 py-2">
+                          <div className="text-[10px] uppercase tracking-widest text-muted-foreground">Canvas</div>
+                          <div className="mt-1 text-sm font-semibold text-foreground">
+                            {previewMonitor ? `${previewMonitor.width}:${previewMonitor.height}` : "16:9"}
                           </div>
-                          <div className="mt-1 text-sm text-slate-300">
-                            {previewMonitor && previewMonitor.height > previewMonitor.width ? "Portrait composition" : "Landscape composition"}
+                          <div className="text-[11px] text-muted-foreground">
+                            {previewMonitor && previewMonitor.height > previewMonitor.width ? "Portrait" : "Landscape"}
                           </div>
                         </div>
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between rounded-[1.35rem] border border-white/10 bg-white/[0.04] px-4 py-3 text-xs text-slate-300">
+                    <div className="flex items-center justify-between rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
                       <span>Preview canvas only</span>
-                      <span>Runtime state is unchanged</span>
+                      <span>Runtime state unchanged</span>
                     </div>
                   </div>
                 </div>

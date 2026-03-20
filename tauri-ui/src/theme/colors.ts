@@ -1,53 +1,51 @@
 /**
- * Brand color palette â€” single source of truth.
- * Change these values to re-skin the entire app.
- *
- * Light: ["#264653","#2a9d8f","#e9c46a","#f4a261","#e76f51"]
- * Dark:  ["#0d1b2a","#1b263b","#415a77","#778da9","#e0e1dd"]
+ * Brand color palette — single source of truth.
+ * Dark theme inspired by Claude Code's aesthetic:
+ * near-black backgrounds, warm orange accent, clean neutrals.
  */
 
 export const lightPalette = {
-  brand1: "#264653", // deep teal â€” primary
-  brand2: "#e63946", // teal â€” secondary / accent
-  brand3: "#e9c46a", // golden yellow â€” highlight
-  brand4: "#f4a261", // warm orange â€” warning
-  brand5: "#e76f51", // coral red â€” destructive
+  brand1: "#264653", // deep teal — primary
+  brand2: "#e63946", // teal — secondary / accent
+  brand3: "#e9c46a", // golden yellow — highlight
+  brand4: "#f4a261", // warm orange — warning
+  brand5: "#e76f51", // coral red — destructive
 } as const;
 
 export const darkPalette = {
-  brand1: "#0d1b2a", // deepest navy â€” background base
-  brand2: "#1b263b", // dark navy â€” card / surface
-  brand3: "#415a77", // muted slate â€” borders / muted
-  brand4: "#778da9", // blue-gray â€” secondary text
-  brand5: "#e0e1dd", // off-white â€” foreground text
+  brand1: "#131418", // near-black — background base
+  brand2: "#1c1e24", // dark surface — card / surface
+  brand3: "#2a2d36", // muted dark — borders / muted
+  brand4: "#8b8fa8", // muted slate — secondary text
+  brand5: "#e2e4ec", // off-white — foreground text
 } as const;
 
 /**
- * Semantic token map â€” used in CSS variables.
- * HSL values are derived from the hex palette above.
+ * Semantic token map — used in CSS variables.
+ * HSL values are derived from the palette above.
  * These are injected into :root and .dark in index.css
  */
 export const semanticTokens = {
   light: {
-    background:    "210 20% 98%",     // near-white warm
-    foreground:    "200 30% 17%",     // brand1 ~#264653
-    card:          "0 0% 100%",       // white
+    background:    "210 20% 98%",
+    foreground:    "200 30% 17%",
+    card:          "0 0% 100%",
     cardForeground:"200 30% 17%",
     popover:       "0 0% 100%",
     popoverForeground: "200 30% 17%",
-    primary:       "174 58% 39%",     // brand2 ~#2a9d8f
+    primary:       "174 58% 39%",
     primaryForeground: "0 0% 100%",
-    secondary:     "42 74% 66%",      // brand3 ~#e9c46a
+    secondary:     "42 74% 66%",
     secondaryForeground: "200 30% 17%",
     muted:         "210 15% 93%",
     mutedForeground: "200 10% 45%",
-    accent:        "27 88% 67%",      // brand4 ~#f4a261
+    accent:        "27 88% 67%",
     accentForeground: "200 30% 17%",
-    destructive:   "14 76% 61%",      // brand5 ~#e76f51
+    destructive:   "14 76% 61%",
     destructiveForeground: "0 0% 100%",
     border:        "210 15% 88%",
     input:         "210 15% 88%",
-    ring:          "174 58% 39%",     // primary ring
+    ring:          "174 58% 39%",
     chart1:        "174 58% 39%",
     chart2:        "42 74% 66%",
     chart3:        "27 88% 67%",
@@ -63,38 +61,53 @@ export const semanticTokens = {
     sidebarRing:   "174 58% 39%",
   },
   dark: {
-    background:    "213 43% 11%",     // brand1 ~#0d1b2a
-    foreground:    "60 3% 87%",       // brand5 ~#e0e1dd
-    card:          "214 37% 17%",     // brand2 ~#1b263b
-    cardForeground:"60 3% 87%",
-    popover:       "214 37% 17%",
-    popoverForeground: "60 3% 87%",
-    primary:       "174 58% 39%",     // teal accent (same as light primary for brand consistency)
-    primaryForeground: "0 0% 100%",
-    secondary:     "213 29% 36%",     // brand3 ~#415a77
-    secondaryForeground: "60 3% 87%",
-    muted:         "213 29% 26%",
-    mutedForeground: "213 19% 58%",   // brand4 ~#778da9
-    accent:        "213 29% 36%",
-    accentForeground: "60 3% 87%",
-    destructive:   "14 76% 61%",
+    // Backgrounds — near-black, Claude Code inspired
+    background:    "228 15% 8%",      // #131418 — near-black base
+    foreground:    "228 15% 91%",     // #e2e4ec — off-white text
+    card:          "228 13% 12%",     // #1c1e24 — dark card surface
+    cardForeground:"228 15% 91%",
+    popover:       "228 13% 12%",
+    popoverForeground: "228 15% 91%",
+
+    // Primary — warm orange (Claude brand accent)
+    primary:       "36 95% 53%",      // #f59e0b — amber-orange
+    primaryForeground: "228 15% 8%",  // dark text on orange
+
+    // Secondary / muted surfaces
+    secondary:     "228 12% 18%",     // #2a2d36 — elevated surface
+    secondaryForeground: "228 15% 91%",
+    muted:         "228 12% 16%",     // between bg and card
+    mutedForeground: "228 10% 55%",   // #8b8fa8 — muted text
+
+    // Accent — same orange
+    accent:        "228 12% 18%",
+    accentForeground: "228 15% 91%",
+
+    // Destructive — red
+    destructive:   "0 72% 51%",
     destructiveForeground: "0 0% 100%",
-    border:        "213 29% 26%",
-    input:         "213 29% 26%",
-    ring:          "174 58% 39%",
-    chart1:        "174 58% 39%",
-    chart2:        "42 74% 66%",
-    chart3:        "27 88% 67%",
-    chart4:        "14 76% 61%",
-    chart5:        "60 3% 87%",
-    sidebar:       "214 37% 14%",
-    sidebarForeground: "60 3% 87%",
-    sidebarPrimary: "174 58% 39%",
-    sidebarPrimaryForeground: "0 0% 100%",
-    sidebarAccent: "213 29% 26%",
-    sidebarAccentForeground: "60 3% 87%",
-    sidebarBorder: "213 29% 26%",
-    sidebarRing:   "174 58% 39%",
+
+    // Borders & inputs — subtle
+    border:        "228 12% 20%",     // very subtle border
+    input:         "228 12% 16%",
+    ring:          "36 95% 53%",      // orange focus ring
+
+    // Charts
+    chart1:        "36 95% 53%",
+    chart2:        "174 60% 41%",
+    chart3:        "270 60% 65%",
+    chart4:        "0 72% 51%",
+    chart5:        "228 15% 91%",
+
+    // Sidebar
+    sidebar:       "228 16% 9%",      // slightly darker than bg
+    sidebarForeground: "228 15% 91%",
+    sidebarPrimary: "36 95% 53%",
+    sidebarPrimaryForeground: "228 15% 8%",
+    sidebarAccent: "228 12% 16%",
+    sidebarAccentForeground: "228 15% 91%",
+    sidebarBorder: "228 12% 16%",
+    sidebarRing:   "36 95% 53%",
   },
 } as const;
 

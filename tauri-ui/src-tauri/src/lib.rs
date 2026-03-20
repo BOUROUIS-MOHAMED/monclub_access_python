@@ -84,6 +84,14 @@ fn desktop_product_name(role: &str) -> &'static str {
     if role == "tv" { "MonClub TV" } else { "MonClub Access" }
 }
 
+fn desktop_window_icon(role: &str) -> Result<Image<'static>, Box<dyn std::error::Error>> {
+    if role == "tv" {
+        Ok(Image::from_bytes(include_bytes!("../icons/tv-icon.png"))?)
+    } else {
+        Ok(Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
+    }
+}
+
 fn api_base(port: u16) -> String {
     format!("http://127.0.0.1:{}/api/v2", port)
 }
@@ -270,7 +278,7 @@ fn rebuild_tray_menu(
 // ─── Setup tray on app start ───
 
 fn setup_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
+    let icon = desktop_window_icon("access")?;
 
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
@@ -382,6 +390,9 @@ pub fn run() {
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(desktop_product_name(&setup_role));
+                if let Ok(icon) = desktop_window_icon(&setup_role) {
+                    let _ = window.set_icon(icon);
+                }
             }
             if setup_role == "access" {
                 let handle = app.handle().clone();

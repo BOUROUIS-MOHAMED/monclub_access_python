@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { useApp } from "@/context/AppContext";
 import { post, openSSE } from "@/api/client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -40,7 +40,7 @@ export default function AgentPage() {
     if (type.includes("error") || type.includes("denied")) return "text-red-400";
     if (type.includes("granted") || type.includes("access")) return "text-emerald-400";
     if (type.includes("warn")) return "text-amber-400";
-    return "text-zinc-300";
+    return "text-foreground/70";
   };
 
   return (
@@ -63,19 +63,17 @@ export default function AgentPage() {
 
       {/* Stats */}
       {agent && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
           {[
             { label: "Statut", value: agent.running ? "Actif" : "Arrêté" },
             { label: "File d'attente", value: String(agent.eventQueueDepth) },
             { label: "Décision moy.", value: `${agent.avgDecisionMs.toFixed(1)} ms` },
             { label: "Stream SSE", value: connected ? "Connecté" : "Déconnecté" },
           ].map(({ label, value }) => (
-            <Card key={label} className="py-3">
-              <CardContent className="px-4 py-0">
-                <p className="text-xs text-muted-foreground">{label}</p>
-                <p className="text-sm font-semibold">{value}</p>
-              </CardContent>
-            </Card>
+            <div key={label} className="rounded-lg border border-border bg-muted/40 px-4 py-3">
+              <p className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">{label}</p>
+              <p className="mt-2 text-sm font-semibold text-foreground">{value}</p>
+            </div>
           ))}
         </div>
       )}
@@ -93,13 +91,13 @@ export default function AgentPage() {
           </div>
         </CardHeader>
         <ScrollArea className="h-[calc(100vh-380px)]">
-          <div className="p-3 font-mono text-xs leading-relaxed bg-[hsl(213,43%,8%)] dark:bg-[hsl(213,43%,5%)] min-h-full">
+          <div className="p-3 font-mono text-xs leading-relaxed bg-background min-h-full">
             {events.length === 0 ? (
-              <p className="text-zinc-500 italic py-8 text-center">En attente d'événements de l'agent…</p>
+              <p className="text-muted-foreground/60 italic py-8 text-center">En attente d'événements de l'agent…</p>
             ) : (
               events.map((ev, i) => (
                 <div key={i} className={cn("py-0.5 flex gap-2", eventColor(ev.type))}>
-                  <span className="text-zinc-600 shrink-0">{ev.ts.split("T")[1]?.substring(0, 8)}</span>
+                  <span className="text-muted-foreground/60 shrink-0">{ev.ts.split("T")[1]?.substring(0, 8)}</span>
                   <Badge variant="outline" className="text-[10px] h-4 px-1">{ev.type}</Badge>
                   <span className="break-all">{typeof ev.data === "string" ? ev.data : JSON.stringify(ev.data)}</span>
                 </div>

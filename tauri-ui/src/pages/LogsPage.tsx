@@ -168,9 +168,9 @@ export default function LogsPage() {
       {/* Log viewer */}
       <Card className="p-0 overflow-hidden">
         <ScrollArea className="h-[calc(100vh-280px)]">
-          <div className="p-3 font-mono text-xs leading-relaxed bg-zinc-950 min-h-full">
+          <div className="p-3 font-mono text-xs leading-relaxed bg-background min-h-full">
             {filtered.length === 0 ? (
-              <p className="text-zinc-500 italic py-8 text-center">
+              <p className="text-muted-foreground/60 italic py-8 text-center">
                 Aucun log à afficher… En attente de données SSE.
               </p>
             ) : (
@@ -179,7 +179,7 @@ export default function LogsPage() {
                   key={i}
                   className={cn("py-0.5 flex gap-2", levelColor(l.level))}
                 >
-                  <span className="text-zinc-600 shrink-0">
+                  <span className="text-muted-foreground/60 shrink-0">
                     {l.ts?.includes("T")
                       ? l.ts.split("T")[1]?.substring(0, 8)
                       : l.ts?.substring(11, 19) || ""}
@@ -187,7 +187,7 @@ export default function LogsPage() {
                   <span className={cn("shrink-0 w-14", levelColor(l.level))}>
                     [{l.level}]
                   </span>
-                  <span className="break-all text-zinc-300">{l.msg}</span>
+                  <span className="break-all text-foreground/70">{l.msg}</span>
                 </div>
               ))
             )}
