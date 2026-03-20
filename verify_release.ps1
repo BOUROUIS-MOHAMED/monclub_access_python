@@ -9,26 +9,20 @@ function Sha256($p) {
   (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant()
 }
 
-function Resolve-PayloadRoot([string]$ExtractRoot) {
-  $exeName = "MonClubAccess.exe"
+function Resolve-PayloadRoot([string]$ExtractRoot, [string]$RootFolderName, [string]$ExeName) {
+  $candidateRoot = Join-Path $ExtractRoot $RootFolderName
+  if (Test-Path (Join-Path $candidateRoot $ExeName)) { return $candidateRoot }
 
-  # common: <root>\MonClubAccess\MonClubAccess.exe
-  $p1 = Join-Path $ExtractRoot "MonClubAccess"
-  if (Test-Path (Join-Path $p1 $exeName)) { return $p1 }
+  $currentRoot = Join-Path $ExtractRoot "current"
+  if (Test-Path (Join-Path $currentRoot $ExeName)) { return $currentRoot }
 
-  # alternative: <root>\current\MonClubAccess.exe
-  $p2 = Join-Path $ExtractRoot "current"
-  if (Test-Path (Join-Path $p2 $exeName)) { return $p2 }
+  if (Test-Path (Join-Path $ExtractRoot $ExeName)) { return $ExtractRoot }
 
-  # alternative: <root>\MonClubAccess.exe
-  if (Test-Path (Join-Path $ExtractRoot $exeName)) { return $ExtractRoot }
-
-  # shallow search
-  $found = Get-ChildItem -LiteralPath $ExtractRoot -Recurse -File -Filter $exeName -ErrorAction SilentlyContinue |
+  $found = Get-ChildItem -LiteralPath $ExtractRoot -Recurse -File -Filter $ExeName -ErrorAction SilentlyContinue |
     Select-Object -First 1
   if ($found) { return (Split-Path -Parent $found.FullName) }
 
-  throw "Could not locate MonClubAccess.exe inside the ZIP content."
+  throw "Could not locate $ExeName inside the ZIP content."
 }
 
 if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "ZIP not found: $ZipPath" }
@@ -38,6 +32,8 @@ $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 
 if ([string]::IsNullOrWhiteSpace($manifest.releaseId)) { throw "manifest.releaseId missing/empty" }
 if ([string]::IsNullOrWhiteSpace($manifest.outputs.zipSha256)) { throw "manifest.outputs.zipSha256 missing/empty" }
+if ([string]::IsNullOrWhiteSpace($manifest.app)) { throw "manifest.app missing/empty" }
+if ([string]::IsNullOrWhiteSpace($manifest.mainExe)) { throw "manifest.mainExe missing/empty" }
 
 $zipHash = Sha256 $ZipPath
 if ($zipHash -ne $manifest.outputs.zipSha256) {
@@ -45,21 +41,21 @@ if ($zipHash -ne $manifest.outputs.zipSha256) {
 }
 
 Write-Host "ZIP SHA256 OK ✅ $zipHash" -ForegroundColor Green
+Write-Host "App       : $($manifest.app)"
 Write-Host "ReleaseId : $($manifest.releaseId)"
 Write-Host "BuiltAtUtc: $($manifest.builtAtUtc)"
 
-# Content verification (exe + version.json)
 $tmp = Join-Path $env:TEMP ("mc_verify_" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force $tmp | Out-Null
 
 try {
   Expand-Archive -LiteralPath $ZipPath -DestinationPath $tmp -Force
 
-  $payload = Resolve-PayloadRoot $tmp
+  $payload = Resolve-PayloadRoot $tmp $manifest.app $manifest.mainExe
 
-  $exePath = Join-Path $payload "MonClubAccess.exe"
+  $exePath = Join-Path $payload $manifest.mainExe
   if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-    throw "MonClubAccess.exe not found where expected: $exePath"
+    throw "$($manifest.mainExe) not found where expected: $exePath"
   }
 
   $verPath = Join-Path $payload "version.json"
@@ -67,7 +63,7 @@ try {
     throw "version.json not found next to exe: $verPath"
   }
 
-  Write-Host "ZIP content OK ✅ (MonClubAccess.exe + version.json found)" -ForegroundColor Green
+  Write-Host "ZIP content OK ✅ ($($manifest.mainExe) + version.json found)" -ForegroundColor Green
 }
 finally {
   try { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } catch {}

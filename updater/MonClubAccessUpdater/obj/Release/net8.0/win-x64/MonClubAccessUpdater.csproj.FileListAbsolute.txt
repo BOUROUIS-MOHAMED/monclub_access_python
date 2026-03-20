@@ -1,8 +1,3 @@
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubAccessUpdater.exe
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubAccessUpdater.deps.json
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubAccessUpdater.runtimeconfig.json
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubAccessUpdater.dll
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubAccessUpdater.pdb
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\Microsoft.CSharp.dll
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\Microsoft.VisualBasic.Core.dll
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\Microsoft.VisualBasic.dll
@@ -191,8 +186,13 @@ C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Re
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubAccessUpdater.csproj.CoreCompileInputs.cache
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubAccessUpdater.sourcelink.json
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubA.409322D1.Up2Date
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubAccessUpdater.dll
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\refint\MonClubAccessUpdater.dll
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubAccessUpdater.pdb
 C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubAccessUpdater.genruntimeconfig.cache
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\ref\MonClubAccessUpdater.dll
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubDesktopUpdater.exe
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubDesktopUpdater.deps.json
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubDesktopUpdater.runtimeconfig.json
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubDesktopUpdater.dll
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\MonClubDesktopUpdater.pdb
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubDesktopUpdater.dll
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\refint\MonClubDesktopUpdater.dll
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\MonClubDesktopUpdater.pdb
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\obj\Release\net8.0\win-x64\ref\MonClubDesktopUpdater.dll

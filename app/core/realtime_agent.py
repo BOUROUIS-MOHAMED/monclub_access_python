@@ -23,8 +23,8 @@ from app.core.db import (
     save_agent_rtlog_state,
     access_history_exists,
 )
-
-from app.core.utils import DB_PATH, ensure_dirs
+from access.storage import current_access_runtime_db_path
+from app.core.utils import ensure_dirs
 from app.sdk.pullsdk import PullSDKDevice
 
 
@@ -1444,7 +1444,8 @@ class NotificationService(threading.Thread):
             ensure_dirs()
         except Exception:
             pass
-        base_dir = os.path.dirname(DB_PATH) if DB_PATH else os.getcwd()
+        access_db_path = str(current_access_runtime_db_path())
+        base_dir = os.path.dirname(access_db_path) if access_db_path else os.getcwd()
         cache_dir = os.path.join(base_dir, "cache", "images")
 
         # create cache with defaults; runtime will update .enabled/.timeout/.limits from backend settings

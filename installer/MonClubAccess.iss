@@ -12,10 +12,17 @@
   #error StageDir define is missing. Pass /DStageDir="full\path\to\staged\MonClubAccess"
 #endif
 
+#ifndef UpdaterSourcePath
+  #error UpdaterSourcePath define is missing. Pass /DUpdaterSourcePath="full\path\to\MonClubDesktopUpdater.exe"
+#endif
+
+#ifndef UpdaterDestExe
+  #define UpdaterDestExe "MonClubAccessUpdater.exe"
+#endif
+
 #define AppVersion ReleaseId
 #define AppPublisher "MonClub"
 #define MainExe "MonClubAccess.exe"
-#define UpdaterExe "MonClubAccessUpdater.exe"
 
 ; Branding assets (relative to this .iss file)
 #define SetupIcon "assets\setup.ico"
@@ -41,7 +48,7 @@ PrivilegesRequired=lowest
 UsePreviousAppDir=no
 UsePreviousTasks=no
 CloseApplications=yes
-CloseApplicationsFilter=MonClubAccess.exe,monclub-access-ui.exe,MonClubAccessUpdater.exe
+CloseApplicationsFilter=MonClubAccess.exe,monclub-access-ui.exe,{#UpdaterDestExe}
 RestartApplications=no
 
 DisableProgramGroupPage=yes
@@ -70,7 +77,7 @@ Name: "{app}\logs"
 Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Ship updater exe into {app}\updater
-Source: "updater\{#UpdaterExe}"; DestDir: "{app}\updater"; Flags: ignoreversion
+Source: "{#UpdaterSourcePath}"; DestDir: "{app}\updater"; DestName: "{#UpdaterDestExe}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon

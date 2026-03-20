@@ -56,6 +56,16 @@ export interface UpdatesBlock {
   currentReleaseId: string | null;
   lastCheckAt: number | null;
   lastError: string | null;
+  componentId?: string | null;
+  componentDisplayName?: string | null;
+  artifactName?: string | null;
+  mainExecutable?: string | null;
+  updaterExecutable?: string | null;
+  updaterInstalled?: boolean;
+  installRoot?: string | null;
+  updateEnabled?: boolean;
+  channel?: string | null;
+  platform?: string | null;
 }
 
 export interface StatusResponse extends ApiOk {
@@ -272,6 +282,16 @@ export interface UpdateStatusResponse {
   currentReleaseId: string | null;
   lastCheckAt: number | null;
   lastError: string | null;
+  componentId?: string | null;
+  componentDisplayName?: string | null;
+  artifactName?: string | null;
+  mainExecutable?: string | null;
+  updaterExecutable?: string | null;
+  updaterInstalled?: boolean;
+  installRoot?: string | null;
+  updateEnabled?: boolean;
+  channel?: string | null;
+  platform?: string | null;
   latestRelease?: {
     releaseId?: string;
     publishDate?: string;

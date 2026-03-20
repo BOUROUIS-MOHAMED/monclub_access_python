@@ -1,25 +1,30 @@
 param(
+  [ValidateSet("access", "tv")]
+  [string]$Component = "access",
+
   [ValidateSet("stable","beta")]
   [string]$Channel = "stable",
 
-  # If empty: auto-pick newest manifest in .\release\
   [string]$ManifestPath = "",
 
-  # Your repo
-  [string]$Repo = "BOUROUIS-MOHAMED/monclub_access_python"
+  [string]$Repo = "BOUROUIS-MOHAMED/monclub_access_python",
+
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 
-# Always run relative paths from repo root (script directory)
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ROOT
 
+. (Join-Path $ROOT "packaging\desktop_components.ps1")
+$meta = Get-DesktopComponentMetadata -Component $Component
+
 function Pick-NewestManifest {
-  $m = Get-ChildItem ".\release\MonClubAccess-*.manifest.json" -File |
+  $m = Get-ChildItem (Join-Path $ROOT "release\$($meta.ManifestGlob)") -File |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
-  if (-not $m) { throw "No manifest found in .\release\ (MonClubAccess-*.manifest.json)" }
+  if (-not $m) { throw "No manifest found in .\release\ ($($meta.ManifestGlob))" }
   return $m.FullName
 }
 
@@ -35,45 +40,37 @@ $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $releaseId = $manifest.releaseId
 if ([string]::IsNullOrWhiteSpace($releaseId)) { throw "releaseId missing in manifest" }
 
-# Resolve expected assets (MUST match build_release.ps1 naming)
 $releaseDir = Join-Path (Get-Location) "release"
-$setupExe   = Join-Path $releaseDir ("MonClubAccessSetup-{0}.exe" -f $releaseId)
-$zipPath    = Join-Path $releaseDir ("MonClubAccess-{0}.zip" -f $releaseId)
+$setupExe = Join-Path $releaseDir ("{0}-{1}.exe" -f $meta.InstallerBaseName, $releaseId)
+$zipPath = Join-Path $releaseDir ("{0}-{1}.zip" -f $meta.ArtifactName, $releaseId)
 
 if (-not (Test-Path -LiteralPath $setupExe -PathType Leaf)) {
-  throw "Installer not found: $setupExe (run build_installer.ps1 first)"
+  throw "Installer not found: $setupExe (run build_installer.ps1 -Component $Component first)"
 }
-
-# Update system REQUIREMENT: ZIP must exist (download target)
 if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
-  throw @"
-Release ZIP not found:
-  $zipPath
-
-Your backend/update flow needs the ZIP as downloadable asset.
-Run build_release.ps1 again (it should produce MonClubAccess-$releaseId.zip).
-"@
+  throw "Release ZIP not found: $zipPath (run build_release.ps1 -Component $Component first)"
 }
 
 $assets = @($setupExe, $ManifestPath, $zipPath)
+$tag = "{0}-win-{1}-{2}" -f $Component, $Channel, $releaseId
+$title = "{0} Windows ({1}) - {2}" -f $meta.ArtifactName, $Channel, $releaseId
 
-# Tag strategy (simple + explicit)
-$tag = "win-{0}-{1}" -f $Channel, $releaseId
-$title = "MonClubAccess Windows ($Channel) - $releaseId"
-
-# Flags per channel
 $extraFlags = @("-R", $Repo, "--title", $title, "--notes", "Automated build $releaseId")
 if ($Channel -eq "beta") {
-  $extraFlags += "--prerelease"     # beta = prerelease
-  $extraFlags += "--latest=false"   # don't override latest stable
+  $extraFlags += "--prerelease"
+  $extraFlags += "--latest=false"
 } else {
-  $extraFlags += "--latest"         # mark stable as Latest
+  $extraFlags += "--latest"
 }
 
 Write-Host "Creating release: $tag" -ForegroundColor Cyan
 Write-Host "Assets:" -ForegroundColor Cyan
 $assets | ForEach-Object { Write-Host " - $_" }
 
-# Requires: gh auth login
+if ($DryRun) {
+  Write-Host "DryRun enabled. GitHub release creation skipped." -ForegroundColor Yellow
+  exit 0
+}
+
 gh release create $tag @assets @extraFlags
 Write-Host "Done." -ForegroundColor Green

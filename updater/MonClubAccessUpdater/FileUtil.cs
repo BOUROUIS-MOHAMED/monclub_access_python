@@ -1,4 +1,4 @@
-namespace MonClubAccessUpdater;
+namespace MonClubDesktopUpdater;
 
 public static class FileUtil
 {

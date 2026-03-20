@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace MonClubAccessUpdater;
+namespace MonClubDesktopUpdater;
 
 public sealed class ReleaseManifest
 {

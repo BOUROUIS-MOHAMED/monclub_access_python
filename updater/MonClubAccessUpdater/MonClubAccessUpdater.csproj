@@ -13,8 +13,8 @@
     <PublishTrimmed>false</PublishTrimmed>
     <InvariantGlobalization>true</InvariantGlobalization>
 
-    <!-- So it looks clean in Task Manager -->
-    <AssemblyName>MonClubAccessUpdater</AssemblyName>
+    <!-- Shared updater infrastructure; installers rename it per component -->
+    <AssemblyName>MonClubDesktopUpdater</AssemblyName>
   </PropertyGroup>
 
 </Project>

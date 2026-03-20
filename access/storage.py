@@ -1,4 +1,4 @@
-"""Split-ready Access storage metadata."""
+"""Access storage metadata for the live split-runtime layout."""
 
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ class AccessStoragePaths:
 def get_access_storage_paths() -> AccessStoragePaths:
     layout = get_desktop_path_layout()
     return AccessStoragePaths(
-        current_runtime_db_path=layout.legacy_combined_db_path,
+        current_runtime_db_path=layout.access_db_path,
         future_db_path=layout.access_db_path,
-        current_config_path=layout.legacy_config_path,
+        current_config_path=layout.access_config_path,
         future_config_path=layout.access_config_path,
         data_dir=layout.access_data_dir,
     )
@@ -33,4 +33,3 @@ def current_access_runtime_db_path() -> Path:
 
 
 __all__ = ["AccessStoragePaths", "current_access_runtime_db_path", "get_access_storage_paths"]
-

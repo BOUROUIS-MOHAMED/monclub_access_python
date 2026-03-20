@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace MonClubAccessUpdater;
+namespace MonClubDesktopUpdater;
 
 public sealed class UpdaterArgs
 {
@@ -70,12 +70,13 @@ public sealed class UpdaterArgs
     }
 
     public static string Usage() =>
-@"MonClubAccessUpdater.exe ^
+@"MonClubDesktopUpdater.exe ^
   --installRoot ""%LOCALAPPDATA%\MonClubAccess"" ^
   --releaseId ""20260210-124245Z"" ^
   --zip ""...\downloads\windows\stable\MonClubAccess-20260210-124245Z.zip"" ^
   --manifest ""...\downloads\windows\stable\MonClubAccess-20260210-124245Z.manifest.json"" ^
   --waitPid 12345 ^
+  [--appExeName ""MonClubAccess.exe""] ^
   [--log ""...\logs\updater-<releaseId>.log""] ^
   [--forceKillAfterSeconds 20]
 ";

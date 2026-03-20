@@ -1,13 +1,21 @@
 param(
+  [ValidateSet("access", "tv")]
+  [string]$Component = "access",
+
   [string]$ManifestPath = "",
-  [string]$IsccPath = ""   # optional override
+
+  [string]$IsccPath = "",
+
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 
-# Always run relative paths from repo root (script directory)
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ROOT
+
+. (Join-Path $ROOT "packaging\desktop_components.ps1")
+$meta = Get-DesktopComponentMetadata -Component $Component
 
 function Resolve-Iscc {
   param([string]$Override)
@@ -18,7 +26,6 @@ function Resolve-Iscc {
     throw "ISCC.exe not found at IsccPath: $p"
   }
 
-  # Candidates (env var first, then common locations, then PATH)
   $candidates = @(
     $env:INNO_ISCC,
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -37,67 +44,91 @@ function Resolve-Iscc {
 }
 
 function Pick-NewestManifest {
-  $m = Get-ChildItem ".\release\MonClubAccess-*.manifest.json" -File |
+  $m = Get-ChildItem (Join-Path $ROOT "release\$($meta.ManifestGlob)") -File |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
-  if (-not $m) { throw "No manifest found in .\release\ (MonClubAccess-*.manifest.json)" }
+  if (-not $m) { throw "No manifest found in .\release\ ($($meta.ManifestGlob))" }
   return $m.FullName
 }
 
-# Find newest manifest if not provided
+function Resolve-UpdaterSourcePath {
+  $generic = Join-Path $ROOT ("installer\updater\{0}" -f $meta.UpdaterSourceExe)
+  if (Test-Path -LiteralPath $generic -PathType Leaf) {
+    return $generic
+  }
+
+  $legacyAccess = Join-Path $ROOT "installer\updater\MonClubAccessUpdater.exe"
+  if (($Component -eq "access") -and (Test-Path -LiteralPath $legacyAccess -PathType Leaf)) {
+    Write-Warning "Falling back to legacy updater binary: $legacyAccess"
+    return $legacyAccess
+  }
+
+  throw @"
+Updater exe not found:
+  $generic
+
+Build it first:
+  dotnet publish .\updater\MonClubAccessUpdater\MonClubAccessUpdater.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
+
+Then copy the published EXE to:
+  installer\updater\$($meta.UpdaterSourceExe)
+"@
+}
+
 if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
   $ManifestPath = Pick-NewestManifest
 }
 
-$manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+  throw "Manifest not found: $ManifestPath"
+}
 
+$manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
 $releaseId = $manifest.releaseId
-$stageDir  = $manifest.outputs.stagedDir
+$stageDir = $manifest.outputs.stagedDir
 
 if ([string]::IsNullOrWhiteSpace($releaseId)) { throw "releaseId missing in manifest" }
-if ([string]::IsNullOrWhiteSpace($stageDir))  { throw "outputs.stagedDir missing in manifest" }
+if ([string]::IsNullOrWhiteSpace($stageDir)) { throw "outputs.stagedDir missing in manifest" }
 if (-not (Test-Path -LiteralPath $stageDir)) { throw "stagedDir not found: $stageDir" }
 
-# IMPORTANT: updater must exist for the installer build
-$updaterExe = Join-Path $ROOT "installer\updater\MonClubAccessUpdater.exe"
-if (-not (Test-Path -LiteralPath $updaterExe -PathType Leaf)) {
-  throw @"
-Updater exe not found:
-  $updaterExe
-
-Build it first (single-file, self-contained):
-  dotnet publish .\updater\MonClubAccessUpdater\MonClubAccessUpdater.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
-
-Then copy the published EXE to:
-  installer\updater\MonClubAccessUpdater.exe
-"@
+$installerScript = Join-Path $ROOT (($meta.InstallerScript -replace '^\.[\\/]', ''))
+if (-not (Test-Path -LiteralPath $installerScript -PathType Leaf)) {
+  throw "Installer script not found: $installerScript"
 }
 
-# NEW: reject the tiny apphost exe (which causes '...Updater.dll missing')
-$minSizeMb = 10
-$sizeMb = (Get-Item -LiteralPath $updaterExe).Length / 1MB
-if ($sizeMb -lt $minSizeMb) {
-  throw @"
-Updater exe looks wrong (too small: {0:N2} MB). This is likely the thin apphost that requires MonClubAccessUpdater.dll next to it.
-
-Fix:
-  dotnet publish .\updater\MonClubAccessUpdater\MonClubAccessUpdater.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
-  Copy the published EXE (publish\MonClubAccessUpdater.exe) to:
-    installer\updater\MonClubAccessUpdater.exe
-"@ -f $sizeMb
+$installerPath = Join-Path $ROOT ("release\{0}-{1}.exe" -f $meta.InstallerBaseName, $releaseId)
+if ($DryRun) {
+  $expectedUpdater = Join-Path $ROOT ("installer\updater\{0}" -f $meta.UpdaterSourceExe)
+  Write-Host ("== {0} installer build ==" -f $meta.DisplayName) -ForegroundColor Cyan
+  Write-Host "Manifest : $ManifestPath" -ForegroundColor Cyan
+  Write-Host "StageDir : $stageDir" -ForegroundColor Cyan
+  Write-Host "ISS      : $installerScript" -ForegroundColor Cyan
+  Write-Host "Updater  : $expectedUpdater" -ForegroundColor Cyan
+  Write-Host "Output   : $installerPath" -ForegroundColor Cyan
+  Write-Host "DryRun enabled. Installer compilation skipped." -ForegroundColor Yellow
+  exit 0
 }
 
+$updaterExe = Resolve-UpdaterSourcePath
 $iscc = Resolve-Iscc -Override $IsccPath
 
-Write-Host "Using ISCC: $iscc" -ForegroundColor Cyan
-Write-Host "ReleaseId: $releaseId" -ForegroundColor Cyan
+Write-Host ("== {0} installer build ==" -f $meta.DisplayName) -ForegroundColor Cyan
+Write-Host "Manifest : $ManifestPath" -ForegroundColor Cyan
 Write-Host "StageDir : $stageDir" -ForegroundColor Cyan
-Write-Host ("Updater  : {0} ({1:N2} MB)" -f $updaterExe, $sizeMb) -ForegroundColor Cyan
+Write-Host "ISS      : $installerScript" -ForegroundColor Cyan
+Write-Host "Updater  : $updaterExe" -ForegroundColor Cyan
+Write-Host "Output   : $installerPath" -ForegroundColor Cyan
 
-& "$iscc" ".\installer\MonClubAccess.iss" "/DReleaseId=$releaseId" "/DStageDir=$stageDir"
+& "$iscc" `
+  "$installerScript" `
+  "/DReleaseId=$releaseId" `
+  "/DStageDir=$stageDir" `
+  "/DUpdaterSourcePath=$updaterExe" `
+  "/DUpdaterDestExe=$($meta.UpdaterInstalledExe)"
+
 if ($LASTEXITCODE -ne 0) {
   throw "ISCC compile failed with exit code $LASTEXITCODE"
 }
 
-Write-Host "Installer built in .\release (MonClubAccessSetup-$releaseId.exe) OK" -ForegroundColor Green
+Write-Host "Installer built OK: $installerPath" -ForegroundColor Green

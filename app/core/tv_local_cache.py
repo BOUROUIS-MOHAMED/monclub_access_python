@@ -14,8 +14,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.db import get_conn, _ensure_column
 from app.core.utils import now_iso, DATA_ROOT
+from shared.desktop_paths import get_desktop_path_layout
+from shared.storage_migration import TV_OWNED_TABLES, migrate_component_tables
+from tv.auth_bridge import load_tv_auth_for_runtime
+from tv.storage import current_tv_runtime_db_path
+from tv.store import get_conn, _ensure_column
 
 _log = logging.getLogger(__name__)
 
@@ -327,6 +331,15 @@ def ensure_tv_local_schema() -> None:
         if _schema_ready:
             return
         _create_tv_schema()
+        layout = get_desktop_path_layout()
+        migrate_component_tables(
+            component="tv",
+            live_db_path=current_tv_runtime_db_path(),
+            legacy_source_db_path=layout.legacy_combined_db_path,
+            owned_tables=TV_OWNED_TABLES,
+            logger=_log,
+        )
+        _create_tv_schema()
         _schema_ready = True
 
 
@@ -518,6 +531,15 @@ def _create_tv_schema() -> None:
                 created_at TEXT NOT NULL
             );
         """)
+        _ensure_column(conn, "tv_sync_run_log", "started_at", "started_at TEXT")
+        _ensure_column(conn, "tv_sync_run_log", "finished_at", "finished_at TEXT")
+        _ensure_column(conn, "tv_sync_run_log", "screen_id", "screen_id INTEGER")
+        _ensure_column(conn, "tv_sync_run_log", "target_snapshot_version", "target_snapshot_version INTEGER")
+        _ensure_column(conn, "tv_sync_run_log", "result", "result TEXT")
+        _ensure_column(conn, "tv_sync_run_log", "warning_count", "warning_count INTEGER DEFAULT 0")
+        _ensure_column(conn, "tv_sync_run_log", "error_message", "error_message TEXT")
+        _ensure_column(conn, "tv_sync_run_log", "correlation_id", "correlation_id TEXT")
+        _ensure_column(conn, "tv_sync_run_log", "created_at", "created_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tv_srl_screen ON tv_sync_run_log(screen_id, created_at);")
 
         # 10) tv_activation_state
@@ -3000,44 +3022,15 @@ def _save_snapshot(*args, **kwargs): pass
 
 def _build_tv_api():
     """Build a MonClubApi instance with TV snapshot URLs from config."""
-    from app.core.config import load_config
-    from shared.api.monclub_api import MonClubApi, ApiEndpoints
+    from shared.api.monclub_api import MonClubApi
+    from tv.config import build_tv_api_endpoints
 
-    cfg = load_config()
-    login_url = getattr(cfg, "api_login_url", "")
-    sync_url = getattr(cfg, "api_sync_url", "")
-    create_fp_url = getattr(cfg, "api_create_user_fingerprint_url", "")
-    latest_release_url = getattr(cfg, "api_latest_release_url", "")
-
-    tv_snapshot_latest_url = getattr(cfg, "api_tv_snapshot_latest_url",
-        "http://monclubwigo.tn/api/v1/manager/tv/screens/{screenId}/snapshots/latest")
-    tv_snapshot_manifest_url = getattr(cfg, "api_tv_snapshot_manifest_url",
-        "http://monclubwigo.tn/api/v1/manager/tv/snapshots/{snapshotId}/asset-manifest")
-    tv_ad_tasks_fetch_url = getattr(cfg, "api_tv_ad_tasks_fetch_url",
-        "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks")
-    tv_ad_task_confirm_ready_url = getattr(cfg, "api_tv_ad_task_confirm_ready_url",
-        "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/confirm-ready")
-    tv_ad_task_submit_proof_url = getattr(cfg, "api_tv_ad_task_submit_proof_url",
-        "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/submit-proof")
-
-    endpoints = ApiEndpoints(
-        login_url=str(login_url or ""),
-        sync_url=str(sync_url or ""),
-        create_user_fingerprint_url=str(create_fp_url or ""),
-        latest_release_url=str(latest_release_url or ""),
-        tv_snapshot_latest_url=str(tv_snapshot_latest_url or ""),
-        tv_snapshot_manifest_url=str(tv_snapshot_manifest_url or ""),
-        tv_ad_tasks_fetch_url=str(tv_ad_tasks_fetch_url or ""),
-        tv_ad_task_confirm_ready_url=str(tv_ad_task_confirm_ready_url or ""),
-        tv_ad_task_submit_proof_url=str(tv_ad_task_submit_proof_url or ""),
-    )
-    return MonClubApi(endpoints=endpoints, logger=_log)
+    return MonClubApi(endpoints=build_tv_api_endpoints(), logger=_log)
 
 
 def _get_auth_token() -> str:
     """Return the current bearer token, or raise if not logged in."""
-    from app.core.db import load_auth_token
-    auth = load_auth_token()
+    auth = load_tv_auth_for_runtime()
     if not auth:
         raise RuntimeError("Not logged in — no auth token available")
     tok = getattr(auth, "token", None)
@@ -7688,9 +7681,13 @@ def _ensure_tv_startup_reconciliation_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS tv_startup_reconciliation_run (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                correlation_id TEXT,
+                trigger_source TEXT,
+                status TEXT,
                 started_at TEXT,
                 finished_at TEXT,
                 overall_result TEXT,
+                summary_json TEXT,
                 blocker_count INTEGER NOT NULL DEFAULT 0,
                 warning_count INTEGER NOT NULL DEFAULT 0,
                 info_count INTEGER NOT NULL DEFAULT 0,
@@ -7707,6 +7704,7 @@ def _ensure_tv_startup_reconciliation_schema() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id INTEGER NOT NULL,
                 phase_name TEXT NOT NULL,
+                status TEXT,
                 result TEXT,
                 message TEXT,
                 started_at TEXT,
@@ -7716,6 +7714,29 @@ def _ensure_tv_startup_reconciliation_schema() -> None:
             );
             """
         )
+        _ensure_column(conn, "tv_startup_reconciliation_run", "started_at", "started_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "finished_at", "finished_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "trigger_source", "trigger_source TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "status", "status TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "overall_result", "overall_result TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "correlation_id", "correlation_id TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "summary_json", "summary_json TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "blocker_count", "blocker_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "warning_count", "warning_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "info_count", "info_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "message", "message TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "metadata_json", "metadata_json TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "created_at", "created_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_run", "updated_at", "updated_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "run_id", "run_id INTEGER NOT NULL")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "phase_name", "phase_name TEXT NOT NULL")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "status", "status TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "result", "result TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "message", "message TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "started_at", "started_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "finished_at", "finished_at TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "metadata_json", "metadata_json TEXT")
+        _ensure_column(conn, "tv_startup_reconciliation_phase", "created_at", "created_at TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tv_startup_run_started ON tv_startup_reconciliation_run(created_at DESC)"
         )
@@ -7772,10 +7793,8 @@ def _startup_overall_result(*, blockers: List[Dict[str, Any]], warnings: List[Di
 
 
 def _startup_runtime_paths() -> Dict[str, Any]:
-    from app.core import utils as _utils
-
     data_root = Path(str(DATA_ROOT))
-    db_path = Path(str(_utils.DB_PATH))
+    db_path = Path(str(current_tv_runtime_db_path()))
     return {
         "dataRoot": data_root,
         "dbPath": db_path,
@@ -7856,7 +7875,8 @@ def _startup_phase_row_to_dict(row) -> Dict[str, Any]:
         "id": _safe_int(raw.get("id"), 0),
         "runId": _safe_int(raw.get("run_id"), 0),
         "phaseName": _safe_str(raw.get("phase_name"), "") or None,
-        "result": _safe_str(raw.get("result"), "") or None,
+        "result": _safe_str(raw.get("result"), "") or _safe_str(raw.get("status"), "") or None,
+        "status": _safe_str(raw.get("status"), "") or _safe_str(raw.get("result"), "") or None,
         "message": _safe_str(raw.get("message"), "") or None,
         "startedAt": _safe_str(raw.get("started_at"), "") or None,
         "finishedAt": _safe_str(raw.get("finished_at"), "") or None,
@@ -7873,15 +7893,15 @@ def _startup_run_row_to_dict(row, *, phases: Optional[List[Dict[str, Any]]] = No
         "id": _safe_int(raw.get("id"), 0),
         "startedAt": _safe_str(raw.get("started_at"), "") or None,
         "finishedAt": _safe_str(raw.get("finished_at"), "") or None,
-        "overallResult": _safe_str(raw.get("overall_result"), "") or None,
-        "status": _safe_str(raw.get("overall_result"), "") or None,
+        "overallResult": _safe_str(raw.get("overall_result"), "") or _safe_str(raw.get("status"), "") or None,
+        "status": _safe_str(raw.get("status"), "") or _safe_str(raw.get("overall_result"), "") or None,
         "blockerCount": _safe_int(raw.get("blocker_count"), 0),
         "warningCount": _safe_int(raw.get("warning_count"), 0),
         "infoCount": _safe_int(raw.get("info_count"), 0),
         "message": _safe_str(raw.get("message"), "") or None,
         "metadata": meta,
-        "triggerSource": _safe_str(meta.get("triggerSource"), "") or None,
-        "correlationId": _safe_str(meta.get("correlationId"), "") or None,
+        "triggerSource": _safe_str(raw.get("trigger_source"), "") or _safe_str(meta.get("triggerSource"), "") or None,
+        "correlationId": _safe_str(raw.get("correlation_id"), "") or _safe_str(meta.get("correlationId"), "") or None,
         "checks": list(meta.get("checks") or []),
         "blockers": list(meta.get("blockers") or []),
         "warnings": list(meta.get("warnings") or []),
@@ -7902,19 +7922,28 @@ def _list_startup_phase_rows(*, run_id: int) -> List[Dict[str, Any]]:
     return [_startup_phase_row_to_dict(row) for row in rows]
 
 
-def _create_startup_run(*, metadata: Optional[Dict[str, Any]] = None, message: Optional[str] = None) -> int:
+def _create_startup_run(
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    message: Optional[str] = None,
+    correlation_id: Optional[str] = None,
+) -> int:
     _ensure_tv_startup_reconciliation_schema()
     ts = now_iso()
+    meta = dict(metadata or {})
+    corr = _safe_str(correlation_id, "").strip() or _safe_str(meta.get("correlationId"), "").strip() or None
+    trigger_source = _safe_str(meta.get("triggerSource"), "").strip() or None
+    summary_json = _json_dumps({"checks": [], "blockers": [], "warnings": [], "infos": []})
     with get_conn() as conn:
         cur = conn.execute(
             """
             INSERT INTO tv_startup_reconciliation_run (
-                started_at, finished_at, overall_result,
+                started_at, finished_at, overall_result, correlation_id, trigger_source, status, summary_json,
                 blocker_count, warning_count, info_count,
                 message, metadata_json, created_at, updated_at
-            ) VALUES (?, NULL, NULL, 0, 0, 0, ?, ?, ?, ?)
+            ) VALUES (?, NULL, NULL, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?)
             """,
-            (ts, message, _json_dumps(metadata or {}), ts, ts),
+            (ts, corr, trigger_source, "STARTED", summary_json, message, _json_dumps(meta), ts, ts),
         )
         conn.commit()
         return _safe_int(cur.lastrowid, 0)
@@ -7932,16 +7961,27 @@ def _update_startup_run(
 ) -> None:
     _ensure_tv_startup_reconciliation_schema()
     ts = now_iso()
+    meta = dict(metadata or {})
+    summary_json = _json_dumps(
+        {
+            "checks": list(meta.get("checks") or []),
+            "blockers": list(meta.get("blockers") or []),
+            "warnings": list(meta.get("warnings") or []),
+            "infos": list(meta.get("infos") or []),
+        }
+    )
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE tv_startup_reconciliation_run
             SET finished_at=?,
                 overall_result=?,
+                status=?,
                 blocker_count=?,
                 warning_count=?,
                 info_count=?,
                 message=?,
+                summary_json=?,
                 metadata_json=?,
                 updated_at=?
             WHERE id=?
@@ -7949,11 +7989,13 @@ def _update_startup_run(
             (
                 ts,
                 overall_result,
+                overall_result,
                 int(blocker_count),
                 int(warning_count),
                 int(info_count),
                 message,
-                _json_dumps(metadata or {}),
+                summary_json,
+                _json_dumps(meta),
                 ts,
                 int(run_id),
             ),
@@ -7968,10 +8010,10 @@ def _start_startup_phase(*, run_id: int, phase_name: str, message: Optional[str]
         cur = conn.execute(
             """
             INSERT INTO tv_startup_reconciliation_phase (
-                run_id, phase_name, result, message, started_at, finished_at, metadata_json, created_at
-            ) VALUES (?, ?, NULL, ?, ?, NULL, ?, ?)
+                run_id, phase_name, status, result, message, started_at, finished_at, metadata_json, created_at
+            ) VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?)
             """,
-            (int(run_id), phase_name, message, ts, _json_dumps(metadata or {}), ts),
+            (int(run_id), phase_name, "STARTED", message, ts, _json_dumps(metadata or {}), ts),
         )
         conn.commit()
         return _safe_int(cur.lastrowid, 0)
@@ -7984,10 +8026,10 @@ def _finish_startup_phase(*, phase_id: int, result: str, message: Optional[str],
         conn.execute(
             """
             UPDATE tv_startup_reconciliation_phase
-            SET result=?, message=?, finished_at=?, metadata_json=?
+            SET status=?, result=?, message=?, finished_at=?, metadata_json=?
             WHERE id=?
             """,
-            (result, message, ts, _json_dumps(metadata or {}), int(phase_id)),
+            (result, result, message, ts, _json_dumps(metadata or {}), int(phase_id)),
         )
         conn.commit()
 
@@ -8449,14 +8491,12 @@ def _startup_window_runtime_reconcile(*, correlation_id: str) -> Dict[str, Any]:
 
 
 def run_tv_deployment_preflight(*, include_query_checks: bool = False, **kwargs) -> Dict[str, Any]:
-    from app.core.config import load_config
-    from app.core.db import load_auth_token
-    from app.core import utils as _utils
     import sqlite3
+    from tv.config import load_tv_app_config
 
     data_root = Path(str(kwargs.get("data_root_override") or kwargs.get("data_root") or DATA_ROOT))
-    db_path = Path(str(kwargs.get("db_path_override") or kwargs.get("db_path") or _utils.DB_PATH))
-    config_loader = kwargs.get("config_loader") or load_config
+    db_path = Path(str(kwargs.get("db_path_override") or kwargs.get("db_path") or current_tv_runtime_db_path()))
+    config_loader = kwargs.get("config_loader") or load_tv_app_config
     monitors_arg = _sanitize_startup_monitors(kwargs.get("monitors"))
     api_probe = kwargs.get("api_probe")
     query_checks = bool(include_query_checks or kwargs.get("include_query_checks"))
@@ -8763,7 +8803,7 @@ def run_tv_deployment_preflight(*, include_query_checks: bool = False, **kwargs)
         )
 
     try:
-        auth_state = load_auth_token()
+        auth_state = load_tv_auth_for_runtime()
         has_auth = bool(auth_state and _safe_str(getattr(auth_state, "token", ""), "").strip())
     except Exception:
         has_auth = False
@@ -8929,6 +8969,7 @@ def run_tv_startup_reconciliation(**kwargs) -> Dict[str, Any]:
         run_id = _create_startup_run(
             metadata={"triggerSource": trigger_source, "correlationId": correlation_id},
             message="Startup reconciliation running.",
+            correlation_id=correlation_id,
         )
         _startup_reconciliation_active["runId"] = run_id
 

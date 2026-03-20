@@ -1,13 +1,17 @@
-# build_release.ps1
-# Reproducible onedir build for MonClub Access (Windows / 32-bit Python required)
-# + release packaging: zip + manifest json + hashes
-# Robust packaging: waits for staged files to unlock (Defender/AV), retries zip, tar fallback.
-
 param(
+  [ValidateSet("access", "tv")]
+  [string]$Component = "access",
+
   [switch]$RecreateVenv,
+
   [string]$ReleaseId = "",
-  [ValidateSet("stable","beta")]
-  [string]$Channel = "stable"
+
+  [ValidateSet("stable", "beta")]
+  [string]$Channel = "stable",
+
+  [switch]$SkipTauriBuild,
+
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +35,7 @@ function Try-Run($Cmd, $Args) {
 }
 
 function Stop-IfRunning($ProcessName) {
+  if ([string]::IsNullOrWhiteSpace($ProcessName)) { return }
   $procs = Get-Process $ProcessName -ErrorAction SilentlyContinue
   if ($procs) {
     Write-Host "Stopping running process: $ProcessName ..." -ForegroundColor Yellow
@@ -43,7 +48,6 @@ function Copy-TreeRobocopy([string]$SrcDir, [string]$DstDir) {
   if (-not (Test-Path $SrcDir)) { throw "Copy source not found: $SrcDir" }
   New-Item -ItemType Directory -Force $DstDir | Out-Null
 
-  # robocopy exit codes: < 8 are OK (0..7)
   $args = @(
     "`"$SrcDir`"",
     "`"$DstDir`"",
@@ -90,7 +94,6 @@ function Wait-StagingUnlocked([string]$Dir, [int]$TimeoutSeconds = 120) {
 }
 
 function Compress-ZipRobust([string]$FolderPath, [string]$ZipPath) {
-  # Wait for AV locks to clear, then retry archive a few times.
   for ($i = 1; $i -le 6; $i++) {
     try {
       Wait-StagingUnlocked -Dir $FolderPath -TimeoutSeconds 120
@@ -106,7 +109,6 @@ function Compress-ZipRobust([string]$FolderPath, [string]$ZipPath) {
 }
 
 function Tar-ZipRobust([string]$WorkingDir, [string]$FolderName, [string]$ZipPath) {
-  # tar.exe is built into Windows. Create zip by folder name from a working dir.
   for ($i = 1; $i -le 6; $i++) {
     try {
       if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath -ErrorAction SilentlyContinue }
@@ -122,42 +124,60 @@ function Tar-ZipRobust([string]$WorkingDir, [string]$FolderName, [string]$ZipPat
   }
 }
 
-# Go to repo root (where this script lives)
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ROOT
 
-Write-Host "== MonClub Access release build ==" -ForegroundColor Cyan
-Write-Host "Root: $ROOT"
-Write-Host "Channel: $Channel" -ForegroundColor Cyan
+. (Join-Path $ROOT "packaging\desktop_components.ps1")
+$meta = Get-DesktopComponentMetadata -Component $Component
 
-# (Optional) recreate venv
+$artifactName = $meta.ArtifactName
+$specPath = Join-Path $ROOT (($meta.SpecPath -replace '^\.[\\/]', ''))
+$uiStagingDir = Join-Path $ROOT (($meta.UiStagingDir -replace '^\.[\\/]', ''))
+$stagedUiExe = Join-Path $uiStagingDir $meta.UiExeName
+$releaseDir = Join-Path $ROOT "release"
+$distAppDir = Join-Path $ROOT ("dist\{0}" -f $artifactName)
+$distExe = Join-Path $distAppDir $meta.MainExe
+
+Write-Host ("== {0} release build ==" -f $meta.DisplayName) -ForegroundColor Cyan
+Write-Host "Root     : $ROOT"
+Write-Host "Component: $Component" -ForegroundColor Cyan
+Write-Host "Channel  : $Channel" -ForegroundColor Cyan
+Write-Host "Spec     : $specPath" -ForegroundColor Cyan
+Write-Host "UI Stage : $stagedUiExe" -ForegroundColor Cyan
+
+if ($DryRun) {
+  Write-Host "DryRun enabled. No build commands executed." -ForegroundColor Yellow
+  exit 0
+}
+
 if ($RecreateVenv -and (Test-Path ".\.venv")) {
   Write-Host "Removing existing .venv..." -ForegroundColor Yellow
   Remove-Item -Recurse -Force ".\.venv"
 }
 
-# Ensure venv
 if (-not (Test-Path ".\.venv")) {
   Write-Host "Creating venv (.venv)..." -ForegroundColor Yellow
   python -m venv .venv
 }
 
-# Activate venv
 Write-Host "Activating venv..." -ForegroundColor Yellow
 . ".\.venv\Scripts\Activate.ps1"
 
-# Enforce 32-bit Python
 Write-Host "Checking Python architecture..." -ForegroundColor Yellow
-python -c "import struct, sys; bits=struct.calcsize('P')*8; print('Python bits:', bits); sys.exit(0 if bits==32 else 1)"
+python -c "import struct; print('Python bits:', struct.calcsize('P')*8)"
 if ($LASTEXITCODE -ne 0) {
-  throw "This build must run with 32-bit Python."
+  throw "Unable to determine Python architecture."
+}
+if ($meta.Requires32BitPython) {
+  python -c "import struct, sys; sys.exit(0 if struct.calcsize('P')*8 == 32 else 1)"
+  if ($LASTEXITCODE -ne 0) {
+    throw "$($meta.DisplayName) packaging must run with 32-bit Python."
+  }
 }
 
-# Upgrade pip tooling
 Write-Host "Upgrading pip/setuptools/wheel..." -ForegroundColor Yellow
 python -m pip install --upgrade pip setuptools wheel
 
-# Install deps
 if (Test-Path ".\requirements.txt") {
   Write-Host "Installing requirements.txt..." -ForegroundColor Yellow
   python -m pip install -r .\requirements.txt
@@ -165,91 +185,74 @@ if (Test-Path ".\requirements.txt") {
   Write-Host "WARNING: requirements.txt not found. Skipping." -ForegroundColor Yellow
 }
 
-# Ensure PyInstaller is installed
 Write-Host "Installing/Upgrading PyInstaller..." -ForegroundColor Yellow
 python -m pip install --upgrade pyinstaller
 
-# Sanity imports
 Write-Host "Sanity import checks..." -ForegroundColor Yellow
 python -c "import requests; print('requests OK', requests.__version__)"
 python -c "import tkinter; print('tkinter OK')"
 
-# Ensure app not running (tray!)
-Stop-IfRunning "MonClubAccess"
+if ((-not $SkipTauriBuild) -or (-not (Test-Path $stagedUiExe))) {
+  Write-Host "Preparing Tauri shell artifact..." -ForegroundColor Yellow
+  & powershell -ExecutionPolicy Bypass -File (Join-Path $ROOT "build_tauri_shell.ps1") -Component $Component -Profile release
+  if ($LASTEXITCODE -ne 0) {
+    throw "build_tauri_shell.ps1 failed with exit code $LASTEXITCODE"
+  }
+}
 
-# Clean build outputs
+Stop-IfRunning $meta.MainProcessName
+
 Write-Host "Cleaning build/ dist/ ..." -ForegroundColor Yellow
 if (Test-Path ".\build") { Remove-Item -Recurse -Force ".\build" }
 if (Test-Path ".\dist")  { Remove-Item -Recurse -Force ".\dist" }
 
-# Build using spec
-$SPEC = ".\MonClubAccess.spec"
-if (-not (Test-Path $SPEC)) {
-  throw "Spec file not found: $SPEC"
+if (-not (Test-Path $specPath)) {
+  throw "Spec file not found: $specPath"
 }
 
 Write-Host "Running PyInstaller..." -ForegroundColor Yellow
-python -m PyInstaller --noconfirm --clean $SPEC
+python -m PyInstaller --noconfirm --clean $specPath
 
-# Post-build: ensure SDK DLLs also exist next to the EXE (dist/<app>/sdk)
-$DIST_APP_DIR = Join-Path $ROOT "dist\MonClubAccess"
-$INTERNAL_SDK = Join-Path $DIST_APP_DIR "_internal\sdk"
-$PUBLIC_SDK = Join-Path $DIST_APP_DIR "sdk"
-
-if (Test-Path $INTERNAL_SDK) {
-  New-Item -ItemType Directory -Force $PUBLIC_SDK | Out-Null
-  Copy-Item (Join-Path $INTERNAL_SDK "*.dll") $PUBLIC_SDK -Force -ErrorAction SilentlyContinue
+if ($meta.RequiresSdkDlls) {
+  $internalSdk = Join-Path $distAppDir "_internal\sdk"
+  $publicSdk = Join-Path $distAppDir "sdk"
+  if (Test-Path $internalSdk) {
+    New-Item -ItemType Directory -Force $publicSdk | Out-Null
+    Copy-Item (Join-Path $internalSdk "*.dll") $publicSdk -Force -ErrorAction SilentlyContinue
+  }
 }
 
-# Verify exe exists
-$DIST_EXE = Join-Path $DIST_APP_DIR "MonClubAccess.exe"
-if (-not (Test-Path $DIST_EXE)) {
-  throw "Build failed: EXE not found at $DIST_EXE"
+if (-not (Test-Path $distExe)) {
+  throw "Build failed: EXE not found at $distExe"
 }
 
-# Bundle Tauri UI executable in release payload (standalone installer runtime)
-$TAURI_UI_RELEASE = Join-Path $ROOT "tauri-ui\src-tauri\target\release\monclub-access-ui.exe"
-$TAURI_UI_DEBUG = Join-Path $ROOT "tauri-ui\src-tauri\target\debug\monclub-access-ui.exe"
-$TAURI_UI_EXE = $null
-
-if (Test-Path $TAURI_UI_RELEASE) {
-  $TAURI_UI_EXE = $TAURI_UI_RELEASE
-} elseif (Test-Path $TAURI_UI_DEBUG) {
-  $TAURI_UI_EXE = $TAURI_UI_DEBUG
-}
-
-if ([string]::IsNullOrWhiteSpace($TAURI_UI_EXE)) {
+if (-not (Test-Path $stagedUiExe)) {
   throw @"
-Tauri UI executable not found.
-Build it first from tauri-ui:
-  npm run tauri build
-Expected file:
-  tauri-ui\src-tauri\target\release\monclub-access-ui.exe
+Component-specific Tauri UI executable not found.
+Expected:
+  $stagedUiExe
+
+Build it with:
+  powershell -ExecutionPolicy Bypass -File .\build_tauri_shell.ps1 -Component $Component
 "@
 }
 
-$DIST_UI_DIR = Join-Path $DIST_APP_DIR "ui"
-New-Item -ItemType Directory -Force $DIST_UI_DIR | Out-Null
-$DIST_TAURI_EXE = Join-Path $DIST_UI_DIR "monclub-access-ui.exe"
-Copy-Item -LiteralPath $TAURI_UI_EXE -Destination $DIST_TAURI_EXE -Force
-Write-Host "Bundled Tauri UI: $DIST_TAURI_EXE" -ForegroundColor Green
-
+$distUiDir = Join-Path $distAppDir "ui"
+New-Item -ItemType Directory -Force $distUiDir | Out-Null
+$distTauriExe = Join-Path $distUiDir $meta.UiExeName
+Copy-Item -LiteralPath $stagedUiExe -Destination $distTauriExe -Force
+Write-Host "Bundled Tauri UI: $distTauriExe" -ForegroundColor Green
 
 Write-Host "`nBuild OK" -ForegroundColor Green
-Write-Host "EXE: $DIST_EXE"
+Write-Host "EXE: $distExe"
 
-# ----------------------------
-# RELEASE PACKAGING
-# ----------------------------
 Write-Host "`nPackaging release..." -ForegroundColor Cyan
-Stop-IfRunning "MonClubAccess"
+Stop-IfRunning $meta.MainProcessName
 
-# ReleaseId default (UTC)
 if ([string]::IsNullOrWhiteSpace($ReleaseId)) {
   $ReleaseId = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss'Z'")
 }
 
-# Optional git info (kept inside manifest only; DO NOT affect file names)
 $gitCmd = Get-Command git -ErrorAction SilentlyContinue
 $git = @{
   available = $false
@@ -267,67 +270,58 @@ if ($gitCmd) {
   if ($r3.ok) { $git.dirty = (-not [string]::IsNullOrWhiteSpace($r3.out)) }
 }
 
-# IMPORTANT: stable asset naming for backend + publish script
-$baseName = "MonClubAccess-$ReleaseId"
+$baseName = "{0}-{1}" -f $artifactName, $ReleaseId
+New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
-$RELEASE_DIR = Join-Path $ROOT "release"
-New-Item -ItemType Directory -Force $RELEASE_DIR | Out-Null
+$stagingRoot = Join-Path $releaseDir "_staging"
+$stagingDir = Join-Path $stagingRoot $baseName
+$stagingApp = Join-Path $stagingDir $artifactName
 
-# Stage directory (avoid dist locks)
-$STAGING_ROOT = Join-Path $RELEASE_DIR "_staging"
-$STAGING_DIR  = Join-Path $STAGING_ROOT $baseName
-$STAGING_APP_PARENT = $STAGING_DIR
-$STAGING_APP_NAME = "MonClubAccess"
-$STAGING_APP = Join-Path $STAGING_APP_PARENT $STAGING_APP_NAME
+if (Test-Path $stagingDir) { Remove-Item -Recurse -Force $stagingDir }
+New-Item -ItemType Directory -Force $stagingApp | Out-Null
 
-if (Test-Path $STAGING_DIR) { Remove-Item -Recurse -Force $STAGING_DIR }
-New-Item -ItemType Directory -Force $STAGING_APP | Out-Null
-
-# Write version.json into dist so it ships inside the ZIP and installed folder
-$VERSION_PATH = Join-Path $DIST_APP_DIR "version.json"
+$versionPath = Join-Path $distAppDir "version.json"
 $versionObj = [ordered]@{
-  app = "MonClubAccess"
+  component = $meta.Id
+  app = $artifactName
+  displayName = $meta.DisplayName
+  mainExe = $meta.MainExe
+  uiExe = $meta.UiExeName
+  updaterExe = $meta.UpdaterInstalledExe
   platform = "windows"
   channel = $Channel
   releaseId = $ReleaseId
   builtAtUtc = (Get-Date).ToUniversalTime().ToString("o")
 }
-($versionObj | ConvertTo-Json -Depth 5) | Out-File -LiteralPath $VERSION_PATH -Encoding utf8
-Write-Host "Wrote version.json -> $VERSION_PATH" -ForegroundColor Green
+($versionObj | ConvertTo-Json -Depth 5) | Out-File -LiteralPath $versionPath -Encoding utf8
+Write-Host "Wrote version.json -> $versionPath" -ForegroundColor Green
 
 Write-Host "Staging dist -> release staging (robocopy with retries)..." -ForegroundColor Yellow
-Copy-TreeRobocopy $DIST_APP_DIR $STAGING_APP
+Copy-TreeRobocopy $distAppDir $stagingApp
+Wait-StagingUnlocked -Dir $stagingApp -TimeoutSeconds 180
 
-# Wait for AV locks to clear on staging
-Wait-StagingUnlocked -Dir $STAGING_APP -TimeoutSeconds 180
-
-$ZIP_PATH = Join-Path $RELEASE_DIR "$baseName.zip"
-$MANIFEST_PATH = Join-Path $RELEASE_DIR "$baseName.manifest.json"
+$zipPath = Join-Path $releaseDir "$baseName.zip"
+$manifestPath = Join-Path $releaseDir "$baseName.manifest.json"
 
 Write-Host "`nCreating zip from staging..." -ForegroundColor Yellow
-
-# Try Compress-Archive (PowerShell) first; if it still fails, fallback to tar.exe.
 try {
-  Compress-ZipRobust -FolderPath $STAGING_APP -ZipPath $ZIP_PATH
+  Compress-ZipRobust -FolderPath $stagingApp -ZipPath $zipPath
 } catch {
   Write-Host "Compress-Archive keeps failing. Falling back to tar.exe..." -ForegroundColor Yellow
-  # tar needs folder name relative to a working directory
-  Tar-ZipRobust -WorkingDir $STAGING_APP_PARENT -FolderName $STAGING_APP_NAME -ZipPath $ZIP_PATH
+  Tar-ZipRobust -WorkingDir $stagingDir -FolderName $artifactName -ZipPath $zipPath
 }
 
-# Collect runtime versions
 $pyExe = (Get-Command python).Source
 $pyVersion = (python -c "import sys; print(sys.version.split()[0])").Trim()
 $pyBits = (python -c "import struct; print(struct.calcsize('P')*8)").Trim()
 $piVersion = (python -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
 
-# Hash shipped binaries based on STAGING (matches zip content)
-$STAGED_EXE = Join-Path $STAGING_APP "MonClubAccess.exe"
+$stagedExe = Join-Path $stagingApp $meta.MainExe
 $binaryExt = @(".exe",".dll",".pyd")
-$files = Get-ChildItem -LiteralPath $STAGING_APP -Recurse -File |
+$files = Get-ChildItem -LiteralPath $stagingApp -Recurse -File |
   Where-Object { $binaryExt -contains $_.Extension.ToLowerInvariant() } |
   ForEach-Object {
-    $rel = $_.FullName.Substring($STAGING_APP.Length).TrimStart("\","/")
+    $rel = $_.FullName.Substring($stagingApp.Length).TrimStart("\","/")
     [ordered]@{
       path = $rel
       size = $_.Length
@@ -335,11 +329,16 @@ $files = Get-ChildItem -LiteralPath $STAGING_APP -Recurse -File |
     }
   }
 
-$zipHash = Get-Sha256 $ZIP_PATH
-$exeHash = Get-Sha256 $STAGED_EXE
+$zipHash = Get-Sha256 $zipPath
+$exeHash = Get-Sha256 $stagedExe
 
 $manifest = [ordered]@{
-  app = "MonClubAccess"
+  component = $meta.Id
+  app = $artifactName
+  displayName = $meta.DisplayName
+  mainExe = $meta.MainExe
+  uiExe = $meta.UiExeName
+  updaterExe = $meta.UpdaterInstalledExe
   platform = "windows"
   channel = $Channel
   releaseId = $ReleaseId
@@ -352,22 +351,21 @@ $manifest = [ordered]@{
   pyinstaller = [ordered]@{ version = $piVersion }
   git = $git
   outputs = [ordered]@{
-    distDir = $DIST_APP_DIR
-    stagedDir = $STAGING_APP
+    distDir = $distAppDir
+    stagedDir = $stagingApp
     exeSha256 = $exeHash
-    zip = $ZIP_PATH
+    zip = $zipPath
     zipSha256 = $zipHash
   }
   shippedBinaries = $files
 }
 
 $manifestJson = ($manifest | ConvertTo-Json -Depth 10)
-[System.IO.File]::WriteAllText($MANIFEST_PATH, $manifestJson, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.Encoding]::UTF8)
 
 Write-Host "`nRelease OK" -ForegroundColor Green
-Write-Host "ZIP      : $ZIP_PATH"
-Write-Host "MANIFEST : $MANIFEST_PATH"
+Write-Host "ZIP      : $zipPath"
+Write-Host "MANIFEST : $manifestPath"
 Write-Host "`nZIP SHA256:" -ForegroundColor Cyan
 Write-Host $zipHash
-
 Write-Host "`nDone." -ForegroundColor Green

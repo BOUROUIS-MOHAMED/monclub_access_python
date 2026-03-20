@@ -2,381 +2,158 @@
 
 ## Locked Target
 
-This repository is moving to the locked target architecture:
+MonClub desktop is being split using the locked target model:
 
 - `MonClub Access` = critical access-control desktop agent
-- `MonClub TV` = separate signage/player desktop app/runtime
-- `Shared Core/Common` = contracts, DTOs, config models, API client base, logging/correlation helpers, updater/install plumbing
-- separate SQLite databases
+- `MonClub TV` = separate signage/player desktop app
+- `Shared` = stable contracts/infrastructure only
+- separate processes
+- separate live SQLite databases
 - backend remains source of truth
-- no shared mutable runtime DB between Access and TV
-- TV failures must never degrade access control
+- no shared mutable runtime DB
 
-This document is based on the current repository state in `C:\Users\mohaa\Desktop\monclub_access_python`.
+Phase 8 retires low-value transitional debt after process, storage, packaging, config, and update separation were already completed in Phases 3 through 7.
+
+## Current State After Phase 8
+
+### Runtime/process state
+
+- Access starts independently through [access/main.py](C:\Users\mohaa\Desktop\monclub_access_python\access\main.py)
+- TV starts independently through [tv/main.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\main.py)
+- the shared Tauri shell is still one codebase, but it is launched in explicit `access` or `tv` mode
+- Access no longer hosts TV by default
+
+### Storage state
+
+- Access uses `access.db`
+- TV uses `tv.db`
+- legacy `app.db` remains migration-only / compatibility-only
+
+### Config/update state
+
+- Access now persists runtime config in `access/config.json`
+- TV now persists runtime config in `tv/config.json`
+- shared install metadata is reduced to `shared/install.json`
+- Access now owns an Access update-runtime wrapper: [access/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\access\update_runtime.py)
+- TV now owns a TV update-runtime wrapper: [tv/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\update_runtime.py)
+- both wrappers use one shared generic engine in [shared/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\update_runtime.py), but runtime state is component-local
+- TV now exposes TV-owned config/update routes from [tv/local_api_routes.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\local_api_routes.py)
+- TV now persists its own backend auth row in `tv.db`
+- the remaining auth compatibility seam is isolated in [tv/auth_bridge.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\auth_bridge.py)
+- Access login/logout still mirror backend auth into the TV-owned auth row on a best-effort basis; Access correctness does not depend on TV mirroring succeeding
+- TV may still perform a one-time compatibility import from Access/legacy auth state if its own auth row does not exist yet
+- local IPC is still intentionally not implemented; shared install metadata records `ipc_mode = NONE`
+
+### Frontend / Tauri state
+
+- shared Tauri infrastructure still lives in one source tree
+- TV-owned implementations now live directly under [tauri-ui/src/tv](C:\Users\mohaa\Desktop\monclub_access_python\tauri-ui\src\tv)
+- low-value generic TV wrapper files under `src/pages`, `src/components`, and `src/api` were removed in Phase 8 because all live imports already resolved through `src/tv/*`
+
+### Packaging/delivery state
+
+- Access now has a dedicated PyInstaller spec: [MonClubAccess.spec](C:\Users\mohaa\Desktop\monclub_access_python\MonClubAccess.spec)
+- TV now has a dedicated PyInstaller spec: [MonClubTV.spec](C:\Users\mohaa\Desktop\monclub_access_python\MonClubTV.spec)
+- Access now has a dedicated installer script: [MonClubAccess.iss](C:\Users\mohaa\Desktop\monclub_access_python\installer\MonClubAccess.iss)
+- TV now has a dedicated installer script: [MonClubTV.iss](C:\Users\mohaa\Desktop\monclub_access_python\installer\MonClubTV.iss)
+- release/installer scripts are now component-aware through [desktop_components.ps1](C:\Users\mohaa\Desktop\monclub_access_python\packaging\desktop_components.ps1)
+- the repo now supports packaging:
+  - Access only
+  - TV only
+  - both, via one ecosystem build invocation that produces both installers and an ecosystem bundle manifest
 
 ## Current-State Audit
 
-### Current desktop/bootstrap shape
-
-- Python entrypoint: `app/main.py`
-- Main composition root: `app/ui/app.py`
-- Tauri shell: `tauri-ui/src/App.tsx`
-- Tauri Rust host: `tauri-ui/src-tauri/src/lib.rs`
-- Local API server: `app/api/local_access_api_v2.py`
-- PyInstaller entry: `MonClubAccess.spec`
-- Release packaging: `build_release.ps1`, `generate_installer.ps1`
-- Installer: `installer/MonClubAccess.iss`
-- Updater: `updater/MonClubAccessUpdater/*`
-
-### Where Access responsibilities currently live
-
-Access-control responsibilities are concentrated in:
-
-- `app/core/db.py`
-  - auth token storage
-  - sync cache normalization
-  - device sync state
-  - access history
-  - offline creation queue
-  - fingerprint cache
-  - local door presets
-- `app/core/device_sync.py`
-  - PushSDK synchronization for `DEVICE` mode devices
-- `app/core/realtime_agent.py`
-  - `AGENT` mode device workers
-  - RTLog polling
-  - access decisioning
-  - notifications/popups/history writing
-- `app/sdk/*`
-  - ZKTeco DLL bindings and device/scanner integration
-- `app/core/settings_reader.py`
-  - backend-driven access settings normalization from SQLite cache
-- `app/ui/app.py`
-  - auth/session handling
-  - local API startup
-  - device sync scheduling
-  - realtime agent lifecycle
-  - offline creation retry flow
-- Tauri access pages:
-  - `tauri-ui/src/pages/DashboardPage.tsx`
-  - `tauri-ui/src/pages/DevicesPage.tsx`
-  - `tauri-ui/src/pages/UsersPage.tsx`
-  - `tauri-ui/src/pages/EnrollPage.tsx`
-  - `tauri-ui/src/pages/AgentPage.tsx`
-  - `tauri-ui/src/pages/ConfigPage.tsx`
-  - `tauri-ui/src/pages/LogsPage.tsx`
-  - `tauri-ui/src/pages/LocalDbPage.tsx`
-  - `tauri-ui/src/pages/LoginPage.tsx`
-  - `tauri-ui/src/pages/RestrictedPage.tsx`
-  - `tauri-ui/src/pages/PopupWindow.tsx`
-
-### Where TV responsibilities currently live
-
-TV responsibilities are concentrated in:
-
-- `app/core/tv_local_cache.py`
-  - monitor inventory
-  - screen bindings and runtime state
-  - snapshot cache and manifest cache
-  - asset download/cache state
-  - readiness and activation
-  - player runtime state/events
-  - ad runtime/task/proof state
-  - support/recovery actions
-  - observability/retention
-  - startup reconciliation and preflight
-- `app/api/local_access_api_v2.py`
-  - TV host orchestration endpoints
-  - TV sync/readiness/activation/player endpoints
-  - TV ad/proof/support/observability/startup endpoints
-- Tauri TV surfaces:
-  - `tauri-ui/src/pages/TvOverviewPage.tsx`
-  - `tauri-ui/src/pages/TvPlayerWindowPage.tsx`
-  - `tauri-ui/src/components/TvOrchestrator.tsx`
-  - `tauri-ui/src/api/tv.ts`
-  - TV DTOs inside `tauri-ui/src/api/types.ts`
-
-### Mixed/coupled modules today
-
-The main coupling points are:
-
-- `app/ui/app.py`
-  - launches Tauri UI while also owning access-control runtime
-  - owns both update manager and local API server
-  - composes access and TV concerns in one application object
-- `app/api/local_access_api_v2.py`
-  - one local API surface for access + TV + updater + DB tools
-- `app/core/config.py`
-  - same config model stores access endpoints and TV endpoints
-- `app/core/utils.py`
-  - one data root and one active SQLite path (`app.db`)
-- `tauri-ui/src/App.tsx`
-  - one Tauri shell routes both access and TV features
-- `tauri-ui/src/layouts/MainLayout.tsx`
-  - one navigation tree contains both access and TV pages
-- packaging
-  - `MonClubAccess.spec`, `build_release.ps1`, and `installer/MonClubAccess.iss` bundle Python runtime + Tauri UI as one product named MonClub Access
-
-### Runtime/storage/config coupling today
-
-- one active SQLite file: `app/core/utils.py` exposes `DB_PATH = DATA_DIR / "app.db"`
-- both `app/core/db.py` and `app/core/tv_local_cache.py` use the same SQLite database
-- one config file: `app/core/utils.py` exposes `CONFIG_PATH = DATA_DIR / "config.json"`
-- one local API port and process: `LocalAccessApiServerV2` serves both Access and TV
-- one Python composition root: `MainApp` in `app/ui/app.py`
-- one Tauri process launched by Access
-- installer/updater are Access-branded and currently update the whole bundle together
-
-## File Ownership Classification
-
-### Clearly Access-only
-
-- `app/core/db.py`
-- `app/core/device_sync.py`
-- `app/core/realtime_agent.py`
-- `app/core/settings_reader.py`
-- `app/sdk/*`
-- `tauri-ui/src/pages/DashboardPage.tsx`
-- `tauri-ui/src/pages/DevicesPage.tsx`
-- `tauri-ui/src/pages/UsersPage.tsx`
-- `tauri-ui/src/pages/EnrollPage.tsx`
-- `tauri-ui/src/pages/AgentPage.tsx`
-- `tauri-ui/src/pages/ConfigPage.tsx`
-- `tauri-ui/src/pages/LogsPage.tsx`
-- `tauri-ui/src/pages/LocalDbPage.tsx`
-- `tauri-ui/src/pages/LoginPage.tsx`
-- `tauri-ui/src/pages/RestrictedPage.tsx`
-- `tauri-ui/src/pages/PopupWindow.tsx`
-
-### Clearly TV-only
-
-- `app/core/tv_local_cache.py`
-- `tauri-ui/src/components/TvOrchestrator.tsx`
-- `tauri-ui/src/pages/TvOverviewPage.tsx`
-- `tauri-ui/src/pages/TvPlayerWindowPage.tsx`
-- `tauri-ui/src/api/tv.ts`
-
-### Should move to Shared/Core
-
-- `app/api/monclub_api.py`
-- `app/core/arch.py`
-- `app/core/logger.py`
-- `app/core/log_buffer.py`
-- shared desktop path/layout metadata currently spread through `app/core/utils.py`
-- updater/install metadata and path helpers currently spread through `app/core/update_manager.py`, `build_release.ps1`, `installer/MonClubAccess.iss`
-
-### Should remain composition roots, but split later
-
-- `app/ui/app.py`
-- `app/api/local_access_api_v2.py`
-- `tauri-ui/src/App.tsx`
-- `tauri-ui/src/layouts/MainLayout.tsx`
-- `tauri-ui/src-tauri/src/lib.rs`
-
-## Target Bounded Contexts
-
-### MonClub Access
-
-Access owns:
-
-- device connectivity and driver integration
-- RTLog polling and access decisions
-- offline user/account creation queue
-- access history and local door authorization support
-- scanner/enrollment tools
-- access-specific UI and operator workflows
-- access updater channel and access runtime health
-
-Access must not own:
-
-- TV bindings/windows/monitors
-- snapshot cache/readiness/activation
-- TV player runtime
-- TV ad runtime/proofs/support/observability
-
-### MonClub TV
-
-TV owns:
-
-- monitor inventory and screen bindings
-- one player window per screen
-- snapshot fetch/cache
-- asset download/cache
-- readiness and activation evaluation
-- player window lifecycle and support/recovery
-- ad runtime/proof tracking
-- TV observability, retention, startup reconciliation
-
-TV must not own:
-
-- ZKTeco device access logic
-- RTLog polling and access authorization
-- offline access-member creation
-- access notifications and popup screen
-
-### Shared Core/Common
-
-Shared owns only stable cross-app building blocks:
-
-- backend API client base and DTO contracts
-- config model envelopes and split path layout metadata
-- logging/correlation helpers
-- installer/updater manifest/path plumbing
-- stable enums/descriptors for bootstrap and packaging
-
-Shared must not own mutable runtime state or operational SQLite tables.
-
-## Storage Split
-
-### Target databases
-
-`access.db` should contain:
-
-- auth/session state if stored locally
-- sync cache normalized tables
-- device sync state
-- access history
-- offline creation queue
-- local fingerprint cache
-- access-only settings/cache derived from backend
-
-`tv.db` should contain:
-
-- monitor inventory
-- screen binding and binding runtime state
-- snapshot cache and required assets
-- local asset validation state
-- readiness and activation tables
-- player state and event logs
-- ad task/runtime/proof state
-- support logs
-- observability history
-- startup reconciliation runs/phases
-
-### Tiny shared install config
-
-Shared install config may contain only:
-
-- install/component metadata
-- updater channel/platform metadata
-- backend base URLs that both apps need
-- optional launcher-discovery metadata
-
-It must not contain mutable operational state. If auth must be shared later, use OS secure storage or explicit token replication, not a shared SQLite runtime database.
-
-### Current-to-target migration
-
-Current state is one SQLite file (`app.db`) with access and TV tables together.
-
-Migration target:
-
-1. keep `app.db` as the live runtime DB during Phase 1
-2. introduce split-ready path scaffolding for `access.db` and `tv.db`
-3. move repositories/service imports behind `access/`, `tv/`, and `shared/` boundaries
-4. later migrate data table-by-table into separate DBs
-5. stop any cross-context table access before the actual DB cutover
-
-## Process Model
-
-### Target Access process
-
-- own Python service/runtime for access control
-- own access local API or access-specific IPC surface
-- own access tray/shell and access operator UI
-- continue operating even if TV is absent or broken
-
-### Target TV process
-
-- own TV orchestration/runtime and player windows
-- own TV local API or TV-specific IPC surface
-- own TV operator UI
-- may be installed without Access
-
-### Optional shared shell/tray
-
-Only justified if a future installer/launcher needs a lightweight selector/tray. It must not become a shared business runtime.
-
-### Failure isolation
-
-- Access crash must not take down TV if both are installed
-- TV crash must not take down access control
-- updater/install actions must be component-aware
-- no live TV processing inside the critical access-control process after later phases
-
-## Communication Model
-
-### Through backend only
-
-These should converge on backend-mediated coordination:
-
-- auth/session identity
-- gym/screen/device/source-of-truth configuration
-- snapshots and manifests
-- ad task fetch and proof submission
-- access sync payloads
-- release/update metadata
-
-### Optional local IPC
-
-Allowed only for narrow host-local coordination later, for example:
-
-- launcher asking each app for health/version
-- optional command handoff between Access shell and TV shell
-- optional local “open screen details” action
-
-### Must never use shared DB communication
-
-- Access must not read/write TV runtime state through a shared mutable SQLite file as a final architecture
-- TV must not depend on access tables for its runtime decisions
-- no “shared operational database” once the split is complete
-
-## Packaging / Installer Model
-
-### Current packaging state
-
-- Python release payload is built as `MonClubAccess`
-- Tauri UI executable is bundled into the same release payload
-- Inno Setup installer installs one `MonClubAccess` product
-- updater is `MonClubAccessUpdater.exe`
-
-### Target packaging state
-
-- one desktop ecosystem / installer family
-- separate installable components:
-  - Access
-  - TV
-  - shared prerequisites/launcher only if needed
-- separate executable/process identities
-- updater/component boundaries per app, even if distributed by one installer
-
-## Phase Structure
-
-### Phase 1
-
-- create `access/`, `tv/`, and `shared/` package boundaries
-- add split-ready storage path scaffolding for `access.db` and `tv.db`
-- add future Access and TV bootstrap descriptors/entry modules
-- route new composition-root imports through those boundaries
-- keep current runtime behavior unchanged
-
-### Phase 2
-
-- move more access and TV implementation modules behind repository/service facades
-- reduce direct imports from `app.core.tv_local_cache` and `app.core.db`
-- split config namespaces
-
-### Phase 3
-
-- separate TV runtime into its own process/app bootstrap
-- give TV its own local API/service host
-- keep Access process free of TV runtime responsibility
-
-### Phase 4
-
-- migrate from `app.db` to `access.db` + `tv.db`
-- implement data migration tooling and cutover
-
-### Phase 5
-
-- split installer/update channels into component-aware delivery
-- optional lightweight ecosystem launcher if still justified
+### Access-owned code
+
+- Access bootstrap/runtime: [access/bootstrap.py](C:\Users\mohaa\Desktop\monclub_access_python\access\bootstrap.py), [access/main.py](C:\Users\mohaa\Desktop\monclub_access_python\access\main.py), [access/runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\access\runtime.py)
+- Access storage: [access/store.py](C:\Users\mohaa\Desktop\monclub_access_python\access\store.py), [access/storage.py](C:\Users\mohaa\Desktop\monclub_access_python\access\storage.py), [app/core/db.py](C:\Users\mohaa\Desktop\monclub_access_python\app\core\db.py)
+- Access config/update ownership: [access/config.py](C:\Users\mohaa\Desktop\monclub_access_python\access\config.py), [access/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\access\update_runtime.py)
+- Access local API ownership: [access/api.py](C:\Users\mohaa\Desktop\monclub_access_python\access\api.py), [access/local_api_routes.py](C:\Users\mohaa\Desktop\monclub_access_python\access\local_api_routes.py)
+- the unused legacy updater shim `app/core/update_manager.py` was removed in Phase 8
+
+### TV-owned code
+
+- TV bootstrap/runtime: [tv/bootstrap.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\bootstrap.py), [tv/main.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\main.py), [tv/app.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\app.py), [tv/runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\runtime.py)
+- TV storage: [tv/store.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\store.py), [tv/storage.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\storage.py), [app/core/tv_local_cache.py](C:\Users\mohaa\Desktop\monclub_access_python\app\core\tv_local_cache.py)
+- TV config/update ownership: [tv/config.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\config.py), [tv/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\update_runtime.py)
+- TV local API ownership: [tv/api.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\api.py), [tv/local_api_routes.py](C:\Users\mohaa\Desktop\monclub_access_python\tv\local_api_routes.py)
+- TV UI ownership seam: [tauri-ui/src/tv](C:\Users\mohaa\Desktop\monclub_access_python\tauri-ui\src\tv)
+
+### Shared/common code
+
+- config split helpers + install metadata: [shared/config.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\config.py)
+- logging/runtime helpers: [shared/logging.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\logging.py), [shared/runtime_support.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\runtime_support.py)
+- Tauri launch bridge: [shared/tauri_launcher.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\tauri_launcher.py)
+- desktop descriptors/contracts: [shared/contracts.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\contracts.py)
+- storage migration helper: [shared/storage_migration.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\storage_migration.py)
+- component identity + generic update engine: [shared/component_identity.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\component_identity.py), [shared/update_runtime.py](C:\Users\mohaa\Desktop\monclub_access_python\shared\update_runtime.py)
+
+### Packaging coupling that existed before Phase 5
+
+- only one PyInstaller target existed: `MonClubAccess.spec`
+- only one installer existed: `installer/MonClubAccess.iss`
+- release scripts assumed only `MonClubAccess-*` outputs
+- publishing and verification scripts assumed only Access filenames
+- updater build/output identity was Access-specific
+- Tauri shell was role-aware at runtime, but packaging still treated it as only an Access payload
+
+## Target Packaging Model Now Implemented
+
+### Access package
+
+- Python app artifact name: `MonClubAccess`
+- main executable: `MonClubAccess.exe`
+- staged UI executable: `monclub-access-ui.exe`
+- installer executable: `MonClubAccessSetup-<releaseId>.exe`
+- updater installed name: `MonClubAccessUpdater.exe`
+
+### TV package
+
+- Python app artifact name: `MonClubTV`
+- main executable: `MonClubTV.exe`
+- staged UI executable: `monclub-tv-ui.exe`
+- installer executable: `MonClubTVSetup-<releaseId>.exe`
+- updater installed name: `MonClubTVUpdater.exe`
+
+### Shared ecosystem delivery
+
+- both components can still be built from the same repository
+- [generate_installer.ps1](C:\Users\mohaa\Desktop\monclub_access_python\generate_installer.ps1) now supports `access`, `tv`, or `both`
+- `both` produces both component installers plus `MonClubDesktopEcosystem-<releaseId>.bundle.json`
+- the updater implementation is still one shared infrastructure project, but installers rename/package it per component
+
+## Packaging / Release File Map
+
+- component metadata: [desktop_components.ps1](C:\Users\mohaa\Desktop\monclub_access_python\packaging\desktop_components.ps1)
+- Access PyInstaller target: [MonClubAccess.spec](C:\Users\mohaa\Desktop\monclub_access_python\MonClubAccess.spec)
+- TV PyInstaller target: [MonClubTV.spec](C:\Users\mohaa\Desktop\monclub_access_python\MonClubTV.spec)
+- component-aware Tauri shell staging: [build_tauri_shell.ps1](C:\Users\mohaa\Desktop\monclub_access_python\build_tauri_shell.ps1)
+- component-aware release packaging: [build_release.ps1](C:\Users\mohaa\Desktop\monclub_access_python\build_release.ps1)
+- component-aware installer packaging: [build_installer.ps1](C:\Users\mohaa\Desktop\monclub_access_python\build_installer.ps1)
+- ecosystem build entry: [generate_installer.ps1](C:\Users\mohaa\Desktop\monclub_access_python\generate_installer.ps1)
+- component-aware release publishing: [publish_github_release.ps1](C:\Users\mohaa\Desktop\monclub_access_python\publish_github_release.ps1)
+- component-aware release verification: [verify_release.ps1](C:\Users\mohaa\Desktop\monclub_access_python\verify_release.ps1)
+- shared updater project: [MonClubAccessUpdater.csproj](C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\MonClubAccessUpdater.csproj)
+- shared updater runtime now uses the generic `MonClubDesktopUpdater` namespace internally while keeping packaging continuity
+
+## What Remains Temporarily Shared
+
+- one repository
+- one shared Tauri source tree
+- one shared updater implementation project
+- one tiny shared install metadata file on disk: `shared/install.json`
+- one installer asset set (icons/bitmaps)
+- one best-effort Access -> TV auth mirror plus one-time TV compatibility import path for old auth state
+- legacy `data/config.json` may still exist as a migration source, but it is no longer the intended live runtime config
+
+These are explicitly temporary/shared delivery concerns, not shared mutable runtime state.
+
+## Final Assessment After Phase 8
+
+The separation work is functionally complete after Phase 8. Any future work is optional polish only:
+
+- further reduce legacy `app/*` implementation modules if they stop providing value
+- decide whether the shared Tauri source tree should remain shared permanently or be physically split into separate UI packages
+- polish the combined ecosystem installer/update UX beyond the current component-correct foundation
+- keep local IPC out unless a later concrete operational need appears; Phase 8 still found no blocker that justified it

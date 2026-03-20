@@ -9,11 +9,12 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 
-namespace MonClubAccessUpdater
+namespace MonClubDesktopUpdater
 {
     internal static class Program
     {
-        private const string AppExeName = "MonClubAccess.exe";
+        // Kept for backward-compatible fallback only; installers pass the real component exe name.
+        private const string DefaultAppExeName = "MonClubAccess.exe";
 
         private sealed class Manifest
         {
@@ -68,6 +69,9 @@ namespace MonClubAccessUpdater
             string zipPath     = Require(parsed, "--zip");
             string manifestPath= Require(parsed, "--manifest");
             int waitPid        = int.Parse(Require(parsed, "--waitPid"));
+            string appExeName  = parsed.TryGetValue("--appExeName", out var appExeValue) && !string.IsNullOrWhiteSpace(appExeValue)
+                ? appExeValue
+                : DefaultAppExeName;
 
             string? logPath = parsed.TryGetValue("--log", out var lp) ? lp : null;
             int forceKillAfterSeconds = parsed.TryGetValue("--forceKillAfterSeconds", out var fk)
@@ -84,14 +88,15 @@ namespace MonClubAccessUpdater
                 log.Info($"zip={zipPath}");
                 log.Info($"manifest={manifestPath}");
                 log.Info($"waitPid={waitPid}");
+                log.Info($"appExeName={appExeName}");
                 log.Info($"forceKillAfterSeconds={forceKillAfterSeconds}");
 
                 // 1) Wait for app pid
                 WaitForPidExit(waitPid, forceKillAfterSeconds, log);
 
-                // 2) Extra safety: kill any other MonClubAccess processes still running from current\
+                // 2) Extra safety: kill any other target-app processes still running from current\
                 string currentDir = Path.Combine(installRoot, "current");
-                KillRunningMonClubAccessFromDir(currentDir, log);
+                KillRunningAppFromDir(currentDir, appExeName, log);
 
                 // 3) Validate manifest + zip hash
                 var manifest = LoadManifest(manifestPath);
@@ -115,14 +120,14 @@ namespace MonClubAccessUpdater
                 }
 
                 // 4) Extract
-                string extractRoot = Path.Combine(Path.GetTempPath(), "MonClubAccessUpdater", releaseId, Guid.NewGuid().ToString("N"));
+                string extractRoot = Path.Combine(Path.GetTempPath(), "MonClubDesktopUpdater", releaseId, Guid.NewGuid().ToString("N"));
                 Directory.CreateDirectory(extractRoot);
 
                 log.Info($"Extracting zip to: {extractRoot}");
                 ZipFile.ExtractToDirectory(zipPath, extractRoot, overwriteFiles: true);
 
                 // 5) Resolve payload root
-                string payloadRoot = ResolvePayloadRoot(extractRoot, log);
+                string payloadRoot = ResolvePayloadRoot(extractRoot, appExeName, log);
                 log.Info($"Resolved payloadRoot: {payloadRoot}");
 
                 // 6) Swap (with retries)
@@ -138,16 +143,16 @@ namespace MonClubAccessUpdater
                     MoveDirectoryWithRetries(payloadRoot, currentDir, log, maxSeconds: 60);
 
                     // 7) Start new app
-                    string exePath = Path.Combine(currentDir, AppExeName);
+                    string exePath = Path.Combine(currentDir, appExeName);
                     if (!File.Exists(exePath))
                     {
                         // fallback search
-                        var found = Directory.GetFiles(currentDir, AppExeName, SearchOption.AllDirectories);
+                        var found = Directory.GetFiles(currentDir, appExeName, SearchOption.AllDirectories);
                         if (found.Length > 0) exePath = found[0];
                     }
                     if (!File.Exists(exePath))
                     {
-                        throw new Exception($"Cannot find {AppExeName} after install in: {currentDir}");
+                        throw new Exception($"Cannot find {appExeName} after install in: {currentDir}");
                     }
 
                     log.Info($"Starting app: {exePath}");
@@ -207,12 +212,13 @@ namespace MonClubAccessUpdater
         {
             Console.WriteLine(err);
             Console.WriteLine();
-            Console.WriteLine("MonClubAccessUpdater.exe ^");
+            Console.WriteLine("MonClubDesktopUpdater.exe ^");
             Console.WriteLine(@"  --installRoot ""%LOCALAPPDATA%\MonClubAccess"" ^");
             Console.WriteLine(@"  --releaseId ""20260210-124245Z"" ^");
             Console.WriteLine(@"  --zip ""...\downloads\windows\stable\MonClubAccess-20260210-124245Z.zip"" ^");
             Console.WriteLine(@"  --manifest ""...\downloads\windows\stable\MonClubAccess-20260210-124245Z.manifest.json"" ^");
             Console.WriteLine(@"  --waitPid 12345 ^");
+            Console.WriteLine(@"  [--appExeName ""MonClubAccess.exe""] ^");
             Console.WriteLine(@"  [--log ""...\logs\updater-<releaseId>.log""] ^");
             Console.WriteLine(@"  [--forceKillAfterSeconds 20]");
         }
@@ -253,13 +259,14 @@ namespace MonClubAccessUpdater
             }
         }
 
-        private static void KillRunningMonClubAccessFromDir(string currentDir, SimpleLogger log)
+        private static void KillRunningAppFromDir(string currentDir, string appExeName, SimpleLogger log)
         {
             try
             {
                 if (!Directory.Exists(currentDir)) return;
 
-                foreach (var p in Process.GetProcessesByName("MonClubAccess"))
+                string processName = Path.GetFileNameWithoutExtension(appExeName);
+                foreach (var p in Process.GetProcessesByName(processName))
                 {
                     try
                     {
@@ -269,13 +276,13 @@ namespace MonClubAccessUpdater
 
                         if (exe.StartsWith(currentDir, StringComparison.OrdinalIgnoreCase))
                         {
-                            log.Warn($"Found running MonClubAccess (pid={p.Id}) from current\\. Closing...");
+                            log.Warn($"Found running {processName} (pid={p.Id}) from current\\. Closing...");
                             try
                             {
                                 p.CloseMainWindow();
                                 if (!p.WaitForExit(3000))
                                 {
-                                    log.Warn($"Killing MonClubAccess pid={p.Id}");
+                                    log.Warn($"Killing {processName} pid={p.Id}");
                                     p.Kill(entireProcessTree: true);
                                     p.WaitForExit(5000);
                                 }
@@ -308,23 +315,22 @@ namespace MonClubAccessUpdater
             return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         }
 
-        private static string ResolvePayloadRoot(string extractRoot, SimpleLogger log)
+        private static string ResolvePayloadRoot(string extractRoot, string appExeName, SimpleLogger log)
         {
-            // If zip root contains single folder "MonClubAccess"
+            string expectedRootName = Path.GetFileNameWithoutExtension(appExeName);
+
             var dirs = Directory.GetDirectories(extractRoot);
             if (dirs.Length == 1)
             {
                 var only = dirs[0];
-                if (Path.GetFileName(only).Equals("MonClubAccess", StringComparison.OrdinalIgnoreCase))
+                if (Path.GetFileName(only).Equals(expectedRootName, StringComparison.OrdinalIgnoreCase))
                     return only;
             }
 
-            // Otherwise if extractRoot directly contains MonClubAccess.exe
-            if (File.Exists(Path.Combine(extractRoot, AppExeName)))
+            if (File.Exists(Path.Combine(extractRoot, appExeName)))
                 return extractRoot;
 
-            // Otherwise find folder containing MonClubAccess.exe
-            var found = Directory.GetFiles(extractRoot, AppExeName, SearchOption.AllDirectories);
+            var found = Directory.GetFiles(extractRoot, appExeName, SearchOption.AllDirectories);
             if (found.Length > 0)
             {
                 return Path.GetDirectoryName(found[0])!;

@@ -168,6 +168,7 @@ class AppConfig:
     api_tv_snapshot_manifest_url: str = "http://monclubwigo.tn/api/v1/manager/tv/snapshots/{snapshotId}/asset-manifest"
     api_tv_ad_tasks_fetch_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks"
     api_tv_ad_task_confirm_ready_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/confirm-ready"
+    api_tv_ad_task_submit_proof_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/submit-proof"
     # -------------------------
     # Sync schedule (seconds)
     # -------------------------
@@ -341,7 +342,7 @@ class AppConfig:
     # -------------------------
     def _resolve_active_device_conn(self) -> tuple[str, int, str]:
         try:
-            from app.core.db import get_sync_device
+            from access.store import get_sync_device
         except Exception:
             get_sync_device = None  # type: ignore[assignment]
 
@@ -441,6 +442,8 @@ class AppConfig:
             cfg.api_tv_ad_tasks_fetch_url = AppConfig.api_tv_ad_tasks_fetch_url
         if not cfg.api_tv_ad_task_confirm_ready_url:
             cfg.api_tv_ad_task_confirm_ready_url = AppConfig.api_tv_ad_task_confirm_ready_url
+        if not cfg.api_tv_ad_task_submit_proof_url:
+            cfg.api_tv_ad_task_submit_proof_url = AppConfig.api_tv_ad_task_submit_proof_url
 
         # sync interval
         try:

@@ -1,11 +1,23 @@
-// Fetch wrapper for localhost Python API â€” all endpoints under /api/v2/
+// Fetch wrapper for localhost Python API - all endpoints under /api/v2/
 
-const BASE = "http://127.0.0.1:8788";
+let _baseUrl = "http://127.0.0.1:8788";
 const PFX = "/api/v2";
 
 let _token: string | null = null;
 export const setAuthToken = (t: string) => { _token = t; };
 export const getAuthToken = () => _token;
+
+export const configureApiBaseUrl = (baseUrl: string) => {
+  const trimmed = String(baseUrl || "").trim();
+  if (trimmed) _baseUrl = trimmed.replace(/\/+$/, "");
+};
+
+export const configureApiPort = (port: number) => {
+  if (!Number.isFinite(port) || port <= 0) return;
+  _baseUrl = `http://127.0.0.1:${Math.trunc(port)}`;
+};
+
+export const getApiBaseUrl = () => _baseUrl;
 
 export class ApiError extends Error {
   status: number;
@@ -32,26 +44,26 @@ async function parse<T>(res: Response): Promise<T> {
 }
 
 export async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
-  let url = `${BASE}${PFX}${path}`;
+  let url = `${_baseUrl}${PFX}${path}`;
   if (params) { const q = new URLSearchParams(params).toString(); if (q) url += `?${q}`; }
   return parse<T>(await fetch(url, { headers: hdrs() }));
 }
 
 export async function post<T>(path: string, body?: unknown): Promise<T> {
-  return parse<T>(await fetch(`${BASE}${PFX}${path}`, {
+  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
     method: "POST", headers: hdrs(),
     body: body != null ? JSON.stringify(body) : undefined,
   }));
 }
 
 export async function patch<T>(path: string, body: unknown): Promise<T> {
-  return parse<T>(await fetch(`${BASE}${PFX}${path}`, {
+  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
     method: "PATCH", headers: hdrs(), body: JSON.stringify(body),
   }));
 }
 
 export async function del<T>(path: string): Promise<T> {
-  return parse<T>(await fetch(`${BASE}${PFX}${path}`, { method: "DELETE", headers: hdrs() }));
+  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, { method: "DELETE", headers: hdrs() }));
 }
 
 // SSE helper
@@ -60,7 +72,7 @@ export function openSSE(
   onEvent: (type: string, data: any) => void,
   onError?: (e: Event) => void,
 ): EventSource {
-  let url = `${BASE}${PFX}${path}`;
+  let url = `${_baseUrl}${PFX}${path}`;
   if (_token) url += `${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(_token)}`;
   const es = new EventSource(url);
   es.onmessage = (e) => { try { onEvent("message", JSON.parse(e.data)); } catch { onEvent("message", e.data); } };

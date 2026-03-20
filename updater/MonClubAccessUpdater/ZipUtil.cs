@@ -1,6 +1,6 @@
 using System.IO.Compression;
 
-namespace MonClubAccessUpdater;
+namespace MonClubDesktopUpdater;
 
 public static class ZipUtil
 {

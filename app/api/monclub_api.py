@@ -157,7 +157,7 @@ class MonClubApi:
 
 
 
-    def get_latest_access_software_release(
+    def get_latest_software_release(
         self,
         *,
         token: str,
@@ -183,26 +183,43 @@ class MonClubApi:
             "Accept": "application/json",
         }
 
-        self.logger.info("API getLatestAccessSoftwareRelease -> %s params=%s", url, params)
+        self.logger.info("API getLatestSoftwareRelease -> %s params=%s", url, params)
         try:
             r = self._session.get(url, params=params, headers=headers, timeout=timeout)
         except Exception as e:
-            raise MonClubApiError(f"getLatestAccessSoftwareRelease request failed: {e}") from e
+            raise MonClubApiError(f"getLatestSoftwareRelease request failed: {e}") from e
 
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
-            raise MonClubApiError(f"getLatestAccessSoftwareRelease failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
+            raise MonClubApiError(f"getLatestSoftwareRelease failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
 
         try:
             data = r.json()
         except Exception as e:
-            raise MonClubApiError(f"getLatestAccessSoftwareRelease returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
+            raise MonClubApiError(f"getLatestSoftwareRelease returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
 
         if not isinstance(data, dict):
-            raise MonClubApiError("getLatestAccessSoftwareRelease JSON is not an object/dict.")
+            raise MonClubApiError("getLatestSoftwareRelease JSON is not an object/dict.")
 
         return data
+
+    def get_latest_access_software_release(
+        self,
+        *,
+        token: str,
+        platform: str = "WINDOWS",
+        channel: str = "stable",
+        release_id: Optional[str] = None,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        return self.get_latest_software_release(
+            token=token,
+            platform=platform,
+            channel=channel,
+            release_id=release_id,
+            timeout=timeout,
+        )
 
 
     def _post_access_creation(self, *, url: str, token: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:

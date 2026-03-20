@@ -20,6 +20,7 @@ import time
 import traceback
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
@@ -310,7 +311,7 @@ def _handle_platform(ctx: _Ctx) -> None:
 
 def _handle_status(ctx: _Ctx) -> None:
     """Unified status snapshot for Tauri dashboard â€” single call."""
-    from app.core.db import load_auth_token, load_sync_cache
+    from access.store import load_auth_token, load_sync_cache
 
     auth = load_auth_token()
     reasons = []
@@ -385,21 +386,8 @@ def _handle_status(ctx: _Ctx) -> None:
         "avgDecisionMs": round(eng.get_avg_decision_ms(), 2) if agent_running else 0.0,
     }
 
-    um = getattr(ctx.app, "_update_manager", None)
-    st = getattr(ctx.app, "_update_status", None)
-    updates: Dict[str, Any] = {
-        "updateAvailable": False, "downloaded": False, "downloading": False,
-        "progress": None, "currentReleaseId": None, "lastCheckAt": None, "lastError": None,
-    }
-    if um:
-        updates["currentReleaseId"] = um.get_current_release_id()
-    if st:
-        updates["updateAvailable"] = bool(getattr(st, "update_available", False))
-        updates["downloaded"] = bool(getattr(st, "downloaded", False))
-        updates["downloading"] = bool(getattr(st, "downloading", False))
-        updates["progress"] = getattr(st, "progress_percent", None)
-        updates["lastCheckAt"] = getattr(st, "last_check_at", None)
-        updates["lastError"] = getattr(st, "last_error", None)
+    updates = _build_update_status_payload(ctx.app)
+    updates["progress"] = updates.get("progressPercent")
 
     ctx.send_json(200, {
         "ok": True,
@@ -427,8 +415,14 @@ def _handle_auth_login(ctx: _Ctx) -> None:
         api = ctx.app._api()
         token = api.login(email=email, password=password)
 
-        from app.core.db import save_auth_token
+        from access.store import save_auth_token
         save_auth_token(email=email, token=token)
+        try:
+            from tv.auth_bridge import mirror_access_auth_to_tv
+
+            mirror_access_auth_to_tv(email=email, token=token)
+        except Exception:
+            ctx.app.logger.warning("TV auth mirror failed during login.", exc_info=True)
 
         ctx.app.cfg.login_email = email
         ctx.app.persist_config()
@@ -448,7 +442,7 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
 
 def _handle_auth_status(ctx: _Ctx) -> None:
-    from app.core.db import load_auth_token
+    from access.store import load_auth_token
     auth = load_auth_token()
     reasons = ctx.app._restriction_reasons() if auth else []
     ctx.send_json(200, {
@@ -470,14 +464,20 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
         ctx.app.stop_realtime_agent()
     except Exception:
         pass
-    from app.core.db import clear_auth_token
+    from access.store import clear_auth_token
     clear_auth_token()
+    try:
+        from tv.auth_bridge import clear_tv_auth_bridge_state
+
+        clear_tv_auth_bridge_state()
+    except Exception:
+        ctx.app.logger.warning("TV auth mirror clear failed during logout.", exc_info=True)
     try:
         ctx.app._update_manager.stop()
     except Exception:
         pass
     try:
-        from app.core.db import save_sync_cache
+        from access.store import save_sync_cache
         save_sync_cache(None)
     except Exception:
         pass
@@ -492,44 +492,70 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
 # ==================== 3) CONFIG ====================
 
 _CONFIG_SENSITIVE = {"password", "commPassword", "comm_password"}
-_CONFIG_WRITABLE = {
-    "api_login_url", "api_sync_url", "api_create_user_fingerprint_url",
-    "api_access_create_membership_url", "api_access_create_account_membership_url",
-    "api_latest_release_url", "api_tv_snapshot_latest_url", "api_tv_snapshot_manifest_url",
-    "api_tv_ad_tasks_fetch_url", "api_tv_ad_task_confirm_ready_url", "sync_interval_sec", "max_login_age_minutes",
-    "log_level", "template_version", "template_encoding", "device_timeout_ms",
-    "local_api_enabled", "local_api_host", "local_api_port",
-    "tray_enabled", "minimize_to_tray_on_close", "start_minimized_to_tray",
-    "agent_realtime_enabled", "device_sync_enabled", "login_email",
-    "data_mode", "selected_device_id",
-    "update_enabled", "update_platform", "update_channel",
-    "update_check_interval_sec", "update_auto_download_zip",
+_UPDATE_RUNTIME_FIELDS = {
+    "update_enabled",
+    "update_platform",
+    "update_channel",
+    "update_check_interval_sec",
+    "update_auto_download_zip",
 }
 
-def _handle_config_get(ctx: _Ctx) -> None:
-    d = ctx.app.cfg.to_dict()
-    # mask sensitive paths but keep DLL paths for display
-    ctx.send_json(200, d)
+
+def _serialize_component_config(component: str, cfg) -> Dict[str, Any]:
+    if component == "tv":
+        from tv.config import serialize_tv_config
+
+        return serialize_tv_config(cfg)
+    from access.config import serialize_access_config
+
+    return serialize_access_config(cfg)
 
 
-def _handle_config_patch(ctx: _Ctx) -> None:
+def _apply_component_config_patch(component: str, cfg, patch: Dict[str, Any]) -> Dict[str, Any]:
+    if component == "tv":
+        from tv.config import apply_tv_config_patch
+
+        return apply_tv_config_patch(cfg, patch)
+    from access.config import apply_access_config_patch
+
+    return apply_access_config_patch(cfg, patch)
+
+
+def _maybe_refresh_update_manager(ctx: _Ctx, changed: Dict[str, Any]) -> None:
+    if not changed or not any(key in _UPDATE_RUNTIME_FIELDS for key in changed):
+        return
+    try:
+        ctx.app.after(0, lambda: ctx.app._ensure_update_manager_started(check_now=False))
+    except Exception:
+        pass
+
+
+def _handle_component_config_get(ctx: _Ctx, component: str) -> None:
+    ctx.send_json(200, _serialize_component_config(component, ctx.app.cfg))
+
+
+def _handle_component_config_patch(ctx: _Ctx, component: str) -> None:
     body = ctx.body()
     if not body:
         ctx.send_json(400, {"ok": False, "error": "empty body"})
         return
-    changed = {}
-    for k, v in body.items():
-        if k not in _CONFIG_WRITABLE:
-            continue
-        try:
-            setattr(ctx.app.cfg, k, v)
-            changed[k] = v
-        except Exception:
-            pass
+    changed = _apply_component_config_patch(component, ctx.app.cfg, body)
     if changed:
         ctx.app.persist_config()
-        ctx.app.logger.info("Config patched via API v2: %s", list(changed.keys()))
-    ctx.send_json(200, {"ok": True, "changed": changed, "config": ctx.app.cfg.to_dict()})
+        _maybe_refresh_update_manager(ctx, changed)
+        ctx.app.logger.info("%s config patched via API v2: %s", component.upper(), list(changed.keys()))
+    ctx.send_json(
+        200,
+        {"ok": True, "changed": changed, "config": _serialize_component_config(component, ctx.app.cfg)},
+    )
+
+
+def _handle_config_get(ctx: _Ctx) -> None:
+    _handle_component_config_get(ctx, "access")
+
+
+def _handle_config_patch(ctx: _Ctx) -> None:
+    _handle_component_config_patch(ctx, "access")
 
 
 def _handle_config_restart_api(ctx: _Ctx) -> None:
@@ -538,6 +564,18 @@ def _handle_config_restart_api(ctx: _Ctx) -> None:
     except Exception:
         pass
     ctx.send_json(200, {"ok": True, "message": "Local API restart scheduled"})
+
+
+def _handle_tv_config_get(ctx: _Ctx) -> None:
+    _handle_component_config_get(ctx, "tv")
+
+
+def _handle_tv_config_patch(ctx: _Ctx) -> None:
+    _handle_component_config_patch(ctx, "tv")
+
+
+def _handle_tv_config_restart_api(ctx: _Ctx) -> None:
+    _handle_config_restart_api(ctx)
 
 
 # ==================== 4) SYNC + CACHE ====================
@@ -551,7 +589,7 @@ def _handle_sync_now(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_meta(ctx: _Ctx) -> None:
-    from app.core.db import load_sync_cache
+    from access.store import load_sync_cache
     cache = load_sync_cache()
     if not cache:
         ctx.send_json(200, {"hasSyncData": False})
@@ -570,7 +608,7 @@ def _handle_sync_cache_meta(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_users(ctx: _Ctx) -> None:
-    from app.core.db import load_sync_cache
+    from access.store import load_sync_cache
     cache = load_sync_cache()
     users = list(cache.users) if cache else []
     limit = ctx.q_int("limit", default=0)
@@ -584,25 +622,25 @@ def _handle_sync_cache_users(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
-    from app.core.db import load_sync_cache
+    from access.store import load_sync_cache
     cache = load_sync_cache()
     ctx.send_json(200, {"memberships": list(cache.membership) if cache else []})
 
 
 def _handle_sync_cache_devices(ctx: _Ctx) -> None:
-    from app.core.db import load_sync_cache
+    from access.store import load_sync_cache
     cache = load_sync_cache()
     ctx.send_json(200, {"devices": list(cache.devices) if cache else []})
 
 
 def _handle_sync_cache_infrastructures(ctx: _Ctx) -> None:
-    from app.core.db import load_sync_cache
+    from access.store import load_sync_cache
     cache = load_sync_cache()
     ctx.send_json(200, {"infrastructures": list(cache.infrastructures) if cache else []})
 
 
 def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
-    from app.core.db import list_sync_gym_access_credentials
+    from access.store import list_sync_gym_access_credentials
     creds = list_sync_gym_access_credentials()
     # mask secret hex for safety
     for c in creds:
@@ -662,6 +700,20 @@ def _handle_tv_binding_get(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
     binding = load_tv_screen_binding()
     ctx.send_json(200, {"ok": True, "binding": binding})
+
+
+def _handle_tv_app_quit(ctx: _Ctx) -> None:
+    def _shutdown() -> None:
+        try:
+            ctx.app.after(0, ctx.app.quit_app)
+        except Exception:
+            try:
+                ctx.app.quit_app()
+            except Exception:
+                pass
+
+    threading.Timer(0.2, _shutdown).start()
+    ctx.send_json(200, {"ok": True, "message": "TV app shutdown scheduled."})
 
 
 def _handle_tv_binding_patch(ctx: _Ctx) -> None:
@@ -1910,7 +1962,7 @@ def _queue_payload_from_body(body: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_offline_creations_active(ctx: _Ctx) -> None:
-    from app.core.db import list_offline_creations, count_offline_creations
+    from access.store import list_offline_creations, count_offline_creations
 
     raw_state = ctx.q("state", "states", default="")
     states = _split_state_filter(raw_state) or list(_OFFLINE_ACTIVE_STATES)
@@ -1926,7 +1978,7 @@ def _handle_offline_creations_active(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creations_history(ctx: _Ctx) -> None:
-    from app.core.db import list_offline_creations, count_offline_creations
+    from access.store import list_offline_creations, count_offline_creations
 
     raw_state = ctx.q("state", "states", default="")
     states = _split_state_filter(raw_state) or list(_OFFLINE_HISTORY_STATES)
@@ -1942,7 +1994,7 @@ def _handle_offline_creations_history(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_get(ctx: _Ctx) -> None:
-    from app.core.db import get_offline_creation
+    from access.store import get_offline_creation
 
     local_id = ctx.param("localId")
     row = get_offline_creation(local_id)
@@ -1988,7 +2040,7 @@ def _handle_offline_creation_queue(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_patch(ctx: _Ctx) -> None:
-    from app.core.db import get_offline_creation, update_offline_creation_payload
+    from access.store import get_offline_creation, update_offline_creation_payload
 
     local_id = ctx.param("localId")
     body = ctx.body()
@@ -2016,7 +2068,7 @@ def _handle_offline_creation_patch(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_toggle(ctx: _Ctx) -> None:
-    from app.core.db import set_offline_creation_try_to_create
+    from access.store import set_offline_creation_try_to_create
 
     local_id = ctx.param("localId")
     body = ctx.body()
@@ -2038,7 +2090,7 @@ def _handle_offline_creation_retry(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_cancel(ctx: _Ctx) -> None:
-    from app.core.db import cancel_offline_creation
+    from access.store import cancel_offline_creation
 
     local_id = ctx.param("localId")
     body = ctx.body()
@@ -2051,7 +2103,7 @@ def _handle_offline_creation_cancel(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_duplicate(ctx: _Ctx) -> None:
-    from app.core.db import duplicate_offline_creation
+    from access.store import duplicate_offline_creation
 
     local_id = ctx.param("localId")
     row = duplicate_offline_creation(local_id)
@@ -2062,7 +2114,7 @@ def _handle_offline_creation_duplicate(ctx: _Ctx) -> None:
 
 
 def _handle_offline_creation_archive(ctx: _Ctx) -> None:
-    from app.core.db import archive_offline_creation
+    from access.store import archive_offline_creation
 
     local_id = ctx.param("localId")
     row = archive_offline_creation(local_id)
@@ -2090,7 +2142,7 @@ _device_sdk_lock = threading.Lock()
 
 def _get_device_conn_params(ctx: _Ctx, device_id: int) -> Tuple[str, int, int, str]:
     """Resolve connection params from sync cache + optional overrides."""
-    from app.core.db import get_sync_device
+    from access.store import get_sync_device
     d = get_sync_device(device_id) or {}
 
     def pick(d, *keys, default=None):
@@ -2383,7 +2435,7 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
 
 def _handle_device_door_presets_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
-    from app.core.db import list_device_door_presets
+    from access.store import list_device_door_presets
     presets = list_device_door_presets(did)
     ctx.send_json(200, {"presets": [
         {"id": p.id, "deviceId": p.device_id, "doorNumber": p.door_number,
@@ -2395,7 +2447,7 @@ def _handle_device_door_presets_list(ctx: _Ctx) -> None:
 def _handle_device_door_presets_create(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     body = ctx.body()
-    from app.core.db import create_device_door_preset
+    from access.store import create_device_door_preset
     try:
         pid = create_device_door_preset(
             device_id=did,
@@ -2410,7 +2462,7 @@ def _handle_device_door_presets_create(ctx: _Ctx) -> None:
 
 def _handle_device_door_presets_delete(ctx: _Ctx) -> None:
     preset_id = ctx.param_int("presetId")
-    from app.core.db import delete_device_door_preset
+    from access.store import delete_device_door_preset
     try:
         delete_device_door_preset(preset_id)
         ctx.send_json(200, {"ok": True})
@@ -2762,7 +2814,7 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
 
 
 def _handle_fingerprints_list(ctx: _Ctx) -> None:
-    from app.core.db import list_fingerprints
+    from access.store import list_fingerprints
     fps = list_fingerprints()
     ctx.send_json(200, {"fingerprints": [
         {"id": f.id, "createdAt": f.created_at, "pin": f.pin, "cardNo": f.card_no,
@@ -2775,7 +2827,7 @@ def _handle_fingerprints_list(ctx: _Ctx) -> None:
 
 def _handle_fingerprints_delete(ctx: _Ctx) -> None:
     fp_id = ctx.param_int("id")
-    from app.core.db import delete_fingerprint
+    from access.store import delete_fingerprint
     try:
         delete_fingerprint(fp_id)
         ctx.send_json(200, {"ok": True})
@@ -2857,12 +2909,26 @@ def _handle_logs_open_dir(ctx: _Ctx) -> None:
 
 # ==================== 9) UPDATES ====================
 
-def _handle_update_status(ctx: _Ctx) -> None:
-    um = getattr(ctx.app, "_update_manager", None)
-    st = getattr(ctx.app, "_update_status", None)
+def _build_update_status_payload(app) -> Dict[str, Any]:
+    um = getattr(app, "_update_manager", None)
+    st = getattr(app, "_update_status", None)
     data: Dict[str, Any] = {"updateAvailable": False}
     if um:
         data["currentReleaseId"] = um.get_current_release_id()
+        component = getattr(um, "component", None)
+        install_root = Path(getattr(um, "install_root", "")) if getattr(um, "install_root", None) else None
+        updater_name = getattr(component, "updater_exe_name", None)
+        updater_path = install_root / "updater" / updater_name if install_root and updater_name else None
+        data["componentId"] = getattr(component, "component_id", None)
+        data["componentDisplayName"] = getattr(component, "display_name", None)
+        data["artifactName"] = getattr(component, "artifact_name", None)
+        data["mainExecutable"] = getattr(component, "main_exe_name", None)
+        data["updaterExecutable"] = updater_name
+        data["updaterInstalled"] = bool(updater_path and updater_path.exists())
+        data["installRoot"] = str(install_root) if install_root else None
+        data["updateEnabled"] = bool(getattr(getattr(app, "cfg", None), "update_enabled", True))
+        data["channel"] = getattr(getattr(app, "cfg", None), "update_channel", None)
+        data["platform"] = getattr(getattr(app, "cfg", None), "update_platform", None)
     if st:
         data["updateAvailable"] = bool(getattr(st, "update_available", False))
         data["downloaded"] = bool(getattr(st, "downloaded", False))
@@ -2880,10 +2946,14 @@ def _handle_update_status(ctx: _Ctx) -> None:
                 "version": lr.get("version"),
                 "notes": lr.get("notes") or lr.get("releaseNotes"),
             }
-    ctx.send_json(200, data)
+    return data
 
 
-def _handle_update_check(ctx: _Ctx) -> None:
+def _handle_component_update_status(ctx: _Ctx) -> None:
+    ctx.send_json(200, _build_update_status_payload(ctx.app))
+
+
+def _handle_component_update_check(ctx: _Ctx) -> None:
     um = getattr(ctx.app, "_update_manager", None)
     if um:
         try:
@@ -2893,7 +2963,7 @@ def _handle_update_check(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True})
 
 
-def _handle_update_download(ctx: _Ctx) -> None:
+def _handle_component_update_download(ctx: _Ctx) -> None:
     um = getattr(ctx.app, "_update_manager", None)
     if um:
         try:
@@ -2903,7 +2973,7 @@ def _handle_update_download(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True})
 
 
-def _handle_update_install(ctx: _Ctx) -> None:
+def _handle_component_update_install(ctx: _Ctx) -> None:
     um = getattr(ctx.app, "_update_manager", None)
     if not um:
         ctx.send_json(400, {"ok": False, "error": "update manager not available"})
@@ -2926,10 +2996,54 @@ def _handle_update_install(ctx: _Ctx) -> None:
     threading.Timer(0.5, _do_install).start()
 
 
+def _handle_update_status(ctx: _Ctx) -> None:
+    _handle_component_update_status(ctx)
+
+
+def _handle_update_check(ctx: _Ctx) -> None:
+    _handle_component_update_check(ctx)
+
+
+def _handle_update_download(ctx: _Ctx) -> None:
+    _handle_component_update_download(ctx)
+
+
+def _handle_update_install(ctx: _Ctx) -> None:
+    _handle_component_update_install(ctx)
+
+
+def _handle_tv_update_status(ctx: _Ctx) -> None:
+    _handle_component_update_status(ctx)
+
+
+def _handle_tv_update_check(ctx: _Ctx) -> None:
+    _handle_component_update_check(ctx)
+
+
+def _handle_tv_update_download(ctx: _Ctx) -> None:
+    _handle_component_update_download(ctx)
+
+
+def _handle_tv_update_install(ctx: _Ctx) -> None:
+    _handle_component_update_install(ctx)
+
+
 # ==================== 10) LOCAL DB TOOLS ====================
 
+def _handle_access_storage_status(ctx: _Ctx) -> None:
+    from access.store import get_access_storage_status
+
+    ctx.send_json(200, get_access_storage_status())
+
+
+def _handle_tv_storage_status(ctx: _Ctx) -> None:
+    from tv.store import get_tv_storage_status
+
+    ctx.send_json(200, get_tv_storage_status())
+
+
 def _handle_db_tables(ctx: _Ctx) -> None:
-    from app.core.db import get_conn
+    from access.store import get_conn
     from access.storage import current_access_runtime_db_path
     tables = []
     try:
@@ -2958,7 +3072,7 @@ def _handle_db_table_query(ctx: _Ctx) -> None:
     if limit > 10000:
         limit = 10000
 
-    from app.core.db import get_conn
+    from access.store import get_conn
     try:
         with get_conn() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
@@ -2971,7 +3085,7 @@ def _handle_db_table_query(ctx: _Ctx) -> None:
 
 
 def _handle_db_access_history(ctx: _Ctx) -> None:
-    from app.core.db import get_recent_access_history
+    from access.store import get_recent_access_history
     limit = ctx.q_int("limit", default=50)
     records = get_recent_access_history(limit=limit)
     ctx.send_json(200, {"records": [
@@ -2996,7 +3110,7 @@ def _handle_db_access_history(ctx: _Ctx) -> None:
 
 
 def _handle_db_export(ctx: _Ctx) -> None:
-    from app.core.db import get_conn
+    from access.store import get_conn
     from app.core.utils import now_iso
     export: Dict[str, Any] = {}
     tables_to_export = [
@@ -3024,7 +3138,7 @@ def _handle_db_export(ctx: _Ctx) -> None:
 
 
 def _handle_db_stats(ctx: _Ctx) -> None:
-    from app.core.db import get_conn
+    from access.store import get_conn
     from access.storage import current_access_runtime_db_path
     info: Dict[str, Any] = {}
     try:
@@ -3367,211 +3481,55 @@ def _handle_tv_activation_attempts(ctx: _Ctx) -> None:
 # Router setup
 # ---------------------------------------------------------------------------
 
-def _build_router() -> _Router:
+def _build_router(scope: str = "combined") -> _Router:
+    # Phase 3 keeps the handler implementation shared, but the server can now
+    # expose access-only, tv-only, or combined route scopes.
+    from access.api import register_access_local_api_routes
+    from tv.api import register_tv_local_api_routes
+
+    normalized = str(scope or "combined").strip().lower() or "combined"
     r = _Router()
-
-    # ---- 1) Health / Status
-    r.add("GET", "/api/v2/health", _handle_health)
-    r.add("GET", "/api/v2/platform", _handle_platform)
-    r.add("GET", "/api/v2/status", _handle_status)
-
-    # ---- 2) Auth
-    r.add("POST", "/api/v2/auth/login", _handle_auth_login)
-    r.add("GET", "/api/v2/auth/status", _handle_auth_status)
-    r.add("POST", "/api/v2/auth/logout", _handle_auth_logout)
-
-    # ---- 3) Config
-    r.add("GET", "/api/v2/config", _handle_config_get)
-    r.add("PATCH", "/api/v2/config", _handle_config_patch)
-    r.add("POST", "/api/v2/config/restart-local-api", _handle_config_restart_api)
-
-    # ---- 4) Sync + Cache
-    r.add("POST", "/api/v2/sync/now", _handle_sync_now)
-    r.add("GET", "/api/v2/sync/cache/meta", _handle_sync_cache_meta)
-    r.add("GET", "/api/v2/sync/cache/users", _handle_sync_cache_users)
-    r.add("GET", "/api/v2/sync/cache/memberships", _handle_sync_cache_memberships)
-    r.add("GET", "/api/v2/sync/cache/devices", _handle_sync_cache_devices)
-    r.add("GET", "/api/v2/sync/cache/infrastructures", _handle_sync_cache_infrastructures)
-    r.add("GET", "/api/v2/sync/cache/credentials", _handle_sync_cache_credentials)
-
-    # ---- TV Host orchestration (A9)
-    r.add("GET", "/api/v2/tv/host/monitors", _handle_tv_host_monitors_get)
-    r.add("POST", "/api/v2/tv/host/monitors/refresh", _handle_tv_host_monitors_refresh)
-    r.add("GET", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_get)
-    r.add("POST", "/api/v2/tv/host/bindings", _handle_tv_host_bindings_post)
-    r.add("PATCH", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_patch)
-    r.add("DELETE", "/api/v2/tv/host/bindings/{bindingId}", _handle_tv_host_binding_delete)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/start", _handle_tv_host_binding_start)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/stop", _handle_tv_host_binding_stop)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/restart", _handle_tv_host_binding_restart)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/status", _handle_tv_host_binding_status)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/events", _handle_tv_host_binding_events)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/runtime-event", _handle_tv_host_binding_runtime_event)
-
-    # ---- TV Support / Recovery (A10)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-summary", _handle_tv_host_binding_support_summary)
-    r.add("POST", "/api/v2/tv/host/bindings/{bindingId}/support-actions/run", _handle_tv_host_binding_support_action_run)
-    r.add("GET", "/api/v2/tv/host/bindings/{bindingId}/support-actions/history", _handle_tv_host_binding_support_action_history)
-
-    # ---- TV Observability / Retention (A11)
-    r.add("GET", "/api/v2/tv/observability/overview", _handle_tv_observability_overview)
-    r.add("GET", "/api/v2/tv/observability/bindings", _handle_tv_observability_bindings)
-    r.add("GET", "/api/v2/tv/observability/bindings/{bindingId}", _handle_tv_observability_binding_detail)
-    r.add("GET", "/api/v2/tv/observability/gyms", _handle_tv_observability_gyms)
-    r.add("GET", "/api/v2/tv/observability/gyms/{gymId}", _handle_tv_observability_gym_detail)
-    r.add("GET", "/api/v2/tv/observability/proofs", _handle_tv_observability_proofs_v2)
-    r.add("GET", "/api/v2/tv/observability/retention", _handle_tv_observability_retention)
-    r.add("POST", "/api/v2/tv/observability/retention/run", _handle_tv_observability_retention_run)
-    r.add("GET", "/api/v2/tv/observability/events", _handle_tv_observability_events_v2)
-
-    # ---- TV Startup / Preflight (A12)
-    r.add("GET", "/api/v2/tv/startup/latest", _handle_tv_hardening_startup_latest)
-    r.add("GET", "/api/v2/tv/startup/runs", _handle_tv_hardening_startup_runs)
-    r.add("POST", "/api/v2/tv/startup/run", _handle_tv_hardening_startup_run)
-    r.add("GET", "/api/v2/tv/startup/preflight", _handle_tv_hardening_preflight)
-
-    # ---- TV Snapshot Sync (A2)
-    r.add("GET", "/api/v2/tv/snapshots", _handle_tv_snapshots_list)
-    r.add("GET", "/api/v2/tv/snapshots/latest", _handle_tv_snapshots_latest)
-    r.add("GET", "/api/v2/tv/snapshots/{snapshotId}/assets", _handle_tv_snapshot_assets)
-    r.add("POST", "/api/v2/tv/snapshots/sync", _handle_tv_snapshots_sync)
-    r.add("GET", "/api/v2/tv/sync-runs", _handle_tv_sync_runs)
-
-    # ---- TV Asset Download (A3)
-    r.add("GET", "/api/v2/tv/assets", _handle_tv_assets_list)
-    r.add("POST", "/api/v2/tv/assets/download", _handle_tv_assets_download)
-    r.add("GET", "/api/v2/tv/assets/{mediaAssetId}", _handle_tv_asset_detail)
-
-    # ---- TV Readiness Engine (A4)
-    r.add("GET", "/api/v2/tv/readiness", _handle_tv_readiness_list)
-    r.add("GET", "/api/v2/tv/readiness/latest", _handle_tv_readiness_latest)
-    r.add("POST", "/api/v2/tv/readiness/recompute", _handle_tv_readiness_recompute)
-
-    # ---- TV Activation Engine (A5)
-    r.add("GET", "/api/v2/tv/activation", _handle_tv_activation_list)
-    r.add("GET", "/api/v2/tv/activation/latest", _handle_tv_activation_latest)
-    r.add("POST", "/api/v2/tv/activation/evaluate", _handle_tv_activation_evaluate)
-    r.add("POST", "/api/v2/tv/activation/activate-latest-ready", _handle_tv_activation_activate_latest_ready)
-    r.add("GET", "/api/v2/tv/activation/attempts", _handle_tv_activation_attempts)
-
-    # ---- TV Player Runtime (A6)
-    r.add("GET", "/api/v2/tv/player/{bindingId}/status", _handle_tv_player_status)
-    r.add("GET", "/api/v2/tv/player/{bindingId}/render-context", _handle_tv_player_render_context)
-    r.add("POST", "/api/v2/tv/player/{bindingId}/reevaluate", _handle_tv_player_reevaluate)
-    r.add("POST", "/api/v2/tv/player/{bindingId}/reload", _handle_tv_player_reload)
-    r.add("POST", "/api/v2/tv/player/{bindingId}/state", _handle_tv_player_state_report)
-    r.add("GET", "/api/v2/tv/player/{bindingId}/events", _handle_tv_player_events)
-
-    # ---- TV Ad Runtime (A7)
-    r.add("GET",  "/api/v2/tv/ad-runtime/tasks",                     _handle_tv_ad_tasks_list)
-    r.add("GET",  "/api/v2/tv/ad-runtime/tasks/{taskId}",             _handle_tv_ad_tasks_runtime_one)
-    r.add("GET",  "/api/v2/tv/ad-runtime/gyms/{gymId}",               _handle_tv_gym_ad_runtime_one)
-    r.add("POST", "/api/v2/tv/ad-runtime/evaluate",                   _handle_tv_ad_evaluate)
-    r.add("POST", "/api/v2/tv/ad-runtime/tasks/{taskId}/inject-now",  _handle_tv_ad_tasks_inject_now)
-    r.add("POST", "/api/v2/tv/ad-runtime/tasks/{taskId}/abort",       _handle_tv_ad_tasks_abort)
-    r.add("GET",  "/api/v2/tv/ad-runtime/runtime/list",               _handle_tv_ad_tasks_runtime_list)
-    r.add("GET",  "/api/v2/tv/ad-runtime/runtime/{taskId}",           _handle_tv_ad_tasks_runtime_one)
-    r.add("POST", "/api/v2/tv/ad-runtime/startup-recover",            _handle_tv_ad_startup_recover)
-
-    # ---- TV Ad Proofs / Outbox (A8)
-    r.add("GET",  "/api/v2/tv/ad-proofs",                             _handle_tv_ad_proofs_list)
-    r.add("GET",  "/api/v2/tv/ad-proofs/{proofId}",                   _handle_tv_ad_proofs_one)
-    r.add("POST", "/api/v2/tv/ad-proofs/process-outbox",              _handle_tv_ad_proofs_process_outbox)
-    r.add("POST", "/api/v2/tv/ad-proofs/{proofId}/retry",             _handle_tv_ad_proofs_retry)
-    r.add("POST", "/api/v2/tv/ad-proofs/startup-recover",             _handle_tv_ad_proofs_startup_recover)
-
-    # ---- 4.5) Offline creation queue
-    r.add("GET", "/api/v2/offline-creations/active", _handle_offline_creations_active)
-    r.add("GET", "/api/v2/offline-creations/history", _handle_offline_creations_history)
-    r.add("GET", "/api/v2/offline-creations/{localId}", _handle_offline_creation_get)
-    r.add("POST", "/api/v2/offline-creations/attempt", _handle_offline_creation_attempt)
-    r.add("POST", "/api/v2/offline-creations/queue", _handle_offline_creation_queue)
-    r.add("PATCH", "/api/v2/offline-creations/{localId}", _handle_offline_creation_patch)
-    r.add("POST", "/api/v2/offline-creations/{localId}/toggle", _handle_offline_creation_toggle)
-    r.add("POST", "/api/v2/offline-creations/{localId}/retry", _handle_offline_creation_retry)
-    r.add("POST", "/api/v2/offline-creations/{localId}/cancel", _handle_offline_creation_cancel)
-    r.add("POST", "/api/v2/offline-creations/{localId}/duplicate", _handle_offline_creation_duplicate)
-    r.add("POST", "/api/v2/offline-creations/{localId}/archive", _handle_offline_creation_archive)
-    r.add("POST", "/api/v2/offline-creations/process-due", _handle_offline_creations_process_due)
-    # ---- 5) Devices (PullSDK)
-    r.add("POST", "/api/v2/devices/{deviceId}/connect", _handle_device_connect)
-    r.add("POST", "/api/v2/devices/{deviceId}/disconnect", _handle_device_disconnect)
-    r.add("GET", "/api/v2/devices/{deviceId}/info", _handle_device_info)
-    r.add("GET", "/api/v2/devices/{deviceId}/table/{tableName}", _handle_device_table)
-    r.add("POST", "/api/v2/devices/{deviceId}/door/open", _handle_device_door_open)
-    r.add("POST", "/api/v2/devices/{deviceId}/users/push", _handle_device_users_push)
-    r.add("GET", "/api/v2/devices/{deviceId}/users", _handle_device_users_list)
-    r.add("POST", "/api/v2/devices/{deviceId}/users/delete", _handle_device_users_delete)
-    r.add("GET", "/api/v2/devices/{deviceId}/door-presets", _handle_device_door_presets_list)
-    r.add("POST", "/api/v2/devices/{deviceId}/door-presets", _handle_device_door_presets_create)
-    r.add("DELETE", "/api/v2/devices/{deviceId}/door-presets/{presetId}", _handle_device_door_presets_delete)
-
-    # ---- 6) Agent Realtime
-    r.add("GET", "/api/v2/agent/status", _handle_agent_status)
-    r.add("POST", "/api/v2/agent/start", _handle_agent_start)
-    r.add("POST", "/api/v2/agent/stop", _handle_agent_stop)
-    r.add("POST", "/api/v2/agent/refresh-devices", _handle_agent_refresh_devices)
-    r.add("GET", "/api/v2/agent/devices", _handle_agent_devices)
-    r.add("POST", "/api/v2/agent/devices/{deviceId}/enable", _handle_agent_device_enable)
-    r.add("POST", "/api/v2/agent/devices/{deviceId}/disable", _handle_agent_device_disable)
-    r.add("GET", "/api/v2/agent/events", _handle_agent_events_sse)
-    r.add("GET", "/api/v2/agent/settings/global", _handle_agent_settings_global)
-    r.add("GET", "/api/v2/agent/settings/device/{deviceId}", _handle_agent_settings_device)
-
-    # ---- 7) Enrollment
-    r.add("POST", "/api/v2/enroll/start", _handle_enroll_start)
-    r.add("POST", "/api/v2/enroll/cancel", _handle_enroll_cancel)
-    r.add("GET", "/api/v2/enroll/status", _handle_enroll_status)
-    r.add("GET", "/api/v2/enroll/events", _handle_enroll_events_sse)
-    r.add("GET", "/api/v2/fingerprints", _handle_fingerprints_list)
-    r.add("DELETE", "/api/v2/fingerprints/{id}", _handle_fingerprints_delete)
-
-    # ---- 8) Logs
-    r.add("GET", "/api/v2/logs/recent", _handle_logs_recent)
-    r.add("GET", "/api/v2/logs/stream", _handle_logs_stream_sse)
-    r.add("POST", "/api/v2/logs/open-dir", _handle_logs_open_dir)
-
-    # ---- 9) Updates
-    r.add("GET", "/api/v2/update/status", _handle_update_status)
-    r.add("POST", "/api/v2/update/check", _handle_update_check)
-    r.add("POST", "/api/v2/update/download", _handle_update_download)
-    r.add("POST", "/api/v2/update/install", _handle_update_install)
-
-    # ---- 10) Local DB Tools
-    r.add("GET", "/api/v2/db/tables", _handle_db_tables)
-    r.add("GET", "/api/v2/db/table/{tableName}", _handle_db_table_query)
-    r.add("GET", "/api/v2/db/access-history", _handle_db_access_history)
-    r.add("POST", "/api/v2/db/export", _handle_db_export)
-    r.add("GET", "/api/v2/db/stats", _handle_db_stats)
-
-    # ---- 11) App / Tray commands
-    r.add("POST", "/api/v2/app/show", _handle_app_show)
-    r.add("POST", "/api/v2/app/hide", _handle_app_hide)
-    r.add("POST", "/api/v2/app/quit", _handle_app_quit)
-
-    # ---- Deprecated V1 (backward compat)
-    r.add("GET", "/api/v1/access/health", _handle_v1_health)
-    r.add("GET", "/api/v1/access/enroll", _handle_v1_enroll)
-
+    if normalized in {"access", "combined"}:
+        register_access_local_api_routes(r)
+    if normalized in {"tv", "combined"}:
+        register_tv_local_api_routes(r)
     return r
+
+
+def _build_access_router() -> _Router:
+    return _build_router("access")
+
+
+def _build_tv_router() -> _Router:
+    return _build_router("tv")
 
 
 # ---------------------------------------------------------------------------
 # Server class (public interface)
 # ---------------------------------------------------------------------------
 
-class LocalAccessApiServerV2:
+class LocalApiServerV2:
     """
     Local REST + SSE server for Tauri+React UI.
 
-    Drop-in replacement for LocalAccessApiServer.
-    Includes all v1 endpoints (deprecated) + full v2 API.
+    The handler implementation remains shared for now, but the server can
+    expose access-only, tv-only, or combined route scopes.
     """
 
-    def __init__(self, *, app, host: str = "127.0.0.1", port: int = 8788):
+    def __init__(
+        self,
+        *,
+        app,
+        host: str = "127.0.0.1",
+        port: int = 8788,
+        route_scope: str = "combined",
+        server_name: str = "LocalApiServerV2",
+    ):
         self.app = app
         self.host = host
         self.port = int(port)
+        self.route_scope = str(route_scope or "combined").strip().lower() or "combined"
+        self.server_name = str(server_name or "LocalApiServerV2")
         self._httpd: Optional[_AppHTTPServerV2] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -3579,7 +3537,7 @@ class LocalAccessApiServerV2:
         if self._httpd is not None:
             return
 
-        router = _build_router()
+        router = _build_router(self.route_scope)
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -3650,51 +3608,10 @@ class LocalAccessApiServerV2:
 
         try:
             self.app.logger.info(
-                "LocalAccessApiServerV2 started on http://%s:%s", self.host, self.port
+                "%s started on http://%s:%s", self.server_name, self.host, self.port
             )
         except Exception:
             pass
-
-        def _run_startup_reconciliation_bg() -> None:
-            try:
-                ensure_tv_local_schema()
-                preflight = run_tv_deployment_preflight(include_query_checks=False)
-                try:
-                    self.app.logger.info(
-                        "TV preflight at startup: status=%s blockers=%s warnings=%s",
-                        preflight.get("status"),
-                        len(preflight.get("blockers") or []),
-                        len(preflight.get("warnings") or []),
-                    )
-                except Exception:
-                    pass
-
-                if not bool(preflight.get("ok")):
-                    try:
-                        self.app.logger.error("TV startup reconciliation skipped due to preflight blockers: %s", preflight.get("blockers"))
-                    except Exception:
-                        pass
-                    return
-
-                out = run_tv_startup_reconciliation(trigger_source="SERVER_START")
-                try:
-                    if bool(out.get("ok")):
-                        self.app.logger.info(
-                            "TV startup reconciliation completed: status=%s failedPhases=%s",
-                            out.get("status"),
-                            out.get("failedPhaseCount"),
-                        )
-                    else:
-                        self.app.logger.warning("TV startup reconciliation blocked/failed: %s", out)
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    self.app.logger.exception("TV startup reconciliation error: %s", e)
-                except Exception:
-                    pass
-
-        threading.Thread(target=_run_startup_reconciliation_bg, daemon=True).start()
 
     def stop(self) -> None:
         if not self._httpd:
@@ -3715,9 +3632,31 @@ class LocalAccessApiServerV2:
                     pass
             _device_sdk_pool.clear()
         try:
-            self.app.logger.info("LocalAccessApiServerV2 stopped.")
+            self.app.logger.info("%s stopped.", self.server_name)
         except Exception:
             pass
+
+
+class LocalAccessApiServerV2(LocalApiServerV2):
+    def __init__(self, *, app, host: str = "127.0.0.1", port: int = 8788):
+        super().__init__(
+            app=app,
+            host=host,
+            port=port,
+            route_scope="access",
+            server_name="LocalAccessApiServerV2",
+        )
+
+
+class LocalCombinedApiServerV2(LocalApiServerV2):
+    def __init__(self, *, app, host: str = "127.0.0.1", port: int = 8788):
+        super().__init__(
+            app=app,
+            host=host,
+            port=port,
+            route_scope="combined",
+            server_name="LocalCombinedApiServerV2",
+        )
 
 
 

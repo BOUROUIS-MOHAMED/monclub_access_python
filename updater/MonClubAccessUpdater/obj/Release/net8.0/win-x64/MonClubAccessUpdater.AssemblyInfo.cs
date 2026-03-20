@@ -10,12 +10,12 @@
 using System;
 using System.Reflection;
 
-[assembly: System.Reflection.AssemblyCompanyAttribute("MonClubAccessUpdater")]
+[assembly: System.Reflection.AssemblyCompanyAttribute("MonClubDesktopUpdater")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d1ddea528e277bfd490d4ee27fa71df370f4b36b")]
-[assembly: System.Reflection.AssemblyProductAttribute("MonClubAccessUpdater")]
-[assembly: System.Reflection.AssemblyTitleAttribute("MonClubAccessUpdater")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e3ba9d5111aa8a8b2a6d3a8c7d21d67bf932628d")]
+[assembly: System.Reflection.AssemblyProductAttribute("MonClubDesktopUpdater")]
+[assembly: System.Reflection.AssemblyTitleAttribute("MonClubDesktopUpdater")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
 
 // Généré par la classe MSBuild WriteCodeFragment.

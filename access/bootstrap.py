@@ -1,4 +1,4 @@
-"""Phase 1 Access bootstrap facade."""
+"""Access bootstrap facade for the standalone Access process."""
 
 from __future__ import annotations
 
@@ -23,8 +23,10 @@ def describe_access_component() -> DesktopComponentDescriptor:
             "local-api-shell",
         ),
         notes=(
-            "Phase 1 keeps the current combined runtime behavior.",
-            "The standalone Access process continues to host the existing local API and Tauri launcher.",
+            "Phase 3 keeps Access independently runnable through access.main.",
+            "Phase 4 activates access.db as the live Access runtime database.",
+            "Phase 6 activates access/config.json and an Access-owned update runtime wrapper.",
+            "TV startup is no longer hosted by default from the Access process.",
         ),
     )
 
@@ -41,4 +43,3 @@ def run_access_app() -> None:
 
 
 __all__ = ["create_access_app", "describe_access_component", "run_access_app"]
-

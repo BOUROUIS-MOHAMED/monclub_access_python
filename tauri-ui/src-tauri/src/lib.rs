@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::Mutex;
 use tauri::{
     image::Image,
@@ -45,6 +46,43 @@ struct PresetsResponse {
 // ─── State ───
 
 struct ApiPort(Mutex<u16>);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRuntimeContext {
+    role: String,
+    api_port: u16,
+    product_name: String,
+    tray_enabled: bool,
+}
+
+fn desktop_role() -> String {
+    match env::var("MONCLUB_DESKTOP_ROLE")
+        .unwrap_or_else(|_| "access".into())
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
+        "tv" => "tv".into(),
+        _ => "access".into(),
+    }
+}
+
+fn default_api_port(role: &str) -> u16 {
+    if role == "tv" { 8789 } else { 8788 }
+}
+
+fn desktop_api_port(role: &str) -> u16 {
+    env::var("MONCLUB_LOCAL_API_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or_else(|| default_api_port(role))
+}
+
+fn desktop_product_name(role: &str) -> &'static str {
+    if role == "tv" { "MonClub TV" } else { "MonClub Access" }
+}
 
 fn api_base(port: u16) -> String {
     format!("http://127.0.0.1:{}/api/v2", port)
@@ -95,6 +133,14 @@ fn post_app_quit(port: u16) {
         .send();
 }
 
+fn post_tv_app_quit(port: u16) {
+    let url = format!("{}/tv/app/quit", api_base(port));
+    let _ = reqwest::blocking::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({}))
+        .send();
+}
+
 // ─── Tauri commands (callable from JS) ───
 
 #[tauri::command]
@@ -104,7 +150,26 @@ fn set_api_port(state: tauri::State<'_, ApiPort>, port: u16) {
 }
 
 #[tauri::command]
+fn get_desktop_runtime_context(state: tauri::State<'_, ApiPort>) -> DesktopRuntimeContext {
+    let role = desktop_role();
+    let api_port = state
+        .0
+        .lock()
+        .map(|p| *p)
+        .unwrap_or_else(|_| default_api_port(&role));
+    DesktopRuntimeContext {
+        role: role.clone(),
+        api_port,
+        product_name: desktop_product_name(&role).into(),
+        tray_enabled: role == "access",
+    }
+}
+
+#[tauri::command]
 fn refresh_tray_menu(app: AppHandle, state: tauri::State<'_, ApiPort>) -> Result<(), String> {
+    if desktop_role() != "access" {
+        return Ok(());
+    }
     let port = *state.0.lock().unwrap();
     let app_clone = app.clone();
 
@@ -204,7 +269,7 @@ fn rebuild_tray_menu(
 
 // ─── Setup tray on app start ───
 
-fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
@@ -230,7 +295,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
     TrayIconBuilder::with_id("main_tray")
         .icon(icon)
-        .tooltip("MonClub Access")
+        .tooltip(tooltip)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(move |app, event| {
@@ -301,21 +366,51 @@ fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let role = desktop_role();
+    let initial_api_port = desktop_api_port(&role);
+    let setup_role = role.clone();
+    let shell_role = role.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(ApiPort(Mutex::new(8788)))
-        .invoke_handler(tauri::generate_handler![set_api_port, refresh_tray_menu])
-        .setup(|app| {
-            let handle = app.handle().clone();
-            setup_tray(&handle)?;
+        .manage(ApiPort(Mutex::new(initial_api_port)))
+        .invoke_handler(tauri::generate_handler![
+            set_api_port,
+            get_desktop_runtime_context,
+            refresh_tray_menu
+        ])
+        .setup(move |app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_title(desktop_product_name(&setup_role));
+            }
+            if setup_role == "access" {
+                let handle = app.handle().clone();
+                setup_tray(&handle, desktop_product_name(&setup_role))?;
+            }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            // Hide main window on close instead of quitting (tray stays running)
+        .on_window_event(move |window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    if shell_role == "access" {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    } else {
+                        api.prevent_close();
+                        let port = window
+                            .app_handle()
+                            .state::<ApiPort>()
+                            .0
+                            .lock()
+                            .map(|p| *p)
+                            .unwrap_or(8789);
+                        let app_handle = window.app_handle().clone();
+                        std::thread::spawn(move || {
+                            post_tv_app_quit(port);
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            app_handle.exit(0);
+                        });
+                    }
                 }
             }
         })

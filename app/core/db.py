@@ -1,7 +1,6 @@
 # app/core/db.py
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import sqlite3
@@ -12,7 +11,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from app.core.utils import DB_PATH, ensure_dirs, now_iso
+from access.storage import current_access_runtime_db_path
+from app.core.utils import ensure_dirs, now_iso
+from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
 # -----------------------------
 # SQLite connection helpers
@@ -20,7 +21,9 @@ from app.core.utils import DB_PATH, ensure_dirs, now_iso
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
     ensure_dirs()
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    db_path = current_access_runtime_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -29,116 +32,6 @@ def get_conn() -> Iterator[sqlite3.Connection]:
             conn.close()
         except Exception:
             pass
-
-
-# -----------------------------
-# Optional DPAPI protection (Windows)
-# -----------------------------
-def _dpapi_encrypt(plain: str) -> str:
-    """
-    Best-effort encryption for auth tokens on Windows using DPAPI.
-    Falls back to raw: prefix if DPAPI is unavailable.
-    """
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        crypt32 = ctypes.WinDLL("crypt32.dll")
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-
-        class DATA_BLOB(ctypes.Structure):
-            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
-
-        def _bytes_to_blob(b: bytes) -> DATA_BLOB:
-            buf = (ctypes.c_byte * len(b))(*b)
-            return DATA_BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
-
-        def _blob_to_bytes(blob: DATA_BLOB) -> bytes:
-            cb = int(blob.cbData)
-            if cb <= 0:
-                return b""
-            data = ctypes.string_at(blob.pbData, cb)
-            kernel32.LocalFree(blob.pbData)
-            return data
-
-        crypt32.CryptProtectData.argtypes = [
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPCWSTR,
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPVOID,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(DATA_BLOB),
-        ]
-        crypt32.CryptProtectData.restype = wintypes.BOOL
-
-        plain_bytes = plain.encode("utf-8")
-        in_blob = _bytes_to_blob(plain_bytes)
-        out_blob = DATA_BLOB()
-
-        ok = crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
-        if not ok:
-            return "raw:" + plain
-
-        enc = _blob_to_bytes(out_blob)
-        return "dpapi:" + base64.b64encode(enc).decode("ascii")
-    except Exception:
-        return "raw:" + plain
-
-
-def _dpapi_decrypt(stored: str) -> str:
-    if not stored:
-        return ""
-    if stored.startswith("raw:"):
-        return stored[len("raw:") :]
-    if not stored.startswith("dpapi:"):
-        return stored
-
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        crypt32 = ctypes.WinDLL("crypt32.dll")
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-
-        class DATA_BLOB(ctypes.Structure):
-            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
-
-        def _bytes_to_blob_alloc(b: bytes) -> DATA_BLOB:
-            buf = (ctypes.c_byte * len(b))(*b)
-            return DATA_BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
-
-        def _blob_to_bytes(blob: DATA_BLOB) -> bytes:
-            cb = int(blob.cbData)
-            if cb <= 0:
-                return b""
-            data = ctypes.string_at(blob.pbData, cb)
-            kernel32.LocalFree(blob.pbData)
-            return data
-
-        crypt32.CryptUnprotectData.argtypes = [
-            ctypes.POINTER(DATA_BLOB),
-            ctypes.POINTER(wintypes.LPWSTR),
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPVOID,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(DATA_BLOB),
-        ]
-        crypt32.CryptUnprotectData.restype = wintypes.BOOL
-
-        enc = base64.b64decode(stored[len("dpapi:") :].encode("ascii"))
-        in_blob = _bytes_to_blob_alloc(enc)
-        out_blob = DATA_BLOB()
-
-        ok = crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
-        if not ok:
-            return ""
-
-        dec = _blob_to_bytes(out_blob)
-        return dec.decode("utf-8", errors="replace")
-    except Exception:
-        return ""
 
 
 # -----------------------------
@@ -928,16 +821,9 @@ def delete_device_door_preset(preset_id: int) -> None:
 # -----------------------------
 # Auth token state
 # -----------------------------
-@dataclass
-class AuthTokenState:
-    email: str
-    token: str
-    last_login_at: str
-
-
 def save_auth_token(*, email: str, token: str, last_login_at: str | None = None) -> None:
     last_login_at = last_login_at or now_iso()
-    protected = _dpapi_encrypt(token)
+    protected = protect_auth_token(token)
 
     with get_conn() as conn:
         conn.execute(
@@ -960,7 +846,7 @@ def load_auth_token() -> AuthTokenState | None:
         if not r:
             return None
         email = (r["email"] or "").strip()
-        token = _dpapi_decrypt(r["token_protected"] or "")
+        token = unprotect_auth_token(r["token_protected"] or "")
         last_login_at = r["last_login_at"] or ""
         if not token:
             return None

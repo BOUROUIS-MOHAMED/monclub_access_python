@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 
-namespace MonClubAccessUpdater;
+namespace MonClubDesktopUpdater;
 
 public static class HashUtil
 {

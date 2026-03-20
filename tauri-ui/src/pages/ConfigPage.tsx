@@ -115,7 +115,9 @@ export default function ConfigPage() {
         <CardContent className="space-y-3">
           <div className="flex items-center justify-between">
             <div className="space-y-1">
+              <p className="text-sm">Composant: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.componentDisplayName || "MonClub Access"}</code></p>
               <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.currentReleaseId || "dev"}</code></p>
+              <p className="text-xs text-muted-foreground">Canal {updates?.channel || "stable"} · Plateforme {updates?.platform || "WINDOWS"}</p>
               {updates?.updateAvailable ? (
                 <Badge variant="warning" className="text-xs">Mise à jour disponible</Badge>
               ) : (
@@ -257,7 +259,11 @@ export default function ConfigPage() {
             <DialogTitle>Mise à jour disponible</DialogTitle>
           </DialogHeader>
           <div className="space-y-2 text-sm">
+            <p>Composant: <code className="bg-muted px-1 rounded">{updates?.componentDisplayName || "MonClub Access"}</code></p>
             <p>Version actuelle: <code className="bg-muted px-1 rounded">{updates?.currentReleaseId || "dev"}</code></p>
+            <p>ExÃ©cutable: <code className="bg-muted px-1 rounded">{updates?.mainExecutable || "MonClubAccess.exe"}</code></p>
+            <p>Updater: <code className="bg-muted px-1 rounded">{updates?.updaterExecutable || "MonClubAccessUpdater.exe"}</code></p>
+            {updates?.installRoot && <p>Install root: <code className="bg-muted px-1 rounded">{updates.installRoot}</code></p>}
             {updates?.lastCheckAt && <p>Dernière vérification: {updates.lastCheckAt}</p>}
             <Separator />
             <p className="text-muted-foreground">Contactez l'équipe MonClub pour obtenir la dernière version.</p>

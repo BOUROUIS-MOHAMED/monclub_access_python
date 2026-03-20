@@ -84,7 +84,7 @@
     "version": "1.0.0",
     "restore": {
       "projectUniqueName": "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\updater\\MonClubAccessUpdater\\MonClubAccessUpdater.csproj",
-      "projectName": "MonClubAccessUpdater",
+      "projectName": "MonClubDesktopUpdater",
       "projectPath": "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\updater\\MonClubAccessUpdater\\MonClubAccessUpdater.csproj",
       "packagesPath": "C:\\Users\\mohaa\\.nuget\\packages\\",
       "outputPath": "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\updater\\MonClubAccessUpdater\\obj\\",

@@ -1,2 +1,2 @@
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\publish\MonClubAccessUpdater.pdb
-C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\publish\MonClubAccessUpdater.exe
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\publish\MonClubDesktopUpdater.pdb
+C:\Users\mohaa\Desktop\monclub_access_python\updater\MonClubAccessUpdater\bin\Release\net8.0\win-x64\publish\MonClubDesktopUpdater.exe
