@@ -9,7 +9,7 @@
  * - Debug overlay toggled with "D" key
  */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   getTvPlayerRenderContext,
@@ -17,6 +17,8 @@ import {
   evaluateTvAdRuntime,
 } from "@/tv/api";
 import type { TvPlayerRenderContext, TvTimelineItemPresented } from "@/tv/api/types";
+import TvLayout0 from "@/tv/layouts/TvLayout0";
+import TvLayout1 from "@/tv/layouts/TvLayout1";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -114,41 +116,6 @@ function DebugOverlay({ bindingId, screenId, ctx, tickCount }: DebugOverlayProps
 // ---------------------------------------------------------------------------
 // Media renderers
 // ---------------------------------------------------------------------------
-
-interface VisualRendererProps {
-  item: TvTimelineItemPresented;
-  muted: boolean;
-}
-
-function VisualRenderer({ item, muted }: VisualRendererProps) {
-  const src = toLocalSrc(item.assetPath);
-  if (!src) {
-    return <IdlePlaceholder reason="Fichier visuel introuvable" />;
-  }
-  const type = item.mediaType?.toUpperCase();
-  if (type === "VIDEO") {
-    return (
-      <video
-        key={src}
-        src={src}
-        autoPlay
-        loop
-        muted={muted}
-        playsInline
-        className="w-full h-full object-contain bg-black"
-      />
-    );
-  }
-  // IMAGE / fallback
-  return (
-    <img
-      key={src}
-      src={src}
-      alt={item.title || ""}
-      className="w-full h-full object-contain bg-black"
-    />
-  );
-}
 
 interface AudioRendererProps {
   item: TvTimelineItemPresented;
@@ -352,50 +319,56 @@ export default function TvPlayerWindowPage() {
 
   const state = ctx.playerState;
   const mode = ctx.renderMode;
-  const visual = ctx.currentVisual;
   const audio = ctx.currentAudio;
-  const muted = ctx.videoMutedByAudio;
 
-  // Determine what to render
+  // Resolve layout (0 = Cool, 1 = Smart; fallback to 0)
+  const resolvedLayoutId = ctx.layoutPresetId === 1 ? 1 : 0;
+
+  // Compute audio progress for layout wiring
+  const audioTitle = audio?.title ?? null;
+  let audioProgressPercent = 0;
+  if (audio && ctx.currentMinuteOfDay != null) {
+    const start = audio.startMinuteOfDay ?? 0;
+    const end = audio.endMinuteOfDay ?? 1440;
+    const duration = Math.max(1, end - start);
+    audioProgressPercent = Math.min(100, Math.max(0, ((ctx.currentMinuteOfDay - start) / duration) * 100));
+  }
+
+  // Compute visual asset src for layout wiring (video muted; AudioRenderer handles audio separately)
+  const visual = ctx.currentVisual;
+  const visualSrc = visual?.assetRenderable ? toLocalSrc(visual.assetPath) : null;
+  const visualMimeType = visual?.mediaType ?? null;
+
+  const layoutNode = resolvedLayoutId === 1
+    ? <TvLayout1 audioTitle={audioTitle} audioProgressPercent={audioProgressPercent} visualSrc={visualSrc} visualMimeType={visualMimeType} bindingId={bindingId} />
+    : <TvLayout0 audioTitle={audioTitle} audioProgressPercent={audioProgressPercent} visualSrc={visualSrc} visualMimeType={visualMimeType} bindingId={bindingId} />;
+
+  // Hidden audio renderer (always present when audio is renderable and no ad audio override)
+  const audioNode = !ctx.adOverrideActive && audio?.assetRenderable
+    ? <AudioRenderer item={audio} />
+    : null;
+
+  // Determine main content layer
   let content: React.ReactNode;
 
-  // A7: Ad override takes priority over normal rendering
+  // A7: Ad override — layout always rendered behind so scheduled video keeps playing.
+  // For FULL_SCREEN the AdRenderer covers the layout entirely (bg-black) but video continues.
   if (ctx.adOverrideActive && ctx.adAssetPath) {
-    const adLayout = ctx.currentAdLayout ?? "FULL_SCREEN";
-    if (adLayout === "FULL_SCREEN") {
-      // Full-screen ad replaces normal content entirely
-      content = (
-        <>
+    content = (
+      <div className="relative w-full h-full">
+        {/* Layout always behind — preserves video playback continuity */}
+        <div className="absolute inset-0">{layoutNode}</div>
+        {/* Ad renderer on top — covers layout visually */}
+        <div className="absolute inset-0 z-10">
           <AdRenderer ctx={ctx} />
-          {ctx.adAudioOverrideActive && audio?.assetRenderable && (
-            // Suppress normal audio when ad is active
-            null
-          )}
-        </>
-      );
-    } else {
-      // Partial layout: normal visual behind, ad overlay on top
-      const normalVisual = visual?.assetRenderable ? (
-        <VisualRenderer item={visual} muted={true} />
-      ) : (
-        <IdlePlaceholder reason={null} />
-      );
-      content = (
-        <div className="relative w-full h-full">
-          <div className="absolute inset-0">{normalVisual}</div>
-          <div className="absolute inset-0">
-            <AdRenderer ctx={ctx} />
-          </div>
         </div>
-      );
-    }
+      </div>
+    );
   } else if (
     state === "BLOCKED_NO_BINDING" ||
-    state === "BLOCKED_BINDING_DISABLED" ||
-    state === "BLOCKED_NO_ACTIVE_SNAPSHOT" ||
-    state === "BLOCKED_NO_RENDERABLE_ITEM" ||
-    state === "IDLE"
+    state === "BLOCKED_BINDING_DISABLED"
   ) {
+    // Binding is missing or disabled — nothing meaningful to show
     content = <IdlePlaceholder reason={ctx.fallbackReason ?? null} />;
   } else if (state === "ERROR" && mode === "ERROR_FALLBACK") {
     content = (
@@ -404,36 +377,10 @@ export default function TvPlayerWindowPage() {
         message={ctx.lastRenderErrorMessage ?? null}
       />
     );
-  } else if (mode === "VISUAL_AND_AUDIO" || mode === "VISUAL_ONLY") {
-    content = (
-      <>
-        {visual?.assetRenderable && <VisualRenderer item={visual} muted={muted} />}
-        {mode === "VISUAL_AND_AUDIO" && audio?.assetRenderable && (
-          <AudioRenderer item={audio} />
-        )}
-        {!(visual?.assetRenderable) && (
-          <IdlePlaceholder reason={ctx.fallbackReason ?? "Visuel indisponible"} />
-        )}
-      </>
-    );
-  } else if (mode === "AUDIO_ONLY") {
-    content = (
-      <>
-        <IdlePlaceholder reason="Audio uniquement" />
-        {audio?.assetRenderable && <AudioRenderer item={audio} />}
-      </>
-    );
   } else {
-    // FALLBACK_RENDERING with partial asset
-    content = (
-      <>
-        {visual?.assetRenderable && <VisualRenderer item={visual} muted={muted} />}
-        {audio?.assetRenderable && <AudioRenderer item={audio} />}
-        {!visual?.assetRenderable && !audio?.assetRenderable && (
-          <IdlePlaceholder reason={ctx.fallbackReason ?? null} />
-        )}
-      </>
-    );
+    // All other states (IDLE, BLOCKED_NO_ACTIVE_SNAPSHOT, BLOCKED_NO_RENDERABLE_ITEM,
+    // PLAYING, etc.) — always show the layout so the UI is visible even with no content yet.
+    content = layoutNode;
   }
 
   return (
@@ -447,6 +394,8 @@ export default function TvPlayerWindowPage() {
         />
       )}
       {content}
+      {/* Background audio playback */}
+      <div className="hidden">{audioNode}</div>
     </div>
   );
 }

@@ -30,6 +30,7 @@ import {
   getTvObservabilityBinding,
   getTvObservabilityOverview,
   getTvObservabilityRetention,
+  refreshTvHostMonitors,
   getTvStartupLatest,
   getTvStartupPreflight,
   getTvStartupRuns,
@@ -39,6 +40,7 @@ import {
   runTvBindingSupportAction,
   runTvObservabilityRetention,
   runTvStartupReconciliation,
+  runTvSnapshotSync,
   startTvHostBinding,
   stopTvHostBinding,
 } from "@/tv/api";
@@ -75,10 +77,21 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { TvOverviewSectionId } from "@/tv/navigation";
 import { ensureTvPlayerWindow } from "@/tv/runtime/playerWindows";
@@ -243,10 +256,23 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
   const [startupFeedback, setStartupFeedback] = useState<string | null>(null);
   const [updateBusyAction, setUpdateBusyAction] = useState<"check" | "download" | "install" | null>(null);
   const [updateFeedback, setUpdateFeedback] = useState<string | null>(null);
+  const [tvSyncing, setTvSyncing] = useState(false);
   const [confirmAction, setConfirmAction] = useState<{
     bindingId: number;
     actionType: TvBindingSupportActionType;
   } | null>(null);
+
+  // Create binding dialog
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createForm, setCreateForm] = useState({
+    screen_id: "",
+    screen_label: "",
+    monitor_id: "",
+    enabled: true,
+    autostart: false,
+    fullscreen: true,
+  });
 
   const selectedBinding = useMemo(
     () => bindings.find((binding) => binding.id === selectedBindingId) ?? null,
@@ -297,6 +323,28 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     },
     [],
   );
+
+  const syncHostMonitors = useCallback(async () => {
+    const monitorList = await availableMonitors();
+    const monitorPayload = monitorList.map((monitor, index) => ({
+      monitor_id: monitor.name || `monitor_${index}`,
+      monitor_label: monitor.name || `Monitor ${index + 1}`,
+      monitor_index: index,
+      is_connected: true,
+      width: monitor.size.width,
+      height: monitor.size.height,
+      offset_x: monitor.position.x,
+      offset_y: monitor.position.y,
+      scale_factor: monitor.scaleFactor,
+      is_primary: index === 0,
+    }));
+    try {
+      await refreshTvHostMonitors(monitorPayload);
+    } catch (error) {
+      console.warn("Failed to refresh TV host monitors before player action.", error);
+    }
+    return monitorList;
+  }, []);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -416,10 +464,10 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
 
   const handleStart = useCallback(async (bindingId: number) => {
     try {
-      await startTvHostBinding(bindingId);
-      const binding = bindings.find((item) => item.id === bindingId) ?? null;
+      const monitorList = await syncHostMonitors();
+      const response = await startTvHostBinding(bindingId);
+      const binding = response.binding ?? bindings.find((item) => item.id === bindingId) ?? null;
       if (binding) {
-        const monitorList = await availableMonitors();
         const result = await ensureTvPlayerWindow(binding, monitorList);
         if (!result.ok) {
           setError(result.reason);
@@ -429,7 +477,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start binding.");
     }
-  }, [bindings, fetchData]);
+  }, [bindings, fetchData, syncHostMonitors]);
 
   const handleStop = useCallback(async (bindingId: number) => {
     try {
@@ -442,17 +490,17 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
 
   const handleRestart = useCallback(async (bindingId: number) => {
     try {
-      await restartTvHostBinding(bindingId);
-      const binding = bindings.find((item) => item.id === bindingId) ?? null;
+      const monitorList = await syncHostMonitors();
+      const response = await restartTvHostBinding(bindingId);
+      const binding = response.binding ?? bindings.find((item) => item.id === bindingId) ?? null;
       if (binding) {
-        const monitorList = await availableMonitors();
         await ensureTvPlayerWindow(binding, monitorList);
       }
       await fetchData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to restart binding.");
     }
-  }, [bindings, fetchData]);
+  }, [bindings, fetchData, syncHostMonitors]);
 
   const handleDelete = useCallback(async (bindingId: number) => {
     if (!window.confirm("Delete this binding?")) {
@@ -469,19 +517,56 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     }
   }, [closeSupportPanel, fetchData, selectedBindingId]);
 
-  const handleCreateNew = useCallback(async () => {
+  const openCreateDialog = useCallback(() => {
+    const maxScreenId = bindings.reduce((acc, b) => Math.max(acc, b.screen_id), 0);
+    const nextId = maxScreenId + 1;
+    setCreateForm({
+      screen_id: String(nextId),
+      screen_label: `Screen ${nextId}`,
+      monitor_id: monitors[0]?.monitor_id ?? "",
+      enabled: true,
+      autostart: false,
+      fullscreen: true,
+    });
+    setCreateDialogOpen(true);
+  }, [bindings, monitors]);
+
+  const handleCreateSubmit = useCallback(async () => {
+    const sid = parseInt(createForm.screen_id, 10);
+    if (!sid || sid <= 0) {
+      setError("Screen ID must be a positive integer.");
+      return;
+    }
+    setCreateBusy(true);
+    setError(null);
     try {
-      const maxScreenId = bindings.reduce((acc, binding) => Math.max(acc, binding.screen_id), 0);
+      await syncHostMonitors();
+      const selectedMonitor = monitors.find((m) => m.monitor_id === createForm.monitor_id);
       await createTvHostBinding({
-        screen_id: maxScreenId + 1,
-        screen_label: `Screen ${maxScreenId + 1}`,
-        enabled: true,
+        screen_id: sid,
+        screen_name: createForm.screen_label.trim() || undefined,
+        monitor_id: createForm.monitor_id || undefined,
+        monitor_label: selectedMonitor?.monitor_label || undefined,
+        monitor_index: selectedMonitor?.monitor_index ?? undefined,
+        enabled: createForm.enabled,
+        autostart: createForm.autostart,
+        fullscreen: createForm.fullscreen,
+        target_display_id: createForm.monitor_id || undefined,
+        last_known_friendly_name: selectedMonitor?.monitor_label || undefined,
+        last_known_bounds_x: selectedMonitor?.offset_x ?? undefined,
+        last_known_bounds_y: selectedMonitor?.offset_y ?? undefined,
+        last_known_width: selectedMonitor?.width ?? undefined,
+        last_known_height: selectedMonitor?.height ?? undefined,
+        last_known_display_order_index: selectedMonitor?.monitor_index ?? undefined,
       });
+      setCreateDialogOpen(false);
       await fetchData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create binding.");
+    } finally {
+      setCreateBusy(false);
     }
-  }, [bindings, fetchData]);
+  }, [createForm, monitors, fetchData, syncHostMonitors]);
 
   const handleRunRetention = useCallback(async () => {
     if (!window.confirm("Run TV retention cleanup now? This removes only old operational history.")) {
@@ -511,7 +596,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     setStartupBusy(true);
     setStartupFeedback(null);
     try {
-      const monitors = await availableMonitors();
+      const monitors = await syncHostMonitors();
       const monitorPayload = monitors.map((monitor, index) => ({
         monitor_id: monitor.name || `monitor_${index}`,
         monitor_label: monitor.name || `Monitor ${index + 1}`,
@@ -540,7 +625,21 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     } finally {
       setStartupBusy(false);
     }
-  }, [fetchData, refreshPanel, selectedBindingId]);
+  }, [fetchData, refreshPanel, selectedBindingId, syncHostMonitors]);
+
+  const handleTvSyncNow = useCallback(async () => {
+    setTvSyncing(true);
+    try {
+      await runTvSnapshotSync();
+      setTimeout(() => {
+        void fetchData();
+      }, 2000);
+    } catch (err) {
+      console.error("[TV Sync]", err);
+    } finally {
+      setTvSyncing(false);
+    }
+  }, [fetchData]);
 
   const handleUpdateAction = useCallback(async (action: "check" | "download" | "install") => {
     setUpdateBusyAction(action);
@@ -613,7 +712,16 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
             </Button>
             <Button
               size="sm"
-              onClick={() => void handleCreateNew()}
+              variant="outline"
+              onClick={() => void handleTvSyncNow()}
+              disabled={tvSyncing}
+            >
+              <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", tvSyncing && "animate-spin")} />
+              {tvSyncing ? "Syncing…" : "Sync Now"}
+            </Button>
+            <Button
+              size="sm"
+              onClick={openCreateDialog}
             >
               Create Binding
             </Button>
@@ -1122,9 +1230,22 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                         </Badge>
                         <Badge variant="outline">Desired {binding.desired_state}</Badge>
                         <Badge variant="outline">Runtime {runtime}</Badge>
+                        {binding.autostart && (
+                          <Badge variant="outline" className="border-sky-500/40 bg-sky-500/10 text-sky-400">
+                            Auto-start
+                          </Badge>
+                        )}
+                        {!binding.enabled && (
+                          <Badge variant="outline" className="border-border bg-muted text-muted-foreground">
+                            Disabled
+                          </Badge>
+                        )}
                       </div>
                       <div className="grid gap-1 text-sm text-muted-foreground">
                         <span>Monitor: {binding.monitor_label || binding.monitor_id || "Unassigned"}</span>
+                        {binding.display_attach_confidence && (
+                          <span>Display attach: {binding.display_attach_confidence}</span>
+                        )}
                         <span>Last support correlation: {summary?.lastCorrelationId || "n/a"}</span>
                         {summary?.reasons?.[0] && <span>Health detail: {summary.reasons[0]}</span>}
                       </div>
@@ -1511,15 +1632,15 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                 </div>
               </ScrollArea>
 
-              <div className="flex min-h-0 flex-col gap-4">
-                <Card className="min-h-0 flex-1">
+              <ScrollArea className="max-h-[68vh] pr-4">
+              <div className="flex flex-col gap-4">
+                <Card>
                   <CardHeader className="pb-3">
                     <CardTitle className="text-base">Support History</CardTitle>
                     <CardDescription>Durable action log with correlation IDs.</CardDescription>
                   </CardHeader>
-                  <CardContent className="min-h-0">
-                    <ScrollArea className="h-[52vh] pr-4">
-                      <div className="space-y-3">
+                  <CardContent>
+                    <div className="space-y-3">
                         {selectedHistory.length === 0 ? (
                           <div className="text-sm text-muted-foreground">No support actions recorded yet.</div>
                         ) : (
@@ -1562,7 +1683,6 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                           ))
                         )}
                       </div>
-                    </ScrollArea>
                   </CardContent>
                 </Card>
 
@@ -1602,6 +1722,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                   </CardContent>
                 </Card>
               </div>
+              </ScrollArea>
             </div>
           )}
         </DialogContent>
@@ -1633,6 +1754,105 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Create binding dialog */}
+      <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Create binding</DialogTitle>
+            <DialogDescription>
+              Link a MonClub screen to a physical display on this host.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="cb-screen-id">Screen ID</Label>
+                <Input
+                  id="cb-screen-id"
+                  type="number"
+                  min={1}
+                  value={createForm.screen_id}
+                  onChange={(e) => setCreateForm((f) => ({ ...f, screen_id: e.target.value }))}
+                  placeholder="e.g. 1"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="cb-screen-label">Label</Label>
+                <Input
+                  id="cb-screen-label"
+                  value={createForm.screen_label}
+                  onChange={(e) => setCreateForm((f) => ({ ...f, screen_label: e.target.value }))}
+                  placeholder="e.g. Screen 1"
+                />
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="cb-monitor">Monitor</Label>
+              <Select
+                value={createForm.monitor_id}
+                onValueChange={(v) => setCreateForm((f) => ({ ...f, monitor_id: v }))}
+              >
+                <SelectTrigger id="cb-monitor">
+                  <SelectValue placeholder="Select a monitor" />
+                </SelectTrigger>
+                <SelectContent>
+                  {monitors.map((m) => (
+                    <SelectItem key={m.monitor_id} value={m.monitor_id}>
+                      {m.monitor_label || m.monitor_id} ({m.width}×{m.height})
+                    </SelectItem>
+                  ))}
+                  {monitors.length === 0 && (
+                    <SelectItem value="" disabled>No monitors detected</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label htmlFor="cb-enabled" className="text-sm font-medium">Enabled</Label>
+                <p className="text-xs text-muted-foreground">Binding will accept player sessions</p>
+              </div>
+              <Switch
+                id="cb-enabled"
+                checked={createForm.enabled}
+                onCheckedChange={(v) => setCreateForm((f) => ({ ...f, enabled: v }))}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label htmlFor="cb-autostart" className="text-sm font-medium">Auto-start</Label>
+                <p className="text-xs text-muted-foreground">Launch player automatically on TV startup (requires master switch in Settings)</p>
+              </div>
+              <Switch
+                id="cb-autostart"
+                checked={createForm.autostart}
+                onCheckedChange={(v) => setCreateForm((f) => ({ ...f, autostart: v }))}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label htmlFor="cb-fullscreen" className="text-sm font-medium">Fullscreen</Label>
+                <p className="text-xs text-muted-foreground">Open player window in fullscreen mode</p>
+              </div>
+              <Switch
+                id="cb-fullscreen"
+                checked={createForm.fullscreen}
+                onCheckedChange={(v) => setCreateForm((f) => ({ ...f, fullscreen: v }))}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateDialogOpen(false)} disabled={createBusy}>
+              Cancel
+            </Button>
+            <Button onClick={() => void handleCreateSubmit()} disabled={createBusy}>
+              {createBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Create
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

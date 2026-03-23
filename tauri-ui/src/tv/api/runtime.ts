@@ -1,5 +1,5 @@
 // TV Player API — A6: binding-scoped player runtime
-import { ApiError, get, post } from "../../api/client";
+import { ApiError, get, openSSE, patch, post } from "../../api/client";
 import type {
   TvPlayerRenderContext,
   TvPlayerStatusResponse,
@@ -60,6 +60,19 @@ export function getTvPlayerEvents(
   return get<TvPlayerEventsResponse>(`/tv/player/${bindingId}/events`, {
     limit: String(limit),
     offset: String(offset),
+  });
+}
+
+// ─── Screen Messages ─────────────────────────────────────────────────────────
+
+// GET /api/v2/tv/screen-messages
+export function getTvScreenMessages(
+  bindingId: number,
+  limit = 5,
+): Promise<import("./types").TvScreenMessagesResponse> {
+  return get(`/tv/screen-messages`, {
+    bindingId: String(bindingId),
+    limit: String(limit),
   });
 }
 
@@ -321,7 +334,7 @@ export function getTvObservabilityEvents(params?: {
   return get(`/tv/observability/events`, query);
 }
 
-export function getTvUpdateStatus(): Promise<import("./types").UpdateStatusResponse> {
+export function getTvUpdateStatus(): Promise<import("../../api/types").UpdateStatusResponse> {
   return get(`/tv/update/status`);
 }
 
@@ -335,6 +348,47 @@ export function downloadTvUpdate(): Promise<{ ok: boolean }> {
 
 export function installTvUpdate(): Promise<{ ok: boolean; message?: string }> {
   return post(`/tv/update/install`, {});
+}
+
+export function cancelTvUpdate(): Promise<{ ok: boolean }> {
+  return post(`/tv/update/cancel`, {});
+}
+
+export function getTvVersionInfo(): Promise<import("../../api/types").UpdateVersionInfoResponse> {
+  return get(`/tv/update/version`);
+}
+
+export function getTvConfig(): Promise<import("./types").AppConfig> {
+  return get(`/tv/config`);
+}
+
+export function patchTvConfig(
+  body: Partial<import("./types").AppConfig>,
+): Promise<{ ok: boolean; changed: Record<string, unknown>; config: import("./types").AppConfig }> {
+  return patch(`/tv/config`, body);
+}
+
+export function getTvRecentLogs(
+  params?: { level?: string; limit?: number },
+): Promise<{ ok: boolean; lines: Array<{ level: string; text: string }>; total: number }> {
+  const query: Record<string, string> = {};
+  if (params?.level) query.level = params.level;
+  if (params?.limit != null) query.limit = String(params.limit);
+  return get(`/tv/logs/recent`, query);
+}
+
+export function openTvLogsStream(
+  onEvent: (type: string, data: unknown) => void,
+  options?: {
+    level?: string;
+    onError?: (event: Event) => void;
+  },
+): EventSource {
+  const level = String(options?.level || "ALL").trim().toUpperCase();
+  const path = level && level !== "ALL"
+    ? `/tv/logs/stream?level=${encodeURIComponent(level)}`
+    : `/tv/logs/stream`;
+  return openSSE(path, onEvent, options?.onError);
 }
 
 export async function getTvStartupLatest(): Promise<import("./types").TvStartupLatestResponse | null> {
@@ -373,4 +427,9 @@ export function getTvStartupPreflight(
   return get(`/tv/startup/preflight`, {
     includeQueryChecks: includeQueryChecks ? "1" : "0",
   });
+}
+
+// POST /api/v2/tv/snapshots/sync
+export function runTvSnapshotSync(): Promise<{ ok: boolean; message: string }> {
+  return post<{ ok: boolean; message: string }>(`/tv/snapshots/sync`, {});
 }

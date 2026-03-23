@@ -25,6 +25,9 @@ def get_conn() -> Iterator[sqlite3.Connection]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     try:
         yield conn
     finally:
@@ -221,6 +224,9 @@ def init_db() -> None:
             """
         )
 
+        # F-027: Track backend upload status for fingerprints
+        _ensure_column(conn, "fingerprints", "backend_confirmed", "backend_confirmed INTEGER NOT NULL DEFAULT 0")
+
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
@@ -228,6 +234,11 @@ def init_db() -> None:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception:
             pass
+
+        # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_users_first_card ON sync_users(first_card_id) WHERE first_card_id IS NOT NULL;")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_users_second_card ON sync_users(second_card_id) WHERE second_card_id IS NOT NULL;")
 
         # -----------------------------
         # memberships
@@ -281,6 +292,8 @@ def init_db() -> None:
                 default_authorize_door_id INTEGER,
                 sdk_read_initial_bytes INTEGER,
 
+                optional_data_sync_delay_minutes INTEGER,
+
                 created_at TEXT,
                 updated_at TEXT
             );
@@ -310,6 +323,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_access_software_settings", "agent_sync_backend_refresh_min", "agent_sync_backend_refresh_min INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "default_authorize_door_id", "default_authorize_door_id INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "sdk_read_initial_bytes", "sdk_read_initial_bytes INTEGER")
+        _ensure_column(conn, "sync_access_software_settings", "optional_data_sync_delay_minutes", "optional_data_sync_delay_minutes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "created_at", "created_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "updated_at", "updated_at TEXT")
 
@@ -428,6 +442,14 @@ def init_db() -> None:
         _ensure_column(conn, "sync_devices", "authorize_timezone_id", "authorize_timezone_id INTEGER")
         _ensure_column(conn, "sync_devices", "pushing_to_device_policy", "pushing_to_device_policy TEXT")
 
+        # F-015: Deduplicate sync_devices by id before adding unique index
+        conn.execute("""
+            DELETE FROM sync_devices WHERE rowid NOT IN (
+                SELECT MIN(rowid) FROM sync_devices GROUP BY id
+            )
+        """)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_devices_id ON sync_devices(id);")
+
         # -----------------------------
         # door presets synced from backend (GymDeviceDoorPresetDto)
         # -----------------------------
@@ -483,6 +505,7 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_gac_gym_id ON sync_gym_access_credentials(gym_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_gac_account_id ON sync_gym_access_credentials(account_id);")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_gac_account_gym ON sync_gym_access_credentials(account_id, gym_id);")
 
         # -----------------------------
         # local door presets per device (legacy/local UI editable)
@@ -628,6 +651,85 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_processing_lock ON offline_creation_queue(state, processing_lock_expires_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_history_state ON offline_creation_queue(state, updated_at);")
 
+        # -----------------------------
+        # optional content sync state (single row — version markers)
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optional_sync_state (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                events_version_at TEXT,
+                products_version_at TEXT,
+                deals_version_at TEXT,
+                last_sync_at TEXT
+            );
+            """
+        )
+
+        # -----------------------------
+        # optional upcoming events (today's events for TV display)
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optional_upcoming_events (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                sub_title TEXT,
+                description TEXT,
+                image TEXT,
+                room TEXT,
+                event_date TEXT,
+                duration_in_minutes INTEGER,
+                coach_name TEXT,
+                price TEXT,
+                category TEXT,
+                available INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_optional_events_date ON optional_upcoming_events(event_date);")
+
+        # -----------------------------
+        # optional products cache
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optional_products (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                model TEXT,
+                description TEXT,
+                image TEXT,
+                category TEXT,
+                price REAL,
+                sale_price REAL,
+                available_number INTEGER,
+                available INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT
+            );
+            """
+        )
+
+        # -----------------------------
+        # optional deals cache (global admin deals)
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS optional_deals (
+                id INTEGER PRIMARY KEY,
+                title TEXT,
+                description TEXT,
+                header TEXT,
+                image TEXT,
+                deal_end_date TEXT,
+                partner_name TEXT,
+                available INTEGER NOT NULL DEFAULT 1,
+                synced_at TEXT
+            );
+            """
+        )
+
         # Backfill state defaults for legacy rows if they exist
         conn.execute("UPDATE offline_creation_queue SET created_at = COALESCE(created_at, updated_at, datetime('now')) WHERE created_at IS NULL OR created_at = '';")
         conn.execute("UPDATE offline_creation_queue SET updated_at = COALESCE(updated_at, created_at, datetime('now')) WHERE updated_at IS NULL OR updated_at = '';")
@@ -636,6 +738,16 @@ def init_db() -> None:
         conn.execute("UPDATE offline_creation_queue SET state = 'pending' WHERE state IS NULL OR state = '';")
 
         conn.commit()
+
+    # F-014: On startup, reset any stale processing locks in the offline queue
+    try:
+        n = reset_stale_processing_locks()
+        if n > 0:
+            import logging
+            logging.getLogger("db").warning(f"[DB] Reset {n} stale processing lock(s) in offline_creation_queue on startup.")
+    except Exception as _e:
+        import logging
+        logging.getLogger("db").error(f"[DB] Failed to reset stale processing locks on startup: {_e}")
 
 
 # -----------------------------
@@ -653,6 +765,7 @@ class FingerprintRecord:
     template_encoding: str
     template_data: str
     template_size: int
+    backend_confirmed: int = 0  # F-027: 0=local-only (unconfirmed), 1=backend upload confirmed
 
 
 def insert_fingerprint(
@@ -697,6 +810,30 @@ def delete_fingerprint(fp_id: int) -> None:
         conn.commit()
 
 
+def confirm_fingerprint_uploaded(fp_id: int) -> None:
+    """
+    F-027: Mark a fingerprint as confirmed uploaded to backend.
+    Call this after a successful backend upload to clear orphan status.
+    """
+    with get_conn() as conn:
+        conn.execute("UPDATE fingerprints SET backend_confirmed=1 WHERE id=?", (int(fp_id),))
+        conn.commit()
+
+
+def list_unconfirmed_fingerprints() -> List[FingerprintRecord]:
+    """
+    F-027: Return fingerprints with backend_confirmed=0.
+    Records with backend_confirmed=0 are local-only and may be orphaned
+    if backend upload never completes. Call confirm_fingerprint_uploaded()
+    after successful backend upload.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM fingerprints WHERE backend_confirmed=0 ORDER BY id ASC"
+        ).fetchall()
+        return [FingerprintRecord(**dict(r)) for r in rows]
+
+
 # -----------------------------
 # Door presets per device (local editable)
 # -----------------------------
@@ -711,7 +848,8 @@ class DeviceDoorPreset:
     updated_at: str
 
 
-def _clamp_int(v: Any, default: int, min_v: int, max_v: int) -> int:
+def _clamp_int_db(v: Any, default: int, min_v: int, max_v: int) -> int:
+    # F-030: renamed from _clamp_int to _clamp_int_db to avoid shadowing settings_reader._clamp_int
     try:
         x = int(str(v).strip())
     except Exception:
@@ -746,8 +884,8 @@ def create_device_door_preset(
     max_per_device: int = 10,
 ) -> int:
     did = int(device_id)
-    dn = _clamp_int(door_number, 1, 1, 64)
-    ps = _clamp_int(pulse_seconds, 3, 1, 60)
+    dn = _clamp_int_db(door_number, 1, 1, 64)
+    ps = _clamp_int_db(pulse_seconds, 3, 1, 60)
     name = (door_name or "").strip()
     if not name:
         raise ValueError("Door name is required.")
@@ -782,8 +920,8 @@ def update_device_door_preset(
 ) -> None:
     pid = int(preset_id)
     did = int(device_id)
-    dn = _clamp_int(door_number, 1, 1, 64)
-    ps = _clamp_int(pulse_seconds, 3, 1, 60)
+    dn = _clamp_int_db(door_number, 1, 1, 64)
+    ps = _clamp_int_db(pulse_seconds, 3, 1, 60)
     name = (door_name or "").strip()
     if not name:
         raise ValueError("Door name is required.")
@@ -1030,9 +1168,11 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         default_authorize_door_id,
                         sdk_read_initial_bytes,
 
+                        optional_data_sync_delay_minutes,
+
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         gym_id=excluded.gym_id,
                         access_server_host=excluded.access_server_host,
@@ -1063,6 +1203,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         default_authorize_door_id=excluded.default_authorize_door_id,
                         sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
+
+                        optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
 
                         created_at=excluded.created_at,
                         updated_at=excluded.updated_at
@@ -1099,6 +1241,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         _to_int_or_none(s.get("defaultAuthorizeDoorId", 15)),
                         _to_int_or_none(s.get("sdkReadInitialBytes", 1048576)),
 
+                        _to_int_or_none(s.get("optionalDataSyncDelayMinutes", 60)),
+
                         _safe_str(s.get("createdAt"), ""),
                         _safe_str(s.get("updatedAt"), updated_at) or updated_at,
                     ),
@@ -1123,7 +1267,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
             cur.execute(
                 """
-                INSERT INTO sync_users (
+                INSERT OR REPLACE INTO sync_users (
                     user_id,
                     active_membership_id,
                     membership_id,
@@ -1640,6 +1784,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
                 agent_sync_backend_refresh_min,
                 default_authorize_door_id,
                 sdk_read_initial_bytes,
+                optional_data_sync_delay_minutes,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1
@@ -1680,9 +1825,193 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
             "defaultAuthorizeDoorId": d.get("default_authorize_door_id"),
             "sdkReadInitialBytes": d.get("sdk_read_initial_bytes"),
 
+            "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
+
             "createdAt": d.get("created_at"),
             "updatedAt": d.get("updated_at"),
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional content sync — state, events, products, deals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_optional_sync_state() -> Dict[str, Any]:
+    """Return the current optional sync state (version markers). Never raises."""
+    try:
+        with get_conn() as conn:
+            r = conn.execute(
+                "SELECT events_version_at, products_version_at, deals_version_at, last_sync_at "
+                "FROM optional_sync_state WHERE id=1"
+            ).fetchone()
+            return dict(r) if r else {}
+    except Exception:
+        return {}
+
+
+def save_optional_sync_state(
+    *,
+    events_version_at: Optional[str],
+    products_version_at: Optional[str],
+    deals_version_at: Optional[str],
+    last_sync_at: str,
+    refresh_events: bool,
+    refresh_products: bool,
+    refresh_deals: bool,
+) -> None:
+    """
+    Upsert the optional sync state row.
+    Only overwrites a version marker when the corresponding refresh flag was true,
+    preserving unchanged markers.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO optional_sync_state (id, events_version_at, products_version_at, deals_version_at, last_sync_at)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                events_version_at   = CASE WHEN ? THEN excluded.events_version_at   ELSE events_version_at   END,
+                products_version_at = CASE WHEN ? THEN excluded.products_version_at ELSE products_version_at END,
+                deals_version_at    = CASE WHEN ? THEN excluded.deals_version_at    ELSE deals_version_at    END,
+                last_sync_at        = excluded.last_sync_at
+            """,
+            (
+                events_version_at,
+                products_version_at,
+                deals_version_at,
+                last_sync_at,
+                1 if refresh_events else 0,
+                1 if refresh_products else 0,
+                1 if refresh_deals else 0,
+            ),
+        )
+        conn.commit()
+
+
+def delete_passed_optional_events() -> int:
+    """
+    Delete events from optional_upcoming_events whose event_date is in the past.
+    Returns the number of deleted rows. Called before each optional sync cycle.
+    """
+    now_iso = datetime.now().isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM optional_upcoming_events WHERE event_date < ?", (now_iso,)
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def replace_optional_events(events: List[Dict[str, Any]]) -> None:
+    """Replace the full optional events cache."""
+    now_ts = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM optional_upcoming_events")
+        for ev in events:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO optional_upcoming_events
+                    (id, title, sub_title, description, image, room, event_date,
+                     duration_in_minutes, coach_name, price, category, available, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ev.get("id"),
+                    ev.get("title"),
+                    ev.get("subTitle"),
+                    ev.get("description"),
+                    ev.get("image"),
+                    ev.get("room"),
+                    ev.get("date"),
+                    ev.get("durationInMinutes"),
+                    ev.get("coachName"),
+                    str(ev["price"]) if ev.get("price") is not None else None,
+                    ev.get("category"),
+                    1 if ev.get("available") else 0,
+                    now_ts,
+                ),
+            )
+        conn.commit()
+
+
+def replace_optional_products(products: List[Dict[str, Any]]) -> None:
+    """Replace the full optional products cache."""
+    now_ts = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM optional_products")
+        for p in products:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO optional_products
+                    (id, title, model, description, image, category,
+                     price, sale_price, available_number, available, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    p.get("id"),
+                    p.get("title"),
+                    p.get("model"),
+                    p.get("description"),
+                    p.get("image"),
+                    p.get("category"),
+                    p.get("price"),
+                    p.get("salePrice"),
+                    p.get("availableNumber"),
+                    1 if p.get("available") else 0,
+                    now_ts,
+                ),
+            )
+        conn.commit()
+
+
+def replace_optional_deals(deals: List[Dict[str, Any]]) -> None:
+    """Replace the full optional deals cache."""
+    now_ts = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute("DELETE FROM optional_deals")
+        for d in deals:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO optional_deals
+                    (id, title, description, header, image, deal_end_date, partner_name, available, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    d.get("id"),
+                    d.get("title"),
+                    d.get("description"),
+                    d.get("header"),
+                    d.get("image"),
+                    d.get("dealEndDate"),
+                    d.get("partnerName"),
+                    1 if d.get("available") else 0,
+                    now_ts,
+                ),
+            )
+        conn.commit()
+
+
+def list_optional_upcoming_events() -> List[Dict[str, Any]]:
+    """Return cached upcoming events ordered by date. Used by TV display."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM optional_upcoming_events ORDER BY event_date ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_optional_products() -> List[Dict[str, Any]]:
+    """Return cached available products. Used by TV display."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM optional_products").fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_optional_deals() -> List[Dict[str, Any]]:
+    """Return cached active deals. Used by TV display."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM optional_deals").fetchall()
+        return [dict(r) for r in rows]
 
 
 def load_sync_cache() -> SyncCacheState | None:
@@ -2047,15 +2376,20 @@ def insert_access_history(
     cmd_ok: bool | None,
     cmd_error: str | None,
     raw: Dict[str, Any] | None,
-) -> None:
+) -> int:
+    """
+    Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
+    Returns rowcount: 1 if inserted (first worker to claim), 0 if already exists.
+    F-013: callers should only open_door if return value is 1.
+    """
     if not str(event_id or "").strip():
-        return
+        return 0
 
     with get_conn() as conn:
         try:
-            conn.execute(
+            cur = conn.execute(
                 """
-                INSERT INTO access_history (
+                INSERT OR IGNORE INTO access_history (
                     created_at, event_id, device_id, door_id, card_no,
                     event_time, event_type,
                     allowed, reason,
@@ -2083,8 +2417,9 @@ def insert_access_history(
                 ),
             )
             conn.commit()
+            return int(cur.rowcount or 0)
         except sqlite3.IntegrityError:
-            return
+            return 0
 
 
 def prune_access_history(*, retention_days: int) -> int:
@@ -2139,6 +2474,43 @@ def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
 
 OFFLINE_QUEUE_ACTIVE_STATES = ("pending", "processing", "failed_retryable", "blocked_auth")
 OFFLINE_QUEUE_FINAL_STATES = ("succeeded", "reconciled", "cancelled", "failed_terminal", "archived")
+
+# F-009: Maximum number of active (pending/processing/failed_retryable/blocked_auth) items in the queue
+_OFFLINE_QUEUE_MAX_PENDING = 500
+
+
+def count_offline_queue_active() -> int:
+    """Count items in pending/processing state (active items)."""
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT COUNT(*) AS c FROM offline_creation_queue WHERE state IN ('pending','processing','failed_retryable','blocked_auth')"
+        ).fetchone()
+        return int(r["c"]) if r else 0
+
+
+def reset_stale_processing_locks(now_iso: Optional[str] = None) -> int:
+    """
+    On startup: reset any offline_creation_queue rows that are stuck in
+    state='processing' with an expired lock TTL back to state='pending'.
+    Returns the count of rows reset.
+    """
+    if now_iso is None:
+        from datetime import datetime, timezone as _tz
+        now_iso = datetime.now(tz=_tz.utc).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE offline_creation_queue
+            SET state = 'pending',
+                processing_lock_token = NULL,
+                processing_lock_expires_at = NULL
+            WHERE state = 'processing'
+              AND (processing_lock_expires_at IS NULL OR processing_lock_expires_at < ?)
+            """,
+            (now_iso,),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 def _utc_now_iso() -> str:
@@ -2277,6 +2649,10 @@ def insert_offline_creation(
     failed_reason: str | None = None,
     next_retry_at: str | None = None,
 ) -> Dict[str, Any]:
+    # F-009: Check queue cap before inserting
+    if count_offline_queue_active() >= _OFFLINE_QUEUE_MAX_PENDING:
+        raise RuntimeError(f"Offline creation queue is full (max={_OFFLINE_QUEUE_MAX_PENDING}). Cannot enqueue new item.")
+
     lid = str(local_id or uuid.uuid4())
     rid = str(client_request_id or uuid.uuid4())
     kind = _normalize_creation_kind(creation_kind)

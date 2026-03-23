@@ -1,6 +1,6 @@
 param(
   [ValidateSet("access", "tv", "both")]
-  [string]$Component = "access",
+  [string]$Component = "both",
 
   [ValidateSet("stable", "beta")]
   [string]$Channel = "stable",

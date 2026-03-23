@@ -16,7 +16,7 @@ def safe_collect_submodules(pkg: str):
 ROOT = Path.cwd().resolve()
 
 APP_ENTRY = str(ROOT / "tv" / "main.py")
-APP_ICON = ROOT / "app" / "ui" / "assets" / "app.ico"
+APP_ICON = ROOT / "installer" / "assets" / "monclub_tv.ico"
 ICON_PATH = str(APP_ICON) if APP_ICON.exists() else None
 
 datas = []

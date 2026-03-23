@@ -76,6 +76,8 @@ from tv.api import (  # noqa: E402
     create_tv_ad_proof,
     list_tv_ad_proof_outbox, load_tv_ad_proof, process_tv_ad_proof_outbox,
     retry_tv_ad_proof, startup_recover_proof_outbox,
+    # Screen messages
+    create_tv_screen_message, list_tv_screen_messages,
 )
 
 
@@ -152,21 +154,31 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
 _ALLOWED_ORIGIN = "tauri://localhost"
 
 def _cors_headers(handler: BaseHTTPRequestHandler) -> None:
-    # In production: restrict to Tauri origin.  For dev: allow localhost variants.
+    # This API binds to 127.0.0.1 only, so it is safe to reflect the requesting
+    # origin back to desktop UI callers instead of maintaining a brittle allowlist.
+    # Packaged Tauri/WebView runtimes may use different localhost-like origins
+    # across platforms/releases (for example http://tauri.localhost or
+    # https://tauri.localhost), and reflecting the origin keeps the local shell
+    # resilient without exposing the API outside loopback.
     origin = handler.headers.get("Origin", "")
-    allowed = (
-        origin.startswith("tauri://")
-        or origin.startswith("https://tauri.localhost")
-        or origin.startswith("http://localhost")
-        or origin.startswith("http://127.0.0.1")
-    )
-    if allowed and origin:
+    requested_headers = handler.headers.get("Access-Control-Request-Headers", "")
+    requested_private_network = handler.headers.get("Access-Control-Request-Private-Network", "")
+    if origin:
         handler.send_header("Access-Control-Allow-Origin", origin)
     else:
         # Fallback for non-browser callers (curl, Tauri sidecar, etc.)
         handler.send_header("Access-Control-Allow-Origin", "http://localhost")
     handler.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Local-Token")
+    if requested_headers.strip():
+        handler.send_header("Access-Control-Allow-Headers", requested_headers)
+    else:
+        handler.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Local-Token")
+    if requested_private_network.strip().lower() == "true":
+        handler.send_header("Access-Control-Allow-Private-Network", "true")
+    handler.send_header(
+        "Vary",
+        "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Access-Control-Request-Private-Network",
+    )
     handler.send_header("Access-Control-Max-Age", "86400")
 
 
@@ -355,14 +367,8 @@ def _handle_status(ctx: _Ctx) -> None:
             elif adm == "AGENT":
                 agent_count += 1
     unknown_count = len(devices) - dev_count - agent_count
-    if dev_count > 0 and agent_count > 0:
-        gm = "MIXED"
-    elif agent_count > 0:
-        gm = "AGENT_ONLY"
-    else:
-        gm = "DEVICE_ONLY"
 
-    mode = {"globalMode": gm, "summary": {"DEVICE": dev_count, "AGENT": agent_count, "UNKNOWN": unknown_count}}
+    mode = {"DEVICE": dev_count, "AGENT": agent_count, "UNKNOWN": unknown_count}
 
     sync = {
         "running": False,
@@ -452,6 +458,83 @@ def _handle_auth_status(ctx: _Ctx) -> None:
         "lastLoginAt": (auth.last_login_at if auth else None),
         "email": (auth.email if auth else None),
     })
+
+
+def _handle_tv_auth_login(ctx: _Ctx) -> None:
+    body = ctx.body()
+    email = _safe_str(body.get("email"), "").strip()
+    password = _safe_str(body.get("password"), "")
+    if not email or not password:
+        ctx.send_json(400, {"ok": False, "error": "email and password are required"})
+        return
+    try:
+        import datetime
+        api = ctx.app._api()
+        token = api.login(email=email, password=password)
+        from tv.auth_bridge import mirror_access_auth_to_tv
+        mirror_access_auth_to_tv(email=email, token=token, last_login_at=datetime.datetime.utcnow().isoformat())
+        # Mirror to Access on best-effort basis (SSO: if Access is co-installed)
+        try:
+            from access.store import save_auth_token
+            save_auth_token(email=email, token=token)
+        except Exception:
+            ctx.app.logger.warning("Access auth mirror failed during TV login.", exc_info=True)
+        ctx.app.cfg.login_email = email
+        ctx.app.persist_config()
+        ctx.app.logger.info("TV Login OK via API v2.")
+        try:
+            ctx.app.after(0, lambda: ctx.app._ensure_update_manager_started(check_now=True))
+        except Exception:
+            pass
+        ctx.send_json(200, {"ok": True, "token": token[:8] + "..." if len(token) > 8 else "***"})
+    except Exception as e:
+        ctx.app.logger.exception("TV Login failed via API v2")
+        ctx.send_json(401, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_auth_status(ctx: _Ctx) -> None:
+    from tv.auth_bridge import load_tv_auth_for_runtime
+    auth = load_tv_auth_for_runtime()
+    ctx.send_json(200, {
+        "ok": True,
+        "session": {
+            "loggedIn": bool(auth and auth.token),
+            "restricted": False,
+            "reasons": [],
+            "email": (auth.email if auth else None),
+            "lastLoginAt": (auth.last_login_at if auth else None),
+            "contractStatus": True,
+            "contractEndDate": None,
+            "loginDaysRemaining": None,
+            "loginWarning": False,
+            "contractDaysRemaining": None,
+            "contractWarning": False,
+        },
+        "mode": {"DEVICE": 0, "AGENT": 0, "UNKNOWN": 0},
+        "sync": {"running": False, "lastSyncAt": None, "lastOk": True, "lastError": None},
+        "deviceSync": {"lastRunAt": None, "lastOk": True, "lastError": None},
+        "pullsdk": {"connected": False, "deviceId": None, "ip": None, "since": None, "lastError": None},
+        "agent": {"running": False, "eventQueueDepth": 0, "avgDecisionMs": 0},
+        "updates": {"updateAvailable": False, "downloaded": False, "downloading": False,
+                    "progress": None, "currentReleaseId": None, "lastCheckAt": None, "lastError": None},
+    })
+
+
+def _handle_tv_auth_logout(ctx: _Ctx) -> None:
+    from tv.store import clear_tv_backend_auth_state
+    clear_tv_backend_auth_state()
+    # Mirror to Access on best-effort basis
+    try:
+        from access.store import clear_auth_token
+        clear_auth_token()
+    except Exception:
+        ctx.app.logger.warning("Access auth mirror clear failed during TV logout.", exc_info=True)
+    try:
+        ctx.app._update_manager.stop()
+    except Exception:
+        pass
+    ctx.app.logger.info("TV Logout via API v2.")
+    ctx.send_json(200, {"ok": True})
 
 
 def _handle_auth_logout(ctx: _Ctx) -> None:
@@ -775,6 +858,15 @@ def _handle_tv_host_bindings_post(ctx: _Ctx) -> None:
             enabled=_safe_bool(body.get("enabled"), default=True),
             autostart=_safe_bool(body.get("autostart"), default=False),
             fullscreen=_safe_bool(body.get("fullscreen"), default=True),
+            target_display_id=_safe_str(body.get("targetDisplayId") or body.get("target_display_id"), "") or None,
+            target_display_path=_safe_str(body.get("targetDisplayPath") or body.get("target_display_path"), "") or None,
+            last_known_friendly_name=_safe_str(body.get("lastKnownFriendlyName") or body.get("last_known_friendly_name"), "") or None,
+            last_known_bounds_x=_safe_int(body.get("lastKnownBoundsX") or body.get("last_known_bounds_x"), 0) if (body.get("lastKnownBoundsX") is not None or body.get("last_known_bounds_x") is not None) else None,
+            last_known_bounds_y=_safe_int(body.get("lastKnownBoundsY") or body.get("last_known_bounds_y"), 0) if (body.get("lastKnownBoundsY") is not None or body.get("last_known_bounds_y") is not None) else None,
+            last_known_width=_safe_int(body.get("lastKnownWidth") or body.get("last_known_width"), 0) if (body.get("lastKnownWidth") is not None or body.get("last_known_width") is not None) else None,
+            last_known_height=_safe_int(body.get("lastKnownHeight") or body.get("last_known_height"), 0) if (body.get("lastKnownHeight") is not None or body.get("last_known_height") is not None) else None,
+            last_known_display_order_index=_safe_int(body.get("lastKnownDisplayOrderIndex") or body.get("last_known_display_order_index"), 0) if (body.get("lastKnownDisplayOrderIndex") is not None or body.get("last_known_display_order_index") is not None) else None,
+            display_attach_confidence=_safe_str(body.get("displayAttachConfidence") or body.get("display_attach_confidence"), "") or None,
         )
         ctx.send_json(200, {"ok": True, "binding": row})
     except ValueError as e:
@@ -798,6 +890,15 @@ def _handle_tv_host_binding_patch(ctx: _Ctx) -> None:
             enabled=_safe_bool(body.get("enabled"), default=False) if "enabled" in body else None,
             autostart=_safe_bool(body.get("autostart"), default=False) if "autostart" in body else None,
             fullscreen=_safe_bool(body.get("fullscreen"), default=True) if "fullscreen" in body else None,
+            target_display_id=_safe_str(body.get("targetDisplayId") or body.get("target_display_id"), "") if ("targetDisplayId" in body or "target_display_id" in body) else None,
+            target_display_path=_safe_str(body.get("targetDisplayPath") or body.get("target_display_path"), "") if ("targetDisplayPath" in body or "target_display_path" in body) else None,
+            last_known_friendly_name=_safe_str(body.get("lastKnownFriendlyName") or body.get("last_known_friendly_name"), "") if ("lastKnownFriendlyName" in body or "last_known_friendly_name" in body) else None,
+            last_known_bounds_x=_safe_int(body.get("lastKnownBoundsX") or body.get("last_known_bounds_x"), 0) if ("lastKnownBoundsX" in body or "last_known_bounds_x" in body) else None,
+            last_known_bounds_y=_safe_int(body.get("lastKnownBoundsY") or body.get("last_known_bounds_y"), 0) if ("lastKnownBoundsY" in body or "last_known_bounds_y" in body) else None,
+            last_known_width=_safe_int(body.get("lastKnownWidth") or body.get("last_known_width"), 0) if ("lastKnownWidth" in body or "last_known_width" in body) else None,
+            last_known_height=_safe_int(body.get("lastKnownHeight") or body.get("last_known_height"), 0) if ("lastKnownHeight" in body or "last_known_height" in body) else None,
+            last_known_display_order_index=_safe_int(body.get("lastKnownDisplayOrderIndex") or body.get("last_known_display_order_index"), 0) if ("lastKnownDisplayOrderIndex" in body or "last_known_display_order_index" in body) else None,
+            display_attach_confidence=_safe_str(body.get("displayAttachConfidence") or body.get("display_attach_confidence"), "") if ("displayAttachConfidence" in body or "display_attach_confidence" in body) else None,
         )
         ctx.send_json(200, {"ok": True, "binding": row})
     except ValueError as e:
@@ -1644,6 +1745,36 @@ def _handle_tv_ad_proofs_startup_recover(ctx: _Ctx) -> None:
     ensure_tv_local_schema()
     result = startup_recover_proof_outbox()
     ctx.send_json(200, result)
+
+
+def _handle_tv_screen_messages_post(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    body = ctx.body()
+    binding_id = _safe_int(body.get("bindingId") or body.get("binding_id"), 0)
+    if binding_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "bindingId is required and must be > 0"})
+        return
+    title = _safe_str(body.get("title"), "").strip()
+    description = _safe_str(body.get("description"), "").strip()
+    image_base64 = _safe_str(body.get("imageBase64") or body.get("image_base64"), "") or None
+    display_duration_sec = max(3, min(10, _safe_int(body.get("displayDurationSec") or body.get("display_duration_sec"), 5)))
+    row = create_tv_screen_message(
+        binding_id=binding_id,
+        title=title,
+        description=description,
+        image_base64=image_base64,
+        display_duration_sec=display_duration_sec,
+    )
+    ctx.send_json(200, {"ok": True, "message": row})
+
+
+def _handle_tv_screen_messages_get(ctx: _Ctx) -> None:
+    ensure_tv_local_schema()
+    binding_id = ctx.q_int("bindingId", "binding_id") or None
+    limit = max(1, min(200, ctx.q_int("limit", default=50)))
+    offset = max(0, ctx.q_int("offset", default=0))
+    rows = list_tv_screen_messages(binding_id=binding_id, limit=limit, offset=offset)
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
 
 
 def _handle_tv_activation_status(ctx: _Ctx) -> None:
@@ -2897,6 +3028,60 @@ def _handle_logs_stream_sse(ctx: _Ctx) -> None:
             return
 
 
+def _handle_tv_logs_recent(ctx: _Ctx) -> None:
+    page = getattr(ctx.app, "page_logs", None)
+    if not page or not hasattr(page, "_buffer"):
+        ctx.send_json(200, {"lines": [], "total": 0})
+        return
+    level = ctx.q("level", default="ALL").upper()
+    limit = ctx.q_int("limit", default=500)
+
+    try:
+        buf = list(page._buffer)
+    except Exception:
+        buf = []
+    if level not in ("", "ALL"):
+        buf = [(lvl, line) for lvl, line in buf if lvl == level]
+    total = len(buf)
+    if limit > 0:
+        buf = buf[-limit:]
+    ctx.send_json(200, {
+        "ok": True,
+        "lines": [{"level": lvl, "text": line} for lvl, line in buf],
+        "total": total,
+    })
+
+
+def _handle_tv_logs_stream_sse(ctx: _Ctx) -> None:
+    ctx.send_sse_start()
+    level = ctx.q("level", default="ALL").upper()
+    page = getattr(ctx.app, "page_logs", None)
+    last_len = len(page._buffer) if page else 0
+
+    while True:
+        try:
+            time.sleep(0.2)
+            if not page:
+                page = getattr(ctx.app, "page_logs", None)
+                continue
+
+            buf = page._buffer
+            cur_len = len(buf)
+            if cur_len > last_len:
+                new_entries = buf[last_len:cur_len]
+                for lvl, line in new_entries:
+                    if level in ("", "ALL") or lvl == level:
+                        if not ctx.send_sse_event("log", {"level": lvl, "text": line}):
+                            return
+                last_len = cur_len
+            elif cur_len < last_len:
+                last_len = cur_len
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception:
+            return
+
+
 def _handle_logs_open_dir(ctx: _Ctx) -> None:
     from app.core.utils import LOG_DIR
     path = str(LOG_DIR)
@@ -2911,10 +3096,15 @@ def _handle_logs_open_dir(ctx: _Ctx) -> None:
 
 def _build_update_status_payload(app) -> Dict[str, Any]:
     um = getattr(app, "_update_manager", None)
-    st = getattr(app, "_update_status", None)
+    # Status lives on the manager itself (new design) or as a separate attribute (legacy)
+    st = getattr(um, "status", None) or getattr(app, "_update_status", None)
     data: Dict[str, Any] = {"updateAvailable": False}
     if um:
-        data["currentReleaseId"] = um.get_current_release_id()
+        # Current version info (new semver fields)
+        data["currentVersion"] = getattr(um, "get_current_version", lambda: "0.0.0")()
+        data["currentCodename"] = getattr(um, "get_current_codename", lambda: "")()
+        # Legacy field for backward compat
+        data["currentReleaseId"] = getattr(um, "get_current_release_id", lambda: "dev")()
         component = getattr(um, "component", None)
         install_root = Path(getattr(um, "install_root", "")) if getattr(um, "install_root", None) else None
         updater_name = getattr(component, "updater_exe_name", None)
@@ -2936,15 +3126,28 @@ def _build_update_status_payload(app) -> Dict[str, Any]:
         data["progressPercent"] = getattr(st, "progress_percent", None)
         data["lastCheckAt"] = getattr(st, "last_check_at", 0)
         data["lastError"] = getattr(st, "last_error", None)
+        # New semver fields
+        data["latestVersion"] = getattr(st, "latest_version", None)
+        data["latestCodename"] = getattr(st, "latest_codename", None)
+        data["releaseDate"] = getattr(st, "release_date", None)
+        data["availableUntil"] = getattr(st, "available_until", None)
+        data["sizeBytes"] = getattr(st, "size_bytes", None)
+        data["releaseNotes"] = getattr(st, "release_notes", None)
+        data["downloadUrl"] = getattr(st, "download_url", None)
+        data["minCompatibleVersion"] = getattr(st, "min_compatible_version", None)
+        # Legacy latestRelease block for backward compat
         lr = getattr(st, "latest_release", None)
         if isinstance(lr, dict):
             data["latestRelease"] = {
                 "releaseId": lr.get("releaseId"),
-                "publishDate": lr.get("publishDate") or lr.get("publish_date") or lr.get("createdAt"),
+                "publishDate": lr.get("publishedAt") or lr.get("publishDate") or lr.get("publish_date"),
                 "channel": lr.get("channel"),
                 "platform": lr.get("platform"),
                 "version": lr.get("version"),
-                "notes": lr.get("notes") or lr.get("releaseNotes"),
+                "codename": lr.get("codename"),
+                "notes": lr.get("releaseNotes") or lr.get("notes"),
+                "availableUntil": lr.get("availableUntil"),
+                "minCompatibleVersion": lr.get("minCompatibleVersion"),
             }
     return data
 
@@ -3026,6 +3229,48 @@ def _handle_tv_update_download(ctx: _Ctx) -> None:
 
 def _handle_tv_update_install(ctx: _Ctx) -> None:
     _handle_component_update_install(ctx)
+
+
+def _handle_component_update_cancel(ctx: _Ctx) -> None:
+    um = getattr(ctx.app, "_update_manager", None)
+    if um:
+        try:
+            um.cancel_download()
+        except Exception:
+            pass
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_update_cancel(ctx: _Ctx) -> None:
+    _handle_component_update_cancel(ctx)
+
+
+def _handle_tv_update_cancel(ctx: _Ctx) -> None:
+    _handle_component_update_cancel(ctx)
+
+
+def _handle_component_update_version_info(ctx: _Ctx) -> None:
+    """Always-available endpoint: returns current version info regardless of update state."""
+    um = getattr(ctx.app, "_update_manager", None)
+    if um:
+        ctx.send_json(200, {
+            "ok": True,
+            "currentVersion": getattr(um, "get_current_version", lambda: "0.0.0")(),
+            "currentCodename": getattr(um, "get_current_codename", lambda: "")(),
+            "currentReleaseId": getattr(um, "get_current_release_id", lambda: "dev")(),
+            "componentId": getattr(getattr(um, "component", None), "component_id", None),
+            "componentDisplayName": getattr(getattr(um, "component", None), "display_name", None),
+        })
+    else:
+        ctx.send_json(200, {"ok": True, "currentVersion": "0.0.0", "currentCodename": "", "currentReleaseId": "dev"})
+
+
+def _handle_update_version_info(ctx: _Ctx) -> None:
+    _handle_component_update_version_info(ctx)
+
+
+def _handle_tv_update_version_info(ctx: _Ctx) -> None:
+    _handle_component_update_version_info(ctx)
 
 
 # ==================== 10) LOCAL DB TOOLS ====================

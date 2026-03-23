@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MonClubDesktopUpdater")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e3ba9d5111aa8a8b2a6d3a8c7d21d67bf932628d")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+256479c37ae16745e95ac3955afa6e106b708a54")]
 [assembly: System.Reflection.AssemblyProductAttribute("MonClubDesktopUpdater")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MonClubDesktopUpdater")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

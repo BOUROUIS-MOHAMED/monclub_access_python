@@ -1,16 +1,76 @@
-import { useMemo, useState } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { ChevronLeft, Menu } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { ArrowRight, ChevronLeft, Download, LogOut, Menu, Settings, User } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
 import { TV_NAV_ITEMS } from "@/tv/navigation";
+import { useTvAuth } from "@/tv/context/TvAuthContext";
+import { getTvUpdateStatus } from "@/tv/api/runtime";
 import tvLogo from "@/tv/assets/monclub_tv.png";
+import { SidebarUpdateCard } from "@/components/SidebarUpdateCard";
 
 export default function TvDashboardShell() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [logoutConfirm, setLogoutConfirm] = useState(false);
+  const { status, logout } = useTvAuth();
+
+  // Update status polling
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [latestVersion, setLatestVersion] = useState<string | null>(null);
+  const [latestCodename, setLatestCodename] = useState<string | null>(null);
+  const updatePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const fetchUpdateStatus = useCallback(async () => {
+    try {
+      const s = await getTvUpdateStatus();
+      setUpdateAvailable(s.updateAvailable ?? false);
+      setLatestVersion(s.latestVersion ?? null);
+      setLatestCodename(s.latestCodename ?? null);
+    } catch {
+      // silent — update check should never break the shell
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchUpdateStatus();
+    updatePollRef.current = setInterval(fetchUpdateStatus, 30_000);
+    return () => {
+      if (updatePollRef.current) clearInterval(updatePollRef.current);
+    };
+  }, [fetchUpdateStatus]);
+
+  // Refresh TV tray on mount so screens are populated
+  useEffect(() => {
+    (async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("refresh_tv_tray_menu").catch(() => {});
+      } catch { /* not in Tauri */ }
+    })();
+  }, []);
+
+  const handleLogout = async () => {
+    setLogoutConfirm(false);
+    await logout();
+  };
 
   const activeItem = useMemo(
     () => TV_NAV_ITEMS.find((item) => location.pathname.startsWith(item.to)) ?? TV_NAV_ITEMS[0],
@@ -102,15 +162,158 @@ export default function TvDashboardShell() {
           </nav>
         </ScrollArea>
 
-        {/* Version tag at bottom */}
-        {sidebarOpen && (
-          <div className="shrink-0 border-t border-border px-4 py-3">
-            <div className="text-[11px] text-muted-foreground">
-              Standalone signage runtime
+        {/* Update notification card */}
+        <SidebarUpdateCard
+          updateAvailable={updateAvailable}
+          latestVersion={latestVersion}
+          latestCodename={latestCodename}
+          sidebarOpen={sidebarOpen}
+          onClick={() => navigate("/tv-updates")}
+        />
+
+        {/* Bottom icon bar: Profile, Settings, Theme, Logout */}
+        <div className="border-t border-border px-2 py-2 shrink-0">
+          {sidebarOpen ? (
+            <div className="flex items-center justify-between gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/tv-profile") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/tv-profile")}
+                  >
+                    <User className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Profil</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/tv-settings") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/tv-settings")}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Paramètres</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <ThemeToggle />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">Thème</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setLogoutConfirm(true)}
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Déconnexion</TooltipContent>
+              </Tooltip>
             </div>
-          </div>
-        )}
+          ) : (
+            <div className="flex flex-col items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/tv-profile") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/tv-profile")}
+                  >
+                    <User className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Profil</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/tv-settings") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/tv-settings")}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Paramètres</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <ThemeToggle />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="right">Thème</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setLogoutConfirm(true)}
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Déconnexion</TooltipContent>
+              </Tooltip>
+            </div>
+          )}
+        </div>
       </aside>
+
+      {/* Logout confirmation dialog */}
+      <Dialog open={logoutConfirm} onOpenChange={setLogoutConfirm}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Se déconnecter ?</DialogTitle>
+            <DialogDescription>
+              Vous devrez vous reconnecter pour accéder à l'application.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setLogoutConfirm(false)}>
+              Annuler
+            </Button>
+            <Button variant="destructive" onClick={handleLogout}>
+              Déconnexion
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Main content */}
       <div className="relative z-10 flex min-w-0 flex-1 flex-col">
@@ -137,17 +340,6 @@ export default function TvDashboardShell() {
               <p className="mt-0.5 text-[13px] text-muted-foreground leading-5 max-w-2xl truncate">
                 {activeItem.description}
               </p>
-            </div>
-
-            <div className="shrink-0 hidden sm:flex items-center gap-2">
-              <div className="rounded-md border border-border bg-muted/60 px-3 py-1.5 text-right">
-                <div className="text-[10px] uppercase tracking-widest text-muted-foreground font-medium">
-                  Runtime
-                </div>
-                <div className="text-[12px] font-medium text-foreground">
-                  Independent desktop
-                </div>
-              </div>
             </div>
           </div>
         </header>

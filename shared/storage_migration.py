@@ -58,6 +58,7 @@ TV_OWNED_TABLES: tuple[str, ...] = (
     "tv_support_action_log",
     "tv_startup_reconciliation_run",
     "tv_startup_reconciliation_phase",
+    "tv_screen_message",
 )
 
 STORAGE_STATUS_TABLE = "__desktop_storage_status"

@@ -68,10 +68,10 @@ export default function DashboardPage() {
       {/* Overview stat row */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         {[
-          { label: "Mode global", value: mode.globalMode, accent: false },
-          { label: "Mode DEVICE", value: String(mode.summary.DEVICE), accent: false },
-          { label: "Mode AGENT", value: String(mode.summary.AGENT), accent: false },
-          { label: "Dernière sync", value: sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").substring(0, 16) : "Jamais", accent: false },
+          { label: "Appareils (DEVICE)", value: String(mode.DEVICE) },
+          { label: "Appareils (AGENT)",  value: String(mode.AGENT) },
+          { label: "Appareils (inconnu)", value: String(mode.UNKNOWN) },
+          { label: "Dernière sync", value: sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").substring(0, 16) : "Jamais" },
         ].map(({ label, value }) => (
           <div key={label} className="rounded-lg border border-border bg-muted/40 px-4 py-3">
             <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">{label}</div>
@@ -109,10 +109,9 @@ export default function DashboardPage() {
 
         {/* Appareils */}
         <Section title="Appareils" icon={<Router className="h-4 w-4 text-primary" />}>
-          <KV label="Mode global" value={<Badge variant="outline" className="text-[11px]">{mode.globalMode}</Badge>} />
-          <KV label="Mode DEVICE" value={mode.summary.DEVICE} />
-          <KV label="Mode AGENT" value={mode.summary.AGENT} />
-          {mode.summary.UNKNOWN > 0 && <KV label="Inconnu" value={mode.summary.UNKNOWN} />}
+          <KV label="En mode Appareil (DEVICE)" value={mode.DEVICE} />
+          <KV label="En mode Agent (AGENT)" value={mode.AGENT} />
+          {mode.UNKNOWN > 0 && <KV label="Mode inconnu" value={mode.UNKNOWN} />}
         </Section>
 
         {/* Sync */}

@@ -28,6 +28,12 @@ from app.core.utils import ensure_dirs
 from app.sdk.pullsdk import PullSDKDevice
 
 
+# ===================== constants =====================
+
+_RECONNECT_BACKOFF_BASE_SEC: float = 0.25
+_RECONNECT_BACKOFF_MAX_SEC: float = 30.0
+
+
 # ===================== generic helpers =====================
 
 def _safe_int(v: Any, default: int = 0) -> int:
@@ -71,7 +77,7 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
-def _parse_event_time_to_epoch(s: str) -> Optional[float]:
+def _parse_event_time_to_epoch(s: str, tz_offset_sec: int = 0) -> Optional[float]:
     """
     Best-effort parsing of RTLog eventTime into epoch seconds.
     Supports:
@@ -105,10 +111,13 @@ def _parse_event_time_to_epoch(s: str) -> Optional[float]:
         pass
 
     # common fallback formats
+    # Device timestamps are local time, not UTC.
+    # tz_offset_sec = device UTC offset in seconds (e.g., +10800 for UTC+3).
+    # Subtracting gives approximate UTC epoch for cursor comparison.
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+            dt = datetime.strptime(raw, fmt)
+            return dt.timestamp() - tz_offset_sec
         except Exception:
             continue
 
@@ -351,6 +360,45 @@ class ImageCache:
 
         return target if ok else ""
 
+    def get_cached(self, url_or_path: str) -> str:
+        """
+        F-024: Non-blocking cache check. Returns cached path if available, otherwise "" (no download).
+        Use this to avoid blocking the notification thread on image download.
+        """
+        s = (url_or_path or "").strip()
+        if not s:
+            return ""
+        if not self.enabled:
+            return ""
+
+        try:
+            if os.path.exists(s) and os.path.isfile(s):
+                return s
+        except Exception:
+            pass
+
+        if not self._is_url(s):
+            return ""
+
+        with self._lock:
+            if s in self._memo:
+                p = self._memo[s]
+                try:
+                    if os.path.exists(p) and os.path.isfile(p):
+                        return p
+                except Exception:
+                    self._memo.pop(s, None)
+
+            target = self._target_path(s)
+            try:
+                if os.path.exists(target) and os.path.isfile(target):
+                    self._memo[s] = target
+                    return target
+            except Exception:
+                pass
+
+        return ""
+
 
 # ===================== dataclasses =====================
 
@@ -429,6 +477,7 @@ class DeviceStatus:
     reconnects: int = 0
     poll_ema: float = 0.0
     cmd_ema: float = 0.0
+    dropped_events: int = 0
 
 
 # ===================== EMA =====================
@@ -472,12 +521,11 @@ class NotificationGate:
             dedupe = 0
 
         with self._lock:
-            # dedupe
+            # 1) dedupe check (read-only — do not update stamp yet)
             if dedupe > 0:
                 last = self._recent.get(key)
                 if last is not None and (now - float(last)) < float(dedupe):
                     return False
-                self._recent[key] = now
 
                 # prune old recent entries opportunistically
                 if len(self._recent) > 5000:
@@ -486,7 +534,7 @@ class NotificationGate:
                         if t < cut:
                             self._recent.pop(k, None)
 
-            # rate limit
+            # 2) rate limit check
             if rate == 0:
                 return False
 
@@ -497,6 +545,9 @@ class NotificationGate:
             if len(self._times) >= rate:
                 return False
 
+            # 3) Both checks passed — commit the stamp and count
+            if dedupe > 0:
+                self._recent[key] = now
             self._times.append(now)
             return True
 
@@ -544,8 +595,15 @@ class DeviceWorker(threading.Thread):
 
         self._device = PullSDKDevice(self.device_payload, logger=self.logger)
 
+        # F-009: device timezone offset for local-time -> UTC epoch conversion
+        self._device_tz_offset_sec: int = _safe_int(
+            self.device_payload.get("timezoneOffsetSeconds") or
+            self.device_payload.get("timezone_offset_seconds"),
+            0,
+        )
+
         # replay protection (in-memory LRU) + persisted cursor (db)
-        self._seen: Deque[str] = deque(maxlen=2000)
+        self._seen: Deque[str] = deque(maxlen=10000)  # F-018: increased from 2000 to reduce eviction under burst
 
         self._last_event_at_str = ""
         self._last_event_id = ""
@@ -558,23 +616,33 @@ class DeviceWorker(threading.Thread):
             if st:
                 self._last_event_at_str = _safe_str(st.last_event_at, "")
                 self._last_event_id = _safe_str(st.last_event_id, "")
-                self._last_event_epoch = _parse_event_time_to_epoch(self._last_event_at_str)
+                self._last_event_epoch = _parse_event_time_to_epoch(
+                    self._last_event_at_str, tz_offset_sec=self._device_tz_offset_sec
+                )
                 if self._last_event_id:
                     self._seen.append(self._last_event_id)
+                # F-016: Pre-populate seen deque with recent event IDs to prevent replay after restart
+                try:
+                    from app.core.db import get_recent_access_history
+                    recent_rows = get_recent_access_history(limit=200)
+                    for row in recent_rows:
+                        eid = _safe_str(getattr(row, "event_id", ""), "")
+                        if eid and eid not in self._seen:
+                            self._seen.append(eid)
+                except Exception:
+                    pass
         except Exception:
             pass
 
         self._polls = 0
         self._events = 0
         self._reconnects = 0
+        self._dropped_events = 0
+        self._events_since_flush = 0
 
         # EMA tracking for performance
         self._poll_ema = EMA(alpha=0.2)
         self._cmd_ema = EMA(alpha=0.2)
-
-        # Exponential backoff tracking (connect)
-        self._reconnect_backoff = 0.25
-        self._max_reconnect_backoff = 30.0
 
         # Adaptive empty sleep
         self._empty_sleep_ms = 0.0
@@ -605,6 +673,7 @@ class DeviceWorker(threading.Thread):
             reconnects=int(self._reconnects),
             poll_ema=float(self._poll_ema.value if self._poll_ema.ready else 0.0),
             cmd_ema=float(self._cmd_ema.value if self._cmd_ema.ready else 0.0),
+            dropped_events=int(self._dropped_events),
         )
         try:
             self.status_cb(st)
@@ -623,7 +692,7 @@ class DeviceWorker(threading.Thread):
         if self._last_event_id and event_id == self._last_event_id:
             return True
 
-        epoch = _parse_event_time_to_epoch(event_time_str)
+        epoch = _parse_event_time_to_epoch(event_time_str, tz_offset_sec=self._device_tz_offset_sec)
         if epoch is None or self._last_event_epoch is None:
             return False
 
@@ -632,11 +701,11 @@ class DeviceWorker(threading.Thread):
 
         return False
 
-    def _maybe_flush_state(self) -> None:
+    def _maybe_flush_state(self, force: bool = False) -> None:
         if not self._state_dirty:
             return
         now_s = time.time()
-        if (now_s - self._last_state_flush_s) < 1.0:
+        if not force and (now_s - self._last_state_flush_s) < 1.0:
             return
         self._last_state_flush_s = now_s
         try:
@@ -666,7 +735,7 @@ class DeviceWorker(threading.Thread):
             return CommandResult(ok=False, error=str(e), cmd_ms=cmd_ms)
 
     def run(self) -> None:
-        reconnect_count = 0
+        reconnect_attempt = 0
         last_error = ""
 
         while not self.stop_event.is_set():
@@ -698,23 +767,50 @@ class DeviceWorker(threading.Thread):
                     ok = False
 
                 if not ok:
-                    reconnect_count += 1
+                    reconnect_attempt += 1
                     self._reconnects += 1
                     last_error = "connect failed"
                     self._emit_status(enabled=True, connected=False, last_error=last_error)
 
-                    backoff = min(self._max_reconnect_backoff, self._reconnect_backoff * (2 ** reconnect_count))
+                    backoff = min(_RECONNECT_BACKOFF_MAX_SEC, _RECONNECT_BACKOFF_BASE_SEC * (2 ** reconnect_attempt))
                     time.sleep(backoff)
                     continue
 
-                reconnect_count = 0
-                self._reconnect_backoff = 0.25
+                reconnect_attempt = 0
                 last_error = ""
                 self._emit_status(enabled=True, connected=True, last_error="")
 
             poll_t0 = _now_ms()
             try:
-                rows = self._device.poll_rtlog_once()
+                # F-021: Watchdog for blocking SDK calls — join with timeout to detect hangs
+                _poll_timeout_sec = 15.0
+                _result_holder: list = []
+                _exc_holder: list = []
+
+                def _poll_fn():
+                    try:
+                        _result_holder.append(self._device.poll_rtlog_once())
+                    except Exception as _e:
+                        _exc_holder.append(_e)
+
+                _poll_thread = threading.Thread(target=_poll_fn, daemon=True)
+                _poll_thread.start()
+                _poll_thread.join(timeout=_poll_timeout_sec)
+
+                if _poll_thread.is_alive():
+                    self.logger.warning(
+                        f"[RT][device={self.device_id}] poll_rtlog_once blocked >{_poll_timeout_sec}s — forcing reconnect"
+                    )
+                    try:
+                        self._device.disconnect()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"poll_rtlog_once watchdog timeout after {_poll_timeout_sec}s")
+
+                if _exc_holder:
+                    raise _exc_holder[0]
+
+                rows = _result_holder[0] if _result_holder else []
                 poll_ms = _now_ms() - poll_t0
                 self._polls += 1
                 self._poll_ema.add(poll_ms)
@@ -778,9 +874,10 @@ class DeviceWorker(threading.Thread):
                         if not event_id:
                             continue
 
-                        if access_history_exists(event_id):
-                            continue
-
+                        # F-028: access_history_exists check moved to DecisionService to reduce
+                        # SQLite read contention in the hot polling path. _replay_seen handles
+                        # in-session deduplication; cross-restart deduplication is handled by
+                        # DecisionService and the access_history UNIQUE constraint.
                         if self._replay_seen(event_id):
                             continue
 
@@ -801,15 +898,26 @@ class DeviceWorker(threading.Thread):
 
                         try:
                             self.event_queue.put(ev, timeout=0.05)
+                        except queue.Full:
+                            self._dropped_events += 1
+                            if self._dropped_events == 1 or self._dropped_events % 100 == 0:
+                                self.logger.warning(
+                                    f"[RT][device={self.device_id}] Event queue full — "
+                                    f"dropping event {event_id} (total_dropped={self._dropped_events})"
+                                )
                         except Exception:
                             pass
 
                         self._last_event_id = event_id
                         self._last_event_at_str = event_time_str or self._last_event_at_str
-                        ep = _parse_event_time_to_epoch(event_time_str)
+                        ep = _parse_event_time_to_epoch(event_time_str, tz_offset_sec=self._device_tz_offset_sec)
                         if ep is not None:
                             self._last_event_epoch = ep
                         self._state_dirty = True
+                        self._events_since_flush += 1
+                        if self._events_since_flush >= 10:
+                            self._maybe_flush_state(force=True)
+                            self._events_since_flush = 0
 
                         self._events += 1
                         self._emit_status(
@@ -825,8 +933,9 @@ class DeviceWorker(threading.Thread):
                 self._maybe_flush_state()
 
                 # optional busy sleep to avoid tight looping
-                if adaptive_sleep and busy_max > 0:
-                    sleep_ms = max(0.0, min(busy_max, max(busy_min, busy_min)))
+                if adaptive_sleep and (busy_min > 0 or busy_max > 0):
+                    # Sleep between busy_min and busy_max ms, using poll latency as reference.
+                    sleep_ms = max(float(busy_min), min(float(busy_max), float(poll_ms)))
                     if sleep_ms > 0:
                         self.wake_event.wait(timeout=max(0.0, sleep_ms / 1000.0))
                         self.wake_event.clear()
@@ -903,6 +1012,8 @@ class DecisionService(threading.Thread):
         self,
     ) -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
         ttl = float(getattr(self, "_cache_ttl_sec", 2.0))
+        if ttl < 0.5:
+            ttl = 0.5  # F-012: minimum 0.5s to prevent DB read storms at TTL=0
         now_s = time.time()
 
         def add_card(idx: Dict[str, List[Dict[str, Any]]], v: Any, u: Dict[str, Any]) -> None:
@@ -1087,13 +1198,12 @@ class DecisionService(threading.Thread):
         raw = (scanned or "").strip()
 
         if not totp_enabled:
-            return {
-                "allowed": True,
-                "reason": "ALLOW_BYPASS_TOTP_DISABLED",
-                "scanMode": "BYPASS",
-                "tookMs": (time.perf_counter() - t0) * 1000.0,
-                "user": None,
-            }
+            # TOTP disabled means "use RFID only" — not "allow everyone"
+            vr = self._verify_card(scanned=scanned, settings=settings, users_by_card=users_by_card)
+            if vr.get("allowed"):
+                vr["scanMode"] = "RFID_ONLY"
+            vr["tookMs"] = (time.perf_counter() - t0) * 1000.0
+            return vr
 
         if (not raw) or (not raw.isdigit()):
             return {
@@ -1153,8 +1263,12 @@ class DecisionService(threading.Thread):
                                 "grants": list(grants),
                             }
                         )
+                        break  # F-022: one match per credential is sufficient; skip remaining counters
                 except Exception:
                     continue
+            # F-022: if we already have a collision (2+ distinct cred IDs), we can short-circuit
+            if len(set(h["credId"] for h in hits)) > 1:
+                break
 
         if hits:
             uniq_creds = sorted(set(h["credId"] for h in hits))
@@ -1258,6 +1372,11 @@ class DecisionService(threading.Thread):
             except queue.Empty:
                 continue
 
+            # F-028: Check history deduplication here (single thread) rather than in DeviceWorker
+            # (one per device) to reduce SQLite read contention under burst conditions.
+            if access_history_exists(ev.event_id):
+                continue
+
             settings = self.settings_provider(ev.device_id)
             t0 = _now_ms()
 
@@ -1281,55 +1400,45 @@ class DecisionService(threading.Thread):
             decision_ms = _now_ms() - t0
             self.decision_ema.add(decision_ms)
 
-            cmd_res = CommandResult(ok=True, error="", cmd_ms=0.0)
-            if action == "OPEN_DOOR":
-                cmd_timeout_ms = _safe_int(settings.get("cmd_timeout_ms"), 4000)
-                cmd_res = self.command_bus.open_door(
-                    device_id=ev.device_id,
-                    door_id=int(door_id),
-                    pulse_time_ms=int(pulse_time_ms),
-                    timeout_ms=int(cmd_timeout_ms),
-                )
-
+            # F-013: INSERT OR IGNORE into access_history BEFORE opening door.
+            # rowcount==1 means this worker claimed the event; rowcount==0 means another worker already inserted it.
+            # This prevents TOCTOU double door-open: the INSERT is atomic on the UNIQUE(event_id) constraint.
+            _history_claimed = 0
             if bool(settings.get("save_history", True)):
                 try:
-                    raw = dict(ev.raw)
-                    raw["decision"] = {
-                        "allowed": allowed,
-                        "reason": reason,
-                        "scanMode": scan_mode,
-                        "commandDoorId": int(door_id),
-                        "pulseTimeMs": int(pulse_time_ms),
-                        "accountId": vr.get("accountId"),
-                        "credId": vr.get("credId"),
-                        "matchedCounter": vr.get("matchedCounter"),
-                        "ageSeconds": vr.get("ageSeconds"),
-                        "activeMembershipId": vr.get("activeMembershipId"),
-                        "tookMs": vr.get("tookMs"),
-                        "user": vr.get("user"),
-                    }
-
-                    self.history_q.put(
-                        HistoryRecord(
-                            event_id=ev.event_id,
-                            device_id=ev.device_id,
-                            door_id=int(door_id) if door_id is not None else None,
-                            card_no=ev.card_no,
-                            event_time=ev.event_time,
-                            event_type=ev.event_type,
-                            allowed=allowed,
-                            reason=reason,
-                            poll_ms=float(ev.poll_ms),
-                            decision_ms=float(decision_ms),
-                            cmd_ms=float(cmd_res.cmd_ms),
-                            cmd_ok=bool(cmd_res.ok),
-                            cmd_error=str(cmd_res.error or ""),
-                            raw=raw,
-                        ),
-                        timeout=0.05,
+                    _history_claimed = insert_access_history(
+                        event_id=ev.event_id,
+                        device_id=ev.device_id,
+                        door_id=int(door_id) if door_id is not None else None,
+                        card_no=ev.card_no,
+                        event_time=ev.event_time,
+                        event_type=ev.event_type,
+                        allowed=allowed,
+                        reason=reason,
+                        poll_ms=float(ev.poll_ms),
+                        decision_ms=float(decision_ms),
+                        cmd_ms=0.0,
+                        cmd_ok=None,
+                        cmd_error=None,
+                        raw=dict(ev.raw),
                     )
                 except Exception:
-                    pass
+                    _history_claimed = 1  # if history insert fails, still proceed (fail-open for door)
+
+            cmd_res = CommandResult(ok=True, error="", cmd_ms=0.0)
+            if action == "OPEN_DOOR":
+                # F-013: only open door if we claimed the event (rowcount>0); skip if another worker already processed it
+                if _history_claimed > 0 or not bool(settings.get("save_history", True)):
+                    cmd_timeout_ms = _safe_int(settings.get("cmd_timeout_ms"), 4000)
+                    cmd_res = self.command_bus.open_door(
+                        device_id=ev.device_id,
+                        door_id=int(door_id),
+                        pulse_time_ms=int(pulse_time_ms),
+                        timeout_ms=int(cmd_timeout_ms),
+                    )
+                else:
+                    # Already processed by another worker — skip notification too
+                    continue
 
             # Per-device notifications (backend controlled)
             if not bool(settings.get("show_notifications", True)):
@@ -1491,7 +1600,16 @@ class NotificationService(threading.Thread):
 
                 icon_path = ""
                 if r.image_path:
-                    icon_path = self._img_cache.resolve(r.image_path)
+                    # F-024: Try to get from cache without downloading (non-blocking)
+                    icon_path = self._img_cache.get_cached(r.image_path)
+                    if not icon_path:
+                        # Not in cache — show notification without image, download in background
+                        def _bg_download(url):
+                            try:
+                                self._img_cache.resolve(url)
+                            except Exception:
+                                pass
+                        threading.Thread(target=_bg_download, args=(r.image_path,), daemon=True).start()
 
                 # respect per-device popupShowImage only for popups; Windows toast can still show icon
                 n = Notification(app_id="MonClub Access", title=r.title, msg=r.message, icon=icon_path or "")
@@ -1544,7 +1662,7 @@ class HistoryService(threading.Thread):
                     raw=r.raw,
                 )
             except Exception as e:
-                self.logger.debug(f"[RT][history write failed] {e}")
+                self.logger.warning(f"[RT][history write failed] {e}")
 
             self._writes += 1
             if self._writes % 200 == 0:
@@ -1653,8 +1771,9 @@ class AgentRealtimeEngine:
         Source of truth: sync_access_software_settings (SQLite).
         """
         now_s = time.time()
-        if (now_s - float(self._global_cache_at)) < float(self._global_cache_ttl_sec) and self._global_cache:
-            return dict(self._global_cache)
+        with self._lock:
+            if (now_s - float(self._global_cache_at)) < float(self._global_cache_ttl_sec) and self._global_cache:
+                return dict(self._global_cache)
 
         try:
             gs = _get_backend_global_settings() or {}
@@ -1663,8 +1782,9 @@ class AgentRealtimeEngine:
         except Exception:
             gs = {}
 
-        self._global_cache = gs
-        self._global_cache_at = now_s
+        with self._lock:
+            self._global_cache = gs
+            self._global_cache_at = now_s
         return dict(gs)
 
     def _device_settings(self, device_id: int) -> Dict[str, Any]:
@@ -1722,6 +1842,7 @@ class AgentRealtimeEngine:
                     "reconnects": st.reconnects,
                     "pollEma": st.poll_ema,
                     "cmdEma": st.cmd_ema,
+                    "droppedEvents": st.dropped_events,
                 }
             return snap
 
@@ -1955,29 +2076,14 @@ class AgentRealtimeEngine:
 
     def set_device_enabled(self, device_id: int, enabled: bool) -> None:
         """
-        This still exists for UI toggles, but the source of truth is backend 'active' + 'accessDataMode'.
-        - If enabled=True: we just refresh devices (if backend says it should run, it will).
-        - If enabled=False: we stop local worker (temporary), but next refresh will recreate it unless backend changes.
+        DEPRECATED — Device enable/disable is controlled by the backend
+        (GymDeviceDto.active + GymDeviceDto.accessDataMode).
+        Local overrides are not persistent and will be reversed on the next
+        refresh_devices() call. Use the backend dashboard to enable/disable devices.
+        Calling this method has no effect.
         """
-        did = int(device_id)
-        if enabled:
-            self.refresh_devices()
-            return
-
-        w = self._get_worker(did)
-        if w:
-            try:
-                w.stop()
-            except Exception:
-                pass
-            with self._lock:
-                self._workers.pop(did, None)
-            self._status_update(
-                DeviceStatus(
-                    device_id=did,
-                    name=getattr(w, "device_name", f"device-{did}"),
-                    enabled=False,
-                    connected=False,
-                    last_error="disabled_locally",
-                )
-            )
+        self.logger.warning(
+            f"[RT] set_device_enabled(device_id={device_id}, enabled={enabled}) called "
+            f"but has no effect — device state is controlled by backend settings. "
+            f"Use refresh_devices() to sync latest backend state."
+        )

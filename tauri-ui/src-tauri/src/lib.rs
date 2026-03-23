@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 // ─── Types for devices/presets from Python API ───
@@ -43,9 +43,25 @@ struct PresetsResponse {
     presets: Vec<DoorPreset>,
 }
 
+// ─── Types for TV screen bindings ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TvScreenInfo {
+    id: i64,
+    screen_label: String,
+    #[serde(default)]
+    monitor_label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TvBindingsResponse {
+    rows: Vec<TvScreenInfo>,
+}
+
 // ─── State ───
 
 struct ApiPort(Mutex<u16>);
+struct KeepBackgroundOnClose(Mutex<bool>);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +157,15 @@ fn post_app_quit(port: u16) {
         .send();
 }
 
+fn fetch_tv_bindings(port: u16) -> Vec<TvScreenInfo> {
+    let url = format!("{}/tv/host/bindings", api_base(port));
+    reqwest::blocking::get(&url)
+        .ok()
+        .and_then(|r| r.json::<TvBindingsResponse>().ok())
+        .map(|r| r.rows)
+        .unwrap_or_default()
+}
+
 fn post_tv_app_quit(port: u16) {
     let url = format!("{}/tv/app/quit", api_base(port));
     let _ = reqwest::blocking::Client::new()
@@ -169,8 +194,74 @@ fn get_desktop_runtime_context(state: tauri::State<'_, ApiPort>) -> DesktopRunti
         role: role.clone(),
         api_port,
         product_name: desktop_product_name(&role).into(),
-        tray_enabled: role == "access",
+        tray_enabled: role == "access" || role == "tv",
     }
+}
+
+#[tauri::command]
+fn set_keep_background_on_close(state: tauri::State<'_, KeepBackgroundOnClose>, enabled: bool) {
+    if let Ok(mut flag) = state.0.lock() {
+        *flag = enabled;
+    }
+}
+
+fn rebuild_tv_tray_menu(
+    app: &AppHandle,
+    bindings: &[TvScreenInfo],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
+
+    let mut msg_sub = SubmenuBuilder::with_id(app, "tray_tv_send_msg", "Envoyer un message");
+
+    if bindings.is_empty() {
+        let no_screen = MenuItemBuilder::with_id("tray_tv_msg_none", "Aucun écran")
+            .enabled(false)
+            .build(app)?;
+        msg_sub = msg_sub.item(&no_screen);
+    } else {
+        for screen in bindings {
+            let label = if !screen.screen_label.is_empty() {
+                screen.screen_label.clone()
+            } else if !screen.monitor_label.is_empty() {
+                screen.monitor_label.clone()
+            } else {
+                format!("Écran #{}", screen.id)
+            };
+            let item_id = format!("tray_tv_msg_{}", screen.id);
+            let item = MenuItemBuilder::with_id(item_id, &label).build(app)?;
+            msg_sub = msg_sub.item(&item);
+        }
+    }
+
+    let msg_menu = msg_sub.build()?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&msg_menu)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    if let Some(tray) = app.tray_by_id("main_tray") {
+        let _ = tray.set_menu(Some(menu));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn refresh_tv_tray_menu(app: AppHandle, state: tauri::State<'_, ApiPort>) -> Result<(), String> {
+    if desktop_role() != "tv" {
+        return Ok(());
+    }
+    let port = *state.0.lock().unwrap();
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        let bindings = fetch_tv_bindings(port);
+        let _ = rebuild_tv_tray_menu(&app_clone, &bindings);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -277,7 +368,15 @@ fn rebuild_tray_menu(
 
 // ─── Setup tray on app start ───
 
-fn setup_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
@@ -316,31 +415,21 @@ fn setup_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::
                 .unwrap_or(8788);
 
             match id {
-                "tray_show" => {
-                    // Show & focus main window
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.show();
-                        let _ = win.unminimize();
-                        let _ = win.set_focus();
-                    }
-                }
+                "tray_show" => show_main_window(&app),
                 "tray_sync" => {
                     let p = port;
                     std::thread::spawn(move || post_sync_now(p));
                 }
                 "tray_quit" => {
-                    // Send quit to Python backend then exit Tauri
                     let p = port;
                     let app_clone = app.clone();
                     std::thread::spawn(move || {
                         post_app_quit(p);
-                        // Small delay to let Python shutdown gracefully
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         app_clone.exit(0);
                     });
                 }
                 _ if id.starts_with("tray_open_") => {
-                    // Parse: tray_open_{deviceId}_{doorNumber}_{pulseSeconds}
                     let parts: Vec<&str> = id.strip_prefix("tray_open_").unwrap_or("").splitn(3, '_').collect();
                     if parts.len() == 3 {
                         if let (Ok(dev_id), Ok(door_num), Ok(pulse)) = (
@@ -358,16 +447,104 @@ fn setup_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::
         })
         .on_tray_icon_event(move |tray, event| {
             if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
-                if let Some(win) = tray.app_handle().get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.unminimize();
-                    let _ = win.set_focus();
-                }
+                show_main_window(&tray.app_handle());
             }
         })
         .build(&app_handle)?;
 
     Ok(())
+}
+
+fn setup_tv_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let icon = desktop_window_icon("tv")?;
+
+    let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
+
+    // Start with a placeholder submenu; refreshed by the frontend after boot
+    let msg_placeholder = MenuItemBuilder::with_id("tray_tv_msg_none", "Chargement…")
+        .enabled(false)
+        .build(app)?;
+    let msg_menu = SubmenuBuilder::with_id(app, "tray_tv_send_msg", "Envoyer un message")
+        .item(&msg_placeholder)
+        .build()?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&msg_menu)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let app_handle = app.clone();
+
+    TrayIconBuilder::with_id("main_tray")
+        .icon(icon)
+        .tooltip(tooltip)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app, event| {
+            let id = event.id().as_ref();
+            let port = app
+                .state::<ApiPort>()
+                .0
+                .lock()
+                .map(|p| *p)
+                .unwrap_or(8789);
+
+            if let Some(binding_id_str) = id.strip_prefix("tray_tv_msg_") {
+                if let Ok(binding_id) = binding_id_str.parse::<i64>() {
+                    let win_label = format!("tv-send-msg-{}", binding_id);
+                    if let Some(existing) = app.get_webview_window(&win_label) {
+                        let _ = existing.show();
+                        let _ = existing.set_focus();
+                    } else {
+                        let url = format!("/tv-send-message?bindingId={}", binding_id);
+                        let _ = tauri::WebviewWindowBuilder::new(
+                            app,
+                            &win_label,
+                            tauri::WebviewUrl::App(url.into()),
+                        )
+                        .title("Envoyer un message")
+                        .inner_size(460.0, 540.0)
+                        .resizable(false)
+                        .center()
+                        .build();
+                    }
+                }
+                return;
+            }
+
+            match id {
+                "tray_show" => show_main_window(&app),
+                "tray_quit" => {
+                    let p = port;
+                    let app_clone = app.clone();
+                    std::thread::spawn(move || {
+                        post_tv_app_quit(p);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        app_clone.exit(0);
+                    });
+                }
+                _ => {}
+            }
+        })
+        .on_tray_icon_event(move |tray, event| {
+            if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
+                show_main_window(&tray.app_handle());
+            }
+        })
+        .build(&app_handle)?;
+
+    Ok(())
+}
+
+fn setup_tray(app: &AppHandle, role: &str, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if role == "tv" {
+        setup_tv_tray(app, tooltip)
+    } else {
+        setup_access_tray(app, tooltip)
+    }
 }
 
 // ─── Main entry point ───
@@ -382,10 +559,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(ApiPort(Mutex::new(initial_api_port)))
+        .manage(KeepBackgroundOnClose(Mutex::new(true)))
         .invoke_handler(tauri::generate_handler![
             set_api_port,
             get_desktop_runtime_context,
-            refresh_tray_menu
+            refresh_tray_menu,
+            refresh_tv_tray_menu,
+            set_keep_background_on_close
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -394,10 +574,8 @@ pub fn run() {
                     let _ = window.set_icon(icon);
                 }
             }
-            if setup_role == "access" {
-                let handle = app.handle().clone();
-                setup_tray(&handle, desktop_product_name(&setup_role))?;
-            }
+            let handle = app.handle().clone();
+            setup_tray(&handle, &setup_role, desktop_product_name(&setup_role))?;
             Ok(())
         })
         .on_window_event(move |window, event| {
@@ -407,20 +585,32 @@ pub fn run() {
                         api.prevent_close();
                         let _ = window.hide();
                     } else {
-                        api.prevent_close();
-                        let port = window
+                        let keep_background = window
                             .app_handle()
-                            .state::<ApiPort>()
+                            .state::<KeepBackgroundOnClose>()
                             .0
                             .lock()
-                            .map(|p| *p)
-                            .unwrap_or(8789);
-                        let app_handle = window.app_handle().clone();
-                        std::thread::spawn(move || {
-                            post_tv_app_quit(port);
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                            app_handle.exit(0);
-                        });
+                            .map(|flag| *flag)
+                            .unwrap_or(true);
+                        if keep_background {
+                            api.prevent_close();
+                            let _ = window.hide();
+                        } else {
+                            api.prevent_close();
+                            let port = window
+                                .app_handle()
+                                .state::<ApiPort>()
+                                .0
+                                .lock()
+                                .map(|p| *p)
+                                .unwrap_or(8789);
+                            let app_handle = window.app_handle().clone();
+                            std::thread::spawn(move || {
+                                post_tv_app_quit(port);
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                app_handle.exit(0);
+                            });
+                        }
                     }
                 }
             }

@@ -1,7 +1,12 @@
 // Fetch wrapper for localhost Python API - all endpoints under /api/v2/
 
-let _baseUrl = "http://127.0.0.1:8788";
-const PFX = "/api/v2";
+import {
+  LOCAL_API_BASE_URL_ACCESS,
+  LOCAL_API_PREFIX,
+} from "@/config/appConst";
+
+let _baseUrl = LOCAL_API_BASE_URL_ACCESS;
+const PFX = LOCAL_API_PREFIX;
 
 let _token: string | null = null;
 export const setAuthToken = (t: string) => { _token = t; };
@@ -28,8 +33,9 @@ export class ApiError extends Error {
   }
 }
 
-function hdrs(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json", Accept: "application/json" };
+function hdrs(includeJsonBody = false): Record<string, string> {
+  const h: Record<string, string> = { Accept: "application/json" };
+  if (includeJsonBody) h["Content-Type"] = "application/json";
   if (_token) h["X-Local-Token"] = _token;
   return h;
 }
@@ -46,24 +52,24 @@ async function parse<T>(res: Response): Promise<T> {
 export async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
   let url = `${_baseUrl}${PFX}${path}`;
   if (params) { const q = new URLSearchParams(params).toString(); if (q) url += `?${q}`; }
-  return parse<T>(await fetch(url, { headers: hdrs() }));
+  return parse<T>(await fetch(url, { headers: hdrs(false) }));
 }
 
 export async function post<T>(path: string, body?: unknown): Promise<T> {
   return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
-    method: "POST", headers: hdrs(),
+    method: "POST", headers: hdrs(true),
     body: body != null ? JSON.stringify(body) : undefined,
   }));
 }
 
 export async function patch<T>(path: string, body: unknown): Promise<T> {
   return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
-    method: "PATCH", headers: hdrs(), body: JSON.stringify(body),
+    method: "PATCH", headers: hdrs(true), body: JSON.stringify(body),
   }));
 }
 
 export async function del<T>(path: string): Promise<T> {
-  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, { method: "DELETE", headers: hdrs() }));
+  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, { method: "DELETE", headers: hdrs(false) }));
 }
 
 // SSE helper

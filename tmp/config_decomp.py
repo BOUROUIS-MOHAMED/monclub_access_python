@@ -1,7 +1,0 @@
-﻿"""Temporary decompiler artifact placeholder.
-
-The previous file at this path was a UTF-16 uncompyle6 output stub, not executable
-project source. It broke repository-wide Python compile checks because it contained
-null bytes. Keeping a harmless UTF-8 module here preserves the path without
-introducing syntax or encoding failures.
-"""

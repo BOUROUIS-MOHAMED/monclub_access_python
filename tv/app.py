@@ -6,9 +6,11 @@ import os
 import queue
 import threading
 import time
+import sys
 from typing import Any, Dict
 
 from shared.api.monclub_api import MonClubApi
+from shared.log_buffer import LogBuffer
 from shared.logging import setup_logging
 from shared.runtime_support import add_windows_dll_search_paths, ensure_dirs
 from shared.tauri_launcher import kill_tauri_ui, launch_tauri_ui
@@ -45,6 +47,7 @@ class TvApp:
         ensure_tv_local_schema()
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.page_logs = LogBuffer(max_lines=5000)
         self.cfg = load_tv_app_config()
         self.logger = setup_logging(getattr(self.cfg, "log_level", "DEBUG"), self.log_queue)
         self.logger.info("TV app started.")
@@ -78,6 +81,8 @@ class TvApp:
         self._update_manager = TvUpdateManager(app=self, cfg=self.cfg, logger=self.logger, api_factory=self._api)
         self._update_status: UpdateStatus | None = None
 
+        self.after(200, self._poll_logs)
+        self._sync_startup_registration()
         schedule_tv_shell_startup(self)
 
     def after(self, delay_ms: int, callback) -> int:
@@ -166,8 +171,65 @@ class TvApp:
         except Exception:
             pass
 
+    def _poll_logs(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                try:
+                    level = "INFO"
+                    line = msg
+                    if " | " in msg:
+                        parts = msg.split(" | ", 2)
+                        if len(parts) >= 2:
+                            level = parts[1].strip()
+                            line = parts[2] if len(parts) > 2 else parts[1]
+                    self.page_logs.append_log(level, line)
+                except Exception:
+                    self.page_logs.append_log("INFO", str(msg))
+        except Exception:
+            pass
+        self.after(200, self._poll_logs)
+
+    def _build_startup_command(self) -> str | None:
+        try:
+            if getattr(sys, "frozen", False):
+                return f'"{Path(sys.executable)}"'
+            return None
+        except Exception:
+            return None
+
+    def _sync_startup_registration(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            import winreg  # type: ignore
+        except Exception:
+            return
+
+        enabled = bool(getattr(self.cfg, "start_on_system_startup", False))
+        command = self._build_startup_command()
+        run_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        value_name = "MonClubTV"
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key_path, 0, winreg.KEY_SET_VALUE) as key:
+                if enabled and command:
+                    winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
+                    self.logger.info("TV startup registration enabled.")
+                else:
+                    try:
+                        winreg.DeleteValue(key, value_name)
+                        self.logger.info("TV startup registration removed.")
+                    except FileNotFoundError:
+                        pass
+                    if enabled and not command:
+                        self.logger.info("TV startup registration skipped because the app is not running from a packaged executable.")
+        except Exception:
+            self.logger.exception("Failed to synchronize TV startup registration")
+
     def persist_config(self) -> None:
         save_tv_app_config(self.cfg)
+        self._sync_startup_registration()
         self.logger.info("TV config saved to tv/config.json.")
 
     def restart_local_api_server(self) -> None:

@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+
+def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """Return True if *port* is already bound on *host*."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        try:
+            s.connect((host, port))
+            return True
+        except (ConnectionRefusedError, OSError):
+            return False
 
 from shared.runtime_support import runtime_base_dir
 
@@ -67,16 +79,35 @@ def launch_tauri_ui(
 
     if is_dev and (tauri_dir / "package.json").exists():
         npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
-        try:
-            proc = subprocess.Popen(
-                [npm_cmd, "run", "tauri", "dev"],
-                cwd=str(tauri_dir),
-                env=env,
-            )
-            logger.info("[Tauri:%s] Launched 'npm run tauri dev' (pid=%s)", role, proc.pid)
-            return proc
-        except Exception as exc:
-            logger.warning("[Tauri:%s] Failed to launch npm tauri dev: %s", role, exc)
+        vite_port = 1420
+        vite_already_running = _is_port_in_use(vite_port)
+        if vite_already_running:
+            # Vite dev server is already up (started by the other app instance).
+            # Run cargo directly to open a second Tauri window without trying to
+            # restart Vite on the same port (which would fail with strictPort).
+            cargo_cmd = "cargo.exe" if os.name == "nt" else "cargo"
+            src_tauri_dir = tauri_dir / "src-tauri"
+            try:
+                proc = subprocess.Popen(
+                    [cargo_cmd, "run", "--no-default-features", "--color", "always", "--"],
+                    cwd=str(src_tauri_dir),
+                    env=env,
+                )
+                logger.info("[Tauri:%s] Launched 'cargo run' (Vite already on :%d) (pid=%s)", role, vite_port, proc.pid)
+                return proc
+            except Exception as exc:
+                logger.warning("[Tauri:%s] Failed to launch cargo run: %s", role, exc)
+        else:
+            try:
+                proc = subprocess.Popen(
+                    [npm_cmd, "run", "tauri", "dev"],
+                    cwd=str(tauri_dir),
+                    env=env,
+                )
+                logger.info("[Tauri:%s] Launched 'npm run tauri dev' (pid=%s)", role, proc.pid)
+                return proc
+            except Exception as exc:
+                logger.warning("[Tauri:%s] Failed to launch npm tauri dev: %s", role, exc)
 
     built_candidates = []
     component_shell_dir = tauri_dir / "component-shells" / ("MonClubTV" if normalized_role == "tv" else "MonClubAccess")

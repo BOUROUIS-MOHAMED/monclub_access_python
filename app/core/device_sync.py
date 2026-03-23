@@ -1,9 +1,10 @@
 # monclub_access_python/app/core/device_sync.py
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Tuple
 
 from app.core.db import (
@@ -30,12 +31,13 @@ def _parse_dt_any(s: str) -> datetime | None:
     if s.endswith("Z"):
         s = s[:-1]
     try:
-        return datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
     except Exception:
         pass
     try:
         if len(s) == 10 and s[4] == "-" and s[7] == "-":
-            return datetime.fromisoformat(s + "T00:00:00")
+            return datetime.fromisoformat(s + "T00:00:00").replace(tzinfo=timezone.utc)
     except Exception:
         pass
     return None
@@ -253,7 +255,7 @@ class DeviceSyncEngine:
             door_ids = [int(default_door_id)]
         device["doorIds"] = door_ids  # keep for downstream use
 
-        now = datetime.now()
+        now = datetime.now(tz=timezone.utc)
         out: Dict[str, Dict[str, Any]] = {}
 
         for u in users or []:
@@ -287,6 +289,7 @@ class DeviceSyncEngine:
         user: Dict[str, Any],
         pin: str,
         local_fp_index: Dict[str, List[Any]],
+        fingerprint_enabled: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Priority:
@@ -296,6 +299,9 @@ class DeviceSyncEngine:
         Output items:
           { fingerId:int, templateVersion:int, templateData:str, templateSize:int }
         """
+        if not fingerprint_enabled:
+            return []
+
         out: List[Dict[str, Any]] = []
 
         fps = user.get("fingerprints")
@@ -486,7 +492,11 @@ class DeviceSyncEngine:
         except Exception as ex:
             self.logger.debug(f"[DeviceSync] Delete userauthorize Pin={pin} ignored: {ex}")
 
-        sdk.delete_device_data(table="user", data=cond, options="")
+        try:
+            sdk.delete_device_data(table="user", data=cond, options="")
+        except Exception as ex:
+            self.logger.warning(f"[DeviceSync] Delete user Pin={pin} ignored: {ex}")
+            return False
         return True
 
     def _delete_auth_and_templates_best_effort(self, *, sdk: PullSDK, pin: str) -> None:
@@ -577,6 +587,12 @@ class DeviceSyncEngine:
             self.logger.warning(f"[DeviceSync] Skip device id={dev_id} name={dev_name!r}: missing ipAddress")
             return
 
+        # F-013: Read fingerprint_enabled per device — controls whether fingerprint templates are pushed
+        fingerprint_enabled = _boolish(
+            device.get("fingerprintEnabled") or device.get("fingerprint_enabled"),
+            default=False,
+        )
+
         desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
         desired_pins = set(desired.keys())
 
@@ -593,7 +609,10 @@ class DeviceSyncEngine:
         templates_for_sync: Dict[str, List[Dict[str, Any]]] = {}
 
         for pin, u in desired.items():
-            templates = self._collect_templates_for_pin(user=u, pin=pin, local_fp_index=local_fp_index)
+            templates = self._collect_templates_for_pin(
+                user=u, pin=pin, local_fp_index=local_fp_index,
+                fingerprint_enabled=fingerprint_enabled,
+            )
             dh = self._compute_desired_hash(
                 pin=pin,
                 user=u,
@@ -612,12 +631,15 @@ class DeviceSyncEngine:
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
         try:
+            import time as _time
+            t_connect = _time.time()
             sdk.connect(
                 ip=ip,
                 port=int(port),
                 timeout_ms=int(getattr(self.cfg, "timeout_ms", 5000) or 5000),
                 password=str(pwd),
             )
+            self.logger.debug(f"[DeviceSync] Device id={dev_id} connect_ms={(_time.time()-t_connect)*1000:.0f}")
 
             rows = sdk.get_device_data_rows(
                 table="user",
@@ -631,6 +653,23 @@ class DeviceSyncEngine:
                 p = _pin_str(r.get("Pin") or r.get("pin") or "")
                 if p:
                     device_pins.add(p)
+
+            # F-011: Drift detection — desired pins missing from device despite having a stored hash
+            # indicate external removal. Force re-sync for those pins.
+            for pin in desired_pins:
+                if pin not in device_pins and prev_hashes.get(pin) and pin not in pins_to_sync:
+                    self.logger.info(
+                        f"[DeviceSync] Device id={dev_id} Pin={pin}: "
+                        f"not on device but hash stored — external removal detected, forcing re-sync"
+                    )
+                    pins_to_sync.add(pin)
+                    if pin not in templates_for_sync:
+                        u = desired.get(pin)
+                        if isinstance(u, dict):
+                            templates_for_sync[pin] = self._collect_templates_for_pin(
+                                user=u, pin=pin, local_fp_index=local_fp_index,
+                                fingerprint_enabled=fingerprint_enabled,
+                            )
 
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
             stale_pins = sorted([p for p in device_pins if p in known_server_pins and p not in desired_pins])
@@ -753,6 +792,7 @@ class DeviceSyncEngine:
 
         default_door_id = self._default_authorize_door_id()
 
+        device_mode_devices: List[Dict[str, Any]] = []
         for d in devices:
             if not _boolish(d.get("active"), default=True):
                 continue
@@ -766,9 +806,26 @@ class DeviceSyncEngine:
                 )
                 continue
 
-            try:
-                self._sync_one_device(device=d, users=users, local_fp_index=local_fp_index, default_door_id=default_door_id)
-            except PullSDKError as ex:
-                self.logger.warning(f"[DeviceSync] Device id={d.get('id')} sync failed (PullSDK): {ex}")
-            except Exception as ex:
-                self.logger.exception(f"[DeviceSync] Device id={d.get('id')} sync failed: {ex}")
+            device_mode_devices.append(d)
+
+        # F-008: Run device syncs in parallel (max_workers=4, safe bounded parallelism)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(
+                    self._sync_one_device,
+                    device=dev,
+                    users=users,
+                    local_fp_index=local_fp_index,
+                    default_door_id=default_door_id,
+                ): dev
+                for dev in device_mode_devices
+            }
+            for future in concurrent.futures.as_completed(futures):
+                dev = futures[future]
+                dev_id = dev.get("id")
+                try:
+                    future.result()
+                except PullSDKError as ex:
+                    self.logger.warning(f"[DeviceSync] device={dev_id} sync failed (PullSDK): {ex}")
+                except Exception as e:
+                    self.logger.error(f"[DeviceSync] device={dev_id} sync failed: {e}")

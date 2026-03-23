@@ -13,6 +13,8 @@ import AgentPage from "./pages/AgentPage";
 import LogsPage from "./pages/LogsPage";
 import ConfigPage from "./pages/ConfigPage";
 import LocalDbPage from "./pages/LocalDbPage";
+import ProfilePage from "./pages/ProfilePage";
+import UpdatePage from "./pages/UpdatePage";
 import RestrictedPage from "./pages/RestrictedPage";
 import PopupWindow from "./pages/PopupWindow";
 
@@ -61,7 +63,8 @@ function AppRoutes() {
         <Route path="logs" element={<LogsPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="local-db" element={<LocalDbPage />} />
-
+        <Route path="profile" element={<ProfilePage />} />
+        <Route path="update" element={<UpdatePage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

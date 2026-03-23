@@ -7,7 +7,12 @@ from typing import Tuple
 RouteSpec = Tuple[str, str, str]
 
 TV_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
+    ("POST", "/api/v2/tv/auth/login", "_handle_tv_auth_login"),
+    ("POST", "/api/v2/tv/auth/logout", "_handle_tv_auth_logout"),
+    ("GET", "/api/v2/tv/auth/status", "_handle_tv_auth_status"),
     ("POST", "/api/v2/tv/app/quit", "_handle_tv_app_quit"),
+    ("GET", "/api/v2/tv/logs/recent", "_handle_tv_logs_recent"),
+    ("GET", "/api/v2/tv/logs/stream", "_handle_tv_logs_stream_sse"),
     ("GET", "/api/v2/tv/config", "_handle_tv_config_get"),
     ("PATCH", "/api/v2/tv/config", "_handle_tv_config_patch"),
     ("POST", "/api/v2/tv/config/restart-local-api", "_handle_tv_config_restart_api"),
@@ -15,6 +20,8 @@ TV_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/tv/update/check", "_handle_tv_update_check"),
     ("POST", "/api/v2/tv/update/download", "_handle_tv_update_download"),
     ("POST", "/api/v2/tv/update/install", "_handle_tv_update_install"),
+    ("POST", "/api/v2/tv/update/cancel", "_handle_tv_update_cancel"),
+    ("GET", "/api/v2/tv/update/version", "_handle_tv_update_version_info"),
     ("GET", "/api/v2/tv/host/monitors", "_handle_tv_host_monitors_get"),
     ("POST", "/api/v2/tv/host/monitors/refresh", "_handle_tv_host_monitors_refresh"),
     ("GET", "/api/v2/tv/host/bindings", "_handle_tv_host_bindings_get"),
@@ -80,6 +87,8 @@ TV_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/tv/ad-proofs/process-outbox", "_handle_tv_ad_proofs_process_outbox"),
     ("POST", "/api/v2/tv/ad-proofs/{proofId}/retry", "_handle_tv_ad_proofs_retry"),
     ("POST", "/api/v2/tv/ad-proofs/startup-recover", "_handle_tv_ad_proofs_startup_recover"),
+    ("POST", "/api/v2/tv/screen-messages", "_handle_tv_screen_messages_post"),
+    ("GET", "/api/v2/tv/screen-messages", "_handle_tv_screen_messages_get"),
 )
 
 

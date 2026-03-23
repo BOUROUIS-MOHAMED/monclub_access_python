@@ -86,6 +86,15 @@ Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks
 [Run]
 Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClubAccess"; Flags: nowait postinstall skipifsilent
 
+[UninstallDelete]
+; Remove the install root including runtime-created folders like downloads/logs/current leftovers.
+Type: filesandordirs; Name: "{app}"
+; Remove persisted data roots so a fresh reinstall starts cleanly.
+Type: filesandordirs; Name: "{commonappdata}\MonClub Access"
+Type: filesandordirs; Name: "{localappdata}\MonClub Access"
+Type: filesandordirs; Name: "{userappdata}\MonClub Access"
+Type: filesandordirs; Name: "{userappdata}\MonClubAccess"
+
 [Code]
 const
   WebView2ClientId = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
@@ -337,4 +346,13 @@ begin
   DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClub Access'));
   DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClub Access'));
   DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClubAccess'));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    KillRunningMonClubProcesses();
+    Sleep(900);
+  end;
 end;

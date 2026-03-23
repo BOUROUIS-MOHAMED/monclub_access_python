@@ -23,8 +23,9 @@ export interface SessionBlock {
 }
 
 export interface ModeBlock {
-  globalMode: "DEVICE_ONLY" | "AGENT_ONLY" | "MIXED";
-  summary: { DEVICE: number; AGENT: number; UNKNOWN: number };
+  DEVICE: number;
+  AGENT: number;
+  UNKNOWN: number;
 }
 
 export interface SyncBlock {
@@ -53,7 +54,16 @@ export interface UpdatesBlock {
   downloaded: boolean;
   downloading: boolean;
   progress: number | null;
+  progressPercent?: number | null;
+  currentVersion?: string | null;
+  currentCodename?: string | null;
   currentReleaseId: string | null;
+  latestVersion?: string | null;
+  latestCodename?: string | null;
+  releaseDate?: string | null;
+  availableUntil?: string | null;
+  sizeBytes?: number | null;
+  releaseNotes?: string | null;
   lastCheckAt: number | null;
   lastError: string | null;
   componentId?: string | null;
@@ -99,17 +109,15 @@ export interface AppConfig {
   plcomm_dll_path: string;
   zkfp_dll_path: string;
   log_level: string;
-  api_login_url: string;
-  api_sync_url: string;
-  api_create_user_fingerprint_url: string;
-  api_latest_release_url: string;
   update_enabled: boolean;
   update_check_interval_sec: number;
   update_auto_download_zip: boolean;
   tray_enabled: boolean;
   minimize_to_tray_on_close: boolean;
   start_minimized_to_tray: boolean;
+  start_on_system_startup: boolean;
   login_email: string;
+  autostart_bindings_enabled?: boolean;
   [key: string]: unknown;
 }
 
@@ -279,7 +287,22 @@ export interface UpdateStatusResponse {
   downloaded: boolean;
   downloading: boolean;
   progressPercent: number | null;
-  currentReleaseId: string | null;
+
+  // Current version info (new semver system)
+  currentVersion: string | null;       // "1.0.0"
+  currentCodename: string | null;      // "Panda"
+  currentReleaseId: string | null;     // legacy "20260321-020139Z"
+
+  // Latest available version info
+  latestVersion: string | null;        // "1.2.0"
+  latestCodename: string | null;       // "KitKat"
+  releaseDate: string | null;          // ISO date string
+  availableUntil: string | null;       // ISO date string
+  sizeBytes: number | null;
+  releaseNotes: string | null;         // HTML string
+  downloadUrl: string | null;
+  minCompatibleVersion: string | null;
+
   lastCheckAt: number | null;
   lastError: string | null;
   componentId?: string | null;
@@ -292,14 +315,28 @@ export interface UpdateStatusResponse {
   updateEnabled?: boolean;
   channel?: string | null;
   platform?: string | null;
+
+  // Legacy block (backward compat)
   latestRelease?: {
     releaseId?: string;
     publishDate?: string;
     channel?: string;
     platform?: string;
     version?: string;
+    codename?: string;
     notes?: string;
+    availableUntil?: string;
+    minCompatibleVersion?: string;
   } | null;
+}
+
+export interface UpdateVersionInfoResponse {
+  ok: boolean;
+  currentVersion: string;
+  currentCodename: string;
+  currentReleaseId: string;
+  componentId?: string | null;
+  componentDisplayName?: string | null;
 }
 
 // ─── H) Logs ───
@@ -379,6 +416,7 @@ export interface TvPlayerRenderContext {
   ok: boolean;
   bindingId: number;
   screenId: number | null;
+  layoutPresetId?: number;
   bindingEnabled: boolean;
   activeSnapshotId: string | null;
   activeSnapshotVersion: number | null;
@@ -406,6 +444,22 @@ export interface TvPlayerRenderContext {
   adAudioOverrideActive?: boolean;
   adDisplayDurationSec?: number | null;
   error?: string;
+}
+
+export interface TvScreenMessage {
+  id: number;
+  bindingId: number;
+  title: string;
+  description: string | null;
+  hasImage: boolean;
+  displayDurationSec: number;
+  createdAt: string;
+}
+
+export interface TvScreenMessagesResponse {
+  ok: boolean;
+  rows: TvScreenMessage[];
+  total: number;
 }
 
 export interface TvPlayerStateRow {
@@ -582,6 +636,16 @@ export interface TvScreenBinding {
   last_error_message: string | null;
   created_at: string;
   updated_at: string;
+  // Display-target fields (A9 auto-attach)
+  target_display_id: string | null;
+  target_display_path: string | null;
+  last_known_friendly_name: string | null;
+  last_known_bounds_x: number | null;
+  last_known_bounds_y: number | null;
+  last_known_width: number | null;
+  last_known_height: number | null;
+  last_known_display_order_index: number | null;
+  display_attach_confidence: string | null;
   runtime?: TvScreenBindingRuntime | null;
 }
 

@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -33,7 +32,7 @@ def _lower(v: Any) -> str:
     return _safe_str(v, "").lower()
 
 
-def _parse_version_json(p: Path) -> Dict[str, Any]:
+def _parse_json_file(p: Path) -> Dict[str, Any]:
     try:
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
@@ -42,14 +41,27 @@ def _parse_version_json(p: Path) -> Dict[str, Any]:
     return {}
 
 
-def _sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest().lower()
+def _semver_tuple(v: str) -> Optional[Tuple[int, int, int]]:
+    """Parse 'x.y.z' or 'x.y.z codename' → (x, y, z). Returns None if invalid."""
+    if not v:
+        return None
+    numeric = v.strip().split()[0]
+    parts = numeric.split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+def _is_version_outdated(current: str, latest: str) -> bool:
+    """Return True if current < latest (semver comparison on x.y.z only)."""
+    a = _semver_tuple(current)
+    b = _semver_tuple(latest)
+    if a is None or b is None:
+        return False
+    return a < b
 
 
 def _resolve_install_root(identity: DesktopComponentIdentity) -> Path:
@@ -93,20 +105,49 @@ def _updater_exe_path(install_root: Path, identity: DesktopComponentIdentity) ->
     return install_root / "updater" / identity.updater_exe_name
 
 
+def _launch_as_admin(exe_path: Path) -> None:
+    """Launch an executable as administrator on Windows."""
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", str(exe_path), None, str(exe_path.parent), 1
+        )
+    else:
+        subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
+
+
 @dataclass
 class UpdateStatus:
-    current_release_id: str
-    latest_release: Optional[Dict[str, Any]] = None
+    # Current installed version info
+    current_version: str = "0.0.0"
+    current_codename: str = ""
+
+    # Latest available version info
+    latest_version: Optional[str] = None
+    latest_codename: Optional[str] = None
+    release_date: Optional[str] = None
+    available_until: Optional[str] = None
+    size_bytes: Optional[int] = None
+    release_notes: Optional[str] = None
+    download_url: Optional[str] = None
+    min_compatible_version: Optional[str] = None
+
+    # Download state
     update_available: bool = False
     downloaded: bool = False
     download_path: Optional[str] = None
-    manifest_path: Optional[str] = None
+    downloading: bool = False
+    progress_percent: Optional[int] = None
+
+    # Meta
     last_check_at: float = 0.0
     last_error: Optional[str] = None
-    downloading: bool = False
-    progress: Optional[int] = None
+
+    # Legacy fields (backward compat with old code that reads these)
+    current_release_id: str = "dev"
+    latest_release: Optional[Dict[str, Any]] = None
     download_progress: Optional[int] = None
-    progress_percent: Optional[int] = None
+    progress: Optional[int] = None
 
 
 class ComponentUpdateManager:
@@ -135,16 +176,41 @@ class ComponentUpdateManager:
         self._force_download_once = False
         self._session = requests.Session()
         self.install_root = _resolve_install_root(component)
-        self.status = UpdateStatus(current_release_id=self.get_current_release_id())
-        self._notified_release_id: Optional[str] = None
+        self.status = UpdateStatus(
+            current_version=self.get_current_version(),
+            current_codename=self.get_current_codename(),
+            current_release_id=self.get_current_release_id(),
+        )
+        self._notified_version: Optional[str] = None
         self._last_progress_emit_at: float = 0.0
         self._last_progress_emit_pct: Optional[int] = None
 
-    def get_current_release_id(self) -> str:
+    def get_current_version(self) -> str:
+        """Read the installed version from version.json (x.y.z format)."""
         try:
             base = runtime_base_dir()
-            version_json = base / "version.json"
-            data = _parse_version_json(version_json)
+            data = _parse_json_file(base / "version.json")
+            v = _safe_str(data.get("version") or data.get("releaseId") or "", "")
+            # If it's a releaseId (timestamp), return "0.0.0" so any real version triggers update
+            if v and _semver_tuple(v):
+                return v
+            return "0.0.0"
+        except Exception:
+            return "0.0.0"
+
+    def get_current_codename(self) -> str:
+        try:
+            base = runtime_base_dir()
+            data = _parse_json_file(base / "version.json")
+            return _safe_str(data.get("codename"), "")
+        except Exception:
+            return ""
+
+    def get_current_release_id(self) -> str:
+        """Legacy: return releaseId for backward compat."""
+        try:
+            base = runtime_base_dir()
+            data = _parse_json_file(base / "version.json")
             rid = _safe_str(
                 data.get("releaseId") or data.get("release_id") or data.get("version") or "",
                 "",
@@ -166,7 +232,7 @@ class ComponentUpdateManager:
         return sec * 1000
 
     def _auto_download(self) -> bool:
-        return bool(getattr(self.cfg, "update_auto_download_zip", True))
+        return bool(getattr(self.cfg, "update_auto_download_zip", False))
 
     def start(self, *, token: str, check_now: bool = True) -> None:
         token = _safe_str(token, "")
@@ -177,13 +243,15 @@ class ComponentUpdateManager:
             self._token = token
             if not self._running:
                 self._running = True
+                self.status.current_version = self.get_current_version()
+                self.status.current_codename = self.get_current_codename()
                 self.status.current_release_id = self.get_current_release_id()
                 self.logger.info(
-                    "[Update:%s] started (platform=%s channel=%s currentReleaseId=%s installRoot=%s)",
+                    "[Update:%s] started (platform=%s channel=%s version=%s installRoot=%s)",
                     self.component.component_id,
                     self._platform(),
                     self._channel(),
-                    self.status.current_release_id,
+                    self.status.current_version,
                     str(self.install_root),
                 )
             if check_now:
@@ -215,6 +283,31 @@ class ComponentUpdateManager:
                 return
             self._force_download_once = True
         self._schedule_next(0)
+
+    def cancel_download(self) -> None:
+        """Delete any downloaded installer file and reset download state."""
+        with self._lock:
+            path = self.status.download_path
+            self.status.downloaded = False
+            self.status.download_path = None
+            self.status.downloading = False
+            self.status.progress_percent = None
+            self.status.progress = None
+            self.status.download_progress = None
+
+        if path:
+            try:
+                p = Path(path)
+                if p.exists():
+                    p.unlink(missing_ok=True)
+                    self.logger.info("[Update:%s] cancelled download, deleted: %s", self.component.component_id, path)
+            except Exception as exc:
+                self.logger.warning("[Update:%s] cancel_download delete failed: %s", self.component.component_id, exc)
+
+        try:
+            self.app.after(0, lambda: self.app.on_update_status_changed(self.status))
+        except Exception:
+            pass
 
     def _schedule_next(self, delay_ms: int) -> None:
         with self._lock:
@@ -260,84 +353,89 @@ class ComponentUpdateManager:
 
     def _run_check_and_download(self, *, token: str, force_download: bool = False) -> None:
         try:
-            current = self.get_current_release_id()
-            self.status.current_release_id = current
+            current_version = self.get_current_version()
+            current_release_id = self.get_current_release_id()
+            self.status.current_version = current_version
+            self.status.current_codename = self.get_current_codename()
+            self.status.current_release_id = current_release_id
+
             api = self._api_factory()
             latest = api.get_latest_software_release(
                 token=token,
                 platform=self._platform(),
                 channel=self._channel(),
-                release_id=current if current else None,
+                current_version=current_version,
+                target=self.component.component_id,
+                release_id=current_release_id if current_release_id != "dev" else None,
                 timeout=20,
             )
 
             self.status.last_check_at = time.time()
             self.status.last_error = None
-            self.status.latest_release = latest
 
-            latest_id = _safe_str(latest.get("releaseId"), "")
-            if not latest_id or latest_id == current:
-                self._set_update_available(False, downloaded=False, latest=None)
+            # Check if update is available (backend sets shouldUpdate)
+            should_update = bool(latest.get("shouldUpdate", False))
+
+            # Also do local semver comparison as fallback
+            latest_version = _safe_str(latest.get("version"), "")
+            if not should_update and latest_version:
+                should_update = _is_version_outdated(current_version, latest_version)
+
+            if not should_update or not latest_version:
+                self._set_update_available(False, downloaded=False, latest=latest)
                 return
 
-            ddir = _download_dir(self.install_root, self._platform(), self._channel())
-            ddir.mkdir(parents=True, exist_ok=True)
+            # Map new response format
+            self.status.latest_version = latest_version
+            self.status.latest_codename = _safe_str(latest.get("codename"), "")
+            self.status.release_date = _safe_str(latest.get("publishedAt") or latest.get("releaseDate"), "")
+            self.status.available_until = _safe_str(latest.get("availableUntil"), "")
+            self.status.release_notes = _safe_str(latest.get("releaseNotes") or latest.get("notes"), "")
+            self.status.min_compatible_version = _safe_str(latest.get("minCompatibleVersion") or latest.get("lastCompatibleReleaseId"), "")
 
+            # Determine download URL (prefer installer, fall back to zip)
+            installer_obj = latest.get("installer") or {}
             zip_obj = latest.get("zip") or {}
-            man_obj = latest.get("manifest") or {}
-            zip_name = _safe_str(zip_obj.get("name"), f"{self.component.artifact_name}-{latest_id}.zip")
-            man_name = _safe_str(
-                man_obj.get("name"),
-                f"{self.component.artifact_name}-{latest_id}.manifest.json",
-            )
+            installer_url = _safe_str(installer_obj.get("url"), "")
+            installer_name = _safe_str(installer_obj.get("name"), "")
+            installer_size = installer_obj.get("size")
             zip_url = _safe_str(zip_obj.get("url"), "")
-            man_url = _safe_str(man_obj.get("url"), "")
-            zip_path = ddir / zip_name
-            man_path = ddir / man_name
+            zip_name = _safe_str(zip_obj.get("name"), "")
 
-            ok_cached = False
-            if zip_path.exists() and man_path.exists():
-                ok_cached = self._verify_cached(zip_path=zip_path, manifest_path=man_path)
-            if ok_cached:
-                self._set_update_available(
-                    True,
-                    downloaded=True,
-                    latest=latest,
-                    zip_path=zip_path,
-                    manifest_path=man_path,
-                )
-                return
+            self.status.size_bytes = installer_size or latest.get("sizeBytes")
 
-            if (not self._auto_download()) and (not force_download):
+            # Use installer URL if available, otherwise fall back to zip
+            if installer_url:
+                download_url = installer_url
+                download_name = installer_name or f"{self.component.artifact_name}-{latest_version}-installer.exe"
+            elif zip_url:
+                download_url = zip_url
+                download_name = zip_name or f"{self.component.artifact_name}-{latest_version}.zip"
+            else:
                 self._set_update_available(True, downloaded=False, latest=latest)
                 return
 
-            if not man_url:
-                raise RuntimeError("latest.manifest.url is empty.")
-            self._download_to_file(man_url, man_path, timeout=30, label="manifest")
-            expected_zip_sha = self._extract_zip_sha_from_manifest(man_path)
-            if not expected_zip_sha:
-                raise RuntimeError("manifest.outputs.zipSha256 missing/invalid.")
+            self.status.download_url = download_url
+            self.status.latest_release = latest
 
-            if not zip_url:
-                raise RuntimeError("latest.zip.url is empty.")
-            self._download_to_file(zip_url, zip_path, timeout=180, label="zip")
+            ddir = _download_dir(self.install_root, self._platform(), self._channel())
+            ddir.mkdir(parents=True, exist_ok=True)
+            download_path = ddir / download_name
 
-            got_sha = _sha256_file(zip_path)
-            if got_sha != expected_zip_sha:
-                try:
-                    zip_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise RuntimeError(f"ZIP sha256 mismatch: expected={expected_zip_sha} got={got_sha}")
+            # Check if already downloaded
+            if download_path.exists() and download_path.stat().st_size > 0:
+                self._set_update_available(True, downloaded=True, latest=latest, download_path=download_path)
+                return
 
-            self._set_update_available(
-                True,
-                downloaded=True,
-                latest=latest,
-                zip_path=zip_path,
-                manifest_path=man_path,
-            )
+            if not self._auto_download() and not force_download:
+                self._set_update_available(True, downloaded=False, latest=latest)
+                return
+
+            # Download the file
+            self._download_to_file(download_url, download_path, timeout=300, label="installer")
+
+            self._set_update_available(True, downloaded=True, latest=latest, download_path=download_path)
+
         except Exception as exc:
             msg = str(exc)
             self.status.last_error = msg
@@ -410,58 +508,18 @@ class ComponentUpdateManager:
         tmp.replace(path)
         self._set_downloading(False, None)
 
-    def _extract_zip_sha_from_manifest(self, manifest_path: Path) -> str:
-        if not manifest_path.is_file():
-            return ""
-        try:
-            content = manifest_path.read_text(encoding="utf-8-sig")
-            data = json.loads(content)
-        except Exception:
-            return ""
-
-        for path in (
-            ("outputs", "zipSha256"),
-            ("zipSha256",),
-            ("sha256",),
-            ("checksum",),
-            ("hash",),
-            ("sha",),
-        ):
-            value = data
-            try:
-                for key in path:
-                    value = value[key]
-                sha = _safe_str(value, "").lower()
-                if sha:
-                    return sha
-            except Exception:
-                continue
-        return ""
-
-    def _verify_cached(self, *, zip_path: Path, manifest_path: Path) -> bool:
-        try:
-            expected = self._extract_zip_sha_from_manifest(manifest_path)
-            if not expected:
-                return False
-            got = _sha256_file(zip_path)
-            return got == expected
-        except Exception:
-            return False
-
     def _set_update_available(
         self,
         available: bool,
         *,
         downloaded: bool,
         latest: Optional[Dict[str, Any]],
-        zip_path: Optional[Path] = None,
-        manifest_path: Optional[Path] = None,
+        download_path: Optional[Path] = None,
     ) -> None:
         self.status.update_available = available
         self.status.downloaded = downloaded
         self.status.latest_release = latest
-        self.status.download_path = str(zip_path) if zip_path else None
-        self.status.manifest_path = str(manifest_path) if manifest_path else None
+        self.status.download_path = str(download_path) if download_path else None
         if downloaded:
             self.status.downloading = False
             self.status.progress = None
@@ -473,9 +531,9 @@ class ComponentUpdateManager:
             pass
 
         if available and downloaded and latest:
-            rid = _safe_str(latest.get("releaseId"), "")
-            if rid and rid != self._notified_release_id:
-                self._notified_release_id = rid
+            ver = _safe_str(latest.get("version"), "")
+            if ver and ver != self._notified_version:
+                self._notified_version = ver
                 try:
                     self.app.after(0, lambda: self.app.on_update_ready(self.status))
                 except Exception:
@@ -486,15 +544,11 @@ class ComponentUpdateManager:
             return False, "No update available."
         if not self.status.downloaded:
             return False, "Update not downloaded yet."
-        if not self.status.download_path or not Path(self.status.download_path).exists():
-            return False, "Downloaded ZIP is missing."
-        if not self.status.manifest_path or not Path(self.status.manifest_path).exists():
-            return False, "Downloaded manifest is missing."
-
-        updater = _updater_exe_path(self.install_root, self.component)
-        if not updater.exists():
-            self.logger.error("[Update:%s] Updater missing at: %s", self.component.component_id, updater)
-            return False, f"Updater not installed yet: {updater}"
+        if not self.status.download_path:
+            return False, "Download path is missing."
+        p = Path(self.status.download_path)
+        if not p.exists():
+            return False, "Downloaded file is missing."
         return True, "OK"
 
     def launch_updater_and_exit(self) -> None:
@@ -502,45 +556,47 @@ class ComponentUpdateManager:
         if not ok:
             raise RuntimeError(reason)
 
-        updater = _updater_exe_path(self.install_root, self.component)
-        zip_path = Path(self.status.download_path or "")
-        man_path = Path(self.status.manifest_path or "")
-        rid = _safe_str((self.status.latest_release or {}).get("releaseId"), "")
+        download_path = Path(self.status.download_path or "")
+        ext = download_path.suffix.lower()
 
-        args = [
-            str(updater),
-            "--installRoot", str(self.install_root),
-            "--releaseId", rid,
-            "--zip", str(zip_path),
-            "--manifest", str(man_path),
-            "--waitPid", str(os.getpid()),
-            "--appExeName", self.component.main_exe_name,
-        ]
+        self.logger.info("[Update:%s] launching installer: %s", self.component.component_id, str(download_path))
 
-        try:
-            log_dir = self.install_root / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / f"{self.component.component_id}-updater-{rid}.log"
-            args += ["--log", str(log_path)]
-        except Exception:
-            pass
+        if ext == ".exe":
+            # Launch installer as admin
+            _launch_as_admin(download_path)
+        else:
+            # Legacy: fall back to the C# updater for ZIP files
+            updater = _updater_exe_path(self.install_root, self.component)
+            if not updater.exists():
+                raise RuntimeError(f"Updater not found: {updater}")
 
-        try:
-            fk = int(getattr(self.cfg, "update_force_kill_after_seconds", 20))
-            if fk > 0:
-                args += ["--forceKillAfterSeconds", str(fk)]
-        except Exception:
-            pass
+            latest = self.status.latest_release or {}
+            rid = _safe_str(latest.get("releaseId") or latest.get("version"), "")
+            args = [
+                str(updater),
+                "--installRoot", str(self.install_root),
+                "--releaseId", rid,
+                "--zip", str(download_path),
+                "--waitPid", str(os.getpid()),
+                "--appExeName", self.component.main_exe_name,
+            ]
+            try:
+                log_dir = self.install_root / "logs"
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_path = log_dir / f"{self.component.component_id}-updater-{rid}.log"
+                args += ["--log", str(log_path)]
+            except Exception:
+                pass
 
-        self.logger.info("[Update:%s] spawning updater: %s", self.component.component_id, " ".join(args))
-        subprocess.Popen(
-            args,
-            cwd=str(self.install_root),
-            close_fds=True,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            ) if os.name == "nt" else 0,
-        )
+            self.logger.info("[Update:%s] spawning C# updater: %s", self.component.component_id, " ".join(args))
+            subprocess.Popen(
+                args,
+                cwd=str(self.install_root),
+                close_fds=True,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+                ) if os.name == "nt" else 0,
+            )
 
 
 __all__ = ["ComponentUpdateManager", "UpdateStatus"]

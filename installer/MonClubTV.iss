@@ -23,7 +23,7 @@
 #define MainExe "MonClubTV.exe"
 #define TauriExe "monclub-tv-ui.exe"
 
-#define SetupIcon "assets\setup.ico"
+#define SetupIcon "assets\monclub_tv.ico"
 #define WizardImage "assets\wizard.bmp"
 #define WizardSmall "assets\wizard_small.bmp"
 
@@ -72,6 +72,15 @@ Name: "{userdesktop}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: de
 
 [Run]
 Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClubTV"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+; Remove the install root including runtime-created folders like downloads/logs/current leftovers.
+Type: filesandordirs; Name: "{app}"
+; Remove persisted data roots so a fresh reinstall starts cleanly.
+Type: filesandordirs; Name: "{commonappdata}\MonClub TV"
+Type: filesandordirs; Name: "{localappdata}\MonClub TV"
+Type: filesandordirs; Name: "{userappdata}\MonClub TV"
+Type: filesandordirs; Name: "{userappdata}\MonClubTV"
 
 [Code]
 const
@@ -247,4 +256,13 @@ begin
   DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClub TV'));
   DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClub TV'));
   DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClubTV'));
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    KillRunningMonClubProcesses();
+    Sleep(900);
+  end;
 end;

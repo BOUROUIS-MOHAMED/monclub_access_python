@@ -219,10 +219,17 @@ GYM_COORD_COMPLETING = "COMPLETING"
 GYM_COORD_ABORTED    = "ABORTED"
 GYM_COORD_ERROR      = "ERROR"
 
-# Ad layouts
-AD_LAYOUT_FULL_SCREEN    = "FULL_SCREEN"
-AD_LAYOUT_BANNER_TOP     = "BANNER_TOP"
-AD_LAYOUT_BANNER_BOTTOM  = "BANNER_BOTTOM"
+# Ad layouts — must match backend TvAdLayout enum exactly
+AD_LAYOUT_FULL_SCREEN = "FULL_SCREEN"
+AD_LAYOUT_ADS_1_4_H   = "ADS_1_4_H"
+AD_LAYOUT_ADS_1_2_H   = "ADS_1_2_H"
+AD_LAYOUT_ADS_3_4_H   = "ADS_3_4_H"
+AD_LAYOUT_ADS_1_4_V   = "ADS_1_4_V"
+AD_LAYOUT_ADS_1_2_V   = "ADS_1_2_V"
+AD_LAYOUT_ADS_3_4_V   = "ADS_3_4_V"
+# Legacy aliases kept for backward-compat; map to nearest match
+AD_LAYOUT_BANNER_TOP    = "ADS_1_4_H"   # was "BANNER_TOP" (no longer a valid backend value)
+AD_LAYOUT_BANNER_BOTTOM = "ADS_1_4_H"   # was "BANNER_BOTTOM" (no longer a valid backend value)
 
 # Ad player override modes (informational labels)
 AD_MODE_NONE              = "NO_AD_OVERRIDE"
@@ -233,8 +240,11 @@ AD_MODE_ERROR_FALLBACK    = "AD_ERROR_FALLBACK"
 # Due-time grace window in seconds
 AD_GRACE_WINDOW_SECONDS = 30
 
-# Remote status sets
-_AD_NONDISPLAYABLE_REMOTE_STATUSES = frozenset({"CANCELLED", "EXPIRED", "REJECTED", "FAILED"})
+# Remote status sets — values must match backend TvAdCampaignTaskStatus enum
+# Backend statuses that mean the task should NOT be displayed:
+#   CANCELLED, EXPIRED, FAILED
+# NOTE: "REJECTED" is not a valid backend status; kept here as harmless dead guard.
+_AD_NONDISPLAYABLE_REMOTE_STATUSES = frozenset({"CANCELLED", "EXPIRED", "FAILED", "REJECTED"})
 
 # ---------------------------------------------------------------------------
 # A8: Proof constants
@@ -387,6 +397,16 @@ def _create_tv_schema() -> None:
             );
         """)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_tv_screen_binding_sid ON tv_screen_binding(screen_id);")
+        # Display-target fields — added as migrations for existing DBs
+        _ensure_column(conn, "tv_screen_binding", "target_display_id", "target_display_id TEXT")
+        _ensure_column(conn, "tv_screen_binding", "target_display_path", "target_display_path TEXT")
+        _ensure_column(conn, "tv_screen_binding", "last_known_friendly_name", "last_known_friendly_name TEXT")
+        _ensure_column(conn, "tv_screen_binding", "last_known_bounds_x", "last_known_bounds_x INTEGER")
+        _ensure_column(conn, "tv_screen_binding", "last_known_bounds_y", "last_known_bounds_y INTEGER")
+        _ensure_column(conn, "tv_screen_binding", "last_known_width", "last_known_width INTEGER")
+        _ensure_column(conn, "tv_screen_binding", "last_known_height", "last_known_height INTEGER")
+        _ensure_column(conn, "tv_screen_binding", "last_known_display_order_index", "last_known_display_order_index INTEGER")
+        _ensure_column(conn, "tv_screen_binding", "display_attach_confidence", "display_attach_confidence TEXT")
 
         # 3) tv_screen_binding_runtime
         conn.execute("""
@@ -797,6 +817,18 @@ def list_tv_host_monitors() -> List[Dict[str, Any]]:
         return _rows_to_list(rows)
 
 
+def _load_default_connected_monitor(conn) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT * FROM tv_host_monitor
+        WHERE is_connected = 1
+        ORDER BY is_primary DESC, monitor_index ASC, id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    return _row_to_dict(row)
+
+
 def replace_tv_host_monitors(*, monitors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ensure_tv_local_schema()
     ts = now_iso()
@@ -846,7 +878,16 @@ def create_tv_screen_binding(*, screen_id: int, screen_name: str = None,
                              monitor_index: int = None,
                              enabled: bool = True, autostart: bool = False,
                              fullscreen: bool = True,
-                             window_label: str = None) -> Dict[str, Any]:
+                             window_label: str = None,
+                             target_display_id: str = None,
+                             target_display_path: str = None,
+                             last_known_friendly_name: str = None,
+                             last_known_bounds_x: int = None,
+                             last_known_bounds_y: int = None,
+                             last_known_width: int = None,
+                             last_known_height: int = None,
+                             last_known_display_order_index: int = None,
+                             display_attach_confidence: str = None) -> Dict[str, Any]:
     ensure_tv_local_schema()
     ts = now_iso()
     label = screen_label or screen_name or ""
@@ -854,7 +895,28 @@ def create_tv_screen_binding(*, screen_id: int, screen_name: str = None,
         existing = conn.execute("SELECT id FROM tv_screen_binding WHERE screen_id=?", (screen_id,)).fetchone()
         if existing:
             raise ValueError(f"screen_id {screen_id} is already bound (binding {existing['id']})")
-            
+
+        if not monitor_id:
+            default_monitor = _load_default_connected_monitor(conn)
+            if default_monitor:
+                monitor_id = default_monitor.get("monitor_id")
+                monitor_label = monitor_label or default_monitor.get("monitor_label")
+                monitor_index = default_monitor.get("monitor_index")
+                if not target_display_id:
+                    target_display_id = default_monitor.get("monitor_id")
+                if not last_known_friendly_name:
+                    last_known_friendly_name = default_monitor.get("monitor_label")
+                if last_known_bounds_x is None:
+                    last_known_bounds_x = default_monitor.get("x")
+                if last_known_bounds_y is None:
+                    last_known_bounds_y = default_monitor.get("y")
+                if last_known_width is None:
+                    last_known_width = default_monitor.get("width")
+                if last_known_height is None:
+                    last_known_height = default_monitor.get("height")
+                if last_known_display_order_index is None:
+                    last_known_display_order_index = default_monitor.get("monitor_index")
+
         if monitor_id:
             conflict = conn.execute("""
                 SELECT b.id FROM tv_screen_binding b
@@ -864,18 +926,30 @@ def create_tv_screen_binding(*, screen_id: int, screen_name: str = None,
             """, (monitor_id, 0)).fetchone()
             if conflict:
                 raise ValueError("MONITOR_ALREADY_ASSIGNED: Monitor is assigned to another active binding.")
-                
+
         cur = conn.execute("""
             INSERT INTO tv_screen_binding
                 (screen_id, screen_label, gym_id, gym_label,
                  monitor_id, monitor_label, monitor_index,
                  enabled, autostart, desired_state, fullscreen,
-                 window_label, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 window_label,
+                 target_display_id, target_display_path,
+                 last_known_friendly_name,
+                 last_known_bounds_x, last_known_bounds_y,
+                 last_known_width, last_known_height,
+                 last_known_display_order_index, display_attach_confidence,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (screen_id, label, gym_id, gym_label,
               monitor_id, monitor_label, monitor_index,
               int(enabled), int(autostart), DESIRED_STOPPED, int(fullscreen),
-              window_label, ts, ts))
+              window_label,
+              target_display_id, target_display_path,
+              last_known_friendly_name,
+              last_known_bounds_x, last_known_bounds_y,
+              last_known_width, last_known_height,
+              last_known_display_order_index, display_attach_confidence,
+              ts, ts))
         conn.commit()
         row = conn.execute("SELECT * FROM tv_screen_binding WHERE id=?", (cur.lastrowid,)).fetchone()
         return _row_to_dict(row) or {}
@@ -887,7 +961,12 @@ def update_tv_screen_binding(*, binding_id: int, **kwargs) -> Dict[str, Any]:
     allowed = {"screen_label", "screen_name", "gym_id", "gym_label",
                "monitor_id", "monitor_label", "monitor_index",
                "enabled", "autostart", "desired_state", "fullscreen",
-               "window_label", "last_error_code", "last_error_message"}
+               "window_label", "last_error_code", "last_error_message",
+               "target_display_id", "target_display_path",
+               "last_known_friendly_name",
+               "last_known_bounds_x", "last_known_bounds_y",
+               "last_known_width", "last_known_height",
+               "last_known_display_order_index", "display_attach_confidence"}
     sets = []
     params = []
     for k, v in kwargs.items():
@@ -1599,22 +1678,47 @@ def start_tv_screen_binding(*, binding_id: int = 0, **kwargs) -> Dict[str, Any]:
         b = conn.execute("SELECT * FROM tv_screen_binding WHERE id=?", (binding_id,)).fetchone()
         if not b:
             raise ValueError("INVALID_BINDING: Binding not found.")
-        
-        if b["monitor_id"]:
+
+        assigned_monitor_id = b["monitor_id"]
+        assigned_monitor_label = b["monitor_label"]
+        assigned_monitor_index = b["monitor_index"]
+        if not assigned_monitor_id:
+            default_monitor = _load_default_connected_monitor(conn)
+            if default_monitor:
+                assigned_monitor_id = default_monitor.get("monitor_id")
+                assigned_monitor_label = default_monitor.get("monitor_label")
+                assigned_monitor_index = default_monitor.get("monitor_index")
+                conn.execute(
+                    "UPDATE tv_screen_binding SET monitor_id=?, monitor_label=?, monitor_index=? WHERE id=?",
+                    (assigned_monitor_id, assigned_monitor_label, assigned_monitor_index, binding_id),
+                )
+
+        if assigned_monitor_id:
             conflict = conn.execute("""
                 SELECT b.id FROM tv_screen_binding b
                 LEFT JOIN tv_screen_binding_runtime r ON b.id = r.binding_id
                 WHERE b.monitor_id = ? AND b.id != ?
                 AND (b.desired_state != 'STOPPED' OR IFNULL(r.runtime_state, 'STOPPED') NOT IN ('STOPPED', 'IDLE', 'CRASHED', 'ERROR'))
-            """, (b["monitor_id"], binding_id)).fetchone()
+            """, (assigned_monitor_id, binding_id)).fetchone()
             if conflict:
                 raise ValueError("MONITOR_ALREADY_ASSIGNED: Monitor is in use by another active binding")
-                
+        else:
+            raise ValueError("MONITOR_MISSING: No connected monitor is available for this binding.")
+
         ts = now_iso()
-        conn.execute("UPDATE tv_screen_binding SET desired_state=?, updated_at=? WHERE id=?", 
-                     (DESIRED_RUNNING, ts, binding_id))
+        conn.execute(
+            "UPDATE tv_screen_binding SET desired_state=?, last_error_code=?, last_error_message=?, updated_at=? WHERE id=?",
+            (DESIRED_RUNNING, None, None, ts, binding_id),
+        )
         conn.commit()
-    
+
+    upsert_tv_screen_binding_runtime(
+        binding_id=binding_id,
+        runtime_state=BINDING_RUNTIME_STARTING,
+        last_error_code="",
+        last_error_message="",
+        tauri_window_label=f"tv-player-{binding_id}",
+    )
     record_tv_screen_binding_event(binding_id=binding_id, event_type="PLAYER_START_REQUESTED")
     return load_tv_screen_binding_by_id(binding_id=binding_id)
 
@@ -1637,10 +1741,37 @@ def restart_tv_screen_binding(*, binding_id: int = 0, **kwargs) -> Dict[str, Any
         b = conn.execute("SELECT * FROM tv_screen_binding WHERE id=?", (binding_id,)).fetchone()
         if not b:
             raise ValueError("INVALID_BINDING: Binding not found.")
+
+        assigned_monitor_id = b["monitor_id"]
+        assigned_monitor_label = b["monitor_label"]
+        assigned_monitor_index = b["monitor_index"]
+        if not assigned_monitor_id:
+            default_monitor = _load_default_connected_monitor(conn)
+            if default_monitor:
+                assigned_monitor_id = default_monitor.get("monitor_id")
+                assigned_monitor_label = default_monitor.get("monitor_label")
+                assigned_monitor_index = default_monitor.get("monitor_index")
+                conn.execute(
+                    "UPDATE tv_screen_binding SET monitor_id=?, monitor_label=?, monitor_index=? WHERE id=?",
+                    (assigned_monitor_id, assigned_monitor_label, assigned_monitor_index, binding_id),
+                )
+
+        if not assigned_monitor_id:
+            raise ValueError("MONITOR_MISSING: No connected monitor is available for this binding.")
+
         ts = now_iso()
-        conn.execute("UPDATE tv_screen_binding SET desired_state=?, updated_at=? WHERE id=?", 
-                     (DESIRED_RUNNING, ts, binding_id))
+        conn.execute(
+            "UPDATE tv_screen_binding SET desired_state=?, last_error_code=?, last_error_message=?, updated_at=? WHERE id=?",
+            (DESIRED_RUNNING, None, None, ts, binding_id),
+        )
         conn.commit()
+    upsert_tv_screen_binding_runtime(
+        binding_id=binding_id,
+        runtime_state=BINDING_RUNTIME_STARTING,
+        last_error_code="",
+        last_error_message="",
+        tauri_window_label=f"tv-player-{binding_id}",
+    )
     record_tv_screen_binding_event(binding_id=binding_id, event_type="PLAYER_RESTART_REQUESTED")
     return load_tv_screen_binding_by_id(binding_id=binding_id)
 
@@ -3029,8 +3160,21 @@ def _build_tv_api():
 
 
 def _get_auth_token() -> str:
-    """Return the current bearer token, or raise if not logged in."""
+    """Return the current bearer token, or raise if not logged in.
+
+    Tries the TV-owned auth state first (tv.db → tv_backend_auth_state).
+    Falls back to the Access auth state (access.db → auth_state) so that
+    the TV sync continues to work even when the TV DB mirror has not been
+    populated yet (e.g. user was already logged in before the TV module was
+    deployed, or mirror_access_auth_to_tv failed silently at login time).
+    """
     auth = load_tv_auth_for_runtime()
+    if not auth:
+        try:
+            from app.core.db import load_auth_token as _load_access_auth_token
+            auth = _load_access_auth_token()
+        except Exception:
+            pass
     if not auth:
         raise RuntimeError("Not logged in — no auth token available")
     tok = getattr(auth, "token", None)
@@ -3343,10 +3487,15 @@ def _validate_local_file(path: str, *,
     has_size = expected_size and expected_size > 0
     has_checksum = bool(expected_checksum and expected_checksum.strip())
 
-    # size check (cheap)
+    # size check (cheap) — mismatch is logged as a warning but does NOT block the asset.
+    # The backend size metadata may be stale or compressed differently; the file is still usable.
+    size_mismatch_note = ""
     if has_size and actual_size != expected_size:
-        return (ASSET_STATE_INVALID_SIZE, VALIDATION_STRONG,
-                f"expected {expected_size} bytes, got {actual_size}")
+        size_mismatch_note = f" [size_mismatch: backend={expected_size}, actual={actual_size}]"
+        _log.warning("[TvValidate] size mismatch for file %s — backend=%d bytes, actual=%d bytes"
+                     " — treating as non-critical, asset will be used as-is",
+                     path, expected_size, actual_size)
+        has_size = False  # skip size from deciding final state
 
     # checksum check (expensive)
     if has_checksum:
@@ -3356,23 +3505,23 @@ def _validate_local_file(path: str, *,
                     f"checksum mismatch: expected {expected_checksum[:16]}..., "
                     f"got {actual_checksum[:16]}...")
         return (ASSET_STATE_VALID, VALIDATION_STRONG,
-                f"size={actual_size}, sha256 matches")
+                f"size={actual_size}, sha256 matches{size_mismatch_note}")
 
     if has_size:
         # size matched, no checksum available
         return (ASSET_STATE_VALID, VALIDATION_WEAK,
-                f"size={actual_size} matches, no checksum available")
+                f"size={actual_size} matches, no checksum available{size_mismatch_note}")
 
-    # no integrity data at all
+    # no integrity data at all (or size was skipped due to mismatch)
     return (ASSET_STATE_PRESENT_UNCHECKED, VALIDATION_WEAK,
-            f"file exists (size={actual_size}), no integrity metadata")
+            f"file exists (size={actual_size}), no integrity metadata{size_mismatch_note}")
 
 
 def _download_file(url: str, dest_path: str, *,
                    timeout: int = 120) -> int:
     """
     Download a file via HTTP GET into dest_path.
-    Returns bytes written.  Raises on failure.
+    Returns bytes written.  Raises on failure with a descriptive message.
     """
     import urllib.request
     import urllib.error
@@ -3382,16 +3531,36 @@ def _download_file(url: str, dest_path: str, *,
     req = urllib.request.Request(url, method="GET")
     req.add_header("User-Agent", "MonClub-Access/1.0")
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        total = 0
-        with open(dest_path, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                total += len(chunk)
-    return total
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            http_status = getattr(resp, "status", None) or getattr(resp, "code", None)
+            content_type = resp.headers.get("Content-Type", "unknown")
+            content_length = resp.headers.get("Content-Length", "unknown")
+            _log.debug("[TvDownload] HTTP %s  Content-Type=%s  Content-Length=%s  url=%s",
+                       http_status, content_type, content_length, url)
+            total = 0
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+        return total
+    except urllib.error.HTTPError as e:
+        body_preview = ""
+        try:
+            body_preview = e.read(512).decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"HTTP {e.code} {e.reason} — url={url}"
+            + (f" — response: {body_preview}" if body_preview else "")
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"URL error: {e.reason} — url={url}") from e
+    except TimeoutError as e:
+        raise RuntimeError(f"Timeout after {timeout}s — url={url}") from e
 
 
 def _build_asset_worklist(*, snapshot_id: str = "",
@@ -3526,28 +3695,44 @@ def _process_single_asset(asset: Dict[str, Any]) -> Dict[str, Any]:
 
     # 4) Download to temp file
     temp_path = expected_path + ".downloading"
+    _log.info("[TvDownload] START  asset=%s  mime=%s  expected_bytes=%s  url=%s",
+              media_id, mime_type or media_type or "?",
+              size_bytes if size_bytes else "unknown",
+              download_link)
     try:
         os.makedirs(os.path.dirname(expected_path), exist_ok=True)
         bytes_written = _download_file(download_link, temp_path)
-        _log.info("[TvDownload] %s — downloaded %d bytes to temp", media_id, bytes_written)
+        _log.info("[TvDownload] OK     asset=%s  bytes_written=%d  dest=%s",
+                  media_id, bytes_written, temp_path)
     except Exception as e:
-        # Clean up partial temp file
+        partial_size = 0
         try:
             if os.path.exists(temp_path):
+                partial_size = os.path.getsize(temp_path)
                 os.remove(temp_path)
         except Exception:
             pass
+        error_detail = str(e)
+        _log.error(
+            "[TvDownload] FAILED asset=%s  error=%s  partial_bytes=%d"
+            "  expected_bytes=%s  url=%s",
+            media_id, error_detail, partial_size,
+            size_bytes if size_bytes else "unknown",
+            download_link,
+            exc_info=True,
+        )
+        state_reason = f"download failed: {error_detail} (url={download_link})"
         upsert_tv_local_asset_state(
             media_asset_id=media_id,
             expected_local_path=expected_path,
             file_exists=False,
             asset_state=ASSET_STATE_ERROR,
-            state_reason=f"download failed: {e}",
+            state_reason=state_reason,
             last_checked_at=now_iso(),
             last_seen_in_snapshot_version=snapshot_version or None,
         )
         result.update(action="DOWNLOAD_FAILED", state=ASSET_STATE_ERROR,
-                      reason=f"download failed: {e}")
+                      reason=state_reason)
         return result
 
     # 5) Validate temp file
@@ -4699,6 +4884,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
             "ok": False,
             "bindingId": bid,
             "screenId": None,
+            "layoutPresetId": 0,
             "playerState": PLAYER_STATE_BLOCKED_NO_BINDING,
             "renderMode": RENDER_MODE_IDLE_FALLBACK,
             "fallbackReason": FALLBACK_REASON_BINDING_NOT_FOUND,
@@ -4713,6 +4899,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
                 "ok": False,
                 "bindingId": bid,
                 "screenId": None,
+                "layoutPresetId": 0,
                 "playerState": PLAYER_STATE_BLOCKED_NO_BINDING,
                 "renderMode": RENDER_MODE_IDLE_FALLBACK,
                 "fallbackReason": FALLBACK_REASON_BINDING_NOT_FOUND,
@@ -4726,6 +4913,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
                 "ok": True,
                 "bindingId": bid,
                 "screenId": sid,
+                "layoutPresetId": 0,
                 "bindingEnabled": False,
                 "activeSnapshotId": None,
                 "activeSnapshotVersion": None,
@@ -4758,6 +4946,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
                 "ok": True,
                 "bindingId": bid,
                 "screenId": sid,
+                "layoutPresetId": 0,
                 "bindingEnabled": True,
                 "activeSnapshotId": None,
                 "activeSnapshotVersion": None,
@@ -4789,6 +4978,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
                 "ok": True,
                 "bindingId": bid,
                 "screenId": sid,
+                "layoutPresetId": 0,
                 "bindingEnabled": True,
                 "activeSnapshotId": active_snapshot_id,
                 "activeSnapshotVersion": active_snapshot_version,
@@ -4817,11 +5007,15 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
         except Exception:
             payload = {}
 
+        _raw_layout_id = _safe_int(snap_row.get("resolved_layout_preset_id"), None)
+        _normalized_layout_preset_id = _raw_layout_id if _raw_layout_id in (0, 1) else 0
+
         if _safe_str(snap_row.get("manifest_status"), "") != MANIFEST_STATUS_COMPLETE:
             _r = {
                 "ok": True,
                 "bindingId": bid,
                 "screenId": sid,
+                "layoutPresetId": _normalized_layout_preset_id,
                 "bindingEnabled": True,
                 "activeSnapshotId": active_snapshot_id,
                 "activeSnapshotVersion": active_snapshot_version,
@@ -4882,6 +5076,7 @@ def _build_player_render_context(*, binding_id: int, now_dt: Optional[datetime] 
         "ok": True,
         "bindingId": bid,
         "screenId": sid,
+        "layoutPresetId": _normalized_layout_preset_id,
         "bindingEnabled": True,
         "activeSnapshotId": active_snapshot_id,
         "activeSnapshotVersion": active_snapshot_version,
@@ -7662,6 +7857,7 @@ STARTUP_PHASES: Tuple[str, ...] = (
     "activation_reconcile",
     "proof_outbox_recover",
     "ad_runtime_recover",
+    "autostart_binding_launch",
     "window_runtime_reconcile",
     "finalize",
 )
@@ -7743,7 +7939,106 @@ def _ensure_tv_startup_reconciliation_schema() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_tv_startup_phase_run ON tv_startup_reconciliation_phase(run_id, id)"
         )
+
+        # 21) tv_screen_message
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tv_screen_message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                binding_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                image_base64 TEXT,
+                display_duration_sec INTEGER NOT NULL DEFAULT 5,
+                created_at TEXT NOT NULL
+            );
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tv_screen_msg_binding ON tv_screen_message(binding_id, created_at DESC)"
+        )
+
         conn.commit()
+
+
+def create_tv_screen_message(
+    *,
+    binding_id: int,
+    title: str,
+    description: str,
+    image_base64: Optional[str],
+    display_duration_sec: int,
+) -> Dict[str, Any]:
+    ts = now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tv_screen_message
+                (binding_id, title, description, image_base64, display_duration_sec, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(binding_id),
+                _safe_str(title, ""),
+                _safe_str(description, ""),
+                image_base64 or None,
+                max(3, min(10, int(display_duration_sec))),
+                ts,
+            ),
+        )
+        conn.commit()
+        row_id = cur.lastrowid
+    return {
+        "id": row_id,
+        "bindingId": binding_id,
+        "title": title,
+        "description": description,
+        "hasImage": bool(image_base64),
+        "displayDurationSec": display_duration_sec,
+        "createdAt": ts,
+    }
+
+
+def list_tv_screen_messages(
+    *,
+    binding_id: Optional[int] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        if binding_id is not None:
+            rows = conn.execute(
+                """
+                SELECT id, binding_id, title, description, image_base64,
+                       display_duration_sec, created_at
+                FROM tv_screen_message
+                WHERE binding_id = ?
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (int(binding_id), int(limit), int(offset)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, binding_id, title, description, image_base64,
+                       display_duration_sec, created_at
+                FROM tv_screen_message
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (int(limit), int(offset)),
+            ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "bindingId": row["binding_id"],
+            "title": row["title"] or "",
+            "description": row["description"] or "",
+            "hasImage": bool(row["image_base64"]),
+            "displayDurationSec": row["display_duration_sec"],
+            "createdAt": row["created_at"],
+        }
+        for row in rows
+    ]
 
 
 def _startup_check_item(
@@ -8940,6 +9235,208 @@ def load_tv_startup_reconciliation_latest(**kwargs) -> Dict[str, Any]:
     return {"ok": True, **_startup_run_row_to_dict(row, phases=_list_startup_phase_rows(run_id=run_id))}
 
 
+# ---------------------------------------------------------------------------
+# Auto-attach: display resolution algorithm + autostart launch phase
+# ---------------------------------------------------------------------------
+
+# Confidence labels for display matching
+DISPLAY_ATTACH_EXACT = "EXACT"
+DISPLAY_ATTACH_FALLBACK_BOUNDS = "FALLBACK_BOUNDS"
+DISPLAY_ATTACH_FALLBACK_INDEX = "FALLBACK_INDEX"
+DISPLAY_ATTACH_FALLBACK_NAME = "FALLBACK_NAME"
+DISPLAY_ATTACH_FALLBACK_FIRST = "FALLBACK_FIRST"
+DISPLAY_ATTACH_UNMATCHED = "UNMATCHED"
+
+
+def _resolve_binding_to_monitor(binding: Dict[str, Any],
+                                available_monitors: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Deterministic display-target resolution for a binding.
+
+    Matching priority (highest → lowest):
+      1. Exact saved target_display_id / monitor_id
+      2. Exact saved target_display_path
+      3. Same position + size (bounds match)
+      4. Same last_known_display_order_index
+      5. Same last_known_friendly_name + same resolution
+      6. First free connected monitor not assigned to another running binding
+
+    Returns (monitor_row_or_None, confidence_string).
+    """
+    connected = [m for m in available_monitors if _binding_bool(m.get("is_connected"))]
+    if not connected:
+        return None, DISPLAY_ATTACH_UNMATCHED
+
+    saved_id = (binding.get("target_display_id") or binding.get("monitor_id") or "").strip()
+    saved_path = (binding.get("target_display_path") or "").strip()
+    saved_name = (binding.get("last_known_friendly_name") or binding.get("monitor_label") or "").strip()
+    saved_x = binding.get("last_known_bounds_x")
+    saved_y = binding.get("last_known_bounds_y")
+    saved_w = binding.get("last_known_width")
+    saved_h = binding.get("last_known_height")
+    saved_idx = binding.get("last_known_display_order_index")
+
+    # 1) Exact target_display_id / monitor_id match
+    if saved_id:
+        for m in connected:
+            if (m.get("monitor_id") or "").strip() == saved_id:
+                return m, DISPLAY_ATTACH_EXACT
+
+    # 2) Exact target_display_path match
+    if saved_path:
+        for m in connected:
+            if (m.get("target_display_path") or m.get("monitor_id") or "").strip() == saved_path:
+                return m, DISPLAY_ATTACH_EXACT
+
+    # 3) Bounds match (x, y, width, height all must match)
+    if None not in (saved_x, saved_y, saved_w, saved_h):
+        for m in connected:
+            if (m.get("x") == saved_x and m.get("y") == saved_y
+                    and m.get("width") == saved_w and m.get("height") == saved_h):
+                return m, DISPLAY_ATTACH_FALLBACK_BOUNDS
+
+    # 4) Display order index match
+    if saved_idx is not None:
+        for m in connected:
+            if m.get("monitor_index") == saved_idx:
+                return m, DISPLAY_ATTACH_FALLBACK_INDEX
+
+    # 5) Friendly name + resolution match
+    if saved_name and None not in (saved_w, saved_h):
+        for m in connected:
+            m_name = (m.get("monitor_label") or "").strip()
+            if m_name == saved_name and m.get("width") == saved_w and m.get("height") == saved_h:
+                return m, DISPLAY_ATTACH_FALLBACK_NAME
+
+    # 6) First free connected monitor (not claimed by another active binding)
+    active_monitor_ids = set()
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT b.monitor_id FROM tv_screen_binding b
+            LEFT JOIN tv_screen_binding_runtime r ON b.id = r.binding_id
+            WHERE b.id != ?
+            AND b.enabled = 1
+            AND b.desired_state != 'STOPPED'
+            AND IFNULL(r.runtime_state, 'IDLE') NOT IN ('STOPPED', 'IDLE', 'CRASHED', 'ERROR')
+        """, (_safe_int(binding.get("id"), -1),)).fetchall()
+        active_monitor_ids = {str(r["monitor_id"] or "") for r in rows if r["monitor_id"]}
+
+    for m in connected:
+        if str(m.get("monitor_id") or "") not in active_monitor_ids:
+            return m, DISPLAY_ATTACH_FALLBACK_FIRST
+
+    return None, DISPLAY_ATTACH_UNMATCHED
+
+
+def _autostart_binding_launch_phase(*, correlation_id: str) -> Dict[str, Any]:
+    """
+    Startup phase: reads global autostart_bindings_enabled, then for each
+    binding with autostart=1 and enabled=1 resolves its display target and
+    sets desired_state=RUNNING so the window reconciliation phase will launch it.
+
+    Logs every decision for supportability.
+    """
+    try:
+        from tv.config import load_tv_app_config
+        cfg = load_tv_app_config()
+        global_enabled = bool(getattr(cfg, "autostart_bindings_enabled", False))
+    except Exception:
+        _log.warning("[AutoStart] Could not read autostart_bindings_enabled from config; defaulting to disabled.")
+        global_enabled = False
+
+    if not global_enabled:
+        _log.info("[AutoStart] Global autostart_bindings_enabled=False — skipping all binding auto-launch.")
+        return {
+            "result": STARTUP_RESULT_SKIPPED,
+            "message": "Global autostart_bindings_enabled is disabled — no bindings auto-launched.",
+            "metadata": {"globalEnabled": False, "launched": 0, "skipped": 0, "failed": 0},
+        }
+
+    all_bindings = list_tv_screen_bindings()
+    candidates = [b for b in all_bindings
+                  if _binding_bool(b.get("enabled")) and _binding_bool(b.get("autostart"))]
+
+    if not candidates:
+        _log.info("[AutoStart] Global autostart enabled but no bindings have autostart=1.")
+        return {
+            "result": STARTUP_RESULT_SKIPPED,
+            "message": "No bindings have autoStart=true.",
+            "metadata": {"globalEnabled": True, "launched": 0, "skipped": 0, "failed": 0},
+        }
+
+    available_monitors = list_tv_host_monitors()
+    launched = 0
+    skipped = 0
+    failed = 0
+
+    for binding in candidates:
+        bid = _safe_int(binding.get("id"), 0)
+        screen_label = binding.get("screen_label") or f"binding#{bid}"
+
+        monitor, confidence = _resolve_binding_to_monitor(binding, available_monitors)
+
+        if not monitor:
+            _log.warning("[AutoStart] binding=%s (%s): no display found — skipping auto-launch.",
+                         bid, screen_label)
+            record_tv_screen_binding_event(
+                binding_id=bid,
+                event_type="AUTOSTART_NO_DISPLAY",
+                severity=SEVERITY_WARN,
+                message="Auto-start skipped: no matching display target found.",
+                metadata_json={"correlationId": correlation_id, "confidence": DISPLAY_ATTACH_UNMATCHED},
+            )
+            failed += 1
+            continue
+
+        monitor_id = monitor.get("monitor_id")
+        monitor_label = monitor.get("monitor_label") or monitor_id
+
+        # Persist resolved display target back to binding (auto-repair)
+        try:
+            update_tv_screen_binding(
+                binding_id=bid,
+                monitor_id=monitor_id,
+                monitor_label=monitor_label,
+                monitor_index=monitor.get("monitor_index"),
+                target_display_id=monitor_id,
+                last_known_friendly_name=monitor.get("monitor_label"),
+                last_known_bounds_x=monitor.get("x"),
+                last_known_bounds_y=monitor.get("y"),
+                last_known_width=monitor.get("width"),
+                last_known_height=monitor.get("height"),
+                last_known_display_order_index=monitor.get("monitor_index"),
+                display_attach_confidence=confidence,
+                desired_state=DESIRED_RUNNING,
+            )
+            _log.info("[AutoStart] binding=%s (%s): resolved to monitor=%s confidence=%s — desired_state→RUNNING.",
+                      bid, screen_label, monitor_id, confidence)
+            record_tv_screen_binding_event(
+                binding_id=bid,
+                event_type="AUTOSTART_LAUNCH_SCHEDULED",
+                severity=SEVERITY_INFO,
+                message=f"Auto-start scheduled: resolved to monitor '{monitor_label}' (confidence={confidence}).",
+                metadata_json={"correlationId": correlation_id, "monitorId": monitor_id,
+                               "confidence": confidence},
+            )
+            launched += 1
+        except Exception as exc:
+            _log.error("[AutoStart] binding=%s (%s): failed to update desired_state: %s",
+                       bid, screen_label, exc, exc_info=True)
+            failed += 1
+
+    result_state = STARTUP_RESULT_PASSED if (launched > 0 or skipped > 0) else STARTUP_RESULT_SKIPPED
+    if failed > 0 and launched == 0:
+        result_state = STARTUP_RESULT_REPAIRED  # partial — still allow reconciliation to continue
+
+    return {
+        "result": result_state,
+        "message": (f"Auto-start: {launched} binding(s) scheduled for launch, "
+                    f"{skipped} skipped, {failed} failed to resolve."),
+        "metadata": {"globalEnabled": True, "launched": launched,
+                     "skipped": skipped, "failed": failed},
+    }
+
+
 def run_tv_startup_reconciliation(**kwargs) -> Dict[str, Any]:
     global _startup_reconciliation_active
 
@@ -9097,6 +9594,7 @@ def run_tv_startup_reconciliation(**kwargs) -> Dict[str, Any]:
             ("activation_reconcile", _startup_activation_reconcile),
             ("proof_outbox_recover", _startup_proof_outbox_recover),
             ("ad_runtime_recover", _startup_ad_runtime_recover),
+            ("autostart_binding_launch", lambda: _autostart_binding_launch_phase(correlation_id=correlation_id)),
             ("window_runtime_reconcile", lambda: _startup_window_runtime_reconcile(correlation_id=correlation_id)),
         ):
             phase_result = _execute_startup_phase(run_id=run_id, phase_name=phase_name, handler=handler)

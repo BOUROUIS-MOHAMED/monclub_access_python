@@ -165,6 +165,8 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
 
         "agent_sync_backend_refresh_min": _clamp_int(raw.get("agentSyncBackendRefreshMin"), 30, 1, 1440),
 
+        "optional_data_sync_delay_minutes": _clamp_int(raw.get("optionalDataSyncDelayMinutes"), 60, 60, 1440),
+
         "default_authorize_door_id": _clamp_int(raw.get("defaultAuthorizeDoorId"), 15, 1, 64),
 
         "sdk_read_initial_bytes": _clamp_int(raw.get("sdkReadInitialBytes"), 1_048_576, 64 * 1024, 16 * 1024 * 1024),
@@ -341,7 +343,11 @@ def get_backend_global_settings() -> Dict[str, Any]:
         v = load_sync_access_software_settings()
         if isinstance(v, dict):
             raw = v
-    except Exception:
+    except Exception as _sr_err:
+        import logging
+        logging.getLogger("settings_reader").error(
+            f"[settings_reader] Failed to read global settings from DB: {_sr_err}. Using defaults."
+        )
         raw = {}
 
     if not raw:

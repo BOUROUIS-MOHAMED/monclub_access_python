@@ -43,12 +43,6 @@ ACCESS_CONFIG_FIELDS = (
     "template_encoding",
     "plcomm_dll_path",
     "zkfp_dll_path",
-    "api_login_url",
-    "api_sync_url",
-    "api_create_user_fingerprint_url",
-    "api_access_create_membership_url",
-    "api_access_create_account_membership_url",
-    "api_latest_release_url",
     "sync_interval_sec",
     "max_login_age_minutes",
     "device_sync_enabled",
@@ -71,22 +65,14 @@ TV_CONFIG_FIELDS = (
     "update_channel",
     "update_check_interval_sec",
     "update_auto_download_zip",
-    "api_latest_release_url",
-    "api_tv_snapshot_latest_url",
-    "api_tv_snapshot_manifest_url",
-    "api_tv_ad_tasks_fetch_url",
-    "api_tv_ad_task_confirm_ready_url",
-    "api_tv_ad_task_submit_proof_url",
+    "minimize_to_tray_on_close",
+    "start_on_system_startup",
+    "autostart_bindings_enabled",
     "log_level",
 )
 
-TV_COMPAT_OVERLAY_FIELDS = (
-    "api_tv_snapshot_latest_url",
-    "api_tv_snapshot_manifest_url",
-    "api_tv_ad_tasks_fetch_url",
-    "api_tv_ad_task_confirm_ready_url",
-    "api_tv_ad_task_submit_proof_url",
-)
+# TV_COMPAT_OVERLAY_FIELDS: URL fields were removed — no overlay needed anymore.
+TV_COMPAT_OVERLAY_FIELDS: tuple[str, ...] = ()
 
 
 def _now_utc_iso() -> str:
@@ -125,12 +111,6 @@ class AccessConfigSection:
     template_encoding: str
     plcomm_dll_path: str
     zkfp_dll_path: str
-    api_login_url: str
-    api_sync_url: str
-    api_create_user_fingerprint_url: str
-    api_access_create_membership_url: str
-    api_access_create_account_membership_url: str
-    api_latest_release_url: str
     sync_interval_sec: int
     max_login_age_minutes: int
     device_sync_enabled: bool
@@ -154,12 +134,9 @@ class TvConfigSection:
     update_channel: str
     update_check_interval_sec: int
     update_auto_download_zip: bool
-    api_latest_release_url: str
-    api_tv_snapshot_latest_url: str
-    api_tv_snapshot_manifest_url: str
-    api_tv_ad_tasks_fetch_url: str
-    api_tv_ad_task_confirm_ready_url: str
-    api_tv_ad_task_submit_proof_url: str
+    minimize_to_tray_on_close: bool = True
+    start_on_system_startup: bool = False
+    autostart_bindings_enabled: bool = False
     log_level: str = "DEBUG"
 
 
@@ -364,12 +341,6 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         template_encoding=str(getattr(cfg, "template_encoding", "base64") or "base64"),
         plcomm_dll_path=str(getattr(cfg, "plcomm_dll_path", "") or ""),
         zkfp_dll_path=str(getattr(cfg, "zkfp_dll_path", "") or ""),
-        api_login_url=str(getattr(cfg, "api_login_url", "") or ""),
-        api_sync_url=str(getattr(cfg, "api_sync_url", "") or ""),
-        api_create_user_fingerprint_url=str(getattr(cfg, "api_create_user_fingerprint_url", "") or ""),
-        api_access_create_membership_url=str(getattr(cfg, "api_access_create_membership_url", "") or ""),
-        api_access_create_account_membership_url=str(getattr(cfg, "api_access_create_account_membership_url", "") or ""),
-        api_latest_release_url=str(getattr(cfg, "api_latest_release_url", "") or ""),
         sync_interval_sec=int(getattr(cfg, "sync_interval_sec", 60) or 60),
         max_login_age_minutes=int(getattr(cfg, "max_login_age_minutes", 43200) or 43200),
         device_sync_enabled=bool(getattr(cfg, "device_sync_enabled", True)),
@@ -394,12 +365,8 @@ def _build_tv_section_from_cfg(cfg: AppConfig) -> TvConfigSection:
         update_channel=str(getattr(cfg, "update_channel", "stable") or "stable"),
         update_check_interval_sec=int(getattr(cfg, "update_check_interval_sec", 30) or 30),
         update_auto_download_zip=bool(getattr(cfg, "update_auto_download_zip", True)),
-        api_latest_release_url=str(getattr(cfg, "api_latest_release_url", "") or ""),
-        api_tv_snapshot_latest_url=str(getattr(cfg, "api_tv_snapshot_latest_url", "") or ""),
-        api_tv_snapshot_manifest_url=str(getattr(cfg, "api_tv_snapshot_manifest_url", "") or ""),
-        api_tv_ad_tasks_fetch_url=str(getattr(cfg, "api_tv_ad_tasks_fetch_url", "") or ""),
-        api_tv_ad_task_confirm_ready_url=str(getattr(cfg, "api_tv_ad_task_confirm_ready_url", "") or ""),
-        api_tv_ad_task_submit_proof_url=str(getattr(cfg, "api_tv_ad_task_submit_proof_url", "") or ""),
+        minimize_to_tray_on_close=bool(getattr(cfg, "minimize_to_tray_on_close", True)),
+        start_on_system_startup=bool(getattr(cfg, "start_on_system_startup", False)),
         log_level=str(getattr(cfg, "log_level", "DEBUG") or "DEBUG"),
     )
 
@@ -460,19 +427,36 @@ def apply_component_config_patch(component: ConfigComponent, cfg: AppConfig, pat
 
 
 def build_api_endpoints(cfg: AppConfig | ConfigEnvelope | None = None) -> ApiEndpoints:
-    envelope = split_config(cfg)
+    """Build all API endpoints from centralized constants (app/core/app_const.py).
+
+    The cfg parameter is accepted for backward compatibility but is no longer
+    used — backend URLs are not stored in or read from runtime config.
+    """
+    from app.core.app_const import (
+        API_LOGIN_URL,
+        API_SYNC_URL,
+        API_CREATE_USER_FINGERPRINT_URL,
+        API_LATEST_RELEASE_URL,
+        API_ACCESS_CREATE_MEMBERSHIP_URL,
+        API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
+        API_TV_SNAPSHOT_LATEST_URL,
+        API_TV_SNAPSHOT_MANIFEST_URL,
+        API_TV_AD_TASKS_FETCH_URL,
+        API_TV_AD_TASK_CONFIRM_READY_URL,
+        API_TV_AD_TASK_SUBMIT_PROOF_URL,
+    )
     return ApiEndpoints(
-        login_url=envelope.access.api_login_url,
-        sync_url=envelope.access.api_sync_url,
-        create_user_fingerprint_url=envelope.access.api_create_user_fingerprint_url,
-        latest_release_url=envelope.access.api_latest_release_url,
-        access_create_membership_url=envelope.access.api_access_create_membership_url,
-        access_create_account_membership_url=envelope.access.api_access_create_account_membership_url,
-        tv_snapshot_latest_url=envelope.tv.api_tv_snapshot_latest_url,
-        tv_snapshot_manifest_url=envelope.tv.api_tv_snapshot_manifest_url,
-        tv_ad_tasks_fetch_url=envelope.tv.api_tv_ad_tasks_fetch_url,
-        tv_ad_task_confirm_ready_url=envelope.tv.api_tv_ad_task_confirm_ready_url,
-        tv_ad_task_submit_proof_url=envelope.tv.api_tv_ad_task_submit_proof_url,
+        login_url=API_LOGIN_URL,
+        sync_url=API_SYNC_URL,
+        create_user_fingerprint_url=API_CREATE_USER_FINGERPRINT_URL,
+        latest_release_url=API_LATEST_RELEASE_URL,
+        access_create_membership_url=API_ACCESS_CREATE_MEMBERSHIP_URL,
+        access_create_account_membership_url=API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
+        tv_snapshot_latest_url=API_TV_SNAPSHOT_LATEST_URL,
+        tv_snapshot_manifest_url=API_TV_SNAPSHOT_MANIFEST_URL,
+        tv_ad_tasks_fetch_url=API_TV_AD_TASKS_FETCH_URL,
+        tv_ad_task_confirm_ready_url=API_TV_AD_TASK_CONFIRM_READY_URL,
+        tv_ad_task_submit_proof_url=API_TV_AD_TASK_SUBMIT_PROOF_URL,
     )
 
 

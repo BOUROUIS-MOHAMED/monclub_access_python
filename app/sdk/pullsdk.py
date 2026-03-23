@@ -4,6 +4,7 @@ import ctypes
 import logging
 import math
 import os
+import threading
 import time
 from ctypes import c_void_p, c_char_p, c_int
 from pathlib import Path
@@ -14,6 +15,28 @@ from app.core.utils import encode_ansi, parse_device_text
 
 class PullSDKError(RuntimeError):
     pass
+
+
+def _decode_sdk_bytes(data: bytes) -> str:
+    """
+    Decode bytes from PullSDK buffer.
+    ZKTeco PullSDK uses ANSI (system code page) encoding.
+    Falls back through utf-8 and latin-1 to ensure no data is lost.
+    """
+    if not data:
+        return ""
+    # Try system ANSI code page first (mbcs — correct for ZKTeco SDK)
+    try:
+        return data.decode("mbcs", errors="strict")
+    except (UnicodeDecodeError, LookupError):
+        pass
+    # Try UTF-8 (some newer firmware may use UTF-8)
+    try:
+        return data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        pass
+    # Latin-1 never raises — safe last resort
+    return data.decode("latin-1", errors="replace")
 
 
 class PullSDK:
@@ -97,7 +120,7 @@ class PullSDK:
             f"ipaddress={ip}",
             f"port={port}",
             f"timeout={timeout_ms}",
-            f"passwd={''}",
+            f"passwd={password}",
         ]
 
         conn_str = ",".join(parts)
@@ -129,6 +152,12 @@ class PullSDK:
             self.logger.info("Disconnected.")
 
     def pull_last_error(self) -> int:
+        """
+        NOTE: PullLastError() reads from a global (non-thread-local) DLL variable.
+        Under concurrent multi-device scenarios, the returned value may reflect
+        a different thread's last error. Use only for supplementary diagnostics.
+        All correctness decisions must be based on the return code (rc) of each SDK call.
+        """
         if self._dll is None:
             return -9999
         return int(self._dll.PullLastError())
@@ -186,7 +215,7 @@ class PullSDK:
             rc = int(call(buf, sz))
 
             if rc >= 0:
-                text = buf.value.decode("mbcs", errors="replace")
+                text = _decode_sdk_bytes(buf.value)
                 self.logger.debug(f"{fn_name} OK rc={rc} size={sz} attempt={attempt} {debug_label}")
                 return rc, text
 
@@ -334,7 +363,7 @@ class PullSDK:
             )
 
             if rc >= 0:
-                text = buf.value.decode("mbcs", errors="replace")
+                text = _decode_sdk_bytes(buf.value)
                 self.logger.debug(f"GetDeviceData OK rc={rc} size={sz} attempt={attempt}")
                 return rc, text
 
@@ -507,7 +536,7 @@ class PullSDK:
             )
 
             if rc >= 0:
-                text = buf.value.decode("mbcs", errors="replace")
+                text = _decode_sdk_bytes(buf.value)
                 self.logger.debug(f"GetDeviceParam OK rc={rc} size={sz} attempt={attempt}")
                 return text
 
@@ -551,6 +580,8 @@ class PullSDKDevice:
 
         self._sdk: Optional[PullSDK] = None
         self._connected = False
+        self._event_seq: int = 0
+        self._sdk_lock = threading.Lock()  # F-007: serialize concurrent SDK calls
 
     @property
     def is_connected(self) -> bool:
@@ -597,20 +628,22 @@ class PullSDKDevice:
         self._connected = False
 
     def open_door(self, *, door_id: int, pulse_time_ms: int, timeout_ms: int = 4000) -> bool:
-        _ = timeout_ms  # Pull SDK door pulse is synchronous; kept for API symmetry
-        if not self.ensure_connected():
-            return False
-        try:
-            assert self._sdk is not None
-            seconds = int(max(1, min(60, math.ceil(int(pulse_time_ms) / 1000.0))))
-            self._sdk.door_pulse_open(door=int(door_id), seconds=int(seconds))
-            return True
-        except Exception as e:
+        # F-007: serialize concurrent SDK calls with per-device lock
+        with self._sdk_lock:
+            _ = timeout_ms  # Pull SDK door pulse is synchronous; kept for API symmetry
+            if not self.ensure_connected():
+                return False
             try:
-                self.logger.debug(f"[PullSDKDevice][{self.device_id}] open_door failed: {e}")
-            except Exception:
-                pass
-            return False
+                assert self._sdk is not None
+                seconds = int(max(1, min(60, math.ceil(int(pulse_time_ms) / 1000.0))))
+                self._sdk.door_pulse_open(door=int(door_id), seconds=int(seconds))
+                return True
+            except Exception as e:
+                try:
+                    self.logger.debug(f"[PullSDKDevice][{self.device_id}] open_door failed: {e}")
+                except Exception:
+                    pass
+                return False
 
     def poll_rtlog_once(self) -> List[Dict[str, Any]]:
         """
@@ -620,10 +653,19 @@ class PullSDKDevice:
         Returns normalized dicts:
           eventId, doorId, eventType, cardNo, eventTime, table, rawRow
         """
+        # F-007: serialize concurrent SDK calls with per-device lock
+        with self._sdk_lock:
+            return self._poll_rtlog_once_locked()
+
+    def _poll_rtlog_once_locked(self) -> List[Dict[str, Any]]:
+        """Internal: called under _sdk_lock."""
         if not self.ensure_connected():
             return []
 
         assert self._sdk is not None
+
+        self._event_seq += 1
+        seq = self._event_seq
 
         # 1) Preferred: RTLogExt
         try:
@@ -633,7 +675,7 @@ class PullSDKDevice:
                     return []
 
                 out: List[Dict[str, Any]] = []
-                for r in recs:
+                for idx, r in enumerate(recs, 1):
                     rtype = (r.get("type") or "").strip().lower()
                     if rtype != "rtlog":
                         # rtstate (door/alarm state) or unknown => ignore for access events
@@ -647,15 +689,17 @@ class PullSDKDevice:
                     verify = (r.get("verifytype") or "").strip()
                     pin = (r.get("pin") or "").strip()
 
-                    # Create a stable synthetic eventId (device does not provide an id in rtlogext)
-                    event_id = f"{event_time}|{card_no}|{event_code}|{event_addr}|{pin}|{inout}|{verify}"
+                    # Create a stable synthetic eventId (device does not provide an id in rtlogext).
+                    # Include idx (position within this poll batch) to disambiguate same-second events.
+                    event_id = f"{event_time}|{card_no}|{event_code}|{event_addr}|{pin}|{inout}|{verify}|{seq}:{idx}"
 
                     out.append(
                         {
                             "eventId": event_id,
                             "doorId": event_addr or None,
                             "eventType": event_code or "RTLOG",
-                            "cardNo": card_no,
+                            # F-004: use pin as fallback identifier when cardno is empty (PIN-only/fingerprint events)
+                            "cardNo": card_no or pin,
                             "eventTime": event_time,
                             "table": "rtlogext",
                             "rawRow": r,
@@ -682,14 +726,25 @@ class PullSDKDevice:
                 return []
 
             out: List[Dict[str, Any]] = []
-            for r in rows:
+            for idx, r in enumerate(rows, 1):
                 # common keys
                 event_time = self._safe_str(self._get_any(r, ["time", "Time"]), "")
                 card_no = self._safe_str(self._get_any(r, ["cardno", "CardNo"]), "")
                 door_id = self._safe_str(self._get_any(r, ["doorid", "DoorID", "eventaddr", "EventAddr"]), "")
                 event_type = self._safe_str(self._get_any(r, ["eventtype", "EventType", "event", "Event"]), "TX")
 
-                event_id = f"{event_time}|{card_no}|{event_type}|{door_id}"
+                # F-010: Skip non-access event types in transaction table.
+                # Event code 0 = normal punch (access). Larger codes are alarms, sensor events, etc.
+                # Only process events that look like access events (empty type or code 0 or non-numeric).
+                try:
+                    et_int = int(event_type)
+                    if et_int not in (0,) and et_int > 0:
+                        continue  # skip alarm/sensor events
+                except (ValueError, TypeError):
+                    pass  # non-numeric type — keep it (may be "TX" etc.)
+
+                # Include idx (position within this poll batch) to disambiguate same-second events.
+                event_id = f"{event_time}|{card_no}|{event_type}|{door_id}|{seq}:{idx}"
 
                 out.append(
                     {

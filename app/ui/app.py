@@ -437,21 +437,6 @@ class MainApp:
                 unk += 1
         return {"DEVICE": dev, "AGENT": ag, "UNKNOWN": unk}
 
-    def get_access_global_mode(self) -> str:
-        s = self.get_access_mode_summary()
-        has_dev = s["DEVICE"] > 0
-        has_ag = s["AGENT"] > 0
-        if has_dev and has_ag:
-            return "MIXED"
-        if has_dev:
-            return "DEVICE_ONLY"
-        if has_ag:
-            return "AGENT_ONLY"
-        return "UNKNOWN"
-
-    def is_device_mode(self) -> bool:
-        return self.get_access_global_mode() == "DEVICE_ONLY"
-
     # ======================= Log polling =======================
     def _poll_logs(self):
         try:
@@ -647,8 +632,7 @@ class MainApp:
             "loggedIn": bool(auth and auth.token),
             "restricted": bool(reasons),
             "reasons": reasons,
-            "mode": self.get_access_global_mode(),
-            "modeSummary": summary,
+            "mode": summary,
             "host": host,
             "port": port,
             "enabled": enabled,

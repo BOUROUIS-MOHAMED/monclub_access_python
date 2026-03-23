@@ -46,19 +46,29 @@ def get_access_config_status():
 
 
 def build_access_api_endpoints(cfg: AppConfig | ConfigEnvelope | None = None) -> ApiEndpoints:
-    section = load_access_config(cfg)
+    """Build Access-specific API endpoints from centralized constants (app/core/app_const.py)."""
+    from app.core.app_const import (
+        API_LOGIN_URL,
+        API_SYNC_URL,
+        API_CREATE_USER_FINGERPRINT_URL,
+        API_LATEST_RELEASE_URL,
+        API_ACCESS_CREATE_MEMBERSHIP_URL,
+        API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
+        API_OPTIONAL_CONTENT_SYNC_URL,
+    )
     return ApiEndpoints(
-        login_url=section.api_login_url,
-        sync_url=section.api_sync_url,
-        create_user_fingerprint_url=section.api_create_user_fingerprint_url,
-        latest_release_url=section.api_latest_release_url,
-        access_create_membership_url=section.api_access_create_membership_url,
-        access_create_account_membership_url=section.api_access_create_account_membership_url,
+        login_url=API_LOGIN_URL,
+        sync_url=API_SYNC_URL,
+        create_user_fingerprint_url=API_CREATE_USER_FINGERPRINT_URL,
+        latest_release_url=API_LATEST_RELEASE_URL,
+        access_create_membership_url=API_ACCESS_CREATE_MEMBERSHIP_URL,
+        access_create_account_membership_url=API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
         tv_snapshot_latest_url="",
         tv_snapshot_manifest_url="",
         tv_ad_tasks_fetch_url="",
         tv_ad_task_confirm_ready_url="",
         tv_ad_task_submit_proof_url="",
+        optional_content_sync_url=API_OPTIONAL_CONTENT_SYNC_URL,
     )
 
 

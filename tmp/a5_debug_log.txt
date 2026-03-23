@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "C:\Users\mohaa\Desktop\monclub_access_python\tmp\debug.py", line 7, in <module>
-    t.run_tests()
-    ~~~~~~~~~~~^^
-  File "c:\Users\mohaa\Desktop\monclub_access_python\tmp\test_a5_activation.py", line 83, in run_tests
-    assert res["result"] == ATTEMPT_RESULT_ACTIVATED
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AssertionError

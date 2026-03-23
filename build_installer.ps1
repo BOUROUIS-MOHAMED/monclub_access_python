@@ -52,10 +52,31 @@ function Pick-NewestManifest {
   return $m.FullName
 }
 
+function Try-BuildSharedUpdater {
+  $scriptPath = Join-Path $ROOT "build_updater.ps1"
+  if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+    return $false
+  }
+
+  Write-Host "Shared updater missing. Building it now..." -ForegroundColor Yellow
+  & powershell -ExecutionPolicy Bypass -File $scriptPath
+  if ($LASTEXITCODE -ne 0) {
+    Write-Warning "build_updater.ps1 failed with exit code $LASTEXITCODE"
+    return $false
+  }
+  return $true
+}
+
 function Resolve-UpdaterSourcePath {
   $generic = Join-Path $ROOT ("installer\updater\{0}" -f $meta.UpdaterSourceExe)
   if (Test-Path -LiteralPath $generic -PathType Leaf) {
     return $generic
+  }
+
+  if (Try-BuildSharedUpdater) {
+    if (Test-Path -LiteralPath $generic -PathType Leaf) {
+      return $generic
+    }
   }
 
   $legacyAccess = Join-Path $ROOT "installer\updater\MonClubAccessUpdater.exe"

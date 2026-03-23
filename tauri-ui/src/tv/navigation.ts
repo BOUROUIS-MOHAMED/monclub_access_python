@@ -3,11 +3,13 @@ import {
   Download,
   LayoutDashboard,
   MonitorPlay,
+  ScrollText,
   ShieldAlert,
   type LucideIcon,
 } from "lucide-react";
 
 export type TvOverviewSectionId = "overview" | "bindings" | "startup" | "updates" | "operations";
+export type TvDashboardView = "overview" | "logs" | "settings" | "profile" | "update";
 
 export interface TvDashboardNavItem {
   to: string;
@@ -15,7 +17,8 @@ export interface TvDashboardNavItem {
   icon: LucideIcon;
   title: string;
   description: string;
-  focusSection: TvOverviewSectionId;
+  view: TvDashboardView;
+  focusSection?: TvOverviewSectionId;
 }
 
 export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
@@ -25,6 +28,7 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     icon: LayoutDashboard,
     title: "TV Command Center",
     description: "Global health, binding pressure, and quick operator actions for the signage runtime.",
+    view: "overview",
     focusSection: "overview",
   },
   {
@@ -33,6 +37,7 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     icon: MonitorPlay,
     title: "Screen Bindings",
     description: "Monitor assignments, runtime states, and per-screen support actions.",
+    view: "overview",
     focusSection: "bindings",
   },
   {
@@ -41,15 +46,16 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     icon: ShieldAlert,
     title: "Startup Safety",
     description: "Preflight checks, reconciliation history, and crash-recovery diagnostics.",
+    view: "overview",
     focusSection: "startup",
   },
   {
     to: "/tv-updates",
     label: "Updates",
     icon: Download,
-    title: "Update Runtime",
-    description: "Standalone MonClub TV release status, download progress, and install readiness.",
-    focusSection: "updates",
+    title: "Software Updates",
+    description: "Check for new MonClub TV releases, download and install updates.",
+    view: "update",
   },
   {
     to: "/tv-operations",
@@ -57,7 +63,16 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     icon: Activity,
     title: "Operations & Retention",
     description: "Retention cleanup, monitor discovery, and long-running operational visibility.",
+    view: "overview",
     focusSection: "operations",
+  },
+  {
+    to: "/tv-logs",
+    label: "Logs",
+    icon: ScrollText,
+    title: "Runtime Logs",
+    description: "Live TV runtime logs for player launch, recovery, sync, and update diagnostics.",
+    view: "logs",
   },
 ];
 

@@ -51,6 +51,15 @@ def get_access_storage_status() -> Dict[str, Any]:
 
 
 _ensure_column = _legacy_access_db._ensure_column
+get_optional_sync_state = _legacy_access_db.get_optional_sync_state
+save_optional_sync_state = _legacy_access_db.save_optional_sync_state
+delete_passed_optional_events = _legacy_access_db.delete_passed_optional_events
+replace_optional_events = _legacy_access_db.replace_optional_events
+replace_optional_products = _legacy_access_db.replace_optional_products
+replace_optional_deals = _legacy_access_db.replace_optional_deals
+list_optional_upcoming_events = _legacy_access_db.list_optional_upcoming_events
+list_optional_products = _legacy_access_db.list_optional_products
+list_optional_deals = _legacy_access_db.list_optional_deals
 archive_offline_creation = _legacy_access_db.archive_offline_creation
 cancel_offline_creation = _legacy_access_db.cancel_offline_creation
 claim_offline_creation_for_processing = _legacy_access_db.claim_offline_creation_for_processing
@@ -83,6 +92,15 @@ update_offline_creation_payload = _legacy_access_db.update_offline_creation_payl
 
 __all__ = [
     "_ensure_column",
+    "get_optional_sync_state",
+    "save_optional_sync_state",
+    "delete_passed_optional_events",
+    "replace_optional_events",
+    "replace_optional_products",
+    "replace_optional_deals",
+    "list_optional_upcoming_events",
+    "list_optional_products",
+    "list_optional_deals",
     "archive_offline_creation",
     "cancel_offline_creation",
     "claim_offline_creation_for_processing",

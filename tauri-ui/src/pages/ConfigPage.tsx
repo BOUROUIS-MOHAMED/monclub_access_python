@@ -167,24 +167,6 @@ export default function ConfigPage() {
             </AccordionContent>
           </AccordionItem>
 
-          <AccordionItem value="api">
-            <AccordionTrigger>URLs API</AccordionTrigger>
-            <AccordionContent className="space-y-4">
-              <div className="space-y-1.5">
-                <Label>URL Backend</Label>
-                <Input value={cfg.backend_url || ""} onChange={(e) => update("backend_url", e.target.value)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label>Port API local</Label>
-                <Input type="number" value={cfg.local_api_port ?? 8788} onChange={(e) => update("local_api_port", parseInt(e.target.value) || 8788)} />
-              </div>
-              <div className="space-y-1.5">
-                <Label>Hôte API local</Label>
-                <Input value={cfg.local_api_host || "127.0.0.1"} onChange={(e) => update("local_api_host", e.target.value)} />
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-
           <AccordionItem value="tray">
             <AccordionTrigger>Tray</AccordionTrigger>
             <AccordionContent className="space-y-3">

@@ -46,19 +46,27 @@ def get_tv_config_status():
 
 
 def build_tv_api_endpoints(cfg: AppConfig | ConfigEnvelope | None = None) -> ApiEndpoints:
-    section = load_tv_config(cfg)
+    """Build TV-specific API endpoints from centralized constants (app/core/app_const.py)."""
+    from app.core.app_const import (
+        API_LATEST_RELEASE_URL,
+        API_TV_SNAPSHOT_LATEST_URL,
+        API_TV_SNAPSHOT_MANIFEST_URL,
+        API_TV_AD_TASKS_FETCH_URL,
+        API_TV_AD_TASK_CONFIRM_READY_URL,
+        API_TV_AD_TASK_SUBMIT_PROOF_URL,
+    )
     return ApiEndpoints(
         login_url="",
         sync_url="",
         create_user_fingerprint_url="",
-        latest_release_url=section.api_latest_release_url,
+        latest_release_url=API_LATEST_RELEASE_URL,
         access_create_membership_url="",
         access_create_account_membership_url="",
-        tv_snapshot_latest_url=section.api_tv_snapshot_latest_url,
-        tv_snapshot_manifest_url=section.api_tv_snapshot_manifest_url,
-        tv_ad_tasks_fetch_url=section.api_tv_ad_tasks_fetch_url,
-        tv_ad_task_confirm_ready_url=section.api_tv_ad_task_confirm_ready_url,
-        tv_ad_task_submit_proof_url=section.api_tv_ad_task_submit_proof_url,
+        tv_snapshot_latest_url=API_TV_SNAPSHOT_LATEST_URL,
+        tv_snapshot_manifest_url=API_TV_SNAPSHOT_MANIFEST_URL,
+        tv_ad_tasks_fetch_url=API_TV_AD_TASKS_FETCH_URL,
+        tv_ad_task_confirm_ready_url=API_TV_AD_TASK_CONFIRM_READY_URL,
+        tv_ad_task_submit_proof_url=API_TV_AD_TASK_SUBMIT_PROOF_URL,
     )
 
 

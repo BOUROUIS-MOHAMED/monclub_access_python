@@ -19,9 +19,14 @@ export function getTvPlayerWindowLabel(bindingId: number) {
 }
 
 export function matchesAssignedMonitor(binding: TvScreenBinding, monitor: DesktopMonitor) {
-  if (!binding.monitor_id && !binding.monitor_label) {
+  if (!binding.monitor_id && !binding.monitor_label && !binding.target_display_id) {
     return true;
   }
+  // Primary: target_display_id (set by the auto-attach resolution algorithm)
+  if (binding.target_display_id && monitor.name === binding.target_display_id) {
+    return true;
+  }
+  // Fallback: legacy monitor_id / monitor_label
   return monitor.name === binding.monitor_id || monitor.name === binding.monitor_label;
 }
 
@@ -107,7 +112,7 @@ export async function ensureTvPlayerWindow(
     y: assignedMonitor.position.y,
     width: assignedMonitor.size.width,
     height: assignedMonitor.size.height,
-    fullscreen: binding.fullscreen,
+    fullscreen: Boolean(binding.fullscreen),
     decorations: !binding.fullscreen,
     focus: true,
   });

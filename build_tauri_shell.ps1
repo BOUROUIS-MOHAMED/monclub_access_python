@@ -21,6 +21,17 @@ $sourceExe = Join-Path $tauriDir ("src-tauri\target\{0}\monclub-access-ui.exe" -
 $stagingDir = Join-Path $ROOT (($meta.UiStagingDir -replace '^\.[\\/]', ''))
 $stagedExe = Join-Path $stagingDir $meta.UiExeName
 $metadataPath = Join-Path $stagingDir "tauri-shell-metadata.json"
+$iconsDir = Join-Path $tauriDir "src-tauri\icons"
+$tvIconMap = [ordered]@{
+  "tv-32x32.png"     = "32x32.png"
+  "tv-128x128.png"   = "128x128.png"
+  "tv-128x128@2x.png" = "128x128@2x.png"
+  "tv-256x256.png"   = "256x256.png"
+  "tv-icon.png"      = "icon.png"
+  "tv-icon.ico"      = "icon.ico"
+  "tv-tray.png"      = "tray.png"
+}
+$iconRestoreDir = $null
 
 Write-Host "== Build Tauri shell ==" -ForegroundColor Cyan
 Write-Host "Component : $($meta.DisplayName)"
@@ -39,6 +50,29 @@ if (-not (Test-Path $tauriDir)) {
 
 Push-Location $tauriDir
 try {
+  if ($Component -eq "tv") {
+    foreach ($sourceName in $tvIconMap.Keys) {
+      $sourcePath = Join-Path $iconsDir $sourceName
+      if (-not (Test-Path $sourcePath)) {
+        throw "TV icon asset missing: $sourcePath"
+      }
+    }
+
+    $iconRestoreDir = Join-Path ([System.IO.Path]::GetTempPath()) ("monclub-tauri-icon-backup-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force $iconRestoreDir | Out-Null
+
+    foreach ($targetName in $tvIconMap.Values) {
+      $targetPath = Join-Path $iconsDir $targetName
+      if (Test-Path $targetPath) {
+        Copy-Item -LiteralPath $targetPath -Destination (Join-Path $iconRestoreDir $targetName) -Force
+      }
+    }
+
+    foreach ($entry in $tvIconMap.GetEnumerator()) {
+      Copy-Item -LiteralPath (Join-Path $iconsDir $entry.Key) -Destination (Join-Path $iconsDir $entry.Value) -Force
+    }
+  }
+
   if (-not (Test-Path ".\node_modules")) {
     Write-Host "node_modules not found. Running npm install..." -ForegroundColor Yellow
     npm install
@@ -60,6 +94,8 @@ try {
     if ($Profile -eq "release") {
       $cargoArgs += "--release"
     }
+    $cargoArgs += "--features"
+    $cargoArgs += "custom-protocol"
     cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) {
       throw "cargo build ($Profile) failed with exit code $LASTEXITCODE"
@@ -70,6 +106,15 @@ try {
   }
 }
 finally {
+  if ($iconRestoreDir -and (Test-Path $iconRestoreDir)) {
+    foreach ($targetName in $tvIconMap.Values) {
+      $backupPath = Join-Path $iconRestoreDir $targetName
+      if (Test-Path $backupPath) {
+        Copy-Item -LiteralPath $backupPath -Destination (Join-Path $iconsDir $targetName) -Force
+      }
+    }
+    Remove-Item -LiteralPath $iconRestoreDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
   Pop-Location
 }
 

@@ -131,13 +131,11 @@ class AppConfig:
     # -------------------------
     # Desktop auto-update
     # -------------------------
-    api_latest_release_url: str = "http://monclubwigo.tn/api/v1/manager/access/getLatestAccessSoftwareRelease"
-
     update_enabled: bool = True
     update_platform: str = "WINDOWS"  # request param (server returns "windows")
     update_channel: str = "stable"
     update_check_interval_sec: int = 30
-    update_auto_download_zip: bool = True
+    update_auto_download_zip: bool = False
 
     # -------------------------
     # Finger template
@@ -156,19 +154,6 @@ class AppConfig:
     # -------------------------
     log_level: str = "DEBUG"
 
-    # -------------------------
-    # MonClub API
-    # -------------------------
-    api_login_url: str = "http://monclubwigo.tn/api/v1/public/access/v1/gym/login"
-    api_sync_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/users/get_gym_users"
-    api_create_user_fingerprint_url: str = "http://monclubwigo.tn/api/v1/manager/userFingerprint/create"
-    api_access_create_membership_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/activeMembership/create"
-    api_access_create_account_membership_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/account-and-activeMembership/create"
-    api_tv_snapshot_latest_url: str = "http://monclubwigo.tn/api/v1/manager/tv/screens/{screenId}/snapshots/latest"
-    api_tv_snapshot_manifest_url: str = "http://monclubwigo.tn/api/v1/manager/tv/snapshots/{snapshotId}/asset-manifest"
-    api_tv_ad_tasks_fetch_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks"
-    api_tv_ad_task_confirm_ready_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/confirm-ready"
-    api_tv_ad_task_submit_proof_url: str = "http://monclubwigo.tn/api/v1/manager/gym/access/v1/tv/ad-tasks/{taskId}/submit-proof"
     # -------------------------
     # Sync schedule (seconds)
     # -------------------------
@@ -213,6 +198,7 @@ class AppConfig:
     tray_enabled: bool = True
     minimize_to_tray_on_close: bool = True
     start_minimized_to_tray: bool = False
+    start_on_system_startup: bool = False
 
     # Convenience: remember last email typed (NOT password)
     login_email: str = ""
@@ -423,28 +409,6 @@ class AppConfig:
         if not cfg.log_level:
             cfg.log_level = "DEBUG"
 
-        # api urls
-        if not cfg.api_login_url:
-            cfg.api_login_url = AppConfig.api_login_url
-        if not cfg.api_sync_url:
-            cfg.api_sync_url = AppConfig.api_sync_url
-        if not cfg.api_create_user_fingerprint_url:
-            cfg.api_create_user_fingerprint_url = AppConfig.api_create_user_fingerprint_url
-        if not cfg.api_access_create_membership_url:
-            cfg.api_access_create_membership_url = AppConfig.api_access_create_membership_url
-        if not cfg.api_access_create_account_membership_url:
-            cfg.api_access_create_account_membership_url = AppConfig.api_access_create_account_membership_url
-        if not cfg.api_tv_snapshot_latest_url:
-            cfg.api_tv_snapshot_latest_url = AppConfig.api_tv_snapshot_latest_url
-        if not cfg.api_tv_snapshot_manifest_url:
-            cfg.api_tv_snapshot_manifest_url = AppConfig.api_tv_snapshot_manifest_url
-        if not cfg.api_tv_ad_tasks_fetch_url:
-            cfg.api_tv_ad_tasks_fetch_url = AppConfig.api_tv_ad_tasks_fetch_url
-        if not cfg.api_tv_ad_task_confirm_ready_url:
-            cfg.api_tv_ad_task_confirm_ready_url = AppConfig.api_tv_ad_task_confirm_ready_url
-        if not cfg.api_tv_ad_task_submit_proof_url:
-            cfg.api_tv_ad_task_submit_proof_url = AppConfig.api_tv_ad_task_submit_proof_url
-
         # sync interval
         try:
             cfg.sync_interval_sec = int(cfg.sync_interval_sec) if cfg.sync_interval_sec else 60
@@ -476,14 +440,12 @@ class AppConfig:
         cfg.tray_enabled = bool(cfg.tray_enabled) if cfg.tray_enabled is not None else True
         cfg.minimize_to_tray_on_close = bool(cfg.minimize_to_tray_on_close) if cfg.minimize_to_tray_on_close is not None else True
         cfg.start_minimized_to_tray = bool(cfg.start_minimized_to_tray) if cfg.start_minimized_to_tray is not None else False
+        cfg.start_on_system_startup = bool(cfg.start_on_system_startup) if getattr(cfg, "start_on_system_startup", None) is not None else False
 
         if cfg.login_email is None:
             cfg.login_email = ""
 
         # update system
-        if not getattr(cfg, "api_latest_release_url", ""):
-            cfg.api_latest_release_url = AppConfig.api_latest_release_url
-
         cfg.update_enabled = bool(getattr(cfg, "update_enabled", True)) if getattr(cfg, "update_enabled", None) is not None else True
 
         cfg.update_platform = _safe_str(getattr(cfg, "update_platform", "WINDOWS"), "WINDOWS").strip().upper() or "WINDOWS"
@@ -496,7 +458,7 @@ class AppConfig:
         if cfg.update_check_interval_sec < 60:
             cfg.update_check_interval_sec = 60
 
-        cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", True), True)
+        cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", False), False)
 
         return cfg
 

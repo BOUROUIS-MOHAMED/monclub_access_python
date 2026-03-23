@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Outlet, NavLink, useLocation } from "react-router-dom";
+import { Outlet, NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useApp } from "@/context/AppContext";
 import { useTrayIntegration } from "@/hooks/useTrayIntegration";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -14,6 +14,11 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -29,7 +34,11 @@ import {
   ChevronLeft,
   AlertTriangle,
   ShieldCheck,
+  User,
+  Download,
+  ArrowRight,
 } from "lucide-react";
+import { SidebarUpdateCard } from "@/components/SidebarUpdateCard";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -38,7 +47,6 @@ const NAV = [
   { to: "/enroll", label: "Enrolement", icon: Fingerprint },
   { to: "/agent", label: "Agent", icon: Bot },
   { to: "/logs", label: "Logs", icon: FileText },
-  { to: "/config", label: "Configuration", icon: Settings },
   { to: "/local-db", label: "Base locale", icon: Database },
 ] as const;
 
@@ -46,9 +54,14 @@ export default function MainLayout() {
   const { status, logout } = useApp();
   const { quitRequested, confirmQuit, cancelQuit } = useTrayIntegration(8788);
   const location = useLocation();
+  const navigate = useNavigate();
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [logoutConfirm, setLogoutConfirm] = useState(false);
+
+  const updateAvailable = status?.updates?.updateAvailable ?? false;
+  const latestVersion = (status?.updates as { latestVersion?: string | null })?.latestVersion ?? null;
+  const latestCodename = (status?.updates as { latestCodename?: string | null })?.latestCodename ?? null;
 
   const s = status?.session;
   const hasLoginWarning = s?.loginWarning && (s?.loginDaysRemaining ?? 99) > 0;
@@ -85,7 +98,7 @@ export default function MainLayout() {
                   MonClub Access
                 </div>
                 <div className="truncate text-[11px] text-muted-foreground">
-                  {s?.email ?? "Contrôle d'accès"}
+                  Contrôle d'accès
                 </div>
               </div>
             </div>
@@ -130,36 +143,154 @@ export default function MainLayout() {
           </nav>
         </ScrollArea>
 
-        {/* Bottom: warning badges + logout */}
-        <div className="border-t border-border px-2 py-2 space-y-1 shrink-0">
-          {sidebarOpen && (hasLoginWarning || hasContractWarning) && (
-            <div className="space-y-1 mb-1">
-              {hasLoginWarning && (
-                <div className="flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1">
-                  <AlertTriangle className="h-3 w-3 shrink-0 text-amber-400" />
-                  <span className="text-[11px] text-amber-400">Session: {s!.loginDaysRemaining}j</span>
-                </div>
-              )}
-              {hasContractWarning && (
-                <div className="flex items-center gap-1.5 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1">
-                  <AlertTriangle className="h-3 w-3 shrink-0 text-red-400" />
-                  <span className="text-[11px] text-red-400">Contrat: {s!.contractDaysRemaining}j</span>
-                </div>
-              )}
+        {/* Update notification card */}
+        <SidebarUpdateCard
+          updateAvailable={updateAvailable}
+          latestVersion={latestVersion}
+          latestCodename={latestCodename}
+          sidebarOpen={sidebarOpen}
+          onClick={() => navigate("/update")}
+        />
+
+        {/* Warning badges */}
+        {sidebarOpen && (hasLoginWarning || hasContractWarning) && (
+          <div className="shrink-0 px-2 pb-1 space-y-1">
+            {hasLoginWarning && (
+              <div className="flex items-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1">
+                <AlertTriangle className="h-3 w-3 shrink-0 text-amber-400" />
+                <span className="text-[11px] text-amber-400">Session: {s!.loginDaysRemaining}j</span>
+              </div>
+            )}
+            {hasContractWarning && (
+              <div className="flex items-center gap-1.5 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1">
+                <AlertTriangle className="h-3 w-3 shrink-0 text-red-400" />
+                <span className="text-[11px] text-red-400">Contrat: {s!.contractDaysRemaining}j</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Bottom icon bar: Profile, Settings, Theme, Logout */}
+        <div className="border-t border-border px-2 py-2 shrink-0">
+          {sidebarOpen ? (
+            <div className="flex items-center justify-between gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/profile") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/profile")}
+                  >
+                    <User className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Profil</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/config") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/config")}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Configuration</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <ThemeToggle />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="top">Thème</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setLogoutConfirm(true)}
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Déconnexion</TooltipContent>
+              </Tooltip>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/profile") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/profile")}
+                  >
+                    <User className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Profil</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn(
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
+                      location.pathname.startsWith("/config") && "bg-primary/10 text-primary",
+                    )}
+                    onClick={() => navigate("/config")}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Configuration</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>
+                    <ThemeToggle />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="right">Thème</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                    onClick={() => setLogoutConfirm(true)}
+                  >
+                    <LogOut className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="right">Déconnexion</TooltipContent>
+              </Tooltip>
             </div>
           )}
-          <Button
-            variant="ghost"
-            size={sidebarOpen ? "sm" : "icon"}
-            className={cn(
-              "w-full text-muted-foreground hover:text-foreground hover:bg-muted",
-              sidebarOpen ? "justify-start gap-2 px-2.5" : "h-9 w-full",
-            )}
-            onClick={() => setLogoutConfirm(true)}
-          >
-            <LogOut className="h-3.5 w-3.5 shrink-0" />
-            {sidebarOpen && <span className="text-[13px]">Deconnexion</span>}
-          </Button>
         </div>
       </aside>
 
@@ -168,9 +299,6 @@ export default function MainLayout() {
         {/* Top bar */}
         <header className="flex items-center justify-between h-14 border-b border-border px-5 bg-background shrink-0">
           <div className="flex items-center gap-2">
-            {s?.email && (
-              <span className="text-[13px] text-muted-foreground hidden sm:inline">{s.email}</span>
-            )}
             {status?.sync?.running && (
               <Badge className="border-primary/25 bg-primary/10 text-primary text-[11px] gap-1">
                 <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
@@ -195,7 +323,6 @@ export default function MainLayout() {
                 )}
               </>
             )}
-            <ThemeToggle />
           </div>
         </header>
 

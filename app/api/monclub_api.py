@@ -22,6 +22,7 @@ class ApiEndpoints:
     tv_ad_tasks_fetch_url: str = ""
     tv_ad_task_confirm_ready_url: str = ""
     tv_ad_task_submit_proof_url: str = ""
+    optional_content_sync_url: str = ""
 
 class MonClubApiError(RuntimeError):
     pass
@@ -164,6 +165,8 @@ class MonClubApi:
         platform: str = "WINDOWS",
         channel: str = "stable",
         release_id: Optional[str] = None,
+        current_version: Optional[str] = None,
+        target: Optional[str] = None,
         timeout: int = 20,
     ) -> Dict[str, Any]:
         url = (self.endpoints.latest_release_url or "").strip()
@@ -177,6 +180,10 @@ class MonClubApi:
             params["channel"] = channel
         if release_id:
             params["releaseId"] = release_id
+        if current_version:
+            params["currentVersion"] = current_version
+        if target:
+            params["target"] = target
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -211,6 +218,8 @@ class MonClubApi:
         platform: str = "WINDOWS",
         channel: str = "stable",
         release_id: Optional[str] = None,
+        current_version: Optional[str] = None,
+        target: Optional[str] = None,
         timeout: int = 20,
     ) -> Dict[str, Any]:
         return self.get_latest_software_release(
@@ -218,6 +227,8 @@ class MonClubApi:
             platform=platform,
             channel=channel,
             release_id=release_id,
+            current_version=current_version,
+            target=target,
             timeout=timeout,
         )
 
@@ -483,6 +494,52 @@ class MonClubApi:
         if isinstance(data, dict):
             return data
         return {"ok": True, "raw": data}
+
+    def get_optional_content_sync(
+        self,
+        *,
+        token: str,
+        events_last_version_at: Optional[str] = None,
+        products_last_version_at: Optional[str] = None,
+        deals_last_version_at: Optional[str] = None,
+        timeout: int = 25,
+    ) -> Dict[str, Any]:
+        url = (self.endpoints.optional_content_sync_url or "").strip()
+        if not url:
+            raise MonClubApiError("Optional content sync URL is empty (check Configuration).")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        body: Dict[str, Any] = {}
+        if events_last_version_at is not None:
+            body["eventsLastVersionAt"] = events_last_version_at
+        if products_last_version_at is not None:
+            body["productsLastVersionAt"] = products_last_version_at
+        if deals_last_version_at is not None:
+            body["dealsLastVersionAt"] = deals_last_version_at
+
+        self.logger.info("API getOptionalContentSync -> %s", url)
+        try:
+            r = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"getOptionalContentSync request failed: {e}") from e
+
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            extra = _extract_trace_info(txt)
+            raise MonClubApiError(f"getOptionalContentSync failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
+
+        try:
+            data = r.json()
+        except Exception as e:
+            raise MonClubApiError(f"getOptionalContentSync returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
+
+        if not isinstance(data, dict):
+            raise MonClubApiError("getOptionalContentSync JSON is not an object/dict.")
+        return data
 
     def submit_tv_ad_task_proof(
         self,
