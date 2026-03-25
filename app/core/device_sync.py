@@ -699,8 +699,11 @@ class DeviceSyncEngine:
                 templates = templates_for_sync.get(pin) or []
 
                 try:
-                    # reduce lockout window: do NOT delete user row for refresh
-                    self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                    # Delete user row + auth + templates before re-inserting.
+                    # SetDeviceData is insert-only on most firmware; leaving the user row
+                    # causes rc=-101 (duplicate). _delete_pin_if_exists skips safely if
+                    # the pin isn't on the device.
+                    self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
 
                     # 1) user (overwrite)
                     pairs = [f"Pin={pin}", f"Name={full_name}"]

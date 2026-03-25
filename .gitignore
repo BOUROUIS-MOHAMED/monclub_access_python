@@ -8,6 +8,7 @@ __pycache__/
 venv/
 ENV/
 
+
 # PyCharm IDE
 .idea/
 
@@ -22,6 +23,7 @@ desktop.ini
 
 tauri-ui/node_modules
 tauri-ui/dist
+tauri-ui/component-shells/
 .venv
 tauri-ui/src-tauri/target
 # Distribution / packaging
