@@ -137,6 +137,33 @@ def _default_installer_file_name(component: DesktopComponentIdentity, version: s
     return f"{component.installer_slug}_{safe_version}.exe"
 
 
+def _normalize_download_file_name(name: str, *, default_name: str, expected_ext: str = "") -> str:
+    candidate = _safe_str(name, "").replace("\\", "/").split("/")[-1].strip()
+    if not candidate:
+        candidate = default_name
+
+    if expected_ext and not candidate.lower().endswith(expected_ext.lower()):
+        candidate = f"{candidate}{expected_ext}"
+
+    return candidate
+
+
+def _legacy_download_path_without_extension(path: Path, expected_ext: str) -> Optional[Path]:
+    if not expected_ext:
+        return None
+
+    lower_ext = expected_ext.lower()
+    name = path.name
+    if not name.lower().endswith(lower_ext):
+        return None
+
+    legacy_name = name[: -len(expected_ext)]
+    if not legacy_name:
+        return None
+
+    return path.with_name(legacy_name)
+
+
 @dataclass
 class UpdateStatus:
     # Current installed version info
@@ -427,10 +454,18 @@ class ComponentUpdateManager:
             # Use installer URL if available, otherwise fall back to zip
             if installer_url:
                 download_url = installer_url
-                download_name = installer_name or _default_installer_file_name(self.component, latest_version)
+                download_name = _normalize_download_file_name(
+                    installer_name,
+                    default_name=_default_installer_file_name(self.component, latest_version),
+                    expected_ext=".exe",
+                )
             elif zip_url:
                 download_url = zip_url
-                download_name = zip_name or f"{self.component.artifact_name}-{latest_version}.zip"
+                download_name = _normalize_download_file_name(
+                    zip_name,
+                    default_name=f"{self.component.artifact_name}-{latest_version}.zip",
+                    expected_ext=".zip",
+                )
             else:
                 self._set_update_available(True, downloaded=False, latest=latest)
                 return
@@ -441,6 +476,18 @@ class ComponentUpdateManager:
             ddir = _download_dir(self.install_root, self._platform(), self._channel())
             ddir.mkdir(parents=True, exist_ok=True)
             download_path = ddir / download_name
+
+            if installer_url:
+                legacy_download_path = _legacy_download_path_without_extension(download_path, ".exe")
+                if (
+                    legacy_download_path
+                    and legacy_download_path.exists()
+                    and not download_path.exists()
+                ):
+                    try:
+                        legacy_download_path.replace(download_path)
+                    except Exception:
+                        pass
 
             # Check if already downloaded
             if download_path.exists() and download_path.stat().st_size > 0:
@@ -577,6 +624,20 @@ class ComponentUpdateManager:
             raise RuntimeError(reason)
 
         download_path = Path(self.status.download_path or "")
+        latest = self.status.latest_release or {}
+        installer_obj = latest.get("installer") or {}
+        expected_installer = bool(_safe_str(installer_obj.get("url"), ""))
+
+        if expected_installer and download_path.suffix.lower() != ".exe":
+            fixed_path = download_path.with_name(f"{download_path.name}.exe")
+            if not fixed_path.exists():
+                try:
+                    download_path.replace(fixed_path)
+                    download_path = fixed_path
+                    self.status.download_path = str(download_path)
+                except Exception:
+                    pass
+
         ext = download_path.suffix.lower()
 
         self.logger.info("[Update:%s] launching installer: %s", self.component.component_id, str(download_path))
@@ -589,7 +650,6 @@ class ComponentUpdateManager:
             if not updater.exists():
                 raise RuntimeError(f"Updater not found: {updater}")
 
-            latest = self.status.latest_release or {}
             rid = _safe_str(latest.get("releaseId") or latest.get("version"), "")
             args = [
                 str(updater),

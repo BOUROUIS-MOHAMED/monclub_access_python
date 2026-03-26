@@ -894,7 +894,11 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
               </div>
               <div className="rounded-lg border border-border bg-muted/40 p-4">
                 <div className="text-xs uppercase tracking-wide text-muted-foreground">Current Version</div>
-                <div className="mt-2 text-base font-semibold">{updateStatus.currentVersion || updateStatus.currentReleaseId || "dev"}</div>
+                <div className="mt-2 text-base font-semibold">
+                  {updateStatus.currentVersion && updateStatus.currentVersion !== "0.0.0"
+                    ? updateStatus.currentVersion
+                    : (updateStatus.currentReleaseId || "dev")}
+                </div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Last check {formatEpochSeconds(updateStatus.lastCheckAt)}
                 </div>

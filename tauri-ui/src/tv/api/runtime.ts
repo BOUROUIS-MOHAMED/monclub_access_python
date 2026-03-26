@@ -335,6 +335,73 @@ export function getTvObservabilityEvents(params?: {
   return get(`/tv/observability/events`, query);
 }
 
+export function getTvSnapshotCache(params?: {
+  screenId?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<import("./types").TvSnapshotCacheResponse> {
+  const query: Record<string, string> = {};
+  if (params?.screenId) query.screenId = String(params.screenId);
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/snapshots`, query);
+}
+
+export function getTvLatestSnapshots(
+  screenId?: number,
+): Promise<import("./types").TvLatestSnapshotsResponse> {
+  return get(`/tv/snapshots/latest`, screenId ? { screenId: String(screenId) } : undefined);
+}
+
+export function getTvSnapshotAssets(
+  snapshotId: string,
+): Promise<import("./types").TvSnapshotAssetsResponse> {
+  return get(`/tv/snapshots/${encodeURIComponent(snapshotId)}/assets`);
+}
+
+export function getTvAssets(params?: {
+  screenId?: number;
+  snapshotId?: string;
+  state?: string;
+  mediaAssetId?: string;
+  limit?: number;
+  offset?: number;
+}): Promise<import("./types").TvLocalAssetsResponse> {
+  const query: Record<string, string> = {};
+  if (params?.screenId) query.screenId = String(params.screenId);
+  if (params?.snapshotId) query.snapshotId = params.snapshotId;
+  if (params?.state) query.state = params.state;
+  if (params?.mediaAssetId) query.mediaAssetId = params.mediaAssetId;
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/assets`, query);
+}
+
+export function downloadTvAssets(body?: {
+  screenId?: number;
+  snapshotId?: string;
+}): Promise<{ ok: boolean; message?: string }> {
+  return post(`/tv/assets/download`, body ?? {});
+}
+
+export function getTvReadiness(params?: {
+  screenId?: number;
+  limit?: number;
+  offset?: number;
+}): Promise<import("./types").TvSnapshotReadinessResponse> {
+  const query: Record<string, string> = {};
+  if (params?.screenId) query.screenId = String(params.screenId);
+  if (params?.limit != null) query.limit = String(params.limit);
+  if (params?.offset != null) query.offset = String(params.offset);
+  return get(`/tv/readiness`, query);
+}
+
+export function getTvLatestReadiness(
+  screenId: number,
+): Promise<import("./types").TvLatestReadinessResponse> {
+  return get(`/tv/readiness/latest`, { screenId: String(screenId) });
+}
+
 export function getTvUpdateStatus(): Promise<import("../../api/types").UpdateStatusResponse> {
   return get(`/tv/update/status`);
 }

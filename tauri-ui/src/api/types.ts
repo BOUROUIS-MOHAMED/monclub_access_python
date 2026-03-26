@@ -376,6 +376,128 @@ export interface AccessHistoryRecord {
   createdAt: string;
 }
 
+export interface TvSnapshotCacheRow {
+  id: number;
+  screen_id: number;
+  snapshot_id: string;
+  snapshot_version: number;
+  activation_state: string | null;
+  resolved_at: string | null;
+  resolved_day_of_week: string | null;
+  resolved_preset_id: number | null;
+  resolved_layout_preset_id: number | null;
+  resolved_policy_id: number | null;
+  playback_policy_version: number | null;
+  playback_policy_hash: string | null;
+  generated_at: string | null;
+  fetched_at: string | null;
+  payload_json: string | null;
+  manifest_json: string | null;
+  asset_count: number;
+  warning_count: number;
+  manifest_status: string | null;
+  sync_status: string | null;
+  last_error: string | null;
+  is_latest: number;
+  is_previous_ready: number;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+export interface TvSnapshotCacheResponse {
+  ok: boolean;
+  rows: TvSnapshotCacheRow[];
+  total: number;
+}
+
+export interface TvLatestSnapshotsResponse {
+  ok: boolean;
+  snapshot?: TvSnapshotCacheRow | null;
+  snapshots?: TvSnapshotCacheRow[];
+}
+
+export interface TvSnapshotRequiredAssetRow {
+  id: number;
+  snapshot_id: string;
+  media_asset_id: string;
+  title: string | null;
+  media_type: string | null;
+  download_link: string | null;
+  checksum_sha256: string | null;
+  size_bytes: number | null;
+  mime_type: string | null;
+  duration_in_seconds: number | null;
+  required_in_timelines_json: string | null;
+  source_preset_item_ids_json: string | null;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+export interface TvSnapshotAssetsResponse {
+  ok: boolean;
+  assets: TvSnapshotRequiredAssetRow[];
+  total: number;
+}
+
+export interface TvLocalAssetStateRow {
+  id: number;
+  media_asset_id: string;
+  expected_local_path: string | null;
+  local_file_path: string | null;
+  file_exists: number;
+  local_size_bytes: number | null;
+  local_checksum_sha256: string | null;
+  asset_state: string;
+  state_reason: string | null;
+  validation_mode: string | null;
+  last_checked_at: string | null;
+  last_seen_in_snapshot_version: number | null;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+export interface TvLocalAssetsResponse {
+  ok: boolean;
+  rows: TvLocalAssetStateRow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface TvSnapshotReadinessRow {
+  id: number;
+  screen_id: number;
+  snapshot_id: string;
+  snapshot_version: number;
+  readiness_state: string;
+  total_required_assets: number;
+  ready_asset_count: number;
+  missing_asset_count: number;
+  invalid_asset_count: number;
+  stale_asset_count: number;
+  computed_at: string | null;
+  is_fully_ready: number;
+  is_latest: number;
+  is_previous_ready: number;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+export interface TvSnapshotReadinessResponse {
+  ok: boolean;
+  rows: TvSnapshotReadinessRow[];
+  total: number;
+}
+
+export interface TvLatestReadinessResponse {
+  ok: boolean;
+  readiness: TvSnapshotReadinessRow;
+}
+
 // ─── L) TV Player (A6) ───
 
 export type TvPlayerState =

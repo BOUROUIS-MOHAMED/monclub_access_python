@@ -71,7 +71,7 @@ export default function DashboardPage() {
           { label: "Appareils (DEVICE)", value: String(mode.DEVICE) },
           { label: "Appareils (AGENT)",  value: String(mode.AGENT) },
           { label: "Appareils (inconnu)", value: String(mode.UNKNOWN) },
-          { label: "Dernière sync", value: sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").substring(0, 16) : "Jamais" },
+          { label: "Last sync ", value: sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").substring(0, 16) : "Jamais" },
         ].map(({ label, value }) => (
           <div key={label} className="rounded-lg border border-border bg-muted/40 px-4 py-3">
             <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">{label}</div>

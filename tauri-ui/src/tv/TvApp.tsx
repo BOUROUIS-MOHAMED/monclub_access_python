@@ -4,10 +4,12 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { getTvConfig } from "@/tv/api";
+import { TvAuthGuard } from "@/tv/components/TvAuthGuard";
 import TvDashboardShell from "@/tv/components/TvDashboardShell";
 import { TvOrchestrator } from "@/tv/components/TvOrchestrator";
 import { TvAuthProvider } from "@/tv/context/TvAuthContext";
 import { TV_NAV_ITEMS, type TvDashboardNavItem, type TvOverviewSectionId } from "@/tv/navigation";
+import TvDownloadsPage from "@/tv/pages/TvDownloadsPage";
 import TvLogsPage from "@/tv/pages/TvLogsPage";
 import TvOverviewPage from "@/tv/pages/TvOverviewPage";
 import TvPlayerWindowPage from "@/tv/pages/TvPlayerWindowPage";
@@ -33,6 +35,9 @@ function renderTvRoute(item: TvDashboardNavItem) {
   }
   if (item.view === "update") {
     return <TvUpdatePage />;
+  }
+  if (item.view === "downloads") {
+    return <TvDownloadsPage />;
   }
   return <TvOverviewRoute focusSection={item.focusSection ?? "overview"} />;
 }
@@ -75,10 +80,12 @@ export default function TvApp() {
               {/* All TV dashboard routes */}
               <Route
                 element={(
-                  <>
-                    <TvOrchestrator />
-                    <TvDashboardShell />
-                  </>
+                  <TvAuthGuard>
+                    <>
+                      <TvOrchestrator />
+                      <TvDashboardShell />
+                    </>
+                  </TvAuthGuard>
                 )}
               >
                 {TV_NAV_ITEMS.map((item) => (

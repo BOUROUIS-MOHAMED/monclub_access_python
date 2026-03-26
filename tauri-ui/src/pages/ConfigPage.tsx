@@ -100,6 +100,9 @@ export default function ConfigPage() {
   };
 
   const updates = status?.updates;
+  const currentVersionDisplay = updates?.currentVersion && updates.currentVersion !== "0.0.0"
+    ? updates.currentVersion
+    : (updates?.currentReleaseId || "dev");
 
   if (loading) {
     return <div className="flex items-center justify-center py-20"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
@@ -132,7 +135,7 @@ export default function ConfigPage() {
           <div className="flex items-center justify-between">
             <div className="space-y-1">
               <p className="text-sm">Composant: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.componentDisplayName || "MonClub Access"}</code></p>
-              <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.currentVersion || updates?.currentReleaseId || "dev"}</code></p>
+              <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{currentVersionDisplay}</code></p>
               <p className="text-xs text-muted-foreground">Canal {updates?.channel || "stable"} · Plateforme {updates?.platform || "WINDOWS"}</p>
               {updates?.updateAvailable ? (
                 <Badge variant="warning" className="text-xs">Mise à jour disponible</Badge>

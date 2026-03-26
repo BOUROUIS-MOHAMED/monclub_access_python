@@ -1,5 +1,6 @@
 import {
   Activity,
+  Database,
   Download,
   LayoutDashboard,
   MonitorPlay,
@@ -9,7 +10,7 @@ import {
 } from "lucide-react";
 
 export type TvOverviewSectionId = "overview" | "bindings" | "startup" | "updates" | "operations";
-export type TvDashboardView = "overview" | "logs" | "settings" | "profile" | "update";
+export type TvDashboardView = "overview" | "downloads" | "logs" | "settings" | "profile" | "update";
 
 export interface TvDashboardNavItem {
   to: string;
@@ -48,6 +49,14 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     description: "Preflight checks, reconciliation history, and crash-recovery diagnostics.",
     view: "overview",
     focusSection: "startup",
+  },
+  {
+    to: "/tv-downloads",
+    label: "Downloads",
+    icon: Database,
+    title: "Download Management",
+    description: "Local content inventory, per-screen readiness, schedules, and repair actions for downloaded TV media.",
+    view: "downloads",
   },
   {
     to: "/tv-updates",
