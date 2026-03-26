@@ -1,8 +1,12 @@
 ; installer\MonClubAccess.iss
 ; Build with:
-;   ISCC.exe installer\MonClubAccess.iss /DReleaseId=20260210-124245Z /DStageDir="C:\...\release\_staging\MonClubAccess-20260210-124245Z\MonClubAccess"
+;   ISCC.exe installer\MonClubAccess.iss /DAppVersion=1.0.0 /DStageDir="C:\...\release\_staging\MonClubAccess-20260326-120000Z\MonClubAccess" /DOutputBaseFilename=monclub_access_1.0.0
 
-#define AppName "MonClubAccess"
+#define AppName "MonClub Access"
+
+#ifndef AppVersion
+  #error AppVersion define is missing. Pass /DAppVersion=1.0.0
+#endif
 
 #ifndef ReleaseId
   #define ReleaseId "DEV"
@@ -12,17 +16,15 @@
   #error StageDir define is missing. Pass /DStageDir="full\path\to\staged\MonClubAccess"
 #endif
 
-#ifndef UpdaterSourcePath
-  #error UpdaterSourcePath define is missing. Pass /DUpdaterSourcePath="full\path\to\MonClubDesktopUpdater.exe"
+#ifndef OutputBaseFilename
+  #define OutputBaseFilename "monclub_access"
 #endif
 
-#ifndef UpdaterDestExe
-  #define UpdaterDestExe "MonClubAccessUpdater.exe"
-#endif
-
-#define AppVersion ReleaseId
 #define AppPublisher "MonClub"
 #define MainExe "MonClubAccess.exe"
+#define TauriExe "monclub-access-ui.exe"
+#define DefaultInstallRoot "{localappdata}\MonClubAccess"
+#define LegacyInstallRoot "{localappdata}\MonClub Access"
 
 ; Branding assets (relative to this .iss file)
 #define SetupIcon "assets\setup.ico"
@@ -33,27 +35,21 @@
 AppId={{9B77A9C2-2B97-4F62-A9E8-4B4C65F3A9B1}
 AppName={#AppName}
 AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
-
-; Installer EXE icon
 SetupIconFile={#SetupIcon}
-
-; Installer wizard branding images
 WizardImageFile={#WizardImage}
 WizardSmallImageFile={#WizardSmall}
-
-; Install per-user (no admin) so auto-updates can write without UAC.
-DefaultDirName={localappdata}\MonClubAccess
+DefaultDirName={code:GetInstallRootDefault}
 PrivilegesRequired=lowest
-UsePreviousAppDir=no
-UsePreviousTasks=no
+UsePreviousAppDir=yes
+UsePreviousTasks=yes
 CloseApplications=yes
-CloseApplicationsFilter=MonClubAccess.exe,monclub-access-ui.exe,{#UpdaterDestExe}
+CloseApplicationsFilter={#MainExe},{#TauriExe},MonClubAccessUpdater.exe
 RestartApplications=no
-
 DisableProgramGroupPage=yes
 OutputDir=..\release
-OutputBaseFilename=MonClubAccessSetup-{#ReleaseId}
+OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -63,9 +59,7 @@ Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescri
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Dirs]
-; Pre-create update layout (nice for cleaner runtime behavior)
 Name: "{app}\current"
-Name: "{app}\updater"
 Name: "{app}\downloads"
 Name: "{app}\downloads\windows"
 Name: "{app}\downloads\windows\stable"
@@ -73,23 +67,17 @@ Name: "{app}\downloads\windows\beta"
 Name: "{app}\logs"
 
 [Files]
-; Install staged folder under {app}\current\...
 Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-; Ship updater exe into {app}\updater
-Source: "{#UpdaterSourcePath}"; DestDir: "{app}\updater"; DestName: "{#UpdaterDestExe}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
 Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClubAccess"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Remove the install root including runtime-created folders like downloads/logs/current leftovers.
 Type: filesandordirs; Name: "{app}"
-; Remove persisted data roots so a fresh reinstall starts cleanly.
 Type: filesandordirs; Name: "{commonappdata}\MonClub Access"
 Type: filesandordirs; Name: "{localappdata}\MonClub Access"
 Type: filesandordirs; Name: "{userappdata}\MonClub Access"
@@ -104,6 +92,122 @@ var
   RuntimeCheckStatusLabel: TNewStaticText;
   RuntimeCheckMemo: TNewMemo;
   RuntimeHasWarning: Boolean;
+  ExistingInstallDetected: Boolean;
+  ExistingInstallRoot: string;
+  ExistingInstallVersion: string;
+
+function ExpandPath(const Value: string): string;
+begin
+  Result := ExpandConstant(Value);
+end;
+
+function DefaultInstallRoot(): string;
+begin
+  Result := ExpandPath('{#DefaultInstallRoot}');
+end;
+
+function LegacyInstallRoot(): string;
+begin
+  Result := ExpandPath('{#LegacyInstallRoot}');
+end;
+
+function PathHasInstalledPayload(const RootPath: string): Boolean;
+begin
+  Result :=
+    DirExists(RootPath) and (
+      FileExists(AddBackslash(RootPath) + 'current\version.json') or
+      FileExists(AddBackslash(RootPath) + 'current\{#MainExe}')
+    );
+end;
+
+function DetectExistingInstallRoot(): string;
+begin
+  Result := '';
+
+  if PathHasInstalledPayload(DefaultInstallRoot()) then
+  begin
+    Result := DefaultInstallRoot();
+    exit;
+  end;
+
+  if PathHasInstalledPayload(LegacyInstallRoot()) then
+  begin
+    Result := LegacyInstallRoot();
+    exit;
+  end;
+end;
+
+function TryExtractJsonStringValue(const JsonText: string; const Key: string; var Value: string): Boolean;
+var
+  Needle: string;
+  KeyPos: Integer;
+  ColonPos: Integer;
+  StartPos: Integer;
+  EndPos: Integer;
+begin
+  Result := False;
+  Value := '';
+  Needle := '"' + Key + '"';
+  KeyPos := Pos(Needle, JsonText);
+  if KeyPos = 0 then
+    exit;
+
+  ColonPos := KeyPos + Length(Needle);
+  while (ColonPos <= Length(JsonText)) and (JsonText[ColonPos] <> ':') do
+    ColonPos := ColonPos + 1;
+  if ColonPos > Length(JsonText) then
+    exit;
+
+  StartPos := ColonPos + 1;
+  while (StartPos <= Length(JsonText)) and ((JsonText[StartPos] = ' ') or (JsonText[StartPos] = #9) or (JsonText[StartPos] = #10) or (JsonText[StartPos] = #13)) do
+    StartPos := StartPos + 1;
+  if (StartPos > Length(JsonText)) or (JsonText[StartPos] <> '"') then
+    exit;
+
+  StartPos := StartPos + 1;
+  EndPos := StartPos;
+  while EndPos <= Length(JsonText) do
+  begin
+    if (JsonText[EndPos] = '"') and ((EndPos = StartPos) or (JsonText[EndPos - 1] <> '\')) then
+      break;
+    EndPos := EndPos + 1;
+  end;
+  if EndPos > Length(JsonText) then
+    exit;
+
+  Value := Copy(JsonText, StartPos, EndPos - StartPos);
+  Result := True;
+end;
+
+function TryReadInstalledVersion(const RootPath: string; var Version: string): Boolean;
+var
+  VersionPath: string;
+  JsonText: AnsiString;
+begin
+  Result := False;
+  Version := '';
+  VersionPath := AddBackslash(RootPath) + 'current\version.json';
+  if not FileExists(VersionPath) then
+    exit;
+  if not LoadStringFromFile(VersionPath, JsonText) then
+    exit;
+  Result := TryExtractJsonStringValue(JsonText, 'version', Version);
+end;
+
+function SameVersionInstalled(): Boolean;
+begin
+  Result := ExistingInstallDetected and
+    (Trim(ExistingInstallVersion) <> '') and
+    (Lowercase(Trim(ExistingInstallVersion)) = Lowercase('{#AppVersion}'));
+end;
+
+function GetInstallRootDefault(Param: string): string;
+begin
+  if ExistingInstallDetected and (Trim(ExistingInstallRoot) <> '') then
+    Result := ExistingInstallRoot
+  else
+    Result := DefaultInstallRoot();
+end;
 
 procedure ExecAndLog(const CmdLine: string);
 var
@@ -117,9 +221,9 @@ end;
 
 procedure KillRunningMonClubProcesses();
 begin
-  Log('Ensuring MonClub processes are stopped...');
-  ExecAndLog('taskkill /F /T /IM "MonClubAccess.exe"');
-  ExecAndLog('taskkill /F /T /IM "monclub-access-ui.exe"');
+  Log('Ensuring MonClub Access processes are stopped...');
+  ExecAndLog('taskkill /F /T /IM "{#MainExe}"');
+  ExecAndLog('taskkill /F /T /IM "{#TauriExe}"');
   ExecAndLog('taskkill /F /T /IM "MonClubAccessUpdater.exe"');
 end;
 
@@ -236,6 +340,30 @@ begin
   RuntimeHasWarning := False;
   RuntimeCheckMemo.Lines.Clear;
 
+  if SameVersionInstalled() then
+  begin
+    RuntimeCheckMemo.Lines.Add('MonClub Access ' + '{#AppVersion}' + ' is already installed.');
+    RuntimeCheckMemo.Lines.Add('No update is needed for this package.');
+    RuntimeCheckStatusLabel.Caption := 'Status: already up to date.';
+    exit;
+  end;
+
+  if ExistingInstallDetected then
+  begin
+    RuntimeCheckMemo.Lines.Add('Existing installation detected:');
+    RuntimeCheckMemo.Lines.Add('  Root: ' + ExistingInstallRoot);
+    if Trim(ExistingInstallVersion) <> '' then
+      RuntimeCheckMemo.Lines.Add('  Installed version: ' + ExistingInstallVersion);
+    RuntimeCheckMemo.Lines.Add('  Package version: ' + '{#AppVersion}');
+    RuntimeCheckMemo.Lines.Add('');
+  end
+  else
+  begin
+    RuntimeCheckMemo.Lines.Add('No existing MonClub Access installation detected.');
+    RuntimeCheckMemo.Lines.Add('This package will run as a fresh installer.');
+    RuntimeCheckMemo.Lines.Add('');
+  end;
+
   RuntimeCheckMemo.Lines.Add('Installer runtime checks:');
   RuntimeCheckMemo.Lines.Add('');
 
@@ -273,8 +401,33 @@ begin
 
   if RuntimeHasWarning then
     RuntimeCheckStatusLabel.Caption := 'Status: warnings found. Click Next to continue or Cancel to stop.'
+  else if ExistingInstallDetected then
+    RuntimeCheckStatusLabel.Caption := 'Status: ready to update the existing installation.'
   else
-    RuntimeCheckStatusLabel.Caption := 'Status: checks passed.';
+    RuntimeCheckStatusLabel.Caption := 'Status: ready to install.';
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  ExistingInstallRoot := DetectExistingInstallRoot();
+  ExistingInstallDetected := Trim(ExistingInstallRoot) <> '';
+  ExistingInstallVersion := '';
+  if ExistingInstallDetected then
+    TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
+
+  if SameVersionInstalled() then
+  begin
+    MsgBox(
+      'MonClub Access version ' + '{#AppVersion}' + ' is already installed on this PC.' + #13#10 +
+      'Nothing will be changed.',
+      mbInformation,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  Result := True;
 end;
 
 procedure InitializeWizard();
@@ -282,7 +435,7 @@ begin
   RuntimeCheckPage := CreateCustomPage(
     wpWelcome,
     'Runtime Prerequisite Check',
-    'MonClub Access checks required runtimes before installation.'
+    'MonClub Access checks required runtimes before installation or update.'
   );
 
   RuntimeCheckStatusLabel := TNewStaticText.Create(RuntimeCheckPage);
@@ -334,18 +487,10 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
 
-  { Fresh install behavior requested:
-    - stop running app/UI/updater
-    - remove previous install folder
-    - remove persisted data roots (ProgramData/LocalAppData/Roaming) }
   KillRunningMonClubProcesses();
   Sleep(900);
 
-  DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClubAccess'));
-  DeleteTreeIfExists(ExpandConstant('{commonappdata}\MonClub Access'));
-  DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClub Access'));
-  DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClub Access'));
-  DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClubAccess'));
+  DeleteTreeIfExists(ExpandConstant('{app}\current'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

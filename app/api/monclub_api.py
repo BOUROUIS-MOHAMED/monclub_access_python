@@ -17,6 +17,7 @@ class ApiEndpoints:
     latest_release_url: str  # NEW
     access_create_membership_url: str = ""
     access_create_account_membership_url: str = ""
+    sync_access_history_url: str = ""
     tv_snapshot_latest_url: str = ""
     tv_snapshot_manifest_url: str = ""
     tv_ad_tasks_fetch_url: str = ""
@@ -286,6 +287,44 @@ class MonClubApi:
             payload=payload,
             timeout=timeout,
         )
+
+    def sync_access_history(self, *, token: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+        url = (self.endpoints.sync_access_history_url or "").strip()
+        if not url:
+            raise MonClubApiError("Access history sync URL is empty (check Configuration).")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+        self.logger.info("API syncAccessHistory -> %s", url)
+        try:
+            r = self._session.post(url, json=(payload or {}), headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"syncAccessHistory request failed: {e}") from e
+
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            extra = _extract_trace_info(txt)
+            raise MonClubApiHttpError(
+                f"syncAccessHistory failed: HTTP {r.status_code} -> {txt[:500]}{extra}",
+                status_code=r.status_code,
+                body=txt,
+            )
+
+        try:
+            data = r.json()
+        except Exception:
+            raw = (r.text or "").strip()
+            if not raw:
+                return {"ok": True}
+            return {"ok": True, "raw": raw}
+
+        if isinstance(data, dict):
+            return data
+        return {"ok": True, "raw": data}
 
 
     def _format_url_template(self, url: str, **kwargs: Any) -> str:

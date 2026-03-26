@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
 from shared.api.monclub_api import MonClubApi
@@ -25,6 +26,8 @@ from tv.config import (
 from tv.auth_bridge import load_tv_auth_for_runtime
 from tv.store import get_tv_storage_status
 from tv.update_runtime import TvUpdateManager, UpdateStatus
+
+WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -80,6 +83,7 @@ class TvApp:
         self._tauri_process = None
         self._update_manager = TvUpdateManager(app=self, cfg=self.cfg, logger=self.logger, api_factory=self._api)
         self._update_status: UpdateStatus | None = None
+        self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
 
         self.after(200, self._poll_logs)
         self._sync_startup_registration()
@@ -176,14 +180,19 @@ class TvApp:
             while True:
                 msg = self.log_queue.get_nowait()
                 try:
+                    timestamp = None
                     level = "INFO"
                     line = msg
                     if " | " in msg:
                         parts = msg.split(" | ", 2)
-                        if len(parts) >= 2:
+                        if len(parts) >= 3:
+                            timestamp = parts[0].strip()
+                            level = parts[1].strip()
+                            line = parts[2]
+                        elif len(parts) >= 2:
                             level = parts[1].strip()
                             line = parts[2] if len(parts) > 2 else parts[1]
-                    self.page_logs.append_log(level, line)
+                    self.page_logs.append_log(level, line, timestamp=timestamp)
                 except Exception:
                     self.page_logs.append_log("INFO", str(msg))
         except Exception:
@@ -193,7 +202,7 @@ class TvApp:
     def _build_startup_command(self) -> str | None:
         try:
             if getattr(sys, "frozen", False):
-                return f'"{Path(sys.executable)}"'
+                return f'"{Path(sys.executable)}" {WINDOWS_STARTUP_ARG}'
             return None
         except Exception:
             return None
@@ -243,6 +252,7 @@ class TvApp:
             api_port=port,
             logger=self.logger,
             existing_process=self._tauri_process,
+            start_hidden=self._started_from_windows_startup,
         )
 
     def _kill_tauri_ui(self) -> None:

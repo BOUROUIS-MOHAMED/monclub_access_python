@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.device_attendance import DeviceAttendanceMaintenanceEngine
 from app.core.device_sync import DeviceSyncEngine
 from app.core.realtime_agent import AgentRealtimeEngine
 from app.core.settings_reader import get_backend_global_settings
@@ -35,6 +36,7 @@ def schedule_access_shell_startup(app: Any) -> None:
 
 __all__ = [
     "AgentRealtimeEngine",
+    "DeviceAttendanceMaintenanceEngine",
     "DeviceSyncEngine",
     "UpdateManager",
     "UpdateStatus",

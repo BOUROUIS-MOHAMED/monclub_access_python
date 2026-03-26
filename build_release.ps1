@@ -129,6 +129,7 @@ Set-Location $ROOT
 
 . (Join-Path $ROOT "packaging\desktop_components.ps1")
 $meta = Get-DesktopComponentMetadata -Component $Component
+$buildVersion = Get-DesktopComponentVersionInfo -Component $Component
 
 $artifactName = $meta.ArtifactName
 $specPath = Join-Path $ROOT (($meta.SpecPath -replace '^\.[\\/]', ''))
@@ -142,6 +143,10 @@ Write-Host ("== {0} release build ==" -f $meta.DisplayName) -ForegroundColor Cya
 Write-Host "Root     : $ROOT"
 Write-Host "Component: $Component" -ForegroundColor Cyan
 Write-Host "Channel  : $Channel" -ForegroundColor Cyan
+Write-Host "Version  : $($buildVersion.Version)" -ForegroundColor Cyan
+if (-not [string]::IsNullOrWhiteSpace($buildVersion.Codename)) {
+  Write-Host "Codename : $($buildVersion.Codename)" -ForegroundColor Cyan
+}
 Write-Host "Spec     : $specPath" -ForegroundColor Cyan
 Write-Host "UI Stage : $stagedUiExe" -ForegroundColor Cyan
 
@@ -285,6 +290,8 @@ $versionObj = [ordered]@{
   component = $meta.Id
   app = $artifactName
   displayName = $meta.DisplayName
+  version = $buildVersion.Version
+  codename = $buildVersion.Codename
   mainExe = $meta.MainExe
   uiExe = $meta.UiExeName
   updaterExe = $meta.UpdaterInstalledExe
@@ -300,72 +307,11 @@ Write-Host "Staging dist -> release staging (robocopy with retries)..." -Foregro
 Copy-TreeRobocopy $distAppDir $stagingApp
 Wait-StagingUnlocked -Dir $stagingApp -TimeoutSeconds 180
 
-$zipPath = Join-Path $releaseDir "$baseName.zip"
-$manifestPath = Join-Path $releaseDir "$baseName.manifest.json"
-
-Write-Host "`nCreating zip from staging..." -ForegroundColor Yellow
-try {
-  Compress-ZipRobust -FolderPath $stagingApp -ZipPath $zipPath
-} catch {
-  Write-Host "Compress-Archive keeps failing. Falling back to tar.exe..." -ForegroundColor Yellow
-  Tar-ZipRobust -WorkingDir $stagingDir -FolderName $artifactName -ZipPath $zipPath
-}
-
-$pyExe = (Get-Command python).Source
-$pyVersion = (python -c "import sys; print(sys.version.split()[0])").Trim()
-$pyBits = (python -c "import struct; print(struct.calcsize('P')*8)").Trim()
-$piVersion = (python -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
-
-$stagedExe = Join-Path $stagingApp $meta.MainExe
-$binaryExt = @(".exe",".dll",".pyd")
-$files = Get-ChildItem -LiteralPath $stagingApp -Recurse -File |
-  Where-Object { $binaryExt -contains $_.Extension.ToLowerInvariant() } |
-  ForEach-Object {
-    $rel = $_.FullName.Substring($stagingApp.Length).TrimStart("\","/")
-    [ordered]@{
-      path = $rel
-      size = $_.Length
-      sha256 = Get-Sha256 $_.FullName
-    }
-  }
-
-$zipHash = Get-Sha256 $zipPath
-$exeHash = Get-Sha256 $stagedExe
-
-$manifest = [ordered]@{
-  component = $meta.Id
-  app = $artifactName
-  displayName = $meta.DisplayName
-  mainExe = $meta.MainExe
-  uiExe = $meta.UiExeName
-  updaterExe = $meta.UpdaterInstalledExe
-  platform = "windows"
-  channel = $Channel
-  releaseId = $ReleaseId
-  builtAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-  python = [ordered]@{
-    executable = $pyExe
-    version = $pyVersion
-    bits = [int]$pyBits
-  }
-  pyinstaller = [ordered]@{ version = $piVersion }
-  git = $git
-  outputs = [ordered]@{
-    distDir = $distAppDir
-    stagedDir = $stagingApp
-    exeSha256 = $exeHash
-    zip = $zipPath
-    zipSha256 = $zipHash
-  }
-  shippedBinaries = $files
-}
-
-$manifestJson = ($manifest | ConvertTo-Json -Depth 10)
-[System.IO.File]::WriteAllText($manifestPath, $manifestJson, [System.Text.Encoding]::UTF8)
-
 Write-Host "`nRelease OK" -ForegroundColor Green
-Write-Host "ZIP      : $zipPath"
-Write-Host "MANIFEST : $manifestPath"
-Write-Host "`nZIP SHA256:" -ForegroundColor Cyan
-Write-Host $zipHash
+Write-Host "StageDir  : $stagingApp"
+Write-Host "Version   : $($buildVersion.Version)"
+if (-not [string]::IsNullOrWhiteSpace($buildVersion.Codename)) {
+  Write-Host "Codename  : $($buildVersion.Codename)"
+}
+Write-Host "ReleaseId : $ReleaseId"
 Write-Host "`nDone." -ForegroundColor Green

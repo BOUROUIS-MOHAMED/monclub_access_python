@@ -87,7 +87,6 @@ export default function UpdatePage() {
     try {
       const s = await getAccessUpdateStatus();
       setStatus(s);
-      setError(null);
     } catch {
       // silent
     }

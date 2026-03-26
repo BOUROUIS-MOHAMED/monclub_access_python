@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { get, post } from "@/api/client";
+import { get, patch } from "@/api/client";
 import { useApp } from "@/context/AppContext";
 import {
   Card, CardContent, CardHeader, CardTitle,
@@ -41,6 +41,7 @@ export default function ConfigPage() {
   const [serverSettings, setServerSettings] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [startupSaving, setStartupSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
@@ -68,7 +69,7 @@ export default function ConfigPage() {
 
   const handleSave = async () => {
     setSaving(true); setError(null); setSuccess(false);
-    try { await post("/config", cfg); setSuccess(true); setDirty(false); setTimeout(() => setSuccess(false), 3000); }
+    try { await patch("/config", cfg); setSuccess(true); setDirty(false); setTimeout(() => setSuccess(false), 3000); }
     catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
@@ -76,6 +77,21 @@ export default function ConfigPage() {
   const update = (key: string, value: any) => {
     setCfg((p) => ({ ...p, [key]: value }));
     setDirty(true);
+  };
+
+  const handleStartupToggle = async (enabled: boolean) => {
+    const previous = Boolean(cfg.start_on_system_startup ?? false);
+    setCfg((p) => ({ ...p, start_on_system_startup: enabled }));
+    setStartupSaving(true);
+    setError(null);
+    try {
+      await patch("/config", { start_on_system_startup: enabled });
+    } catch (e) {
+      setCfg((p) => ({ ...p, start_on_system_startup: previous }));
+      setError(String(e));
+    } finally {
+      setStartupSaving(false);
+    }
   };
 
   const handleUnlockAdvanced = () => {
@@ -116,7 +132,7 @@ export default function ConfigPage() {
           <div className="flex items-center justify-between">
             <div className="space-y-1">
               <p className="text-sm">Composant: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.componentDisplayName || "MonClub Access"}</code></p>
-              <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.currentReleaseId || "dev"}</code></p>
+              <p className="text-sm">Version actuelle: <code className="bg-muted px-1.5 py-0.5 rounded text-xs">{updates?.currentVersion || updates?.currentReleaseId || "dev"}</code></p>
               <p className="text-xs text-muted-foreground">Canal {updates?.channel || "stable"} · Plateforme {updates?.platform || "WINDOWS"}</p>
               {updates?.updateAvailable ? (
                 <Badge variant="warning" className="text-xs">Mise à jour disponible</Badge>
@@ -134,6 +150,31 @@ export default function ConfigPage() {
       </Card>
 
       {/* Advanced settings — locked by default */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2"><Settings className="h-4 w-4" /> Demarrage Windows</CardTitle>
+        </CardHeader>
+        <CardContent className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <Label htmlFor="start-on-windows-switch">Ouvrir MonClub Access avec Windows</Label>
+            <p className="text-sm text-muted-foreground">
+              Quand cette option est activee, MonClub Access est ajoute au demarrage de Windows et son interface s&apos;ouvre automatiquement a l&apos;ouverture de session.
+            </p>
+            <p className="text-xs text-muted-foreground">
+              En mode developpement, la preference est enregistree, mais l&apos;inscription au demarrage Windows ne s&apos;applique que sur les builds installes.
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            {startupSaving && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            <Switch
+              id="start-on-windows-switch"
+              checked={Boolean(cfg.start_on_system_startup ?? false)}
+              onCheckedChange={(checked: boolean) => { void handleStartupToggle(checked); }}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
       {!advancedUnlocked ? (
         <div className="flex justify-center py-8">
           <Button variant="outline" onClick={() => setPwdDialogOpen(true)}>
@@ -175,7 +216,7 @@ export default function ConfigPage() {
                 <Label>Activer le tray</Label>
               </div>
               <div className="flex items-center gap-3">
-                <Switch checked={cfg.minimize_to_tray ?? true} onCheckedChange={(v: boolean) => update("minimize_to_tray", v)} />
+                <Switch checked={cfg.minimize_to_tray_on_close ?? true} onCheckedChange={(v: boolean) => update("minimize_to_tray_on_close", v)} />
                 <Label>Minimiser dans le tray</Label>
               </div>
             </AccordionContent>
@@ -242,9 +283,10 @@ export default function ConfigPage() {
           </DialogHeader>
           <div className="space-y-2 text-sm">
             <p>Composant: <code className="bg-muted px-1 rounded">{updates?.componentDisplayName || "MonClub Access"}</code></p>
-            <p>Version actuelle: <code className="bg-muted px-1 rounded">{updates?.currentReleaseId || "dev"}</code></p>
+            <p>Version actuelle: <code className="bg-muted px-1 rounded">{updates?.currentVersion || updates?.currentReleaseId || "dev"}</code></p>
             <p>ExÃ©cutable: <code className="bg-muted px-1 rounded">{updates?.mainExecutable || "MonClubAccess.exe"}</code></p>
-            <p>Updater: <code className="bg-muted px-1 rounded">{updates?.updaterExecutable || "MonClubAccessUpdater.exe"}</code></p>
+            <p>Package d&apos;installation: <code className="bg-muted px-1 rounded">{updates?.latestVersion ? `monclub_access_${updates?.latestVersion}.exe` : "monclub_access_<version>.exe"}</code></p>
+            <p>Flux: <code className="bg-muted px-1 rounded">Le .exe telecharge installe ou met a jour automatiquement</code></p>
             {updates?.installRoot && <p>Install root: <code className="bg-muted px-1 rounded">{updates.installRoot}</code></p>}
             {updates?.lastCheckAt && <p>Dernière vérification: {updates.lastCheckAt}</p>}
             <Separator />

@@ -1,6 +1,12 @@
 ; installer\MonClubTV.iss
+; Build with:
+;   ISCC.exe installer\MonClubTV.iss /DAppVersion=1.0.0 /DStageDir="C:\...\release\_staging\MonClubTV-20260326-120000Z\MonClubTV" /DOutputBaseFilename=monclub_tv_1.0.0
 
-#define AppName "MonClubTV"
+#define AppName "MonClub TV"
+
+#ifndef AppVersion
+  #error AppVersion define is missing. Pass /DAppVersion=1.0.0
+#endif
 
 #ifndef ReleaseId
   #define ReleaseId "DEV"
@@ -10,18 +16,15 @@
   #error StageDir define is missing. Pass /DStageDir="full\path\to\staged\MonClubTV"
 #endif
 
-#ifndef UpdaterSourcePath
-  #error UpdaterSourcePath define is missing. Pass /DUpdaterSourcePath="full\path\to\MonClubDesktopUpdater.exe"
+#ifndef OutputBaseFilename
+  #define OutputBaseFilename "monclub_tv"
 #endif
 
-#ifndef UpdaterDestExe
-  #define UpdaterDestExe "MonClubTVUpdater.exe"
-#endif
-
-#define AppVersion ReleaseId
 #define AppPublisher "MonClub"
 #define MainExe "MonClubTV.exe"
 #define TauriExe "monclub-tv-ui.exe"
+#define DefaultInstallRoot "{localappdata}\MonClubTV"
+#define LegacyInstallRoot "{localappdata}\MonClub TV"
 
 #define SetupIcon "assets\monclub_tv.ico"
 #define WizardImage "assets\wizard.bmp"
@@ -31,20 +34,21 @@
 AppId={{4A8D6A8A-7AC6-4C87-862D-2E5A6B644D27}
 AppName={#AppName}
 AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 SetupIconFile={#SetupIcon}
 WizardImageFile={#WizardImage}
 WizardSmallImageFile={#WizardSmall}
-DefaultDirName={localappdata}\MonClubTV
+DefaultDirName={code:GetInstallRootDefault}
 PrivilegesRequired=lowest
-UsePreviousAppDir=no
-UsePreviousTasks=no
+UsePreviousAppDir=yes
+UsePreviousTasks=yes
 CloseApplications=yes
-CloseApplicationsFilter={#MainExe},{#TauriExe},{#UpdaterDestExe}
+CloseApplicationsFilter={#MainExe},{#TauriExe},MonClubTVUpdater.exe
 RestartApplications=no
 DisableProgramGroupPage=yes
 OutputDir=..\release
-OutputBaseFilename=MonClubTVSetup-{#ReleaseId}
+OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -55,7 +59,6 @@ Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription
 
 [Dirs]
 Name: "{app}\current"
-Name: "{app}\updater"
 Name: "{app}\downloads"
 Name: "{app}\downloads\windows"
 Name: "{app}\downloads\windows\stable"
@@ -64,19 +67,16 @@ Name: "{app}\logs"
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#UpdaterSourcePath}"; DestDir: "{app}\updater"; DestName: "{#UpdaterDestExe}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
 Name: "{userdesktop}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClubTV"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub TV"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; Remove the install root including runtime-created folders like downloads/logs/current leftovers.
 Type: filesandordirs; Name: "{app}"
-; Remove persisted data roots so a fresh reinstall starts cleanly.
 Type: filesandordirs; Name: "{commonappdata}\MonClub TV"
 Type: filesandordirs; Name: "{localappdata}\MonClub TV"
 Type: filesandordirs; Name: "{userappdata}\MonClub TV"
@@ -91,6 +91,122 @@ var
   RuntimeCheckStatusLabel: TNewStaticText;
   RuntimeCheckMemo: TNewMemo;
   RuntimeHasWarning: Boolean;
+  ExistingInstallDetected: Boolean;
+  ExistingInstallRoot: string;
+  ExistingInstallVersion: string;
+
+function ExpandPath(const Value: string): string;
+begin
+  Result := ExpandConstant(Value);
+end;
+
+function DefaultInstallRoot(): string;
+begin
+  Result := ExpandPath('{#DefaultInstallRoot}');
+end;
+
+function LegacyInstallRoot(): string;
+begin
+  Result := ExpandPath('{#LegacyInstallRoot}');
+end;
+
+function PathHasInstalledPayload(const RootPath: string): Boolean;
+begin
+  Result :=
+    DirExists(RootPath) and (
+      FileExists(AddBackslash(RootPath) + 'current\version.json') or
+      FileExists(AddBackslash(RootPath) + 'current\{#MainExe}')
+    );
+end;
+
+function DetectExistingInstallRoot(): string;
+begin
+  Result := '';
+
+  if PathHasInstalledPayload(DefaultInstallRoot()) then
+  begin
+    Result := DefaultInstallRoot();
+    exit;
+  end;
+
+  if PathHasInstalledPayload(LegacyInstallRoot()) then
+  begin
+    Result := LegacyInstallRoot();
+    exit;
+  end;
+end;
+
+function TryExtractJsonStringValue(const JsonText: string; const Key: string; var Value: string): Boolean;
+var
+  Needle: string;
+  KeyPos: Integer;
+  ColonPos: Integer;
+  StartPos: Integer;
+  EndPos: Integer;
+begin
+  Result := False;
+  Value := '';
+  Needle := '"' + Key + '"';
+  KeyPos := Pos(Needle, JsonText);
+  if KeyPos = 0 then
+    exit;
+
+  ColonPos := KeyPos + Length(Needle);
+  while (ColonPos <= Length(JsonText)) and (JsonText[ColonPos] <> ':') do
+    ColonPos := ColonPos + 1;
+  if ColonPos > Length(JsonText) then
+    exit;
+
+  StartPos := ColonPos + 1;
+  while (StartPos <= Length(JsonText)) and ((JsonText[StartPos] = ' ') or (JsonText[StartPos] = #9) or (JsonText[StartPos] = #10) or (JsonText[StartPos] = #13)) do
+    StartPos := StartPos + 1;
+  if (StartPos > Length(JsonText)) or (JsonText[StartPos] <> '"') then
+    exit;
+
+  StartPos := StartPos + 1;
+  EndPos := StartPos;
+  while EndPos <= Length(JsonText) do
+  begin
+    if (JsonText[EndPos] = '"') and ((EndPos = StartPos) or (JsonText[EndPos - 1] <> '\')) then
+      break;
+    EndPos := EndPos + 1;
+  end;
+  if EndPos > Length(JsonText) then
+    exit;
+
+  Value := Copy(JsonText, StartPos, EndPos - StartPos);
+  Result := True;
+end;
+
+function TryReadInstalledVersion(const RootPath: string; var Version: string): Boolean;
+var
+  VersionPath: string;
+  JsonText: AnsiString;
+begin
+  Result := False;
+  Version := '';
+  VersionPath := AddBackslash(RootPath) + 'current\version.json';
+  if not FileExists(VersionPath) then
+    exit;
+  if not LoadStringFromFile(VersionPath, JsonText) then
+    exit;
+  Result := TryExtractJsonStringValue(JsonText, 'version', Version);
+end;
+
+function SameVersionInstalled(): Boolean;
+begin
+  Result := ExistingInstallDetected and
+    (Trim(ExistingInstallVersion) <> '') and
+    (Lowercase(Trim(ExistingInstallVersion)) = Lowercase('{#AppVersion}'));
+end;
+
+function GetInstallRootDefault(Param: string): string;
+begin
+  if ExistingInstallDetected and (Trim(ExistingInstallRoot) <> '') then
+    Result := ExistingInstallRoot
+  else
+    Result := DefaultInstallRoot();
+end;
 
 procedure ExecAndLog(const CmdLine: string);
 var
@@ -105,9 +221,9 @@ end;
 procedure KillRunningMonClubProcesses();
 begin
   Log('Ensuring MonClub TV processes are stopped...');
-  ExecAndLog('taskkill /F /T /IM "MonClubTV.exe"');
-  ExecAndLog('taskkill /F /T /IM "monclub-tv-ui.exe"');
-  ExecAndLog('taskkill /F /T /IM "{#UpdaterDestExe}"');
+  ExecAndLog('taskkill /F /T /IM "{#MainExe}"');
+  ExecAndLog('taskkill /F /T /IM "{#TauriExe}"');
+  ExecAndLog('taskkill /F /T /IM "MonClubTVUpdater.exe"');
 end;
 
 procedure DeleteTreeIfExists(const PathValue: string);
@@ -161,6 +277,30 @@ begin
   RuntimeHasWarning := False;
   RuntimeCheckMemo.Lines.Clear;
 
+  if SameVersionInstalled() then
+  begin
+    RuntimeCheckMemo.Lines.Add('MonClub TV ' + '{#AppVersion}' + ' is already installed.');
+    RuntimeCheckMemo.Lines.Add('No update is needed for this package.');
+    RuntimeCheckStatusLabel.Caption := 'Status: already up to date.';
+    exit;
+  end;
+
+  if ExistingInstallDetected then
+  begin
+    RuntimeCheckMemo.Lines.Add('Existing installation detected:');
+    RuntimeCheckMemo.Lines.Add('  Root: ' + ExistingInstallRoot);
+    if Trim(ExistingInstallVersion) <> '' then
+      RuntimeCheckMemo.Lines.Add('  Installed version: ' + ExistingInstallVersion);
+    RuntimeCheckMemo.Lines.Add('  Package version: ' + '{#AppVersion}');
+    RuntimeCheckMemo.Lines.Add('');
+  end
+  else
+  begin
+    RuntimeCheckMemo.Lines.Add('No existing MonClub TV installation detected.');
+    RuntimeCheckMemo.Lines.Add('This package will run as a fresh installer.');
+    RuntimeCheckMemo.Lines.Add('');
+  end;
+
   RuntimeCheckMemo.Lines.Add('Installer runtime checks:');
   RuntimeCheckMemo.Lines.Add('');
 
@@ -187,8 +327,33 @@ begin
 
   if RuntimeHasWarning then
     RuntimeCheckStatusLabel.Caption := 'Status: warnings found. Click Next to continue or Cancel to stop.'
+  else if ExistingInstallDetected then
+    RuntimeCheckStatusLabel.Caption := 'Status: ready to update the existing installation.'
   else
-    RuntimeCheckStatusLabel.Caption := 'Status: checks passed.';
+    RuntimeCheckStatusLabel.Caption := 'Status: ready to install.';
+end;
+
+function InitializeSetup(): Boolean;
+begin
+  ExistingInstallRoot := DetectExistingInstallRoot();
+  ExistingInstallDetected := Trim(ExistingInstallRoot) <> '';
+  ExistingInstallVersion := '';
+  if ExistingInstallDetected then
+    TryReadInstalledVersion(ExistingInstallRoot, ExistingInstallVersion);
+
+  if SameVersionInstalled() then
+  begin
+    MsgBox(
+      'MonClub TV version ' + '{#AppVersion}' + ' is already installed on this PC.' + #13#10 +
+      'Nothing will be changed.',
+      mbInformation,
+      MB_OK
+    );
+    Result := False;
+    exit;
+  end;
+
+  Result := True;
 end;
 
 procedure InitializeWizard();
@@ -196,7 +361,7 @@ begin
   RuntimeCheckPage := CreateCustomPage(
     wpWelcome,
     'Runtime Prerequisite Check',
-    'MonClub TV checks required runtimes before installation.'
+    'MonClub TV checks required runtimes before installation or update.'
   );
 
   RuntimeCheckStatusLabel := TNewStaticText.Create(RuntimeCheckPage);
@@ -251,11 +416,7 @@ begin
   KillRunningMonClubProcesses();
   Sleep(900);
 
-  DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClubTV'));
-  DeleteTreeIfExists(ExpandConstant('{commonappdata}\MonClub TV'));
-  DeleteTreeIfExists(ExpandConstant('{localappdata}\MonClub TV'));
-  DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClub TV'));
-  DeleteTreeIfExists(ExpandConstant('{userappdata}\MonClubTV'));
+  DeleteTreeIfExists(ExpandConstant('{app}\current'));
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

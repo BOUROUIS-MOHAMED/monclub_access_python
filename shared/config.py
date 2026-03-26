@@ -52,6 +52,7 @@ ACCESS_CONFIG_FIELDS = (
     "tray_enabled",
     "minimize_to_tray_on_close",
     "start_minimized_to_tray",
+    "start_on_system_startup",
     "login_email",
     "log_level",
 )
@@ -120,6 +121,7 @@ class AccessConfigSection:
     tray_enabled: bool = True
     minimize_to_tray_on_close: bool = True
     start_minimized_to_tray: bool = False
+    start_on_system_startup: bool = False
     login_email: str = ""
     log_level: str = "DEBUG"
 
@@ -350,6 +352,7 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         tray_enabled=bool(getattr(cfg, "tray_enabled", True)),
         minimize_to_tray_on_close=bool(getattr(cfg, "minimize_to_tray_on_close", True)),
         start_minimized_to_tray=bool(getattr(cfg, "start_minimized_to_tray", False)),
+        start_on_system_startup=bool(getattr(cfg, "start_on_system_startup", False)),
         login_email=str(getattr(cfg, "login_email", "") or ""),
         log_level=str(getattr(cfg, "log_level", "DEBUG") or "DEBUG"),
     )

@@ -54,6 +54,7 @@ def build_access_api_endpoints(cfg: AppConfig | ConfigEnvelope | None = None) ->
         API_LATEST_RELEASE_URL,
         API_ACCESS_CREATE_MEMBERSHIP_URL,
         API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
+        API_SYNC_ACCESS_HISTORY_URL,
         API_OPTIONAL_CONTENT_SYNC_URL,
     )
     return ApiEndpoints(
@@ -63,6 +64,7 @@ def build_access_api_endpoints(cfg: AppConfig | ConfigEnvelope | None = None) ->
         latest_release_url=API_LATEST_RELEASE_URL,
         access_create_membership_url=API_ACCESS_CREATE_MEMBERSHIP_URL,
         access_create_account_membership_url=API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL,
+        sync_access_history_url=API_SYNC_ACCESS_HISTORY_URL,
         tv_snapshot_latest_url="",
         tv_snapshot_manifest_url="",
         tv_ad_tasks_fetch_url="",

@@ -17,6 +17,7 @@ import ProfilePage from "./pages/ProfilePage";
 import UpdatePage from "./pages/UpdatePage";
 import RestrictedPage from "./pages/RestrictedPage";
 import PopupWindow from "./pages/PopupWindow";
+import TrayPanelPage from "./pages/TrayPanelPage";
 
 function AppRoutes() {
   const { status, loading, error } = useApp();
@@ -78,6 +79,7 @@ export default function App() {
         <BrowserRouter>
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
+            <Route path="/tray-panel" element={<AppProvider><TrayPanelPage /></AppProvider>} />
             <Route path="*" element={<AppProvider><AppRoutes /></AppProvider>} />
           </Routes>
         </BrowserRouter>

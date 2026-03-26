@@ -340,7 +340,19 @@ export interface UpdateVersionInfoResponse {
 }
 
 // ─── H) Logs ───
-export interface LogLine { level: string; text: string }
+export interface LogLine {
+  level: string;
+  text: string;
+  id?: string | number | null;
+  revision?: number | null;
+  rawText?: string | null;
+  repeatCount?: number | null;
+  collapsed?: boolean;
+  ts?: string | null;
+  firstSeenAt?: string | null;
+  lastSeenAt?: string | null;
+  tokens?: Record<string, string> | null;
+}
 
 // ─── I) Enroll ───
 export interface EnrollStatusResponse {

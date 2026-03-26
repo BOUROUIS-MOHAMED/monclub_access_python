@@ -25,6 +25,7 @@ API_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/users/get_gym_users"
 API_CREATE_USER_FINGERPRINT_URL: str = f"{_API_V1}/manager/userFingerprint/create"
 API_ACCESS_CREATE_MEMBERSHIP_URL: str = f"{_API_V1}/manager/gym/access/v1/activeMembership/create"
 API_ACCESS_CREATE_ACCOUNT_MEMBERSHIP_URL: str = f"{_API_V1}/manager/gym/access/v1/account-and-activeMembership/create"
+API_SYNC_ACCESS_HISTORY_URL: str = f"{_API_V1}/manager/gym/access/v1/users/sync_gym_access_history"
 API_LATEST_RELEASE_URL: str = f"{_API_V1}/manager/access/getLatestAccessSoftwareRelease"
 API_OPTIONAL_CONTENT_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/content/sync"
 

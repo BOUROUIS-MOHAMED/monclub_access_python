@@ -893,8 +893,8 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                 </div>
               </div>
               <div className="rounded-lg border border-border bg-muted/40 p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Current Release</div>
-                <div className="mt-2 text-base font-semibold">{updateStatus.currentReleaseId || "dev"}</div>
+                <div className="text-xs uppercase tracking-wide text-muted-foreground">Current Version</div>
+                <div className="mt-2 text-base font-semibold">{updateStatus.currentVersion || updateStatus.currentReleaseId || "dev"}</div>
                 <div className="mt-2 text-xs text-muted-foreground">
                   Last check {formatEpochSeconds(updateStatus.lastCheckAt)}
                 </div>
@@ -908,16 +908,16 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
                   {updateStatus.downloaded && <Badge variant="outline">Downloaded</Badge>}
                 </div>
                 <div className="mt-2 text-xs text-muted-foreground">
-                  {updateStatus.latestRelease?.releaseId || "No newer TV release detected."}
+                  {updateStatus.latestVersion ? `Version ${updateStatus.latestVersion}` : (updateStatus.latestRelease?.releaseId || "No newer TV release detected.")}
                 </div>
               </div>
               <div className="rounded-lg border border-border bg-muted/40 p-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">Updater</div>
+                <div className="text-xs uppercase tracking-wide text-muted-foreground">Installer Package</div>
                 <div className="mt-2 text-base font-semibold">
-                  {updateStatus.updaterInstalled ? "Ready" : "Missing"}
+                  {updateStatus.downloaded ? "Downloaded EXE Ready" : "Downloaded EXE Required"}
                 </div>
                 <div className="mt-2 text-xs text-muted-foreground">
-                  {updateStatus.updaterExecutable || "MonClubTVUpdater.exe"}
+                  {updateStatus.latestVersion ? `monclub_tv_${updateStatus.latestVersion}.exe` : "monclub_tv_<version>.exe"}
                 </div>
               </div>
             </div>

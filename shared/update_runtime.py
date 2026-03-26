@@ -41,6 +41,21 @@ def _parse_json_file(p: Path) -> Dict[str, Any]:
     return {}
 
 
+def _runtime_version_payload(component: DesktopComponentIdentity) -> Dict[str, Any]:
+    base = runtime_base_dir()
+    version_data = _parse_json_file(base / "version.json")
+    if version_data:
+        return version_data
+
+    if not is_frozen():
+        update_data = _parse_json_file(base / "update.json")
+        component_data = update_data.get(component.component_id)
+        if isinstance(component_data, dict):
+            return component_data
+
+    return {}
+
+
 def _semver_tuple(v: str) -> Optional[Tuple[int, int, int]]:
     """Parse 'x.y.z' or 'x.y.z codename' → (x, y, z). Returns None if invalid."""
     if not v:
@@ -105,15 +120,21 @@ def _updater_exe_path(install_root: Path, identity: DesktopComponentIdentity) ->
     return install_root / "updater" / identity.updater_exe_name
 
 
-def _launch_as_admin(exe_path: Path) -> None:
-    """Launch an executable as administrator on Windows."""
+def _launch_installer_exe(exe_path: Path) -> None:
+    creationflags = 0
     if os.name == "nt":
-        import ctypes
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", str(exe_path), None, str(exe_path.parent), 1
-        )
-    else:
-        subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    subprocess.Popen(
+        [str(exe_path)],
+        cwd=str(exe_path.parent),
+        close_fds=True,
+        creationflags=creationflags,
+    )
+
+
+def _default_installer_file_name(component: DesktopComponentIdentity, version: str) -> str:
+    safe_version = _safe_str(version, "0.0.0")
+    return f"{component.installer_slug}_{safe_version}.exe"
 
 
 @dataclass
@@ -188,8 +209,7 @@ class ComponentUpdateManager:
     def get_current_version(self) -> str:
         """Read the installed version from version.json (x.y.z format)."""
         try:
-            base = runtime_base_dir()
-            data = _parse_json_file(base / "version.json")
+            data = _runtime_version_payload(self.component)
             v = _safe_str(data.get("version") or data.get("releaseId") or "", "")
             # If it's a releaseId (timestamp), return "0.0.0" so any real version triggers update
             if v and _semver_tuple(v):
@@ -200,8 +220,7 @@ class ComponentUpdateManager:
 
     def get_current_codename(self) -> str:
         try:
-            base = runtime_base_dir()
-            data = _parse_json_file(base / "version.json")
+            data = _runtime_version_payload(self.component)
             return _safe_str(data.get("codename"), "")
         except Exception:
             return ""
@@ -209,8 +228,7 @@ class ComponentUpdateManager:
     def get_current_release_id(self) -> str:
         """Legacy: return releaseId for backward compat."""
         try:
-            base = runtime_base_dir()
-            data = _parse_json_file(base / "version.json")
+            data = _runtime_version_payload(self.component)
             rid = _safe_str(
                 data.get("releaseId") or data.get("release_id") or data.get("version") or "",
                 "",
@@ -378,6 +396,8 @@ class ComponentUpdateManager:
 
             # Also do local semver comparison as fallback
             latest_version = _safe_str(latest.get("version"), "")
+            if latest_version and _semver_tuple(current_version) and _semver_tuple(latest_version):
+                should_update = _is_version_outdated(current_version, latest_version)
             if not should_update and latest_version:
                 should_update = _is_version_outdated(current_version, latest_version)
 
@@ -407,7 +427,7 @@ class ComponentUpdateManager:
             # Use installer URL if available, otherwise fall back to zip
             if installer_url:
                 download_url = installer_url
-                download_name = installer_name or f"{self.component.artifact_name}-{latest_version}-installer.exe"
+                download_name = installer_name or _default_installer_file_name(self.component, latest_version)
             elif zip_url:
                 download_url = zip_url
                 download_name = zip_name or f"{self.component.artifact_name}-{latest_version}.zip"
@@ -562,8 +582,7 @@ class ComponentUpdateManager:
         self.logger.info("[Update:%s] launching installer: %s", self.component.component_id, str(download_path))
 
         if ext == ".exe":
-            # Launch installer as admin
-            _launch_as_admin(download_path)
+            _launch_installer_exe(download_path)
         else:
             # Legacy: fall back to the C# updater for ZIP files
             updater = _updater_exe_path(self.install_root, self.component)

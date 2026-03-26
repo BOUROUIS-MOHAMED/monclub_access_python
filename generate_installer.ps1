@@ -80,12 +80,13 @@ function Invoke-InstallerBuild([string]$TargetComponent) {
   }
 }
 
-function Find-LatestArtifact([hashtable]$Meta, [string]$SuffixPattern) {
-  $releaseDir = Join-Path $ROOT "release"
-  $item = Get-ChildItem -Path $releaseDir -Filter $SuffixPattern -File |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  return $item
+function Find-InstallerArtifact([string]$TargetComponent) {
+  $versionInfo = Get-DesktopComponentVersionInfo -Component $TargetComponent
+  $installerPath = Join-Path $ROOT ("release\{0}" -f $versionInfo.InstallerFileName)
+  if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+    throw "Installer not found for ${TargetComponent}: $installerPath"
+  }
+  return $installerPath
 }
 
 $components = Resolve-ComponentList $Component
@@ -105,14 +106,16 @@ Invoke-Step -Name "Environment summary" -Action {
 
 foreach ($targetComponent in $components) {
   $targetMeta = Get-DesktopComponentMetadata -Component $targetComponent
+  $versionInfo = Get-DesktopComponentVersionInfo -Component $targetComponent
 
   Invoke-Step -Name ("Build release payload ({0})" -f $targetMeta.DisplayName) -Action {
     Invoke-ReleaseBuild -TargetComponent $targetComponent -ResolvedReleaseId $ReleaseId
   }
 
-  Invoke-Step -Name ("Build installer ({0})" -f $targetMeta.DisplayName) -Action {
+  Invoke-Step -Name ("Build unified installer ({0})" -f $targetMeta.DisplayName) -Action {
     if ($DryRun) {
-      Write-Host ("DryRun installer target: release\{0}-{1}.exe" -f $targetMeta.InstallerBaseName, $ReleaseId) -ForegroundColor Yellow
+      $expectedPath = Join-Path $ROOT ("release\{0}" -f $versionInfo.InstallerFileName)
+      Write-Host ("DryRun installer target: {0}" -f $expectedPath) -ForegroundColor Yellow
     } else {
       Invoke-InstallerBuild -TargetComponent $targetComponent
     }
@@ -122,53 +125,14 @@ foreach ($targetComponent in $components) {
 Invoke-Step -Name "Locate generated outputs" -Action {
   foreach ($targetComponent in $components) {
     $targetMeta = Get-DesktopComponentMetadata -Component $targetComponent
-    $installer = $null
-    $manifest = $null
-    $zip = $null
-    if (-not $DryRun) {
-      $installer = Find-LatestArtifact -Meta $targetMeta -SuffixPattern ("{0}-{1}.exe" -f $targetMeta.InstallerBaseName, $ReleaseId)
-      $manifest = Find-LatestArtifact -Meta $targetMeta -SuffixPattern ("{0}-{1}.manifest.json" -f $targetMeta.ArtifactName, $ReleaseId)
-      $zip = Find-LatestArtifact -Meta $targetMeta -SuffixPattern ("{0}-{1}.zip" -f $targetMeta.ArtifactName, $ReleaseId)
+    $versionInfo = Get-DesktopComponentVersionInfo -Component $targetComponent
+    $installerText = if ($DryRun) {
+      Join-Path $ROOT ("release\{0}" -f $versionInfo.InstallerFileName)
+    } else {
+      Find-InstallerArtifact -TargetComponent $targetComponent
     }
-
-    if (-not $DryRun) {
-      if (-not $installer) { throw "Installer not found for $targetComponent" }
-      if (-not $manifest) { throw "Manifest not found for $targetComponent" }
-      if (-not $zip) { throw "ZIP not found for $targetComponent" }
-    }
-
-    $installerText = if ($installer) { $installer.FullName } else { Join-Path $ROOT ("release\{0}-{1}.exe" -f $targetMeta.InstallerBaseName, $ReleaseId) }
-    $manifestText = if ($manifest) { $manifest.FullName } else { Join-Path $ROOT ("release\{0}-{1}.manifest.json" -f $targetMeta.ArtifactName, $ReleaseId) }
-    $zipText = if ($zip) { $zip.FullName } else { Join-Path $ROOT ("release\{0}-{1}.zip" -f $targetMeta.ArtifactName, $ReleaseId) }
 
     Write-Host "$($targetMeta.DisplayName) installer: $installerText" -ForegroundColor Green
-    Write-Host "$($targetMeta.DisplayName) manifest : $manifestText" -ForegroundColor Green
-    Write-Host "$($targetMeta.DisplayName) zip      : $zipText" -ForegroundColor Green
-  }
-}
-
-if (($components.Count -gt 1) -and (-not $DryRun)) {
-  Invoke-Step -Name "Write ecosystem bundle manifest" -Action {
-    $bundlePath = Join-Path $ROOT ("release\MonClubDesktopEcosystem-{0}.bundle.json" -f $ReleaseId)
-    $bundle = [ordered]@{
-      releaseId = $ReleaseId
-      channel = $Channel
-      builtAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-      components = [ordered]@{}
-    }
-
-    foreach ($targetComponent in $components) {
-      $targetMeta = Get-DesktopComponentMetadata -Component $targetComponent
-      $bundle.components[$targetComponent] = [ordered]@{
-        artifact = $targetMeta.ArtifactName
-        installer = (Join-Path $ROOT ("release\{0}-{1}.exe" -f $targetMeta.InstallerBaseName, $ReleaseId))
-        manifest = (Join-Path $ROOT ("release\{0}-{1}.manifest.json" -f $targetMeta.ArtifactName, $ReleaseId))
-        zip = (Join-Path $ROOT ("release\{0}-{1}.zip" -f $targetMeta.ArtifactName, $ReleaseId))
-      }
-    }
-
-    ($bundle | ConvertTo-Json -Depth 6) | Out-File -LiteralPath $bundlePath -Encoding utf8
-    Write-Host "Ecosystem bundle manifest: $bundlePath" -ForegroundColor Green
   }
 }
 

@@ -645,6 +645,74 @@ class PullSDKDevice:
                     pass
                 return False
 
+    def get_table_count(self, *, table: str, filter_expr: str = "", options: str = "") -> int:
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return -1
+            try:
+                assert self._sdk is not None
+                return int(self._sdk.get_device_data_count(table=table, filter_expr=filter_expr, options=options))
+            except Exception as e:
+                try:
+                    self.logger.debug(f"[PullSDKDevice][{self.device_id}] get_table_count failed table={table}: {e}")
+                except Exception:
+                    pass
+                return -1
+
+    def read_table_rows(
+        self,
+        *,
+        table: str,
+        fields: str = "*",
+        filter_expr: str = "",
+        options: str = "",
+        initial_size: int | None = None,
+    ) -> List[Dict[str, str]]:
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return []
+            try:
+                assert self._sdk is not None
+                return self._sdk.get_device_data_rows(
+                    table=table,
+                    fields=fields,
+                    filter_expr=filter_expr,
+                    options=options,
+                    initial_size=initial_size,
+                )
+            except Exception as e:
+                try:
+                    self.logger.debug(f"[PullSDKDevice][{self.device_id}] read_table_rows failed table={table}: {e}")
+                except Exception:
+                    pass
+                return []
+
+    def delete_table_rows(self, *, table: str, data: str = "", options: str = "") -> int:
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return -1
+            try:
+                assert self._sdk is not None
+                return int(self._sdk.delete_device_data(table=table, data=data, options=options))
+            except Exception as e:
+                try:
+                    self.logger.debug(f"[PullSDKDevice][{self.device_id}] delete_table_rows failed table={table}: {e}")
+                except Exception:
+                    pass
+                return -1
+
+    def read_transaction_rows(self, *, options: str = "new record", initial_size: int | None = None) -> List[Dict[str, str]]:
+        return self.read_table_rows(
+            table="transaction",
+            fields="*",
+            filter_expr="",
+            options=options,
+            initial_size=initial_size,
+        )
+
+    def delete_all_transaction_rows(self) -> int:
+        return self.delete_table_rows(table="transaction", data="", options="")
+
     def poll_rtlog_once(self) -> List[Dict[str, Any]]:
         """
         Preferred: GetRTLogExt (PUSH format, easy parsing).

@@ -1,6 +1,7 @@
 // TV Player API — A6: binding-scoped player runtime
 import { ApiError, get, openSSE, patch, post } from "../../api/client";
 import type {
+  LogLine,
   TvPlayerRenderContext,
   TvPlayerStatusResponse,
   TvPlayerEventsResponse,
@@ -144,7 +145,7 @@ export function getTvHostBindings(): Promise<{ ok: boolean; rows: import("./type
 }
 
 export function createTvHostBinding(
-  body: Partial<import("./types").TvScreenBinding>
+  body: Partial<import("./types").TvScreenBinding> & { screen_name?: string; screenName?: string }
 ): Promise<{ ok: boolean; binding: import("./types").TvScreenBinding }> {
   return post(`/tv/host/bindings`, body);
 }
@@ -370,7 +371,7 @@ export function patchTvConfig(
 
 export function getTvRecentLogs(
   params?: { level?: string; limit?: number },
-): Promise<{ ok: boolean; lines: Array<{ level: string; text: string }>; total: number }> {
+): Promise<{ ok: boolean; lines: LogLine[]; total: number }> {
   const query: Record<string, string> = {};
   if (params?.level) query.level = params.level;
   if (params?.limit != null) query.limit = String(params.limit);

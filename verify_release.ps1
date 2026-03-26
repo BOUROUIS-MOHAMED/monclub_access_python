@@ -1,70 +1,70 @@
 param(
-  [Parameter(Mandatory=$true)][string]$ZipPath,
-  [Parameter(Mandatory=$true)][string]$ManifestPath
+  [ValidateSet("access", "tv")]
+  [string]$Component = "access",
+
+  [string]$StageDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-function Sha256($p) {
-  (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash.ToLowerInvariant()
-}
+$ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $ROOT
 
-function Resolve-PayloadRoot([string]$ExtractRoot, [string]$RootFolderName, [string]$ExeName) {
-  $candidateRoot = Join-Path $ExtractRoot $RootFolderName
-  if (Test-Path (Join-Path $candidateRoot $ExeName)) { return $candidateRoot }
+. (Join-Path $ROOT "packaging\desktop_components.ps1")
+$meta = Get-DesktopComponentMetadata -Component $Component
 
-  $currentRoot = Join-Path $ExtractRoot "current"
-  if (Test-Path (Join-Path $currentRoot $ExeName)) { return $currentRoot }
-
-  if (Test-Path (Join-Path $ExtractRoot $ExeName)) { return $ExtractRoot }
-
-  $found = Get-ChildItem -LiteralPath $ExtractRoot -Recurse -File -Filter $ExeName -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-  if ($found) { return (Split-Path -Parent $found.FullName) }
-
-  throw "Could not locate $ExeName inside the ZIP content."
-}
-
-if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "ZIP not found: $ZipPath" }
-if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "Manifest not found: $ManifestPath" }
-
-$manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-
-if ([string]::IsNullOrWhiteSpace($manifest.releaseId)) { throw "manifest.releaseId missing/empty" }
-if ([string]::IsNullOrWhiteSpace($manifest.outputs.zipSha256)) { throw "manifest.outputs.zipSha256 missing/empty" }
-if ([string]::IsNullOrWhiteSpace($manifest.app)) { throw "manifest.app missing/empty" }
-if ([string]::IsNullOrWhiteSpace($manifest.mainExe)) { throw "manifest.mainExe missing/empty" }
-
-$zipHash = Sha256 $ZipPath
-if ($zipHash -ne $manifest.outputs.zipSha256) {
-  throw "ZIP SHA256 mismatch. Expected $($manifest.outputs.zipSha256) got $zipHash"
-}
-
-Write-Host "ZIP SHA256 OK ✅ $zipHash" -ForegroundColor Green
-Write-Host "App       : $($manifest.app)"
-Write-Host "ReleaseId : $($manifest.releaseId)"
-Write-Host "BuiltAtUtc: $($manifest.builtAtUtc)"
-
-$tmp = Join-Path $env:TEMP ("mc_verify_" + [guid]::NewGuid().ToString("N"))
-New-Item -ItemType Directory -Force $tmp | Out-Null
-
-try {
-  Expand-Archive -LiteralPath $ZipPath -DestinationPath $tmp -Force
-
-  $payload = Resolve-PayloadRoot $tmp $manifest.app $manifest.mainExe
-
-  $exePath = Join-Path $payload $manifest.mainExe
-  if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-    throw "$($manifest.mainExe) not found where expected: $exePath"
+function Pick-NewestStageDir {
+  $stagingRoot = Join-Path $ROOT "release\_staging"
+  if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) {
+    throw "Staging root not found: $stagingRoot"
   }
 
-  $verPath = Join-Path $payload "version.json"
-  if (-not (Test-Path -LiteralPath $verPath -PathType Leaf)) {
-    throw "version.json not found next to exe: $verPath"
-  }
+  $candidates = Get-ChildItem -LiteralPath $stagingRoot -Directory |
+    ForEach-Object { Join-Path $_.FullName $meta.ArtifactName } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+    Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending
 
-  Write-Host "ZIP content OK ✅ ($($manifest.mainExe) + version.json found)" -ForegroundColor Green
+  $stage = $candidates | Select-Object -First 1
+  if (-not $stage) {
+    throw "No staged payload found for $Component under $stagingRoot"
+  }
+  return $stage
 }
-finally {
-  try { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue } catch {}
+
+if ([string]::IsNullOrWhiteSpace($StageDir)) {
+  $StageDir = Pick-NewestStageDir
 }
+
+if (-not (Test-Path -LiteralPath $StageDir -PathType Container)) {
+  throw "StageDir not found: $StageDir"
+}
+
+$versionPath = Join-Path $StageDir "version.json"
+if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
+  throw "version.json not found: $versionPath"
+}
+
+$versionData = Get-Content -LiteralPath $versionPath -Raw | ConvertFrom-Json
+$mainExe = [string]($versionData.mainExe)
+$version = [string]($versionData.version)
+$releaseId = [string]($versionData.releaseId)
+$componentId = [string]($versionData.component)
+$codename = [string]($versionData.codename)
+$mainExePath = Join-Path $StageDir $mainExe
+
+if ([string]::IsNullOrWhiteSpace($componentId)) { throw "component missing in $versionPath" }
+if ([string]::IsNullOrWhiteSpace($mainExe)) { throw "mainExe missing in $versionPath" }
+if ([string]::IsNullOrWhiteSpace($version)) { throw "version missing in $versionPath" }
+if ([string]::IsNullOrWhiteSpace($releaseId)) { throw "releaseId missing in $versionPath" }
+if (-not (Test-Path -LiteralPath $mainExePath -PathType Leaf)) {
+  throw "Main executable not found in staged payload: $mainExePath"
+}
+
+Write-Host "Stage payload OK" -ForegroundColor Green
+Write-Host "Component : $componentId"
+Write-Host "Version   : $version"
+if (-not [string]::IsNullOrWhiteSpace($codename)) {
+  Write-Host "Codename  : $codename"
+}
+Write-Host "ReleaseId : $releaseId"
+Write-Host "MainExe   : $mainExePath"

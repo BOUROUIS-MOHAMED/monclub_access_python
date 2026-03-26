@@ -6,6 +6,7 @@ import type {
   UserDto, AgentStatusResponse, AgentDeviceSnap,
   UpdateStatusResponse, LogLine, LocalFingerprintDto, PopupEvent,
 } from "./types";
+import { normalizeLogLine, upsertLogLine } from "@/lib/logs";
 
 // ── generic fetch hook ──
 function useApi<T>(fetcher: () => Promise<T>, deps: unknown[] = []) {
@@ -108,9 +109,12 @@ export function useLogStream(maxLines = 2000) {
   useEffect(() => {
     const es = openSSE("/logs/stream", (type, data) => {
       if (type === "log" && data && typeof data === "object") {
+        const normalized = normalizeLogLine(data);
+        if (!normalized) {
+          return;
+        }
         setLines((prev) => {
-          const n = [...prev, data as LogLine];
-          return n.length > maxLines ? n.slice(-maxLines) : n;
+          return upsertLogLine(prev, normalized, maxLines);
         });
       }
     });

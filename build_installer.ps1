@@ -2,7 +2,7 @@ param(
   [ValidateSet("access", "tv")]
   [string]$Component = "access",
 
-  [string]$ManifestPath = "",
+  [string]$StageDir = "",
 
   [string]$IsccPath = "",
 
@@ -43,110 +43,100 @@ function Resolve-Iscc {
   throw "ISCC.exe not found. Install Inno Setup, or set INNO_ISCC env var, or pass -IsccPath."
 }
 
-function Pick-NewestManifest {
-  $m = Get-ChildItem (Join-Path $ROOT "release\$($meta.ManifestGlob)") -File |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-
-  if (-not $m) { throw "No manifest found in .\release\ ($($meta.ManifestGlob))" }
-  return $m.FullName
-}
-
-function Try-BuildSharedUpdater {
-  $scriptPath = Join-Path $ROOT "build_updater.ps1"
-  if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
-    return $false
+function Pick-NewestStageDir {
+  $stagingRoot = Join-Path $ROOT "release\_staging"
+  if (-not (Test-Path -LiteralPath $stagingRoot -PathType Container)) {
+    throw "Staging root not found: $stagingRoot"
   }
 
-  Write-Host "Shared updater missing. Building it now..." -ForegroundColor Yellow
-  & powershell -ExecutionPolicy Bypass -File $scriptPath
-  if ($LASTEXITCODE -ne 0) {
-    Write-Warning "build_updater.ps1 failed with exit code $LASTEXITCODE"
-    return $false
+  $candidates = Get-ChildItem -LiteralPath $stagingRoot -Directory |
+    ForEach-Object { Join-Path $_.FullName $meta.ArtifactName } |
+    Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+    Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending
+
+  $stage = $candidates | Select-Object -First 1
+  if (-not $stage) {
+    throw "No staged payload found for $Component under $stagingRoot"
   }
-  return $true
+  return $stage
 }
 
-function Resolve-UpdaterSourcePath {
-  $generic = Join-Path $ROOT ("installer\updater\{0}" -f $meta.UpdaterSourceExe)
-  if (Test-Path -LiteralPath $generic -PathType Leaf) {
-    return $generic
+function Read-StageVersionInfo {
+  param([string]$ResolvedStageDir)
+
+  $versionPath = Join-Path $ResolvedStageDir "version.json"
+  if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) {
+    throw "version.json not found in staged payload: $versionPath"
   }
 
-  if (Try-BuildSharedUpdater) {
-    if (Test-Path -LiteralPath $generic -PathType Leaf) {
-      return $generic
-    }
+  $data = Get-Content -LiteralPath $versionPath -Raw | ConvertFrom-Json
+  $version = [string]($data.version)
+  $releaseId = [string]($data.releaseId)
+  $codename = [string]($data.codename)
+
+  if ([string]::IsNullOrWhiteSpace($version)) {
+    throw "version missing in $versionPath"
+  }
+  if ([string]::IsNullOrWhiteSpace($releaseId)) {
+    throw "releaseId missing in $versionPath"
   }
 
-  $legacyAccess = Join-Path $ROOT "installer\updater\MonClubAccessUpdater.exe"
-  if (($Component -eq "access") -and (Test-Path -LiteralPath $legacyAccess -PathType Leaf)) {
-    Write-Warning "Falling back to legacy updater binary: $legacyAccess"
-    return $legacyAccess
+  return @{
+    Version = $version
+    ReleaseId = $releaseId
+    Codename = $codename
+    VersionPath = $versionPath
   }
-
-  throw @"
-Updater exe not found:
-  $generic
-
-Build it first:
-  dotnet publish .\updater\MonClubAccessUpdater\MonClubAccessUpdater.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
-
-Then copy the published EXE to:
-  installer\updater\$($meta.UpdaterSourceExe)
-"@
 }
 
-if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
-  $ManifestPath = Pick-NewestManifest
+if ([string]::IsNullOrWhiteSpace($StageDir)) {
+  $StageDir = Pick-NewestStageDir
 }
 
-if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
-  throw "Manifest not found: $ManifestPath"
+if (-not (Test-Path -LiteralPath $StageDir -PathType Container)) {
+  throw "StageDir not found: $StageDir"
 }
 
-$manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-$releaseId = $manifest.releaseId
-$stageDir = $manifest.outputs.stagedDir
-
-if ([string]::IsNullOrWhiteSpace($releaseId)) { throw "releaseId missing in manifest" }
-if ([string]::IsNullOrWhiteSpace($stageDir)) { throw "outputs.stagedDir missing in manifest" }
-if (-not (Test-Path -LiteralPath $stageDir)) { throw "stagedDir not found: $stageDir" }
-
+$stageInfo = Read-StageVersionInfo -ResolvedStageDir $StageDir
 $installerScript = Join-Path $ROOT (($meta.InstallerScript -replace '^\.[\\/]', ''))
 if (-not (Test-Path -LiteralPath $installerScript -PathType Leaf)) {
   throw "Installer script not found: $installerScript"
 }
 
-$installerPath = Join-Path $ROOT ("release\{0}-{1}.exe" -f $meta.InstallerBaseName, $releaseId)
+$installerFileName = Format-DesktopInstallerFileName -Component $Component -Version $stageInfo.Version
+$installerPath = Join-Path $ROOT ("release\{0}" -f $installerFileName)
+$outputBaseName = [System.IO.Path]::GetFileNameWithoutExtension($installerFileName)
+
 if ($DryRun) {
-  $expectedUpdater = Join-Path $ROOT ("installer\updater\{0}" -f $meta.UpdaterSourceExe)
   Write-Host ("== {0} installer build ==" -f $meta.DisplayName) -ForegroundColor Cyan
-  Write-Host "Manifest : $ManifestPath" -ForegroundColor Cyan
-  Write-Host "StageDir : $stageDir" -ForegroundColor Cyan
-  Write-Host "ISS      : $installerScript" -ForegroundColor Cyan
-  Write-Host "Updater  : $expectedUpdater" -ForegroundColor Cyan
-  Write-Host "Output   : $installerPath" -ForegroundColor Cyan
+  Write-Host "StageDir   : $StageDir" -ForegroundColor Cyan
+  Write-Host "Version    : $($stageInfo.Version)" -ForegroundColor Cyan
+  Write-Host "Codename   : $($stageInfo.Codename)" -ForegroundColor Cyan
+  Write-Host "ReleaseId  : $($stageInfo.ReleaseId)" -ForegroundColor Cyan
+  Write-Host "VersionJson: $($stageInfo.VersionPath)" -ForegroundColor Cyan
+  Write-Host "ISS        : $installerScript" -ForegroundColor Cyan
+  Write-Host "Output     : $installerPath" -ForegroundColor Cyan
   Write-Host "DryRun enabled. Installer compilation skipped." -ForegroundColor Yellow
   exit 0
 }
 
-$updaterExe = Resolve-UpdaterSourcePath
 $iscc = Resolve-Iscc -Override $IsccPath
 
 Write-Host ("== {0} installer build ==" -f $meta.DisplayName) -ForegroundColor Cyan
-Write-Host "Manifest : $ManifestPath" -ForegroundColor Cyan
-Write-Host "StageDir : $stageDir" -ForegroundColor Cyan
-Write-Host "ISS      : $installerScript" -ForegroundColor Cyan
-Write-Host "Updater  : $updaterExe" -ForegroundColor Cyan
-Write-Host "Output   : $installerPath" -ForegroundColor Cyan
+Write-Host "StageDir   : $StageDir" -ForegroundColor Cyan
+Write-Host "Version    : $($stageInfo.Version)" -ForegroundColor Cyan
+Write-Host "Codename   : $($stageInfo.Codename)" -ForegroundColor Cyan
+Write-Host "ReleaseId  : $($stageInfo.ReleaseId)" -ForegroundColor Cyan
+Write-Host "VersionJson: $($stageInfo.VersionPath)" -ForegroundColor Cyan
+Write-Host "ISS        : $installerScript" -ForegroundColor Cyan
+Write-Host "Output     : $installerPath" -ForegroundColor Cyan
 
 & "$iscc" `
   "$installerScript" `
-  "/DReleaseId=$releaseId" `
-  "/DStageDir=$stageDir" `
-  "/DUpdaterSourcePath=$updaterExe" `
-  "/DUpdaterDestExe=$($meta.UpdaterInstalledExe)"
+  "/DAppVersion=$($stageInfo.Version)" `
+  "/DReleaseId=$($stageInfo.ReleaseId)" `
+  "/DStageDir=$StageDir" `
+  "/DOutputBaseFilename=$outputBaseName"
 
 if ($LASTEXITCODE -ne 0) {
   throw "ISCC compile failed with exit code $LASTEXITCODE"

@@ -2566,7 +2566,25 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
 
 def _handle_device_door_presets_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
-    from access.store import list_device_door_presets
+    from access.store import get_sync_device_payload, list_device_door_presets
+
+    device_payload = get_sync_device_payload(did) or {}
+    synced_presets = device_payload.get("doorPresets")
+
+    if isinstance(synced_presets, list) and synced_presets:
+        ctx.send_json(200, {"presets": [
+            {
+                "id": _safe_int((p or {}).get("id"), 0),
+                "deviceId": _safe_int((p or {}).get("deviceId"), did),
+                "doorNumber": _safe_int((p or {}).get("doorNumber"), 1),
+                "pulseSeconds": _safe_int((p or {}).get("pulseSeconds"), 3),
+                "doorName": _safe_str((p or {}).get("doorName"), ""),
+            }
+            for p in synced_presets
+            if isinstance(p, dict)
+        ]})
+        return
+
     presets = list_device_door_presets(did)
     ctx.send_json(200, {"presets": [
         {"id": p.id, "deviceId": p.device_id, "doorNumber": p.door_number,
@@ -2688,6 +2706,14 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
 
     # send initial status
     ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+    last_popup_seq = 0
+    if eng:
+        try:
+            # New subscribers should only receive future popup events, but they must
+            # not compete with other subscribers for the same queue items.
+            last_popup_seq = eng.get_latest_popup_event_seq()
+        except Exception:
+            last_popup_seq = 0
 
     last_snap: Dict[int, Dict[str, Any]] = {}
     while True:
@@ -2713,36 +2739,17 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
             except Exception:
                 pass
 
-            # drain popup queue for React
-            popup_q = eng.get_popup_queue()
-            for _ in range(10):
-                try:
-                    req = popup_q.get_nowait()
-                    alive = ctx.send_sse_event("popup", {
-                        "eventId": req.event_id,
-                        "title": req.title,
-                        "message": req.message,
-                        "imagePath": req.image_path,
-                        "popupShowImage": req.popup_show_image,
-                        "userFullName": getattr(req, "user_full_name", ""),
-                        "userImage": getattr(req, "user_image", ""),
-                        "userValidFrom": getattr(req, "user_valid_from", ""),
-                        "userValidTo": getattr(req, "user_valid_to", ""),
-                        "userMembershipId": getattr(req, "user_membership_id", None),
-                        "userPhone": getattr(req, "user_phone", ""),
-                        "deviceId": getattr(req, "device_id", 0),
-                        "deviceName": getattr(req, "device_name", ""),
-                        "allowed": getattr(req, "allowed", False),
-                        "reason": getattr(req, "reason", ""),
-                        "scanMode": getattr(req, "scan_mode", ""),
-                        "popupDurationSec": getattr(req, "popup_duration_sec", 3),
-                        "popupEnabled": getattr(req, "popup_enabled", True),
-                        "winNotifyEnabled": getattr(req, "win_notify_enabled", True),
-                    })
-                    if not alive:
-                        return
-                except Exception:
-                    break
+            # Fan out popup events to every SSE subscriber instead of letting
+            # subscribers race on the same queue item.
+            try:
+                popup_events = eng.get_popup_events_since(last_popup_seq, limit=10)
+            except Exception:
+                popup_events = []
+            for popup_seq, payload in popup_events:
+                alive = ctx.send_sse_event("popup", payload)
+                if not alive:
+                    return
+                last_popup_seq = popup_seq
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
@@ -2968,118 +2975,162 @@ def _handle_fingerprints_delete(ctx: _Ctx) -> None:
 
 # ==================== 8) LOGS ====================
 
-def _handle_logs_recent(ctx: _Ctx) -> None:
-    page = getattr(ctx.app, "page_logs", None)
-    if not page or not hasattr(page, "_buffer"):
-        ctx.send_json(200, {"lines": [], "total": 0})
-        return
-    level = ctx.q("level", default="ALL").upper()
-    limit = ctx.q_int("limit", default=500)
+def _serialize_log_entry(entry: Any) -> Dict[str, Any]:
+    repeat_count = max(1, _safe_int(getattr(entry, "repeat_count", 1), 1))
+    raw_text = _safe_str(getattr(entry, "raw_text", getattr(entry, "text", "")), "")
+    text = _safe_str(getattr(entry, "text", raw_text), raw_text)
+    if repeat_count > 1 and text == raw_text:
+        text = f"{raw_text} (x{repeat_count})"
 
+    tokens: Dict[str, str] = {}
+    raw_tokens = getattr(entry, "tokens", None)
+    if isinstance(raw_tokens, dict):
+        for key, value in raw_tokens.items():
+            k = _safe_str(key, "").strip()
+            v = _safe_str(value, "").strip()
+            if k and v:
+                tokens[k] = v
+
+    ts = _safe_str(getattr(entry, "first_seen_at", getattr(entry, "ts", "")), "").strip()
+    last_seen_at = _safe_str(getattr(entry, "last_seen_at", ts), ts).strip()
+    if not ts:
+        ts = last_seen_at or time.strftime("%Y-%m-%dT%H:%M:%S")
+
+    return {
+        "id": getattr(entry, "id", None),
+        "revision": _safe_int(getattr(entry, "revision", repeat_count), repeat_count),
+        "level": _safe_str(getattr(entry, "level", "INFO"), "INFO").upper(),
+        "text": text,
+        "rawText": raw_text or text,
+        "repeatCount": repeat_count,
+        "collapsed": repeat_count > 1,
+        "ts": ts,
+        "firstSeenAt": ts,
+        "lastSeenAt": last_seen_at or ts,
+        "tokens": tokens,
+    }
+
+
+def _read_log_filters(ctx: _Ctx) -> Dict[str, Any]:
+    return {
+        "level": ctx.q("level", default="ALL").upper(),
+        "query": _safe_str(ctx.q("q", "query", "filter", "search", default=""), "").strip().lower(),
+        "door": _safe_str(ctx.q("door", "doorId", "doorNumber", default=""), "").strip().lower(),
+        "card": _safe_str(ctx.q("card", "cardId", "cardNo", "code", default=""), "").strip().lower(),
+        "device": _safe_str(ctx.q("device", "deviceId", default=""), "").strip().lower(),
+        "category": _safe_str(ctx.q("category", default="ALL"), "ALL").strip().upper(),
+        "repeated_only": _safe_bool(ctx.q("repeatedOnly", "duplicatesOnly", "collapsedOnly", default="0"), False),
+    }
+
+
+def _payload_matches_log_filters(payload: Dict[str, Any], filters: Dict[str, Any]) -> bool:
+    level = _safe_str(payload.get("level"), "INFO").upper()
+    if filters["level"] not in ("", "ALL") and level != filters["level"]:
+        return False
+
+    repeat_count = max(1, _safe_int(payload.get("repeatCount"), 1))
+    if filters["repeated_only"] and repeat_count <= 1:
+        return False
+
+    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+    category = _safe_str(tokens.get("category"), "SYSTEM").upper()
+    if filters["category"] not in ("", "ALL") and category != filters["category"]:
+        return False
+
+    searchable_parts = [
+        _safe_str(payload.get("rawText"), ""),
+        _safe_str(payload.get("text"), ""),
+        level,
+        _safe_str(payload.get("ts"), ""),
+        _safe_str(tokens.get("door"), ""),
+        _safe_str(tokens.get("cardId"), ""),
+        _safe_str(tokens.get("deviceId"), ""),
+        _safe_str(tokens.get("userId"), ""),
+        _safe_str(tokens.get("mode"), ""),
+        category,
+    ]
+    searchable = " ".join(part for part in searchable_parts if part).lower()
+
+    if filters["query"] and filters["query"] not in searchable:
+        return False
+    if filters["door"] and filters["door"] not in (_safe_str(tokens.get("door"), "").lower() or searchable):
+        return False
+    if filters["card"] and filters["card"] not in (_safe_str(tokens.get("cardId"), "").lower() or searchable):
+        return False
+    if filters["device"] and filters["device"] not in (_safe_str(tokens.get("deviceId"), "").lower() or searchable):
+        return False
+    return True
+
+
+def _load_log_payloads(page: Any, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not page or not hasattr(page, "snapshot"):
+        return []
     try:
-        buf = list(page._buffer)  # copy for safety
+        entries = page.snapshot()
     except Exception:
-        buf = []
-    if level not in ("", "ALL"):
-        buf = [(lvl, line) for lvl, line in buf if lvl == level]
-    total = len(buf)
+        return []
+    payloads = [_serialize_log_entry(entry) for entry in entries]
+    return [payload for payload in payloads if _payload_matches_log_filters(payload, filters)]
+
+
+def _handle_logs_recent_common(ctx: _Ctx, *, include_ok: bool = False) -> None:
+    page = getattr(ctx.app, "page_logs", None)
+    filters = _read_log_filters(ctx)
+    limit = ctx.q_int("limit", default=500)
+    lines = _load_log_payloads(page, filters)
+    total = len(lines)
     if limit > 0:
-        buf = buf[-limit:]
-    ctx.send_json(200, {
-        "lines": [{"level": lvl, "text": line} for lvl, line in buf],
-        "total": total,
-    })
+        lines = lines[-limit:]
+    payload: Dict[str, Any] = {"lines": lines, "total": total}
+    if include_ok:
+        payload["ok"] = True
+    ctx.send_json(200, payload)
+
+
+def _stream_logs_common(ctx: _Ctx) -> None:
+    ctx.send_sse_start()
+    filters = _read_log_filters(ctx)
+    page = getattr(ctx.app, "page_logs", None)
+    last_revision = page.get_revision() if page and hasattr(page, "get_revision") else 0
+
+    while True:
+        try:
+            time.sleep(0.2)
+            if not page:
+                page = getattr(ctx.app, "page_logs", None)
+                last_revision = page.get_revision() if page and hasattr(page, "get_revision") else 0
+                continue
+
+            if not hasattr(page, "changes_since"):
+                return
+
+            last_revision, changed_entries = page.changes_since(last_revision)
+            for entry in changed_entries:
+                payload = _serialize_log_entry(entry)
+                if _payload_matches_log_filters(payload, filters):
+                    if not ctx.send_sse_event("log", payload):
+                        return
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+        except Exception:
+            return
+
+
+def _handle_logs_recent(ctx: _Ctx) -> None:
+    _handle_logs_recent_common(ctx)
 
 
 def _handle_logs_stream_sse(ctx: _Ctx) -> None:
     """SSE stream: real-time log tail."""
-    ctx.send_sse_start()
-    level = ctx.q("level", default="ALL").upper()
-    log_q = getattr(ctx.app, "log_queue", None)
-
-    # We create a secondary queue listener by reading from the page buffer tail
-    page = getattr(ctx.app, "page_logs", None)
-    last_len = len(page._buffer) if page else 0
-
-    while True:
-        try:
-            time.sleep(0.2)
-            if not page:
-                page = getattr(ctx.app, "page_logs", None)
-                continue
-
-            buf = page._buffer
-            cur_len = len(buf)
-            if cur_len > last_len:
-                new_entries = buf[last_len:cur_len]
-                for lvl, line in new_entries:
-                    if level in ("", "ALL") or lvl == level:
-                        alive = ctx.send_sse_event("log", {"level": lvl, "text": line})
-                        if not alive:
-                            return
-                last_len = cur_len
-            elif cur_len < last_len:
-                # buffer was cleared
-                last_len = cur_len
-
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            return
-        except Exception:
-            return
+    _stream_logs_common(ctx)
 
 
 def _handle_tv_logs_recent(ctx: _Ctx) -> None:
-    page = getattr(ctx.app, "page_logs", None)
-    if not page or not hasattr(page, "_buffer"):
-        ctx.send_json(200, {"lines": [], "total": 0})
-        return
-    level = ctx.q("level", default="ALL").upper()
-    limit = ctx.q_int("limit", default=500)
-
-    try:
-        buf = list(page._buffer)
-    except Exception:
-        buf = []
-    if level not in ("", "ALL"):
-        buf = [(lvl, line) for lvl, line in buf if lvl == level]
-    total = len(buf)
-    if limit > 0:
-        buf = buf[-limit:]
-    ctx.send_json(200, {
-        "ok": True,
-        "lines": [{"level": lvl, "text": line} for lvl, line in buf],
-        "total": total,
-    })
+    _handle_logs_recent_common(ctx, include_ok=True)
 
 
 def _handle_tv_logs_stream_sse(ctx: _Ctx) -> None:
-    ctx.send_sse_start()
-    level = ctx.q("level", default="ALL").upper()
-    page = getattr(ctx.app, "page_logs", None)
-    last_len = len(page._buffer) if page else 0
-
-    while True:
-        try:
-            time.sleep(0.2)
-            if not page:
-                page = getattr(ctx.app, "page_logs", None)
-                continue
-
-            buf = page._buffer
-            cur_len = len(buf)
-            if cur_len > last_len:
-                new_entries = buf[last_len:cur_len]
-                for lvl, line in new_entries:
-                    if level in ("", "ALL") or lvl == level:
-                        if not ctx.send_sse_event("log", {"level": lvl, "text": line}):
-                            return
-                last_len = cur_len
-            elif cur_len < last_len:
-                last_len = cur_len
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            return
-        except Exception:
-            return
+    _stream_logs_common(ctx)
 
 
 def _handle_logs_open_dir(ctx: _Ctx) -> None:
@@ -3185,7 +3236,7 @@ def _handle_component_update_install(ctx: _Ctx) -> None:
     if not can:
         ctx.send_json(400, {"ok": False, "error": reason})
         return
-    ctx.send_json(200, {"ok": True, "message": "launching updater and exiting"})
+    ctx.send_json(200, {"ok": True, "message": "launching installer and exiting"})
     # Schedule quit after response is sent
     def _do_install():
         try:
@@ -3349,6 +3400,14 @@ def _handle_db_access_history(ctx: _Ctx) -> None:
             "cmdOk": r.cmd_ok,
             "cmdError": r.cmd_error,
             "createdAt": r.created_at,
+            "historySource": r.history_source,
+            "backendSyncState": r.backend_sync_state,
+            "backendAttemptCount": r.backend_attempt_count,
+            "backendFailureCount": r.backend_failure_count,
+            "backendLastAttemptAt": r.backend_last_attempt_at,
+            "backendNextRetryAt": r.backend_next_retry_at,
+            "backendSyncedAt": r.backend_synced_at,
+            "backendLastError": r.backend_last_error,
         }
         for r in records
     ]})
@@ -3361,7 +3420,7 @@ def _handle_db_export(ctx: _Ctx) -> None:
     tables_to_export = [
         "sync_users", "sync_memberships", "sync_devices", "sync_infrastructures",
         "sync_gym_access_credentials", "fingerprints", "device_door_presets",
-        "agent_rtlog_state", "access_history", "device_sync_state", "auth_state",
+        "agent_rtlog_state", "access_history", "device_sync_state", "device_attendance_state", "auth_state",
     ]
     try:
         with get_conn() as conn:

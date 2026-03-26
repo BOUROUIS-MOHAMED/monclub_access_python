@@ -375,6 +375,7 @@ def init_db() -> None:
 
                 rtlog_table TEXT,
                 save_history INTEGER,
+                device_attendance_history_reading_delay_minutes INTEGER,
                 platform TEXT,
 
                 totp_enabled INTEGER,
@@ -429,6 +430,12 @@ def init_db() -> None:
 
         _ensure_column(conn, "sync_devices", "rtlog_table", "rtlog_table TEXT")
         _ensure_column(conn, "sync_devices", "save_history", "save_history INTEGER")
+        _ensure_column(
+            conn,
+            "sync_devices",
+            "device_attendance_history_reading_delay_minutes",
+            "device_attendance_history_reading_delay_minutes INTEGER",
+        )
         _ensure_column(conn, "sync_devices", "platform", "platform TEXT")
 
         _ensure_column(conn, "sync_devices", "adaptive_sleep", "adaptive_sleep INTEGER")
@@ -562,12 +569,59 @@ def init_db() -> None:
                 cmd_ok INTEGER,
                 cmd_error TEXT,
                 raw_json TEXT,
+                history_source TEXT NOT NULL DEFAULT 'AGENT',
+                backend_sync_state TEXT NOT NULL DEFAULT 'PENDING',
+                backend_attempt_count INTEGER NOT NULL DEFAULT 0,
+                backend_failure_count INTEGER NOT NULL DEFAULT 0,
+                backend_last_attempt_at TEXT,
+                backend_next_retry_at TEXT,
+                backend_synced_at TEXT,
+                backend_last_error TEXT,
                 UNIQUE(event_id)
             );
             """
         )
+        _ensure_column(conn, "access_history", "history_source", "history_source TEXT NOT NULL DEFAULT 'AGENT'")
+        _ensure_column(conn, "access_history", "backend_sync_state", "backend_sync_state TEXT NOT NULL DEFAULT 'PENDING'")
+        _ensure_column(conn, "access_history", "backend_attempt_count", "backend_attempt_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "access_history", "backend_failure_count", "backend_failure_count INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "access_history", "backend_last_attempt_at", "backend_last_attempt_at TEXT")
+        _ensure_column(conn, "access_history", "backend_next_retry_at", "backend_next_retry_at TEXT")
+        _ensure_column(conn, "access_history", "backend_synced_at", "backend_synced_at TEXT")
+        _ensure_column(conn, "access_history", "backend_last_error", "backend_last_error TEXT")
+        conn.execute("UPDATE access_history SET history_source='AGENT' WHERE history_source IS NULL OR history_source=''")
+        conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
+        conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
+        conn.execute("UPDATE access_history SET backend_failure_count=0 WHERE backend_failure_count IS NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_access_history_device_time ON access_history(device_id, event_time);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_access_history_created_at ON access_history(created_at);")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_history_backend_sync "
+            "ON access_history(backend_sync_state, backend_next_retry_at, id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_access_history_source_time "
+            "ON access_history(history_source, event_time);"
+        )
+
+        # -----------------------------
+        # device attendance state (DEVICE-mode polling/upload/purge)
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_attendance_state (
+                device_id INTEGER PRIMARY KEY,
+                last_read_started_at TEXT,
+                last_read_finished_at TEXT,
+                last_read_event_count INTEGER NOT NULL DEFAULT 0,
+                last_read_error TEXT,
+                last_purge_at TEXT,
+                last_purge_deleted_count INTEGER NOT NULL DEFAULT 0,
+                last_purge_error TEXT,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
 
         # -----------------------------
         # device sync incremental state (per-device+pin)
@@ -1370,7 +1424,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                     pulse_time_ms, cmd_timeout_ms, timeout_ms,
 
-                    rtlog_table, save_history, platform,
+                    rtlog_table, save_history, device_attendance_history_reading_delay_minutes, platform,
 
                     totp_enabled, rfid_enabled, fingerprint_enabled, face_id_enabled,
 
@@ -1393,7 +1447,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     ?, ?,
                     ?, ?,
                     ?, ?, ?,
-                    ?, ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, ?, ?, ?,
@@ -1444,6 +1498,9 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                     _safe_str(d.get("rtlogTable", "rtlog"), "rtlog"),
                     _bool_to_i(d.get("saveHistory", True), default=1),
+                    _to_int_or_none(
+                        d.get("deviceAttendanceHistoryReadingDelay", d.get("device_attendance_history_reading_delay"))
+                    ),
                     d.get("platform"),
 
                     _bool_to_i(d.get("totpEnabled", True), default=1),
@@ -1693,6 +1750,17 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
 
         "rtlogTable": _safe_str(g("rtlogTable", "rtlog_table", default="rtlog"), "rtlog") or "rtlog",
         "saveHistory": _boolish(g("saveHistory", "save_history", default=1), True),
+        "deviceAttendanceHistoryReadingDelay": (
+            _to_int_or_none(
+                g(
+                    "deviceAttendanceHistoryReadingDelay",
+                    "device_attendance_history_reading_delay",
+                    "device_attendance_history_reading_delay_minutes",
+                    default=30,
+                )
+            )
+            or 30
+        ),
         "platform": g("platform"),
 
         "totpEnabled": _boolish(g("totpEnabled", "totp_enabled", default=1), True),
@@ -2346,6 +2414,52 @@ class AccessHistoryRow:
     cmd_ok: Optional[int]
     cmd_error: Optional[str]
     raw_json: str
+    history_source: str
+    backend_sync_state: str
+    backend_attempt_count: int
+    backend_failure_count: int
+    backend_last_attempt_at: Optional[str]
+    backend_next_retry_at: Optional[str]
+    backend_synced_at: Optional[str]
+    backend_last_error: Optional[str]
+
+
+ACCESS_HISTORY_SOURCE_AGENT = "AGENT"
+ACCESS_HISTORY_SOURCE_DEVICE = "DEVICE"
+
+ACCESS_HISTORY_SYNC_PENDING = "PENDING"
+ACCESS_HISTORY_SYNC_FAILED_RETRYABLE = "FAILED_RETRYABLE"
+ACCESS_HISTORY_SYNC_FAILED_TERMINAL = "FAILED_TERMINAL"
+ACCESS_HISTORY_SYNC_SYNCED = "SYNCED"
+
+
+@dataclass
+class DeviceAttendanceState:
+    device_id: int
+    last_read_started_at: str
+    last_read_finished_at: str
+    last_read_event_count: int
+    last_read_error: str
+    last_purge_at: str
+    last_purge_deleted_count: int
+    last_purge_error: str
+    updated_at: str
+
+
+def normalize_access_history_source(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    return ACCESS_HISTORY_SOURCE_DEVICE if s == ACCESS_HISTORY_SOURCE_DEVICE else ACCESS_HISTORY_SOURCE_AGENT
+
+
+def normalize_access_history_sync_state(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s == ACCESS_HISTORY_SYNC_SYNCED:
+        return ACCESS_HISTORY_SYNC_SYNCED
+    if s == ACCESS_HISTORY_SYNC_FAILED_TERMINAL:
+        return ACCESS_HISTORY_SYNC_FAILED_TERMINAL
+    if s == ACCESS_HISTORY_SYNC_FAILED_RETRYABLE:
+        return ACCESS_HISTORY_SYNC_FAILED_RETRYABLE
+    return ACCESS_HISTORY_SYNC_PENDING
 
 
 def access_history_exists(event_id: str) -> bool:
@@ -2358,6 +2472,46 @@ def access_history_exists(event_id: str) -> bool:
             return bool(r)
     except Exception:
         return False
+
+
+def _build_access_history_insert_params(
+    *,
+    event_id: str,
+    device_id: int | None,
+    door_id: int | None,
+    card_no: str | None,
+    event_time: str | None,
+    event_type: str | None,
+    allowed: bool,
+    reason: str | None,
+    poll_ms: float | None,
+    decision_ms: float | None,
+    cmd_ms: float | None,
+    cmd_ok: bool | None,
+    cmd_error: str | None,
+    raw: Dict[str, Any] | None,
+    history_source: str | None,
+    backend_sync_state: str | None,
+) -> tuple[Any, ...]:
+    return (
+        now_iso(),
+        str(event_id),
+        int(device_id) if device_id is not None else None,
+        int(door_id) if door_id is not None else None,
+        (str(card_no) if card_no is not None else None),
+        (str(event_time) if event_time is not None else None),
+        (str(event_type) if event_type is not None else None),
+        1 if bool(allowed) else 0,
+        (str(reason or "")[:500]),
+        float(poll_ms) if poll_ms is not None else None,
+        float(decision_ms) if decision_ms is not None else None,
+        float(cmd_ms) if cmd_ms is not None else None,
+        (1 if bool(cmd_ok) else 0) if cmd_ok is not None else None,
+        (str(cmd_error or "")[:1000]) if cmd_error else None,
+        json.dumps(raw or {}, ensure_ascii=False),
+        normalize_access_history_source(history_source),
+        normalize_access_history_sync_state(backend_sync_state),
+    )
 
 
 def insert_access_history(
@@ -2376,6 +2530,8 @@ def insert_access_history(
     cmd_ok: bool | None,
     cmd_error: str | None,
     raw: Dict[str, Any] | None,
+    history_source: str | None = None,
+    backend_sync_state: str | None = None,
 ) -> int:
     """
     Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
@@ -2395,31 +2551,84 @@ def insert_access_history(
                     allowed, reason,
                     poll_ms, decision_ms, cmd_ms,
                     cmd_ok, cmd_error,
-                    raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_json,
+                    history_source,
+                    backend_sync_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    now_iso(),
-                    str(event_id),
-                    int(device_id) if device_id is not None else None,
-                    int(door_id) if door_id is not None else None,
-                    (str(card_no) if card_no is not None else None),
-                    (str(event_time) if event_time is not None else None),
-                    (str(event_type) if event_type is not None else None),
-                    1 if bool(allowed) else 0,
-                    (str(reason or "")[:500]),
-                    float(poll_ms) if poll_ms is not None else None,
-                    float(decision_ms) if decision_ms is not None else None,
-                    float(cmd_ms) if cmd_ms is not None else None,
-                    (1 if bool(cmd_ok) else 0) if cmd_ok is not None else None,
-                    (str(cmd_error or "")[:1000]) if cmd_error else None,
-                    json.dumps(raw or {}, ensure_ascii=False),
+                _build_access_history_insert_params(
+                    event_id=event_id,
+                    device_id=device_id,
+                    door_id=door_id,
+                    card_no=card_no,
+                    event_time=event_time,
+                    event_type=event_type,
+                    allowed=allowed,
+                    reason=reason,
+                    poll_ms=poll_ms,
+                    decision_ms=decision_ms,
+                    cmd_ms=cmd_ms,
+                    cmd_ok=cmd_ok,
+                    cmd_error=cmd_error,
+                    raw=raw,
+                    history_source=history_source,
+                    backend_sync_state=backend_sync_state,
                 ),
             )
             conn.commit()
             return int(cur.rowcount or 0)
         except sqlite3.IntegrityError:
             return 0
+
+
+def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
+    batch: List[tuple[Any, ...]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        event_id = str(row.get("event_id") or row.get("eventId") or "").strip()
+        if not event_id:
+            continue
+        batch.append(
+            _build_access_history_insert_params(
+                event_id=event_id,
+                device_id=row.get("device_id", row.get("deviceId")),
+                door_id=row.get("door_id", row.get("doorId")),
+                card_no=row.get("card_no", row.get("cardNo")),
+                event_time=row.get("event_time", row.get("eventTime")),
+                event_type=row.get("event_type", row.get("eventType")),
+                allowed=bool(row.get("allowed", False)),
+                reason=row.get("reason"),
+                poll_ms=row.get("poll_ms", row.get("pollMs")),
+                decision_ms=row.get("decision_ms", row.get("decisionMs")),
+                cmd_ms=row.get("cmd_ms", row.get("cmdMs")),
+                cmd_ok=row.get("cmd_ok", row.get("cmdOk")),
+                cmd_error=row.get("cmd_error", row.get("cmdError")),
+                raw=row.get("raw"),
+                history_source=row.get("history_source", row.get("historySource")),
+                backend_sync_state=row.get("backend_sync_state", row.get("backendSyncState")),
+            )
+        )
+    if not batch:
+        return 0
+    with get_conn() as conn:
+        cur = conn.executemany(
+            """
+            INSERT OR IGNORE INTO access_history (
+                created_at, event_id, device_id, door_id, card_no,
+                event_time, event_type,
+                allowed, reason,
+                poll_ms, decision_ms, cmd_ms,
+                cmd_ok, cmd_error,
+                raw_json,
+                history_source,
+                backend_sync_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            batch,
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 def prune_access_history(*, retention_days: int) -> int:
@@ -2430,9 +2639,10 @@ def prune_access_history(*, retention_days: int) -> int:
         cur = conn.execute(
             """
             DELETE FROM access_history
-            WHERE julianday('now') - julianday(created_at) > ?
+            WHERE julianday('now') - julianday(COALESCE(backend_synced_at, created_at)) > ?
+              AND backend_sync_state IN (?, ?)
             """,
-            (days,),
+            (days, ACCESS_HISTORY_SYNC_SYNCED, ACCESS_HISTORY_SYNC_FAILED_TERMINAL),
         )
         conn.commit()
         return int(cur.rowcount or 0)
@@ -2459,6 +2669,217 @@ def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
             d = dict(r)
             out.append(AccessHistoryRow(**d))
         return out
+
+
+def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHistoryRow]:
+    lim = int(limit)
+    if lim < 1:
+        lim = 1
+    if lim > 1000:
+        lim = 1000
+    now = now_iso()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM access_history
+            WHERE backend_sync_state IN (?, ?)
+              AND (backend_next_retry_at IS NULL OR backend_next_retry_at = '' OR backend_next_retry_at <= ?)
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (ACCESS_HISTORY_SYNC_PENDING, ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, now, lim),
+        ).fetchall()
+        return [AccessHistoryRow(**dict(r)) for r in rows]
+
+
+def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None = None) -> int:
+    ids = sorted({int(x) for x in row_ids if int(x) > 0})
+    if not ids:
+        return 0
+    ts = str(synced_at or now_iso())
+    placeholders = ",".join("?" for _ in ids)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE access_history
+            SET backend_sync_state=?,
+                backend_attempt_count=COALESCE(backend_attempt_count, 0) + 1,
+                backend_synced_at=?,
+                backend_last_attempt_at=?,
+                backend_next_retry_at=NULL,
+                backend_last_error=NULL
+            WHERE id IN ({placeholders})
+            """,
+            (ACCESS_HISTORY_SYNC_SYNCED, ts, ts, *ids),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def mark_access_history_sync_failure(
+    *,
+    row_ids: Iterable[int],
+    error: str,
+    retry_after_seconds: int = 300,
+    terminal: bool = False,
+    attempted_at: str | None = None,
+) -> int:
+    ids = sorted({int(x) for x in row_ids if int(x) > 0})
+    if not ids:
+        return 0
+    ts = str(attempted_at or now_iso())
+    retry_after = max(30, int(retry_after_seconds or 300))
+    try:
+        retry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) + timedelta(seconds=retry_after)
+        retry_at = retry_dt.isoformat()
+    except Exception:
+        retry_at = now_iso()
+    state = ACCESS_HISTORY_SYNC_FAILED_TERMINAL if terminal else ACCESS_HISTORY_SYNC_FAILED_RETRYABLE
+    next_retry = None if terminal else retry_at
+    placeholders = ",".join("?" for _ in ids)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE access_history
+            SET backend_sync_state=?,
+                backend_attempt_count=COALESCE(backend_attempt_count, 0) + 1,
+                backend_failure_count=COALESCE(backend_failure_count, 0) + 1,
+                backend_last_attempt_at=?,
+                backend_next_retry_at=?,
+                backend_last_error=?
+            WHERE id IN ({placeholders})
+            """,
+            (state, ts, next_retry, str(error or "")[:2000], *ids),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def mark_access_history_sync_attempt(
+    *,
+    row_ids: Iterable[int],
+    attempted_at: str | None = None,
+) -> int:
+    ids = sorted({int(x) for x in row_ids if int(x) > 0})
+    if not ids:
+        return 0
+    ts = str(attempted_at or now_iso())
+    placeholders = ",".join("?" for _ in ids)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE access_history
+            SET backend_attempt_count=COALESCE(backend_attempt_count, 0) + 1,
+                backend_last_attempt_at=?
+            WHERE id IN ({placeholders})
+            """,
+            (ts, *ids),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def load_device_attendance_state(device_id: int) -> Optional[DeviceAttendanceState]:
+    did = int(device_id)
+    with get_conn() as conn:
+        r = conn.execute(
+            """
+            SELECT
+                device_id,
+                last_read_started_at,
+                last_read_finished_at,
+                last_read_event_count,
+                last_read_error,
+                last_purge_at,
+                last_purge_deleted_count,
+                last_purge_error,
+                updated_at
+            FROM device_attendance_state
+            WHERE device_id=?
+            """,
+            (did,),
+        ).fetchone()
+        if not r:
+            return None
+        return DeviceAttendanceState(
+            device_id=int(r["device_id"]),  # type: ignore[index]
+            last_read_started_at=str(r["last_read_started_at"] or ""),
+            last_read_finished_at=str(r["last_read_finished_at"] or ""),
+            last_read_event_count=int(r["last_read_event_count"] or 0),
+            last_read_error=str(r["last_read_error"] or ""),
+            last_purge_at=str(r["last_purge_at"] or ""),
+            last_purge_deleted_count=int(r["last_purge_deleted_count"] or 0),
+            last_purge_error=str(r["last_purge_error"] or ""),
+            updated_at=str(r["updated_at"] or ""),
+        )
+
+
+def save_device_attendance_state(
+    *,
+    device_id: int,
+    last_read_started_at: str | None = None,
+    last_read_finished_at: str | None = None,
+    last_read_event_count: int | None = None,
+    last_read_error: str | None = None,
+    last_purge_at: str | None = None,
+    last_purge_deleted_count: int | None = None,
+    last_purge_error: str | None = None,
+) -> None:
+    did = int(device_id)
+    with get_conn() as conn:
+        existing = conn.execute(
+            """
+            SELECT
+                last_read_started_at,
+                last_read_finished_at,
+                last_read_event_count,
+                last_read_error,
+                last_purge_at,
+                last_purge_deleted_count,
+                last_purge_error
+            FROM device_attendance_state
+            WHERE device_id=?
+            """,
+            (did,),
+        ).fetchone()
+        base = dict(existing) if existing else {}
+        conn.execute(
+            """
+            INSERT INTO device_attendance_state (
+                device_id,
+                last_read_started_at,
+                last_read_finished_at,
+                last_read_event_count,
+                last_read_error,
+                last_purge_at,
+                last_purge_deleted_count,
+                last_purge_error,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                last_read_started_at=excluded.last_read_started_at,
+                last_read_finished_at=excluded.last_read_finished_at,
+                last_read_event_count=excluded.last_read_event_count,
+                last_read_error=excluded.last_read_error,
+                last_purge_at=excluded.last_purge_at,
+                last_purge_deleted_count=excluded.last_purge_deleted_count,
+                last_purge_error=excluded.last_purge_error,
+                updated_at=excluded.updated_at
+            """,
+            (
+                did,
+                str(last_read_started_at if last_read_started_at is not None else base.get("last_read_started_at") or ""),
+                str(last_read_finished_at if last_read_finished_at is not None else base.get("last_read_finished_at") or ""),
+                int(last_read_event_count if last_read_event_count is not None else base.get("last_read_event_count") or 0),
+                str(last_read_error if last_read_error is not None else base.get("last_read_error") or ""),
+                str(last_purge_at if last_purge_at is not None else base.get("last_purge_at") or ""),
+                int(last_purge_deleted_count if last_purge_deleted_count is not None else base.get("last_purge_deleted_count") or 0),
+                str(last_purge_error if last_purge_error is not None else base.get("last_purge_error") or ""),
+                now_iso(),
+            ),
+        )
+        conn.commit()
 
 
 

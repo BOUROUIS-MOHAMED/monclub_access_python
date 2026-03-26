@@ -84,6 +84,30 @@ def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:
     return x
 
 
+def _parse_duration_minutes(v: Any, default_minutes: int = 30, *, min_minutes: int = 1, max_minutes: int = 1440) -> int:
+    if v is None:
+        return default_minutes
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return _clamp_int(v, default_minutes, min_minutes, max_minutes)
+
+    s = _safe_str(v, "").strip().lower()
+    if not s:
+        return default_minutes
+
+    try:
+        if s.endswith("ms"):
+            return _clamp_int(float(s[:-2]) / 60000.0, default_minutes, min_minutes, max_minutes)
+        if s.endswith("s"):
+            return _clamp_int(float(s[:-1]) / 60.0, default_minutes, min_minutes, max_minutes)
+        if s.endswith("m"):
+            return _clamp_int(float(s[:-1]), default_minutes, min_minutes, max_minutes)
+        if s.endswith("h"):
+            return _clamp_int(float(s[:-1]) * 60.0, default_minutes, min_minutes, max_minutes)
+        return _clamp_int(float(s), default_minutes, min_minutes, max_minutes)
+    except Exception:
+        return default_minutes
+
+
 # --------------- raw payload fallback (ONLY as a fallback) ---------------
 
 def _read_sync_payload_json_fallback() -> Dict[str, Any]:
@@ -219,17 +243,17 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     # sleep/backoff
     adaptive_sleep = _boolish(dev.get("adaptiveSleep"), True)
     busy_min = _clamp_int(dev.get("busySleepMinMs"), 0, 0, 60000)
-    busy_max = _clamp_int(dev.get("busySleepMaxMs"), 500, 0, 60000)
+    busy_max = _clamp_int(dev.get("busySleepMaxMs"), 50, 0, 60000)
     if busy_max < busy_min:
         busy_max = busy_min
 
-    empty_min = _clamp_int(dev.get("emptySleepMinMs"), 200, 0, 60000)
-    empty_max = _clamp_int(dev.get("emptySleepMaxMs"), 500, 0, 60000)
+    empty_min = _clamp_int(dev.get("emptySleepMinMs"), 50, 0, 60000)
+    empty_max = _clamp_int(dev.get("emptySleepMaxMs"), 150, 0, 60000)
     if empty_max < empty_min:
         empty_max = empty_min
 
     empty_factor = _clamp_float(dev.get("emptyBackoffFactor"), 1.35, 1.0, 3.0)
-    empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 2000, 0, 120000)
+    empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 500, 0, 120000)
 
     # TOTP/RFID
     totp_enabled = _boolish(dev.get("totpEnabled"), True)
@@ -259,6 +283,16 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     rtlog_table = _safe_str(dev.get("rtlogTable"), "rtlog").strip() or "rtlog"
     platform = _safe_str(dev.get("platform"), "").strip()
     save_history = _boolish(dev.get("saveHistory"), True)
+    device_attendance_history_reading_delay_minutes = _parse_duration_minutes(
+        dev.get(
+            "deviceAttendanceHistoryReadingDelay",
+            dev.get(
+                "device_attendance_history_reading_delay",
+                dev.get("device_attendance_history_reading_delay_minutes"),
+            ),
+        ),
+        30,
+    )
 
     # device capability flags
     fingerprint_enabled = _boolish(dev.get("fingerprintEnabled"), False)
@@ -302,6 +336,8 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
 
         # notifications
         "save_history": bool(save_history),
+        "device_attendance_history_reading_delay_minutes": int(device_attendance_history_reading_delay_minutes),
+        "device_attendance_history_reading_delay_seconds": int(device_attendance_history_reading_delay_minutes * 60),
         "show_notifications": bool(show_notifications),
         "win_notify_enabled": bool(win_notify_enabled),
         "popup_enabled": bool(popup_enabled),

@@ -34,6 +34,7 @@ ACCESS_OWNED_TABLES: tuple[str, ...] = (
     "agent_rtlog_state",
     "access_history",
     "device_sync_state",
+    "device_attendance_state",
     "offline_creation_queue",
 )
 

@@ -76,8 +76,4 @@
   #root {
     overflow: hidden;
   }
-
-  body[data-desktop-role="tv"] {
-    background: #131418;
-  }
 }

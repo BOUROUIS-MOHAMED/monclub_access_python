@@ -28,6 +28,7 @@ def launch_tauri_ui(
     api_port: int,
     logger,
     existing_process: Optional[subprocess.Popen] = None,
+    start_hidden: bool = False,
 ) -> Optional[subprocess.Popen]:
     """Launch the shared Tauri UI binary in the requested shell mode."""
 
@@ -57,6 +58,7 @@ def launch_tauri_ui(
     env = os.environ.copy()
     env["MONCLUB_DESKTOP_ROLE"] = normalized_role
     env["MONCLUB_LOCAL_API_PORT"] = str(int(api_port))
+    env["MONCLUB_START_HIDDEN"] = "1" if start_hidden else "0"
 
     cargo_bin = Path.home() / ".cargo" / "bin"
     if cargo_bin.is_dir():

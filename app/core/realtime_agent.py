@@ -445,6 +445,30 @@ class NotificationRequest:
     win_notify_enabled: bool = True
 
 
+def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
+    return {
+        "eventId": req.event_id,
+        "title": req.title,
+        "message": req.message,
+        "imagePath": req.image_path,
+        "popupShowImage": req.popup_show_image,
+        "userFullName": req.user_full_name,
+        "userImage": req.user_image,
+        "userValidFrom": req.user_valid_from,
+        "userValidTo": req.user_valid_to,
+        "userMembershipId": req.user_membership_id,
+        "userPhone": req.user_phone,
+        "deviceId": req.device_id,
+        "deviceName": req.device_name,
+        "allowed": req.allowed,
+        "reason": req.reason,
+        "scanMode": req.scan_mode,
+        "popupDurationSec": req.popup_duration_sec,
+        "popupEnabled": req.popup_enabled,
+        "winNotifyEnabled": req.win_notify_enabled,
+    }
+
+
 @dataclass
 class HistoryRecord:
     event_id: str
@@ -1368,7 +1392,7 @@ class DecisionService(threading.Thread):
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                ev = self.event_queue.get(timeout=0.25)
+                ev = self.event_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
 
@@ -1700,6 +1724,10 @@ class AgentRealtimeEngine:
         self._notify_q: "queue.Queue[NotificationRequest]" = queue.Queue(maxsize=5000)
         self._popup_q: "queue.Queue[NotificationRequest]" = queue.Queue(maxsize=5000)
         self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(maxsize=5000)
+        self._popup_capture_lock = threading.Lock()
+        self._popup_events_lock = threading.Lock()
+        self._popup_events_seq = 0
+        self._popup_events_replay: Deque[tuple[int, Dict[str, Any]]] = deque(maxlen=128)
 
         self._statuses: Dict[int, DeviceStatus] = {}
         self._workers: Dict[int, DeviceWorker] = {}
@@ -1825,6 +1853,41 @@ class AgentRealtimeEngine:
     def get_popup_queue(self) -> "queue.Queue[NotificationRequest]":
         return self._popup_q
 
+    def _resize_popup_replay_buffer(self, max_events: int) -> None:
+        size = max(16, min(int(max_events), 1000))
+        with self._popup_events_lock:
+            self._popup_events_replay = deque(self._popup_events_replay, maxlen=size)
+
+    def capture_popup_events(self, limit: int = 50) -> int:
+        drained = 0
+        target = max(1, _safe_int(limit, 50))
+        with self._popup_capture_lock:
+            while drained < target:
+                try:
+                    req = self._popup_q.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+                payload = _popup_payload_from_request(req)
+                with self._popup_events_lock:
+                    self._popup_events_seq += 1
+                    self._popup_events_replay.append((self._popup_events_seq, payload))
+                drained += 1
+        return drained
+
+    def get_latest_popup_event_seq(self) -> int:
+        self.capture_popup_events(limit=100)
+        with self._popup_events_lock:
+            return int(self._popup_events_seq)
+
+    def get_popup_events_since(self, seq: int, limit: int = 10) -> List[tuple[int, Dict[str, Any]]]:
+        target = max(1, _safe_int(limit, 10))
+        self.capture_popup_events(limit=max(target * 2, 10))
+        with self._popup_events_lock:
+            rows = [(event_seq, dict(payload)) for event_seq, payload in self._popup_events_replay if event_seq > seq]
+        return rows[:target]
+
     def get_status_snapshot(self) -> Dict[int, Dict[str, Any]]:
         with self._lock:
             snap = {}
@@ -1878,6 +1941,9 @@ class AgentRealtimeEngine:
         self._notify_q = queue.Queue(maxsize=int(g.get("notification_queue_max", 5000)))
         self._popup_q = queue.Queue(maxsize=int(g.get("popup_queue_max", g.get("notification_queue_max", 5000))))
         self._history_q = queue.Queue(maxsize=int(g.get("history_queue_max", 5000)))
+        self._resize_popup_replay_buffer(
+            max_events=int(g.get("popup_queue_max", g.get("notification_queue_max", 5000)))
+        )
 
         self._decision_ema = EMA(alpha=float(g.get("decision_ema_alpha", 0.2)))
 
