@@ -300,7 +300,8 @@ $versionObj = [ordered]@{
   releaseId = $ReleaseId
   builtAtUtc = (Get-Date).ToUniversalTime().ToString("o")
 }
-($versionObj | ConvertTo-Json -Depth 5) | Out-File -LiteralPath $versionPath -Encoding utf8
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($versionPath, ($versionObj | ConvertTo-Json -Depth 5), $utf8NoBom)
 Write-Host "Wrote version.json -> $versionPath" -ForegroundColor Green
 
 Write-Host "Staging dist -> release staging (robocopy with retries)..." -ForegroundColor Yellow

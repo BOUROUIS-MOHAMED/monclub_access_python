@@ -35,7 +35,7 @@ def _lower(v: Any) -> str:
 def _parse_json_file(p: Path) -> Dict[str, Any]:
     try:
         if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8-sig"))
     except Exception:
         pass
     return {}
