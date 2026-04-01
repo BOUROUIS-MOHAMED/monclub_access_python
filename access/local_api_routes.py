@@ -50,6 +50,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/devices/{deviceId}/door-presets", "_handle_device_door_presets_list"),
     ("POST", "/api/v2/devices/{deviceId}/door-presets", "_handle_device_door_presets_create"),
     ("DELETE", "/api/v2/devices/{deviceId}/door-presets/{presetId}", "_handle_device_door_presets_delete"),
+    ("GET", "/api/v2/ultra/status", "_handle_ultra_status"),
     ("GET", "/api/v2/agent/status", "_handle_agent_status"),
     ("POST", "/api/v2/agent/start", "_handle_agent_start"),
     ("POST", "/api/v2/agent/stop", "_handle_agent_stop"),

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import threading
 import time
 import traceback
@@ -23,6 +24,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+
+_SQLITE_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+from app.api.monclub_api import MonClubApiHttpError
 
 # TV boundary — imported through the phase 1 TV facade so new code does not
 # depend on the legacy implementation module directly.
@@ -145,6 +150,34 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     if not raw:
         return {}
     return json.loads(raw.decode("utf-8"))
+
+
+def _load_tv_dashboard_runtime_token() -> str:
+    try:
+        from tv.auth_bridge import load_tv_auth_for_runtime
+
+        auth = load_tv_auth_for_runtime()
+        token = _safe_str(getattr(auth, "token", None), "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+
+    try:
+        from access.store import load_auth_token
+
+        auth = load_auth_token()
+        token = _safe_str(getattr(auth, "token", None), "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+
+    return ""
+
+
+def _send_tv_dashboard_auth_required(ctx: "_Ctx") -> None:
+    ctx.send_json(401, {"ok": False, "error": "Login required to load dashboard TV data."})
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +401,12 @@ def _handle_status(ctx: _Ctx) -> None:
                 agent_count += 1
     unknown_count = len(devices) - dev_count - agent_count
 
-    mode = {"DEVICE": dev_count, "AGENT": agent_count, "UNKNOWN": unknown_count}
+    try:
+        mode = ctx.app.get_access_mode_summary()
+    except Exception:
+        ultra_count = 0
+        unknown_count = len(devices) - dev_count - agent_count
+        mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
 
     sync = {
         "running": False,
@@ -392,6 +430,15 @@ def _handle_status(ctx: _Ctx) -> None:
         "avgDecisionMs": round(eng.get_avg_decision_ms(), 2) if agent_running else 0.0,
     }
 
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    ultra_running = bool(ultra_eng and ultra_eng.running)
+    ultra: Dict[str, Any] = {"running": ultra_running, "devices": {}}
+    if ultra_running:
+        try:
+            ultra = ultra_eng.get_status()
+        except Exception:
+            pass
+
     updates = _build_update_status_payload(ctx.app)
     updates["progress"] = updates.get("progressPercent")
 
@@ -403,6 +450,7 @@ def _handle_status(ctx: _Ctx) -> None:
         "deviceSync": {"lastRunAt": None, "lastOk": True, "lastError": None},
         "pullsdk": pullsdk,
         "agent": agent,
+        "ultra": ultra,
         "updates": updates,
     })
 
@@ -442,9 +490,12 @@ def _handle_auth_login(ctx: _Ctx) -> None:
             pass
 
         ctx.send_json(200, {"ok": True, "token": token[:8] + "..." if len(token) > 8 else "***"})
+    except MonClubApiHttpError as e:
+        ctx.app.logger.warning("Login failed via API v2: HTTP %s", e.status_code)
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
     except Exception as e:
         ctx.app.logger.exception("Login failed via API v2")
-        ctx.send_json(401, {"ok": False, "error": str(e)})
+        ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
 def _handle_auth_status(ctx: _Ctx) -> None:
@@ -487,9 +538,12 @@ def _handle_tv_auth_login(ctx: _Ctx) -> None:
         except Exception:
             pass
         ctx.send_json(200, {"ok": True, "token": token[:8] + "..." if len(token) > 8 else "***"})
+    except MonClubApiHttpError as e:
+        ctx.app.logger.warning("TV Login failed via API v2: HTTP %s", e.status_code)
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
     except Exception as e:
         ctx.app.logger.exception("TV Login failed via API v2")
-        ctx.send_json(401, {"ok": False, "error": str(e)})
+        ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
 def _handle_tv_auth_status(ctx: _Ctx) -> None:
@@ -518,6 +572,175 @@ def _handle_tv_auth_status(ctx: _Ctx) -> None:
         "updates": {"updateAvailable": False, "downloaded": False, "downloading": False,
                     "progress": None, "currentReleaseId": None, "lastCheckAt": None, "lastError": None},
     })
+
+
+def _handle_tv_dashboard_screens_list(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    enabled_raw = ctx.q("enabled", default="")
+    has_layout_raw = ctx.q("hasLayout", "has_layout", default="")
+    include_archived_raw = ctx.q("includeArchived", "include_archived", default="")
+
+    try:
+        data = ctx.app._api().get_tv_screens(
+            token=token,
+            q=ctx.q("q", default="") or None,
+            gym_id=ctx.q_int("gymId", "gym_id", default=0) or None,
+            enabled=_safe_bool(enabled_raw) if enabled_raw != "" else None,
+            orientation=ctx.q("orientation", default="") or None,
+            has_layout=_safe_bool(has_layout_raw) if has_layout_raw != "" else None,
+            include_archived=_safe_bool(include_archived_raw) if include_archived_raw != "" else None,
+            page=max(0, ctx.q_int("page", default=0)),
+            size=max(1, min(ctx.q_int("size", default=50), 200)),
+            sort_by=ctx.q("sortBy", "sort_by", default="name") or "name",
+            sort_dir=ctx.q("sortDir", "sort_dir", default="asc") or "asc",
+        )
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard screens list failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_screen_detail(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    screen_id = ctx.param_int("screenId", 0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId must be a positive integer."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_screen_by_id(token=token, screen_id=screen_id)
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard screen detail failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_screen_content_plan(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    screen_id = ctx.param_int("screenId", 0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId must be a positive integer."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_screen_content_plan(token=token, screen_id=screen_id)
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard screen content plan failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_screen_snapshots(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    screen_id = ctx.param_int("screenId", 0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId must be a positive integer."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_screen_snapshots(
+            token=token,
+            screen_id=screen_id,
+            page=max(0, ctx.q_int("page", default=0)),
+            size=max(1, min(ctx.q_int("size", default=20), 100)),
+            sort_by=ctx.q("sortBy", "sort_by", default="version") or "version",
+            sort_dir=ctx.q("sortDir", "sort_dir", default="desc") or "desc",
+        )
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard screen snapshots failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_screen_latest_snapshot(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    screen_id = ctx.param_int("screenId", 0)
+    if screen_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "screenId must be a positive integer."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_latest_snapshot(
+            token=token,
+            screen_id=screen_id,
+            resolve_at=ctx.q("resolveAt", "resolve_at", default="") or None,
+        )
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard latest snapshot failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_snapshot_detail(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    snapshot_id = _safe_str(ctx.param("snapshotId"), "").strip()
+    if not snapshot_id:
+        ctx.send_json(400, {"ok": False, "error": "snapshotId is required."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_snapshot_by_id(token=token, snapshot_id=snapshot_id)
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard snapshot detail failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_tv_dashboard_snapshot_manifest(ctx: _Ctx) -> None:
+    token = _load_tv_dashboard_runtime_token()
+    if not token:
+        _send_tv_dashboard_auth_required(ctx)
+        return
+
+    snapshot_id = _safe_str(ctx.param("snapshotId"), "").strip()
+    if not snapshot_id:
+        ctx.send_json(400, {"ok": False, "error": "snapshotId is required."})
+        return
+
+    try:
+        data = ctx.app._api().get_tv_snapshot_manifest(token=token, snapshot_id=snapshot_id)
+        ctx.send_json(200, {"ok": True, **data})
+    except MonClubApiHttpError as e:
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("TV dashboard snapshot manifest failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
 def _handle_tv_auth_logout(ctx: _Ctx) -> None:
@@ -2751,6 +2974,23 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                     return
                 last_popup_seq = popup_seq
 
+            # ULTRA engine popup events — drain non-blocking from popup_q
+            ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+            if ultra_eng and ultra_eng.running:
+                try:
+                    from app.core.realtime_agent import _popup_payload_from_request
+                    for _ in range(10):
+                        try:
+                            req = ultra_eng.popup_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        payload = _popup_payload_from_request(req)
+                        alive = ctx.send_sse_event("popup", payload)
+                        if not alive:
+                            return
+                except Exception:
+                    pass
+
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
         except Exception:
@@ -2766,6 +3006,20 @@ def _handle_agent_settings_device(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     settings = ctx.app.cfg.get_agent_device_settings(did)
     ctx.send_json(200, settings)
+
+
+# ==================== 6b) ULTRA ====================
+
+def _handle_ultra_status(ctx: _Ctx) -> None:
+    """GET /api/v2/ultra/status — ULTRA engine status."""
+    eng = getattr(ctx.app, "_ultra_engine", None)
+    if eng is None or not eng.running:
+        ctx.send_json(200, {"running": False, "devices": {}})
+        return
+    try:
+        ctx.send_json(200, eng.get_status())
+    except Exception:
+        ctx.send_json(200, {"running": True, "devices": {}})
 
 
 # ==================== 7) ENROLLMENT ====================
@@ -3336,6 +3590,97 @@ def _handle_tv_storage_status(ctx: _Ctx) -> None:
     from tv.store import get_tv_storage_status
 
     ctx.send_json(200, get_tv_storage_status())
+
+
+def _normalize_sqlite_table_name(table_name: str) -> str:
+    name = (table_name or "").strip()
+    if not _SQLITE_TABLE_NAME_RE.fullmatch(name):
+        raise ValueError("invalid table name")
+    return name
+
+
+def _handle_tv_db_tables(ctx: _Ctx) -> None:
+    from shared.storage_migration import STORAGE_STATUS_TABLE, TV_OWNED_TABLES
+    from tv.storage import current_tv_runtime_db_path
+    from tv.store import get_conn
+
+    owned_tables = set(TV_OWNED_TABLES)
+    owned_tables.update({STORAGE_STATUS_TABLE, "tv_backend_auth_state"})
+    tables = []
+    db_path = current_tv_runtime_db_path()
+
+    try:
+        with get_conn() as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+            for row in rows:
+                name = str(row[0])
+                count = conn.execute(f"SELECT COUNT(*) FROM [{name}]").fetchone()[0]
+                tables.append({
+                    "name": name,
+                    "rowCount": int(count or 0),
+                    "owned": name in owned_tables,
+                })
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc)})
+        return
+
+    db_size = 0
+    try:
+        db_size = os.path.getsize(str(db_path))
+    except Exception:
+        pass
+
+    ctx.send_json(200, {
+        "ok": True,
+        "dbPath": str(db_path),
+        "dbSizeBytes": db_size,
+        "tables": tables,
+    })
+
+
+def _handle_tv_db_table_query(ctx: _Ctx) -> None:
+    from tv.store import get_conn
+
+    try:
+        table_name = _normalize_sqlite_table_name(ctx.param("tableName"))
+    except ValueError as exc:
+        ctx.send_json(400, {"ok": False, "error": str(exc)})
+        return
+
+    limit = ctx.q_int("limit", default=500)
+    offset = max(0, ctx.q_int("offset", default=0))
+    if limit <= 0:
+        limit = 500
+    if limit > 10000:
+        limit = 10000
+
+    try:
+        with get_conn() as conn:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table_name,),
+            ).fetchone()
+            if not table_exists:
+                ctx.send_json(404, {"ok": False, "error": f"unknown table: {table_name}"})
+                return
+
+            total = conn.execute(f"SELECT COUNT(*) FROM [{table_name}]").fetchone()[0]
+            cursor = conn.execute(f"SELECT * FROM [{table_name}] LIMIT ? OFFSET ?", (limit, offset))
+            columns = [d[0] for d in (cursor.description or [])]
+            rows = [dict(row) for row in cursor.fetchall()]
+    except Exception as exc:
+        ctx.send_json(400, {"ok": False, "error": str(exc)})
+        return
+
+    ctx.send_json(200, {
+        "ok": True,
+        "tableName": table_name,
+        "columns": columns,
+        "rows": rows,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
 
 
 def _handle_db_tables(ctx: _Ctx) -> None:
