@@ -26,6 +26,7 @@ from app.core.db import (
 from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
 from app.sdk.pullsdk import PullSDKDevice
+from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 
 
 # ===================== constants =====================
@@ -403,46 +404,10 @@ class ImageCache:
 # ===================== dataclasses =====================
 
 @dataclass
-class AccessEvent:
-    event_id: str
-    device_id: int
-    door_id: Optional[int]
-    event_type: str
-    card_no: str
-    event_time: str
-    raw: Dict[str, Any]
-    poll_ms: float
-
-
-@dataclass
 class CommandResult:
     ok: bool
     error: str
     cmd_ms: float
-
-
-@dataclass
-class NotificationRequest:
-    event_id: str
-    title: str
-    message: str
-    image_path: str = ""  # can be URL or local path
-    popup_show_image: bool = True  # NEW: respect device.popupShowImage
-    # ── enriched user/device data for Tauri popup screen ──
-    user_full_name: str = ""
-    user_image: str = ""
-    user_valid_from: str = ""
-    user_valid_to: str = ""
-    user_membership_id: Optional[int] = None
-    user_phone: str = ""
-    device_id: int = 0
-    device_name: str = ""
-    allowed: bool = False
-    reason: str = ""
-    scan_mode: str = ""
-    popup_duration_sec: int = 3
-    popup_enabled: bool = True
-    win_notify_enabled: bool = True
 
 
 def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
@@ -467,24 +432,6 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "popupEnabled": req.popup_enabled,
         "winNotifyEnabled": req.win_notify_enabled,
     }
-
-
-@dataclass
-class HistoryRecord:
-    event_id: str
-    device_id: int
-    door_id: Optional[int]
-    card_no: str
-    event_time: str
-    event_type: str
-    allowed: bool
-    reason: str
-    poll_ms: float
-    decision_ms: float
-    cmd_ms: float
-    cmd_ok: bool
-    cmd_error: str
-    raw: Dict[str, Any]
 
 
 @dataclass
