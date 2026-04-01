@@ -1399,7 +1399,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             # normalize accessDataMode
             adm_raw = d.get("accessDataMode") or d.get("access_data_mode") or "DEVICE"
             adm = str(adm_raw or "").strip().upper()
-            if adm not in ("DEVICE", "AGENT"):
+            if adm not in ("DEVICE", "AGENT", "ULTRA"):
                 adm = "DEVICE"
 
             cur.execute(
@@ -1704,7 +1704,7 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
 
     adm_raw = g("accessDataMode", "access_data_mode", default="DEVICE") or "DEVICE"
     adm = str(adm_raw).strip().upper()
-    if adm not in ("DEVICE", "AGENT"):
+    if adm not in ("DEVICE", "AGENT", "ULTRA"):
         adm = "DEVICE"
 
     return {

@@ -151,9 +151,13 @@ def _extract_devices_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any
 # --------------- normalization ---------------
 
 def normalize_access_data_mode(v: Any) -> str:
-    """Strictly normalize accessDataMode to 'DEVICE' or 'AGENT'."""
+    """Normalize accessDataMode to 'DEVICE', 'AGENT', or 'ULTRA'."""
     s = _safe_str(v, "DEVICE").strip().upper()
-    return "AGENT" if s == "AGENT" else "DEVICE"
+    if s == "AGENT":
+        return "AGENT"
+    if s == "ULTRA":
+        return "ULTRA"
+    return "DEVICE"
 
 
 def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -362,6 +366,11 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "replay_lru_size": 2000,
         "poll_ema_alpha": 0.2,
         "cmd_ema_alpha": 0.2,
+
+        # ULTRA mode fields
+        "ultra_sync_interval_minutes": int(dev.get("ultraSyncIntervalMinutes") or 15),
+        "ultra_totp_rescue_enabled": bool(dev.get("ultraTotpRescueEnabled", True)),
+        "ultra_rtlog_enabled": bool(dev.get("ultraRtlogEnabled", True)),
     }
 
 

@@ -66,6 +66,8 @@ def _normalize_data_mode(v: Any) -> str:
         return "DEVICE"
     if s in ("AGENT", "AGENT_DATA", "AGENT_MODE", "IN_AGENT_DATA", "2", "FALSE", "NO", "OFF"):
         return "AGENT"
+    if s in ("ULTRA", "ULTRA_MODE", "3"):
+        return "ULTRA"
     return "DEVICE"
 
 
