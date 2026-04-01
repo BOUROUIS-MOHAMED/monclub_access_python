@@ -65,6 +65,7 @@ from access.runtime import (
     UpdateStatus,
     schedule_access_shell_startup,
 )
+from app.core.ultra_engine import UltraEngine
 from access.api import LocalAccessApiServerV2
 from shared.api.monclub_api import MonClubApi, MonClubApiHttpError
 
@@ -311,6 +312,8 @@ class MainApp:
         self._device_sync_engine = DeviceSyncEngine(cfg=self.cfg, logger=self.logger)
         self._device_attendance_engine = DeviceAttendanceMaintenanceEngine(cfg=self.cfg, logger=self.logger)
         self._agent_engine = AgentRealtimeEngine(cfg=self.cfg, logger=self.logger)
+        self._ultra_engine = UltraEngine(cfg=self.cfg, logger_inst=self.logger)
+        self._ultra_history_consumer = None
 
         self._tray = None  # no tkinter tray
 
@@ -378,6 +381,15 @@ class MainApp:
 
     def destroy(self) -> None:
         self._stop_event.set()
+        # Shutdown ULTRA engine
+        try:
+            if self._ultra_engine and self._ultra_engine.running:
+                self._ultra_engine.stop()
+            if self._ultra_history_consumer:
+                self._ultra_history_consumer.stop()
+                self._ultra_history_consumer = None
+        except Exception:
+            pass
 
     def quit(self) -> None:
         self._stop_event.set()
@@ -430,7 +442,7 @@ class MainApp:
     def get_access_mode_summary(self) -> Dict[str, int]:
         cache = load_sync_cache()
         devices = getattr(cache, "devices", []) if cache else []
-        dev = ag = unk = 0
+        dev = ag = ultra = unk = 0
         for d in devices or []:
             if not isinstance(d, dict):
                 continue
@@ -440,9 +452,11 @@ class MainApp:
                 dev += 1
             elif m == "AGENT":
                 ag += 1
+            elif m == "ULTRA":
+                ultra += 1
             else:
                 unk += 1
-        return {"DEVICE": dev, "AGENT": ag, "UNKNOWN": unk}
+        return {"DEVICE": dev, "AGENT": ag, "ULTRA": ultra, "UNKNOWN": unk}
 
     # ======================= Log polling =======================
     def _poll_logs(self):
@@ -954,6 +968,45 @@ class MainApp:
                     self._agent_engine.refresh_devices()
             except Exception:
                 pass
+
+            # --- ULTRA mode management ---
+            try:
+                summary = self.get_access_mode_summary()
+                ultra_count = summary.get("ULTRA", 0)
+
+                if ultra_count > 0 and not self._ultra_engine.running:
+                    cache = load_sync_cache()
+                    if cache:
+                        all_devices = getattr(cache, "devices", []) or []
+                        ultra_devices = [
+                            d for d in all_devices
+                            if isinstance(d, dict) and str(d.get("accessDataMode", "")).strip().upper() == "ULTRA"
+                        ]
+                        if ultra_devices:
+                            # Agent engine will naturally drop devices that switched to ULTRA
+                            # on its next refresh cycle (it only runs AGENT-mode devices).
+                            self._ultra_engine.start(ultra_devices)
+
+                            # Start history consumer for ULTRA engine
+                            if not self._ultra_history_consumer:
+                                from app.core.realtime_agent import HistoryService
+                                from app.core.settings_reader import get_backend_global_settings
+                                self._ultra_history_consumer = HistoryService(
+                                    logger=self.logger,
+                                    history_q=self._ultra_engine.history_q,
+                                    global_settings=get_backend_global_settings,
+                                )
+                                self._ultra_history_consumer.start()
+
+                # Stop ULTRA engine if no ULTRA devices remain (switched away from ULTRA)
+                if ultra_count == 0 and self._ultra_engine.running:
+                    self.logger.info("[ULTRA] No ULTRA devices remaining, stopping engine")
+                    self._ultra_engine.stop()
+                    if self._ultra_history_consumer:
+                        self._ultra_history_consumer.stop()
+                        self._ultra_history_consumer = None
+            except Exception as ex:
+                self.logger.exception(f"[ULTRA] Unexpected error in sync_tick: {ex}")
 
             try:
                 self.maybe_run_offline_retry(sync_online=sync_online, source="hourly")
