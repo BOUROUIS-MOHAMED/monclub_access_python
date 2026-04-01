@@ -202,7 +202,7 @@ Add `ULTRA` option to the accessDataMode dropdown (alongside DEVICE/AGENT).
 
 **2. ULTRA-specific settings panel**
 When ULTRA is selected, show:
-- Sync interval (minutes, default 15, min 5)
+- Sync interval (minutes, default 15, min 5, max 1440)
 - TOTP rescue enabled (toggle, default on)
 - RTLog observation enabled (toggle, default on)
 
@@ -404,7 +404,7 @@ This does NOT call `verify_card()` — it skips RFID validation checks (enabled 
 
 **`ultraSyncIntervalMinutes`:** min=5, max=1440 (24 hours), default=15. Validated on upsert.
 
-**Enum ordinal:** `AccessSoftwareDataMode` values: `DEVICE` (existing), `AGENT` (existing), `ULTRA` (new, appended at end). The Access client maps string `"ULTRA"` and numeric `"3"` to ULTRA mode. The numeric mapping matches the 0-indexed enum ordinal (DEVICE=0, AGENT=1, ULTRA=2) — but the Access client should prefer string matching and only use numeric as fallback.
+**Enum ordinal:** `AccessSoftwareDataMode` values: `DEVICE` (existing), `AGENT` (existing), `ULTRA` (new, appended at end). The Access client uses a **1-indexed** numeric convention: `"1"` -> DEVICE, `"2"` -> AGENT, `"3"` -> ULTRA. This matches the existing codebase convention (config.py maps `"1"` to DEVICE, `"2"` to AGENT). The Java enum ordinal is 0-indexed, but the Access client numeric aliases are 1-indexed. String matching (`"ULTRA"`) is preferred; numeric (`"3"`) is a fallback only.
 
 ---
 
@@ -416,6 +416,52 @@ Add: "ULTRA", "ULTRA_MODE", "3" -> "ULTRA"
 **2. `app/core/settings_reader.py` — `normalize_access_data_mode()`:**
 Change from binary (AGENT/DEVICE) to ternary: add "ULTRA" recognition.
 Current code returns `"AGENT" if s == "AGENT" else "DEVICE"` — must become an explicit 3-way check with "DEVICE" as default fallback for unknown values.
+
+**Boolean inputs:** The existing `_normalize_data_mode()` in config.py maps `bool True` -> DEVICE, `bool False` -> AGENT. Boolean inputs cannot produce ULTRA. This is acceptable — boolean config values are legacy and should not be used for ternary mode selection.
+
+---
+
+## ULTRA-Awareness Audit Checklist
+
+All locations in the codebase that branch on `accessDataMode` must recognize ULTRA. Failing to update any of these will silently misclassify ULTRA devices as DEVICE:
+
+| File | Location | Current behavior | Required change |
+|------|----------|-----------------|-----------------|
+| `app/core/config.py` | `_normalize_data_mode()` | Maps strings/ints to DEVICE or AGENT | Add ULTRA mapping |
+| `app/core/settings_reader.py` | `normalize_access_data_mode()` | Binary: AGENT or DEVICE | Add ULTRA as third option |
+| `app/core/db.py` | Sync cache writer (~line 1402) | `if adm not in ("DEVICE","AGENT"): adm = "DEVICE"` | Add "ULTRA" to allowed values |
+| `app/core/db.py` | `list_sync_devices_payload()` (~line 1707) | Same pattern as above | Add "ULTRA" to allowed values |
+| `app/core/device_sync.py` | Device filter (~line 806) | `if mode != "DEVICE": continue` | Keep as-is: correctly skips ULTRA (ULTRA has its own sync scheduler) |
+| `app/ui/app.py` | `get_access_mode_summary()` | Counts DEVICE and AGENT, rest is UNKNOWN | Add ULTRA count |
+| `app/api/local_access_api_v2.py` | Status endpoint mode summary | Same as app.py | Add ULTRA count |
+| `app/ui/app.py` | Engine startup logic | Starts DeviceSyncEngine or AgentRealtimeEngine | Add UltraEngine startup for ULTRA devices |
+
+**DeviceSyncEngine and ULTRA:** DeviceSyncEngine filters by `mode != "DEVICE"` and skips non-DEVICE devices. ULTRA devices are correctly skipped. UltraSyncScheduler handles ULTRA device pushes independently — no double-push risk.
+
+---
+
+## PullSDK Thread Safety for ULTRA
+
+In AGENT mode, `open_door()` goes through `DeviceCommandBus` which serializes commands via the `DeviceWorker` thread. In ULTRA mode, `open_door()` is called directly from `UltraDeviceWorker`.
+
+This is safe because:
+- Each `UltraDeviceWorker` owns a dedicated `PullSDKDevice` connection to its device
+- Only the owning worker thread calls `poll_rtlog_once()` and `open_door()` on that connection
+- No concurrent access to the same `PullSDKDevice` instance — single-thread-per-connection model
+- This is the same thread safety model as AGENT mode's `DeviceWorker` (one thread per device connection)
+
+No changes to the PullSDK wrapper are needed.
+
+---
+
+## QR Reader Constraints
+
+QR code readers send raw numeric values to the controller. Most readers accept codes up to 7+ digits. The TOTP format is configurable per-device:
+- Default: prefix "9" + 7 digits = 8 characters total
+- For gyms with readers limited to 7 characters: reduce `totp_digits` to 6 (prefix + 6 = 7)
+- For gyms with readers limited to shorter: reduce further (min `totp_digits` = 4)
+
+This is already handled by the existing per-device `totp_digits` setting. No ULTRA-specific changes needed.
 
 ---
 
