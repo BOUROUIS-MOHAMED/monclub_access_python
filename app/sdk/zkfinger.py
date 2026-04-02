@@ -745,8 +745,8 @@ class ZKFinger:
             score = int(self._dll.ZKFPM_DBMatch(self.db_handle, a1, ctypes.c_uint(n1), a2, ctypes.c_uint(n2)))
             return score
         except OSError as e:
-            self._log.warning("ZKFPM_DBMatch raised OSError (skipping match check): %s", e)
-            return 1
+            self._log.error("ZKFPM_DBMatch raised OSError (treating as NO MATCH for safety): %s", e)
+            return 0  # H-005: fail-closed — treat HW error as no match, not match
 
     def db_merge(self, t1: bytes, t2: bytes, t3: bytes) -> bytes:
         if not self._dll or not self.db_handle:

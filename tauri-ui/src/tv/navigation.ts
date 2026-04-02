@@ -3,6 +3,7 @@ import {
   Database,
   Download,
   LayoutDashboard,
+  Monitor,
   MonitorPlay,
   ScrollText,
   ShieldAlert,
@@ -10,7 +11,7 @@ import {
 } from "lucide-react";
 
 export type TvOverviewSectionId = "overview" | "bindings" | "startup" | "updates" | "operations";
-export type TvDashboardView = "overview" | "downloads" | "logs" | "settings" | "profile" | "update";
+export type TvDashboardView = "overview" | "downloads" | "database" | "logs" | "screens" | "settings" | "profile" | "update";
 
 export interface TvDashboardNavItem {
   to: string;
@@ -57,6 +58,22 @@ export const TV_NAV_ITEMS: TvDashboardNavItem[] = [
     title: "Download Management",
     description: "Local content inventory, per-screen readiness, schedules, and repair actions for downloaded TV media.",
     view: "downloads",
+  },
+  {
+    to: "/tv-screens",
+    label: "Screens",
+    icon: Monitor,
+    title: "Dashboard Screens",
+    description: "Read-only dashboard screens, content plans, snapshots, and visual timeline playback views.",
+    view: "screens",
+  },
+  {
+    to: "/tv-local-db",
+    label: "Local DB",
+    icon: Database,
+    title: "Local TV Database",
+    description: "Inspect the live TV SQLite store, table counts, and saved rows directly from this machine.",
+    view: "database",
   },
   {
     to: "/tv-updates",

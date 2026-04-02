@@ -25,6 +25,7 @@ import {
   downloadTvUpdate,
   getTvBindingSupportHistory,
   getTvBindingSupportSummary,
+  getTvDashboardScreens,
   getTvHostBindings,
   getTvHostMonitors,
   getTvObservabilityBinding,
@@ -52,6 +53,7 @@ import type {
   TvObservabilityRetentionResponse,
   TvBindingSupportActionType,
   TvBindingSupportSummaryResponse,
+  TvDashboardScreen,
   TvHostMonitor,
   TvScreenBinding,
   TvStartupLatestResponse,
@@ -136,6 +138,8 @@ const ACTION_DESCRIPTIONS: Partial<Record<TvBindingSupportActionType, string>> =
   RESTART_PLAYER_WINDOW: "Recycle the player window for this binding only.",
   RESET_TRANSIENT_PLAYER_STATE: "Clear local transient player/runtime rows without touching snapshots, assets, proofs, or history.",
 };
+
+const CREATE_SCREEN_EMPTY_VALUE = "__none__";
 
 function healthBadgeClass(health: TvBindingHealthSummary | undefined) {
   switch (health) {
@@ -265,6 +269,9 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
   // Create binding dialog
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
+  const [dashboardScreens, setDashboardScreens] = useState<TvDashboardScreen[]>([]);
+  const [dashboardScreensLoading, setDashboardScreensLoading] = useState(false);
+  const [dashboardScreensError, setDashboardScreensError] = useState<string | null>(null);
   const [createForm, setCreateForm] = useState({
     screen_id: "",
     screen_label: "",
@@ -290,6 +297,32 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     }
     return monitors.find((monitor) => matchesBindingMonitor(previewBinding, monitor)) ?? null;
   }, [monitors, previewBinding]);
+
+  const dashboardScreenById = useMemo(() => {
+    const next = new Map<number, TvDashboardScreen>();
+    for (const screen of dashboardScreens) {
+      next.set(screen.id, screen);
+    }
+    return next;
+  }, [dashboardScreens]);
+
+  const boundScreenIds = useMemo(
+    () => new Set(bindings.map((binding) => binding.screen_id)),
+    [bindings],
+  );
+
+  const selectedCreateScreen = useMemo(() => {
+    const sid = parseInt(createForm.screen_id, 10);
+    if (!sid || sid <= 0) {
+      return null;
+    }
+    return dashboardScreenById.get(sid) ?? null;
+  }, [createForm.screen_id, dashboardScreenById]);
+
+  const createScreenAlreadyBound = useMemo(() => {
+    const sid = parseInt(createForm.screen_id, 10);
+    return Boolean(sid && boundScreenIds.has(sid));
+  }, [boundScreenIds, createForm.screen_id]);
 
   const startupSignalItems = useMemo(() => {
     if (!startupPreflight) {
@@ -344,6 +377,26 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       console.warn("Failed to refresh TV host monitors before player action.", error);
     }
     return monitorList;
+  }, []);
+
+  const loadDashboardScreens = useCallback(async () => {
+    setDashboardScreensLoading(true);
+    setDashboardScreensError(null);
+    try {
+      const response = await getTvDashboardScreens({
+        includeArchived: false,
+        page: 0,
+        size: 100,
+        sortBy: "name",
+        sortDir: "asc",
+      });
+      setDashboardScreens(response.items ?? []);
+    } catch (err) {
+      setDashboardScreens([]);
+      setDashboardScreensError(err instanceof Error ? err.message : "Failed to load dashboard screens.");
+    } finally {
+      setDashboardScreensLoading(false);
+    }
   }, []);
 
   const fetchData = useCallback(async () => {
@@ -412,6 +465,10 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     }, 5000);
     return () => window.clearInterval(interval);
   }, [fetchData]);
+
+  useEffect(() => {
+    void loadDashboardScreens();
+  }, [loadDashboardScreens]);
 
   const openSupportPanel = useCallback(
     async (bindingId: number) => {
@@ -518,23 +575,27 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
   }, [closeSupportPanel, fetchData, selectedBindingId]);
 
   const openCreateDialog = useCallback(() => {
-    const maxScreenId = bindings.reduce((acc, b) => Math.max(acc, b.screen_id), 0);
-    const nextId = maxScreenId + 1;
+    const preferredScreen = dashboardScreens.find((screen) => !boundScreenIds.has(screen.id))
+      ?? null;
     setCreateForm({
-      screen_id: String(nextId),
-      screen_label: `Screen ${nextId}`,
+      screen_id: preferredScreen ? String(preferredScreen.id) : "",
+      screen_label: preferredScreen?.name ?? "",
       monitor_id: monitors[0]?.monitor_id ?? "",
       enabled: true,
       autostart: false,
       fullscreen: true,
     });
     setCreateDialogOpen(true);
-  }, [bindings, monitors]);
+  }, [boundScreenIds, dashboardScreens, monitors]);
 
   const handleCreateSubmit = useCallback(async () => {
     const sid = parseInt(createForm.screen_id, 10);
     if (!sid || sid <= 0) {
-      setError("Screen ID must be a positive integer.");
+      setError("Please select a dashboard screen.");
+      return;
+    }
+    if (createScreenAlreadyBound) {
+      setError("This dashboard screen is already bound on this host.");
       return;
     }
     setCreateBusy(true);
@@ -544,7 +605,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
       const selectedMonitor = monitors.find((m) => m.monitor_id === createForm.monitor_id);
       await createTvHostBinding({
         screen_id: sid,
-        screen_name: createForm.screen_label.trim() || undefined,
+        screen_name: selectedCreateScreen?.name || createForm.screen_label.trim() || undefined,
         monitor_id: createForm.monitor_id || undefined,
         monitor_label: selectedMonitor?.monitor_label || undefined,
         monitor_index: selectedMonitor?.monitor_index ?? undefined,
@@ -566,7 +627,7 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
     } finally {
       setCreateBusy(false);
     }
-  }, [createForm, monitors, fetchData, syncHostMonitors]);
+  }, [createForm, createScreenAlreadyBound, selectedCreateScreen, monitors, fetchData, syncHostMonitors]);
 
   const handleRunRetention = useCallback(async () => {
     if (!window.confirm("Run TV retention cleanup now? This removes only old operational history.")) {
@@ -1769,26 +1830,71 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="cb-screen-select">Screen</Label>
+              <Select
+                value={createForm.screen_id || CREATE_SCREEN_EMPTY_VALUE}
+                onValueChange={(value) => {
+                  if (value === CREATE_SCREEN_EMPTY_VALUE) {
+                    setCreateForm((form) => ({ ...form, screen_id: "", screen_label: "" }));
+                    return;
+                  }
+                  const nextScreen = dashboardScreens.find((screen) => screen.id === Number(value)) ?? null;
+                  setCreateForm((form) => ({
+                    ...form,
+                    screen_id: value,
+                    screen_label: nextScreen?.name ?? "",
+                  }));
+                }}
+              >
+                <SelectTrigger id="cb-screen-select">
+                  <SelectValue placeholder="Select a dashboard screen" />
+                </SelectTrigger>
+                <SelectContent>
+                  {dashboardScreens.map((screen) => {
+                    const isBound = boundScreenIds.has(screen.id);
+                    const label = `${screen.name} (#${screen.id})${isBound ? " - already bound" : ""}`;
+                    return (
+                      <SelectItem key={screen.id} value={String(screen.id)} disabled={isBound}>
+                        {label}
+                      </SelectItem>
+                    );
+                  })}
+                  {dashboardScreens.length === 0 && (
+                    <SelectItem value={CREATE_SCREEN_EMPTY_VALUE} disabled>
+                      {dashboardScreensLoading ? "Loading dashboard screens..." : "No dashboard screens available"}
+                    </SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Choose a real dashboard screen and MonClub TV will store its screen id automatically.
+              </p>
+            </div>
+            {dashboardScreensError && (
+              <Alert variant="destructive">
+                <AlertDescription>{dashboardScreensError}</AlertDescription>
+              </Alert>
+            )}
+            {createScreenAlreadyBound && (
+              <Alert>
+                <AlertDescription>
+                  This dashboard screen is already bound on this host. Select a different screen to continue.
+                </AlertDescription>
+              </Alert>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label htmlFor="cb-screen-id">Screen ID</Label>
-                <Input
-                  id="cb-screen-id"
-                  type="number"
-                  min={1}
-                  value={createForm.screen_id}
-                  onChange={(e) => setCreateForm((f) => ({ ...f, screen_id: e.target.value }))}
-                  placeholder="e.g. 1"
-                />
+                <Label>Selected screen id</Label>
+                <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-foreground">
+                  {createForm.screen_id || "No screen selected"}
+                </div>
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="cb-screen-label">Label</Label>
-                <Input
-                  id="cb-screen-label"
-                  value={createForm.screen_label}
-                  onChange={(e) => setCreateForm((f) => ({ ...f, screen_label: e.target.value }))}
-                  placeholder="e.g. Screen 1"
-                />
+                <Label>Screen label</Label>
+                <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-foreground">
+                  {selectedCreateScreen?.name || createForm.screen_label || "No screen selected"}
+                </div>
               </div>
             </div>
             <div className="space-y-1.5">
@@ -1850,7 +1956,10 @@ export default function TvOverviewPage({ focusSection = "overview" }: TvOverview
             <Button variant="outline" onClick={() => setCreateDialogOpen(false)} disabled={createBusy}>
               Cancel
             </Button>
-            <Button onClick={() => void handleCreateSubmit()} disabled={createBusy}>
+            <Button
+              onClick={() => void handleCreateSubmit()}
+              disabled={createBusy || !createForm.screen_id || createScreenAlreadyBound}
+            >
               {createBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Create
             </Button>

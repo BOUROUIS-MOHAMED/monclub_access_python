@@ -36,6 +36,9 @@ def init_db() -> None:
             owned_tables=ACCESS_OWNED_TABLES,
             logger=_log,
         )
+        # L-003: Second init_db() ensures any new schema columns are added after
+        # migration (migration may import old schema from legacy DB). Uses IF NOT EXISTS
+        # and ALTER ADD COLUMN so it's idempotent and safe.
         _legacy_access_db.init_db()
         _access_store_ready = True
 

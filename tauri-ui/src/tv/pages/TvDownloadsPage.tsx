@@ -566,7 +566,7 @@ function ScheduleLaneTable({
 }
 
 export default function TvDownloadsPage() {
-  const [tab, setTab] = useState<DownloadsTab>("library");
+  const [tab, setTab] = useState<DownloadsTab>("screens");
   const [bindings, setBindings] = useState<TvObservabilityBindingSummary[]>([]);
   const [latestSnapshots, setLatestSnapshots] = useState<TvSnapshotCacheRow[]>([]);
   const [latestReadinessRows, setLatestReadinessRows] = useState<TvSnapshotReadinessRow[]>([]);
@@ -841,6 +841,45 @@ export default function TvDownloadsPage() {
     [selectedScreenLibraryRows],
   );
 
+  const selectedScreenDownloadedRows = useMemo(
+    () => selectedScreenLibraryRows.filter((item) => isAssetReady(item.status)),
+    [selectedScreenLibraryRows],
+  );
+
+  const selectedReadinessSummary = useMemo(() => {
+    if (!selectedBinding) {
+      return {
+        title: "No screen selected",
+        toneClassName: "border-border bg-muted/30 text-foreground",
+        note: "Choose a screen to inspect its downloads and schedule.",
+      };
+    }
+    if (!selectedReadiness) {
+      return {
+        title: "Readiness not computed yet",
+        toneClassName: "border-sky-500/30 bg-sky-500/10 text-foreground",
+        note: "Run a sync or readiness computation to know if this screen can play offline.",
+      };
+    }
+    if (selectedReadiness.is_fully_ready === 1) {
+      return {
+        title: "Ready to play",
+        toneClassName: "border-emerald-500/30 bg-emerald-500/10 text-foreground",
+        note: `${selectedReadiness.ready_asset_count} media already available locally for this screen.`,
+      };
+    }
+
+    const missingCount = (selectedReadiness.missing_asset_count ?? 0)
+      + (selectedReadiness.invalid_asset_count ?? 0)
+      + (selectedReadiness.stale_asset_count ?? 0);
+
+    return {
+      title: "Needs downloads before it is safe",
+      toneClassName: "border-amber-500/30 bg-amber-500/10 text-foreground",
+      note: `${missingCount} media item(s) still need to be downloaded or repaired.`,
+    };
+  }, [selectedBinding, selectedReadiness]);
+
   const filteredLibraryRows = useMemo(() => {
     const query = deferredSearch.trim().toLowerCase();
     return libraryRows.filter((item) => {
@@ -1039,15 +1078,15 @@ export default function TvDownloadsPage() {
 
       <Tabs value={tab} onValueChange={(value) => setTab(value as DownloadsTab)}>
         <TabsList className="grid w-full grid-cols-3 md:w-auto">
-          <TabsTrigger value="library">Library</TabsTrigger>
           <TabsTrigger value="screens">Screens</TabsTrigger>
+          <TabsTrigger value="library">Storage</TabsTrigger>
           <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
         <TabsContent value="library" className="space-y-4">
           <Card className="gap-4 py-5">
             <CardHeader className="px-5 pb-0">
-              <CardTitle className="text-base">Local Media Library</CardTitle>
+              <CardTitle className="text-base">Stored Media</CardTitle>
               <CardDescription>
                 Browse everything cached locally for the latest screen snapshots and trigger targeted repairs directly from the list.
               </CardDescription>
@@ -1278,283 +1317,234 @@ export default function TvDownloadsPage() {
             </Card>
 
             <div className="space-y-4">
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+              {detailLoading && !selectedDetail ? (
                 <Card className="gap-4 py-5">
-                  <CardHeader className="px-5 pb-0">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Latest snapshot</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-1 px-5">
-                    <div className="text-xl font-semibold">
-                      {selectedSnapshot ? `v${selectedSnapshot.snapshot_version}` : "n/a"}
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      {selectedSnapshot?.snapshot_id || "No snapshot cached"}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      Fetched {formatTimestamp(selectedSnapshot?.fetched_at)}
-                    </div>
+                  <CardContent className="px-5 py-12 text-sm text-muted-foreground">
+                    Loading selected screen details...
                   </CardContent>
                 </Card>
-
+              ) : !selectedBinding ? (
                 <Card className="gap-4 py-5">
-                  <CardHeader className="px-5 pb-0">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Readiness</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-1 px-5">
-                    <div className="flex items-center gap-2">
-                      <Badge className={cn("border", readinessBadgeClass(selectedReadiness?.readiness_state))}>
-                        {selectedReadiness?.readiness_state || "UNKNOWN"}
-                      </Badge>
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      {selectedReadiness?.ready_asset_count ?? 0}/{selectedReadiness?.total_required_assets ?? 0} assets ready
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      Missing {selectedReadiness?.missing_asset_count ?? 0}, invalid {selectedReadiness?.invalid_asset_count ?? 0}, stale {selectedReadiness?.stale_asset_count ?? 0}
-                    </div>
+                  <CardContent className="px-5 py-12 text-sm text-muted-foreground">
+                    Select a screen on the left to manage its downloads.
                   </CardContent>
                 </Card>
+              ) : (
+                <>
+                  <Card className="gap-4 py-5">
+                    <CardContent className="space-y-5 px-5">
+                      <div className={cn("rounded-2xl border p-5", selectedReadinessSummary.toneClassName)}>
+                        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                          <div className="space-y-2">
+                            <div className="text-xs font-medium uppercase tracking-[0.16em] opacity-80">
+                              {selectedBinding.screenLabel}
+                            </div>
+                            <div className="text-2xl font-semibold tracking-tight">
+                              {selectedReadinessSummary.title}
+                            </div>
+                            <div className="max-w-2xl text-sm opacity-85">
+                              {selectedReadinessSummary.note}
+                            </div>
+                          </div>
 
-                <Card className="gap-4 py-5">
-                  <CardHeader className="px-5 pb-0">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Local content</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-1 px-5">
-                    <div className="text-xl font-semibold">
-                      {selectedScreenReadyCount}/{selectedScreenLibraryRows.length}
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      Assets ready for this screen's latest snapshot
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {selectedScreenAttentionRows.length} item(s) currently need repair
-                    </div>
-                  </CardContent>
-                </Card>
+                          <div className="grid gap-3 sm:grid-cols-3">
+                            <div className="rounded-xl border border-white/10 bg-background/40 p-3">
+                              <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Snapshot</div>
+                              <div className="mt-1 text-lg font-semibold">
+                                {selectedSnapshot ? `v${selectedSnapshot.snapshot_version}` : "n/a"}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                {formatTimestamp(selectedSnapshot?.fetched_at)}
+                              </div>
+                            </div>
+                            <div className="rounded-xl border border-white/10 bg-background/40 p-3">
+                              <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Downloaded</div>
+                              <div className="mt-1 text-lg font-semibold">
+                                {selectedScreenDownloadedRows.length}/{selectedScreenLibraryRows.length}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                Ready locally
+                              </div>
+                            </div>
+                            <div className="rounded-xl border border-white/10 bg-background/40 p-3">
+                              <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Missing</div>
+                              <div className="mt-1 text-lg font-semibold">
+                                {selectedScreenAttentionRows.length}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                Need download or repair
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
 
-                <Card className="gap-4 py-5">
-                  <CardHeader className="px-5 pb-0">
-                    <CardTitle className="text-sm font-medium text-muted-foreground">Player state</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-1 px-5">
-                    <div className="text-xl font-semibold">
-                      {selectedRenderContext?.playerState || selectedBinding?.playerState || "n/a"}
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      {selectedRenderContext?.renderMode || "No render mode reported"}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      Evaluated {formatTimestamp(selectedRenderContext?.evaluatedAt)}
-                    </div>
-                  </CardContent>
-                </Card>
-              </div>
-
-              <Card className="gap-4 py-5">
-                <CardHeader className="px-5 pb-0">
-                  <CardTitle className="text-base">Selected Screen Status</CardTitle>
-                  <CardDescription>
-                    Schedule, active items, and current download pressure for the chosen TV screen.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-4 px-5">
-                  {detailLoading && !selectedDetail ? (
-                    <div className="rounded-lg border border-dashed px-4 py-6 text-sm text-muted-foreground">
-                      Loading selected screen details...
-                    </div>
-                  ) : !selectedBinding ? (
-                    <div className="rounded-lg border border-dashed px-4 py-6 text-sm text-muted-foreground">
-                      Select a binding to inspect its download readiness and schedule.
-                    </div>
-                  ) : (
-                    <>
-                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                        <div className="rounded-lg border bg-muted/30 p-4">
+                      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                        <div className="rounded-xl border p-4">
                           <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Current visual</div>
                           <div className="mt-2 font-medium">
                             {selectedRenderContext?.currentVisual?.title || "Nothing active"}
                           </div>
                           <div className="mt-1 text-xs text-muted-foreground">
-                            {selectedRenderContext?.currentVisual?.mediaAssetId || "n/a"}
+                            {selectedRenderContext?.currentVisual?.mediaAssetId || "No visual media right now"}
                           </div>
-                          {selectedRenderContext?.currentVisual && (
-                            <div className="mt-2 flex flex-wrap gap-2">
-                              <Badge className={cn("border", assetStateBadgeClass(selectedRenderContext.currentVisual.assetState))}>
-                                {selectedRenderContext.currentVisual.assetState || "UNKNOWN"}
-                              </Badge>
-                              <Badge className={cn(
-                                "border",
-                                selectedRenderContext.currentVisual.assetRenderable
-                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                                  : "border-red-500/30 bg-red-500/10 text-red-400",
-                              )}>
-                                {selectedRenderContext.currentVisual.assetRenderable ? "Ready" : "Blocked"}
-                              </Badge>
-                            </div>
-                          )}
                         </div>
 
-                        <div className="rounded-lg border bg-muted/30 p-4">
+                        <div className="rounded-xl border p-4">
                           <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Current audio</div>
                           <div className="mt-2 font-medium">
                             {selectedRenderContext?.currentAudio?.title || "Nothing active"}
                           </div>
                           <div className="mt-1 text-xs text-muted-foreground">
-                            {selectedRenderContext?.currentAudio?.mediaAssetId || "n/a"}
+                            {selectedRenderContext?.currentAudio?.mediaAssetId || "No audio media right now"}
                           </div>
-                          {selectedRenderContext?.currentAudio && (
-                            <div className="mt-2 flex flex-wrap gap-2">
-                              <Badge className={cn("border", assetStateBadgeClass(selectedRenderContext.currentAudio.assetState))}>
-                                {selectedRenderContext.currentAudio.assetState || "UNKNOWN"}
-                              </Badge>
-                              <Badge className={cn(
-                                "border",
-                                selectedRenderContext.currentAudio.assetRenderable
-                                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                                  : "border-red-500/30 bg-red-500/10 text-red-400",
-                              )}>
-                                {selectedRenderContext.currentAudio.assetRenderable ? "Ready" : "Blocked"}
-                              </Badge>
-                            </div>
-                          )}
                         </div>
 
-                        <div className="rounded-lg border bg-muted/30 p-4">
-                          <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Runtime health</div>
+                        <div className="rounded-xl border p-4">
+                          <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Player</div>
                           <div className="mt-2 flex flex-wrap gap-2">
                             <Badge className={cn("border", healthBadgeClass(selectedBinding.health))}>
                               {selectedBinding.health}
                             </Badge>
                             <Badge variant="outline">
-                              {selectedBinding.runtimeState || "n/a"}
+                              {selectedRenderContext?.playerState || selectedBinding.playerState || "n/a"}
                             </Badge>
                           </div>
                           <div className="mt-2 text-xs text-muted-foreground">
-                            Monitor {selectedDetail?.monitor.available ? "available" : "missing"} / player {selectedRenderContext?.playerState || selectedBinding.playerState || "n/a"}
+                            {selectedRenderContext?.renderMode || "No render mode reported"}
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl border p-4">
+                          <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Monitor</div>
+                          <div className="mt-2 font-medium">
+                            {selectedDetail?.monitor.available ? "Connected" : "Missing or disconnected"}
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            Last checked {formatTimestamp(selectedRenderContext?.evaluatedAt)}
                           </div>
                           {selectedRenderContext?.fallbackReason && (
                             <div className="mt-1 text-xs text-muted-foreground">
-                              Fallback reason: {selectedRenderContext.fallbackReason}
+                              Fallback: {selectedRenderContext.fallbackReason}
                             </div>
                           )}
                         </div>
-
-                        <div className="rounded-lg border bg-muted/30 p-4">
-                          <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">Download queue</div>
-                          <div className="mt-2 font-medium">
-                            {selectedScreenAttentionRows.length} asset(s) need action
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            Failed assets reported by support: {selectedDetail?.failedAssets.count ?? 0}
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            Last support action: {selectedDetail?.lastSupportAction?.action_type || "n/a"}
-                          </div>
-                        </div>
                       </div>
+                    </CardContent>
+                  </Card>
 
-                      <div className="grid gap-4 xl:grid-cols-2">
-                        <ScheduleLaneTable
-                          title="Visual Schedule"
-                          items={selectedRenderContext?.visualItems ?? []}
-                          currentItemId={selectedRenderContext?.currentVisual?.itemId}
-                        />
-                        <ScheduleLaneTable
-                          title="Audio Schedule"
-                          items={selectedRenderContext?.audioItems ?? []}
-                          currentItemId={selectedRenderContext?.currentAudio?.itemId}
-                        />
-                      </div>
+                  <div className="grid gap-4 xl:grid-cols-2">
+                    <ScheduleLaneTable
+                      title="Visual Schedule"
+                      items={selectedRenderContext?.visualItems ?? []}
+                      currentItemId={selectedRenderContext?.currentVisual?.itemId}
+                    />
+                    <ScheduleLaneTable
+                      title="Audio Schedule"
+                      items={selectedRenderContext?.audioItems ?? []}
+                      currentItemId={selectedRenderContext?.currentAudio?.itemId}
+                    />
+                  </div>
 
-                      <Card className="gap-4 py-5">
-                        <CardHeader className="px-5 pb-0">
-                          <CardTitle className="text-base">Downloaded Content For This Screen</CardTitle>
-                          <CardDescription>
-                            Required assets from the latest snapshot and whether they are already usable locally.
-                          </CardDescription>
-                        </CardHeader>
-                        <CardContent className="px-5">
-                          <Table>
-                            <TableHeader>
-                              <TableRow>
-                                <TableHead>Asset</TableHead>
-                                <TableHead>Status</TableHead>
-                                <TableHead>Local file</TableHead>
-                                <TableHead className="text-right">Action</TableHead>
-                              </TableRow>
-                            </TableHeader>
-                            <TableBody>
-                              {selectedScreenLibraryRows.length === 0 ? (
-                                <TableRow>
-                                  <TableCell colSpan={4} className="py-8 text-center text-sm text-muted-foreground">
-                                    No required assets found for the selected screen.
-                                  </TableCell>
-                                </TableRow>
-                              ) : (
-                                selectedScreenLibraryRows.map((item) => {
-                                  const actionKey = `screen-asset:${item.mediaAssetId}`;
-                                  const localPath = item.localState?.local_file_path || item.localState?.expected_local_path || null;
-                                  return (
-                                    <TableRow key={`screen-${item.mediaAssetId}`}>
-                                      <TableCell>
-                                        <div className="font-medium">{item.title || item.mediaAssetId}</div>
-                                        <div className="text-xs text-muted-foreground">
-                                          {item.mediaType || "unknown"} / {formatBytes(item.sizeBytes)}
-                                        </div>
-                                      </TableCell>
-                                      <TableCell>
-                                        <div className="flex flex-wrap gap-2">
-                                          <Badge className={cn("border", assetStateBadgeClass(item.status))}>
-                                            {item.status}
-                                          </Badge>
-                                          {isAssetReady(item.status) && (
-                                            <Badge className="border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
-                                              Ready
-                                            </Badge>
-                                          )}
-                                        </div>
-                                        {item.statusReason && (
-                                          <div className="mt-1 text-xs text-muted-foreground">{item.statusReason}</div>
-                                        )}
-                                      </TableCell>
-                                      <TableCell className="text-xs text-muted-foreground">
-                                        {localPath || "No local file yet"}
-                                      </TableCell>
-                                      <TableCell className="text-right">
-                                        {!isAssetReady(item.status) ? (
-                                          <Button
-                                            size="sm"
-                                            variant="outline"
-                                            disabled={busyAction != null}
-                                            onClick={() => void runSupportAction(
-                                              "RETRY_ONE_DOWNLOAD",
-                                              { mediaAssetId: item.mediaAssetId },
-                                              actionKey,
-                                            )}
-                                          >
-                                            {busyAction === actionKey ? (
-                                              <Loader2 className="h-4 w-4 animate-spin" />
-                                            ) : (
-                                              <Wrench className="h-4 w-4" />
-                                            )}
-                                            Retry
-                                          </Button>
-                                        ) : (
-                                          <span className="text-xs text-muted-foreground">Ready</span>
-                                        )}
-                                      </TableCell>
-                                    </TableRow>
-                                  );
-                                })
-                              )}
-                            </TableBody>
-                          </Table>
-                        </CardContent>
-                      </Card>
-                    </>
-                  )}
-                </CardContent>
-              </Card>
+                  <div className="grid gap-4 xl:grid-cols-2">
+                    <Card className="gap-4 py-5">
+                      <CardHeader className="px-5 pb-0">
+                        <CardTitle className="text-base">Already Downloaded</CardTitle>
+                        <CardDescription>
+                          Media that is already on this PC and ready for this screen.
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3 px-5">
+                        {selectedScreenDownloadedRows.length === 0 ? (
+                          <div className="rounded-lg border border-dashed px-4 py-6 text-sm text-muted-foreground">
+                            Nothing from the current screen schedule is ready locally yet.
+                          </div>
+                        ) : (
+                          selectedScreenDownloadedRows.map((item) => {
+                            const localPath = item.localState?.local_file_path || item.localState?.expected_local_path || null;
+                            return (
+                              <div key={`ready-${item.mediaAssetId}`} className="rounded-xl border p-4">
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="font-medium">{item.title || item.mediaAssetId}</div>
+                                    <div className="mt-1 text-xs text-muted-foreground">
+                                      {item.mediaType || "unknown"} / {formatBytes(item.sizeBytes)}
+                                    </div>
+                                  </div>
+                                  <Badge className="border border-emerald-500/30 bg-emerald-500/10 text-emerald-400">
+                                    Ready
+                                  </Badge>
+                                </div>
+                                <div className="mt-3 text-xs text-muted-foreground">
+                                  {localPath || "Local file path unavailable"}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </CardContent>
+                    </Card>
+
+                    <Card className="gap-4 py-5">
+                      <CardHeader className="px-5 pb-0">
+                        <CardTitle className="text-base">Missing Or Broken Media</CardTitle>
+                        <CardDescription>
+                          These items still need to be downloaded or repaired before the screen is fully safe offline.
+                        </CardDescription>
+                      </CardHeader>
+                      <CardContent className="space-y-3 px-5">
+                        {selectedScreenAttentionRows.length === 0 ? (
+                          <div className="rounded-lg border border-dashed px-4 py-6 text-sm text-muted-foreground">
+                            Everything required by the latest snapshot is already ready.
+                          </div>
+                        ) : (
+                          selectedScreenAttentionRows.map((item) => {
+                            const actionKey = `screen-asset:${item.mediaAssetId}`;
+                            return (
+                              <div key={`missing-${item.mediaAssetId}`} className="rounded-xl border p-4">
+                                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                                  <div className="min-w-0">
+                                    <div className="font-medium">{item.title || item.mediaAssetId}</div>
+                                    <div className="mt-1 text-xs text-muted-foreground">
+                                      {item.mediaType || "unknown"} / {item.mediaAssetId}
+                                    </div>
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                      <Badge className={cn("border", assetStateBadgeClass(item.status))}>
+                                        {item.status}
+                                      </Badge>
+                                      {item.statusReason && (
+                                        <Badge variant="outline">{item.statusReason}</Badge>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={busyAction != null}
+                                    onClick={() => void runSupportAction(
+                                      "RETRY_ONE_DOWNLOAD",
+                                      { mediaAssetId: item.mediaAssetId },
+                                      actionKey,
+                                    )}
+                                  >
+                                    {busyAction === actionKey ? (
+                                      <Loader2 className="h-4 w-4 animate-spin" />
+                                    ) : (
+                                      <Wrench className="h-4 w-4" />
+                                    )}
+                                    Download / Repair
+                                  </Button>
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </CardContent>
+                    </Card>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </TabsContent>

@@ -158,10 +158,17 @@ export function usePopupStream(maxHistory = 50) {
   const esRef = useRef<EventSource | null>(null);
 
   const sendToPopupWindow = useCallback((evt: PopupEvent) => {
-    // Write event to localStorage — the popup window polls this
+    // Method 1: localStorage — works in browser / same-context mode
     try {
       localStorage.setItem("popupEvent", JSON.stringify(evt));
     } catch { /* ignore */ }
+
+    // Method 2: Tauri cross-window IPC — required in Tauri because each
+    // WebviewWindow is a separate WebView2 process with isolated localStorage.
+    // `emit` broadcasts to all webview windows; PopupWindow listens for this.
+    import("@tauri-apps/api/event")
+      .then(({ emit }) => emit("popup-notification", evt))
+      .catch(() => { /* not running inside Tauri — ignore */ });
   }, []);
 
   useEffect(() => {

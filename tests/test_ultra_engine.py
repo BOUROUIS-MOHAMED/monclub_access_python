@@ -874,16 +874,16 @@ class TestHistoryQueueBehavior:
 
     @patch("app.core.ultra_engine.insert_access_history", side_effect=Exception("DB down"))
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
-    def test_insert_exception_still_enqueues_history(self, mock_lls, mock_iah):
-        """If insert throws, worker falls back to inserted=True and still queues."""
+    def test_insert_exception_skips_history_enqueue(self, mock_lls, mock_iah):
+        """If insert throws, worker sets inserted=False (fail-closed) to prevent dedup bypass."""
         worker = _make_worker()
         worker._cached_state = _EMPTY_LOCAL_STATE
         worker._cached_state_ts = time.monotonic()
 
         worker._process_event(_make_event(event_type=0))
 
-        # On exception, code sets inserted=True (fail-open) so history is enqueued
-        assert not worker._history_q.empty()
+        # On exception, code sets inserted=False (fail-closed) so history is NOT enqueued
+        assert worker._history_q.empty()
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)

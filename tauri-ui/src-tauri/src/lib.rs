@@ -74,6 +74,8 @@ struct DesktopRuntimeContext {
     api_port: u16,
     product_name: String,
     tray_enabled: bool,
+    /// B-001: Local API token for authenticating requests from this UI session.
+    api_token: String,
 }
 
 fn desktop_role() -> String {
@@ -137,9 +139,16 @@ fn api_base(port: u16) -> String {
 
 // ─── HTTP helpers (blocking, runs on separate thread) ───
 
+fn local_api_token() -> String {
+    env::var("MONCLUB_LOCAL_API_TOKEN").unwrap_or_default()
+}
+
 fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
     let url = format!("{}/sync/cache/devices", api_base(port));
-    reqwest::blocking::get(&url)
+    reqwest::blocking::Client::new()
+        .get(&url)
+        .header("X-Local-Token", local_api_token())
+        .send()
         .ok()
         .and_then(|r| r.json::<DevicesResponse>().ok())
         .map(|r| r.devices)
@@ -148,7 +157,10 @@ fn fetch_devices(port: u16) -> Vec<DeviceInfo> {
 
 fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
     let url = format!("{}/devices/{}/door-presets", api_base(port), device_id);
-    reqwest::blocking::get(&url)
+    reqwest::blocking::Client::new()
+        .get(&url)
+        .header("X-Local-Token", local_api_token())
+        .send()
         .ok()
         .and_then(|r| r.json::<PresetsResponse>().ok())
         .map(|r| r.presets)
@@ -163,6 +175,7 @@ fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i6
     });
     let _ = reqwest::blocking::Client::new()
         .post(&url)
+        .header("X-Local-Token", local_api_token())
         .json(&body)
         .send();
 }
@@ -171,6 +184,7 @@ fn post_sync_now(port: u16) {
     let url = format!("{}/sync/now", api_base(port));
     let _ = reqwest::blocking::Client::new()
         .post(&url)
+        .header("X-Local-Token", local_api_token())
         .json(&serde_json::json!({}))
         .send();
 }
@@ -179,13 +193,17 @@ fn post_app_quit(port: u16) {
     let url = format!("{}/app/quit", api_base(port));
     let _ = reqwest::blocking::Client::new()
         .post(&url)
+        .header("X-Local-Token", local_api_token())
         .json(&serde_json::json!({}))
         .send();
 }
 
 fn fetch_tv_bindings(port: u16) -> Vec<TvScreenInfo> {
     let url = format!("{}/tv/host/bindings", api_base(port));
-    reqwest::blocking::get(&url)
+    reqwest::blocking::Client::new()
+        .get(&url)
+        .header("X-Local-Token", local_api_token())
+        .send()
         .ok()
         .and_then(|r| r.json::<TvBindingsResponse>().ok())
         .map(|r| r.rows)
@@ -196,6 +214,7 @@ fn post_tv_app_quit(port: u16) {
     let url = format!("{}/tv/app/quit", api_base(port));
     let _ = reqwest::blocking::Client::new()
         .post(&url)
+        .header("X-Local-Token", local_api_token())
         .json(&serde_json::json!({}))
         .send();
 }
@@ -216,11 +235,13 @@ fn get_desktop_runtime_context(state: tauri::State<'_, ApiPort>) -> DesktopRunti
         .lock()
         .map(|p| *p)
         .unwrap_or_else(|_| default_api_port(&role));
+    let api_token = env::var("MONCLUB_LOCAL_API_TOKEN").unwrap_or_default();
     DesktopRuntimeContext {
         role: role.clone(),
         api_port,
         product_name: desktop_product_name(&role).into(),
         tray_enabled: role == "access" || role == "tv",
+        api_token,
     }
 }
 

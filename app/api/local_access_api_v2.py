@@ -408,11 +408,12 @@ def _handle_status(ctx: _Ctx) -> None:
         unknown_count = len(devices) - dev_count - agent_count
         mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
 
+    # H-005: Real sync telemetry from MainApp instead of placeholders
     sync = {
-        "running": False,
-        "lastSyncAt": (cache.updated_at if cache else None),
-        "lastOk": bool(cache),
-        "lastError": None,
+        "running": bool(getattr(ctx.app, "_sync_work_running", False)),
+        "lastSyncAt": getattr(ctx.app, "_last_sync_at", None) or (cache.updated_at if cache else None),
+        "lastOk": getattr(ctx.app, "_last_sync_ok", bool(cache)),
+        "lastError": getattr(ctx.app, "_last_sync_error", None),
     }
 
     pullsdk: Dict[str, Any] = {"connected": False, "deviceId": None, "ip": None, "since": None, "lastError": None}
@@ -442,12 +443,19 @@ def _handle_status(ctx: _Ctx) -> None:
     updates = _build_update_status_payload(ctx.app)
     updates["progress"] = updates.get("progressPercent")
 
+    # H-005: Device sync telemetry from MainApp instead of placeholders
+    device_sync = {
+        "lastRunAt": getattr(ctx.app, "_last_device_sync_at", None),
+        "lastOk": getattr(ctx.app, "_last_device_sync_ok", True),
+        "lastError": getattr(ctx.app, "_last_device_sync_error", None),
+    }
+
     ctx.send_json(200, {
         "ok": True,
         "session": session,
         "mode": mode,
         "sync": sync,
-        "deviceSync": {"lastRunAt": None, "lastOk": True, "lastError": None},
+        "deviceSync": device_sync,
         "pullsdk": pullsdk,
         "agent": agent,
         "ultra": ultra,
@@ -2631,8 +2639,21 @@ def _handle_device_table(ctx: _Ctx) -> None:
         except Exception: pass
 
 
+_door_open_last: Dict[int, float] = {}  # M-003: per-device rate limit for door open
+_DOOR_OPEN_COOLDOWN_SEC = 1.0
+
 def _handle_device_door_open(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+
+    # M-003: Rate limit — 1 second cooldown per device
+    import time as _time
+    _now = _time.monotonic()
+    _last = _door_open_last.get(did, 0.0)
+    if (_now - _last) < _DOOR_OPEN_COOLDOWN_SEC:
+        ctx.send_json(429, {"ok": False, "error": "Door open rate limited (1s cooldown)"})
+        return
+    _door_open_last[did] = _now
+
     body = ctx.body()
     door = _safe_int(body.get("doorNumber"), 1)
     pulse_sec = _safe_int(body.get("pulseSeconds"), 3)
@@ -4208,6 +4229,33 @@ class LocalApiServerV2:
                         return
 
                     ctx = _Ctx(self, params, qs, server.app)
+
+                    # B-001: Validate local API token on every non-exempt request.
+                    # The token is generated per-session by MainApp and passed to
+                    # Tauri via MONCLUB_LOCAL_API_TOKEN env var. The client sends it
+                    # as X-Local-Token header (REST) or ?token= query param (SSE).
+                    _AUTH_EXEMPT = {
+                        "_handle_auth_login", "_handle_auth_status",
+                        "_handle_tv_auth_login", "_handle_tv_auth_status",
+                        "_handle_health", "_handle_v1_health",
+                    }
+                    fn_name = getattr(handler_fn, "__name__", "")
+                    if fn_name not in _AUTH_EXEMPT:
+                        _expected_token = getattr(server.app, "_local_api_token", None)
+                        _caller_token = (
+                            self.headers.get("X-Local-Token", "").strip()
+                            or _qs_first(qs, "token", default="").strip()
+                        )
+                        if not _expected_token or not _caller_token or _caller_token != _expected_token:
+                            body = _json_bytes({"ok": False, "error": "Local API token invalid or missing"})
+                            self.send_response(401)
+                            _cors_headers(self)
+                            self.send_header("Content-Type", "application/json; charset=utf-8")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
+
                     handler_fn(ctx)
                 except Exception as e:
                     try:

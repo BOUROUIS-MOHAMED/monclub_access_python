@@ -932,7 +932,9 @@ class DecisionService(threading.Thread):
         self.device_name_provider = device_name_provider or (lambda did: f"device-{did}")
 
         self._cache_lock = threading.Lock()
-        self._cache_ttl_sec = 2.0
+        # L-005: Cache TTL now configurable from backend settings (was hardcoded 2.0)
+        _g_settings = global_settings() if global_settings else {}
+        self._cache_ttl_sec = float(_g_settings.get("decision_cache_ttl_sec", 2.0))
 
         self._creds_cache_at = 0.0
         self._creds_cache: List[Dict[str, Any]] = []
@@ -1033,8 +1035,14 @@ class DecisionService(threading.Thread):
                         cmd_error=None,
                         raw=dict(ev.raw),
                     )
-                except Exception:
-                    _history_claimed = 1  # if history insert fails, still proceed (fail-open for door)
+                except Exception as ex:
+                    _history_claimed = 0
+                    self.logger.exception(
+                        "[RT][device=%s] access_history insert failed for event_id=%s; denying door-open: %s",
+                        ev.device_id,
+                        ev.event_id,
+                        ex,
+                    )
 
             cmd_res = CommandResult(ok=True, error="", cmd_ms=0.0)
             if action == "OPEN_DOOR":
@@ -1170,6 +1178,9 @@ class NotificationService(threading.Thread):
 
         # create cache with defaults; runtime will update .enabled/.timeout/.limits from backend settings
         self._img_cache = ImageCache(cache_dir=cache_dir)
+        # L-002: Use bounded thread pool for background image downloads instead of spawning unbounded threads
+        from concurrent.futures import ThreadPoolExecutor
+        self._img_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="img-dl")
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1220,7 +1231,8 @@ class NotificationService(threading.Thread):
                                 self._img_cache.resolve(url)
                             except Exception:
                                 pass
-                        threading.Thread(target=_bg_download, args=(r.image_path,), daemon=True).start()
+                        # L-002: Submit to bounded thread pool instead of spawning unbounded threads
+                        self._img_executor.submit(_bg_download, r.image_path)
 
                 # respect per-device popupShowImage only for popups; Windows toast can still show icon
                 n = Notification(app_id="MonClub Access", title=r.title, msg=r.message, icon=icon_path or "")
@@ -1283,6 +1295,14 @@ class HistoryService(threading.Thread):
                     deleted = prune_access_history(retention_days=days)
                     if deleted > 0:
                         self.logger.info(f"[RT] history pruned: {deleted} rows (retention_days={days})")
+                except Exception:
+                    pass
+                # M-008: Also clean up old offline creation queue entries
+                try:
+                    from app.core.db import prune_offline_creation_queue
+                    oq_deleted = prune_offline_creation_queue(retention_days=30)
+                    if oq_deleted > 0:
+                        self.logger.info(f"[RT] offline queue pruned: {oq_deleted} rows")
                 except Exception:
                     pass
 
@@ -1556,14 +1576,11 @@ class AgentRealtimeEngine:
         else:
             self.logger.info("[RT] Notification service disabled by backend settings")
 
-        if bool(g.get("history_service_enabled", True)):
-            try:
-                self._hist.start()
-                self.logger.info("[RT] History service started")
-            except Exception as e:
-                self.logger.error(f"[RT] Failed to start history service: {e}")
-        else:
-            self.logger.info("[RT] History service disabled by backend settings")
+        # H-002: HistoryService is not used in AGENT mode — DecisionService writes
+        # history directly via insert_access_history(). HistoryService is only needed
+        # for ULTRA mode (where UltraDeviceWorker enqueues to history_q).
+        # Skipping start here to avoid running an idle thread.
+        self.logger.info("[RT] History service not started (AGENT mode writes history directly)")
 
         decider_count = _safe_int(g.get("decision_workers", 1), 1)
         if decider_count < 1:

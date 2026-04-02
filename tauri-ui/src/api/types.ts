@@ -363,7 +363,29 @@ export interface EnrollStatusResponse {
 }
 
 // ─── J) DB ───
-export interface DbTableInfo { name: string; rowCount: number }
+export interface DbTableInfo {
+  name: string;
+  rowCount: number;
+  owned?: boolean;
+}
+
+export interface DbTablesResponse {
+  ok: boolean;
+  dbPath?: string;
+  dbSizeBytes?: number;
+  tables: DbTableInfo[];
+}
+
+export interface DbTableQueryResponse {
+  ok: boolean;
+  tableName?: string;
+  columns: string[];
+  rows: Record<string, unknown>[];
+  total: number;
+  limit?: number;
+  offset?: number;
+}
+
 export interface AccessHistoryRecord {
   eventId: string;
   deviceId: number | null;
@@ -440,6 +462,156 @@ export interface TvSnapshotAssetsResponse {
   assets: TvSnapshotRequiredAssetRow[];
   total: number;
 }
+
+// ─── J2) Dashboard TV read-only proxy ───
+
+export type TvDashboardScreenOrientation = "LANDSCAPE" | "PORTRAIT";
+
+export type TvDashboardDayOfWeek =
+  | "MONDAY"
+  | "TUESDAY"
+  | "WEDNESDAY"
+  | "THURSDAY"
+  | "FRIDAY"
+  | "SATURDAY"
+  | "SUNDAY";
+
+export interface TvDashboardScreen {
+  id: number;
+  gymId: number;
+  name: string;
+  description?: string | null;
+  orientation: TvDashboardScreenOrientation;
+  resolutionWidth: number;
+  resolutionHeight: number;
+  layoutPresetId?: number | null;
+  playbackPolicyId?: number | null;
+  enabled: boolean;
+  timezone: string;
+  lastHeartbeatAt?: string | null;
+  lastSyncAt?: string | null;
+  activeSnapshotVersion?: string | null;
+  archivedAt?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  readyForProgramming: boolean;
+  readinessNote: string;
+  usesDefaultPolicy: boolean;
+  policyNote: string;
+  supportOverride: boolean;
+}
+
+export interface TvDashboardScreenPageResponse extends ApiOk {
+  items: TvDashboardScreen[];
+  page: number;
+  size: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+}
+
+export interface TvDashboardScreenResponse extends ApiOk, TvDashboardScreen {}
+
+export type TvDashboardScreenContentPlanDayAssignments = Record<TvDashboardDayOfWeek, number | null>;
+
+export interface TvDashboardScreenContentPlan extends ApiOk {
+  id?: number | null;
+  screenId: number;
+  gymId: number;
+  defaultPresetId?: number | null;
+  enabled: boolean;
+  dayAssignments: TvDashboardScreenContentPlanDayAssignments;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  supportOverride: boolean;
+}
+
+export interface TvDashboardMediaAsset {
+  id: number;
+  title: string;
+  mediaType?: string | null;
+  durationInSeconds?: number | null;
+  hasSound?: boolean | null;
+  mimeType?: string | null;
+  sizeBytes?: number | null;
+  checksumSha256?: string | null;
+}
+
+export interface TvDashboardTimelineItem {
+  presetItemId?: number | null;
+  timelineType: "VISUAL" | "AUDIO" | string;
+  startMinuteOfDay: number;
+  endMinuteOfDay: number;
+  startTime?: string | null;
+  endTime?: string | null;
+  mediaAsset?: TvDashboardMediaAsset | null;
+  videoAudioEnabled?: boolean | null;
+  audioOverriddenByTimeline?: boolean | null;
+  [key: string]: unknown;
+}
+
+export interface TvDashboardSnapshotPayload {
+  timelines?: Partial<Record<"VISUAL" | "AUDIO", TvDashboardTimelineItem[]>>;
+  [key: string]: unknown;
+}
+
+export interface TvDashboardSnapshotManifestItem {
+  mediaAssetId: number;
+  title: string;
+  mediaType: "VIDEO" | "AUDIO" | "IMAGE";
+  downloadLink?: string | null;
+  checksumSha256?: string | null;
+  sizeBytes?: number | null;
+  mimeType?: string | null;
+  durationInSeconds?: number | null;
+  requiredInTimelines: Array<"VISUAL" | "AUDIO">;
+  sourcePresetItemIds: number[];
+}
+
+export interface TvDashboardSnapshotAssetManifest {
+  snapshotId: number;
+  screenId: number;
+  snapshotVersion: number;
+  generatedAt: string;
+  assetCount: number;
+  items: TvDashboardSnapshotManifestItem[];
+}
+
+export interface TvDashboardResolvedSnapshot {
+  id: number;
+  screenId: number;
+  version: number;
+  activationState: "GENERATED" | "ACTIVE" | "SUPERSEDED" | string;
+  resolvedAt: string;
+  resolvedDayOfWeek: TvDashboardDayOfWeek | string;
+  resolvedPresetId?: number | null;
+  resolvedLayoutPresetId: number;
+  resolvedPolicyId: number;
+  playbackPolicyVersion: number;
+  playbackPolicyHash: string;
+  assetCount: number;
+  warningCount: number;
+  generatedAt: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+  payload?: TvDashboardSnapshotPayload | null;
+  assetManifest?: TvDashboardSnapshotAssetManifest | null;
+}
+
+export interface TvDashboardResolvedSnapshotResponse extends ApiOk, TvDashboardResolvedSnapshot {}
+
+export interface TvDashboardSnapshotPageResponse extends ApiOk {
+  items: TvDashboardResolvedSnapshot[];
+  page: number;
+  size: number;
+  total: number;
+  totalPages: number;
+  hasNext: boolean;
+}
+
+export interface TvDashboardSnapshotAssetManifestResponse
+  extends ApiOk,
+    TvDashboardSnapshotAssetManifest {}
 
 export interface TvLocalAssetStateRow {
   id: number;

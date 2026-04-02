@@ -1,6 +1,8 @@
 // TV Player API — A6: binding-scoped player runtime
 import { ApiError, get, openSSE, patch, post } from "../../api/client";
 import type {
+  DbTableQueryResponse,
+  DbTablesResponse,
   LogLine,
   TvPlayerRenderContext,
   TvPlayerStatusResponse,
@@ -359,6 +361,83 @@ export function getTvSnapshotAssets(
   return get(`/tv/snapshots/${encodeURIComponent(snapshotId)}/assets`);
 }
 
+export function getTvDashboardScreens(params?: {
+  q?: string;
+  gymId?: number;
+  enabled?: boolean;
+  orientation?: string;
+  hasLayout?: boolean;
+  includeArchived?: boolean;
+  page?: number;
+  size?: number;
+  sortBy?: string;
+  sortDir?: string;
+}): Promise<import("./types").TvDashboardScreenPageResponse> {
+  const query: Record<string, string> = {};
+  if (params?.q) query.q = params.q;
+  if (params?.gymId) query.gymId = String(params.gymId);
+  if (params?.enabled != null) query.enabled = params.enabled ? "true" : "false";
+  if (params?.orientation) query.orientation = params.orientation;
+  if (params?.hasLayout != null) query.hasLayout = params.hasLayout ? "true" : "false";
+  if (params?.includeArchived != null) query.includeArchived = params.includeArchived ? "true" : "false";
+  if (params?.page != null) query.page = String(params.page);
+  if (params?.size != null) query.size = String(params.size);
+  if (params?.sortBy) query.sortBy = params.sortBy;
+  if (params?.sortDir) query.sortDir = params.sortDir;
+  return get(`/tv/dashboard/screens`, query);
+}
+
+export function getTvDashboardScreen(
+  screenId: number,
+): Promise<import("./types").TvDashboardScreenResponse> {
+  return get(`/tv/dashboard/screens/${screenId}`);
+}
+
+export function getTvDashboardScreenContentPlan(
+  screenId: number,
+): Promise<import("./types").TvDashboardScreenContentPlan> {
+  return get(`/tv/dashboard/screens/${screenId}/content-plan`);
+}
+
+export function getTvDashboardScreenSnapshots(
+  screenId: number,
+  params?: {
+    page?: number;
+    size?: number;
+    sortBy?: string;
+    sortDir?: string;
+  },
+): Promise<import("./types").TvDashboardSnapshotPageResponse> {
+  const query: Record<string, string> = {};
+  if (params?.page != null) query.page = String(params.page);
+  if (params?.size != null) query.size = String(params.size);
+  if (params?.sortBy) query.sortBy = params.sortBy;
+  if (params?.sortDir) query.sortDir = params.sortDir;
+  return get(`/tv/dashboard/screens/${screenId}/snapshots`, query);
+}
+
+export function getTvDashboardScreenLatestSnapshot(
+  screenId: number,
+  resolveAt?: string,
+): Promise<import("./types").TvDashboardResolvedSnapshotResponse> {
+  return get(
+    `/tv/dashboard/screens/${screenId}/snapshots/latest`,
+    resolveAt ? { resolveAt } : undefined,
+  );
+}
+
+export function getTvDashboardSnapshot(
+  snapshotId: number | string,
+): Promise<import("./types").TvDashboardResolvedSnapshotResponse> {
+  return get(`/tv/dashboard/snapshots/${encodeURIComponent(String(snapshotId))}`);
+}
+
+export function getTvDashboardSnapshotManifest(
+  snapshotId: number | string,
+): Promise<import("./types").TvDashboardSnapshotAssetManifestResponse> {
+  return get(`/tv/dashboard/snapshots/${encodeURIComponent(String(snapshotId))}/asset-manifest`);
+}
+
 export function getTvAssets(params?: {
   screenId?: number;
   snapshotId?: string;
@@ -400,6 +479,21 @@ export function getTvLatestReadiness(
   screenId: number,
 ): Promise<import("./types").TvLatestReadinessResponse> {
   return get(`/tv/readiness/latest`, { screenId: String(screenId) });
+}
+
+export function getTvDbTables(): Promise<DbTablesResponse> {
+  return get(`/tv/db/tables`);
+}
+
+export function getTvDbTable(
+  tableName: string,
+  limit = 500,
+  offset = 0,
+): Promise<DbTableQueryResponse> {
+  return get(`/tv/db/table/${encodeURIComponent(tableName)}`, {
+    limit: String(limit),
+    offset: String(offset),
+  });
 }
 
 export function getTvUpdateStatus(): Promise<import("../../api/types").UpdateStatusResponse> {

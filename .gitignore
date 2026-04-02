@@ -17,6 +17,10 @@ data/app.db
 data/logs/
 data/config.json
 
+# TOTP secrets cache — must never be committed
+gym_access_secrets_cache.json
+totp_replay_state.json
+
 # Windows
 Thumbs.db
 desktop.ini

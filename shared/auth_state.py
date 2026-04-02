@@ -57,12 +57,16 @@ def protect_auth_token(plain: str) -> str:
 
         ok = crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
         if not ok:
-            return "raw:" + plain
+            import logging as _log
+            _log.getLogger(__name__).error("DPAPI CryptProtectData failed — refusing to store plaintext token")
+            return ""
 
         enc = _blob_to_bytes(out_blob)
         return "dpapi:" + base64.b64encode(enc).decode("ascii")
-    except Exception:
-        return "raw:" + plain
+    except Exception as _exc:
+        import logging as _log
+        _log.getLogger(__name__).error("DPAPI unavailable (%s) — refusing to store plaintext token", _exc)
+        return ""
 
 
 def unprotect_auth_token(stored: str) -> str:

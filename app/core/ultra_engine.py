@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections import deque
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional
 
 from app.core.access_types import HistoryRecord, NotificationRequest
@@ -58,7 +59,8 @@ class UltraDeviceWorker(threading.Thread):
         self._backoff = float(settings.get("empty_backoff_factor", 1.35))
         self._backoff_cap = int(settings.get("empty_backoff_max_ms", 2000))
         self._empty_sleep_ms = float(self._empty_min)
-        self._poll_timeout_sec = 15.0
+        # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
+        self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
 
         # Local state cache (avoid per-event DB reads)
         self._cached_state: Optional[tuple] = None
@@ -370,7 +372,7 @@ class UltraDeviceWorker(threading.Thread):
         if allowed:
             # Open door
             t_cmd = time.monotonic()
-            door_opened = self._open_door_with_retry()
+            door_opened = self._open_door_with_retry(door_id=door_id)
             cmd_ms = (time.monotonic() - t_cmd) * 1000
             cmd_ok = door_opened
 
@@ -418,14 +420,20 @@ class UltraDeviceWorker(threading.Thread):
             cmd_error=cmd_error,
         )
 
-    def _open_door_with_retry(self) -> bool:
+    def _open_door_with_retry(self, *, door_id: Optional[int] = None) -> bool:
         """Open door via PullSDK. Retry once on failure. Returns True if succeeded."""
-        door_id = int(self._settings.get("door_entry_id", 1))
+        resolved_door_id = int(self._settings.get("door_entry_id", 1))
+        try:
+            candidate = int(door_id) if door_id is not None else 0
+            if candidate > 0:
+                resolved_door_id = candidate
+        except Exception:
+            pass
         pulse_ms = int(self._settings.get("pulse_time_ms", 3000))
         for attempt in range(2):
             try:
                 assert self._sdk is not None
-                ok = self._sdk.open_door(door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
+                ok = self._sdk.open_door(door_id=resolved_door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
                 if ok:
                     return True
             except Exception as e:
@@ -565,8 +573,8 @@ class UltraDeviceWorker(threading.Thread):
             )
             inserted = rowcount == 1
         except Exception as e:
-            logger.warning(f"{self._prefix} history DB insert failed: {e}")
-            inserted = True  # still try to enqueue on failure
+            logger.error(f"{self._prefix} history DB insert failed: {e}")
+            inserted = False  # treat as duplicate to avoid bypass of dedup gate
 
         if not inserted:
             return  # duplicate, already processed
@@ -706,8 +714,18 @@ class UltraSyncScheduler:
 
         # Compute hash of current user payload for this device
         users = getattr(cache, "users", []) or []
+        # M-004: Include card numbers and fingerprint hashes in payload hash,
+        # not just activeMembershipId. Otherwise card-only changes are missed.
         payload_str = json.dumps(
-            sorted([u.get("activeMembershipId", "") for u in users if u]),
+            sorted([
+                (
+                    u.get("activeMembershipId", ""),
+                    u.get("firstCardId", ""),
+                    u.get("secondCardId", ""),
+                    u.get("fingerprintsHash", ""),
+                )
+                for u in users if u
+            ]),
             sort_keys=True,
         )
         current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
@@ -718,8 +736,15 @@ class UltraSyncScheduler:
 
         logger.info(f"[ULTRA:{device_id}] sync push started")
 
+        device_copy = dict(device or {})
+        device_copy["accessDataMode"] = "DEVICE"
+        filtered_cache_attrs = dict(getattr(cache, "__dict__", {}))
+        filtered_cache_attrs["users"] = list(users)
+        filtered_cache_attrs["devices"] = [device_copy]
+        filtered_cache = SimpleNamespace(**filtered_cache_attrs)
+
         engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
-        engine.run_blocking(cache=cache, source="ultra_sync")
+        engine.run_blocking(cache=filtered_cache, source="ultra_sync")
 
         self._last_hash[device_id] = current_hash
         logger.info(f"[ULTRA:{device_id}] sync push complete")
@@ -747,8 +772,15 @@ class UltraEngine:
         self._workers: Dict[int, UltraDeviceWorker] = {}
         self._sync_scheduler: Optional[UltraSyncScheduler] = None
         self._stop_event = threading.Event()
-        self._popup_q: "queue.Queue[NotificationRequest]" = queue.Queue(maxsize=5000)
-        self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(maxsize=5000)
+        # M-001: Queue sizes read from backend settings (consistent with AGENT mode).
+        from app.core.settings_reader import get_backend_global_settings
+        _g = get_backend_global_settings() or {}
+        self._popup_q: "queue.Queue[NotificationRequest]" = queue.Queue(
+            maxsize=int(_g.get("popup_queue_max", _g.get("notification_queue_max", 5000)))
+        )
+        self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(
+            maxsize=int(_g.get("history_queue_max", 5000))
+        )
         self._running = False
 
     @property
@@ -782,19 +814,21 @@ class UltraEngine:
 
         logger.info(f"[ULTRA] Starting with {len(ultra_devices)} device(s)")
 
-        # Start sync scheduler
-        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
-        self._sync_scheduler.start(ultra_devices)
-
-        # Start per-device workers
         from app.core.settings_reader import normalize_device_settings
 
+        prepared_devices: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
         for d in ultra_devices:
-            device_id = int(d.get("id", 0))
             settings = normalize_device_settings(d)
-
-            # Stash settings on the device dict for the sync scheduler
             d["_settings"] = settings
+            prepared_devices.append((d, settings))
+
+        # Start sync scheduler after device settings are attached.
+        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
+        self._sync_scheduler.start([d for d, _settings in prepared_devices])
+
+        # Start per-device workers
+        for d, settings in prepared_devices:
+            device_id = int(d.get("id", 0))
 
             worker = UltraDeviceWorker(
                 device=d,

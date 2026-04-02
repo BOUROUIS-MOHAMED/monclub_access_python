@@ -205,7 +205,7 @@ class DeviceSyncEngine:
         # accessDataMode: per-device mode (DEVICE or AGENT)
         adm_raw = g("accessDataMode", "access_data_mode", default="DEVICE")
         adm = str(adm_raw or "").strip().upper()
-        if adm not in ("DEVICE", "AGENT"):
+        if adm not in ("DEVICE", "AGENT", "ULTRA"):
             adm = "DEVICE"
 
         # per-device timezone/policy (used for userauthorize)
@@ -731,7 +731,11 @@ class DeviceSyncEngine:
                         pushed_templates += ok_count
                         if errs:
                             warn_templates_users += 1
-                            self.logger.debug(f"[DeviceSync] Pin={pin} template warnings: {errs[:3]}")
+                            # M-006: Log all errors (not just first 3) and include count
+                            self.logger.warning(
+                                f"[DeviceSync] Pin={pin} template errors ({len(errs)} total): "
+                                f"{errs[:5]}{'...' if len(errs) > 5 else ''}"
+                            )
 
                     # persist applied hash only on success
                     save_device_sync_state(

@@ -32,7 +32,12 @@ API_OPTIONAL_CONTENT_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/content/s
 # ── TV endpoints ──────────────────────────────────────────────────────────────
 # Template placeholders use {screenId} / {snapshotId} / {taskId} —
 # they are substituted at call-time inside MonClubApi._format_url_template().
+API_TV_SCREENS_URL: str = f"{_API_V1}/manager/tv/screens"
+API_TV_SCREEN_BY_ID_URL: str = f"{_API_V1}/manager/tv/screens/{{screenId}}"
+API_TV_SCREEN_CONTENT_PLAN_URL: str = f"{_API_V1}/manager/tv/screens/{{screenId}}/content-plan"
+API_TV_SCREEN_SNAPSHOTS_URL: str = f"{_API_V1}/manager/tv/screens/{{screenId}}/snapshots"
 API_TV_SNAPSHOT_LATEST_URL: str = f"{_API_V1}/manager/tv/screens/{{screenId}}/snapshots/latest"
+API_TV_SNAPSHOT_BY_ID_URL: str = f"{_API_V1}/manager/tv/snapshots/{{snapshotId}}"
 API_TV_SNAPSHOT_MANIFEST_URL: str = f"{_API_V1}/manager/tv/snapshots/{{snapshotId}}/asset-manifest"
 API_TV_AD_TASKS_FETCH_URL: str = f"{_API_V1}/manager/gym/access/v1/tv/ad-tasks"
 API_TV_AD_TASK_CONFIRM_READY_URL: str = f"{_API_V1}/manager/gym/access/v1/tv/ad-tasks/{{taskId}}/confirm-ready"

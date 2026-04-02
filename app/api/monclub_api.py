@@ -1,6 +1,7 @@
 # monclub_access_python/app/api/monclub_api.py
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -18,7 +19,12 @@ class ApiEndpoints:
     access_create_membership_url: str = ""
     access_create_account_membership_url: str = ""
     sync_access_history_url: str = ""
+    tv_screens_url: str = ""
+    tv_screen_by_id_url: str = ""
+    tv_screen_content_plan_url: str = ""
+    tv_screen_snapshots_url: str = ""
     tv_snapshot_latest_url: str = ""
+    tv_snapshot_by_id_url: str = ""
     tv_snapshot_manifest_url: str = ""
     tv_ad_tasks_fetch_url: str = ""
     tv_ad_task_confirm_ready_url: str = ""
@@ -41,24 +47,56 @@ def _now_epoch_ms() -> str:
     return str(int(time.time() * 1000))
 
 
+def _load_error_payload(txt: str) -> Dict[str, Any]:
+    try:
+        data = json.loads(txt or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _extract_trace_info(txt: str) -> str:
     """
     Best-effort extraction of traceId/timestamp/path from the backend JSON error.
     Doesn't throw.
     """
-    try:
-        import json
-
-        j = json.loads(txt or "{}")
-        details = j.get("details") or {}
-        trace_id = details.get("traceId") or j.get("traceId")
-        ts = details.get("timestamp") or j.get("timestamp")
-        path = details.get("path") or j.get("path")
-        if trace_id or ts or path:
-            return f" | traceId={trace_id} | ts={ts} | path={path}"
-    except Exception:
-        pass
+    j = _load_error_payload(txt)
+    details = j.get("details") or {}
+    if not isinstance(details, dict):
+        details = {}
+    trace_id = details.get("traceId") or j.get("traceId")
+    ts = details.get("timestamp") or j.get("timestamp")
+    path = details.get("path") or j.get("path")
+    if trace_id or ts or path:
+        return f" | traceId={trace_id} | ts={ts} | path={path}"
     return ""
+
+
+def _build_login_error_message(status_code: int, txt: str) -> str:
+    payload = _load_error_payload(txt)
+    error_msg = str(
+        payload.get("errorMsg")
+        or payload.get("message")
+        or payload.get("error")
+        or ""
+    ).strip()
+    code = str(payload.get("code") or "").strip().upper()
+    normalized = error_msg.lower()
+
+    if status_code == 401 or code == "UNAUTHORIZED":
+        if "invalid email or password" in normalized:
+            return "Email ou mot de passe incorrect."
+        if error_msg:
+            return error_msg
+        return "Connexion refusee. Verifiez vos identifiants puis reessayez."
+
+    if error_msg:
+        return f"Connexion impossible: {error_msg}"
+
+    if status_code >= 500:
+        return "Le serveur MonClub est indisponible pour le moment. Reessayez dans un instant."
+
+    return f"Connexion impossible (HTTP {status_code})."
 
 
 class MonClubApi:
@@ -83,7 +121,12 @@ class MonClubApi:
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
-            raise MonClubApiError(f"Login failed: HTTP {r.status_code} -> {txt[:300]}{extra}")
+            self.logger.warning("API login failed: HTTP %s -> %s%s", r.status_code, txt[:600], extra)
+            raise MonClubApiHttpError(
+                _build_login_error_message(r.status_code, txt),
+                status_code=r.status_code,
+                body=txt,
+            )
 
         token = (r.text or "").strip()
         if not token:
@@ -338,6 +381,159 @@ class MonClubApi:
             u = u.replace("{" + str(key) + "}", s)
         return u
 
+    def _get_json_dict(
+        self,
+        *,
+        url: str,
+        token: str,
+        operation_name: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        final_url = (url or "").strip()
+        if not final_url:
+            raise MonClubApiError(f"{operation_name} URL is empty (check Configuration).")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        safe_params = dict(params or {})
+        self.logger.info("API %s -> %s params=%s", operation_name, final_url, safe_params)
+        try:
+            r = self._session.get(final_url, params=safe_params or None, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"{operation_name} request failed: {e}") from e
+
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            extra = _extract_trace_info(txt)
+            raise MonClubApiHttpError(
+                f"{operation_name} failed: HTTP {r.status_code} -> {txt[:400]}{extra}",
+                status_code=r.status_code,
+                body=txt,
+            )
+
+        try:
+            data = r.json()
+        except Exception as e:
+            raise MonClubApiError(f"{operation_name} returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
+
+        if not isinstance(data, dict):
+            raise MonClubApiError(f"{operation_name} JSON is not an object/dict.")
+        return data
+
+    def get_tv_screens(
+        self,
+        *,
+        token: str,
+        q: Optional[str] = None,
+        gym_id: Optional[int] = None,
+        enabled: Optional[bool] = None,
+        orientation: Optional[str] = None,
+        has_layout: Optional[bool] = None,
+        include_archived: Optional[bool] = None,
+        page: int = 0,
+        size: int = 50,
+        sort_by: str = "name",
+        sort_dir: str = "asc",
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "page": max(0, int(page or 0)),
+            "size": max(1, min(int(size or 50), 200)),
+            "sortBy": str(sort_by or "name").strip() or "name",
+            "sortDir": str(sort_dir or "asc").strip() or "asc",
+        }
+        if q and str(q).strip():
+            params["q"] = str(q).strip()
+        if gym_id is not None and int(gym_id) > 0:
+            params["gymId"] = int(gym_id)
+        if enabled is not None:
+            params["enabled"] = bool(enabled)
+        if orientation and str(orientation).strip():
+            params["orientation"] = str(orientation).strip()
+        if has_layout is not None:
+            params["hasLayout"] = bool(has_layout)
+        if include_archived is not None:
+            params["includeArchived"] = bool(include_archived)
+
+        return self._get_json_dict(
+            url=self.endpoints.tv_screens_url,
+            token=token,
+            operation_name="getTvScreens",
+            params=params,
+            timeout=timeout,
+        )
+
+    def get_tv_screen_by_id(
+        self,
+        *,
+        token: str,
+        screen_id: int,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = self._format_url_template(
+            self.endpoints.tv_screen_by_id_url,
+            screenId=screen_id,
+            screen_id=screen_id,
+        )
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvScreenById",
+            timeout=timeout,
+        )
+
+    def get_tv_screen_content_plan(
+        self,
+        *,
+        token: str,
+        screen_id: int,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = self._format_url_template(
+            self.endpoints.tv_screen_content_plan_url,
+            screenId=screen_id,
+            screen_id=screen_id,
+        )
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvScreenContentPlan",
+            timeout=timeout,
+        )
+
+    def get_tv_screen_snapshots(
+        self,
+        *,
+        token: str,
+        screen_id: int,
+        page: int = 0,
+        size: int = 20,
+        sort_by: str = "version",
+        sort_dir: str = "desc",
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = self._format_url_template(
+            self.endpoints.tv_screen_snapshots_url,
+            screenId=screen_id,
+            screen_id=screen_id,
+        )
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvScreenSnapshots",
+            params={
+                "page": max(0, int(page or 0)),
+                "size": max(1, min(int(size or 20), 100)),
+                "sortBy": str(sort_by or "version").strip() or "version",
+                "sortDir": str(sort_dir or "desc").strip() or "desc",
+            },
+            timeout=timeout,
+        )
+
     def get_tv_latest_snapshot(
         self,
         *,
@@ -351,36 +547,35 @@ class MonClubApi:
             screenId=screen_id,
             screen_id=screen_id,
         )
-        if not url:
-            raise MonClubApiError("TV latest snapshot URL is empty (check Configuration).")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
         params: Dict[str, Any] = {}
         if resolve_at and str(resolve_at).strip():
             params["resolveAt"] = str(resolve_at).strip()
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvLatestSnapshot",
+            params=params,
+            timeout=timeout,
+        )
 
-        self.logger.info("API getTvLatestSnapshot -> %s params=%s", url, params)
-        try:
-            r = self._session.get(url, params=params, headers=headers, timeout=timeout)
-        except Exception as e:
-            raise MonClubApiError(f"getTvLatestSnapshot request failed: {e}") from e
-
-        if r.status_code < 200 or r.status_code >= 300:
-            txt = (r.text or "").strip()
-            extra = _extract_trace_info(txt)
-            raise MonClubApiError(f"getTvLatestSnapshot failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
-
-        try:
-            data = r.json()
-        except Exception as e:
-            raise MonClubApiError(f"getTvLatestSnapshot returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
-
-        if not isinstance(data, dict):
-            raise MonClubApiError("getTvLatestSnapshot JSON is not an object/dict.")
-        return data
+    def get_tv_snapshot_by_id(
+        self,
+        *,
+        token: str,
+        snapshot_id: str,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        url = self._format_url_template(
+            self.endpoints.tv_snapshot_by_id_url,
+            snapshotId=snapshot_id,
+            snapshot_id=snapshot_id,
+        )
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvSnapshotById",
+            timeout=timeout,
+        )
 
     def get_tv_snapshot_manifest(
         self,
@@ -394,32 +589,12 @@ class MonClubApi:
             snapshotId=snapshot_id,
             snapshot_id=snapshot_id,
         )
-        if not url:
-            raise MonClubApiError("TV snapshot manifest URL is empty (check Configuration).")
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        }
-        self.logger.info("API getTvSnapshotManifest -> %s", url)
-        try:
-            r = self._session.get(url, headers=headers, timeout=timeout)
-        except Exception as e:
-            raise MonClubApiError(f"getTvSnapshotManifest request failed: {e}") from e
-
-        if r.status_code < 200 or r.status_code >= 300:
-            txt = (r.text or "").strip()
-            extra = _extract_trace_info(txt)
-            raise MonClubApiError(f"getTvSnapshotManifest failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
-
-        try:
-            data = r.json()
-        except Exception as e:
-            raise MonClubApiError(f"getTvSnapshotManifest returned non-JSON: {e} -> {(r.text or '')[:200]}") from e
-
-        if not isinstance(data, dict):
-            raise MonClubApiError("getTvSnapshotManifest JSON is not an object/dict.")
-        return data
+        return self._get_json_dict(
+            url=url,
+            token=token,
+            operation_name="getTvSnapshotManifest",
+            timeout=timeout,
+        )
 
 
     def get_tv_ad_tasks(

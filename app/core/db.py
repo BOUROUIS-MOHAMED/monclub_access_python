@@ -1176,6 +1176,20 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             (1 if contract_status else 0, contract_end_date, updated_at),
         )
 
+        # H-006: Validate sync data before replacing cache.
+        # If backend returns empty user list but we had >10 users before,
+        # this is likely a backend error — refuse to wipe local cache.
+        if not users:
+            old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+            if old_count > 10:
+                import logging as _log
+                _log.getLogger(__name__).error(
+                    f"[DB] save_sync_cache: backend returned 0 users but local cache has {old_count}. "
+                    "Refusing to clear — likely backend error. Skipping normalized table update."
+                )
+                conn.commit()
+                return
+
         # clear normalized tables
         cur.execute("DELETE FROM sync_users")
         cur.execute("DELETE FROM sync_memberships")
@@ -2426,6 +2440,7 @@ class AccessHistoryRow:
 
 ACCESS_HISTORY_SOURCE_AGENT = "AGENT"
 ACCESS_HISTORY_SOURCE_DEVICE = "DEVICE"
+ACCESS_HISTORY_SOURCE_ULTRA = "ULTRA"
 
 ACCESS_HISTORY_SYNC_PENDING = "PENDING"
 ACCESS_HISTORY_SYNC_FAILED_RETRYABLE = "FAILED_RETRYABLE"
@@ -2448,7 +2463,11 @@ class DeviceAttendanceState:
 
 def normalize_access_history_source(v: Any) -> str:
     s = str(v or "").strip().upper()
-    return ACCESS_HISTORY_SOURCE_DEVICE if s == ACCESS_HISTORY_SOURCE_DEVICE else ACCESS_HISTORY_SOURCE_AGENT
+    if s == ACCESS_HISTORY_SOURCE_DEVICE:
+        return ACCESS_HISTORY_SOURCE_DEVICE
+    if s == ACCESS_HISTORY_SOURCE_ULTRA:
+        return ACCESS_HISTORY_SOURCE_ULTRA
+    return ACCESS_HISTORY_SOURCE_AGENT
 
 
 def normalize_access_history_sync_state(v: Any) -> str:
@@ -2643,6 +2662,22 @@ def prune_access_history(*, retention_days: int) -> int:
               AND backend_sync_state IN (?, ?)
             """,
             (days, ACCESS_HISTORY_SYNC_SYNCED, ACCESS_HISTORY_SYNC_FAILED_TERMINAL),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def prune_offline_creation_queue(*, retention_days: int = 30) -> int:
+    """M-008: Clean up succeeded/failed offline creations older than retention_days."""
+    days = max(int(retention_days), 1)
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM offline_creation_queue
+            WHERE state IN ('succeeded', 'failed_terminal')
+              AND julianday('now') - julianday(updated_at) > ?
+            """,
+            (days,),
         )
         conn.commit()
         return int(cur.rowcount or 0)

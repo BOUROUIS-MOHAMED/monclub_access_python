@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { configureApiPort } from "@/api/client";
+import { configureApiPort, setAuthToken } from "@/api/client";
 
 export type DesktopShellRole = "access" | "tv";
 
@@ -8,6 +8,8 @@ export interface DesktopRuntimeContext {
   apiPort: number;
   productName: string;
   trayEnabled: boolean;
+  /** B-001: Local API token for authenticating requests. */
+  apiToken: string;
 }
 
 const DEFAULT_CONTEXT: DesktopRuntimeContext = {
@@ -15,6 +17,7 @@ const DEFAULT_CONTEXT: DesktopRuntimeContext = {
   apiPort: 8788,
   productName: "MonClub Access",
   trayEnabled: true,
+  apiToken: "",
 };
 
 let currentContext: DesktopRuntimeContext = DEFAULT_CONTEXT;
@@ -38,6 +41,7 @@ function normalizeContext(value: Partial<DesktopRuntimeContext> | null | undefin
     apiPort,
     productName: value?.productName?.trim() || (role === "tv" ? "MonClub TV" : "MonClub Access"),
     trayEnabled: value?.trayEnabled ?? (role === "access"),
+    apiToken: value?.apiToken?.trim() || "",
   };
 }
 
@@ -50,6 +54,11 @@ export async function loadDesktopRuntimeContext(): Promise<DesktopRuntimeContext
   }
 
   configureApiPort(currentContext.apiPort);
+
+  // B-001: Bootstrap local API token from Tauri runtime context.
+  if (currentContext.apiToken) {
+    setAuthToken(currentContext.apiToken);
+  }
 
   if (typeof document !== "undefined") {
     document.title = currentContext.productName;

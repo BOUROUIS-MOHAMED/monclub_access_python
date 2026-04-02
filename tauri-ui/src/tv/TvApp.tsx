@@ -10,10 +10,12 @@ import { TvOrchestrator } from "@/tv/components/TvOrchestrator";
 import { TvAuthProvider } from "@/tv/context/TvAuthContext";
 import { TV_NAV_ITEMS, type TvDashboardNavItem, type TvOverviewSectionId } from "@/tv/navigation";
 import TvDownloadsPage from "@/tv/pages/TvDownloadsPage";
+import TvLocalDbPage from "@/tv/pages/TvLocalDbPage";
 import TvLogsPage from "@/tv/pages/TvLogsPage";
 import TvOverviewPage from "@/tv/pages/TvOverviewPage";
 import TvPlayerWindowPage from "@/tv/pages/TvPlayerWindowPage";
 import TvSendMessagePage from "@/tv/pages/TvSendMessagePage";
+import TvScreensPage from "@/tv/pages/TvScreensPage";
 import TvProfilePage from "@/tv/pages/TvProfilePage";
 import TvSettingsPage from "@/tv/pages/TvSettingsPage";
 import TvUpdatePage from "@/tv/pages/TvUpdatePage";
@@ -38,6 +40,12 @@ function renderTvRoute(item: TvDashboardNavItem) {
   }
   if (item.view === "downloads") {
     return <TvDownloadsPage />;
+  }
+  if (item.view === "database") {
+    return <TvLocalDbPage />;
+  }
+  if (item.view === "screens") {
+    return <TvScreensPage />;
   }
   return <TvOverviewRoute focusSection={item.focusSection ?? "overview"} />;
 }
@@ -98,6 +106,7 @@ export default function TvApp() {
                 {/* Settings and Profile are not in the nav list but still need routes */}
                 <Route path="/tv-settings" element={<TvSettingsPage />} />
                 <Route path="/tv-profile" element={<TvProfilePage />} />
+                <Route path="/tv-screens/:screenId" element={<TvScreensPage />} />
                 <Route path="/" element={<Navigate to="/tv-overview" replace />} />
                 <Route path="*" element={<Navigate to="/tv-overview" replace />} />
               </Route>

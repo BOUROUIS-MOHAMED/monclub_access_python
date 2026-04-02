@@ -43,6 +43,8 @@ export default function PopupWindow() {
   const [showData, setShowData] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastLocalEventIdRef = useRef<string>("");
+  // Deduplication across all delivery channels (SSE + Tauri IPC + localStorage)
+  const lastShownEventIdRef = useRef<string>("");
 
   const resolveImage = useCallback((evt: PopupEvent) => {
     if (!evt.popupShowImage) {
@@ -62,6 +64,11 @@ export default function PopupWindow() {
   }, []);
 
   const showNotification = useCallback((evt: PopupEvent) => {
+    // Deduplicate: skip if this exact event was already shown (can arrive via
+    // multiple channels: direct SSE, Tauri IPC, and localStorage fallback).
+    if (evt.eventId && evt.eventId === lastShownEventIdRef.current) return;
+    lastShownEventIdRef.current = evt.eventId || "";
+
     setNotification(evt);
     setShowData(true);
     resolveImage(evt);
@@ -75,6 +82,9 @@ export default function PopupWindow() {
     );
   }, [resolveImage]);
 
+  // Channel 1 — Direct SSE from the backend.
+  // The popup window connects independently so it receives events without
+  // needing the main window to relay them.
   useEffect(() => {
     const es = openSSE("/agent/events", (type, data) => {
       if (type !== "popup" && type !== "notification") return;
@@ -94,6 +104,35 @@ export default function PopupWindow() {
     };
   }, [showNotification]);
 
+  // Channel 2 — Tauri cross-window IPC (primary relay from main window).
+  // In Tauri, each WebviewWindow is a separate WebView2 process with
+  // isolated localStorage — so we use Tauri's emit/listen instead.
+  // The main window emits "popup-notification" via usePopupStream whenever
+  // it receives an event from the backend SSE.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<any>("popup-notification", (event) => {
+          try {
+            const parsed = toPopupEvent(event.payload);
+            showNotification(parsed);
+          } catch {
+            // ignore malformed payload
+          }
+        })
+      )
+      .then((fn) => { unlisten = fn; })
+      .catch(() => { /* not running inside Tauri — no-op */ });
+
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [showNotification]);
+
+  // Channel 3 — localStorage polling (browser / same-context fallback).
+  // Works when the app is opened as a regular browser tab (not Tauri).
   useEffect(() => {
     const readLocalPopup = () => {
       try {
