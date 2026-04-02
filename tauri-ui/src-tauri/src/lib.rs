@@ -5,7 +5,7 @@ use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 
 // ─── Types for devices/presets from Python API ───
@@ -256,6 +256,17 @@ fn set_keep_background_on_close(state: tauri::State<'_, KeepBackgroundOnClose>, 
 fn destroy_access_panel_window(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(ACCESS_PANEL_LABEL) {
         window.destroy().map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn focus_and_show_enrollment(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        win.emit("enroll-focus-requested", serde_json::Value::Null).map_err(|e: tauri::Error| e.to_string())?;
     }
     Ok(())
 }
@@ -694,7 +705,8 @@ pub fn run() {
             refresh_tray_menu,
             refresh_tv_tray_menu,
             set_keep_background_on_close,
-            destroy_access_panel_window
+            destroy_access_panel_window,
+            focus_and_show_enrollment
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
