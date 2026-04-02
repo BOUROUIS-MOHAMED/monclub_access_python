@@ -2950,12 +2950,17 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
 
     # send initial status
     ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+
+    # ?replayLast=N — send the last N popup events immediately on connect.
+    # The popup display screen uses replayLast=1 so it shows the last entry
+    # even if it happened before the window was opened.
+    replay_last = max(0, min(ctx.q_int("replayLast", "replay_last", default=0), 20))
+
     last_popup_seq = 0
     if eng:
         try:
-            # New subscribers should only receive future popup events, but they must
-            # not compete with other subscribers for the same queue items.
-            last_popup_seq = eng.get_latest_popup_event_seq()
+            latest = eng.get_latest_popup_event_seq()
+            last_popup_seq = max(0, latest - replay_last)
         except Exception:
             last_popup_seq = 0
 
@@ -3049,17 +3054,26 @@ def _handle_ultra_status(ctx: _Ctx) -> None:
 _enroll_logs: List[str] = []
 _enroll_step: str = ""
 _enroll_result: Optional[str] = None  # "success" | "failed" | "cancelled" | None
+_enroll_start_meta: Optional[Dict[str, Any]] = None  # set when enroll starts
 _enroll_lock = threading.Lock()
 _enroll_event = threading.Event()  # signaled on each update
 
 
 def _enroll_reset() -> None:
-    global _enroll_logs, _enroll_step, _enroll_result
+    global _enroll_logs, _enroll_step, _enroll_result, _enroll_start_meta
     with _enroll_lock:
         _enroll_logs = []
         _enroll_step = ""
         _enroll_result = None
+        _enroll_start_meta = None
         _enroll_event.clear()
+
+
+def _enroll_set_start_meta(meta: Dict[str, Any]) -> None:
+    global _enroll_start_meta
+    with _enroll_lock:
+        _enroll_start_meta = meta
+        _enroll_event.set()
 
 
 def _enroll_set_step(s: str) -> None:
@@ -3099,6 +3113,7 @@ def _handle_enroll_start(ctx: _Ctx) -> None:
 
     # Reset FIRST (no race)
     _enroll_reset()
+    _enroll_set_start_meta({"userId": user_id, "fingerId": finger_id, "fullName": full_name})
     _enroll_add_log("Enroll requestedâ€¦")
 
     # Your current implementation only supports backend enroll
@@ -3152,14 +3167,22 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
     last_log_idx = 0
     last_step = ""
     sent_result = False
+    sent_start_meta: Optional[Dict[str, Any]] = None
     last_ping = time.time()
 
     def send_snapshot() -> bool:
-        nonlocal last_log_idx, last_step, sent_result
+        nonlocal last_log_idx, last_step, sent_result, sent_start_meta
         with _enroll_lock:
             step = _enroll_step
             logs = list(_enroll_logs)
             result = _enroll_result
+            start_meta = _enroll_start_meta
+
+        # send enroll_started if available
+        if start_meta and start_meta != sent_start_meta:
+            if not ctx.send_sse_event("enroll_started", start_meta):
+                return False
+            sent_start_meta = start_meta
 
         # send all existing logs
         for i in range(0, len(logs)):
@@ -3193,12 +3216,20 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
                 step = _enroll_step
                 logs = list(_enroll_logs)
                 result = _enroll_result
+                start_meta = _enroll_start_meta
 
             # detect reset (new enroll)
             if len(logs) < last_log_idx:
                 last_log_idx = 0
             if result is None:
                 sent_result = False
+            if start_meta is None:
+                sent_start_meta = None
+
+            if start_meta and start_meta != sent_start_meta:
+                if not ctx.send_sse_event("enroll_started", start_meta):
+                    return
+                sent_start_meta = start_meta
 
             for i in range(last_log_idx, len(logs)):
                 if not ctx.send_sse_event("log", {"line": logs[i]}):
