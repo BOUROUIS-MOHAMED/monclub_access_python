@@ -68,6 +68,7 @@ from access.runtime import (
 from app.core.ultra_engine import UltraEngine
 from access.api import LocalAccessApiServerV2
 from shared.api.monclub_api import MonClubApi, MonClubApiHttpError
+from app.core.change_detector import ChangeDetectorService
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
@@ -339,6 +340,7 @@ class MainApp:
         self._sched_id_counter = 0
 
         self._tauri_process: Optional[Any] = None
+        self._change_detector: Optional[ChangeDetectorService] = None
 
         self._offline_queue_lock = threading.Lock()
         self._offline_retry_interval_sec = 3600
@@ -395,6 +397,11 @@ class MainApp:
 
     def destroy(self) -> None:
         self._stop_event.set()
+        if self._change_detector is not None:
+            try:
+                self._change_detector.stop()
+            except Exception:
+                pass
         # Shutdown ULTRA engine (with lock to prevent race with sync_tick)
         try:
             with self._ultra_lock:
@@ -595,6 +602,7 @@ class MainApp:
     # ======================= Navigation state (headless) =======================
     def show_app(self):
         self._active_view = "app"
+        self._start_change_detector()
 
     def show_login(self):
         try:
@@ -605,6 +613,12 @@ class MainApp:
             self._update_manager.stop()
         except Exception:
             pass
+        if self._change_detector is not None:
+            try:
+                self._change_detector.stop()
+            except Exception:
+                pass
+            self._change_detector = None
         self._active_view = "login"
 
     def show_restricted(self):
@@ -616,6 +630,30 @@ class MainApp:
         except Exception:
             pass
         self._active_view = "restricted"
+
+    def _start_change_detector(self) -> None:
+        """Lazily create and start ChangeDetectorService once logged in."""
+        if self._change_detector is not None and self._change_detector._thread and self._change_detector._thread.is_alive():
+            return
+        try:
+            from app.core.db import load_sync_access_software_settings
+            from app.core.app_const import MONCLUB_BASE_URL
+            settings = load_sync_access_software_settings()
+            gym_id = settings.get("gymId") if settings else None
+            if not gym_id:
+                self.logger.debug("[ChangeDetector] No gymId in settings, skipping start")
+                return
+            self._change_detector = ChangeDetectorService(
+                app=self,
+                backend_base_url=MONCLUB_BASE_URL,
+                get_token_fn=lambda: (load_auth_token().token if load_auth_token() else ""),
+                re_login_fn=lambda: None,
+                gym_id=int(gym_id),
+                logger=self.logger,
+            )
+            self._change_detector.start()
+        except Exception as exc:
+            self.logger.warning("[ChangeDetector] Failed to start: %s", exc)
 
     def force_login(self):
         clear_auth_token()
