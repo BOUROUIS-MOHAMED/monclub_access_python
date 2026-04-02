@@ -2,6 +2,8 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppProvider, useApp } from "./context/AppContext";
+import { EnrollmentProvider } from "./context/EnrollmentContext";
+import { useEnrollmentListener } from "./hooks/useEnrollmentListener";
 import { Loader2 } from "lucide-react";
 import MainLayout from "./layouts/MainLayout";
 import LoginPage from "./pages/LoginPage";
@@ -23,6 +25,7 @@ function AppRoutes() {
   const { status, loading, error } = useApp();
   const loggedIn = status?.session?.loggedIn ?? false;
   const restricted = status?.session?.restricted ?? false;
+  useEnrollmentListener();
 
   if (loading && !status) {
     return (
@@ -80,7 +83,7 @@ export default function App() {
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
             <Route path="/tray-panel" element={<AppProvider><TrayPanelPage /></AppProvider>} />
-            <Route path="*" element={<AppProvider><AppRoutes /></AppProvider>} />
+            <Route path="*" element={<AppProvider><EnrollmentProvider><AppRoutes /></EnrollmentProvider></AppProvider>} />
           </Routes>
         </BrowserRouter>
       </TooltipProvider>

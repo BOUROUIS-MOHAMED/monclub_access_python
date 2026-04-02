@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useEnroll, useUsers } from "@/api/hooks";
 import { ApiError, openSSE } from "@/api/client";
+import { useEnrollment } from "@/context/EnrollmentContext";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -27,6 +28,7 @@ export default function EnrollPage() {
   const enroll = useEnroll();
   const { data: userData } = useUsers();
   const users: any[] = userData?.users ?? [];
+  const { enrollMeta, clearMeta } = useEnrollment();
 
   // Backend is the only implemented mode right now.
   const [enrollType, setEnrollType] = useState<"LOCAL" | "BACKEND">("BACKEND");
@@ -35,6 +37,14 @@ export default function EnrollPage() {
   const [pin, setPin] = useState("");
   const [cardNo, setCardNo] = useState("");
   const [fingerId, setFingerId] = useState("0");
+
+  // Pre-fill from remote trigger
+  useEffect(() => {
+    if (enrollMeta) {
+      if (enrollMeta.userId) setSelectedUserId(enrollMeta.userId);
+      if (enrollMeta.fingerId !== undefined) setFingerId(String(enrollMeta.fingerId));
+    }
+  }, [enrollMeta]);
 
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -260,6 +270,29 @@ export default function EnrollPage() {
         <Fingerprint className="h-5 w-5 text-primary" />
         <h1 className="text-lg font-semibold">Enrolement d&apos;empreinte</h1>
       </div>
+
+      {enrollMeta && (
+        <div className="relative rounded-xl overflow-hidden border border-primary/30 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-4">
+          <div className="flex items-center gap-3">
+            <div className="flex-shrink-0 w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
+              <Fingerprint className="h-5 w-5 text-primary animate-pulse" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-semibold text-foreground">Enrolement demarre depuis le tableau de bord</p>
+              <p className="text-xs text-muted-foreground truncate">
+                {enrollMeta.fullName ? `Membre : ${enrollMeta.fullName}` : `ID : ${enrollMeta.userId}`}
+                {enrollMeta.fingerId !== undefined ? ` · Doigt #${enrollMeta.fingerId}` : ""}
+              </p>
+            </div>
+            <button
+              className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1 rounded"
+              onClick={clearMeta}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>

@@ -82,7 +82,7 @@ export function openSSE(
   if (_token) url += `${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(_token)}`;
   const es = new EventSource(url);
   es.onmessage = (e) => { try { onEvent("message", JSON.parse(e.data)); } catch { onEvent("message", e.data); } };
-  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping"]) {
+  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping","enroll_started"]) {
     es.addEventListener(t, ((e: MessageEvent) => {
       try { onEvent(t, JSON.parse(e.data)); } catch { onEvent(t, e.data); }
     }) as EventListener);
