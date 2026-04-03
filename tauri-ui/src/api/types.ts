@@ -905,6 +905,8 @@ export interface PopupEvent {
   winNotifyEnabled?: boolean;
   /** Timestamp when the event was received client-side */
   receivedAt?: number;
+  /** ISO date string (YYYY-MM-DD) of the member's birthday, if available */
+  userBirthday?: string;
 }
 
 // ─── N) Host Monitor & Binding (A9) ───

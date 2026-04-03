@@ -818,6 +818,7 @@ class ZKFinger:
         timeout_per_sample_s: float = 20.0,
         poll_sleep_s: float = 0.10,
         progress_cb: Optional[Callable[[str], None]] = None,
+        phase_cb: Optional[Callable[[dict], None]] = None,
         cancel_event: Optional[Any] = None,
     ) -> bytes:
         """
@@ -844,6 +845,13 @@ class ZKFinger:
                 except Exception:
                     pass
 
+        def phase_report(data: dict) -> None:
+            if phase_cb:
+                try:
+                    phase_cb(data)
+                except Exception:
+                    pass
+
         def is_cancelled() -> bool:
             try:
                 return bool(cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set())
@@ -853,6 +861,7 @@ class ZKFinger:
         templates: List[bytes] = []
 
         for i in range(3):
+            phase_report({"phase": "wait_finger", "sampleNum": i + 1})
             report(f"Enroll: waiting for sample {i+1}/3 ... (img_buf={len(img_buf)} tpl_buf={len(tpl_buf)})")
             start = time.time()
 
@@ -871,11 +880,13 @@ class ZKFinger:
                     if require_same_finger and templates:
                         score = self.db_match(templates[-1], tpl)
                         if score < match_threshold:
+                            phase_report({"phase": "sample_rejected", "sampleNum": i + 1, "score": score})
                             report(f"Enroll: sample {i+1}/3 rejected (different finger?) score={score}. Try same finger.")
                             time.sleep(0.6)
                             continue
 
                     templates.append(tpl)
+                    phase_report({"phase": "sample_captured", "sampleNum": i + 1})
                     report(f"Enroll: sample {i+1}/3 captured ✅ (tpl={len(tpl)} bytes)")
                     time.sleep(0.35)
                     break
@@ -885,6 +896,7 @@ class ZKFinger:
         if is_cancelled():
             raise ZKFingerError("Cancelled.")
 
+        phase_report({"phase": "processing"})
         report("Enroll: merging 3 samples ...")
         reg = self.db_merge(templates[0], templates[1], templates[2])
         report(f"Enroll: merged ✅ (reg={len(reg)} bytes)")

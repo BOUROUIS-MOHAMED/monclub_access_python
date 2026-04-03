@@ -9,6 +9,7 @@ from app.api.local_access_api_v2 import (
     LocalAccessApiServerV2,
     _enroll_add_log,
     _enroll_reset,
+    _enroll_set_phase,
     _enroll_set_result,
     _enroll_set_step,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "LocalAccessApiServerV2",
     "_enroll_add_log",
     "_enroll_reset",
+    "_enroll_set_phase",
     "_enroll_set_result",
     "_enroll_set_step",
     "get_access_local_api_route_specs",

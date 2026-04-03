@@ -398,6 +398,7 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "popupDurationSec": req.popup_duration_sec,
         "popupEnabled": req.popup_enabled,
         "winNotifyEnabled": req.win_notify_enabled,
+        "userBirthday": req.user_birthday,
     }
 
 
@@ -1131,6 +1132,7 @@ class DecisionService(threading.Thread):
                 user_valid_from=_safe_str((user or {}).get("validFrom", (user or {}).get("valid_from")), "") if isinstance(user, dict) else "",
                 user_valid_to=_safe_str((user or {}).get("validTo", (user or {}).get("valid_to")), "") if isinstance(user, dict) else "",
                 user_membership_id=_safe_int(am_id, 0) if am_id else None,
+                user_birthday=_safe_str((user or {}).get("birthday"), "") if isinstance(user, dict) else "",
                 user_phone=user_phone,
                 device_id=int(ev.device_id),
                 device_name=self.device_name_provider(int(ev.device_id)),

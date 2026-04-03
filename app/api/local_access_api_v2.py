@@ -3055,18 +3055,40 @@ _enroll_logs: List[str] = []
 _enroll_step: str = ""
 _enroll_result: Optional[str] = None  # "success" | "failed" | "cancelled" | None
 _enroll_start_meta: Optional[Dict[str, Any]] = None  # set when enroll starts
+_enroll_phase: Optional[Dict[str, Any]] = None  # structured phase for overlay UI
+_enroll_phase_seq: int = 0  # monotonic counter for SSE delta detection
+_enroll_last_tpl: Optional[Dict[str, Any]] = None  # stored after merge for retry-push
+_enroll_last_tpl_lock = threading.Lock()
 _enroll_lock = threading.Lock()
 _enroll_event = threading.Event()  # signaled on each update
 
 
 def _enroll_reset() -> None:
-    global _enroll_logs, _enroll_step, _enroll_result, _enroll_start_meta
+    global _enroll_logs, _enroll_step, _enroll_result, _enroll_start_meta, _enroll_phase, _enroll_phase_seq
     with _enroll_lock:
         _enroll_logs = []
         _enroll_step = ""
         _enroll_result = None
         _enroll_start_meta = None
+        _enroll_phase = None
+        _enroll_phase_seq = 0
         _enroll_event.clear()
+
+
+def _enroll_partial_reset_for_retry() -> None:
+    """Partial reset for retry-push: clears logs/step/result but NOT phase_seq.
+
+    A full _enroll_reset() sets phase_seq=0.  Connected SSE clients track
+    last_phase_seq locally; after a reset they would see phase_seq=1 which
+    fails the ``phase_seq > last_phase_seq`` guard (e.g. 1 > 7 is False) and
+    silently drop every subsequent phase event for that connection.
+    """
+    global _enroll_logs, _enroll_step, _enroll_result
+    with _enroll_lock:
+        _enroll_logs = []
+        _enroll_step = ""
+        _enroll_result = None
+        _enroll_event.set()
 
 
 def _enroll_set_start_meta(meta: Dict[str, Any]) -> None:
@@ -3097,6 +3119,15 @@ def _enroll_set_result(r: str) -> None:
         _enroll_event.set()
 
 
+def _enroll_set_phase(data: Dict[str, Any]) -> None:
+    """Set structured phase data for the overlay UI (sent via SSE 'phase' event)."""
+    global _enroll_phase, _enroll_phase_seq
+    with _enroll_lock:
+        _enroll_phase_seq += 1
+        _enroll_phase = {**data, "_seq": _enroll_phase_seq}
+        _enroll_event.set()
+
+
 def _handle_enroll_start(ctx: _Ctx) -> None:
     body = ctx.body()
 
@@ -3111,17 +3142,14 @@ def _handle_enroll_start(ctx: _Ctx) -> None:
     full_name = _safe_str(body.get("fullName"), "").strip()
     device = _safe_str(body.get("device"), "zk9500").strip()
 
-    # Reset FIRST (no race)
-    _enroll_reset()
-    _enroll_set_start_meta({"userId": user_id, "fingerId": finger_id, "fullName": full_name})
-    _enroll_add_log("Enroll requestedâ€¦")
-
     # Your current implementation only supports backend enroll
     if target != "backend":
-        _enroll_set_result("failed")
         ctx.send_json(400, {"ok": False, "error": "LOCAL enroll not implemented. Use type=BACKEND."})
         return
 
+    # begin_remote_enroll checks _enroll_running under its own lock.
+    # We must NOT touch shared enroll globals before this point -- a 409
+    # means another enrollment is still running and owns that state.
     result = ctx.app.begin_remote_enroll(
         user_id=user_id,
         finger_id=finger_id,
@@ -3130,13 +3158,14 @@ def _handle_enroll_start(ctx: _Ctx) -> None:
     )
 
     if result.get("ok"):
-        _enroll_add_log("Enroll started âœ…")
+        # Worker will call _enroll_reset() as its first action; set start_meta
+        # now so SSE clients get member info immediately after the 202.
+        _enroll_set_start_meta({"userId": user_id, "fingerId": finger_id, "fullName": full_name})
+        _enroll_add_log("Enroll requested…")
         ctx.send_json(202, result)
     else:
-        code = int(result.get("status") or 400)
-        _enroll_add_log("Enroll start failed âŒ")
-        _enroll_set_result("failed")
-        ctx.send_json(code, result)
+        # Do NOT write to shared state -- a running enrollment may own it.
+        ctx.send_json(int(result.get("status") or 400), result)
 
 
 def _handle_enroll_cancel(ctx: _Ctx) -> None:
@@ -3160,6 +3189,81 @@ def _handle_enroll_status(ctx: _Ctx) -> None:
         })
 
 
+_ENROLL_TPL_TTL_S = 600  # 10 minutes
+
+
+def _enroll_store_tpl(data: Dict[str, Any]) -> None:
+    global _enroll_last_tpl
+    with _enroll_last_tpl_lock:
+        _enroll_last_tpl = {**data, "timestamp": time.time()}
+
+
+def _enroll_clear_tpl() -> None:
+    global _enroll_last_tpl
+    with _enroll_last_tpl_lock:
+        _enroll_last_tpl = None
+
+
+def _handle_enroll_retry_push(ctx: _Ctx) -> None:
+    """Retry saving the last enrolled template to the backend (no re-scan needed)."""
+    with _enroll_last_tpl_lock:
+        tpl = _enroll_last_tpl
+
+    if not tpl:
+        ctx.send_json(404, {"ok": False, "error": "No template available for retry."})
+        return
+
+    age = time.time() - tpl.get("timestamp", 0)
+    if age > _ENROLL_TPL_TTL_S:
+        _enroll_clear_tpl()
+        ctx.send_json(410, {"ok": False, "error": f"Template expired ({int(age)}s > {_ENROLL_TPL_TTL_S}s). Enroll again."})
+        return
+
+    from app.core.config import load_auth_token
+    auth = load_auth_token()
+    if not auth or not auth.token:
+        ctx.send_json(401, {"ok": False, "error": "Not logged in."})
+        return
+
+    # Partial reset: clears logs/step/result but NOT phase_seq.
+    # A full _enroll_reset() sets phase_seq=0; connected SSE clients whose
+    # last_phase_seq > 0 would then never see the new push phase event
+    # (condition: phase_seq > last_phase_seq would be e.g. 1 > 7 = False).
+    _enroll_partial_reset_for_retry()
+    _enroll_set_phase({"phase": "push"})
+    _enroll_add_log("Retrying push to backend...")
+
+    # Dispatch to a daemon thread so the HTTP server thread is not blocked.
+    # The outbound API call has no timeout and could stall indefinitely on a
+    # slow or unreachable backend, which would starve the SSE connection.
+    _tpl_snapshot = dict(tpl)
+    _token_snapshot = auth.token
+    _app_ref = ctx.app
+
+    def _do_retry_push() -> None:
+        try:
+            payload = {
+                "activeMembershipId": int(_tpl_snapshot["active_membership_id"]),
+                "fingerId": int(_tpl_snapshot["finger_id"]),
+                "templateData": _tpl_snapshot["tpl_text"],
+                "templateVersion": int(_tpl_snapshot["tpl_ver"]),
+                "templateEncoding": _tpl_snapshot["enc_backend"],
+                "label": "dashboard",
+                "enabled": True,
+            }
+            api = _app_ref._api()
+            resp = api.create_user_fingerprint(token=_token_snapshot, payload=payload)
+            _enroll_add_log(f"Push OK: {resp}")
+            _enroll_set_result("success")
+            _enroll_clear_tpl()
+        except Exception as e:
+            _enroll_add_log(f"ERROR: Retry push failed: {e}")
+            _enroll_set_result("failed")
+
+    threading.Thread(target=_do_retry_push, daemon=True).start()
+    ctx.send_json(202, {"ok": True, "message": "Retry push started"})
+
+
 def _handle_enroll_events_sse(ctx: _Ctx) -> None:
     """SSE stream: enrollment progress. Sends initial snapshot immediately."""
     ctx.send_sse_start()
@@ -3168,15 +3272,18 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
     last_step = ""
     sent_result = False
     sent_start_meta: Optional[Dict[str, Any]] = None
+    last_phase_seq = 0
     last_ping = time.time()
 
     def send_snapshot() -> bool:
-        nonlocal last_log_idx, last_step, sent_result, sent_start_meta
+        nonlocal last_log_idx, last_step, sent_result, sent_start_meta, last_phase_seq
         with _enroll_lock:
             step = _enroll_step
             logs = list(_enroll_logs)
             result = _enroll_result
             start_meta = _enroll_start_meta
+            phase = _enroll_phase
+            phase_seq = _enroll_phase_seq
 
         # send enroll_started if available
         if start_meta and start_meta != sent_start_meta:
@@ -3195,6 +3302,13 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
             if not ctx.send_sse_event("step", {"step": step}):
                 return False
             last_step = step
+
+        # send current phase if available
+        if phase and phase_seq > last_phase_seq:
+            phase_data = {k: v for k, v in phase.items() if k != "_seq"}
+            if not ctx.send_sse_event("phase", phase_data):
+                return False
+            last_phase_seq = phase_seq
 
         # send current result once (but keep stream open)
         if result:
@@ -3217,6 +3331,8 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
                 logs = list(_enroll_logs)
                 result = _enroll_result
                 start_meta = _enroll_start_meta
+                phase = _enroll_phase
+                phase_seq = _enroll_phase_seq
 
             # detect reset (new enroll)
             if len(logs) < last_log_idx:
@@ -3225,6 +3341,8 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
                 sent_result = False
             if start_meta is None:
                 sent_start_meta = None
+            if phase is None:
+                last_phase_seq = 0
 
             if start_meta and start_meta != sent_start_meta:
                 if not ctx.send_sse_event("enroll_started", start_meta):
@@ -3240,6 +3358,12 @@ def _handle_enroll_events_sse(ctx: _Ctx) -> None:
                 if not ctx.send_sse_event("step", {"step": step}):
                     return
                 last_step = step
+
+            if phase and phase_seq > last_phase_seq:
+                phase_data = {k: v for k, v in phase.items() if k != "_seq"}
+                if not ctx.send_sse_event("phase", phase_data):
+                    return
+                last_phase_seq = phase_seq
 
             if result and not sent_result:
                 if not ctx.send_sse_event(result, {"result": result}):
@@ -4269,6 +4393,10 @@ class LocalApiServerV2:
                         "_handle_auth_login", "_handle_auth_status",
                         "_handle_tv_auth_login", "_handle_tv_auth_status",
                         "_handle_health", "_handle_v1_health",
+                        # Dashboard (browser) callers cannot obtain the session token.
+                        # sync/now is harmless (just triggers a data fetch).
+                        # enroll/start still requires physical ZK device interaction.
+                        "_handle_sync_now", "_handle_enroll_start", "_handle_enroll_retry_push",
                     }
                     fn_name = getattr(handler_fn, "__name__", "")
                     if fn_name not in _AUTH_EXEMPT:

@@ -1,5 +1,5 @@
 // React hooks — one per API endpoint group, using real /api/v2 paths
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { get, post, patch, del, openSSE, ApiError } from "./client";
 import type {
   StatusResponse, LoginRequest, LoginResponse, AppConfig,
@@ -127,13 +127,14 @@ export function useLogStream(maxLines = 2000) {
 
 // ── Enroll actions ──
 export function useEnroll() {
-  return {
+  return useMemo(() => ({
     start: (params: Record<string, any>) => post("/enroll/start", params),
     cancel: () => post("/enroll/cancel"),
     status: () => get<any>("/enroll/status"),
+    retryPush: () => post("/enroll/retry-push"),
     listFingerprints: async () => { const r = await get<{ fingerprints: any[] }>("/fingerprints"); return r.fingerprints || []; },
     deleteFingerprint: (id: number) => del(`/fingerprints/${id}`),
-  };
+  }), []);
 }
 
 // ── PullSDK actions ──

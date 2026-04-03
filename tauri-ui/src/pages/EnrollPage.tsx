@@ -13,7 +13,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import LogViewer from "@/components/LogViewer2";
-import { Fingerprint, Play, Square, Trash2, Loader2 } from "lucide-react";
+import { Fingerprint, Play, Square, Trash2, Loader2, Volume2, VolumeX } from "lucide-react";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,6 +23,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import EnrollOverlay, { type EnrollPhase } from "@/components/EnrollOverlay";
+import { useEnrollSounds } from "@/hooks/useEnrollSounds";
+import { usePhaseTimeout } from "@/hooks/usePhaseTimeout";
 
 export default function EnrollPage() {
   const enroll = useEnroll();
@@ -49,6 +52,60 @@ export default function EnrollPage() {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+
+  // Overlay state
+  const [overlayOpen, setOverlayOpen] = useState(false);
+  const [phase, setPhaseRaw] = useState<EnrollPhase>("idle");
+  const [scanProgress, setScanProgress] = useState(0);
+  const scanProgressRef = useRef(0);
+
+  // Debounce: hold "lift_finger" for at least 1.5 s so the user actually sees it.
+  // Without this, the ZK SDK sends "captured" then 350 ms later "waiting for sample"
+  // which makes "LEVEZ LE DOIGT" flash invisibly.
+  const phaseRef = useRef<EnrollPhase>("idle");
+  const holdUntilRef = useRef(0);
+  const deferredTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const LIFT_HOLD_MS = 1500;
+
+  const setPhase = useCallback((next: EnrollPhase) => {
+    const now = Date.now();
+
+    // If we're still holding lift_finger and incoming is wait_finger, defer it
+    if (
+      phaseRef.current === "lift_finger" &&
+      next === "wait_finger" &&
+      now < holdUntilRef.current
+    ) {
+      // Schedule the transition for after the hold expires
+      if (deferredTimerRef.current) clearTimeout(deferredTimerRef.current);
+      deferredTimerRef.current = setTimeout(() => {
+        phaseRef.current = next;
+        setPhaseRaw(next);
+        deferredTimerRef.current = null;
+      }, holdUntilRef.current - now);
+      return;
+    }
+
+    // Clear any pending deferred transition (e.g. if success/failed arrives)
+    if (deferredTimerRef.current) {
+      clearTimeout(deferredTimerRef.current);
+      deferredTimerRef.current = null;
+    }
+
+    // If entering lift_finger, set the hold deadline
+    if (next === "lift_finger") {
+      holdUntilRef.current = now + LIFT_HOLD_MS;
+    }
+
+    phaseRef.current = next;
+    setPhaseRaw(next);
+  }, []);
+
+  // Sound + timeout
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem("enroll.soundEnabled") !== "false");
+  const { playSound } = useEnrollSounds(soundEnabled);
+  const timedOut = usePhaseTimeout(phase);
+  const [retryAvailable, setRetryAvailable] = useState(false);
 
   const [fingerprints, setFingerprints] = useState<any[]>([]);
   const [fpLoading, setFpLoading] = useState(false);
@@ -131,12 +188,53 @@ export default function EnrollPage() {
     void loadFingerprints();
   }, [loadFingerprints]);
 
+  // Parse a step/log string → EnrollPhase
+  const stepToPhase = useCallback((s: string): EnrollPhase | null => {
+    const l = s.toLowerCase();
+    if (!l) return null;
+    if (l.includes("waiting for sample"))                                    return "wait_finger";
+    if (l.includes("captured"))                                              return "lift_finger";
+    if (l.includes("rejected"))                                              return "sample_rejected";
+    if (l.includes("merging") || l.includes("merged") || l.includes("encoding")) return "processing";
+    if (l.includes("saving to backend"))                                     return "push";
+    if (l.includes("initializing scanner") || l.includes("opening device")) return "device_init";
+    if (l.includes("enrollment..."))                                         return "wait_finger";
+    if (l.includes("checking") || l.includes("resolving") || l.includes("sync")) return "connecting";
+    return null;
+  }, []);
+
   useEffect(() => {
     const FINAL = new Set(["success", "failed", "cancelled", "error"]);
 
     try {
       const es = openSSE("/enroll/events", (type, data) => {
+        // Note: on SSE reconnect, server replays full snapshot automatically
         try {
+          // Structured phase events (authoritative, from enriched Python backend)
+          if (type === "phase" && data?.phase) {
+            const phaseMap: Record<string, EnrollPhase> = {
+              connecting: "connecting",
+              device_init: "device_init",
+              wait_finger: "wait_finger",
+              sample_captured: "lift_finger",
+              sample_rejected: "sample_rejected",
+              processing: "processing",
+              push: "push",
+            };
+            const mapped = phaseMap[data.phase as string];
+            if (mapped) {
+              if ((mapped === "lift_finger" || mapped === "sample_rejected") && typeof data.sampleNum === "number") {
+                scanProgressRef.current = data.sampleNum;
+                setScanProgress(data.sampleNum);
+              }
+              // Sound triggers
+              if (data.phase === "sample_captured") playSound("sample_captured");
+              if (data.phase === "sample_rejected") playSound("sample_rejected");
+              setPhase(mapped);
+            }
+            return;
+          }
+
           if (type === "log") {
             const line =
               typeof data === "string"
@@ -149,6 +247,18 @@ export default function EnrollPage() {
 
             if (/^ERROR:/i.test(line)) {
               lastEnrollErrorRef.current = line.replace(/^ERROR:\s*/i, "").trim();
+            }
+
+            // Track captured samples from log lines
+            const capMatch = line.match(/sample\s+(\d+)\/3\s+captured/i);
+            if (capMatch) {
+              const n = parseInt(capMatch[1], 10);
+              scanProgressRef.current = n;
+              setScanProgress(n);
+              setPhase("lift_finger");
+            } else {
+              const derived = stepToPhase(line);
+              if (derived && derived !== "lift_finger") setPhase(derived);
             }
 
             setLogs((prev) => {
@@ -166,6 +276,19 @@ export default function EnrollPage() {
                 : data?.step != null
                   ? String(data.step)
                   : safeStringify(data, 300);
+
+            // Update phase from step string (step is authoritative current state)
+            const capMatch = step.match(/sample\s+(\d+)\/3\s+captured/i);
+            if (capMatch) {
+              const n = parseInt(capMatch[1], 10);
+              scanProgressRef.current = n;
+              setScanProgress(n);
+              setPhase("lift_finger");
+            } else {
+              const derived = stepToPhase(step);
+              if (derived) setPhase(derived);
+            }
+
             setLogs((prev) => [...prev, step]);
             return;
           }
@@ -176,6 +299,24 @@ export default function EnrollPage() {
             setRunning(false);
             startReqRef.current = false;
             void loadFingerprints();
+
+            // Drive overlay to terminal state
+            if (r === "success") {
+              setPhase("success");
+              setRetryAvailable(false);
+              playSound("success");
+              // overlay auto-dismisses after 3 s via its own timer
+            } else if (r === "cancelled") {
+              setPhase("cancelled");
+              setOverlayOpen(false);
+              setRetryAvailable(false);
+            } else {
+              // Check if failure happened during push phase — retry available
+              setRetryAvailable(phaseRef.current === "push");
+              setPhase("failed");
+              playSound("failed");
+              // overlay stays open so user sees the error
+            }
 
             if (r !== "success" && r !== "cancelled") {
               showError(lastEnrollErrorRef.current || "Enrolement echoue. Verifiez les logs.");
@@ -201,7 +342,7 @@ export default function EnrollPage() {
       showError(err);
       return () => {};
     }
-  }, [loadFingerprints, showError]);
+  }, [loadFingerprints, showError, stepToPhase]);
 
   const handleStart = async () => {
     if (running || startReqRef.current) return;
@@ -213,25 +354,30 @@ export default function EnrollPage() {
 
     startReqRef.current = true;
     lastEnrollErrorRef.current = "";
+    scanProgressRef.current = 0;
 
     setRunning(true);
     setResult(null);
     setLogs(["Demarrage..."]);
+    setScanProgress(0);
+    setPhase("connecting");
+    setOverlayOpen(true);
 
     try {
-      const selectedUser = users.find((u) => String(u.userId) === selectedUserId);
-
+      const u = users.find((x) => String(x.userId) === selectedUserId);
       await enroll.start({
         type: "BACKEND",
         target: "backend",
-        userId: selectedUser ? selectedUser.userId : undefined,
-        fullName: selectedUser ? selectedUser.fullName : undefined,
+        userId: u ? u.userId : undefined,
+        fullName: u ? u.fullName : undefined,
         fingerId: parseInt(fingerId, 10) || 0,
       });
     } catch (e) {
       setResult("error");
       setRunning(false);
       startReqRef.current = false;
+      lastEnrollErrorRef.current = errToMessage(e);
+      setPhase("failed");   // overlay shows error + "Fermer" button
       showError(e);
     }
   };
@@ -245,7 +391,49 @@ export default function EnrollPage() {
     setRunning(false);
     setResult("cancelled");
     startReqRef.current = false;
+    setOverlayOpen(false);
+    setPhase("idle");
   };
+
+  const handleOverlayDismiss = useCallback(() => {
+    setOverlayOpen(false);
+    setPhase("idle");
+    setRetryAvailable(false);
+  }, [setPhase]);
+
+  const handleRetryPush = useCallback(async () => {
+    setPhase("push");
+    setRetryAvailable(false);
+    try {
+      await enroll.retryPush();
+      // SSE will deliver the success/failed event
+    } catch (e) {
+      setPhase("failed");
+      showError(e);
+    }
+  }, [enroll, setPhase, showError]);
+
+  const toggleSound = useCallback(() => {
+    setSoundEnabled((prev) => {
+      const next = !prev;
+      localStorage.setItem("enroll.soundEnabled", String(next));
+      return next;
+    });
+  }, []);
+
+  // Cancel enrollment if user navigates away from this page while it's running.
+  // Also clean up the deferred lift_finger timer.
+  const runningRef = useRef(false);
+  runningRef.current = running;
+  useEffect(() => {
+    return () => {
+      if (deferredTimerRef.current) clearTimeout(deferredTimerRef.current);
+      if (runningRef.current) {
+        // Fire-and-forget cancel — the Python worker will stop scanning
+        enroll.cancel().catch(() => {});
+      }
+    };
+  }, [enroll]);
 
   const removeFp = async (id: number) => {
     try {
@@ -264,11 +452,32 @@ export default function EnrollPage() {
       )
     : users.slice(0, 50);
 
+  const selectedUser = users.find((u) => String(u.userId) === selectedUserId);
+
   return (
+    <>
+    <EnrollOverlay
+      open={overlayOpen}
+      phase={phase}
+      scanProgress={scanProgress}
+      fullName={selectedUser?.fullName ?? enrollMeta?.fullName}
+      fingerId={parseInt(fingerId, 10)}
+      errorMsg={lastEnrollErrorRef.current || undefined}
+      timedOut={timedOut}
+      retryAvailable={retryAvailable}
+      onCancel={handleCancel}
+      onDismiss={handleOverlayDismiss}
+      onRetryPush={handleRetryPush}
+    />
     <div className="space-y-6">
       <div className="flex items-center gap-3">
         <Fingerprint className="h-5 w-5 text-primary" />
         <h1 className="text-lg font-semibold">Enrolement d&apos;empreinte</h1>
+        <div className="ml-auto">
+          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={toggleSound} title={soundEnabled ? "Son active" : "Son desactive"}>
+            {soundEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4 text-muted-foreground" />}
+          </Button>
+        </div>
       </div>
 
       {enrollMeta && (
@@ -474,6 +683,7 @@ export default function EnrollPage() {
         </AlertDialogContent>
       </AlertDialog>
     </div>
+    </>
   );
 }
 

@@ -76,18 +76,35 @@ export async function del<T>(path: string): Promise<T> {
 export function openSSE(
   path: string,
   onEvent: (type: string, data: any) => void,
-  onError?: (e: Event) => void,
+  optionsOrOnError?: ((e: Event) => void) | { onError?: (e: Event) => void; onReconnect?: () => void },
 ): EventSource {
+  // Backward compat: third arg can be a plain onError callback or an options object
+  const opts = typeof optionsOrOnError === "function"
+    ? { onError: optionsOrOnError }
+    : optionsOrOnError;
   let url = `${_baseUrl}${PFX}${path}`;
+  // SECURITY NOTE (CRITICAL-4): EventSource cannot send custom headers, so the
+  // auth token must be passed as a query-string parameter here. This makes it
+  // visible in server access logs and browser DevTools network history.
+  // Mitigation: the server listens only on 127.0.0.1 (loopback), limiting
+  // exposure to local processes. A proper fix requires a one-time SSE ticket:
+  //   POST /api/v2/sse-ticket (authenticated) → { ticket, expiresIn: 30 }
+  // The SSE handler would accept ?ticket= (single-use, 30s TTL) instead of
+  // ?token=. TODO: implement when a loopback log-forwarding risk is confirmed.
   if (_token) url += `${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(_token)}`;
   const es = new EventSource(url);
+  let wasOpen = false;
+  es.onopen = () => {
+    if (wasOpen && opts?.onReconnect) opts.onReconnect();
+    wasOpen = true;
+  };
   es.onmessage = (e) => { try { onEvent("message", JSON.parse(e.data)); } catch { onEvent("message", e.data); } };
-  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping","enroll_started"]) {
+  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping","enroll_started","phase"]) {
     es.addEventListener(t, ((e: MessageEvent) => {
       try { onEvent(t, JSON.parse(e.data)); } catch { onEvent(t, e.data); }
     }) as EventListener);
   }
-  if (onError) es.onerror = onError;
+  if (opts?.onError) es.onerror = opts.onError;
   return es;
 }
 

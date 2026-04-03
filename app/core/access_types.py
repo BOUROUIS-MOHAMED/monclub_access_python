@@ -36,6 +36,7 @@ class NotificationRequest:
     allowed: bool = False
     reason: str = ""
     scan_mode: str = ""
+    user_birthday: str = ""
     popup_duration_sec: int = 3
     popup_enabled: bool = True
     win_notify_enabled: bool = True

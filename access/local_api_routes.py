@@ -65,6 +65,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/enroll/cancel", "_handle_enroll_cancel"),
     ("GET", "/api/v2/enroll/status", "_handle_enroll_status"),
     ("GET", "/api/v2/enroll/events", "_handle_enroll_events_sse"),
+    ("POST", "/api/v2/enroll/retry-push", "_handle_enroll_retry_push"),
     ("GET", "/api/v2/fingerprints", "_handle_fingerprints_list"),
     ("DELETE", "/api/v2/fingerprints/{id}", "_handle_fingerprints_delete"),
     ("GET", "/api/v2/logs/recent", "_handle_logs_recent"),
