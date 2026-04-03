@@ -98,6 +98,10 @@ prune_access_history = _legacy_access_db.prune_access_history
 save_auth_token = _legacy_access_db.save_auth_token
 save_device_attendance_state = _legacy_access_db.save_device_attendance_state
 save_sync_cache = _legacy_access_db.save_sync_cache
+save_sync_cache_delta = _legacy_access_db.save_sync_cache_delta
+save_version_tokens = _legacy_access_db.save_version_tokens
+load_version_tokens = _legacy_access_db.load_version_tokens
+clear_version_tokens = _legacy_access_db.clear_version_tokens
 set_offline_creation_try_to_create = _legacy_access_db.set_offline_creation_try_to_create
 update_offline_creation_payload = _legacy_access_db.update_offline_creation_payload
 
@@ -151,6 +155,10 @@ __all__ = [
     "save_auth_token",
     "save_device_attendance_state",
     "save_sync_cache",
+    "save_sync_cache_delta",
+    "save_version_tokens",
+    "load_version_tokens",
+    "clear_version_tokens",
     "set_offline_creation_try_to_create",
     "update_offline_creation_payload",
 ]
