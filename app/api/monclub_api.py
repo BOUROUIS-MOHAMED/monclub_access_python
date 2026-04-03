@@ -134,13 +134,15 @@ class MonClubApi:
 
         return token
 
-    def get_sync_data(self, *, token: str, timeout: int = 20) -> Dict[str, Any]:
+    def get_sync_data(self, *, token: str, version_tokens: dict | None = None, timeout: int = 20) -> Dict[str, Any]:
         url = (self.endpoints.sync_url or "").strip()
         if not url:
             raise MonClubApiError("Sync URL is empty (check Configuration).")
 
         # IMPORTANT: backend expects numeric timestamp-like value
         params = {"lastCheckTimeStamp": _now_epoch_ms()}
+        if version_tokens:
+            params.update(version_tokens)
 
         headers = {
             "Authorization": f"Bearer {token}",
