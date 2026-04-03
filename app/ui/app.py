@@ -998,12 +998,18 @@ class MainApp:
 
                 save_sync_cache_delta(data, refresh)
 
-                # Save new version tokens ONLY after successful cache write
+                # Save new version tokens ONLY after successful cache write.
+                # Keys must match the Java @RequestParam names exactly so they
+                # are recognised on the next request (membersVersion, not currentMembersVersion).
                 new_tokens = {
-                    k: data[k]
-                    for k in ("currentMembersVersion", "currentDevicesVersion",
-                              "currentCredentialsVersion", "currentSettingsVersion")
-                    if data.get(k)
+                    param: data[field]
+                    for param, field in (
+                        ("membersVersion",     "currentMembersVersion"),
+                        ("devicesVersion",     "currentDevicesVersion"),
+                        ("credentialsVersion", "currentCredentialsVersion"),
+                        ("settingsVersion",    "currentSettingsVersion"),
+                    )
+                    if data.get(field)
                 }
                 if new_tokens:
                     save_version_tokens(new_tokens)
