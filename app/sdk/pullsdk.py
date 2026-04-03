@@ -593,6 +593,10 @@ class PullSDKDevice:
         return self.connect()
 
     def connect(self) -> bool:
+        self.logger.info(
+            "[PullSDKDevice][%s] connect attempt: name=%r ip=%s port=%s timeout_ms=%s",
+            self.device_id, self.name, self.ip, self.port, self.timeout_ms,
+        )
         try:
             self.disconnect()
 
@@ -608,17 +612,29 @@ class PullSDKDevice:
                 platform=str(self.platform or "") if (self.platform or "").strip() else None,
             )
             self._connected = True
+            self.logger.info(
+                "[PullSDKDevice][%s] connected OK: name=%r ip=%s port=%s",
+                self.device_id, self.name, self.ip, self.port,
+            )
             return True
         except Exception as e:
             self._connected = False
             self._sdk = None
             try:
-                self.logger.debug(f"[PullSDKDevice][{self.device_id}] connect failed: {e}")
+                self.logger.warning(
+                    "[PullSDKDevice][%s] connect FAILED: name=%r ip=%s port=%s error=%s",
+                    self.device_id, self.name, self.ip, self.port, e,
+                )
             except Exception:
                 pass
             return False
 
     def disconnect(self) -> None:
+        if self._connected or self._sdk:
+            self.logger.debug(
+                "[PullSDKDevice][%s] disconnect: name=%r was_connected=%s",
+                self.device_id, self.name, self._connected,
+            )
         try:
             if self._sdk:
                 self._sdk.disconnect()
@@ -631,16 +647,31 @@ class PullSDKDevice:
         # F-007: serialize concurrent SDK calls with per-device lock
         with self._sdk_lock:
             _ = timeout_ms  # Pull SDK door pulse is synchronous; kept for API symmetry
+            self.logger.info(
+                "[PullSDKDevice][%s] open_door: name=%r door_id=%s pulse_ms=%s",
+                self.device_id, self.name, door_id, pulse_time_ms,
+            )
             if not self.ensure_connected():
+                self.logger.warning(
+                    "[PullSDKDevice][%s] open_door FAILED: not connected (name=%r door_id=%s)",
+                    self.device_id, self.name, door_id,
+                )
                 return False
             try:
                 assert self._sdk is not None
                 seconds = int(max(1, min(60, math.ceil(int(pulse_time_ms) / 1000.0))))
                 self._sdk.door_pulse_open(door=int(door_id), seconds=int(seconds))
+                self.logger.info(
+                    "[PullSDKDevice][%s] open_door OK: name=%r door_id=%s seconds=%s",
+                    self.device_id, self.name, door_id, seconds,
+                )
                 return True
             except Exception as e:
                 try:
-                    self.logger.debug(f"[PullSDKDevice][{self.device_id}] open_door failed: {e}")
+                    self.logger.warning(
+                        "[PullSDKDevice][%s] open_door FAILED: name=%r door_id=%s error=%s",
+                        self.device_id, self.name, door_id, e,
+                    )
                 except Exception:
                     pass
                 return False

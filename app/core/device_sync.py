@@ -633,13 +633,19 @@ class DeviceSyncEngine:
         try:
             import time as _time
             t_connect = _time.time()
+            self.logger.info(
+                "[DeviceSync] Device id=%s name=%r connecting: ip=%s port=%s", dev_id, dev_name, ip, port
+            )
             sdk.connect(
                 ip=ip,
                 port=int(port),
                 timeout_ms=int(getattr(self.cfg, "timeout_ms", 5000) or 5000),
                 password=str(pwd),
             )
-            self.logger.debug(f"[DeviceSync] Device id={dev_id} connect_ms={(_time.time()-t_connect)*1000:.0f}")
+            connect_ms = (_time.time() - t_connect) * 1000
+            self.logger.info(
+                "[DeviceSync] Device id=%s name=%r connected OK: connect_ms=%.0f", dev_id, dev_name, connect_ms
+            )
 
             rows = sdk.get_device_data_rows(
                 table="user",
@@ -698,6 +704,11 @@ class DeviceSyncEngine:
                 card = _pin_str(u.get("firstCardId") or "")
                 templates = templates_for_sync.get(pin) or []
 
+                self.logger.debug(
+                    "[DeviceSync] Device id=%s syncing Pin=%s name=%r card=%r templates=%d",
+                    dev_id, pin, full_name, card, len(templates),
+                )
+
                 try:
                     # Delete user row + auth + templates before re-inserting.
                     # SetDeviceData is insert-only on most firmware; leaving the user row
@@ -721,9 +732,9 @@ class DeviceSyncEngine:
                             authorize_timezone_id=int(authorize_timezone_id),
                         )
                         if auth_err:
-                            self.logger.debug(f"[DeviceSync] Pin={pin} authorize warn: {auth_err}")
+                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize warn: {auth_err}")
                     except Exception as ex:
-                        self.logger.debug(f"[DeviceSync] Pin={pin} authorize warn: {ex}")
+                        self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize warn: {ex}")
 
                     # 3) templates
                     if templates:
@@ -733,8 +744,12 @@ class DeviceSyncEngine:
                             warn_templates_users += 1
                             # M-006: Log all errors (not just first 3) and include count
                             self.logger.warning(
-                                f"[DeviceSync] Pin={pin} template errors ({len(errs)} total): "
+                                f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)} total): "
                                 f"{errs[:5]}{'...' if len(errs) > 5 else ''}"
+                            )
+                        else:
+                            self.logger.debug(
+                                f"[DeviceSync] Device id={dev_id} Pin={pin} templates pushed OK: count={ok_count}"
                             )
 
                     # persist applied hash only on success
@@ -746,6 +761,9 @@ class DeviceSyncEngine:
                         error=None,
                     )
                     ok_synced += 1
+                    self.logger.debug(
+                        "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin
+                    )
 
                 except Exception as ex:
                     failed_synced += 1
@@ -756,7 +774,10 @@ class DeviceSyncEngine:
                         ok=False,
                         error=str(ex),
                     )
-                    self.logger.warning(f"[DeviceSync] Pin={pin} sync failed: {ex}")
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s",
+                        dev_id, pin, ex,
+                    )
 
             pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
 
@@ -798,22 +819,40 @@ class DeviceSyncEngine:
             return
 
         default_door_id = self._default_authorize_door_id()
+        self.logger.info(
+            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d default_door_id=%s",
+            len(devices), len(users), len(local_fp_index), default_door_id,
+        )
 
         device_mode_devices: List[Dict[str, Any]] = []
         for d in devices:
+            dev_id = d.get("id")
+            dev_name = d.get("name", "")
             if not _boolish(d.get("active"), default=True):
+                self.logger.info(
+                    "[DeviceSync] Skip device id=%s name=%r: active=False", dev_id, dev_name
+                )
                 continue
             if not _boolish(d.get("accessDevice"), default=True):
+                self.logger.info(
+                    "[DeviceSync] Skip device id=%s name=%r: accessDevice=False", dev_id, dev_name
+                )
                 continue
 
             # Only sync DEVICE-mode devices; AGENT-mode devices are handled by AgentRealtimeEngine
-            if str(d.get("accessDataMode", "DEVICE")).strip().upper() != "DEVICE":
-                self.logger.debug(
-                    f"[DeviceSync] Skip device id={d.get('id')} name={d.get('name')!r}: accessDataMode={d.get('accessDataMode')}"
+            adm = str(d.get("accessDataMode", "DEVICE")).strip().upper()
+            if adm != "DEVICE":
+                self.logger.info(
+                    "[DeviceSync] Skip device id=%s name=%r: accessDataMode=%r (not DEVICE)",
+                    dev_id, dev_name, adm,
                 )
                 continue
 
             device_mode_devices.append(d)
+
+        self.logger.info(
+            "[DeviceSync] device_mode_devices to sync: %d", len(device_mode_devices)
+        )
 
         # F-008: Run device syncs in parallel (max_workers=4, safe bounded parallelism)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -830,9 +869,19 @@ class DeviceSyncEngine:
             for future in concurrent.futures.as_completed(futures):
                 dev = futures[future]
                 dev_id = dev.get("id")
+                dev_name = dev.get("name", "")
                 try:
                     future.result()
+                    self.logger.info(
+                        "[DeviceSync] device id=%s name=%r sync future completed OK", dev_id, dev_name
+                    )
                 except PullSDKError as ex:
-                    self.logger.warning(f"[DeviceSync] device={dev_id} sync failed (PullSDK): {ex}")
+                    self.logger.warning(
+                        "[DeviceSync] device id=%s name=%r sync FAILED (PullSDK): %s",
+                        dev_id, dev_name, ex,
+                    )
                 except Exception as e:
-                    self.logger.error(f"[DeviceSync] device={dev_id} sync failed: {e}")
+                    self.logger.error(
+                        "[DeviceSync] device id=%s name=%r sync FAILED (unexpected): %s",
+                        dev_id, dev_name, e,
+                    )

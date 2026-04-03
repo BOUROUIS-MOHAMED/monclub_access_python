@@ -990,7 +990,27 @@ class MainApp:
                 # First sync (no tokens) transfers full payload — allow more time.
                 # Delta syncs (tokens present) are small and fast — keep tight timeout.
                 sync_timeout = 60 if version_tokens else 60
+
+                self.logger.info(
+                    "[SYNC-DEBUG] >>> Sending sync request. version_tokens=%s",
+                    version_tokens,
+                )
+
                 data = api.get_sync_data(token=auth.token, version_tokens=version_tokens, timeout=sync_timeout)
+
+                # --- DEBUG: log key response fields ---
+                _users_raw = data.get("users")
+                _users_count = len(_users_raw) if isinstance(_users_raw, list) else f"NOT-A-LIST({type(_users_raw).__name__})"
+                self.logger.info(
+                    "[SYNC-DEBUG] <<< Response: refreshMembers=%r  users_count=%s  "
+                    "refreshDevices=%r  devices_count=%s  "
+                    "currentMembersVersion=%r  currentDevicesVersion=%r  "
+                    "response_keys=%s",
+                    data.get("refreshMembers"), _users_count,
+                    data.get("refreshDevices"), len(data.get("devices") or []),
+                    data.get("currentMembersVersion"), data.get("currentDevicesVersion"),
+                    list(data.keys())[:20],
+                )
 
                 refresh = {
                     "members":     data.get("refreshMembers", True),
@@ -1018,8 +1038,9 @@ class MainApp:
                     save_version_tokens(new_tokens)
 
                 self.logger.info(
-                    "getSyncData OK (delta): members=%s devices=%s creds=%s settings=%s",
+                    "getSyncData OK (delta): members=%s devices=%s creds=%s settings=%s  new_tokens=%s",
                     refresh["members"], refresh["devices"], refresh["credentials"], refresh["settings"],
+                    new_tokens,
                 )
                 sync_online = True
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

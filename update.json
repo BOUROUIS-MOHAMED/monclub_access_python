@@ -1,10 +1,10 @@
 {
   "access": {
-    "version": "1.0.4",
+    "version": "1.0.5",
     "codename": "Panda"
   },
   "tv": {
-    "version": "1.0.4",
+    "version": "1.0.5",
     "codename": "Panda"
   }
 }

@@ -1783,8 +1783,13 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
         # Conditional: members (users + fingerprints)
         if refresh.get("members", True):
             users = data.get("users") or []
+            old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+            _logger.info(
+                "[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=True, "
+                "incoming_users=%d, old_db_count=%d",
+                len(users), old_count,
+            )
             if not users:
-                old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
                 if old_count > 10:
                     _logger.error(
                         f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
@@ -1792,6 +1797,12 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                     )
                     conn.commit()
                     return
+                else:
+                    _logger.warning(
+                        "[SYNC-DEBUG] H-006 NOT triggered (old_count=%d <= 10). "
+                        "Will DELETE all sync_users with 0 replacements!",
+                        old_count,
+                    )
             cur.execute("DELETE FROM sync_users")
             for u in users:
                 if not isinstance(u, dict):
@@ -1823,6 +1834,14 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         u.get("qrCodePayload"), u.get("birthday"),
                     ),
                 )
+
+            new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+            _logger.info(
+                "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
+                new_count,
+            )
+        else:
+            _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 
         # Conditional: devices
         if refresh.get("devices", True):

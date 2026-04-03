@@ -101,13 +101,20 @@ class ChangeDetectorService:
 
         url = f"{self._backend_base_url}{_MEMBERS_VERSION_PATH}"
         token = self._get_token()
+        if not token:
+            self._logger.warning("[ChangeDetector] No auth token available — skipping poll")
+            return
         headers = {"Authorization": f"Bearer {token}"}
+
+        self._logger.debug("[ChangeDetector] polling: url=%s gymId=%s", url, self._gym_id)
 
         try:
             resp = _requests.get(url, headers=headers, timeout=10)
         except _requests.RequestException as exc:
             self._logger.warning("[ChangeDetector] Network error: %s", exc)
             return
+
+        self._logger.debug("[ChangeDetector] response: status=%s", resp.status_code)
 
         if resp.status_code == 401:
             self._logger.info("[ChangeDetector] 401 — attempting re-login")
@@ -119,6 +126,7 @@ class ChangeDetectorService:
                 )
                 self.stop()
                 return
+            self._logger.info("[ChangeDetector] re-login OK, retrying poll")
             try:
                 resp = _requests.get(
                     url,
@@ -133,8 +141,8 @@ class ChangeDetectorService:
 
         if resp.status_code != 200:
             self._logger.warning(
-                "[ChangeDetector] Unexpected status %s from members-version",
-                resp.status_code,
+                "[ChangeDetector] Unexpected status %s from members-version (url=%s)",
+                resp.status_code, url,
             )
             return
 
@@ -146,6 +154,7 @@ class ChangeDetectorService:
             return
 
         if not version:
+            self._logger.warning("[ChangeDetector] response has no lastModifiedAt field: %s", data)
             return
 
         # Parse as datetime for correct comparison (avoids fragile string comparison
@@ -161,11 +170,14 @@ class ChangeDetectorService:
         if self._last_known_version is None:
             # First successful poll — set baseline, no sync
             self._last_known_version = parsed_version
-            self._logger.info("[ChangeDetector] Baseline set: %s", version)
+            self._logger.info("[ChangeDetector] Baseline set: lastModifiedAt=%s", version)
             return
 
         if parsed_version > self._last_known_version:
-            self._logger.info("[ChangeDetector] Change detected, triggering sync")
+            self._logger.info(
+                "[ChangeDetector] Change detected! old=%s new=%s — triggering sync",
+                self._last_known_version.isoformat(), version,
+            )
             self._last_known_version = parsed_version
             try:
                 self._app.after(0, self._app.request_sync_now)
@@ -173,3 +185,8 @@ class ChangeDetectorService:
                 self._logger.warning(
                     "[ChangeDetector] Failed to schedule sync: %s", exc
                 )
+        else:
+            self._logger.debug(
+                "[ChangeDetector] no change: lastModifiedAt=%s (known=%s)",
+                version, self._last_known_version.isoformat(),
+            )

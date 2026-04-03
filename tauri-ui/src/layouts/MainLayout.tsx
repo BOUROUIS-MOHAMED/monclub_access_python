@@ -30,13 +30,11 @@ import {
   Settings,
   Database,
   LogOut,
-  Menu,
   ChevronLeft,
+  Menu,
   AlertTriangle,
   ShieldCheck,
   User,
-  Download,
-  ArrowRight,
 } from "lucide-react";
 import { SidebarUpdateCard } from "@/components/SidebarUpdateCard";
 
@@ -44,10 +42,17 @@ const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/devices", label: "Appareils", icon: Router },
   { to: "/users", label: "Utilisateurs", icon: Users },
-  { to: "/enroll", label: "Enrolement", icon: Fingerprint },
+  { to: "/enroll", label: "Enrôlement", icon: Fingerprint },
   { to: "/agent", label: "Agent", icon: Bot },
   { to: "/logs", label: "Logs", icon: FileText },
   { to: "/local-db", label: "Base locale", icon: Database },
+] as const;
+
+const ALL_ROUTES = [
+  ...NAV,
+  { to: "/profile", label: "Profil" },
+  { to: "/config", label: "Configuration" },
+  { to: "/update", label: "Mise à jour" },
 ] as const;
 
 export default function MainLayout() {
@@ -67,10 +72,30 @@ export default function MainLayout() {
   const hasLoginWarning = s?.loginWarning && (s?.loginDaysRemaining ?? 99) > 0;
   const hasContractWarning = s?.contractWarning && (s?.contractDaysRemaining ?? 99) > 0;
 
+  const pageTitle =
+    ALL_ROUTES.find(({ to }) =>
+      to === "/" ? location.pathname === "/" : location.pathname.startsWith(to)
+    )?.label ?? "MonClub Access";
+
   const handleLogout = async () => {
     setLogoutConfirm(false);
     await logout();
   };
+
+  const bottomIcons = [
+    {
+      icon: User,
+      label: "Profil",
+      action: () => navigate("/profile"),
+      active: location.pathname.startsWith("/profile"),
+    },
+    {
+      icon: Settings,
+      label: "Configuration",
+      action: () => navigate("/config"),
+      active: location.pathname.startsWith("/config"),
+    },
+  ];
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -89,16 +114,16 @@ export default function MainLayout() {
           )}
         >
           {sidebarOpen && (
-            <div className="flex items-center gap-2 min-w-0">
-              <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/15 text-primary">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
                 <ShieldCheck className="h-4 w-4" />
               </div>
-              <div className="min-w-0">
-                <div className="truncate text-[13px] font-semibold text-foreground tracking-wide">
-                  MonClub Access
+              <div className="min-w-0 leading-none">
+                <div className="truncate text-[13px] font-bold text-foreground tracking-tight">
+                  MonClub
                 </div>
-                <div className="truncate text-[11px] text-muted-foreground">
-                  Contrôle d'accès
+                <div className="truncate text-[10px] font-semibold text-primary tracking-[0.15em] uppercase">
+                  Access
                 </div>
               </div>
             </div>
@@ -119,25 +144,34 @@ export default function MainLayout() {
             {NAV.map(({ to, label, icon: Icon }) => {
               const isActive = to === "/" ? location.pathname === "/" : location.pathname.startsWith(to);
               return (
-                <NavLink
-                  key={to}
-                  to={to}
-                  className={cn(
-                    "group flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors duration-100",
-                    isActive
-                      ? "bg-primary/12 text-primary"
-                      : "text-muted-foreground hover:bg-muted hover:text-foreground",
-                    !sidebarOpen && "justify-center px-0 py-2",
+                <Tooltip key={to} delayDuration={0}>
+                  <TooltipTrigger asChild>
+                    <NavLink
+                      to={to}
+                      className={cn(
+                        "relative group flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors duration-100",
+                        isActive
+                          ? "bg-primary/10 text-primary"
+                          : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                        !sidebarOpen && "justify-center px-0 py-2",
+                      )}
+                    >
+                      {isActive && (
+                        <span className="absolute left-0 top-1 bottom-1 w-[2px] rounded-r-full bg-primary" />
+                      )}
+                      <Icon
+                        className={cn(
+                          "h-4 w-4 shrink-0 transition-colors",
+                          isActive ? "text-primary" : "text-muted-foreground group-hover:text-foreground",
+                        )}
+                      />
+                      {sidebarOpen && <span className="truncate">{label}</span>}
+                    </NavLink>
+                  </TooltipTrigger>
+                  {!sidebarOpen && (
+                    <TooltipContent side="right">{label}</TooltipContent>
                   )}
-                >
-                  <Icon
-                    className={cn(
-                      "h-4 w-4 shrink-0",
-                      isActive ? "text-primary" : "text-muted-foreground group-hover:text-foreground",
-                    )}
-                  />
-                  {sidebarOpen && <span className="truncate">{label}</span>}
-                </NavLink>
+                </Tooltip>
               );
             })}
           </nav>
@@ -170,140 +204,65 @@ export default function MainLayout() {
           </div>
         )}
 
-        {/* Bottom icon bar: Profile, Settings, Theme, Logout */}
-        <div className="border-t border-border px-2 py-2 shrink-0">
-          {sidebarOpen ? (
-            <div className="flex items-center justify-between gap-1">
-              <Tooltip>
+        {/* Bottom icon bar */}
+        <div className={cn("border-t border-border px-2 py-2 shrink-0", sidebarOpen ? "" : "")}>
+          <div className={cn("flex gap-1", sidebarOpen ? "items-center justify-between" : "flex-col items-center")}>
+            {bottomIcons.map(({ icon: Icon, label, action, active }) => (
+              <Tooltip key={label} delayDuration={0}>
                 <TooltipTrigger asChild>
                   <Button
                     variant="ghost"
                     size="icon"
                     className={cn(
                       "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
-                      location.pathname.startsWith("/profile") && "bg-primary/10 text-primary",
+                      active && "bg-primary/10 text-primary hover:text-primary",
                     )}
-                    onClick={() => navigate("/profile")}
+                    onClick={action}
                   >
-                    <User className="h-4 w-4" />
+                    <Icon className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="top">Profil</TooltipContent>
+                <TooltipContent side={sidebarOpen ? "top" : "right"}>{label}</TooltipContent>
               </Tooltip>
+            ))}
 
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
-                      location.pathname.startsWith("/config") && "bg-primary/10 text-primary",
-                    )}
-                    onClick={() => navigate("/config")}
-                  >
-                    <Settings className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">Configuration</TooltipContent>
-              </Tooltip>
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild>
+                <span>
+                  <ThemeToggle />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side={sidebarOpen ? "top" : "right"}>Thème</TooltipContent>
+            </Tooltip>
 
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span>
-                    <ThemeToggle />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="top">Thème</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                    onClick={() => setLogoutConfirm(true)}
-                  >
-                    <LogOut className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="top">Déconnexion</TooltipContent>
-              </Tooltip>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center gap-1">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
-                      location.pathname.startsWith("/profile") && "bg-primary/10 text-primary",
-                    )}
-                    onClick={() => navigate("/profile")}
-                  >
-                    <User className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="right">Profil</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted",
-                      location.pathname.startsWith("/config") && "bg-primary/10 text-primary",
-                    )}
-                    onClick={() => navigate("/config")}
-                  >
-                    <Settings className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="right">Configuration</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span>
-                    <ThemeToggle />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="right">Thème</TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                    onClick={() => setLogoutConfirm(true)}
-                  >
-                    <LogOut className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="right">Déconnexion</TooltipContent>
-              </Tooltip>
-            </div>
-          )}
+            <Tooltip delayDuration={0}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                  onClick={() => setLogoutConfirm(true)}
+                >
+                  <LogOut className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side={sidebarOpen ? "top" : "right"}>Déconnexion</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
       </aside>
 
       {/* Main content */}
       <div className="flex flex-col flex-1 min-w-0">
         {/* Top bar */}
-        <header className="flex items-center justify-between h-14 border-b border-border px-5 bg-background shrink-0">
-          <div className="flex items-center gap-2">
+        <header className="flex items-center justify-between h-12 border-b border-border px-5 bg-background shrink-0">
+          <div className="flex items-center gap-3">
+            <h1 className="text-[13px] font-semibold text-foreground">{pageTitle}</h1>
             {status?.sync?.running && (
-              <Badge className="border-primary/25 bg-primary/10 text-primary text-[11px] gap-1">
+              <span className="inline-flex items-center gap-1.5 text-[11px] text-primary">
                 <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
                 Synchronisation…
-              </Badge>
+              </span>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -337,12 +296,12 @@ export default function MainLayout() {
       <Dialog open={logoutConfirm} onOpenChange={setLogoutConfirm}>
         <DialogContent className="max-w-sm">
           <DialogHeader>
-            <DialogTitle>Se deconnecter ?</DialogTitle>
-            <DialogDescription>Vous devrez vous reconnecter pour acceder a l'application.</DialogDescription>
+            <DialogTitle>Se déconnecter ?</DialogTitle>
+            <DialogDescription>Vous devrez vous reconnecter pour accéder à l'application.</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={() => setLogoutConfirm(false)}>Annuler</Button>
-            <Button variant="destructive" onClick={handleLogout}>Deconnexion</Button>
+            <Button variant="destructive" onClick={handleLogout}>Déconnexion</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -352,7 +311,7 @@ export default function MainLayout() {
         <DialogContent className="max-w-sm">
           <DialogHeader>
             <DialogTitle>Quitter MonClub Access ?</DialogTitle>
-            <DialogDescription>L'application et tous les services seront arretes.</DialogDescription>
+            <DialogDescription>L'application et tous les services seront arrêtés.</DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <Button variant="outline" onClick={cancelQuit}>Annuler</Button>

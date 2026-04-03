@@ -702,8 +702,12 @@ class DeviceWorker(threading.Thread):
                 ok = False
                 try:
                     ok = self._device.ensure_connected()
-                except Exception:
+                except Exception as _conn_exc:
                     ok = False
+                    self.logger.warning(
+                        "[RT][device=%s] ensure_connected raised: %s",
+                        self.device_id, _conn_exc,
+                    )
 
                 if not ok:
                     reconnect_attempt += 1
@@ -712,11 +716,19 @@ class DeviceWorker(threading.Thread):
                     self._emit_status(enabled=True, connected=False, last_error=last_error)
 
                     backoff = min(_RECONNECT_BACKOFF_MAX_SEC, _RECONNECT_BACKOFF_BASE_SEC * (2 ** reconnect_attempt))
+                    self.logger.warning(
+                        "[RT][device=%s] connect FAILED (attempt=%d, reconnects=%d) — backoff=%.2fs",
+                        self.device_id, reconnect_attempt, self._reconnects, backoff,
+                    )
                     time.sleep(backoff)
                     continue
 
                 reconnect_attempt = 0
                 last_error = ""
+                self.logger.info(
+                    "[RT][device=%s] connected OK (name=%r, reconnects_total=%d)",
+                    self.device_id, self.device_name, self._reconnects,
+                )
                 self._emit_status(enabled=True, connected=True, last_error="")
 
             poll_t0 = _now_ms()
@@ -835,6 +847,11 @@ class DeviceWorker(threading.Thread):
                             poll_ms=float(poll_ms),
                         )
 
+                        self.logger.debug(
+                            "[RT][device=%s] dispatching event: id=%s card=%r type=%s time=%s",
+                            self.device_id, event_id,
+                            ev.card_no, ev.event_type, ev.event_time,
+                        )
                         try:
                             self.event_queue.put(ev, timeout=0.05)
                         except queue.Full:
@@ -1014,6 +1031,13 @@ class DecisionService(threading.Thread):
             decision_ms = _now_ms() - t0
             self.decision_ema.add(decision_ms)
 
+            self.logger.info(
+                "[RT][device=%s] DECISION: card=%r allowed=%s reason=%s scan_mode=%s "
+                "door_id=%s decision_ms=%.1f event_id=%s",
+                ev.device_id, ev.card_no, allowed, reason, scan_mode,
+                door_id, decision_ms, ev.event_id,
+            )
+
             # F-013: INSERT OR IGNORE into access_history BEFORE opening door.
             # rowcount==1 means this worker claimed the event; rowcount==0 means another worker already inserted it.
             # This prevents TOCTOU double door-open: the INSERT is atomic on the UNIQUE(event_id) constraint.
@@ -1050,14 +1074,32 @@ class DecisionService(threading.Thread):
                 # F-013: only open door if we claimed the event (rowcount>0); skip if another worker already processed it
                 if _history_claimed > 0 or not bool(settings.get("save_history", True)):
                     cmd_timeout_ms = _safe_int(settings.get("cmd_timeout_ms"), 4000)
+                    self.logger.info(
+                        "[RT][device=%s] OPEN_DOOR: door_id=%s pulse_ms=%s event_id=%s",
+                        ev.device_id, door_id, pulse_time_ms, ev.event_id,
+                    )
                     cmd_res = self.command_bus.open_door(
                         device_id=ev.device_id,
                         door_id=int(door_id),
                         pulse_time_ms=int(pulse_time_ms),
                         timeout_ms=int(cmd_timeout_ms),
                     )
+                    if cmd_res.ok:
+                        self.logger.info(
+                            "[RT][device=%s] OPEN_DOOR OK: door_id=%s cmd_ms=%.1f event_id=%s",
+                            ev.device_id, door_id, cmd_res.cmd_ms, ev.event_id,
+                        )
+                    else:
+                        self.logger.error(
+                            "[RT][device=%s] OPEN_DOOR FAILED: door_id=%s error=%r cmd_ms=%.1f event_id=%s",
+                            ev.device_id, door_id, cmd_res.error, cmd_res.cmd_ms, ev.event_id,
+                        )
                 else:
                     # Already processed by another worker — skip notification too
+                    self.logger.debug(
+                        "[RT][device=%s] OPEN_DOOR skipped (duplicate event_id=%s history_claimed=%s)",
+                        ev.device_id, ev.event_id, _history_claimed,
+                    )
                     continue
 
             # Per-device notifications (backend controlled)
@@ -1148,15 +1190,33 @@ class DecisionService(threading.Thread):
             if bool(settings.get("win_notify_enabled", True)):
                 try:
                     self.notify_q.put(req, timeout=0.05)
-                except Exception:
-                    pass
+                    self.logger.debug(
+                        "[RT][device=%s] win_notify enqueued: allowed=%s user=%r event_id=%s",
+                        ev.device_id, req.allowed, req.user_full_name, req.event_id,
+                    )
+                except queue.Full:
+                    self.logger.warning(
+                        "[RT][device=%s] win_notify queue FULL — dropping event_id=%s",
+                        ev.device_id, ev.event_id,
+                    )
+                except Exception as _nq_ex:
+                    self.logger.warning("[RT][device=%s] win_notify enqueue error: %s", ev.device_id, _nq_ex)
 
             # Popup (Tkinter) (per-device popupEnabled)
             if bool(settings.get("popup_enabled", True)):
                 try:
                     self.popup_q.put(req, timeout=0.05)
-                except Exception:
-                    pass
+                    self.logger.debug(
+                        "[RT][device=%s] popup enqueued: allowed=%s user=%r event_id=%s",
+                        ev.device_id, req.allowed, req.user_full_name, req.event_id,
+                    )
+                except queue.Full:
+                    self.logger.warning(
+                        "[RT][device=%s] popup queue FULL — dropping event_id=%s",
+                        ev.device_id, ev.event_id,
+                    )
+                except Exception as _pq_ex:
+                    self.logger.warning("[RT][device=%s] popup enqueue error: %s", ev.device_id, _pq_ex)
 
 
 # ===================== Notification service (Windows) =====================
@@ -1684,21 +1744,30 @@ class AgentRealtimeEngine:
                 continue
             devices_by_id[int(did)] = dev
 
+        self.logger.info("[RT] refresh_devices: total devices in cache=%d", len(devices_by_id))
+
         desired_agent_ids: set[int] = set()
         for did, dev in devices_by_id.items():
+            dev_name = dev.get("name", f"device-{did}")
             # support both keys (but payload from list_sync_devices_payload is camelCase)
             if not _boolish(dev.get("active", True), True):
+                self.logger.info("[RT] device id=%s name=%r skipped: active=False", did, dev_name)
                 continue
 
             access_device_val = dev.get("accessDevice", dev.get("access_device", True))
             if not _boolish(access_device_val, True):
+                self.logger.info("[RT] device id=%s name=%r skipped: accessDevice=False", did, dev_name)
                 continue
 
             mode = _normalize_access_data_mode(dev.get("accessDataMode") or dev.get("access_data_mode"))
             if mode != "AGENT":
+                self.logger.info(
+                    "[RT] device id=%s name=%r skipped: accessDataMode=%r (not AGENT)", did, dev_name, mode
+                )
                 continue
 
             desired_agent_ids.add(int(did))
+            self.logger.info("[RT] device id=%s name=%r: will run AGENT worker", did, dev_name)
 
         with self._lock:
             existing_ids = set(self._workers.keys())
@@ -1709,6 +1778,10 @@ class AgentRealtimeEngine:
             w = self._get_worker(did)
             if not w:
                 dev = devices_by_id.get(did) or {"id": did, "name": f"device-{did}"}
+                self.logger.info(
+                    "[RT] starting NEW DeviceWorker for device id=%s name=%r",
+                    did, dev.get("name", f"device-{did}"),
+                )
                 w = DeviceWorker(
                     device_payload=dev,
                     logger=self.logger,
@@ -1720,8 +1793,11 @@ class AgentRealtimeEngine:
                     self._workers[did] = w
                 try:
                     w.start()
-                except Exception:
-                    pass
+                    self.logger.info("[RT] DeviceWorker thread started for device id=%s", did)
+                except Exception as _start_exc:
+                    self.logger.error(
+                        "[RT] DeviceWorker thread start FAILED for device id=%s: %s", did, _start_exc
+                    )
             else:
                 w.wake_event.set()
 
@@ -1730,6 +1806,9 @@ class AgentRealtimeEngine:
         for did in sorted(to_remove):
             w = self._get_worker(did)
             if w:
+                self.logger.info(
+                    "[RT] stopping DeviceWorker for device id=%s (removed or mode changed)", did
+                )
                 try:
                     w.stop()
                 except Exception:

@@ -13,6 +13,7 @@ SSE endpoints:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -24,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+
+_logger = logging.getLogger(__name__)
 
 _SQLITE_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -2945,7 +2948,16 @@ def _handle_agent_device_disable(ctx: _Ctx) -> None:
 
 def _handle_agent_events_sse(ctx: _Ctx) -> None:
     """SSE stream: agent events (access decisions, device status, popups)."""
+    client_addr = getattr(ctx.handler, "client_address", ("?", "?"))
+    _logger.info(
+        "[SSE/agent_events] client connected: %s:%s", client_addr[0], client_addr[1]
+    )
     eng = getattr(ctx.app, "_agent_engine", None)
+    _logger.debug(
+        "[SSE/agent_events] agent_engine=%s running=%s",
+        type(eng).__name__ if eng else None,
+        bool(eng and eng.is_running()),
+    )
     ctx.send_sse_start()
 
     # send initial status
@@ -2995,8 +3007,19 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
             except Exception:
                 popup_events = []
             for popup_seq, payload in popup_events:
+                _logger.debug(
+                    "[SSE/agent_events] sending AGENT popup seq=%s allowed=%s user=%r client=%s:%s",
+                    popup_seq,
+                    payload.get("allowed"),
+                    payload.get("userFullName"),
+                    client_addr[0], client_addr[1],
+                )
                 alive = ctx.send_sse_event("popup", payload)
                 if not alive:
+                    _logger.info(
+                        "[SSE/agent_events] client disconnected (broken pipe) at popup seq=%s: %s:%s",
+                        popup_seq, client_addr[0], client_addr[1],
+                    )
                     return
                 last_popup_seq = popup_seq
 
@@ -3011,15 +3034,33 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                         except queue.Empty:
                             break
                         payload = _popup_payload_from_request(req)
+                        _logger.debug(
+                            "[SSE/agent_events] sending ULTRA popup allowed=%s user=%r client=%s:%s",
+                            payload.get("allowed"),
+                            payload.get("userFullName"),
+                            client_addr[0], client_addr[1],
+                        )
                         alive = ctx.send_sse_event("popup", payload)
                         if not alive:
+                            _logger.info(
+                                "[SSE/agent_events] client disconnected (ULTRA popup): %s:%s",
+                                client_addr[0], client_addr[1],
+                            )
                             return
-                except Exception:
-                    pass
+                except Exception as _sse_exc:
+                    _logger.warning("[SSE/agent_events] ULTRA popup dispatch error: %s", _sse_exc)
 
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as _pipe_exc:
+            _logger.info(
+                "[SSE/agent_events] client disconnected (connection lost): %s:%s — %s",
+                client_addr[0], client_addr[1], type(_pipe_exc).__name__,
+            )
             return
-        except Exception:
+        except Exception as _sse_loop_exc:
+            _logger.warning(
+                "[SSE/agent_events] unexpected error, closing stream: %s:%s — %s",
+                client_addr[0], client_addr[1], _sse_loop_exc,
+            )
             return
 
 

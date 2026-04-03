@@ -4,31 +4,53 @@ import { post } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
-import { Separator } from "@/components/ui/separator";
 import StatusChip from "@/components/StatusChip2";
+import { cn } from "@/lib/utils";
 import {
   RefreshCw, Router, Bot, Users, CheckCircle, Monitor,
   Bug, AlertTriangle, Play, Square,
 } from "lucide-react";
 
-function Section({ title, icon, children }: { title: string; icon: React.ReactNode; children: React.ReactNode }) {
+function Panel({
+  title,
+  icon,
+  children,
+  className,
+}: {
+  title: string;
+  icon: React.ReactNode;
+  children: React.ReactNode;
+  className?: string;
+}) {
   return (
-    <div className="rounded-xl border border-border bg-card overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-border">
+    <div className={cn("rounded-xl border border-border bg-card overflow-hidden", className)}>
+      <div className="flex items-center gap-2.5 px-5 py-3.5 border-b border-border/60">
         {icon}
-        <span className="text-[13px] font-semibold text-foreground">{title}</span>
+        <span className="text-[13px] font-semibold tracking-tight">{title}</span>
       </div>
-      <div className="px-4 py-3 space-y-2 text-[13px]">{children}</div>
+      <div className="px-5 py-4">{children}</div>
     </div>
   );
 }
 
-function KV({ label, value }: { label: string; value: React.ReactNode }) {
+function Row({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between py-0.5">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="text-right text-foreground">{value ?? "—"}</span>
+    <div className="flex items-center justify-between gap-4 py-[3px]">
+      <span className="text-[12px] text-muted-foreground shrink-0">{label}</span>
+      <span className="text-[13px] text-right font-medium">{value ?? "—"}</span>
     </div>
+  );
+}
+
+function StatusDot({ ok, pulse }: { ok: boolean; pulse?: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-block h-1.5 w-1.5 rounded-full",
+        ok ? "bg-emerald-400" : "bg-zinc-500",
+        pulse && ok && "animate-pulse",
+      )}
+    />
   );
 }
 
@@ -44,14 +66,16 @@ export default function DashboardPage() {
   const agent = status.agent;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       {/* Expiry warnings */}
       {s.loginWarning && s.loginDaysRemaining != null && s.loginDaysRemaining > 0 && (
         <Alert variant="warning">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Session expirante</AlertTitle>
           <AlertDescription>
-            Votre session expire dans <strong>{s.loginDaysRemaining} jour{s.loginDaysRemaining > 1 ? "s" : ""}</strong>. Veuillez vous reconnecter.
+            Votre session expire dans{" "}
+            <strong>{s.loginDaysRemaining} jour{s.loginDaysRemaining > 1 ? "s" : ""}</strong>.{" "}
+            Veuillez vous reconnecter.
           </AlertDescription>
         </Alert>
       )}
@@ -60,112 +84,313 @@ export default function DashboardPage() {
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Contrat en fin de validité</AlertTitle>
           <AlertDescription>
-            Votre contrat expire dans <strong>{s.contractDaysRemaining} jour{s.contractDaysRemaining > 1 ? "s" : ""}</strong>. Contactez l'équipe MonClub pour renouveler.
+            Votre contrat expire dans{" "}
+            <strong>{s.contractDaysRemaining} jour{s.contractDaysRemaining > 1 ? "s" : ""}</strong>.{" "}
+            Contactez l'équipe MonClub pour renouveler.
           </AlertDescription>
         </Alert>
       )}
 
-      {/* Overview stat row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-        {[
-          { label: "Appareils (DEVICE)", value: String(mode.DEVICE) },
-          { label: "Appareils (AGENT)",  value: String(mode.AGENT) },
-          { label: "Appareils (inconnu)", value: String(mode.UNKNOWN) },
-          { label: "Last sync ", value: sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").substring(0, 16) : "Jamais" },
-        ].map(({ label, value }) => (
-          <div key={label} className="rounded-lg border border-border bg-muted/40 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-widest text-muted-foreground font-medium">{label}</div>
-            <div className="mt-2 text-sm font-semibold text-foreground">{value}</div>
-          </div>
-        ))}
+      {/* System status strip — no card, horizontal info row */}
+      <div className="flex items-center gap-5 text-[12px] pb-4 border-b border-border/60">
+        <div className="flex items-center gap-1.5">
+          <StatusDot ok={agent.running} pulse />
+          <span className="text-muted-foreground">Agent</span>
+          <span className="font-medium">{agent.running ? "Actif" : "Arrêté"}</span>
+        </div>
+
+        <div className="h-3.5 w-px bg-border" />
+
+        <div className="flex items-center gap-1.5">
+          <StatusDot ok={sync.lastOk} />
+          <span className="text-muted-foreground">Sync</span>
+          <span className="font-mono font-medium">
+            {sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").slice(0, 16) : "—"}
+          </span>
+        </div>
+
+        <div className="h-3.5 w-px bg-border" />
+
+        <div className="flex items-center gap-1.5">
+          <StatusDot ok={status.pullsdk.connected} />
+          <span className="text-muted-foreground">PullSDK</span>
+          <span className="font-medium">
+            {status.pullsdk.connected ? "Connecté" : "Non connecté"}
+          </span>
+        </div>
+
+        <div className="h-3.5 w-px bg-border" />
+
+        <div className="flex items-center gap-1 text-muted-foreground font-mono">
+          <span className="text-foreground">{mode.DEVICE}</span>
+          <span>D</span>
+          <span className="mx-1 opacity-40">·</span>
+          <span className="text-foreground">{mode.AGENT}</span>
+          <span>A</span>
+          {mode.UNKNOWN > 0 && (
+            <>
+              <span className="mx-1 opacity-40">·</span>
+              <span className="text-amber-400">{mode.UNKNOWN}</span>
+              <span>?</span>
+            </>
+          )}
+        </div>
+
+        <Button
+          size="sm"
+          variant="outline"
+          className="ml-auto h-7 text-[12px] gap-1.5 px-3"
+          onClick={syncNow}
+          disabled={sync.running}
+        >
+          <RefreshCw className={cn("h-3 w-3", sync.running && "animate-spin")} />
+          {sync.running ? "En cours…" : "Synchroniser"}
+        </Button>
       </div>
 
-      {/* Cards grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-        {/* Session */}
-        <Section title="Session" icon={<CheckCircle className="h-4 w-4 text-emerald-400" />}>
-          <KV label="Email" value={s.email} />
-          <KV label="Dernière connexion" value={s.lastLoginAt?.replace("T", " ") ?? "—"} />
-          <KV label="Session" value={
-            s.loginDaysRemaining != null ? (
-              <Badge className={s.loginWarning
-                ? "border-amber-500/30 bg-amber-500/10 text-amber-400 text-[11px]"
-                : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
-              }>
-                {s.loginDaysRemaining}j
-              </Badge>
-            ) : "—"
-          } />
-          <KV label="Contrat" value={
-            <Badge className={s.contractStatus
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
-              : "border-red-500/30 bg-red-500/10 text-red-400 text-[11px]"
-            }>
-              {s.contractStatus ? "Actif" : "Inactif"}
-            </Badge>
-          } />
-          {s.contractEndDate && <KV label="Fin contrat" value={s.contractEndDate} />}
-        </Section>
+      {/* Main grid — 3 columns, varying spans */}
+      <div className="grid grid-cols-3 gap-4">
 
-        {/* Appareils */}
-        <Section title="Appareils" icon={<Router className="h-4 w-4 text-primary" />}>
-          <KV label="En mode Appareil (DEVICE)" value={mode.DEVICE} />
-          <KV label="En mode Agent (AGENT)" value={mode.AGENT} />
-          {mode.UNKNOWN > 0 && <KV label="Mode inconnu" value={mode.UNKNOWN} />}
-        </Section>
+        {/* Agent — dominant, spans 2 columns */}
+        <Panel
+          className="col-span-2"
+          title="Agent Temps Réel"
+          icon={
+            <Bot
+              className={cn(
+                "h-3.5 w-3.5",
+                agent.running ? "text-emerald-400" : "text-amber-400",
+              )}
+            />
+          }
+        >
+          <div className="flex items-start gap-10 mb-5">
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1.5">
+                File d'attente
+              </div>
+              <div className="text-3xl font-bold font-mono leading-none tabular-nums">
+                {agent.eventQueueDepth}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1.5">
+                Décision moy.
+              </div>
+              <div className="text-3xl font-bold font-mono leading-none tabular-nums">
+                {agent.avgDecisionMs.toFixed(1)}
+                <span className="text-sm font-normal text-muted-foreground ml-1.5">ms</span>
+              </div>
+            </div>
+            <div className="ml-auto">
+              <StatusChip
+                variant={agent.running ? "online" : "offline"}
+                label={agent.running ? "Actif" : "Arrêté"}
+              />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              variant="outline"
+              className="flex-1 h-8 text-[12px]"
+              disabled={agent.running}
+              onClick={() => post("/agent/start")}
+            >
+              <Play className="h-3 w-3" /> Démarrer
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="flex-1 h-8 text-[12px]"
+              disabled={!agent.running}
+              onClick={() => post("/agent/stop")}
+            >
+              <Square className="h-3 w-3" /> Arrêter
+            </Button>
+          </div>
+        </Panel>
+
+        {/* Session — right column */}
+        <Panel
+          title="Session"
+          icon={<CheckCircle className="h-3.5 w-3.5 text-emerald-400" />}
+        >
+          <div className="space-y-[2px]">
+            <Row
+              label="Email"
+              value={<span className="font-mono text-[12px]">{s.email}</span>}
+            />
+            <Row
+              label="Dernière connexion"
+              value={
+                <span className="font-mono text-[12px]">
+                  {s.lastLoginAt?.replace("T", " ").slice(0, 16) ?? "—"}
+                </span>
+              }
+            />
+            <Row
+              label="Session"
+              value={
+                s.loginDaysRemaining != null ? (
+                  <Badge
+                    className={
+                      s.loginWarning
+                        ? "border-amber-500/30 bg-amber-500/10 text-amber-400 text-[11px]"
+                        : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
+                    }
+                  >
+                    {s.loginDaysRemaining}j
+                  </Badge>
+                ) : (
+                  "—"
+                )
+              }
+            />
+            <Row
+              label="Contrat"
+              value={
+                <Badge
+                  className={
+                    s.contractStatus
+                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
+                      : "border-red-500/30 bg-red-500/10 text-red-400 text-[11px]"
+                  }
+                >
+                  {s.contractStatus ? "Actif" : "Inactif"}
+                </Badge>
+              }
+            />
+            {s.contractEndDate && (
+              <Row
+                label="Échéance"
+                value={
+                  <span className="font-mono text-[12px]">{s.contractEndDate}</span>
+                }
+              />
+            )}
+          </div>
+        </Panel>
 
         {/* Sync */}
-        <Section title="Synchronisation" icon={<RefreshCw className="h-4 w-4 text-primary" />}>
-          <KV label="Statut" value={
-            <StatusChip variant={sync.running ? "syncing" : sync.lastOk ? "online" : "error"}
-              label={sync.running ? "En cours" : sync.lastOk ? "OK" : "Échoué"} />
-          } />
-          <KV label="Dernière sync" value={sync.lastSyncAt?.replace("T", " ") ?? "Jamais"} />
-          <Separator className="my-1" />
-          <Button size="sm" variant="outline" className="w-full h-8 text-[13px]" onClick={syncNow} disabled={sync.running}>
-            <RefreshCw className="h-3.5 w-3.5" /> Synchroniser
-          </Button>
-        </Section>
-
-        {/* Agent */}
-        <Section title="Agent Temps Réel" icon={<Bot className={`h-4 w-4 ${agent.running ? "text-emerald-400" : "text-amber-400"}`} />}>
-          <KV label="Statut" value={
-            <StatusChip variant={agent.running ? "online" : "offline"} label={agent.running ? "Actif" : "Arrêté"} />
-          } />
-          <KV label="File d'attente" value={agent.eventQueueDepth} />
-          <KV label="Décision moy." value={`${agent.avgDecisionMs.toFixed(1)} ms`} />
-          <Separator className="my-1" />
-          <div className="flex gap-2">
-            <Button size="sm" variant="outline" className="flex-1 h-8 text-[13px]" disabled={agent.running} onClick={() => post("/agent/start")}>
-              <Play className="h-3.5 w-3.5" /> Start
-            </Button>
-            <Button size="sm" variant="outline" className="flex-1 h-8 text-[13px]" disabled={!agent.running} onClick={() => post("/agent/stop")}>
-              <Square className="h-3.5 w-3.5" /> Stop
-            </Button>
+        <Panel
+          title="Synchronisation"
+          icon={<RefreshCw className="h-3.5 w-3.5 text-primary" />}
+        >
+          <div className="space-y-[2px]">
+            <Row
+              label="Statut"
+              value={
+                <StatusChip
+                  variant={sync.running ? "syncing" : sync.lastOk ? "online" : "error"}
+                  label={sync.running ? "En cours" : sync.lastOk ? "OK" : "Échoué"}
+                />
+              }
+            />
+            <Row
+              label="Dernière sync"
+              value={
+                <span className="font-mono text-[12px]">
+                  {sync.lastSyncAt?.replace("T", " ").slice(0, 16) ?? "Jamais"}
+                </span>
+              }
+            />
           </div>
-        </Section>
+        </Panel>
 
         {/* PullSDK */}
-        <Section title="PullSDK" icon={<Users className="h-4 w-4 text-primary" />}>
-          <KV label="Connecté" value={
-            <StatusChip variant={status.pullsdk.connected ? "online" : "offline"} label={status.pullsdk.connected ? "Oui" : "Non"} />
-          } />
-          {status.pullsdk.deviceId && <KV label="Appareil" value={`#${status.pullsdk.deviceId}`} />}
-          {status.pullsdk.ip && <KV label="IP" value={status.pullsdk.ip} />}
-        </Section>
+        <Panel
+          title="PullSDK"
+          icon={<Users className="h-3.5 w-3.5 text-primary" />}
+        >
+          <div className="space-y-[2px]">
+            <Row
+              label="Connecté"
+              value={
+                <StatusChip
+                  variant={status.pullsdk.connected ? "online" : "offline"}
+                  label={status.pullsdk.connected ? "Oui" : "Non"}
+                />
+              }
+            />
+            {status.pullsdk.deviceId && (
+              <Row
+                label="Appareil"
+                value={
+                  <span className="font-mono text-[12px]">#{status.pullsdk.deviceId}</span>
+                }
+              />
+            )}
+            {status.pullsdk.ip && (
+              <Row
+                label="IP"
+                value={
+                  <span className="font-mono text-[12px]">{status.pullsdk.ip}</span>
+                }
+              />
+            )}
+          </div>
+        </Panel>
 
-        {/* Notification screen */}
-        <Section title="Écran Notification" icon={<Monitor className="h-4 w-4 text-primary" />}>
-          <p className="text-muted-foreground text-[12px] mb-2">Ouvrez l'écran de notification pour afficher les accès en temps réel.</p>
+        {/* Notification Screen */}
+        <Panel
+          title="Écran Notification"
+          icon={<Monitor className="h-3.5 w-3.5 text-primary" />}
+        >
+          <p className="text-[12px] text-muted-foreground mb-3 leading-relaxed">
+            Ouvrez l'écran pour afficher les accès en temps réel.
+          </p>
           <div className="flex gap-2">
-            <Button size="sm" variant="outline" className="flex-1 h-8 text-[13px]" onClick={openPopupWindow}>
-              <Monitor className="h-3.5 w-3.5" /> Ouvrir
+            <Button
+              size="sm"
+              variant="outline"
+              className="flex-1 h-8 text-[12px]"
+              onClick={openPopupWindow}
+            >
+              <Monitor className="h-3 w-3" /> Ouvrir
             </Button>
-            <Button size="sm" variant="outline" className="h-8 text-[13px]" onClick={sendTestNotification}>
-              <Bug className="h-3.5 w-3.5" /> Test
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 text-[12px]"
+              onClick={sendTestNotification}
+            >
+              <Bug className="h-3 w-3" /> Test
             </Button>
           </div>
-        </Section>
+        </Panel>
+
+        {/* Appareils */}
+        <Panel
+          title="Appareils"
+          icon={<Router className="h-3.5 w-3.5 text-primary" />}
+        >
+          <div className="flex gap-6">
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
+                Device
+              </div>
+              <div className="text-2xl font-bold font-mono tabular-nums">{mode.DEVICE}</div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
+                Agent
+              </div>
+              <div className="text-2xl font-bold font-mono tabular-nums">{mode.AGENT}</div>
+            </div>
+            {mode.UNKNOWN > 0 && (
+              <div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
+                  Inconnu
+                </div>
+                <div className="text-2xl font-bold font-mono tabular-nums text-amber-400">
+                  {mode.UNKNOWN}
+                </div>
+              </div>
+            )}
+          </div>
+        </Panel>
+
       </div>
     </div>
   );

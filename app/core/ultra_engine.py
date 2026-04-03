@@ -114,24 +114,33 @@ class UltraDeviceWorker(threading.Thread):
 
     def _connect(self):
         """Connect to device via PullSDK."""
+        ip = self._device.get("ipAddress", "")
+        port = self._device.get("portNumber", self._device.get("devicePort", 4370))
+        logger.info(f"{self._prefix} connect attempt: name={self._device_name!r} ip={ip} port={port}")
         try:
             self._sdk = PullSDKDevice(device_payload=self._device, logger=logger)
             ok = self._sdk.connect()
             if ok:
                 self._connected = True
-                ip = self._device.get("ipAddress", "")
-                port = self._device.get("portNumber", self._device.get("devicePort", 4370))
-                logger.info(f"{self._prefix} connected to {ip}:{port}")
+                logger.info(f"{self._prefix} connected OK: name={self._device_name!r} ip={ip} port={port}")
             else:
                 self._connected = False
                 self._sdk = None
-                logger.error(f"{self._prefix} connect returned False")
+                logger.error(
+                    f"{self._prefix} connect returned False: "
+                    f"name={self._device_name!r} ip={ip} port={port}"
+                )
         except Exception as e:
-            logger.error(f"{self._prefix} connect failed: {e}")
+            logger.error(
+                f"{self._prefix} connect FAILED: "
+                f"name={self._device_name!r} ip={ip} port={port} error={e}"
+            )
             self._connected = False
             self._sdk = None
 
     def _disconnect(self):
+        if self._connected or self._sdk:
+            logger.debug(f"{self._prefix} disconnect: was_connected={self._connected}")
         if self._sdk:
             try:
                 self._sdk.disconnect()
@@ -167,12 +176,21 @@ class UltraDeviceWorker(threading.Thread):
         self._poll_ema_ms = alpha * elapsed_ms + (1 - alpha) * self._poll_ema_ms
 
         if t.is_alive():
-            logger.error(f"{self._prefix} poll_rtlog timed out ({self._poll_timeout_sec}s)")
+            logger.error(
+                f"{self._prefix} poll_rtlog WATCHDOG TIMEOUT "
+                f"(>{self._poll_timeout_sec}s elapsed={elapsed_ms:.0f}ms) — forcing reconnect"
+            )
             return None
         if error[0]:
-            logger.error(f"{self._prefix} poll_rtlog error: {error[0]}")
+            logger.error(
+                f"{self._prefix} poll_rtlog ERROR: {error[0]} "
+                f"(elapsed={elapsed_ms:.0f}ms) — forcing reconnect"
+            )
             return None
-        return result[0] or []
+        events = result[0] or []
+        if events:
+            logger.debug(f"{self._prefix} poll_rtlog OK: {len(events)} event(s) in {elapsed_ms:.0f}ms")
+        return events
 
     # ------------------------------------------------------------------ #
     # Event deduplication
@@ -214,15 +232,24 @@ class UltraDeviceWorker(threading.Thread):
             event_id = f"{self._device_id}:{event_time}:{card_no}"
 
         if self._is_seen(event_id):
+            logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
 
         self._events_processed += 1
+
+        logger.debug(
+            f"{self._prefix} event #{self._events_processed}: "
+            f"id={event_id} card={card_no!r} type={event_type_raw!r} time={event_time!r} door={door_id_raw!r}"
+        )
 
         # Parse event type: 0 = normal/verified (ALLOW), anything else = DENY
         try:
             event_type_int = int(event_type_raw)
         except (ValueError, TypeError):
             event_type_int = -1
+            logger.warning(
+                f"{self._prefix} unrecognised eventType={event_type_raw!r} for event_id={event_id}"
+            )
 
         is_allow = (event_type_int == 0)
 
@@ -296,7 +323,15 @@ class UltraDeviceWorker(threading.Thread):
             user_valid_from = str(user.get("validFrom", user.get("valid_from", "")) or "")
             user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
 
-        logger.info(f"{self._prefix} rtlog ALLOW: card={card_no}, user={user_name}")
+        if not user_name:
+            logger.warning(
+                f"{self._prefix} rtlog ALLOW: card={card_no!r} — "
+                f"user NOT found in local cache (card not in sync_users)"
+            )
+        logger.info(
+            f"{self._prefix} rtlog ALLOW: card={card_no!r} user={user_name!r} "
+            f"door={door_id} event_id={event_id}"
+        )
 
         self._enqueue_notification(
             event_id=event_id,
@@ -369,8 +404,19 @@ class UltraDeviceWorker(threading.Thread):
         cmd_ok: Optional[bool] = None
         cmd_error = ""
 
+        masked_code = code[0] + "*" * (len(code) - 2) + code[-1] if len(code) > 2 else code
+        logger.info(
+            f"{self._prefix} TOTP_RESCUE: code={masked_code} "
+            f"allowed={allowed} reason={reason} user={user_name!r} "
+            f"decision_ms={decision_ms:.1f} event_id={event_id}"
+        )
+
         if allowed:
             # Open door
+            logger.info(
+                f"{self._prefix} TOTP_RESCUE opening door: door_id={door_id} "
+                f"user={user_name!r} code={masked_code}"
+            )
             t_cmd = time.monotonic()
             door_opened = self._open_door_with_retry(door_id=door_id)
             cmd_ms = (time.monotonic() - t_cmd) * 1000
@@ -378,20 +424,25 @@ class UltraDeviceWorker(threading.Thread):
 
             if door_opened:
                 self._totp_rescues += 1
-                masked = code[0] + "*" * (len(code) - 2) + code[-1] if len(code) > 2 else code
                 logger.info(
-                    f"{self._prefix} rtlog TOTP_RESCUE: code={masked}, "
-                    f"user={user_name}, decision={decision_ms:.0f}ms cmd={cmd_ms:.0f}ms"
+                    f"{self._prefix} TOTP_RESCUE door OPENED: code={masked_code} "
+                    f"user={user_name!r} decision={decision_ms:.0f}ms cmd={cmd_ms:.0f}ms"
                 )
             else:
                 allowed = False
                 reason = "DOOR_CMD_FAILED"
                 cmd_error = "door open failed after valid TOTP"
                 self._door_cmd_failures += 1
-                logger.error(f"{self._prefix} door_cmd_failed after valid TOTP")
+                logger.error(
+                    f"{self._prefix} TOTP_RESCUE door FAILED to open: code={masked_code} "
+                    f"user={user_name!r} cmd_ms={cmd_ms:.0f}ms door_cmd_failures={self._door_cmd_failures}"
+                )
         else:
             self._totp_failures += 1
-            logger.info(f"{self._prefix} rtlog DENY: code=TOTP, reason={reason}")
+            logger.info(
+                f"{self._prefix} TOTP_RESCUE DENY: code={masked_code} reason={reason} "
+                f"user={user_name!r} totp_failures={self._totp_failures}"
+            )
 
         self._enqueue_notification(
             event_id=event_id,
@@ -430,18 +481,30 @@ class UltraDeviceWorker(threading.Thread):
         except Exception:
             pass
         pulse_ms = int(self._settings.get("pulse_time_ms", 3000))
+        logger.debug(
+            f"{self._prefix} open_door_with_retry: resolved_door_id={resolved_door_id} "
+            f"pulse_ms={pulse_ms} sdk_connected={bool(self._sdk and self._connected)}"
+        )
         for attempt in range(2):
             try:
-                assert self._sdk is not None
+                if self._sdk is None:
+                    logger.error(f"{self._prefix} open_door attempt {attempt + 1}: sdk is None (not connected)")
+                    break
                 ok = self._sdk.open_door(door_id=resolved_door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
                 if ok:
+                    logger.debug(f"{self._prefix} open_door succeeded on attempt {attempt + 1}")
                     return True
+                else:
+                    logger.warning(
+                        f"{self._prefix} open_door attempt {attempt + 1} returned False"
+                    )
             except Exception as e:
                 logger.warning(
-                    f"{self._prefix} open_door attempt {attempt + 1} failed: {e}"
+                    f"{self._prefix} open_door attempt {attempt + 1} EXCEPTION: {e}"
                 )
             if attempt == 0:
                 time.sleep(0.1)
+        logger.error(f"{self._prefix} open_door_with_retry: all attempts failed for door_id={resolved_door_id}")
         return False
 
     # ------------------------------------------------------------------ #
@@ -453,7 +516,10 @@ class UltraDeviceWorker(threading.Thread):
         door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
     ):
         """Device denied a non-TOTP code. Log and notify."""
-        logger.info(f"{self._prefix} rtlog DENY: card={card_no}, reason=DEVICE_DENIED")
+        logger.info(
+            f"{self._prefix} rtlog DENY: card={card_no!r} reason=DEVICE_DENIED "
+            f"event_type={event_type!r} door={door_id} event_id={event_id}"
+        )
         self._enqueue_notification(
             event_id=event_id,
             allowed=False,
@@ -527,8 +593,15 @@ class UltraDeviceWorker(threading.Thread):
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),
             )
             self._popup_q.put_nowait(req)
+            logger.debug(
+                f"{self._prefix} popup enqueued: allowed={allowed} reason={reason} "
+                f"user={user_full_name!r} scan_mode={scan_mode} event_id={event_id}"
+            )
         except queue.Full:
-            logger.warning(f"{self._prefix} popup queue full, dropping notification")
+            logger.warning(
+                f"{self._prefix} popup queue FULL — dropping notification "
+                f"(allowed={allowed} user={user_full_name!r} event_id={event_id})"
+            )
 
     def _enqueue_history(
         self,
@@ -608,8 +681,14 @@ class UltraDeviceWorker(threading.Thread):
         """Return (creds, users_by_am, users_by_card) with 5-second cache."""
         now = time.monotonic()
         if self._cached_state is None or (now - self._cached_state_ts) > self._CACHE_TTL_SEC:
+            logger.debug(f"{self._prefix} refreshing local state cache from DB")
             self._cached_state = load_local_state()
             self._cached_state_ts = now
+            creds, users_by_am, users_by_card = self._cached_state
+            logger.debug(
+                f"{self._prefix} local state cache refreshed: "
+                f"creds={len(creds)} users_by_am={len(users_by_am)} users_by_card={len(users_by_card)}"
+            )
         return self._cached_state
 
     # ------------------------------------------------------------------ #
@@ -807,8 +886,20 @@ class UltraEngine:
             if str(d.get("accessDataMode", "")).strip().upper() == "ULTRA"
         ]
 
+        all_device_count = len(devices)
+        non_ultra = [d for d in devices if str(d.get("accessDataMode", "")).strip().upper() != "ULTRA"]
+        logger.info(
+            "[ULTRA] start: total_devices=%d ultra_devices=%d skipped=%d",
+            all_device_count, len(ultra_devices), len(non_ultra),
+        )
+        for d in non_ultra:
+            logger.info(
+                "[ULTRA] device id=%s name=%r skipped (accessDataMode=%r)",
+                d.get("id"), d.get("name"), d.get("accessDataMode"),
+            )
+
         if not ultra_devices:
-            logger.info("[ULTRA] No ULTRA-mode devices found")
+            logger.info("[ULTRA] No ULTRA-mode devices found — engine not starting")
             self._running = False
             return
 
@@ -821,6 +912,13 @@ class UltraEngine:
             settings = normalize_device_settings(d)
             d["_settings"] = settings
             prepared_devices.append((d, settings))
+            logger.info(
+                "[ULTRA] device id=%s name=%r ip=%s port=%s totp_rescue=%s rtlog=%s",
+                d.get("id"), d.get("name"),
+                d.get("ipAddress", "?"), d.get("portNumber", "?"),
+                settings.get("ultra_totp_rescue_enabled", True),
+                settings.get("ultra_rtlog_enabled", True),
+            )
 
         # Start sync scheduler after device settings are attached.
         self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
@@ -838,7 +936,11 @@ class UltraEngine:
                 stop_event=self._stop_event,
             )
             self._workers[device_id] = worker
-            worker.start()
+            try:
+                worker.start()
+                logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
+            except Exception as _w_exc:
+                logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
 
     def stop(self):
         """Stop all workers and sync scheduler."""

@@ -155,7 +155,8 @@
       "Bash(while read:*)",
       "Bash(do grep:*)",
       "Bash(done)",
-      "Bash(find D:projectsMonClubmonclub_backendsrcmainjava -name *.java -type f)"
+      "Bash(find D:projectsMonClubmonclub_backendsrcmainjava -name *.java -type f)",
+      "Bash(grep -n \"findMaxUpdatedAt\\\\|findAllValidForAccess\\\\|findSyncProjection\" D:projectsMonClubmonclub_backend/src/main/java/com/tpjava/tpjava/Repositories/*.java)"
     ]
   }
 }

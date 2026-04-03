@@ -156,8 +156,11 @@ class MonClubApi:
             raise MonClubApiError(f"getSyncData request failed: {e}") from e
 
         if r.status_code < 200 or r.status_code >= 300:
+            
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
+            self.logger.info(extra)
+            print(txt)
             raise MonClubApiError(f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
 
         try:
