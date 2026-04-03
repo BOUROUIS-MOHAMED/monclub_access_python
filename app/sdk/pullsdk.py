@@ -570,8 +570,8 @@ class PullSDKDevice:
         self.device_id = self._safe_int(self.payload.get("id"), 0)
         self.name = self._safe_str(self.payload.get("name"), f"device-{self.device_id}")
 
-        self.ip = self._pick_str(["ip", "ipAddress", "ipaddress", "host", "address"], default="")
-        self.port = self._pick_int(["port", "devicePort"], default=4370)
+        self.ip = self._pick_str(["ip", "ipAddress", "ipaddress", "ip_address", "host", "address"], default="")
+        self.port = self._pick_int(["port", "portNumber", "port_number", "devicePort"], default=4370)
         self.password = self._pick_str(["password", "passwd", "pass", "devicePassword"], default="")
         self.platform = self._pick_str(["platform", "devicePlatform"], default="")
 

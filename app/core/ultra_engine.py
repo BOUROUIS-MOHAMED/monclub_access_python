@@ -114,8 +114,8 @@ class UltraDeviceWorker(threading.Thread):
 
     def _connect(self):
         """Connect to device via PullSDK."""
-        ip = self._device.get("ipAddress", "")
-        port = self._device.get("portNumber", self._device.get("devicePort", 4370))
+        ip = self._device.get("ipAddress") or self._device.get("ip_address", "")
+        port = self._device.get("portNumber") or self._device.get("port_number") or self._device.get("devicePort") or 4370
         logger.info(f"{self._prefix} connect attempt: name={self._device_name!r} ip={ip} port={port}")
         try:
             self._sdk = PullSDKDevice(device_payload=self._device, logger=logger)
@@ -881,21 +881,21 @@ class UltraEngine:
         self._running = True
         self._stop_event.clear()
 
-        ultra_devices = [
-            d for d in devices
-            if str(d.get("accessDataMode", "")).strip().upper() == "ULTRA"
-        ]
+        def _adm(d):
+            return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
+
+        ultra_devices = [d for d in devices if _adm(d) == "ULTRA"]
 
         all_device_count = len(devices)
-        non_ultra = [d for d in devices if str(d.get("accessDataMode", "")).strip().upper() != "ULTRA"]
+        non_ultra = [d for d in devices if _adm(d) != "ULTRA"]
         logger.info(
             "[ULTRA] start: total_devices=%d ultra_devices=%d skipped=%d",
             all_device_count, len(ultra_devices), len(non_ultra),
         )
         for d in non_ultra:
             logger.info(
-                "[ULTRA] device id=%s name=%r skipped (accessDataMode=%r)",
-                d.get("id"), d.get("name"), d.get("accessDataMode"),
+                "[ULTRA] device id=%s name=%r skipped (accessDataMode=%r / access_data_mode=%r)",
+                d.get("id"), d.get("name"), d.get("accessDataMode"), d.get("access_data_mode"),
             )
 
         if not ultra_devices:

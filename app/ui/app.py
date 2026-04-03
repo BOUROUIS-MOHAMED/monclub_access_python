@@ -1103,14 +1103,28 @@ class MainApp:
                 summary = self.get_access_mode_summary()
                 ultra_count = summary.get("ULTRA", 0)
 
+                self.logger.info("[ULTRA] sync_tick: mode_summary=%s", summary)
                 cache = load_sync_cache() if ultra_count > 0 else None
                 ultra_devices = []
                 if cache:
+                    from app.core.db import _coerce_device_row_to_payload, _expand_device_json_fields
                     all_devices = getattr(cache, "devices", []) or []
+                    # Normalize DB snake_case rows → camelCase payload dicts so that
+                    # accessDataMode / ipAddress / portNumber keys are always present.
+                    normalized_devices = [
+                        _coerce_device_row_to_payload(_expand_device_json_fields(d))
+                        if isinstance(d, dict) else d
+                        for d in all_devices
+                    ]
                     ultra_devices = [
-                        d for d in all_devices
+                        d for d in normalized_devices
                         if isinstance(d, dict) and str(d.get("accessDataMode", "")).strip().upper() == "ULTRA"
                     ]
+                    self.logger.info(
+                        "[ULTRA] sync_tick: all_devices=%d ultra_devices=%d ids=%s",
+                        len(all_devices), len(ultra_devices),
+                        [d.get("id") for d in ultra_devices],
+                    )
 
                 if ultra_count > 0 and not self._ultra_engine.running:
                     if ultra_devices:
