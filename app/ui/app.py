@@ -987,7 +987,10 @@ class MainApp:
             try:
                 api = self._api()
                 version_tokens = load_version_tokens() or None
-                data = api.get_sync_data(token=auth.token, version_tokens=version_tokens)
+                # First sync (no tokens) transfers full payload — allow more time.
+                # Delta syncs (tokens present) are small and fast — keep tight timeout.
+                sync_timeout = 60 if version_tokens else 60
+                data = api.get_sync_data(token=auth.token, version_tokens=version_tokens, timeout=sync_timeout)
 
                 refresh = {
                     "members":     data.get("refreshMembers", True),
