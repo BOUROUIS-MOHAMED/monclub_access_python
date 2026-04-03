@@ -62,6 +62,10 @@ class UltraDeviceWorker(threading.Thread):
         # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
         self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
 
+        # Sync-pause handshake: set by UltraSyncScheduler before it connects to the device
+        self._sync_pause = threading.Event()      # set = paused for sync
+        self._sync_paused_ack = threading.Event() # set = worker confirmed disconnect
+
         # Local state cache (avoid per-event DB reads)
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
@@ -77,6 +81,20 @@ class UltraDeviceWorker(threading.Thread):
         self._pre_populate_seen()
 
         while not self._stop.is_set():
+            # Yield the TCP connection to UltraSyncScheduler when requested
+            if self._sync_pause.is_set():
+                if self._connected:
+                    logger.info(
+                        f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
+                    )
+                    self._disconnect()
+                self._sync_paused_ack.set()
+                while self._sync_pause.is_set() and not self._stop.is_set():
+                    self._stop.wait(0.5)
+                self._sync_paused_ack.clear()
+                logger.info(f"{self._prefix} sync pause ended — will reconnect")
+                continue
+
             # Connect if needed
             if not self._connected:
                 self._connect()
@@ -148,6 +166,26 @@ class UltraDeviceWorker(threading.Thread):
                 pass
         self._sdk = None
         self._connected = False
+
+    def pause_for_sync(self, timeout: float = 20.0) -> bool:
+        """Ask worker to disconnect and wait until it confirms.
+
+        Called by UltraSyncScheduler before it opens its own TCP connection.
+        Returns True if the worker acknowledged the pause within *timeout* seconds.
+        """
+        self._sync_paused_ack.clear()
+        self._sync_pause.set()
+        acked = self._sync_paused_ack.wait(timeout=timeout)
+        if not acked:
+            logger.warning(
+                f"{self._prefix} pause_for_sync: worker did not ack within {timeout}s "
+                f"(it may still be mid-poll — sync will proceed anyway)"
+            )
+        return acked
+
+    def resume_from_sync(self):
+        """Allow worker to reconnect after sync engine has disconnected."""
+        self._sync_pause.clear()
 
     # ------------------------------------------------------------------ #
     # RTLog polling with watchdog (15s timeout)
@@ -727,6 +765,11 @@ class UltraSyncScheduler:
         self._last_hash: Dict[int, str] = {}  # device_id -> payload hash
         self._last_sync_at: Dict[int, str] = {}
         self._next_sync_at: Dict[int, str] = {}
+        self._workers: Dict[int, "UltraDeviceWorker"] = {}
+
+    def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
+        """Register per-device worker references so _sync_device can pause them."""
+        self._workers = workers
 
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
@@ -822,11 +865,33 @@ class UltraSyncScheduler:
         filtered_cache_attrs["devices"] = [device_copy]
         filtered_cache = SimpleNamespace(**filtered_cache_attrs)
 
-        engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
-        engine.run_blocking(cache=filtered_cache, source="ultra_sync")
+        # Pause the RTLog worker so it releases the single TCP connection to this device
+        worker = self._workers.get(int(device_id)) if device_id is not None else None
+        if worker:
+            logger.info(
+                f"[ULTRA:{device_id}] sync: pausing RTLog worker for TCP handoff"
+            )
+            acked = worker.pause_for_sync(timeout=20.0)
+            logger.info(
+                f"[ULTRA:{device_id}] sync: worker pause acked={acked} — connecting for sync"
+            )
+        else:
+            logger.warning(
+                f"[ULTRA:{device_id}] sync: no worker found for device — proceeding without pause "
+                f"(risk: dual TCP connection on C3-200)"
+            )
 
-        self._last_hash[device_id] = current_hash
-        logger.info(f"[ULTRA:{device_id}] sync push complete")
+        try:
+            engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+            engine.run_blocking(cache=filtered_cache, source="ultra_sync")
+            self._last_hash[device_id] = current_hash
+            logger.info(f"[ULTRA:{device_id}] sync push complete")
+        finally:
+            if worker:
+                worker.resume_from_sync()
+                logger.info(
+                    f"[ULTRA:{device_id}] sync: worker resumed — will reconnect for RTLog polling"
+                )
 
     def get_sync_status(self) -> Dict[int, Dict[str, Any]]:
         return {
@@ -920,11 +985,7 @@ class UltraEngine:
                 settings.get("ultra_rtlog_enabled", True),
             )
 
-        # Start sync scheduler after device settings are attached.
-        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
-        self._sync_scheduler.start([d for d, _settings in prepared_devices])
-
-        # Start per-device workers
+        # Start per-device workers first so scheduler can reference them
         for d, settings in prepared_devices:
             device_id = int(d.get("id", 0))
 
@@ -941,6 +1002,11 @@ class UltraEngine:
                 logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
             except Exception as _w_exc:
                 logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
+
+        # Start sync scheduler with worker references so it can pause them for TCP handoff
+        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
+        self._sync_scheduler.set_workers(self._workers)
+        self._sync_scheduler.start([d for d, _settings in prepared_devices])
 
     def stop(self):
         """Stop all workers and sync scheduler."""
