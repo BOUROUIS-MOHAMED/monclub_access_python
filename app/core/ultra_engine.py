@@ -818,7 +818,7 @@ class UltraSyncScheduler:
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(next_t)
                 )
             except Exception as e:
-                logger.error(f"[ULTRA:{device_id}] sync failed: {e}")
+                self._logger.error("[ULTRA:%s] sync failed: %s", device_id, e)
 
     def _sync_device(self, device: Dict[str, Any]):
         """Push data to a single device with hash-based change detection.
@@ -831,7 +831,7 @@ class UltraSyncScheduler:
         device_id = device.get("id")
         cache = load_sync_cache()
         if cache is None:
-            logger.warning(f"[ULTRA:{device_id}] sync skip: no sync cache available")
+            self._logger.warning("[ULTRA:%s] sync skip: no sync cache available", device_id)
             return
 
         # Compute hash of current user payload for this device
@@ -853,10 +853,10 @@ class UltraSyncScheduler:
         current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
 
         if self._last_hash.get(device_id) == current_hash:
-            logger.info(f"[ULTRA:{device_id}] sync skip: hash unchanged")
+            self._logger.info("[ULTRA:%s] sync skip: hash unchanged", device_id)
             return
 
-        logger.info(f"[ULTRA:{device_id}] sync push started")
+        self._logger.info("[ULTRA:%s] sync push started", device_id)
 
         device_copy = dict(device or {})
         device_copy["accessDataMode"] = "DEVICE"
@@ -868,29 +868,29 @@ class UltraSyncScheduler:
         # Pause the RTLog worker so it releases the single TCP connection to this device
         worker = self._workers.get(int(device_id)) if device_id is not None else None
         if worker:
-            logger.info(
-                f"[ULTRA:{device_id}] sync: pausing RTLog worker for TCP handoff"
+            self._logger.info(
+                "[ULTRA:%s] sync: pausing RTLog worker for TCP handoff", device_id
             )
             acked = worker.pause_for_sync(timeout=20.0)
-            logger.info(
-                f"[ULTRA:{device_id}] sync: worker pause acked={acked} — connecting for sync"
+            self._logger.info(
+                "[ULTRA:%s] sync: worker pause acked=%s — connecting for sync", device_id, acked
             )
         else:
-            logger.warning(
-                f"[ULTRA:{device_id}] sync: no worker found for device — proceeding without pause "
-                f"(risk: dual TCP connection on C3-200)"
+            self._logger.warning(
+                "[ULTRA:%s] sync: no worker found — proceeding without pause "
+                "(risk: dual TCP connection on C3-200)", device_id
             )
 
         try:
             engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
             engine.run_blocking(cache=filtered_cache, source="ultra_sync")
             self._last_hash[device_id] = current_hash
-            logger.info(f"[ULTRA:{device_id}] sync push complete")
+            self._logger.info("[ULTRA:%s] sync push complete", device_id)
         finally:
             if worker:
                 worker.resume_from_sync()
-                logger.info(
-                    f"[ULTRA:{device_id}] sync: worker resumed — will reconnect for RTLog polling"
+                self._logger.info(
+                    "[ULTRA:%s] sync: worker resumed — will reconnect for RTLog polling", device_id
                 )
 
     def get_sync_status(self) -> Dict[int, Dict[str, Any]]:
@@ -953,22 +953,22 @@ class UltraEngine:
 
         all_device_count = len(devices)
         non_ultra = [d for d in devices if _adm(d) != "ULTRA"]
-        logger.info(
+        self._logger.info(
             "[ULTRA] start: total_devices=%d ultra_devices=%d skipped=%d",
             all_device_count, len(ultra_devices), len(non_ultra),
         )
         for d in non_ultra:
-            logger.info(
+            self._logger.info(
                 "[ULTRA] device id=%s name=%r skipped (accessDataMode=%r / access_data_mode=%r)",
                 d.get("id"), d.get("name"), d.get("accessDataMode"), d.get("access_data_mode"),
             )
 
         if not ultra_devices:
-            logger.info("[ULTRA] No ULTRA-mode devices found — engine not starting")
+            self._logger.info("[ULTRA] No ULTRA-mode devices found — engine not starting")
             self._running = False
             return
 
-        logger.info(f"[ULTRA] Starting with {len(ultra_devices)} device(s)")
+        self._logger.info("[ULTRA] Starting with %d device(s)", len(ultra_devices))
 
         from app.core.settings_reader import normalize_device_settings
 
@@ -977,7 +977,7 @@ class UltraEngine:
             settings = normalize_device_settings(d)
             d["_settings"] = settings
             prepared_devices.append((d, settings))
-            logger.info(
+            self._logger.info(
                 "[ULTRA] device id=%s name=%r ip=%s port=%s totp_rescue=%s rtlog=%s",
                 d.get("id"), d.get("name"),
                 d.get("ipAddress", "?"), d.get("portNumber", "?"),
@@ -999,9 +999,9 @@ class UltraEngine:
             self._workers[device_id] = worker
             try:
                 worker.start()
-                logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
+                self._logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
             except Exception as _w_exc:
-                logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
+                self._logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
 
         # Start sync scheduler with worker references so it can pause them for TCP handoff
         self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
@@ -1012,7 +1012,7 @@ class UltraEngine:
         """Stop all workers and sync scheduler."""
         if not self._running:
             return
-        logger.info("[ULTRA] Stopping engine")
+        self._logger.info("[ULTRA] Stopping engine")
         self._stop_event.set()
 
         # Stop sync scheduler
@@ -1023,11 +1023,11 @@ class UltraEngine:
         for device_id, worker in self._workers.items():
             worker.join(timeout=10)
             if worker.is_alive():
-                logger.warning(f"[ULTRA:{device_id}] worker did not stop in time")
+                self._logger.warning("[ULTRA:%s] worker did not stop in time", device_id)
 
         self._workers.clear()
         self._running = False
-        logger.info("[ULTRA] Engine stopped")
+        self._logger.info("[ULTRA] Engine stopped")
 
     def get_status(self) -> Dict[str, Any]:
         """Return full ULTRA engine status for /api/v2/ultra/status."""
