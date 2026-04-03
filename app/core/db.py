@@ -219,7 +219,8 @@ def init_db() -> None:
                 fingerprints_json TEXT,
                 face_id TEXT,
                 account_username_id TEXT,
-                qr_code_payload TEXT
+                qr_code_payload TEXT,
+                birthday TEXT
             );
             """
         )
@@ -230,6 +231,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
+        _ensure_column(conn, "sync_users", "birthday", "birthday TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception:
@@ -791,6 +793,18 @@ def init_db() -> None:
         conn.execute("UPDATE offline_creation_queue SET state = 'failed_terminal' WHERE created = 0 AND (try_to_create = 0 OR try_to_create = '0') AND (state IS NULL OR state = '' OR state IN ('pending','failed_retryable'));")
         conn.execute("UPDATE offline_creation_queue SET state = 'pending' WHERE state IS NULL OR state = '';")
 
+        # -----------------------------
+        # delta sync: version tokens
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_version_tokens (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+
         conn.commit()
 
     # F-014: On startup, reset any stale processing locks in the offline queue
@@ -802,6 +816,42 @@ def init_db() -> None:
     except Exception as _e:
         import logging
         logging.getLogger("db").error(f"[DB] Failed to reset stale processing locks on startup: {_e}")
+
+
+# -----------------------------
+# Delta sync: version tokens
+# -----------------------------
+
+def save_version_tokens(tokens: dict) -> None:
+    """Upsert version tokens. keys: membersVersion, devicesVersion, credentialsVersion, settingsVersion."""
+    if not tokens:
+        return
+    with get_conn() as conn:
+        for key, value in tokens.items():
+            if value is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO sync_version_tokens (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (key, str(value)),
+            )
+        conn.commit()
+
+
+def load_version_tokens() -> dict:
+    """Return all saved version tokens, or empty dict if none."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT key, value FROM sync_version_tokens").fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+
+def clear_version_tokens() -> None:
+    """Delete all saved version tokens (call on logout/login/cache-clear)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sync_version_tokens")
+        conn.commit()
 
 
 # -----------------------------
@@ -1114,6 +1164,163 @@ def _safe_str(v: Any, default: str = "") -> str:
         return default
 
 
+def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
+    """Insert a single device (presets + device row) into sync tables. Helper shared by save_sync_cache and save_sync_cache_delta."""
+    if not isinstance(d, dict):
+        return
+
+    # save synced door presets
+    presets = d.get("doorPresets") or []
+    if isinstance(presets, list):
+        for p in presets:
+            if not isinstance(p, dict):
+                continue
+            cur.execute(
+                """
+                INSERT INTO sync_device_door_presets (
+                    remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _to_int_or_none(p.get("id")),
+                    _to_int_or_none(p.get("deviceId") or d.get("id")),
+                    _to_int_or_none(p.get("doorNumber")),
+                    _to_int_or_none(p.get("pulseSeconds")),
+                    _safe_str(p.get("doorName"), ""),
+                    _safe_str(p.get("createdAt"), None),
+                    _safe_str(p.get("updatedAt"), None),
+                ),
+            )
+
+    # normalize accessDataMode
+    adm_raw = d.get("accessDataMode") or d.get("access_data_mode") or "DEVICE"
+    adm = str(adm_raw or "").strip().upper()
+    if adm not in ("DEVICE", "AGENT", "ULTRA"):
+        adm = "DEVICE"
+
+    cur.execute(
+        """
+        INSERT INTO sync_devices (
+            id, name, description, allowed_memberships_json,
+
+            active, access_device,
+
+            ip_address, mac_address, password, port_number,
+
+            access_data_mode,
+
+            model, installed_models_json, door_ids_json, zone,
+
+            show_notifications, win_notify_enabled, popup_enabled, popup_duration_sec, popup_show_image,
+
+            totp_prefix, totp_digits, totp_period_seconds, totp_drift_steps,
+            totp_max_past_age_seconds, totp_max_future_skew_seconds,
+
+            rfid_min_digits, rfid_max_digits,
+
+            pulse_time_ms, cmd_timeout_ms, timeout_ms,
+
+            rtlog_table, save_history, device_attendance_history_reading_delay_minutes, platform,
+
+            totp_enabled, rfid_enabled, fingerprint_enabled, face_id_enabled,
+
+            adaptive_sleep, busy_sleep_min_ms, busy_sleep_max_ms,
+            empty_sleep_min_ms, empty_sleep_max_ms,
+            empty_backoff_factor, empty_backoff_max_ms,
+
+            authorize_timezone_id, pushing_to_device_policy,
+
+            created_at, updated_at
+        )
+        VALUES (
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?, ?,
+            ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?
+        )
+        """,
+        (
+            d.get("id"),
+            d.get("name"),
+            d.get("description"),
+            json.dumps(d.get("allowedMemberships") or [], ensure_ascii=False),
+
+            _bool_to_i(d.get("active", True), default=1),
+            _bool_to_i(d.get("accessDevice", True), default=1),
+
+            d.get("ipAddress"),
+            d.get("macAddress"),
+            d.get("password"),
+            d.get("portNumber"),
+
+            adm,
+
+            d.get("model"),
+            json.dumps(d.get("installedModels") or [], ensure_ascii=False),
+            json.dumps(d.get("doorIds") or [], ensure_ascii=False),
+            d.get("zone"),
+
+            _bool_to_i(d.get("showNotifications", True), default=1),
+            _bool_to_i(d.get("winNotifyEnabled", True), default=1),
+            _bool_to_i(d.get("popupEnabled", True), default=1),
+            _to_int_or_none(d.get("popupDurationSec", 3)),
+            _bool_to_i(d.get("popupShowImage", True), default=1),
+
+            _safe_str(d.get("totpPrefix", "9"), "9"),
+            _to_int_or_none(d.get("totpDigits", 7)),
+            _to_int_or_none(d.get("totpPeriodSeconds", 30)),
+            _to_int_or_none(d.get("totpDriftSteps", 1)),
+            _to_int_or_none(d.get("totpMaxPastAgeSeconds", 32)),
+            _to_int_or_none(d.get("totpMaxFutureSkewSeconds", 3)),
+
+            _to_int_or_none(d.get("rfidMinDigits", 1)),
+            _to_int_or_none(d.get("rfidMaxDigits", 16)),
+
+            _to_int_or_none(d.get("pulseTimeMs", 3000)),
+            _to_int_or_none(d.get("cmdTimeoutMs", 4000)),
+            _to_int_or_none(d.get("timeoutMs", 5000)),
+
+            _safe_str(d.get("rtlogTable", "rtlog"), "rtlog"),
+            _bool_to_i(d.get("saveHistory", True), default=1),
+            _to_int_or_none(
+                d.get("deviceAttendanceHistoryReadingDelay", d.get("device_attendance_history_reading_delay"))
+            ),
+            d.get("platform"),
+
+            _bool_to_i(d.get("totpEnabled", True), default=1),
+            _bool_to_i(d.get("rfidEnabled", True), default=1),
+            _bool_to_i(d.get("fingerprintEnabled", False), default=0),
+            _bool_to_i(d.get("faceIdEnabled", False), default=0),
+
+            _bool_to_i(d.get("adaptiveSleep", True), default=1),
+            _to_int_or_none(d.get("busySleepMinMs", 0)),
+            _to_int_or_none(d.get("busySleepMaxMs", 500)),
+            _to_int_or_none(d.get("emptySleepMinMs", 200)),
+            _to_int_or_none(d.get("emptySleepMaxMs", 500)),
+            _to_float_or_none(d.get("emptyBackoffFactor", 1.35)),
+            _to_int_or_none(d.get("emptyBackoffMaxMs", 2000)),
+
+            _to_int_or_none(d.get("authorizeTimezoneId", 1)),
+            d.get("pushingToDevicePolicy") or d.get("pushing_to_device_policy"),
+
+            _safe_str(d.get("createdAt"), ""),
+            _safe_str(d.get("updatedAt"), ""),
+        ),
+    )
+
+
 def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     """
     Persist ActiveMemberResponse payload and normalized tables.
@@ -1342,8 +1549,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json,
-                    face_id, account_username_id, qr_code_payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    face_id, account_username_id, qr_code_payload, birthday
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -1361,6 +1568,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("faceId"),
                     u.get("accountUsernameId") or u.get("account_username_id"),
                     u.get("qrCodePayload"),
+                    u.get("birthday"),
                 ),
             )
 
@@ -1384,159 +1592,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
         # devices + synced door presets
         for d in devices:
-            if not isinstance(d, dict):
-                continue
-
-            # save presets (synced)
-            presets = d.get("doorPresets") or []
-            if isinstance(presets, list):
-                for p in presets:
-                    if not isinstance(p, dict):
-                        continue
-                    cur.execute(
-                        """
-                        INSERT INTO sync_device_door_presets (
-                            remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            _to_int_or_none(p.get("id")),
-                            _to_int_or_none(p.get("deviceId") or d.get("id")),
-                            _to_int_or_none(p.get("doorNumber")),
-                            _to_int_or_none(p.get("pulseSeconds")),
-                            _safe_str(p.get("doorName"), ""),
-                            _safe_str(p.get("createdAt"), None),
-                            _safe_str(p.get("updatedAt"), None),
-                        ),
-                    )
-
-            # normalize accessDataMode
-            adm_raw = d.get("accessDataMode") or d.get("access_data_mode") or "DEVICE"
-            adm = str(adm_raw or "").strip().upper()
-            if adm not in ("DEVICE", "AGENT", "ULTRA"):
-                adm = "DEVICE"
-
-            cur.execute(
-                """
-                INSERT INTO sync_devices (
-                    id, name, description, allowed_memberships_json,
-
-                    active, access_device,
-
-                    ip_address, mac_address, password, port_number,
-
-                    access_data_mode,
-
-                    model, installed_models_json, door_ids_json, zone,
-
-                    show_notifications, win_notify_enabled, popup_enabled, popup_duration_sec, popup_show_image,
-
-                    totp_prefix, totp_digits, totp_period_seconds, totp_drift_steps,
-                    totp_max_past_age_seconds, totp_max_future_skew_seconds,
-
-                    rfid_min_digits, rfid_max_digits,
-
-                    pulse_time_ms, cmd_timeout_ms, timeout_ms,
-
-                    rtlog_table, save_history, device_attendance_history_reading_delay_minutes, platform,
-
-                    totp_enabled, rfid_enabled, fingerprint_enabled, face_id_enabled,
-
-                    adaptive_sleep, busy_sleep_min_ms, busy_sleep_max_ms,
-                    empty_sleep_min_ms, empty_sleep_max_ms,
-                    empty_backoff_factor, empty_backoff_max_ms,
-
-                    authorize_timezone_id, pushing_to_device_policy,
-
-                    created_at, updated_at
-                )
-                VALUES (
-                    ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?, ?, ?,
-                    ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?, ?,
-                    ?, ?, ?, ?,
-                    ?, ?,
-                    ?, ?
-                )
-                """,
-                (
-                    d.get("id"),
-                    d.get("name"),
-                    d.get("description"),
-                    json.dumps(d.get("allowedMemberships") or [], ensure_ascii=False),
-
-                    _bool_to_i(d.get("active", True), default=1),
-                    _bool_to_i(d.get("accessDevice", True), default=1),
-
-                    d.get("ipAddress"),
-                    d.get("macAddress"),
-                    d.get("password"),
-                    d.get("portNumber"),
-
-                    adm,
-
-                    d.get("model"),
-                    json.dumps(d.get("installedModels") or [], ensure_ascii=False),
-                    json.dumps(d.get("doorIds") or [], ensure_ascii=False),
-                    d.get("zone"),
-
-                    _bool_to_i(d.get("showNotifications", True), default=1),
-                    _bool_to_i(d.get("winNotifyEnabled", True), default=1),
-                    _bool_to_i(d.get("popupEnabled", True), default=1),
-                    _to_int_or_none(d.get("popupDurationSec", 3)),
-                    _bool_to_i(d.get("popupShowImage", True), default=1),
-
-                    _safe_str(d.get("totpPrefix", "9"), "9"),
-                    _to_int_or_none(d.get("totpDigits", 7)),
-                    _to_int_or_none(d.get("totpPeriodSeconds", 30)),
-                    _to_int_or_none(d.get("totpDriftSteps", 1)),
-                    _to_int_or_none(d.get("totpMaxPastAgeSeconds", 32)),
-                    _to_int_or_none(d.get("totpMaxFutureSkewSeconds", 3)),
-
-                    _to_int_or_none(d.get("rfidMinDigits", 1)),
-                    _to_int_or_none(d.get("rfidMaxDigits", 16)),
-
-                    _to_int_or_none(d.get("pulseTimeMs", 3000)),
-                    _to_int_or_none(d.get("cmdTimeoutMs", 4000)),
-                    _to_int_or_none(d.get("timeoutMs", 5000)),
-
-                    _safe_str(d.get("rtlogTable", "rtlog"), "rtlog"),
-                    _bool_to_i(d.get("saveHistory", True), default=1),
-                    _to_int_or_none(
-                        d.get("deviceAttendanceHistoryReadingDelay", d.get("device_attendance_history_reading_delay"))
-                    ),
-                    d.get("platform"),
-
-                    _bool_to_i(d.get("totpEnabled", True), default=1),
-                    _bool_to_i(d.get("rfidEnabled", True), default=1),
-                    _bool_to_i(d.get("fingerprintEnabled", False), default=0),
-                    _bool_to_i(d.get("faceIdEnabled", False), default=0),
-
-                    _bool_to_i(d.get("adaptiveSleep", True), default=1),
-                    _to_int_or_none(d.get("busySleepMinMs", 0)),
-                    _to_int_or_none(d.get("busySleepMaxMs", 500)),
-                    _to_int_or_none(d.get("emptySleepMinMs", 200)),
-                    _to_int_or_none(d.get("emptySleepMaxMs", 500)),
-                    _to_float_or_none(d.get("emptyBackoffFactor", 1.35)),
-                    _to_int_or_none(d.get("emptyBackoffMaxMs", 2000)),
-
-                    _to_int_or_none(d.get("authorizeTimezoneId", 1)),
-                    d.get("pushingToDevicePolicy") or d.get("pushing_to_device_policy"),
-
-                    _safe_str(d.get("createdAt"), ""),
-                    _safe_str(d.get("updatedAt"), ""),
-                ),
-            )
+            _insert_device_row(cur, d)
 
         # infrastructures
         for inf in infrastructures:
@@ -1595,6 +1651,239 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         conn.commit()
 
 
+def save_sync_cache_delta(data: dict, refresh: dict) -> None:
+    """
+    Delta-aware cache update. Only replaces sections where refresh[section] is True.
+    Sections with refresh=False are left untouched in the local cache.
+
+    refresh = {
+        "members":     True/False,
+        "devices":     True/False,
+        "credentials": True/False,
+        "settings":    True/False,
+    }
+
+    H-006 guard only applies when refreshMembers=True AND backend returns 0 users.
+    """
+    if not data:
+        return
+
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+
+    updated_at = now_iso()
+    contract_status = bool(data.get("contractStatus", False))
+    contract_end_date = (data.get("contractEndDate") or "").strip()
+    access_settings = data.get("accessSoftwareSettings") or data.get("access_software_settings") or None
+    memberships = data.get("membership") or data.get("memberships") or []
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        # Always: update contract meta
+        cur.execute(
+            """
+            INSERT INTO sync_meta (id, contract_status, contract_end_date, updated_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                contract_status=excluded.contract_status,
+                contract_end_date=excluded.contract_end_date,
+                updated_at=excluded.updated_at
+            """,
+            (1 if contract_status else 0, contract_end_date, updated_at),
+        )
+
+        # Always: update access software settings
+        if isinstance(access_settings, dict):
+            s = access_settings
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO sync_access_software_settings (
+                        id, gym_id, access_server_host, access_server_port, access_server_enabled,
+                        image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
+                        event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
+                        decision_workers, decision_ema_alpha,
+                        history_retention_days, notification_rate_limit_per_minute, notification_dedupe_window_sec,
+                        notification_service_enabled, history_service_enabled,
+                        agent_sync_backend_refresh_min,
+                        default_authorize_door_id, sdk_read_initial_bytes,
+                        optional_data_sync_delay_minutes,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        gym_id=excluded.gym_id,
+                        access_server_host=excluded.access_server_host,
+                        access_server_port=excluded.access_server_port,
+                        access_server_enabled=excluded.access_server_enabled,
+                        image_cache_enabled=excluded.image_cache_enabled,
+                        image_cache_timeout_sec=excluded.image_cache_timeout_sec,
+                        image_cache_max_bytes=excluded.image_cache_max_bytes,
+                        image_cache_max_files=excluded.image_cache_max_files,
+                        event_queue_max=excluded.event_queue_max,
+                        notification_queue_max=excluded.notification_queue_max,
+                        history_queue_max=excluded.history_queue_max,
+                        popup_queue_max=excluded.popup_queue_max,
+                        decision_workers=excluded.decision_workers,
+                        decision_ema_alpha=excluded.decision_ema_alpha,
+                        history_retention_days=excluded.history_retention_days,
+                        notification_rate_limit_per_minute=excluded.notification_rate_limit_per_minute,
+                        notification_dedupe_window_sec=excluded.notification_dedupe_window_sec,
+                        notification_service_enabled=excluded.notification_service_enabled,
+                        history_service_enabled=excluded.history_service_enabled,
+                        agent_sync_backend_refresh_min=excluded.agent_sync_backend_refresh_min,
+                        default_authorize_door_id=excluded.default_authorize_door_id,
+                        sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
+                        optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
+                        created_at=excluded.created_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        1,
+                        _to_int_or_none(s.get("gymId") if "gymId" in s else s.get("gym_id")),
+                        _safe_str(s.get("accessServerHost") if "accessServerHost" in s else s.get("access_server_host"), ""),
+                        _to_int_or_none(s.get("accessServerPort") if "accessServerPort" in s else s.get("access_server_port")),
+                        _bool_to_i(s.get("accessServerEnabled", True), default=1),
+                        _bool_to_i(s.get("imageCacheEnabled", True), default=1),
+                        _to_int_or_none(s.get("imageCacheTimeoutSec", 2)),
+                        _to_int_or_none(s.get("imageCacheMaxBytes", 5242880)),
+                        _to_int_or_none(s.get("imageCacheMaxFiles", 1000)),
+                        _to_int_or_none(s.get("eventQueueMax", 5000)),
+                        _to_int_or_none(s.get("notificationQueueMax", 5000)),
+                        _to_int_or_none(s.get("historyQueueMax", 5000)),
+                        _to_int_or_none(s.get("popupQueueMax", 5000)),
+                        _to_int_or_none(s.get("decisionWorkers", 1)),
+                        _to_float_or_none(s.get("decisionEmaAlpha", 0.2)),
+                        _to_int_or_none(s.get("historyRetentionDays", 30)),
+                        _to_int_or_none(s.get("notificationRateLimitPerMinute", 30)),
+                        _to_int_or_none(s.get("notificationDedupeWindowSec", 30)),
+                        _bool_to_i(s.get("notificationServiceEnabled", True), default=1),
+                        _bool_to_i(s.get("historyServiceEnabled", True), default=1),
+                        _to_int_or_none(s.get("agentSyncBackendRefreshMin", 30)),
+                        _to_int_or_none(s.get("defaultAuthorizeDoorId", 15)),
+                        _to_int_or_none(s.get("sdkReadInitialBytes", 1048576)),
+                        _to_int_or_none(s.get("optionalDataSyncDelayMinutes", 60)),
+                        _safe_str(s.get("createdAt"), ""),
+                        _safe_str(s.get("updatedAt"), updated_at) or updated_at,
+                    ),
+                )
+            except Exception:
+                pass  # never break sync
+
+        # Always: update membership types
+        cur.execute("DELETE FROM sync_memberships")
+        for m in memberships:
+            if not isinstance(m, dict):
+                continue
+            cur.execute(
+                "INSERT INTO sync_memberships (id, title, description, price, duration_in_days) VALUES (?, ?, ?, ?, ?)",
+                (m.get("id"), m.get("title"), m.get("description"), m.get("price"), m.get("durationInDays")),
+            )
+
+        # Conditional: members (users + fingerprints)
+        if refresh.get("members", True):
+            users = data.get("users") or []
+            if not users:
+                old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                if old_count > 10:
+                    _logger.error(
+                        f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
+                        f"but local cache has {old_count}. Refusing to clear — likely backend error."
+                    )
+                    conn.commit()
+                    return
+            cur.execute("DELETE FROM sync_users")
+            for u in users:
+                if not isinstance(u, dict):
+                    continue
+                fps = u.get("fingerprints") or []
+                if not isinstance(fps, list):
+                    fps = []
+                am_id = u.get("activeMembershipId")
+                m_id = u.get("membershipId")
+                if am_id is None or str(am_id).strip() == "":
+                    am_id = m_id
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO sync_users (
+                        user_id, active_membership_id, membership_id,
+                        full_name, phone, email, valid_from, valid_to,
+                        first_card_id, second_card_id, image,
+                        fingerprints_json, face_id, account_username_id, qr_code_payload, birthday
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        u.get("userId"), am_id, m_id,
+                        u.get("fullName"), u.get("phone"), u.get("email"),
+                        u.get("validFrom"), u.get("validTo"),
+                        u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
+                        json.dumps(fps, ensure_ascii=False),
+                        u.get("faceId"),
+                        u.get("accountUsernameId") or u.get("account_username_id"),
+                        u.get("qrCodePayload"), u.get("birthday"),
+                    ),
+                )
+
+        # Conditional: devices
+        if refresh.get("devices", True):
+            cur.execute("DELETE FROM sync_devices")
+            cur.execute("DELETE FROM sync_device_door_presets")
+            for d in (data.get("devices") or []):
+                _insert_device_row(cur, d)
+
+        # Conditional: credentials
+        if refresh.get("credentials", True):
+            cur.execute("DELETE FROM sync_gym_access_credentials")
+            for c in (data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []):
+                if not isinstance(c, dict):
+                    continue
+                granted_ids = c.get("grantedActiveMembershipIds")
+                if not isinstance(granted_ids, list):
+                    granted_ids = []
+                cur.execute(
+                    """
+                    INSERT INTO sync_gym_access_credentials (
+                        id, gym_id, account_id, secret_hex, enabled,
+                        rotated_at, created_at, updated_at,
+                        granted_active_membership_ids_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        _to_int_or_none(c.get("id")),
+                        _to_int_or_none(c.get("gymId") if "gymId" in c else c.get("gym_id")),
+                        _to_int_or_none(c.get("accountId") if "accountId" in c else c.get("account_id")),
+                        str((c.get("secretHex") if "secretHex" in c else c.get("secret_hex")) or ""),
+                        1 if bool(c.get("enabled", False)) else 0,
+                        c.get("rotatedAt") or c.get("rotated_at"),
+                        c.get("createdAt") or c.get("created_at"),
+                        c.get("updatedAt") or c.get("updated_at"),
+                        json.dumps(granted_ids, ensure_ascii=False),
+                    ),
+                )
+
+        # Conditional: settings (infrastructures)
+        if refresh.get("settings", True):
+            cur.execute("DELETE FROM sync_infrastructures")
+            for z in (data.get("infrastructures") or data.get("infrastructure") or []):
+                if not isinstance(z, dict):
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO sync_infrastructures (id, name, gym_agent_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        z.get("id"),
+                        z.get("name"),
+                        json.dumps(z.get("gymAgent") or {}, ensure_ascii=False),
+                        z.get("createdAt"),
+                        z.get("updatedAt"),
+                    ),
+                )
+
+        conn.commit()
+
+
 def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
     def g(*keys, default=None):
         for k in keys:
@@ -1635,6 +1924,7 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "faceId": g("faceId", "face_id"),
         "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
         "qrCodePayload": g("qrCodePayload", "qr_code_payload"),
+        "birthday": g("birthday"),
     }
 
 
