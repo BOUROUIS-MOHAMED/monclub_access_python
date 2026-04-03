@@ -950,9 +950,11 @@ class DecisionService(threading.Thread):
         self.device_name_provider = device_name_provider or (lambda did: f"device-{did}")
 
         self._cache_lock = threading.Lock()
-        # L-005: Cache TTL now configurable from backend settings (was hardcoded 2.0)
+        # L-005: Cache TTL now configurable from backend settings (default 30s)
+        # Increased from 2s to 30s: load_sync_cache() with 1000+ users was adding
+        # 200-500ms to every decision that expired the 2s window.
         _g_settings = global_settings() if global_settings else {}
-        self._cache_ttl_sec = float(_g_settings.get("decision_cache_ttl_sec", 2.0))
+        self._cache_ttl_sec = float(_g_settings.get("decision_cache_ttl_sec", 30.0))
 
         self._creds_cache_at = 0.0
         self._creds_cache: List[Dict[str, Any]] = []

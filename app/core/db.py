@@ -2493,8 +2493,15 @@ def load_sync_cache() -> SyncCacheState | None:
 
 
 def list_sync_users() -> List[Dict[str, Any]]:
-    cache = load_sync_cache()
-    return list(cache.users) if cache else []
+    """Direct query — avoids loading memberships/devices/infra via load_sync_cache() hot path."""
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM sync_users").fetchall()]
+    users = [_coerce_user_row_to_payload(r) for r in rows]
+    try:
+        users.extend(list_projected_offline_users(base_users=users))
+    except Exception:
+        pass
+    return users
 
 
 def list_sync_memberships() -> List[Dict[str, Any]]:
@@ -2582,8 +2589,11 @@ def get_sync_access_software_settings_payload() -> Optional[Dict[str, Any]]:
 
 
 def list_sync_gym_access_credentials() -> List[Dict[str, Any]]:
-    cache = load_sync_cache()
-    return list(cache.gym_access_credentials) if cache else []
+    """Direct query — avoids full load_sync_cache() on the hot verification path."""
+    with get_conn() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM sync_gym_access_credentials").fetchall()]
+    rows = [_expand_gym_access_credential_json_fields(r) for r in rows]
+    return [_coerce_gym_access_credential_row_to_payload(r) for r in rows]
 
 
 # -----------------------------
