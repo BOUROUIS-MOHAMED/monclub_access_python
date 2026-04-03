@@ -720,7 +720,36 @@ class DeviceSyncEngine:
                     pairs = [f"Pin={pin}", f"Name={full_name}"]
                     if card:
                         pairs.append(f"CardNo={card}")
-                    sdk.set_device_data(table="user", data="\t".join(pairs) + "\r\n", options="")
+                    _user_data = "\t".join(pairs) + "\r\n"
+                    try:
+                        sdk.set_device_data(table="user", data=_user_data, options="")
+                    except PullSDKError as _set_err:
+                        if "rc=-101" not in str(_set_err):
+                            raise
+                        # rc=-101 = duplicate pin — device_pins was incomplete (GetDeviceData
+                        # returned fewer pins than actually on the device). Force-delete the
+                        # stale user row and retry once so the insert succeeds.
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 (duplicate) "
+                            "— force-deleting stale row and retrying",
+                            dev_id, pin,
+                        )
+                        # Also clear auth/templates so delete_user won't fail on FK constraints.
+                        self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                        try:
+                            sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
+                        except Exception as _del_ex:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s Pin=%s force-delete failed: %s — giving up",
+                                dev_id, pin, _del_ex,
+                            )
+                            raise _set_err from None
+                        # Retry the insert now that the row is gone.
+                        sdk.set_device_data(table="user", data=_user_data, options="")
+                        self.logger.info(
+                            "[DeviceSync] Device id=%s Pin=%s retry after force-delete OK",
+                            dev_id, pin,
+                        )
                     pushed_users += 1
 
                     # 2) authorize (respect backend timezone id)
