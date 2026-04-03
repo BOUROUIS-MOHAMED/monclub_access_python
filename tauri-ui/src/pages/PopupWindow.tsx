@@ -5,6 +5,12 @@ import type { PopupEvent } from "@/api/types";
 const API_PORT = 8788;
 const API_BASE = `http://127.0.0.1:${API_PORT}/api/v2`;
 
+// ── Timing constants ──────────────────────────────────────────────────────────
+const MIN_SHOW_MS = 2000;   // never interrupt a notification before this
+const MAX_SHOW_MS = 8000;   // go idle this long after last event
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 function toPopupEvent(raw: any): PopupEvent {
   const eventId = String(raw?.eventId ?? raw?.id ?? `evt-${Date.now()}`);
   const userFullName = String(raw?.userFullName ?? raw?.fullName ?? "");
@@ -62,13 +68,68 @@ function InfoCell({ label, value }: { label: string; value: string }) {
 
 const CONFETTI = ["#facc15", "#f472b6", "#a78bfa", "#34d399", "#fb923c", "#60a5fa"];
 
+// ── Idle screen ───────────────────────────────────────────────────────────────
+
+function IdleScreen({ gymName }: { gymName: string }) {
+  return (
+    <div
+      className="h-screen w-screen flex flex-col items-center justify-center gap-8 select-none"
+      style={{ background: "#050505" }}
+    >
+      {/* logo */}
+      <img
+        src="/logo.png"
+        alt="MonClub"
+        style={{ width: 160, height: 160, objectFit: "contain", opacity: 0.85 }}
+      />
+      {/* gym name */}
+      <p
+        className="font-black tracking-[0.25em] uppercase text-center"
+        style={{ color: "#52525b", fontSize: "clamp(1.2rem, 2.5vw, 2rem)" }}
+      >
+        {gymName || "MonClub Access"}
+      </p>
+    </div>
+  );
+}
+
+// ── Main component ─────────────────────────────────────────────────────────────
+
 export default function PopupWindow() {
-  const [notification, setNotification] = useState<PopupEvent | null>(null);
+  const [phase, setPhase] = useState<"idle" | "showing">("idle");
+  const [current, setCurrent] = useState<PopupEvent | null>(null);
   const [imgSrc, setImgSrc] = useState<string | null>(null);
-  const [showData, setShowData] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [gymName, setGymName] = useState<string>("");
+
+  // Refs — used inside callbacks to avoid stale closures
+  const phaseRef = useRef<"idle" | "showing">("idle");
+  const showSinceRef = useRef<number>(0);
+  const pendingRef = useRef<PopupEvent | null>(null);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const minTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastShownIdRef = useRef<string>("");
   const lastLocalEventIdRef = useRef<string>("");
-  const lastShownEventIdRef = useRef<string>("");
+
+  // Keep phaseRef in sync
+  const setPhaseSync = useCallback((p: "idle" | "showing") => {
+    phaseRef.current = p;
+    setPhase(p);
+  }, []);
+
+  // Fetch gym name once on mount
+  useEffect(() => {
+    fetch(`${API_BASE}/status`)
+      .then((r) => r.json())
+      .then((d) => {
+        const name =
+          d?.session?.gymName ||
+          d?.gymName ||
+          d?.session?.organizationName ||
+          "";
+        if (name) setGymName(String(name));
+      })
+      .catch(() => {});
+  }, []);
 
   const resolveImage = useCallback((evt: PopupEvent) => {
     if (!evt.popupShowImage) { setImgSrc(null); return; }
@@ -78,42 +139,88 @@ export default function PopupWindow() {
     setImgSrc(`${API_BASE}/image-cache?url=${encodeURIComponent(img)}`);
   }, []);
 
-  const showNotification = useCallback((evt: PopupEvent) => {
-    if (evt.eventId && evt.eventId === lastShownEventIdRef.current) return;
-    lastShownEventIdRef.current = evt.eventId || "";
-    setNotification(evt);
-    setShowData(true);
-    resolveImage(evt);
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(
-      () => setShowData(false),
-      Math.max(1, Number(evt.popupDurationSec || 5)) * 1000,
-    );
-  }, [resolveImage]);
+  // showEvent — transitions to "showing" state with proper timers
+  const showEvent = useCallback((evt: PopupEvent) => {
+    pendingRef.current = null;
+    if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+    if (minTimerRef.current) clearTimeout(minTimerRef.current);
 
-  // Channel 1 — Direct SSE
+    lastShownIdRef.current = evt.eventId || "";
+    showSinceRef.current = Date.now();
+    setCurrent(evt);
+    setPhaseSync("showing");
+    resolveImage(evt);
+
+    // After MAX_SHOW_MS with no new events → go idle
+    idleTimerRef.current = setTimeout(() => {
+      pendingRef.current = null;
+      setPhaseSync("idle");
+    }, MAX_SHOW_MS);
+
+    // After MIN_SHOW_MS → pick up any queued event
+    minTimerRef.current = setTimeout(() => {
+      const next = pendingRef.current;
+      if (next) {
+        pendingRef.current = null;
+        showEvent(next);
+      }
+    }, MIN_SHOW_MS);
+  }, [resolveImage, setPhaseSync]);
+
+  // handleEvent — the single entry point for all incoming events
+  const handleEvent = useCallback((evt: PopupEvent) => {
+    // Global deduplicate
+    if (evt.eventId && evt.eventId === lastShownIdRef.current) return;
+
+    if (phaseRef.current === "idle") {
+      // Screen is idle — show immediately
+      showEvent(evt);
+      return;
+    }
+
+    // Currently showing: respect MIN_SHOW_MS
+    const elapsed = Date.now() - showSinceRef.current;
+    if (elapsed >= MIN_SHOW_MS) {
+      // Min time already served — switch now
+      showEvent(evt);
+    } else {
+      // Too soon — queue it (only keep the latest incoming event)
+      pendingRef.current = evt;
+    }
+  }, [showEvent]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      if (minTimerRef.current) clearTimeout(minTimerRef.current);
+    };
+  }, []);
+
+  // Channel 1 — Direct SSE from backend
   useEffect(() => {
     const es = openSSE("/agent/events?replayLast=1", (type, data) => {
       if (type !== "popup" && type !== "notification") return;
-      try { showNotification(toPopupEvent(typeof data === "string" ? JSON.parse(data) : data)); }
-      catch { /* ignore */ }
+      try {
+        handleEvent(toPopupEvent(typeof data === "string" ? JSON.parse(data) : data));
+      } catch { /* ignore */ }
     });
-    return () => { es.close(); if (timerRef.current) clearTimeout(timerRef.current); };
-  }, [showNotification]);
+    return () => { es.close(); };
+  }, [handleEvent]);
 
   // Channel 2 — Tauri IPC
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     import("@tauri-apps/api/event")
       .then(({ listen }) => listen<any>("popup-notification", (e) => {
-        try { showNotification(toPopupEvent(e.payload)); } catch { /* ignore */ }
+        try { handleEvent(toPopupEvent(e.payload)); } catch { /* ignore */ }
       }))
       .then((fn) => { unlisten = fn; })
       .catch(() => { /* browser mode */ });
     return () => { if (unlisten) unlisten(); };
-  }, [showNotification]);
+  }, [handleEvent]);
 
-  // Channel 3 — localStorage polling
+  // Channel 3 — localStorage polling (fallback / cross-window)
   useEffect(() => {
     const read = () => {
       try {
@@ -122,38 +229,41 @@ export default function PopupWindow() {
         const parsed = toPopupEvent(JSON.parse(raw));
         if (!parsed.eventId || parsed.eventId === lastLocalEventIdRef.current) return;
         lastLocalEventIdRef.current = parsed.eventId;
-        showNotification(parsed);
+        handleEvent(parsed);
       } catch { /* ignore */ }
     };
     const onStorage = (e: StorageEvent) => { if (e.key === "popupEvent") read(); };
     read();
     window.addEventListener("storage", onStorage);
     const id = window.setInterval(read, 500);
-    return () => { window.removeEventListener("storage", onStorage); window.clearInterval(id); };
-  }, [showNotification]);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.clearInterval(id);
+    };
+  }, [handleEvent]);
 
-  if (!notification) return <div className="h-screen w-screen bg-black" />;
+  // ── Idle screen ────────────────────────────────────────────────────────────
+  if (phase === "idle" || !current) {
+    return <IdleScreen gymName={gymName} />;
+  }
 
-  const n = notification;
+  // ── Notification screen ───────────────────────────────────────────────────
+  const n = current;
   const isAllowed = Boolean(n.allowed);
   const isBirthday = isTodayBirthday(n.userBirthday);
   const initial = (n.userFullName || "?")[0].toUpperCase();
 
-  // ── colour scheme ──
-  const accentColor  = isBirthday ? "#f59e0b" : isAllowed ? "#10b981" : "#ef4444";
-  const glowHex      = isBirthday ? "250,159,21"  : isAllowed ? "16,185,129" : "239,68,68";
-  const statusLabel  = isBirthday ? "Joyeux Anniversaire !" : isAllowed ? "Accès Autorisé" : "Accès Refusé";
-  const statusIcon   = isBirthday ? "🎂" : isAllowed ? "✓" : "✗";
-  const noBgFrom     = isBirthday ? "#451a03" : isAllowed ? "#022c22" : "#2d0a0a";
-  const noBgTo       = "#050505";
+  const accentColor = isBirthday ? "#f59e0b" : isAllowed ? "#10b981" : "#ef4444";
+  const glowHex     = isBirthday ? "250,159,21"  : isAllowed ? "16,185,129" : "239,68,68";
+  const statusLabel = isBirthday ? "Joyeux Anniversaire !" : isAllowed ? "Accès Autorisé" : "Accès Refusé";
+  const statusIcon  = isBirthday ? "🎂" : isAllowed ? "✓" : "✗";
+  const noBgFrom    = isBirthday ? "#451a03" : isAllowed ? "#022c22" : "#2d0a0a";
+  const noBgTo      = "#050505";
 
   return (
-    <div
-      className="h-screen w-screen flex overflow-hidden select-none relative"
-      style={{ opacity: showData ? 1 : 0.18, transition: "opacity 0.6s ease" }}
-    >
+    <div className="h-screen w-screen flex overflow-hidden select-none relative">
       {/* ── CONFETTI (birthday only) ── */}
-      {isBirthday && showData && (
+      {isBirthday && (
         <div className="absolute inset-0 pointer-events-none overflow-hidden z-30">
           {[...Array(28)].map((_, i) => (
             <div
@@ -195,22 +305,18 @@ export default function PopupWindow() {
             </span>
           </div>
         )}
-        {/* gradient fade to right → dark panel */}
         <div
           className="absolute inset-0"
           style={{ background: "linear-gradient(to right, transparent 55%, #050505 100%)" }}
         />
-        {/* bottom vignette */}
         <div
           className="absolute inset-0"
           style={{ background: "linear-gradient(to top, #050505 0%, transparent 35%)" }}
         />
-        {/* top vignette */}
         <div
           className="absolute inset-0"
           style={{ background: "linear-gradient(to bottom, #050505 0%, transparent 20%)" }}
         />
-        {/* colored vertical stripe along right edge */}
         <div
           className="absolute top-0 bottom-0 right-0 w-1"
           style={{ background: accentColor, opacity: 0.6 }}
@@ -238,10 +344,7 @@ export default function PopupWindow() {
 
         {/* status badge */}
         <div className="flex items-center gap-4 mb-6 relative">
-          <span
-            className="text-2xl font-black leading-none"
-            style={{ color: accentColor }}
-          >
+          <span className="text-2xl font-black leading-none" style={{ color: accentColor }}>
             {statusIcon}
           </span>
           <span
@@ -257,7 +360,7 @@ export default function PopupWindow() {
           )}
         </div>
 
-        {/* ── NAME ── big and bold */}
+        {/* name */}
         <h1
           className="font-black text-white relative z-10 leading-none mb-4"
           style={{
@@ -289,12 +392,7 @@ export default function PopupWindow() {
         {/* divider */}
         <div
           className="rounded-full mb-8"
-          style={{
-            height: 3,
-            width: "4rem",
-            background: accentColor,
-            opacity: 0.8,
-          }}
+          style={{ height: 3, width: "4rem", background: accentColor, opacity: 0.8 }}
         />
 
         {/* info grid */}
