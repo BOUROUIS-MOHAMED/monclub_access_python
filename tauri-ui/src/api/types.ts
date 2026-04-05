@@ -82,7 +82,18 @@ export interface StatusResponse extends ApiOk {
   session: SessionBlock;
   mode: ModeBlock;
   sync: SyncBlock;
-  deviceSync: { lastRunAt: string | null; lastOk: boolean; lastError: string | null };
+  deviceSync: {
+    lastRunAt: string | null;
+    lastOk: boolean;
+    lastError: string | null;
+    progress: {
+      running: boolean;
+      deviceName: string;
+      deviceId: number | null;
+      current: number;
+      total: number;
+    } | null;
+  };
   pullsdk: PullSdkBlock;
   agent: AgentBlock;
   updates: UpdatesBlock;

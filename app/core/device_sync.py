@@ -141,6 +141,15 @@ class DeviceSyncEngine:
         self.logger = logger
         self._run_lock = threading.Lock()
         self._running = False
+        # Live progress for the frontend banner (thread-safe: dict value
+        # assignments are atomic under CPython GIL).
+        self._sync_progress: Dict[str, Any] = {
+            "running": False,
+            "deviceName": "",
+            "deviceId": None,
+            "current": 0,
+            "total": 0,
+        }
 
     def run_blocking(self, *, cache, source: str = "timer") -> bool:
         with self._run_lock:
@@ -717,6 +726,12 @@ class DeviceSyncEngine:
             ok_synced = 0
             failed_synced = 0
 
+            # Update live progress for the frontend banner
+            self._sync_progress["deviceName"] = dev_name or ""
+            self._sync_progress["deviceId"] = did
+            self._sync_progress["current"] = 0
+            self._sync_progress["total"] = len(pins_to_sync)
+
             for pin in sorted(pins_to_sync):
                 u = desired.get(pin)
                 if not isinstance(u, dict):
@@ -827,12 +842,14 @@ class DeviceSyncEngine:
                         error=None,
                     )
                     ok_synced += 1
+                    self._sync_progress["current"] = ok_synced + failed_synced
                     self.logger.debug(
                         "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin
                     )
 
                 except Exception as ex:
                     failed_synced += 1
+                    self._sync_progress["current"] = ok_synced + failed_synced
                     save_device_sync_state(
                         device_id=did,
                         pin=pin,
@@ -920,6 +937,9 @@ class DeviceSyncEngine:
             "[DeviceSync] device_mode_devices to sync: %d", len(device_mode_devices)
         )
 
+        # Signal frontend banner: sync in progress
+        self._sync_progress["running"] = True
+
         # F-008: Run device syncs in parallel (max_workers=4, safe bounded parallelism)
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
@@ -951,3 +971,8 @@ class DeviceSyncEngine:
                         "[DeviceSync] device id=%s name=%r sync FAILED (unexpected): %s",
                         dev_id, dev_name, e,
                     )
+
+        # Clear banner after all devices are done
+        self._sync_progress["running"] = False
+        self._sync_progress["current"] = 0
+        self._sync_progress["total"] = 0
