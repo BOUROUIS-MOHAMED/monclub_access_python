@@ -263,7 +263,7 @@ export default function TvUpdatePage() {
                         disabled={installing}
                       >
                         {installing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
-                        Install now
+                        Restart to update
                       </Button>
                       <Button
                         variant="outline"
