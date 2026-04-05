@@ -815,6 +815,39 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True})
 
 
+def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
+    """Validate the gym admin-agent / statistics password.
+
+    Body: { "password": "<plain-text>" }
+    Returns 200 { ok: true } on success, 401 { ok: false, error: "..." } on wrong password.
+    """
+    body = ctx.body()
+    password = _safe_str(body.get("password"), "")
+    if not password:
+        ctx.send_json(400, {"ok": False, "error": "password is required"})
+        return
+
+    from access.store import load_auth_token
+    auth = load_auth_token()
+    if not auth or not auth.token:
+        ctx.send_json(401, {"ok": False, "error": "Not authenticated"})
+        return
+
+    try:
+        api = ctx.app._api()
+        valid = api.validate_statistics_password(token=auth.token, password=password)
+        if valid:
+            ctx.send_json(200, {"ok": True})
+        else:
+            ctx.send_json(401, {"ok": False, "error": "Mot de passe incorrect"})
+    except MonClubApiHttpError as e:
+        ctx.app.logger.warning("verify_admin_password: HTTP %s", e.status_code)
+        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except Exception as e:
+        ctx.app.logger.exception("verify_admin_password failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
 # ==================== 3) CONFIG ====================
 
 _CONFIG_SENSITIVE = {"password", "commPassword", "comm_password"}

@@ -175,6 +175,37 @@ class MonClubApi:
 
         return data
 
+    def validate_statistics_password(self, *, token: str, password: str, timeout: int = 10) -> bool:
+        """Validate the gym statistics/admin-agent password against the backend.
+
+        Returns True if the password is correct, False if wrong (401).
+        Raises MonClubApiHttpError for unexpected HTTP errors.
+        """
+        from urllib.parse import urlparse
+        parsed = urlparse(self.endpoints.login_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        url = f"{base}/connected/account/openStatisticsInfo"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        try:
+            r = self._session.post(url, json={"password": password}, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"validate_statistics_password request failed: {e}") from e
+
+        if r.status_code == 200:
+            return True
+        if r.status_code == 401:
+            return False
+        txt = (r.text or "").strip()
+        raise MonClubApiHttpError(
+            f"validate_statistics_password: HTTP {r.status_code}",
+            status_code=r.status_code,
+            body=txt,
+        )
+
     def create_user_fingerprint(self, *, token: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
         url = (self.endpoints.create_user_fingerprint_url or "").strip()
         if not url:

@@ -17,6 +17,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/auth/login", "_handle_auth_login"),
     ("GET", "/api/v2/auth/status", "_handle_auth_status"),
     ("POST", "/api/v2/auth/logout", "_handle_auth_logout"),
+    ("POST", "/api/v2/auth/verify-admin-password", "_handle_auth_verify_admin_password"),
     ("GET", "/api/v2/config", "_handle_config_get"),
     ("PATCH", "/api/v2/config", "_handle_config_patch"),
     ("POST", "/api/v2/config/restart-local-api", "_handle_config_restart_api"),
