@@ -399,6 +399,8 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "popupEnabled": req.popup_enabled,
         "winNotifyEnabled": req.win_notify_enabled,
         "userBirthday": req.user_birthday,
+        "imageSource": req.image_source,
+        "userImageStatus": req.user_image_status,
     }
 
 
@@ -769,12 +771,12 @@ class DeviceWorker(threading.Thread):
                 # adaptive sleep knobs
                 adaptive_sleep = bool(settings.get("adaptive_sleep", True))
                 busy_min = float(_safe_int(settings.get("busy_sleep_min_ms"), 0))
-                busy_max = float(_safe_int(settings.get("busy_sleep_max_ms"), 50))
+                busy_max = float(_safe_int(settings.get("busy_sleep_max_ms"), 20))
                 if busy_max < busy_min:
                     busy_max = busy_min
 
-                empty_min = float(_safe_int(settings.get("empty_sleep_min_ms"), 200))
-                empty_max = float(_safe_int(settings.get("empty_sleep_max_ms"), 500))
+                empty_min = float(_safe_int(settings.get("empty_sleep_min_ms"), 50))
+                empty_max = float(_safe_int(settings.get("empty_sleep_max_ms"), 100))
                 if empty_max < empty_min:
                     empty_max = empty_min
 
@@ -784,7 +786,7 @@ class DeviceWorker(threading.Thread):
                 if empty_factor > 3.0:
                     empty_factor = 3.0
 
-                empty_backoff_max = float(_safe_int(settings.get("empty_backoff_max_ms"), 2000))
+                empty_backoff_max = float(_safe_int(settings.get("empty_backoff_max_ms"), 200))
                 if empty_backoff_max < 0:
                     empty_backoff_max = 0.0
 
@@ -845,6 +847,7 @@ class DeviceWorker(threading.Thread):
                             event_time=event_time_str,
                             raw=r if isinstance(r, dict) else {"raw": _safe_str(r)},
                             poll_ms=float(poll_ms),
+                            queued_at=_now_ms(),
                         )
 
                         self.logger.debug(
@@ -1011,9 +1014,14 @@ class DecisionService(threading.Thread):
                 continue
 
             settings = self.settings_provider(ev.device_id)
+            queue_ms = _now_ms() - ev.queued_at if ev.queued_at > 0 else 0.0
             t0 = _now_ms()
 
+            t_load = _now_ms()
             creds_payload, users_by_am, users_by_card = self._load_local_state()
+            load_ms = _now_ms() - t_load
+
+            t_verify = _now_ms()
             vr = self._verify_totp(
                 scanned=ev.card_no,
                 settings=settings,
@@ -1021,6 +1029,7 @@ class DecisionService(threading.Thread):
                 users_by_am=users_by_am,
                 users_by_card=users_by_card,
             )
+            verify_ms = _now_ms() - t_verify
 
             allowed = bool(vr.get("allowed", False))
             reason = _safe_str(vr.get("reason", "DENY"))
@@ -1035,9 +1044,9 @@ class DecisionService(threading.Thread):
 
             self.logger.info(
                 "[RT][device=%s] DECISION: card=%r allowed=%s reason=%s scan_mode=%s "
-                "door_id=%s decision_ms=%.1f event_id=%s",
+                "door_id=%s | pollMs=%.1f queueMs=%.1f loadMs=%.1f verifyMs=%.1f decisionMs=%.1f | event_id=%s",
                 ev.device_id, ev.card_no, allowed, reason, scan_mode,
-                door_id, decision_ms, ev.event_id,
+                door_id, ev.poll_ms, queue_ms, load_ms, verify_ms, decision_ms, ev.event_id,
             )
 
             # F-013: INSERT OR IGNORE into access_history BEFORE opening door.

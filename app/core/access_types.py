@@ -15,6 +15,7 @@ class AccessEvent:
     event_time: str
     raw: Dict[str, Any]
     poll_ms: float
+    queued_at: float = 0.0  # perf_counter ms when event was put in queue
 
 
 @dataclass
@@ -37,6 +38,8 @@ class NotificationRequest:
     reason: str = ""
     scan_mode: str = ""
     user_birthday: str = ""
+    image_source: str = ""
+    user_image_status: str = ""
     popup_duration_sec: int = 3
     popup_enabled: bool = True
     win_notify_enabled: bool = True
