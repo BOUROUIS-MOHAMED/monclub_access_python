@@ -4,12 +4,11 @@ import { post } from "@/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
-import { Progress } from "@/components/ui/progress";
 import StatusChip from "@/components/StatusChip2";
 import { cn } from "@/lib/utils";
 import {
   RefreshCw, Router, Bot, Users, CheckCircle, Monitor,
-  Bug, AlertTriangle, Play, Square, Upload,
+  Bug, AlertTriangle, Play, Square,
 } from "lucide-react";
 
 function Panel({
@@ -65,38 +64,9 @@ export default function DashboardPage() {
   const mode = status.mode;
   const sync = status.sync;
   const agent = status.agent;
-  const dsp = status.deviceSync?.progress;
-  const dspRunning = dsp?.running && (dsp.total ?? 0) > 0;
-  const dspPct = dspRunning && dsp.total > 0 ? Math.round((dsp.current / dsp.total) * 100) : 0;
 
   return (
     <div className="space-y-5">
-      {/* Device sync progress banner */}
-      {dspRunning && (
-        <div className="rounded-xl border border-primary/30 bg-primary/5 px-5 py-4 space-y-3">
-          <div className="flex items-center gap-2.5">
-            <Upload className="h-4 w-4 text-primary animate-pulse" />
-            <span className="text-[13px] font-semibold tracking-tight">
-              Envoi des utilisateurs vers l'appareil
-              {dsp.deviceName ? ` "${dsp.deviceName}"` : ""}
-            </span>
-          </div>
-          <Progress value={dspPct} className="h-2" />
-          <div className="flex items-center justify-between text-[12px] text-muted-foreground">
-            <span>
-              <span className="font-mono font-semibold text-foreground">{dsp.current}</span>
-              {" / "}
-              <span className="font-mono font-semibold text-foreground">{dsp.total}</span>
-              {" utilisateurs"}
-            </span>
-            <span className="font-mono">{dspPct}%</span>
-          </div>
-          <p className="text-[11px] text-muted-foreground/80">
-            Veuillez ne pas fermer l'application pendant la synchronisation.
-          </p>
-        </div>
-      )}
-
       {/* Expiry warnings */}
       {s.loginWarning && s.loginDaysRemaining != null && s.loginDaysRemaining > 0 && (
         <Alert variant="warning">

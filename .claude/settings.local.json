@@ -163,7 +163,10 @@
       "WebFetch(domain:bdragon300.github.io)",
       "WebFetch(domain:api.github.com)",
       "Bash(curl -s https://raw.githubusercontent.com/bdragon300/pyzkaccess/master/pyzkaccess/param.py)",
-      "Bash(curl -s https://raw.githubusercontent.com/bdragon300/pyzkaccess/master/pyzkaccess/door.py)"
+      "Bash(curl -s https://raw.githubusercontent.com/bdragon300/pyzkaccess/master/pyzkaccess/door.py)",
+      "Bash(find /d/projects/MonClub/monclub_backend -type f -name *.py)",
+      "Bash(find /d/projects/MonClub/monclub_backend -type f \\\\\\(-name *.java -o -name *.kt \\\\\\))",
+      "Bash(grep -r \"allowedMemberships\\\\|allowed_memberships\\\\|allowedMembership\" /d/projects/MonClub/monclub_backend --include=*.java --include=*.kt)"
     ]
   }
 }

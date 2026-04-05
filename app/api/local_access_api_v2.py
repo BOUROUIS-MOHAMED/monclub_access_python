@@ -447,19 +447,10 @@ def _handle_status(ctx: _Ctx) -> None:
     updates["progress"] = updates.get("progressPercent")
 
     # H-005: Device sync telemetry from MainApp instead of placeholders
-    _ds_engine = getattr(ctx.app, "_device_sync_engine", None)
-    _ds_prog = getattr(_ds_engine, "_sync_progress", None) if _ds_engine else None
     device_sync = {
         "lastRunAt": getattr(ctx.app, "_last_device_sync_at", None),
         "lastOk": getattr(ctx.app, "_last_device_sync_ok", True),
         "lastError": getattr(ctx.app, "_last_device_sync_error", None),
-        "progress": {
-            "running": _ds_prog.get("running", False),
-            "deviceName": _ds_prog.get("deviceName", ""),
-            "deviceId": _ds_prog.get("deviceId"),
-            "current": _ds_prog.get("current", 0),
-            "total": _ds_prog.get("total", 0),
-        } if _ds_prog else None,
     }
 
     ctx.send_json(200, {
