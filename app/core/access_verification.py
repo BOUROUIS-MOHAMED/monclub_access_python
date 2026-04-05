@@ -418,6 +418,18 @@ def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]],
                 s = str(am_id).strip()
                 if s:
                     idx_by_am[int(s)] = u
+            else:
+                # Fallback: index by userId for users without activeMembershipId.
+                # device_sync uses userId as the device Pin when activeMembershipId
+                # is null, so the same key must be in this lookup index.
+                user_id = u.get("userId")
+                if user_id is not None:
+                    s = str(user_id).strip()
+                    if s.isdigit():
+                        uid_int = int(s)
+                        # Only add if no activeMembershipId user already owns this key
+                        if uid_int not in idx_by_am:
+                            idx_by_am[uid_int] = u
         except Exception:
             pass
 

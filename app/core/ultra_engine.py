@@ -340,6 +340,16 @@ class UltraDeviceWorker(threading.Thread):
         if hits:
             user = hits[0] if isinstance(hits, list) else hits
 
+        # Fallback: for fingerprint scans the device sets cardNo=pin (F-004).
+        # If card lookup missed, try users_by_am using the raw RTLog pin field.
+        if user is None and raw_row:
+            pin_raw = str(raw_row.get("pin") or "").strip()
+            if pin_raw.isdigit():
+                try:
+                    user = users_by_am.get(int(pin_raw))
+                except Exception:
+                    pass
+
         user_name = ""
         user_image = ""
         user_membership_id: Optional[int] = None

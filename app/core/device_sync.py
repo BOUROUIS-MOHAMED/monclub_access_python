@@ -271,10 +271,19 @@ class DeviceSyncEngine:
             if not isinstance(u, dict):
                 continue
 
-            pin = _pin_str(u.get("activeMembershipId"))
+            # Prefer activeMembershipId as Pin; fall back to userId for users that
+            # have no active membership record in the backend (activeMembershipId=null).
+            # userId is always present, always unique — safe as a device Pin.
+            am_pin = _pin_str(u.get("activeMembershipId"))
+            pin = am_pin or _pin_str(u.get("userId"))
             if not pin:
                 continue
             if not pin.isdigit():
+                continue
+
+            # Collision guard: a userId-fallback pin must not overwrite an
+            # activeMembershipId-based entry already placed in the output.
+            if pin in out and not am_pin:
                 continue
 
             mid = _to_int(u.get("membershipId"), default=None)
