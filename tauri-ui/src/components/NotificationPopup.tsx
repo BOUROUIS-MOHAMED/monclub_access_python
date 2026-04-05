@@ -1,5 +1,6 @@
 import { Box, Typography, Chip, Fade } from "@mui/material";
 import PersonIcon from "@mui/icons-material/Person";
+import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import type { PopupEvent } from "../api/types";
 
 interface Props {
@@ -77,6 +78,27 @@ export default function NotificationPopup({ popup, onDismiss }: Props) {
             <Typography variant="body2" sx={{ color: "#555", mt: 1 }}>Photo non disponible</Typography>
           </Box>
         </Box>
+
+        {/* Image flags */}
+        {(popup.imageSource === 'PROFILE_BORROWED' || popup.userImageStatus === 'REQUIRED_CHANGE') && (
+          <Box sx={{ gridColumn: "2/4", display: "flex", flexWrap: "wrap", gap: 1, px: 2, pb: 1 }}>
+            {popup.imageSource === 'PROFILE_BORROWED' && (
+              <Chip
+                size="small"
+                icon={<PersonIcon />}
+                label="Profile photo — no gym image set"
+              />
+            )}
+            {popup.userImageStatus === 'REQUIRED_CHANGE' && (
+              <Chip
+                size="small"
+                color="warning"
+                icon={<WarningAmberIcon />}
+                label="Image change required"
+              />
+            )}
+          </Box>
+        )}
 
         {/* ROW 2-3, COL 4: Info right */}
         <Box sx={{ gridColumn: "4/5", gridRow: "2/4", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "flex-start", px: 3, py: 2, bgcolor: allowed ? "rgba(34,197,94,0.1)" : "rgba(239,68,68,0.1)" }}>

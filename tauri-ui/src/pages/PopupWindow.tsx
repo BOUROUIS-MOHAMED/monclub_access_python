@@ -40,6 +40,8 @@ function toPopupEvent(raw: any): PopupEvent {
     winNotifyEnabled: raw?.winNotifyEnabled !== false,
     receivedAt: Number(raw?.receivedAt ?? Date.now()),
     userBirthday: raw?.userBirthday ? String(raw.userBirthday) : undefined,
+    imageSource: raw?.imageSource ? String(raw.imageSource) : undefined,
+    userImageStatus: raw?.userImageStatus ? String(raw.userImageStatus) : undefined,
   };
 }
 
@@ -169,6 +171,9 @@ export default function PopupWindow() {
 
   // handleEvent — the single entry point for all incoming events
   const handleEvent = useCallback((evt: PopupEvent) => {
+    // Only show popup for allowed (entered) users
+    if (!evt.allowed) return;
+
     // Global deduplicate
     if (evt.eventId && evt.eventId === lastShownIdRef.current) return;
 
@@ -249,15 +254,14 @@ export default function PopupWindow() {
 
   // ── Notification screen ───────────────────────────────────────────────────
   const n = current;
-  const isAllowed = Boolean(n.allowed);
   const isBirthday = isTodayBirthday(n.userBirthday);
   const initial = (n.userFullName || "?")[0].toUpperCase();
 
-  const accentColor = isBirthday ? "#f59e0b" : isAllowed ? "#10b981" : "#ef4444";
-  const glowHex     = isBirthday ? "250,159,21"  : isAllowed ? "16,185,129" : "239,68,68";
-  const statusLabel = isBirthday ? "Joyeux Anniversaire !" : isAllowed ? "Accès Autorisé" : "Accès Refusé";
-  const statusIcon  = isBirthday ? "🎂" : isAllowed ? "✓" : "✗";
-  const noBgFrom    = isBirthday ? "#451a03" : isAllowed ? "#022c22" : "#2d0a0a";
+  const accentColor = isBirthday ? "#f59e0b" : "#10b981";
+  const glowHex     = isBirthday ? "250,159,21"  : "16,185,129";
+  const statusLabel = isBirthday ? "Joyeux Anniversaire !" : "Accès Autorisé";
+  const statusIcon  = isBirthday ? "🎂" : "✓";
+  const noBgFrom    = isBirthday ? "#451a03" : "#022c22";
   const noBgTo      = "#050505";
 
   return (
@@ -386,6 +390,28 @@ export default function PopupWindow() {
             >
               # {n.userMembershipId}
             </div>
+          </div>
+        )}
+
+        {/* image flags */}
+        {(n.imageSource === 'PROFILE_BORROWED' || n.userImageStatus === 'REQUIRED_CHANGE') && (
+          <div className="flex flex-wrap gap-2 mb-4">
+            {n.imageSource === 'PROFILE_BORROWED' && (
+              <span
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium"
+                style={{ background: 'rgba(255,255,255,0.08)', color: '#a1a1aa' }}
+              >
+                👤 Profile photo — no gym image set
+              </span>
+            )}
+            {n.userImageStatus === 'REQUIRED_CHANGE' && (
+              <span
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium"
+                style={{ background: 'rgba(251,146,60,0.15)', color: '#fb923c', border: '1px solid rgba(251,146,60,0.3)' }}
+              >
+                ⚠ Image change required
+              </span>
+            )}
           </div>
         )}
 

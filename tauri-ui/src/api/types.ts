@@ -907,6 +907,10 @@ export interface PopupEvent {
   receivedAt?: number;
   /** ISO date string (YYYY-MM-DD) of the member's birthday, if available */
   userBirthday?: string;
+  /** "PROFILE_BORROWED" | "GYM_UPLOAD" | "GYM_CAPTURE" | "GYM_GALLERY" | undefined */
+  imageSource?: string;
+  /** "REQUIRED_CHANGE" | "OK" | undefined */
+  userImageStatus?: string;
 }
 
 // ─── N) Host Monitor & Binding (A9) ───
