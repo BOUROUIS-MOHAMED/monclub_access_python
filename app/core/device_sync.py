@@ -599,10 +599,27 @@ class DeviceSyncEngine:
         if authorize_timezone_id < 1:
             authorize_timezone_id = 1
 
-        door_ids_raw = device.get("doorIds") or []
-        door_ids = _norm_int_list(door_ids_raw)
-        if not door_ids:
-            door_ids = [int(default_door_id)]
+        # Resolve physical door numbers for userauthorize.
+        # doorPresets contain the REAL physical door numbers (1-4 on C3-400).
+        # The backend's doorIds may contain a bitmask value like 15 (=all doors)
+        # which causes the C3 to fire ALL relays on a single card scan.
+        # Using individual door numbers (one authorize row per door) ensures only
+        # the scanned reader's relay fires.
+        presets = device.get("doorPresets") or []
+        physical_doors = sorted(set(
+            int(p.get("doorNumber") or p.get("door_number") or 0)
+            for p in presets if isinstance(p, dict)
+            and (p.get("doorNumber") or p.get("door_number"))
+        ))
+        physical_doors = [d for d in physical_doors if d > 0]
+
+        if physical_doors:
+            door_ids = physical_doors
+        else:
+            door_ids_raw = device.get("doorIds") or []
+            door_ids = _norm_int_list(door_ids_raw)
+            if not door_ids:
+                door_ids = [int(default_door_id)]
 
         if dev_id is None:
             self.logger.warning(f"[DeviceSync] Skip device name={dev_name!r}: missing id")
