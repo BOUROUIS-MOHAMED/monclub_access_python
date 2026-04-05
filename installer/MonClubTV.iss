@@ -73,7 +73,7 @@ Name: "{userprograms}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: s
 Name: "{userdesktop}\MonClubTV"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub TV"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub TV"; Flags: nowait postinstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"

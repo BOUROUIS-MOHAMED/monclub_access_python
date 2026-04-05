@@ -74,7 +74,7 @@ Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Task
 Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
