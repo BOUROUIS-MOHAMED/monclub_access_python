@@ -203,7 +203,7 @@ export default function PopupWindow() {
 
   // Channel 1 — Direct SSE from backend
   useEffect(() => {
-    const es = openSSE("/agent/events?replayLast=1", (type, data) => {
+    const es = openSSE("/agent/events", (type, data) => {
       if (type !== "popup" && type !== "notification") return;
       try {
         handleEvent(toPopupEvent(typeof data === "string" ? JSON.parse(data) : data));

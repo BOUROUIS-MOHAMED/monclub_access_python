@@ -966,6 +966,12 @@ class DecisionService(threading.Thread):
         self._users_by_active_membership_id: Dict[int, Dict[str, Any]] = {}
         self._users_by_card: Dict[str, List[Dict[str, Any]]] = {}
 
+        # Card-level cooldown: prevents duplicate door opens when the C3
+        # controller fires multiple events for the same card/QR scan
+        # (e.g. one per door on a multi-door controller).
+        self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
+        self._card_cooldown_sec = 10.0  # seconds — matches replay_block_window_seconds default
+
         self.stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -1012,6 +1018,23 @@ class DecisionService(threading.Thread):
             # (one per device) to reduce SQLite read contention under burst conditions.
             if access_history_exists(ev.event_id):
                 continue
+
+            # Card-level cooldown: the C3-400 fires separate events per door for
+            # a single card/QR scan. Without this, the turnstile re-opens.
+            card_key = f"{ev.device_id}:{ev.card_no}" if ev.card_no else ""
+            if card_key:
+                now_mono = _now_ms() / 1000.0
+                last_seen = self._card_cooldown.get(card_key, 0.0)
+                if (now_mono - last_seen) < self._card_cooldown_sec:
+                    self.logger.debug(
+                        "[RT] SKIP card cooldown: device=%s card=%r elapsed=%.1fs",
+                        ev.device_id, ev.card_no, now_mono - last_seen,
+                    )
+                    continue
+                self._card_cooldown[card_key] = now_mono
+                if len(self._card_cooldown) > 5000:
+                    cutoff = now_mono - self._card_cooldown_sec * 2
+                    self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
 
             settings = self.settings_provider(ev.device_id)
             queue_ms = _now_ms() - ev.queued_at if ev.queued_at > 0 else 0.0

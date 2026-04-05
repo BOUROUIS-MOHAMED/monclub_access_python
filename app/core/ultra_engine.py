@@ -50,6 +50,11 @@ class UltraDeviceWorker(threading.Thread):
         self._door_cmd_failures = 0
         self._poll_ema_ms = 0.0
         self._prefix = f"[ULTRA:{self._device_id}]"
+        # Card-level cooldown: prevents duplicate door opens when the C3
+        # controller fires multiple events for the same card/QR scan
+        # (e.g. one per door on a multi-door panel).
+        self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
+        self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 10))
 
         # Adaptive sleep settings (same as AGENT mode)
         self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
@@ -272,6 +277,24 @@ class UltraDeviceWorker(threading.Thread):
         if self._is_seen(event_id):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
+
+        # Card-level cooldown: the C3-400 fires separate events per door for a
+        # single card/QR scan. Without this, the turnstile re-opens after the
+        # user has already passed through.
+        if card_no:
+            now_mono = time.monotonic()
+            last_seen = self._card_cooldown.get(card_no, 0.0)
+            if (now_mono - last_seen) < self._card_cooldown_sec:
+                logger.debug(
+                    f"{self._prefix} SKIP card cooldown: card={card_no!r} "
+                    f"elapsed={now_mono - last_seen:.1f}s < {self._card_cooldown_sec}s"
+                )
+                return
+            self._card_cooldown[card_no] = now_mono
+            # Prune old entries to avoid unbounded growth
+            if len(self._card_cooldown) > 5000:
+                cutoff = now_mono - self._card_cooldown_sec * 2
+                self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
 
         self._events_processed += 1
 
