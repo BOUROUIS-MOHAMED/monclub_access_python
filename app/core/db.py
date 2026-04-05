@@ -231,7 +231,9 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
-        _ensure_column(conn, "sync_users", "birthday", "birthday TEXT")
+        _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
+        _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
+        _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception:
@@ -1549,8 +1551,9 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json,
-                    face_id, account_username_id, qr_code_payload, birthday
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    face_id, account_username_id, qr_code_payload, birthday,
+                    image_source, user_image_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -1569,6 +1572,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("accountUsernameId") or u.get("account_username_id"),
                     u.get("qrCodePayload"),
                     u.get("birthday"),
+                    u.get("imageSource"),
+                    u.get("userImageStatus"),
                 ),
             )
 
@@ -1820,8 +1825,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         user_id, active_membership_id, membership_id,
                         full_name, phone, email, valid_from, valid_to,
                         first_card_id, second_card_id, image,
-                        fingerprints_json, face_id, account_username_id, qr_code_payload, birthday
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
+                        image_source, user_image_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         u.get("userId"), am_id, m_id,
@@ -1832,6 +1838,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         u.get("faceId"),
                         u.get("accountUsernameId") or u.get("account_username_id"),
                         u.get("qrCodePayload"), u.get("birthday"),
+                        u.get("imageSource"),
+                        u.get("userImageStatus"),
                     ),
                 )
 
@@ -1939,6 +1947,8 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "firstCardId": g("firstCardId", "first_card_id"),
         "secondCardId": g("secondCardId", "second_card_id"),
         "image": g("image"),
+        "imageSource": g("imageSource", "image_source"),
+        "userImageStatus": g("userImageStatus", "user_image_status"),
         "fingerprints": fps,
         "faceId": g("faceId", "face_id"),
         "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
