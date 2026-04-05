@@ -73,23 +73,83 @@ const CONFETTI = ["#facc15", "#f472b6", "#a78bfa", "#34d399", "#fb923c", "#60a5f
 // ── Idle screen ───────────────────────────────────────────────────────────────
 
 function IdleScreen({ gymName }: { gymName: string }) {
+  const name = gymName || "MonClub Access";
   return (
     <div
-      className="h-screen w-screen flex flex-col items-center justify-center gap-4 select-none"
-      style={{ background: "#050505" }}
+      className="h-screen w-screen flex flex-col items-center justify-center select-none relative overflow-hidden"
+      style={{ background: "#080808" }}
     >
+      {/* ambient radial glow behind the text */}
+      <div
+        className="absolute pointer-events-none"
+        style={{
+          width: "70vw",
+          height: "70vw",
+          borderRadius: "50%",
+          background: "radial-gradient(circle, rgba(16,185,129,0.07) 0%, transparent 70%)",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
+        }}
+      />
+
+      {/* top rule */}
+      <div
+        style={{
+          width: "clamp(3rem, 8vw, 6rem)",
+          height: 2,
+          background: "linear-gradient(90deg, transparent, #10b981, transparent)",
+          marginBottom: "clamp(1.5rem, 4vh, 3rem)",
+        }}
+      />
+
+      {/* gym name */}
       <h1
-        className="font-black uppercase tracking-widest text-center"
-        style={{ color: "#ffffff", fontSize: "clamp(2.5rem, 6vw, 5rem)", margin: 0 }}
+        className="font-black uppercase text-center"
+        style={{
+          margin: 0,
+          letterSpacing: "0.18em",
+          lineHeight: 1.1,
+          fontSize: "clamp(3rem, 7vw, 6.5rem)",
+          background: "linear-gradient(160deg, #ffffff 40%, #a1a1aa 100%)",
+          WebkitBackgroundClip: "text",
+          WebkitTextFillColor: "transparent",
+        }}
       >
-        {gymName || "MonClub Access"}
+        {name}
       </h1>
-      <h3
-        className="font-medium tracking-[0.3em] uppercase text-center"
-        style={{ color: "#3f3f46", fontSize: "clamp(0.85rem, 1.5vw, 1.1rem)", margin: 0 }}
+
+      {/* bottom rule */}
+      <div
+        style={{
+          width: "clamp(3rem, 8vw, 6rem)",
+          height: 2,
+          background: "linear-gradient(90deg, transparent, #10b981, transparent)",
+          marginTop: "clamp(1.5rem, 4vh, 3rem)",
+          marginBottom: "clamp(1rem, 3vh, 2rem)",
+        }}
+      />
+
+      {/* powered by */}
+      <p
+        className="font-medium uppercase text-center"
+        style={{
+          margin: 0,
+          letterSpacing: "0.45em",
+          fontSize: "clamp(0.7rem, 1.2vw, 0.95rem)",
+          color: "#52525b",
+        }}
       >
-        powered by monclub
-      </h3>
+        powered by&nbsp;
+        <span style={{ color: "#10b981", fontWeight: 700 }}>monclub</span>
+      </p>
+
+      <style>{`
+        @keyframes idlePulse {
+          0%, 100% { opacity: 0.07; }
+          50%       { opacity: 0.13; }
+        }
+      `}</style>
     </div>
   );
 }
@@ -101,6 +161,7 @@ export default function PopupWindow() {
   const [current, setCurrent] = useState<PopupEvent | null>(null);
   const [imgSrc, setImgSrc] = useState<string | null>(null);
   const [gymName, setGymName] = useState<string>("");
+  const [showKey, setShowKey] = useState(0);
 
   // Refs — used inside callbacks to avoid stale closures
   const phaseRef = useRef<"idle" | "showing">("idle");
@@ -108,14 +169,16 @@ export default function PopupWindow() {
   const pendingRef = useRef<PopupEvent | null>(null);
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const minTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastShownIdRef = useRef<string>("");
+  const shownCooldownRef = useRef<Map<string, number>>(new Map());
   const lastLocalRawRef = useRef<string>("");
+  const goIdleRef = useRef<() => void>(() => {});
 
   // Keep phaseRef in sync
   const setPhaseSync = useCallback((p: "idle" | "showing") => {
     phaseRef.current = p;
     setPhase(p);
   }, []);
+
 
   // Fetch gym name once on mount
   useEffect(() => {
@@ -146,16 +209,27 @@ export default function PopupWindow() {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     if (minTimerRef.current) clearTimeout(minTimerRef.current);
 
-    lastShownIdRef.current = evt.eventId || `${evt.userFullName}|${evt.deviceId}`;
+    // Record cooldown keyed by person — prevents dual-engine duplicate events
+    const personKey = String(evt.userMembershipId ?? `${evt.userFullName}|${evt.deviceId}`);
+    shownCooldownRef.current.set(personKey, Date.now());
     showSinceRef.current = Date.now();
     setCurrent(evt);
+    setShowKey((k) => k + 1);
     setPhaseSync("showing");
     resolveImage(evt);
 
-    // After MAX_SHOW_MS with no new events → go idle
-    idleTimerRef.current = setTimeout(() => {
+    // goIdleRef is called by BOTH the timer and onAnimationEnd on the progress bar
+    goIdleRef.current = () => {
+      if (phaseRef.current !== "showing") return;
+      if (pendingRef.current) return; // minTimer will handle the pending event
       pendingRef.current = null;
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
       setPhaseSync("idle");
+    };
+
+    // After MAX_SHOW_MS with no new events → go idle (backup for onAnimationEnd)
+    idleTimerRef.current = setTimeout(() => {
+      goIdleRef.current();
     }, MAX_SHOW_MS);
 
     // After MIN_SHOW_MS → pick up any queued event
@@ -173,9 +247,10 @@ export default function PopupWindow() {
     // Only show popup for allowed (entered) users
     if (!evt.allowed) return;
 
-    // Global deduplicate — use eventId if available, else fingerprint name+device
-    const fp = evt.eventId || `${evt.userFullName}|${evt.deviceId}`;
-    if (fp && fp === lastShownIdRef.current) return;
+    // Deduplicate by person within MAX_SHOW_MS window — handles dual-engine duplicates
+    const personKey = String(evt.userMembershipId ?? `${evt.userFullName}|${evt.deviceId}`);
+    const lastAt = shownCooldownRef.current.get(personKey) ?? 0;
+    if (Date.now() - lastAt < MAX_SHOW_MS) return;
 
     if (phaseRef.current === "idle") {
       // Screen is idle — show immediately
@@ -466,10 +541,33 @@ export default function PopupWindow() {
         ) : null}
       </div>
 
+      {/* ── PROGRESS BAR — time remaining until idle ── */}
+      <div
+        className="absolute bottom-0 left-0 right-0"
+        style={{ height: 4, background: "rgba(255,255,255,0.06)" }}
+      >
+        <div
+          key={showKey}
+          onAnimationEnd={() => goIdleRef.current()}
+          style={{
+            height: "100%",
+            width: "100%",
+            background: accentColor,
+            opacity: 0.7,
+            transformOrigin: "left center",
+            animation: `progressDrain ${MAX_SHOW_MS}ms linear forwards`,
+          }}
+        />
+      </div>
+
       <style>{`
         @keyframes confettiFall {
           0%   { transform: translateY(0px) rotate(0deg);    opacity: 0.9; }
           100% { transform: translateY(105vh) rotate(540deg); opacity: 0;   }
+        }
+        @keyframes progressDrain {
+          0%   { transform: scaleX(1); }
+          100% { transform: scaleX(0); }
         }
       `}</style>
     </div>

@@ -66,6 +66,7 @@ const ACCESS_PANEL_LABEL: &str = "access-panel";
 const ACCESS_PANEL_WIDTH: f64 = 428.0;
 const ACCESS_PANEL_HEIGHT: f64 = 608.0;
 const ACCESS_PANEL_MARGIN: f64 = 16.0;
+const POPUP_LABEL: &str = "access_popup";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -415,10 +416,12 @@ fn rebuild_tray_menu(
     // ── Separator + Quit ──
     let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
     let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
+    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show_item)
         .item(&panel_item)
+        .item(&popup_item)
         .item(&open_menu)
         .item(&sync_item)
         .separator()
@@ -507,11 +510,36 @@ fn show_access_panel_window(app: &AppHandle) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(win) = app.get_webview_window(POPUP_LABEL) {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        POPUP_LABEL,
+        tauri::WebviewUrl::App("/popup".into()),
+    )
+    .title("MonClub Access — Écran Notification")
+    .inner_size(1024.0, 600.0)
+    .resizable(true)
+    .decorations(true)
+    .always_on_top(true)
+    .center()
+    .build()?;
+    let _ = win.show();
+    let _ = win.set_focus();
+    Ok(())
+}
+
 fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
     let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
+    let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
     let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir porte")
         .item(
@@ -525,6 +553,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
     let menu = MenuBuilder::new(app)
         .item(&show_item)
         .item(&panel_item)
+        .item(&popup_item)
         .item(&open_sub)
         .item(&sync_item)
         .separator()
@@ -549,6 +578,9 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
                 }
                 "tray_panel" => {
                     let _ = show_access_panel_window(&app);
+                }
+                "tray_popup" => {
+                    let _ = show_popup_window(&app);
                 }
                 "tray_sync" => {
                     let p = port;

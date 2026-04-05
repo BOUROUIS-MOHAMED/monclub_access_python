@@ -170,7 +170,10 @@
       "Bash(python -c \"from app.core.ultra_engine import UltraEngine; from app.core.realtime_agent import AgentRealtimeEngine; print\\(''imports OK''\\)\")",
       "WebFetch(domain:www.scribd.com)",
       "Bash(python -c \"from app.core.device_sync import DeviceSyncEngine; from app.core.ultra_engine import UltraEngine; from app.core.realtime_agent import AgentRealtimeEngine; print\\(''all imports OK''\\)\")",
-      "Bash(python -c \"from app.core.device_sync import DeviceSyncEngine; print\\(''OK''\\)\")"
+      "Bash(python -c \"from app.core.device_sync import DeviceSyncEngine; print\\(''OK''\\)\")",
+      "Bash(python -m pytest tests/test_launch_safety_regressions.py -v --co)",
+      "Bash(python -m pytest tests/test_silent_update.py -v)",
+      "Bash(python -m pytest tests/test_silent_update.py tests/test_access_verification.py tests/test_auth_reconnect.py tests/test_change_detector.py tests/test_launch_safety_regressions.py -v)"
     ]
   }
 }
