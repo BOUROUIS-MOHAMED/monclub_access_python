@@ -238,7 +238,9 @@ class DeviceSyncEngine:
 
         Filters:
         - allowedMemberships (if provided) uses user.membershipId
-        - validFrom/validTo (if provided)
+        - validFrom/validTo ONLY when pushingToDevicePolicy == "VALID_ONLY"
+          (default: push ALL members with an activeMembershipId regardless of
+          expiry — the PC/ULTRA engine handles real-time validity at scan time)
         - pin must be digits (controllers expect numeric Pin)
 
         Also ensures device has a usable doorIds list (fallback to default_door_id).
@@ -254,6 +256,13 @@ class DeviceSyncEngine:
         if not door_ids:
             door_ids = [int(default_door_id)]
         device["doorIds"] = door_ids  # keep for downstream use
+
+        # Validity-date filter: ONLY apply when explicitly opted in via
+        # pushingToDevicePolicy="VALID_ONLY".  The default (null / any other
+        # value) pushes every member so the full roster is on the device and
+        # the PC-side logic decides access at scan time.
+        policy = str(device.get("pushingToDevicePolicy") or "").strip().upper()
+        filter_by_validity = (policy == "VALID_ONLY")
 
         now = datetime.now(tz=timezone.utc)
         out: Dict[str, Dict[str, Any]] = {}
@@ -272,12 +281,13 @@ class DeviceSyncEngine:
             if allowed_set and (mid is None or int(mid) not in allowed_set):
                 continue
 
-            vf = _parse_dt_any(u.get("validFrom") or "")
-            vt = _parse_dt_any(u.get("validTo") or "")
-            if vf and now < vf:
-                continue
-            if vt and now > vt:
-                continue
+            if filter_by_validity:
+                vf = _parse_dt_any(u.get("validFrom") or "")
+                vt = _parse_dt_any(u.get("validTo") or "")
+                if vf and now < vf:
+                    continue
+                if vt and now > vt:
+                    continue
 
             out[pin] = u
 
@@ -625,8 +635,11 @@ class DeviceSyncEngine:
                 pins_to_sync.add(pin)
                 templates_for_sync[pin] = templates
 
+        _policy_str = str(device.get("pushingToDevicePolicy") or "ALL").strip().upper()
         self.logger.info(
-            f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} desired={len(desired_pins)} to_sync={len(pins_to_sync)} doors={door_ids} tz={authorize_timezone_id}"
+            f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
+            f"desired={len(desired_pins)} to_sync={len(pins_to_sync)} "
+            f"doors={door_ids} tz={authorize_timezone_id} policy={_policy_str}"
         )
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)

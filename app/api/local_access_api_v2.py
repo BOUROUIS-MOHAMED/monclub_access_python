@@ -2679,7 +2679,52 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
         except Exception:
             pass
 
-    # Fallback: direct PullSDK connect
+    # Try ULTRA engine (for ULTRA-mode devices).
+    # CRITICAL: must pause the RTLog worker before connecting — the C3-200 only allows
+    # one TCP connection at a time.  Without pausing, the worker and the door-open code
+    # race for the TCP slot, causing ControlDevice to fail on a stale handle (HTTP 500).
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    if ultra_eng and ultra_eng.running:
+        worker = ultra_eng._workers.get(did)
+        if worker:
+            _logger.info(
+                "[LocalAPI] ULTRA door open: device_id=%s door=%s pulse_sec=%s — pausing RTLog worker",
+                did, door, pulse_sec,
+            )
+            worker.pause_for_sync(timeout=5.0)
+            try:
+                from access.store import get_sync_device as _get_sync_device
+                device_obj = _get_sync_device(did) or {}
+                try:
+                    from app.sdk.pullsdk import PullSDKDevice as _PSDev
+                    pdev = _PSDev(device_payload=device_obj, logger=ctx.app.logger)
+                    if not pdev.connect():
+                        ctx.send_json(500, {"ok": False, "error": "ULTRA: PullSDKDevice connect failed"})
+                        return
+                    try:
+                        ok = pdev.open_door(door_id=door, pulse_time_ms=pulse_sec * 1000)
+                        _logger.info(
+                            "[LocalAPI] ULTRA door open: device_id=%s door=%s ok=%s",
+                            did, door, ok,
+                        )
+                        ctx.send_json(200, {"ok": ok, "rc": 0, "source": "ultra"})
+                    except Exception as _e:
+                        _logger.warning(
+                            "[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s",
+                            did, door, _e,
+                        )
+                        ctx.send_json(500, {"ok": False, "error": str(_e)})
+                    finally:
+                        try: pdev.disconnect()
+                        except Exception: pass
+                except Exception as _e:
+                    ctx.send_json(500, {"ok": False, "error": str(_e)})
+            finally:
+                worker.resume_from_sync()
+                _logger.info("[LocalAPI] ULTRA door open: device_id=%s RTLog worker resumed", did)
+            return
+
+    # Fallback: direct PullSDK connect (DEVICE-mode or unmanaged devices)
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
