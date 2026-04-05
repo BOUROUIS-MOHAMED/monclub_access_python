@@ -137,7 +137,7 @@ class AppConfig:
     update_platform: str = "WINDOWS"  # request param (server returns "windows")
     update_channel: str = "stable"
     update_check_interval_sec: int = 30
-    update_auto_download_zip: bool = False
+    update_auto_download_zip: bool = True
 
     # -------------------------
     # Finger template
@@ -460,7 +460,7 @@ class AppConfig:
         if cfg.update_check_interval_sec < 60:
             cfg.update_check_interval_sec = 60
 
-        cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", False), False)
+        cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", True), True)
 
         return cfg
 

@@ -120,12 +120,15 @@ def _updater_exe_path(install_root: Path, identity: DesktopComponentIdentity) ->
     return install_root / "updater" / identity.updater_exe_name
 
 
-def _launch_installer_exe(exe_path: Path) -> None:
+def _launch_installer_exe(exe_path: Path, *, silent: bool = True) -> None:
+    cmd = [str(exe_path)]
+    if silent:
+        cmd += ["/VERYSILENT", "/SUPPRESSMSGBOXES"]
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     subprocess.Popen(
-        [str(exe_path)],
+        cmd,
         cwd=str(exe_path.parent),
         close_fds=True,
         creationflags=creationflags,
@@ -277,7 +280,7 @@ class ComponentUpdateManager:
         return sec * 1000
 
     def _auto_download(self) -> bool:
-        return bool(getattr(self.cfg, "update_auto_download_zip", False))
+        return bool(getattr(self.cfg, "update_auto_download_zip", True))
 
     def start(self, *, token: str, check_now: bool = True) -> None:
         token = _safe_str(token, "")
