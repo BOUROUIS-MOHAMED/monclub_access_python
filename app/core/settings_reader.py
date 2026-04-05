@@ -371,6 +371,10 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "ultra_sync_interval_minutes": int(dev.get("ultraSyncIntervalMinutes") or 15),
         "ultra_totp_rescue_enabled": bool(dev.get("ultraTotpRescueEnabled", True)),
         "ultra_rtlog_enabled": bool(dev.get("ultraRtlogEnabled", True)),
+
+        # Per-door presets (from dashboard doorPresets config).
+        # List of dicts: [{"doorNumber": 1, "pulseSeconds": 3, "doorName": "..."}, ...]
+        "door_presets": list(dev.get("door_presets") or dev.get("doorPresets") or []),
     }
 
 

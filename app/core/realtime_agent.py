@@ -1037,7 +1037,16 @@ class DecisionService(threading.Thread):
 
             action = "OPEN_DOOR" if allowed else "NONE"
             door_id = ev.door_id if ev.door_id is not None else _safe_int(settings.get("door_entry_id"), 1)
+            # Per-door pulse from doorPresets (set in dashboard), fallback to device-level pulseTimeMs.
             pulse_time_ms = _safe_int(settings.get("pulse_time_ms"), 3000)
+            for _dp in (settings.get("door_presets") or []):
+                if isinstance(_dp, dict):
+                    _dn = _dp.get("doorNumber") or _dp.get("door_number")
+                    if _dn is not None and int(_dn) == door_id:
+                        _ps = _dp.get("pulseSeconds") or _dp.get("pulse_seconds")
+                        if _ps is not None and int(_ps) > 0:
+                            pulse_time_ms = int(_ps) * 1000
+                        break
 
             decision_ms = _now_ms() - t0
             self.decision_ema.add(decision_ms)

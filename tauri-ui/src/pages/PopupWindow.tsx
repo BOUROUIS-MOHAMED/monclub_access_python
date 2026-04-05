@@ -75,22 +75,21 @@ const CONFETTI = ["#facc15", "#f472b6", "#a78bfa", "#34d399", "#fb923c", "#60a5f
 function IdleScreen({ gymName }: { gymName: string }) {
   return (
     <div
-      className="h-screen w-screen flex flex-col items-center justify-center gap-8 select-none"
+      className="h-screen w-screen flex flex-col items-center justify-center gap-4 select-none"
       style={{ background: "#050505" }}
     >
-      {/* logo */}
-      <img
-        src="/logo.png"
-        alt="MonClub"
-        style={{ width: 160, height: 160, objectFit: "contain", opacity: 0.85 }}
-      />
-      {/* gym name */}
-      <p
-        className="font-black tracking-[0.25em] uppercase text-center"
-        style={{ color: "#52525b", fontSize: "clamp(1.2rem, 2.5vw, 2rem)" }}
+      <h1
+        className="font-black uppercase tracking-widest text-center"
+        style={{ color: "#ffffff", fontSize: "clamp(2.5rem, 6vw, 5rem)", margin: 0 }}
       >
         {gymName || "MonClub Access"}
-      </p>
+      </h1>
+      <h3
+        className="font-medium tracking-[0.3em] uppercase text-center"
+        style={{ color: "#3f3f46", fontSize: "clamp(0.85rem, 1.5vw, 1.1rem)", margin: 0 }}
+      >
+        powered by monclub
+      </h3>
     </div>
   );
 }

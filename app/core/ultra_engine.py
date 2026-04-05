@@ -540,7 +540,19 @@ class UltraDeviceWorker(threading.Thread):
                 resolved_door_id = candidate
         except Exception:
             pass
+
+        # Per-door pulse from doorPresets (set in dashboard), fallback to device-level pulseTimeMs.
         pulse_ms = int(self._settings.get("pulse_time_ms", 3000))
+        for p in (self._settings.get("door_presets") or []):
+            if not isinstance(p, dict):
+                continue
+            dn = p.get("doorNumber") or p.get("door_number")
+            if dn is not None and int(dn) == resolved_door_id:
+                ps = p.get("pulseSeconds") or p.get("pulse_seconds")
+                if ps is not None and int(ps) > 0:
+                    pulse_ms = int(ps) * 1000
+                break
+
         logger.debug(
             f"{self._prefix} open_door_with_retry: resolved_door_id={resolved_door_id} "
             f"pulse_ms={pulse_ms} sdk_connected={bool(self._sdk and self._connected)}"
