@@ -167,7 +167,9 @@
       "Bash(find /d/projects/MonClub/monclub_backend -type f -name *.py)",
       "Bash(find /d/projects/MonClub/monclub_backend -type f \\\\\\(-name *.java -o -name *.kt \\\\\\))",
       "Bash(grep -r \"allowedMemberships\\\\|allowed_memberships\\\\|allowedMembership\" /d/projects/MonClub/monclub_backend --include=*.java --include=*.kt)",
-      "Bash(python -c \"from app.core.ultra_engine import UltraEngine; from app.core.realtime_agent import AgentRealtimeEngine; print\\(''imports OK''\\)\")"
+      "Bash(python -c \"from app.core.ultra_engine import UltraEngine; from app.core.realtime_agent import AgentRealtimeEngine; print\\(''imports OK''\\)\")",
+      "WebFetch(domain:www.scribd.com)",
+      "Bash(python -c \"from app.core.device_sync import DeviceSyncEngine; from app.core.ultra_engine import UltraEngine; from app.core.realtime_agent import AgentRealtimeEngine; print\\(''all imports OK''\\)\")"
     ]
   }
 }

@@ -239,6 +239,7 @@ class DeviceSyncEngine:
             # NEW (from backend/device DTO)
             "authorizeTimezoneId": int(tz_id),
             "pushingToDevicePolicy": pushing_policy,
+            "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
         }
 
     def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
@@ -863,6 +864,29 @@ class DeviceSyncEngine:
                     )
 
             pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
+
+            # ── Write door timing to controller firmware ──
+            # Without this, the C3 keeps its factory/old defaults and the
+            # turnstile relay stays active too long (allows a second person).
+            presets = device.get("doorPresets") or []
+            for p in presets:
+                if not isinstance(p, dict):
+                    continue
+                dn = p.get("doorNumber") or p.get("door_number")
+                ps = p.get("pulseSeconds") or p.get("pulse_seconds")
+                if dn is not None and ps is not None and int(ps) > 0:
+                    param_str = f"Door{int(dn)}Drivertime={int(ps)}"
+                    try:
+                        sdk.set_device_param(items=param_str)
+                        self.logger.info(
+                            "[DeviceSync] Device id=%s SetDeviceParam %s OK",
+                            dev_id, param_str,
+                        )
+                    except Exception as ex:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s SetDeviceParam %s failed: %s",
+                            dev_id, param_str, ex,
+                        )
 
             self.logger.info(
                 f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned}"

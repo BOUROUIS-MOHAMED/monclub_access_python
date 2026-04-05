@@ -109,7 +109,7 @@ export default function PopupWindow() {
   const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const minTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastShownIdRef = useRef<string>("");
-  const lastLocalEventIdRef = useRef<string>("");
+  const lastLocalRawRef = useRef<string>("");
 
   // Keep phaseRef in sync
   const setPhaseSync = useCallback((p: "idle" | "showing") => {
@@ -146,7 +146,7 @@ export default function PopupWindow() {
     if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
     if (minTimerRef.current) clearTimeout(minTimerRef.current);
 
-    lastShownIdRef.current = evt.eventId || "";
+    lastShownIdRef.current = evt.eventId || `${evt.userFullName}|${evt.deviceId}`;
     showSinceRef.current = Date.now();
     setCurrent(evt);
     setPhaseSync("showing");
@@ -173,8 +173,9 @@ export default function PopupWindow() {
     // Only show popup for allowed (entered) users
     if (!evt.allowed) return;
 
-    // Global deduplicate
-    if (evt.eventId && evt.eventId === lastShownIdRef.current) return;
+    // Global deduplicate — use eventId if available, else fingerprint name+device
+    const fp = evt.eventId || `${evt.userFullName}|${evt.deviceId}`;
+    if (fp && fp === lastShownIdRef.current) return;
 
     if (phaseRef.current === "idle") {
       // Screen is idle — show immediately
@@ -229,11 +230,9 @@ export default function PopupWindow() {
     const read = () => {
       try {
         const raw = localStorage.getItem("popupEvent");
-        if (!raw) return;
-        const parsed = toPopupEvent(JSON.parse(raw));
-        if (!parsed.eventId || parsed.eventId === lastLocalEventIdRef.current) return;
-        lastLocalEventIdRef.current = parsed.eventId;
-        handleEvent(parsed);
+        if (!raw || raw === lastLocalRawRef.current) return;
+        lastLocalRawRef.current = raw;
+        handleEvent(toPopupEvent(JSON.parse(raw)));
       } catch { /* ignore */ }
     };
     const onStorage = (e: StorageEvent) => { if (e.key === "popupEvent") read(); };
