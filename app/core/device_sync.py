@@ -717,37 +717,52 @@ class DeviceSyncEngine:
                     self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
 
                     # 1) user (overwrite)
+                    # Only include CardNo if it is a non-empty numeric string.
+                    # Non-numeric card IDs (e.g. "aaa") are rejected by device firmware.
+                    card_valid = card if (card and card.isdigit()) else ""
+                    if card and not card_valid:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric — skipping CardNo",
+                            dev_id, pin, card,
+                        )
+
                     pairs = [f"Pin={pin}", f"Name={full_name}"]
-                    if card:
-                        pairs.append(f"CardNo={card}")
+                    if card_valid:
+                        pairs.append(f"CardNo={card_valid}")
                     _user_data = "\t".join(pairs) + "\r\n"
                     try:
                         sdk.set_device_data(table="user", data=_user_data, options="")
                     except PullSDKError as _set_err:
                         if "rc=-101" not in str(_set_err):
                             raise
-                        # rc=-101 = duplicate pin — device_pins was incomplete (GetDeviceData
-                        # returned fewer pins than actually on the device). Force-delete the
-                        # stale user row and retry once so the insert succeeds.
+                        # rc=-101 has two common causes on ZKTeco C3-200 firmware:
+                        #   (a) Duplicate pin — GetDeviceData returned incomplete pin list so
+                        #       _delete_pin_if_exists skipped a pin that already exists.
+                        #   (b) Unsupported field — some C3-200 firmware variants do not have a
+                        #       Name column and reject SetDeviceData when Name= is included.
+                        # Strategy: force-delete the stale row (handles a), then retry with
+                        # minimal fields only — Pin + CardNo, no Name (handles b).
                         self.logger.warning(
-                            "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 (duplicate) "
-                            "— force-deleting stale row and retrying",
+                            "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 "
+                            "— force-delete + retry without Name",
                             dev_id, pin,
                         )
-                        # Also clear auth/templates so delete_user won't fail on FK constraints.
+                        # Clear auth/templates first so the user delete won't fail on constraints.
                         self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
                         try:
                             sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
                         except Exception as _del_ex:
-                            self.logger.warning(
-                                "[DeviceSync] Device id=%s Pin=%s force-delete failed: %s — giving up",
+                            self.logger.debug(
+                                "[DeviceSync] Device id=%s Pin=%s force-delete user: %s (continuing to retry)",
                                 dev_id, pin, _del_ex,
                             )
-                            raise _set_err from None
-                        # Retry the insert now that the row is gone.
-                        sdk.set_device_data(table="user", data=_user_data, options="")
+                        # Retry with minimal fields only (no Name).
+                        minimal_pairs = [f"Pin={pin}"]
+                        if card_valid:
+                            minimal_pairs.append(f"CardNo={card_valid}")
+                        sdk.set_device_data(table="user", data="\t".join(minimal_pairs) + "\r\n", options="")
                         self.logger.info(
-                            "[DeviceSync] Device id=%s Pin=%s retry after force-delete OK",
+                            "[DeviceSync] Device id=%s Pin=%s retry without Name OK",
                             dev_id, pin,
                         )
                     pushed_users += 1

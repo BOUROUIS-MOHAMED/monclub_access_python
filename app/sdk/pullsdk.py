@@ -105,6 +105,11 @@ class PullSDK:
                 self._dll.GetDeviceParam.argtypes = [c_void_p, c_void_p, c_int, c_char_p]
                 self._dll.GetDeviceParam.restype = c_int
 
+            # int SetDeviceParam(HANDLE h, char* item);
+            if hasattr(self._dll, "SetDeviceParam"):
+                self._dll.SetDeviceParam.argtypes = [c_void_p, c_char_p]
+                self._dll.SetDeviceParam.restype = c_int
+
             self.logger.info("PullSDK loaded OK.")
         except OSError as e:
             self._dll = None
@@ -552,6 +557,25 @@ class PullSDK:
 
         raise PullSDKError(f"GetDeviceParam FAILED after max size. last_rc={last_rc} PullLastError={last_err}")
 
+    def supports_set_device_param(self) -> bool:
+        self.load()
+        return self._dll is not None and hasattr(self._dll, "SetDeviceParam")
+
+    def set_device_param(self, *, items: str) -> int:
+        h = self._require_handle()
+        self.load()
+        if self._dll is None or not hasattr(self._dll, "SetDeviceParam"):
+            raise PullSDKError("SetDeviceParam not available in this plcommpro.dll build.")
+        it = (items or "").strip()
+        if not it:
+            raise PullSDKError("items is empty for SetDeviceParam")
+        self.logger.debug(f"SetDeviceParam({it!r})")
+        rc = int(self._dll.SetDeviceParam(c_void_p(h), encode_ansi(it)))
+        if rc < 0:
+            err = self.pull_last_error()
+            raise PullSDKError(f"SetDeviceParam FAILED rc={rc} PullLastError={err} items={it!r}")
+        return rc
+
 
 class PullSDKDevice:
     """
@@ -660,6 +684,19 @@ class PullSDKDevice:
             try:
                 assert self._sdk is not None
                 seconds = int(max(1, min(60, math.ceil(int(pulse_time_ms) / 1000.0))))
+
+                # Many C3-200 firmware versions ignore ControlDevice param3 and use the
+                # device's stored DoorNDriveTime instead. Set it explicitly before firing
+                # the relay so the configured pulse time is always respected.
+                if self._sdk.supports_set_device_param():
+                    try:
+                        self._sdk.set_device_param(items=f"Door{door_id}Drivertime={seconds}")
+                    except Exception as _sp_err:
+                        self.logger.debug(
+                            "[PullSDKDevice][%s] SetDeviceParam Door%sDriveTime=%s ignored: %s",
+                            self.device_id, door_id, seconds, _sp_err,
+                        )
+
                 self._sdk.door_pulse_open(door=int(door_id), seconds=int(seconds))
                 self.logger.info(
                     "[PullSDKDevice][%s] open_door OK: name=%r door_id=%s seconds=%s",

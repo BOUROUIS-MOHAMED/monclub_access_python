@@ -157,7 +157,13 @@
       "Bash(done)",
       "Bash(find D:projectsMonClubmonclub_backendsrcmainjava -name *.java -type f)",
       "Bash(grep -n \"findMaxUpdatedAt\\\\|findAllValidForAccess\\\\|findSyncProjection\" D:projectsMonClubmonclub_backend/src/main/java/com/tpjava/tpjava/Repositories/*.java)",
-      "Bash(grep -r \"usePopupStream\\\\|openPopupWindow\\\\|sendTestNotification\" C:/Users/mohaa/Desktop/monclub_access_python/tauri-ui/src --include=*.tsx --include=*.ts -n)"
+      "Bash(grep -r \"usePopupStream\\\\|openPopupWindow\\\\|sendTestNotification\" C:/Users/mohaa/Desktop/monclub_access_python/tauri-ui/src --include=*.tsx --include=*.ts -n)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:bdragon300.github.io)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(curl -s https://raw.githubusercontent.com/bdragon300/pyzkaccess/master/pyzkaccess/param.py)",
+      "Bash(curl -s https://raw.githubusercontent.com/bdragon300/pyzkaccess/master/pyzkaccess/door.py)"
     ]
   }
 }
