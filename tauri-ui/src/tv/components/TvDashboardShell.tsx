@@ -36,6 +36,9 @@ export default function TvDashboardShell() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [latestVersion, setLatestVersion] = useState<string | null>(null);
   const [latestCodename, setLatestCodename] = useState<string | null>(null);
+  const [updateDownloaded, setUpdateDownloaded] = useState(false);
+  const [updateDownloading, setUpdateDownloading] = useState(false);
+  const [updateProgressPercent, setUpdateProgressPercent] = useState<number | null>(null);
   const updatePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchUpdateStatus = useCallback(async () => {
@@ -44,6 +47,9 @@ export default function TvDashboardShell() {
       setUpdateAvailable(s.updateAvailable ?? false);
       setLatestVersion(s.latestVersion ?? null);
       setLatestCodename(s.latestCodename ?? null);
+      setUpdateDownloaded(s.downloaded ?? false);
+      setUpdateDownloading(s.downloading ?? false);
+      setUpdateProgressPercent(s.progressPercent ?? null);
     } catch {
       // silent — update check should never break the shell
     }
@@ -169,6 +175,9 @@ export default function TvDashboardShell() {
           latestCodename={latestCodename}
           sidebarOpen={sidebarOpen}
           onClick={() => navigate("/tv-updates")}
+          downloaded={updateDownloaded}
+          downloading={updateDownloading}
+          progressPercent={updateProgressPercent}
         />
 
         {/* Bottom icon bar: Profile, Settings, Theme, Logout */}

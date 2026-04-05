@@ -67,6 +67,11 @@ export default function MainLayout() {
   const updateAvailable = status?.updates?.updateAvailable ?? false;
   const latestVersion = (status?.updates as { latestVersion?: string | null })?.latestVersion ?? null;
   const latestCodename = (status?.updates as { latestCodename?: string | null })?.latestCodename ?? null;
+  // No `as` cast needed below — downloaded/downloading/progressPercent are already
+  // typed directly on UpdatesBlock (tauri-ui/src/api/types.ts lines 54–57).
+  const updateDownloaded = status?.updates?.downloaded ?? false;
+  const updateDownloading = status?.updates?.downloading ?? false;
+  const updateProgressPercent = status?.updates?.progressPercent ?? null;
 
   const s = status?.session;
   const hasLoginWarning = s?.loginWarning && (s?.loginDaysRemaining ?? 99) > 0;
@@ -184,6 +189,9 @@ export default function MainLayout() {
           latestCodename={latestCodename}
           sidebarOpen={sidebarOpen}
           onClick={() => navigate("/update")}
+          downloaded={updateDownloaded}
+          downloading={updateDownloading}
+          progressPercent={updateProgressPercent}
         />
 
         {/* Warning badges */}
