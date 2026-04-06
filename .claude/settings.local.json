@@ -177,7 +177,13 @@
       "Read(//c/Users/mohaa/AppData/**)",
       "Bash(python -c \"from app.core.utils import CONFIG_PATH; print\\(CONFIG_PATH\\)\")",
       "Bash(python -c \"import json; d=json.load\\(open\\(''C:/ProgramData/MonClub Access/access/config.json''\\)\\); print\\(''auto_download:'', d.get\\(''update_auto_download_zip'', ''NOT SET''\\)\\)\")",
-      "Bash(python -c \"import subprocess; print\\(''CREATE_NO_WINDOW:'', hex\\(subprocess.CREATE_NO_WINDOW\\)\\)\")"
+      "Bash(python -c \"import subprocess; print\\(''CREATE_NO_WINDOW:'', hex\\(subprocess.CREATE_NO_WINDOW\\)\\)\")",
+      "Bash(cmd /c \"dir \"\"%LOCALAPPDATA%\\\\MonClub*\"\" /b /ad 2>&1\")",
+      "Bash(cmd /c \"timeout /t 5 /nobreak >nul && type C:\\\\temp\\\\pstest.txt 2>&1\")",
+      "Bash(cmd /c \"if exist C:\\\\temp\\\\ \\(echo exists\\) else \\(echo missing\\)\")",
+      "Bash(cmd /c \"dir C:\\\\ /b /ad 2>&1\")",
+      "Bash(python -c \"import os; print\\(os.path.exists\\(''C:/temp''\\)\\)\")",
+      "Bash(python -c \"import os; os.remove\\(r''C:\\\\Users\\\\mohaa\\\\Desktop\\\\monclub_access_python\\\\.git\\\\index.lock''\\)\")"
     ]
   }
 }
