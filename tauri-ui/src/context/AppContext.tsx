@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
-import { get, post, ApiError } from "@/api/client";
+import { get, post, openSSE, ApiError } from "@/api/client";
 import type { StatusResponse, LoginRequest, LoginResponse } from "@/api/types";
 
 interface AppState {
@@ -60,6 +60,26 @@ export function AppProvider({ children }: { children: ReactNode }) {
     refreshStatus();
     const id = setInterval(refreshStatus, 5000);
     return () => clearInterval(id);
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    const sse = openSSE(
+      "/status/stream",
+      (type, data) => {
+        if (type !== "status" || !data || typeof data !== "object") return;
+        setState((prev) => ({
+          ...prev,
+          status: data as StatusResponse,
+          coreReady: true,
+          loading: false,
+          error: null,
+        }));
+      },
+      {
+        onReconnect: () => { void refreshStatus(); },
+      },
+    );
+    return () => sse.close();
   }, [refreshStatus]);
 
   return (

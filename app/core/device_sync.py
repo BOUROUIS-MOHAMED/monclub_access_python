@@ -141,6 +141,8 @@ class DeviceSyncEngine:
         self.logger = logger
         self._run_lock = threading.Lock()
         self._running = False
+        self._progress_cond = threading.Condition()
+        self._progress_seq = 0
         # Live progress readable by the status API (dict value assignments are
         # atomic under CPython GIL — safe across ThreadPoolExecutor workers).
         self._sync_progress: Dict[str, Any] = {
@@ -150,6 +152,27 @@ class DeviceSyncEngine:
             "current": 0,
             "total": 0,
         }
+
+    def _set_progress(self, **changes: Any) -> None:
+        with self._progress_cond:
+            changed = False
+            for key, value in changes.items():
+                if self._sync_progress.get(key) != value:
+                    self._sync_progress[key] = value
+                    changed = True
+            if changed:
+                self._progress_seq += 1
+                self._progress_cond.notify_all()
+
+    def get_progress_snapshot(self) -> tuple[Dict[str, Any], int]:
+        with self._progress_cond:
+            return dict(self._sync_progress), self._progress_seq
+
+    def wait_for_progress_change(self, last_seq: int, timeout: float = 1.0) -> tuple[Dict[str, Any], int]:
+        with self._progress_cond:
+            if self._progress_seq == last_seq:
+                self._progress_cond.wait(timeout=max(0.0, float(timeout)))
+            return dict(self._sync_progress), self._progress_seq
 
     def run_blocking(self, *, cache, source: str = "timer") -> bool:
         with self._run_lock:
@@ -745,10 +768,12 @@ class DeviceSyncEngine:
             failed_synced = 0
 
             # Expose live progress for the frontend banner.
-            self._sync_progress["deviceName"] = dev_name or ""
-            self._sync_progress["deviceId"] = did
-            self._sync_progress["current"] = 0
-            self._sync_progress["total"] = len(pins_to_sync)
+            self._set_progress(
+                deviceName=dev_name or "",
+                deviceId=did,
+                current=0,
+                total=len(pins_to_sync),
+            )
 
             for pin in sorted(pins_to_sync):
                 u = desired.get(pin)
@@ -860,14 +885,14 @@ class DeviceSyncEngine:
                         error=None,
                     )
                     ok_synced += 1
-                    self._sync_progress["current"] = ok_synced + failed_synced
+                    self._set_progress(current=ok_synced + failed_synced)
                     self.logger.debug(
                         "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin
                     )
 
                 except Exception as ex:
                     failed_synced += 1
-                    self._sync_progress["current"] = ok_synced + failed_synced
+                    self._set_progress(current=ok_synced + failed_synced)
                     save_device_sync_state(
                         device_id=did,
                         pin=pin,
@@ -979,7 +1004,7 @@ class DeviceSyncEngine:
         )
 
         # F-008: Run device syncs in parallel (max_workers=4, safe bounded parallelism)
-        self._sync_progress["running"] = True
+        self._set_progress(running=True)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
@@ -1012,6 +1037,10 @@ class DeviceSyncEngine:
                             dev_id, dev_name, e,
                         )
         finally:
-            self._sync_progress["running"] = False
-            self._sync_progress["current"] = 0
-            self._sync_progress["total"] = 0
+            self._set_progress(
+                running=False,
+                deviceName="",
+                deviceId=None,
+                current=0,
+                total=0,
+            )

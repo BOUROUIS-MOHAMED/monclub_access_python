@@ -6,6 +6,7 @@ Binds to 127.0.0.1.  All endpoints under /api/v2/*.
 Backward-compatible v1 endpoints are kept with Deprecation headers.
 
 SSE endpoints:
+  - GET /api/v2/status/stream
   - GET /api/v2/logs/stream
   - GET /api/v2/agent/events
   - GET /api/v2/enroll/events
@@ -358,6 +359,8 @@ def _handle_platform(ctx: _Ctx) -> None:
 # ==================== 1.5) UNIFIED STATUS ====================
 
 def _handle_status(ctx: _Ctx) -> None:
+    ctx.send_json(200, _build_status_payload(ctx.app))
+    return
     """Unified status snapshot for Tauri dashboard â€” single call."""
     from access.store import load_auth_token, load_sync_cache
 
@@ -473,6 +476,171 @@ def _handle_status(ctx: _Ctx) -> None:
         "ultra": ultra,
         "updates": updates,
     })
+
+
+def _build_status_payload(app: Any) -> Dict[str, Any]:
+    from access.store import load_auth_token, load_sync_cache
+
+    auth = load_auth_token()
+    reasons = []
+    try:
+        reasons = app._restriction_reasons() if auth else []
+    except Exception:
+        pass
+    cache = load_sync_cache()
+
+    session = {
+        "loggedIn": bool(auth and auth.token),
+        "restricted": bool(reasons),
+        "reasons": reasons,
+        "email": (auth.email if auth else None),
+        "lastLoginAt": (auth.last_login_at if auth else None),
+        "contractStatus": bool(cache and cache.contract_status),
+        "contractEndDate": (cache.contract_end_date if cache else None),
+    }
+
+    try:
+        expiry = app._compute_expiry_warnings()
+        session["loginDaysRemaining"] = expiry.get("loginDaysRemaining")
+        session["loginWarning"] = expiry.get("loginWarning", False)
+        session["contractDaysRemaining"] = expiry.get("contractDaysRemaining")
+        session["contractWarning"] = expiry.get("contractWarning", False)
+    except Exception:
+        session["loginDaysRemaining"] = None
+        session["loginWarning"] = False
+        session["contractDaysRemaining"] = None
+        session["contractWarning"] = False
+
+    devices = list(cache.devices) if cache else []
+    dev_count = 0
+    agent_count = 0
+    for d in devices:
+        if isinstance(d, dict):
+            adm = str(d.get("accessDataMode") or d.get("access_data_mode") or "").upper()
+            if adm == "DEVICE":
+                dev_count += 1
+            elif adm == "AGENT":
+                agent_count += 1
+    unknown_count = len(devices) - dev_count - agent_count
+
+    try:
+        mode = app.get_access_mode_summary()
+    except Exception:
+        ultra_count = 0
+        unknown_count = len(devices) - dev_count - agent_count
+        mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
+
+    sync = {
+        "running": bool(getattr(app, "_sync_work_running", False)),
+        "lastSyncAt": getattr(app, "_last_sync_at", None) or (cache.updated_at if cache else None),
+        "lastOk": getattr(app, "_last_sync_ok", bool(cache)),
+        "lastError": getattr(app, "_last_sync_error", None),
+    }
+
+    pullsdk: Dict[str, Any] = {"connected": False, "deviceId": None, "ip": None, "since": None, "lastError": None}
+    with _device_sdk_lock:
+        if _device_sdk_pool:
+            first_id = next(iter(_device_sdk_pool))
+            pullsdk["connected"] = True
+            pullsdk["deviceId"] = first_id
+
+    eng = getattr(app, "_agent_engine", None)
+    agent_running = bool(eng and eng.is_running())
+    agent = {
+        "running": agent_running,
+        "eventQueueDepth": eng.get_queue_depth() if agent_running else 0,
+        "avgDecisionMs": round(eng.get_avg_decision_ms(), 2) if agent_running else 0.0,
+    }
+
+    ultra_eng = getattr(app, "_ultra_engine", None)
+    ultra_running = bool(ultra_eng and ultra_eng.running)
+    ultra: Dict[str, Any] = {"running": ultra_running, "devices": {}}
+    if ultra_running:
+        try:
+            ultra = ultra_eng.get_status()
+        except Exception:
+            pass
+
+    updates = _build_update_status_payload(app)
+    updates["progress"] = updates.get("progressPercent")
+
+    ds_engine = getattr(app, "_device_sync_engine", None)
+    ds_progress = None
+    if ds_engine:
+        try:
+            ds_progress, _ = ds_engine.get_progress_snapshot()
+        except Exception:
+            ds_progress = getattr(ds_engine, "_sync_progress", None)
+    device_sync = {
+        "lastRunAt": getattr(app, "_last_device_sync_at", None),
+        "lastOk": getattr(app, "_last_device_sync_ok", True),
+        "lastError": getattr(app, "_last_device_sync_error", None),
+        "progress": {
+            "running": ds_progress.get("running", False),
+            "deviceName": ds_progress.get("deviceName", ""),
+            "deviceId": ds_progress.get("deviceId"),
+            "current": ds_progress.get("current", 0),
+            "total": ds_progress.get("total", 0),
+        } if ds_progress else None,
+    }
+
+    return {
+        "ok": True,
+        "session": session,
+        "mode": mode,
+        "sync": sync,
+        "deviceSync": device_sync,
+        "pullsdk": pullsdk,
+        "agent": agent,
+        "ultra": ultra,
+        "updates": updates,
+    }
+
+
+def _status_payload_signature(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _handle_status_stream_sse(ctx: _Ctx) -> None:
+    ctx.send_sse_start()
+
+    payload = _build_status_payload(ctx.app)
+    last_signature = _status_payload_signature(payload)
+    if not ctx.send_sse_event("status", payload):
+        return
+
+    ds_engine = getattr(ctx.app, "_device_sync_engine", None)
+    progress_seq = -1
+    if ds_engine:
+        try:
+            _, progress_seq = ds_engine.get_progress_snapshot()
+        except Exception:
+            progress_seq = -1
+
+    idle_ticks = 0
+    while True:
+        if ds_engine and hasattr(ds_engine, "wait_for_progress_change"):
+            try:
+                _, progress_seq = ds_engine.wait_for_progress_change(progress_seq, timeout=1.0)
+            except Exception:
+                time.sleep(1.0)
+        else:
+            time.sleep(1.0)
+
+        payload = _build_status_payload(ctx.app)
+        signature = _status_payload_signature(payload)
+        if signature != last_signature:
+            last_signature = signature
+            idle_ticks = 0
+            if not ctx.send_sse_event("status", payload):
+                return
+            continue
+
+        idle_ticks += 1
+        if idle_ticks >= 15:
+            idle_ticks = 0
+            if not ctx.send_sse_event("ping", {"t": int(time.time())}):
+                return
 
 
 # ==================== 2) AUTH ====================
