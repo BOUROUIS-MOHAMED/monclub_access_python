@@ -477,6 +477,33 @@ def _handle_status(ctx: _Ctx) -> None:
         "updates": updates,
     })
 
+def _get_engine_progress_snapshot(engine: Any) -> Optional[Dict[str, Any]]:
+    if not engine:
+        return None
+    try:
+        progress, _ = engine.get_progress_snapshot()
+        return progress
+    except Exception:
+        return getattr(engine, "_sync_progress", None)
+
+
+def _get_live_device_sync_progress(app: Any) -> Optional[Dict[str, Any]]:
+    main_progress = _get_engine_progress_snapshot(getattr(app, "_device_sync_engine", None))
+    if main_progress and main_progress.get("running"):
+        return main_progress
+
+    ultra_eng = getattr(app, "_ultra_engine", None)
+    ultra_progress = None
+    if ultra_eng and hasattr(ultra_eng, "get_sync_progress_snapshot"):
+        try:
+            ultra_progress, _ = ultra_eng.get_sync_progress_snapshot()
+        except Exception:
+            ultra_progress = None
+    if ultra_progress and ultra_progress.get("running"):
+        return ultra_progress
+
+    return main_progress or ultra_progress
+
 
 def _build_status_payload(app: Any) -> Dict[str, Any]:
     from access.store import load_auth_token, load_sync_cache
@@ -564,13 +591,7 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
     updates = _build_update_status_payload(app)
     updates["progress"] = updates.get("progressPercent")
 
-    ds_engine = getattr(app, "_device_sync_engine", None)
-    ds_progress = None
-    if ds_engine:
-        try:
-            ds_progress, _ = ds_engine.get_progress_snapshot()
-        except Exception:
-            ds_progress = getattr(ds_engine, "_sync_progress", None)
+    ds_progress = _get_live_device_sync_progress(app)
     device_sync = {
         "lastRunAt": getattr(app, "_last_device_sync_at", None),
         "lastOk": getattr(app, "_last_device_sync_ok", True),
@@ -609,23 +630,9 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
     if not ctx.send_sse_event("status", payload):
         return
 
-    ds_engine = getattr(ctx.app, "_device_sync_engine", None)
-    progress_seq = -1
-    if ds_engine:
-        try:
-            _, progress_seq = ds_engine.get_progress_snapshot()
-        except Exception:
-            progress_seq = -1
-
     idle_ticks = 0
     while True:
-        if ds_engine and hasattr(ds_engine, "wait_for_progress_change"):
-            try:
-                _, progress_seq = ds_engine.wait_for_progress_change(progress_seq, timeout=1.0)
-            except Exception:
-                time.sleep(1.0)
-        else:
-            time.sleep(1.0)
+        time.sleep(0.25)
 
         payload = _build_status_payload(ctx.app)
         signature = _status_payload_signature(payload)
@@ -637,7 +644,7 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
             continue
 
         idle_ticks += 1
-        if idle_ticks >= 15:
+        if idle_ticks >= 60:
             idle_ticks = 0
             if not ctx.send_sse_event("ping", {"t": int(time.time())}):
                 return

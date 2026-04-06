@@ -827,6 +827,8 @@ class UltraSyncScheduler:
         self._last_sync_at: Dict[int, str] = {}
         self._next_sync_at: Dict[int, str] = {}
         self._workers: Dict[int, "UltraDeviceWorker"] = {}
+        self._active_sync_lock = threading.Lock()
+        self._active_sync_engine: Optional[Any] = None
 
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
         """Register per-device worker references so _sync_device can pause them."""
@@ -944,10 +946,15 @@ class UltraSyncScheduler:
 
         try:
             engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+            with self._active_sync_lock:
+                self._active_sync_engine = engine
             engine.run_blocking(cache=filtered_cache, source="ultra_sync")
             self._last_hash[device_id] = current_hash
             self._logger.info("[ULTRA:%s] sync push complete", device_id)
         finally:
+            with self._active_sync_lock:
+                if self._active_sync_engine is engine:
+                    self._active_sync_engine = None
             if worker:
                 worker.resume_from_sync()
                 self._logger.info(
@@ -962,6 +969,16 @@ class UltraSyncScheduler:
             }
             for did in [d.get("id") for d in self._devices]
         }
+
+    def get_active_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:
+        with self._active_sync_lock:
+            engine = self._active_sync_engine
+        if engine and hasattr(engine, "get_progress_snapshot"):
+            try:
+                return engine.get_progress_snapshot()
+            except Exception:
+                return None, 0
+        return None, 0
 
 
 # ---------------------------------------------------------------------------
@@ -1109,3 +1126,8 @@ class UltraEngine:
             "running": self._running,
             "devices": devices,
         }
+
+    def get_sync_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:
+        if not self._sync_scheduler:
+            return None, 0
+        return self._sync_scheduler.get_active_progress_snapshot()

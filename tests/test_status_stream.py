@@ -33,6 +33,18 @@ class _StatusStreamApp:
         return {"DEVICE": 1, "AGENT": 0, "ULTRA": 0, "UNKNOWN": 0}
 
 
+class _UltraProgressEngine:
+    def __init__(self, progress: dict[str, object]) -> None:
+        self._progress = progress
+        self.running = True
+
+    def get_sync_progress_snapshot(self) -> tuple[dict[str, object], int]:
+        return self._progress, 1
+
+    def get_status(self) -> dict[str, object]:
+        return {"running": True, "devices": {}}
+
+
 class _FakeStatusStreamCtx:
     def __init__(self, app: _StatusStreamApp) -> None:
         self.app = app
@@ -107,6 +119,33 @@ def test_build_status_payload_includes_live_device_sync_progress() -> None:
         "deviceId": 7,
         "current": 2,
         "total": 5,
+    }
+
+
+def test_build_status_payload_uses_ultra_sync_progress_when_main_engine_is_idle() -> None:
+    engine = DeviceSyncEngine(cfg=SimpleNamespace(), logger=MagicMock())
+    app = _StatusStreamApp(engine)
+    app._ultra_engine = _UltraProgressEngine({
+        "running": True,
+        "deviceName": "door 1",
+        "deviceId": 5,
+        "current": 12,
+        "total": 1100,
+    })
+
+    with (
+        patch("access.store.load_auth_token", return_value=_make_auth()),
+        patch("access.store.load_sync_cache", return_value=_make_cache()),
+        _patched_status_dependencies(),
+    ):
+        payload = local_access_api_v2._build_status_payload(app)
+
+    assert payload["deviceSync"]["progress"] == {
+        "running": True,
+        "deviceName": "door 1",
+        "deviceId": 5,
+        "current": 12,
+        "total": 1100,
     }
 
 
