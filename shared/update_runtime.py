@@ -121,11 +121,16 @@ def _updater_exe_path(install_root: Path, identity: DesktopComponentIdentity) ->
 
 
 def _launch_installer_exe(exe_path: Path, *, silent: bool = True) -> None:
+    # On Windows we want hidden child processes that survive this process's exit.
+    # We use CREATE_NO_WINDOW to suppress any console flash.
+    # We intentionally DO NOT use DETACHED_PROCESS: it prevents PowerShell from
+    # executing commands (tested: the process spawns but runs nothing). On Windows,
+    # child processes survive parent exit by default, so DETACHED_PROCESS is
+    # unnecessary for our "launch-and-exit" pattern.
     creationflags = 0
     if os.name == "nt":
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
-            | subprocess.DETACHED_PROCESS
             | subprocess.CREATE_NO_WINDOW
         )
 
@@ -149,7 +154,7 @@ def _launch_installer_exe(exe_path: Path, *, silent: bool = True) -> None:
             f"-ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'"
         )
         subprocess.Popen(
-            ["powershell", "-WindowStyle", "Hidden", "-NonInteractive", "-Command", ps_cmd],
+            ["powershell", "-NonInteractive", "-Command", ps_cmd],
             creationflags=creationflags,
             close_fds=True,
         )
