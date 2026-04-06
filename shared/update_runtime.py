@@ -121,22 +121,48 @@ def _updater_exe_path(install_root: Path, identity: DesktopComponentIdentity) ->
 
 
 def _launch_installer_exe(exe_path: Path, *, silent: bool = True) -> None:
-    cmd = [str(exe_path)]
-    if silent:
-        cmd += ["/VERYSILENT", "/SUPPRESSMSGBOXES"]
     creationflags = 0
     if os.name == "nt":
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP
             | subprocess.DETACHED_PROCESS
-            | subprocess.CREATE_NO_WINDOW  # prevent CMD flash on Windows
+            | subprocess.CREATE_NO_WINDOW
         )
-    subprocess.Popen(
-        cmd,
-        cwd=str(exe_path.parent),
-        close_fds=True,
-        creationflags=creationflags,
-    )
+
+    if os.name == "nt" and silent:
+        # On Windows, wrap the installer in a hidden PowerShell that waits for
+        # THIS process to fully exit before running the installer.
+        #
+        # Without this, the installer's PrepareToInstall runs taskkill /F on
+        # MonClubAccess.exe then immediately calls DelTree on {app}\current —
+        # but PyInstaller DLLs may still be locked for a moment after a
+        # force-kill, causing DelTree to fail silently and leaving the old
+        # version in place.
+        #
+        # With this wrapper, our process exits gracefully first (releasing all
+        # locks), then PowerShell starts the installer. No race condition.
+        pid = os.getpid()
+        exe_str = str(exe_path).replace("'", "''")  # escape PS single-quotes
+        ps_cmd = (
+            f"Wait-Process -Id {pid} -ErrorAction SilentlyContinue; "
+            f"Start-Process -FilePath '{exe_str}' "
+            f"-ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES'"
+        )
+        subprocess.Popen(
+            ["powershell", "-WindowStyle", "Hidden", "-NonInteractive", "-Command", ps_cmd],
+            creationflags=creationflags,
+            close_fds=True,
+        )
+    else:
+        cmd = [str(exe_path)]
+        if silent:
+            cmd += ["/VERYSILENT", "/SUPPRESSMSGBOXES"]
+        subprocess.Popen(
+            cmd,
+            cwd=str(exe_path.parent),
+            close_fds=True,
+            creationflags=creationflags,
+        )
 
 
 def _default_installer_file_name(component: DesktopComponentIdentity, version: str) -> str:

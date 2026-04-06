@@ -20,20 +20,28 @@ def _call_launch(silent: bool, exe_path: str = r"C:\fake\setup.exe"):
         return mock_popen.call_args
 
 
+def _cmd_contains(call, flag: str) -> bool:
+    """Return True if *flag* appears anywhere in the Popen command list."""
+    cmd = call[0][0]   # first positional arg = the command list
+    return any(flag in part for part in cmd if isinstance(part, str))
+
+
 def test_launch_installer_exe_silent_adds_flags():
-    """Default silent=True must pass /VERYSILENT and /SUPPRESSMSGBOXES."""
+    """Default silent=True must pass /VERYSILENT and /SUPPRESSMSGBOXES.
+
+    With the PowerShell wrapper the flags live inside the PS command string
+    rather than as top-level list elements, so we search all parts.
+    """
     call = _call_launch(silent=True)
-    cmd = call[0][0]          # first positional arg = the command list
-    assert "/VERYSILENT" in cmd
-    assert "/SUPPRESSMSGBOXES" in cmd
+    assert _cmd_contains(call, "/VERYSILENT")
+    assert _cmd_contains(call, "/SUPPRESSMSGBOXES")
 
 
 def test_launch_installer_exe_not_silent_omits_flags():
     """silent=False must NOT pass silent flags."""
     call = _call_launch(silent=False)
-    cmd = call[0][0]
-    assert "/VERYSILENT" not in cmd
-    assert "/SUPPRESSMSGBOXES" not in cmd
+    assert not _cmd_contains(call, "/VERYSILENT")
+    assert not _cmd_contains(call, "/SUPPRESSMSGBOXES")
 
 
 def test_launch_installer_exe_default_is_silent():
@@ -41,8 +49,8 @@ def test_launch_installer_exe_default_is_silent():
     from shared.update_runtime import _launch_installer_exe
     with patch("shared.update_runtime.subprocess.Popen") as mock_popen:
         _launch_installer_exe(Path(r"C:\fake\setup.exe"))
-        cmd = mock_popen.call_args[0][0]
-    assert "/VERYSILENT" in cmd
+        call = mock_popen.call_args
+    assert _cmd_contains(call, "/VERYSILENT")
 
 
 # ---------------------------------------------------------------------------
