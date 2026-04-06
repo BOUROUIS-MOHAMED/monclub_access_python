@@ -66,8 +66,9 @@ export default function DashboardPage() {
   const sync = status.sync;
   const agent = status.agent;
   const dsp = status.deviceSync?.progress;
-  const dspActive = !!(dsp?.running && dsp.total > 0);
-  const dspPct = dspActive ? Math.round((dsp.current / dsp.total) * 100) : 0;
+  const dspActive = !!(dsp?.running);
+  const dspPushing = dspActive && dsp.total > 0;
+  const dspPct = dspPushing ? Math.round((dsp.current / dsp.total) * 100) : 0;
 
   return (
     <div className="space-y-5">
@@ -77,20 +78,27 @@ export default function DashboardPage() {
           <div className="flex items-center gap-2.5">
             <Upload className="h-4 w-4 text-primary animate-pulse" />
             <span className="text-[13px] font-semibold tracking-tight">
-              Envoi des utilisateurs vers l'appareil
-              {dsp.deviceName ? ` "${dsp.deviceName}"` : ""}
+              {dspPushing
+                ? `Envoi des utilisateurs vers l'appareil${dsp.deviceName ? ` "${dsp.deviceName}"` : ""}`
+                : `Connexion à l'appareil${dsp.deviceName ? ` "${dsp.deviceName}"` : ""}…`}
             </span>
           </div>
-          <Progress value={dspPct} className="h-2" />
-          <div className="flex items-center justify-between text-[12px] text-muted-foreground">
-            <span>
-              <span className="font-mono font-semibold text-foreground">{dsp.current}</span>
-              {" / "}
-              <span className="font-mono font-semibold text-foreground">{dsp.total}</span>
-              {" utilisateurs"}
-            </span>
-            <span className="font-mono">{dspPct}%</span>
-          </div>
+          {dspPushing ? (
+            <>
+              <Progress value={dspPct} className="h-2" />
+              <div className="flex items-center justify-between text-[12px] text-muted-foreground">
+                <span>
+                  <span className="font-mono font-semibold text-foreground">{dsp.current}</span>
+                  {" / "}
+                  <span className="font-mono font-semibold text-foreground">{dsp.total}</span>
+                  {" utilisateurs"}
+                </span>
+                <span className="font-mono">{dspPct}%</span>
+              </div>
+            </>
+          ) : (
+            <Progress value={undefined} className="h-2 animate-pulse" />
+          )}
           <p className="text-[11px] text-muted-foreground/80">
             Veuillez ne pas fermer l'application pendant la synchronisation.
           </p>

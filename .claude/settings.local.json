@@ -173,7 +173,11 @@
       "Bash(python -c \"from app.core.device_sync import DeviceSyncEngine; print\\(''OK''\\)\")",
       "Bash(python -m pytest tests/test_launch_safety_regressions.py -v --co)",
       "Bash(python -m pytest tests/test_silent_update.py -v)",
-      "Bash(python -m pytest tests/test_silent_update.py tests/test_access_verification.py tests/test_auth_reconnect.py tests/test_change_detector.py tests/test_launch_safety_regressions.py -v)"
+      "Bash(python -m pytest tests/test_silent_update.py tests/test_access_verification.py tests/test_auth_reconnect.py tests/test_change_detector.py tests/test_launch_safety_regressions.py -v)",
+      "Read(//c/Users/mohaa/AppData/**)",
+      "Bash(python -c \"from app.core.utils import CONFIG_PATH; print\\(CONFIG_PATH\\)\")",
+      "Bash(python -c \"import json; d=json.load\\(open\\(''C:/ProgramData/MonClub Access/access/config.json''\\)\\); print\\(''auto_download:'', d.get\\(''update_auto_download_zip'', ''NOT SET''\\)\\)\")",
+      "Bash(python -c \"import subprocess; print\\(''CREATE_NO_WINDOW:'', hex\\(subprocess.CREATE_NO_WINDOW\\)\\)\")"
     ]
   }
 }

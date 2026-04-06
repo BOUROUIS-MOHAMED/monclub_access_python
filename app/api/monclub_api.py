@@ -183,7 +183,10 @@ class MonClubApi:
         """
         from urllib.parse import urlparse
         parsed = urlparse(self.endpoints.login_url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
+        # Extract scheme + host + first two path segments (e.g. /api/v1)
+        path_parts = [p for p in parsed.path.split('/') if p]
+        prefix = ('/' + '/'.join(path_parts[:2])) if len(path_parts) >= 2 else ''
+        base = f"{parsed.scheme}://{parsed.netloc}{prefix}"
         url = f"{base}/connected/account/openStatisticsInfo"
         headers = {
             "Authorization": f"Bearer {token}",
