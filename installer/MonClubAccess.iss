@@ -473,13 +473,16 @@ begin
   begin
     RunRuntimeChecks();
 
-    if RuntimeHasWarning then
+    if RuntimeHasWarning and not WizardSilent() then
       Result := (MsgBox(
         'Some runtime checks returned warnings (WebView2 and/or ZKTeco driver).' + #13#10 +
         'Continue installation anyway?',
         mbConfirmation,
         MB_YESNO or MB_DEFBUTTON2
       ) = IDYES);
+    // In silent mode (WizardSilent = True): proceed regardless of warnings.
+    // The app may not function correctly if WebView2/ZKTeco is missing,
+    // but a silent update should never block due to a warning dialog.
   end;
 end;
 

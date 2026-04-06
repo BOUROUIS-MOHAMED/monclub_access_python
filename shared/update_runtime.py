@@ -126,7 +126,11 @@ def _launch_installer_exe(exe_path: Path, *, silent: bool = True) -> None:
         cmd += ["/VERYSILENT", "/SUPPRESSMSGBOXES"]
     creationflags = 0
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW  # prevent CMD flash on Windows
+        )
     subprocess.Popen(
         cmd,
         cwd=str(exe_path.parent),

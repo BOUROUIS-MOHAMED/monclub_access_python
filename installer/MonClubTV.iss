@@ -399,13 +399,14 @@ begin
   begin
     RunRuntimeChecks();
 
-    if RuntimeHasWarning then
+    if RuntimeHasWarning and not WizardSilent() then
       Result := (MsgBox(
         'WebView2 runtime warning detected.' + #13#10 +
         'Continue installation anyway?',
         mbConfirmation,
         MB_YESNO or MB_DEFBUTTON2
       ) = IDYES);
+    // In silent mode (WizardSilent = True): proceed regardless of warnings.
   end;
 end;
 

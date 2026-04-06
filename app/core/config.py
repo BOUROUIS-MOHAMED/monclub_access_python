@@ -468,6 +468,13 @@ class AppConfig:
 def load_config() -> AppConfig:
     raw = load_json(CONFIG_PATH, default={})
     if isinstance(raw, dict):
+        # One-time migration: if update_auto_download_zip was never explicitly set
+        # to True by the operator, upgrade it to True so silent updates work.
+        # An operator who wants to disable it must set it to False explicitly after
+        # this version is deployed — the key will then persist as False on next save.
+        if not raw.get("update_auto_download_zip", False):
+            raw["update_auto_download_zip"] = True
+            save_json(CONFIG_PATH, raw)
         return AppConfig.from_dict(raw)
     return AppConfig()
 
