@@ -55,10 +55,11 @@ export async function get<T>(path: string, params?: Record<string, string>): Pro
   return parse<T>(await fetch(url, { headers: hdrs(false) }));
 }
 
-export async function post<T>(path: string, body?: unknown): Promise<T> {
+export async function post<T>(path: string, body?: unknown, timeoutMs = 15_000): Promise<T> {
   return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
     method: "POST", headers: hdrs(true),
     body: body != null ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
   }));
 }
 

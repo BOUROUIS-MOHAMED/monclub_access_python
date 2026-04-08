@@ -4696,6 +4696,11 @@ class LocalApiServerV2:
                     path = parsed.path or ""
                     qs = parse_qs(parsed.query or "")
 
+                    try:
+                        server.app.logger.debug("[LocalAPI v2] >> %s %s", method, path)
+                    except Exception:
+                        pass
+
                     handler_fn, params = router.match(method, path)
                     if handler_fn is None:
                         body = _json_bytes({"ok": False, "error": "Not found", "path": path})

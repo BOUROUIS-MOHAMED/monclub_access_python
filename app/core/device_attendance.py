@@ -98,11 +98,16 @@ def _dt_from_any(value: Any) -> Optional[datetime]:
 def _normalize_datetime_text(value: Any, fallback: str | None = None) -> str:
     dt_value = _dt_from_any(value)
     if dt_value is not None:
-        return dt_value.strftime("%Y-%m-%d %H:%M:%S")
+        return dt_value.strftime("%Y-%m-%dT%H:%M:%S")
     txt = _safe_str(value, "").strip()
     if txt:
-        return txt.replace("T", " ").replace("Z", "")
-    return _safe_str(fallback, now_iso())
+        # Preserve ISO 8601 T separator; strip trailing Z (naive local time)
+        return txt.replace("Z", "").replace(" ", "T")
+    fb = _safe_str(fallback, "").strip()
+    if fb:
+        return _normalize_datetime_text(fb)
+    from app.core.utils import now_iso
+    return now_iso().replace(" ", "T")
 
 
 def _lower_keys(row: Dict[str, Any]) -> Dict[str, Any]:
