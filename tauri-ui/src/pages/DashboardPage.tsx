@@ -8,7 +8,7 @@ import { Progress } from "@/components/ui/progress";
 import StatusChip from "@/components/StatusChip2";
 import { cn } from "@/lib/utils";
 import {
-  RefreshCw, Router, Bot, Users, CheckCircle, Monitor,
+  RefreshCw, RotateCcw, Router, Bot, Users, CheckCircle, Monitor,
   Bug, AlertTriangle, Play, Square, Upload,
 } from "lucide-react";
 
@@ -56,7 +56,7 @@ function StatusDot({ ok, pulse }: { ok: boolean; pulse?: boolean }) {
 }
 
 export default function DashboardPage() {
-  const { status, syncNow } = useApp();
+  const { status, syncNow, hardSyncNow } = useApp();
   const { openPopupWindow, sendTestNotification } = usePopupStream();
 
   if (!status) return <p className="text-[13px] text-muted-foreground">Chargement…</p>;
@@ -174,16 +174,30 @@ export default function DashboardPage() {
           )}
         </div>
 
-        <Button
-          size="sm"
-          variant="outline"
-          className="ml-auto h-7 text-[12px] gap-1.5 px-3"
-          onClick={syncNow}
-          disabled={sync.running}
-        >
-          <RefreshCw className={cn("h-3 w-3", sync.running && "animate-spin")} />
-          {sync.running ? "En cours…" : "Synchroniser"}
-        </Button>
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[12px] gap-1.5 px-3"
+            onClick={syncNow}
+            disabled={sync.running}
+            title="Synchroniser — pousse uniquement les différences vers les appareils"
+          >
+            <RefreshCw className={cn("h-3 w-3", sync.running && "animate-spin")} />
+            {sync.running ? "En cours…" : "Synchroniser"}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[12px] gap-1.5 px-3 text-amber-500 border-amber-500/40 hover:bg-amber-500/10 hover:text-amber-400"
+            onClick={hardSyncNow}
+            disabled={sync.running}
+            title="Réinitialisation complète — force le rechargement de tous les membres sur les appareils"
+          >
+            <RotateCcw className={cn("h-3 w-3", sync.running && "animate-spin")} />
+            {sync.running ? "En cours…" : "Hard Reset"}
+          </Button>
+        </div>
       </div>
 
       {/* Main grid — 3 columns, varying spans */}

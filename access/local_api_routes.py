@@ -23,6 +23,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("PATCH", "/api/v2/config", "_handle_config_patch"),
     ("POST", "/api/v2/config/restart-local-api", "_handle_config_restart_api"),
     ("POST", "/api/v2/sync/now", "_handle_sync_now"),
+    ("POST", "/api/v2/sync/hard-reset", "_handle_sync_hard_reset"),
     ("GET", "/api/v2/sync/cache/meta", "_handle_sync_cache_meta"),
     ("GET", "/api/v2/sync/cache/users", "_handle_sync_cache_users"),
     ("GET", "/api/v2/sync/cache/memberships", "_handle_sync_cache_memberships"),

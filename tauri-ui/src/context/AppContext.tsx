@@ -14,6 +14,7 @@ interface AppCtx extends AppState {
   login: (req: LoginRequest) => Promise<LoginResponse>;
   logout: () => Promise<void>;
   syncNow: () => Promise<void>;
+  hardSyncNow: () => Promise<void>;
 }
 
 const Ctx = createContext<AppCtx | null>(null);
@@ -56,6 +57,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setTimeout(refreshStatus, 1500);
   }, [refreshStatus]);
 
+  const hardSyncNow = useCallback(async () => {
+    await post("/sync/hard-reset");
+    setTimeout(refreshStatus, 1500);
+  }, [refreshStatus]);
+
   useEffect(() => {
     refreshStatus();
     const id = setInterval(refreshStatus, 5000);
@@ -83,7 +89,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [refreshStatus]);
 
   return (
-    <Ctx.Provider value={{ ...state, refreshStatus, login, logout, syncNow }}>
+    <Ctx.Provider value={{ ...state, refreshStatus, login, logout, syncNow, hardSyncNow }}>
       {children}
     </Ctx.Provider>
   );

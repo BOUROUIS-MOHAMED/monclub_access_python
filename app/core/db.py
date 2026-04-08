@@ -2791,6 +2791,14 @@ def clear_device_sync_hashes(*, device_id: int) -> int:
         return cursor.rowcount
 
 
+def clear_all_device_sync_hashes() -> int:
+    """Hard-reset: clear sync hashes for ALL devices so next sync re-pushes every user."""
+    with get_conn() as conn:
+        cursor = conn.execute("DELETE FROM device_sync_state")
+        conn.commit()
+        return cursor.rowcount
+
+
 # Realtime RTLog cursor/state
 # -----------------------------
 @dataclass

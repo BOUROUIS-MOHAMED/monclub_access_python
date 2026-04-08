@@ -1122,6 +1122,27 @@ def _handle_sync_now(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True, "message": "sync triggered"})
 
 
+def _handle_sync_hard_reset(ctx: _Ctx) -> None:
+    """Clear all device sync hashes so the next sync re-pushes every user, then trigger sync."""
+    try:
+        from app.core.db import clear_all_device_sync_hashes
+        cleared = clear_all_device_sync_hashes()
+
+        # Also clear ULTRA scheduler in-memory hashes for all devices
+        ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+        if ultra_eng:
+            sched = getattr(ultra_eng, "_sync_scheduler", None)
+            if sched:
+                for device_id in list(getattr(sched, "_last_hash", {}).keys()):
+                    sched.force_resync(device_id)
+
+        ctx.app.after(0, ctx.app.request_sync_now)
+        ctx.send_json(200, {"ok": True, "cleared": cleared, "message": "Hard reset: all sync hashes cleared, full push triggered"})
+    except Exception as e:
+        _logger.exception("[LocalAPI] hard-reset failed")
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
 def _handle_sync_cache_meta(ctx: _Ctx) -> None:
     from access.store import load_sync_cache
     cache = load_sync_cache()
