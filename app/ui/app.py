@@ -1040,6 +1040,8 @@ class MainApp:
                 }
 
                 save_sync_cache_delta(data, refresh)
+                from app.core.db import invalidate_sync_cache
+                invalidate_sync_cache()
 
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they

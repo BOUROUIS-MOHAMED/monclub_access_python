@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -2479,7 +2480,32 @@ def list_optional_deals() -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-def load_sync_cache() -> SyncCacheState | None:
+_sync_cache_lock = threading.Lock()
+_sync_cache_entry: tuple[float, "SyncCacheState | None"] = (0.0, None)
+_SYNC_CACHE_TTL = 5.0  # seconds
+
+
+def invalidate_sync_cache() -> None:
+    """Force the next load_sync_cache() call to read from the DB."""
+    global _sync_cache_entry
+    with _sync_cache_lock:
+        _sync_cache_entry = (0.0, None)
+
+
+def load_sync_cache() -> "SyncCacheState | None":
+    global _sync_cache_entry
+    now = time.monotonic()
+    with _sync_cache_lock:
+        expires, cached = _sync_cache_entry
+        if now < expires and cached is not None:
+            return cached
+    result = _load_sync_cache_db()
+    with _sync_cache_lock:
+        _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
+    return result
+
+
+def _load_sync_cache_db() -> "SyncCacheState | None":
     with get_conn() as conn:
         meta = conn.execute("SELECT contract_status, contract_end_date, updated_at FROM sync_meta WHERE id=1").fetchone()
         if not meta:
