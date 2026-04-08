@@ -379,26 +379,33 @@ class MainApp:
 
     def mainloop(self) -> None:
         """Run the headless event loop. Blocks until quit_app() is called."""
-        while not self._stop_event.is_set():
-            now = time.monotonic()
-            to_run = []
-            with self._sched_lock:
-                remaining = []
-                for t, sid, cb in self._scheduled:
-                    if t <= now:
-                        to_run.append(cb)
-                    else:
-                        remaining.append((t, sid, cb))
-                self._scheduled = remaining
+        try:
+            while not self._stop_event.is_set():
+                now = time.monotonic()
+                to_run = []
+                with self._sched_lock:
+                    remaining = []
+                    for t, sid, cb in self._scheduled:
+                        if t <= now:
+                            to_run.append(cb)
+                        else:
+                            remaining.append((t, sid, cb))
+                    self._scheduled = remaining
 
-            for cb in to_run:
-                try:
-                    cb()
-                except Exception:
-                    if hasattr(self, "logger"):
-                        self.logger.exception("Scheduled callback error")
+                for cb in to_run:
+                    try:
+                        cb()
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception:
+                        if hasattr(self, "logger"):
+                            self.logger.exception("Scheduled callback error")
 
             self._stop_event.wait(timeout=0.05)
+        except KeyboardInterrupt:
+            if hasattr(self, "logger"):
+                self.logger.info("KeyboardInterrupt received, shutting down.")
+            self.quit_app()
 
     def destroy(self) -> None:
         self._stop_event.set()

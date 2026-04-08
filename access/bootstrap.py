@@ -39,7 +39,10 @@ def create_access_app():
 
 def run_access_app() -> None:
     app = create_access_app()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        pass
 
 
 __all__ = ["create_access_app", "describe_access_component", "run_access_app"]
