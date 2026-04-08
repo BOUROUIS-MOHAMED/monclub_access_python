@@ -263,6 +263,11 @@ class DeviceSyncEngine:
             "authorizeTimezoneId": int(tz_id),
             "pushingToDevicePolicy": pushing_policy,
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
+
+            # Anti-fraud settings (per-device)
+            "anti_fraude_card":     _boolish(g("anti_fraude_card",    "antiFraudeCard",    default=True), True),
+            "anti_fraude_qr_code":  _boolish(g("anti_fraude_qr_code", "antiFraudeQrCode",  default=True), True),
+            "anti_fraude_duration": _to_int(g("anti_fraude_duration", "antiFraudeDuration", default=30), default=30) or 30,
         }
 
     def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
@@ -972,6 +977,29 @@ class DeviceSyncEngine:
                             "[DeviceSync] Device id=%s SetDeviceParam %s failed: %s",
                             dev_id, param_str, ex,
                         )
+
+            # [Anti-fraud] Push hardware anti-passback parameter to ZKTeco controller.
+            # AntiPassback=1 + AntiPassbackTime enables card-level hardware dedup.
+            # NOTE: Parameter names are for C3-200/C3-400 series; verify against
+            # the PullSDK reference for other models. Failure is non-fatal — the
+            # software AntiFraudGuard remains the primary enforcer in all modes.
+            _af_card = bool(device.get("anti_fraude_card", True))
+            _af_duration = int(device.get("anti_fraude_duration") or 30)
+            _af_param = (
+                f"AntiPassback=1&AntiPassbackTime={_af_duration}"
+                if _af_card else "AntiPassback=0"
+            )
+            try:
+                sdk.set_device_param(items=_af_param)
+                self.logger.info(
+                    "[DeviceSync] Device id=%s anti-passback param OK (%s)",
+                    dev_id, _af_param,
+                )
+            except Exception as _af_ex:
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s anti-passback param FAILED (non-fatal): %s",
+                    dev_id, _af_ex,
+                )
 
             self.logger.info(
                 f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned}"
