@@ -160,7 +160,7 @@ class MonClubApi:
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
             self.logger.info(extra)
-            print(txt)
+            self.logger.debug("getSyncData response body: %s", txt[:500])
             raise MonClubApiError(f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
 
         try:
@@ -370,7 +370,7 @@ class MonClubApi:
             timeout=timeout,
         )
 
-    def sync_access_history(self, *, token: str, payload: Dict[str, Any], timeout: int = 30) -> Dict[str, Any]:
+    def sync_access_history(self, *, token: str, payload: Any, timeout: int = 30) -> Dict[str, Any]:
         url = (self.endpoints.sync_access_history_url or "").strip()
         if not url:
             raise MonClubApiError("Access history sync URL is empty (check Configuration).")
@@ -383,7 +383,7 @@ class MonClubApi:
 
         self.logger.info("API syncAccessHistory -> %s", url)
         try:
-            r = self._session.post(url, json=(payload or {}), headers=headers, timeout=timeout)
+            r = self._session.post(url, json=(payload if payload is not None else []), headers=headers, timeout=timeout)
         except Exception as e:
             raise MonClubApiError(f"syncAccessHistory request failed: {e}") from e
 
@@ -842,5 +842,4 @@ class MonClubApi:
         if isinstance(data, dict):
             return data
         return {"ok": True, "raw": data}
-
 

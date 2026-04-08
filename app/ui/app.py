@@ -329,6 +329,7 @@ class MainApp:
         self._tray = None  # no tkinter tray
 
         self._sync_work_running = False
+        self._sync_fail_count = 0  # consecutive sync failures for exponential backoff
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -965,9 +966,21 @@ class MainApp:
             self._sync_after_id = None
 
         interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
-        interval = int(max(10, int(interval_cfg)))
+        base_interval = int(max(10, int(interval_cfg)))
+
+        # Exponential backoff on consecutive failures (cap at 10 min)
+        if self._sync_fail_count > 0:
+            import random
+            backoff = min(base_interval * (2 ** self._sync_fail_count), 600)
+            interval = int(backoff) + random.randint(0, 10)  # jitter
+        else:
+            interval = base_interval
+
         self._sync_after_id = self.after(interval * 1000, self._sync_tick)
-        self.logger.info(f"Sync scheduled every {interval} sec")
+        if self._sync_fail_count > 0:
+            self.logger.info(f"Sync scheduled in {interval}s (backoff, fails={self._sync_fail_count})")
+        else:
+            self.logger.info(f"Sync scheduled every {interval} sec")
 
     def _sync_tick(self):
         self.reschedule_sync_timer()
@@ -1046,6 +1059,7 @@ class MainApp:
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = True
                 self._last_sync_error = None
+                self._sync_fail_count = 0  # reset backoff on success
 
             except Exception as ex:
                 self.logger.exception(f"getSyncData failed: {ex} (using cached data if available)")
@@ -1053,6 +1067,7 @@ class MainApp:
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = False
                 self._last_sync_error = str(ex)[:200]
+                self._sync_fail_count = min(self._sync_fail_count + 1, 6)  # cap exponent
 
             # Device sync (DEVICE-mode devices only)
             try:
@@ -1090,16 +1105,17 @@ class MainApp:
             except Exception as ex:
                 self.logger.exception("[DeviceAttendance] Unexpected error: %s", ex)
 
-            # Realtime agent refresh
-            try:
-                if self._agent_engine.is_running():
-                    self._agent_engine.refresh_devices()
-            except Exception:
-                pass
-
-            # --- ULTRA mode management (guarded by _ultra_lock to prevent race) ---
+            # --- Agent + ULTRA mode management (synchronized under _ultra_lock
+            #     to prevent race condition when devices switch modes) ---
             try:
               with self._ultra_lock:
+                # Refresh AGENT engine first (stops workers for devices that switched away from AGENT).
+                # Must be inside _ultra_lock so AGENT worker teardown completes before ULTRA starts.
+                try:
+                    if self._agent_engine.is_running():
+                        self._agent_engine.refresh_devices()
+                except Exception as _agent_exc:
+                    self.logger.warning("[AGENT] refresh_devices error: %s", _agent_exc)
                 summary = self.get_access_mode_summary()
                 ultra_count = summary.get("ULTRA", 0)
 

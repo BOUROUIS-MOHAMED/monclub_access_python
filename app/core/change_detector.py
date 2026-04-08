@@ -54,6 +54,7 @@ class ChangeDetectorService:
         self._last_known_version: Optional[object] = None  # datetime after first poll
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._consecutive_failures: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,7 +91,13 @@ class ChangeDetectorService:
                 self._poll_once()
             except Exception as exc:
                 self._logger.exception("[ChangeDetector] Unexpected error: %s", exc)
-            self._stop_event.wait(timeout=self._poll_interval)
+                self._consecutive_failures = min(self._consecutive_failures + 1, 5)
+            # Backoff on consecutive failures (cap at 5 min)
+            if self._consecutive_failures > 0:
+                backoff = min(self._poll_interval * (2 ** self._consecutive_failures), 300)
+                self._stop_event.wait(timeout=backoff)
+            else:
+                self._stop_event.wait(timeout=self._poll_interval)
 
     def _poll_once(self) -> None:
         if _requests is None:
@@ -112,6 +119,7 @@ class ChangeDetectorService:
             resp = _requests.get(url, headers=headers, timeout=10)
         except _requests.RequestException as exc:
             self._logger.warning("[ChangeDetector] Network error: %s", exc)
+            self._consecutive_failures = min(self._consecutive_failures + 1, 5)
             return
 
         self._logger.debug("[ChangeDetector] response: status=%s", resp.status_code)
@@ -166,6 +174,9 @@ class ChangeDetectorService:
                 "[ChangeDetector] Cannot parse lastModifiedAt '%s': %s", version, exc
             )
             return
+
+        # Successful API call — reset backoff counter
+        self._consecutive_failures = 0
 
         if self._last_known_version is None:
             # First successful poll — set baseline, no sync

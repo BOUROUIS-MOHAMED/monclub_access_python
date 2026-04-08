@@ -236,8 +236,8 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
-        except Exception:
-            pass
+        except Exception as _mig_exc:
+            _logger.error("[DB] schema migration _rebuild_sync_users failed: %s", _mig_exc)
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
@@ -1808,46 +1808,110 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         "Will DELETE all sync_users with 0 replacements!",
                         old_count,
                     )
-            cur.execute("DELETE FROM sync_users")
-            for u in users:
-                if not isinstance(u, dict):
-                    continue
-                fps = u.get("fingerprints") or []
-                if not isinstance(fps, list):
-                    fps = []
-                am_id = u.get("activeMembershipId")
-                m_id = u.get("membershipId")
-                if am_id is None or str(am_id).strip() == "":
-                    am_id = m_id
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO sync_users (
-                        user_id, active_membership_id, membership_id,
-                        full_name, phone, email, valid_from, valid_to,
-                        first_card_id, second_card_id, image,
-                        fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                        image_source, user_image_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        u.get("userId"), am_id, m_id,
-                        u.get("fullName"), u.get("phone"), u.get("email"),
-                        u.get("validFrom"), u.get("validTo"),
-                        u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
-                        json.dumps(fps, ensure_ascii=False),
-                        u.get("faceId"),
-                        u.get("accountUsernameId") or u.get("account_username_id"),
-                        u.get("qrCodePayload"), u.get("birthday"),
-                        u.get("imageSource"),
-                        u.get("userImageStatus"),
-                    ),
-                )
 
-            new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
-            _logger.info(
-                "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
-                new_count,
-            )
+            # --- Content-hash guard: skip DELETE+INSERT if user data is unchanged ---
+            # This prevents unnecessary DB churn and device re-sync when backend
+            # returns refreshMembers=True but user data is actually the same.
+            def _users_content_hash(user_list):
+                """Compute a SHA-1 hash of the user list content for comparison."""
+                h = hashlib.sha1()
+                for u in sorted(user_list, key=lambda x: (x.get("userId") or 0, x.get("activeMembershipId") or x.get("membershipId") or 0)):
+                    am_id = u.get("activeMembershipId")
+                    m_id = u.get("membershipId")
+                    if am_id is None or str(am_id).strip() == "":
+                        am_id = m_id
+                    fps = u.get("fingerprints") or []
+                    row = (
+                        f"{u.get('userId')}|{am_id}|{m_id}|"
+                        f"{u.get('fullName')}|{u.get('phone')}|{u.get('email')}|"
+                        f"{u.get('validFrom')}|{u.get('validTo')}|"
+                        f"{u.get('firstCardId')}|{u.get('secondCardId')}|"
+                        f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
+                        f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
+                        f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
+                        f"{u.get('imageSource')}|{u.get('userImageStatus')}"
+                    )
+                    h.update(row.encode("utf-8", errors="replace"))
+                return h.hexdigest()
+
+            if users and old_count > 0:
+                incoming_hash = _users_content_hash(users)
+                # Build equivalent dicts from existing DB rows for comparison
+                existing_rows = cur.execute(
+                    "SELECT user_id, active_membership_id, membership_id, "
+                    "full_name, phone, email, valid_from, valid_to, "
+                    "first_card_id, second_card_id, image, fingerprints_json, "
+                    "face_id, account_username_id, qr_code_payload, birthday, "
+                    "image_source, user_image_status FROM sync_users"
+                ).fetchall()
+                existing_as_dicts = []
+                for r in existing_rows:
+                    fps_raw = r[11] or "[]"
+                    try:
+                        fps_parsed = json.loads(fps_raw)
+                    except Exception:
+                        fps_parsed = []
+                    existing_as_dicts.append({
+                        "userId": r[0], "activeMembershipId": r[1], "membershipId": r[2],
+                        "fullName": r[3], "phone": r[4], "email": r[5],
+                        "validFrom": r[6], "validTo": r[7],
+                        "firstCardId": r[8], "secondCardId": r[9], "image": r[10],
+                        "fingerprints": fps_parsed,
+                        "faceId": r[12], "accountUsernameId": r[13],
+                        "qrCodePayload": r[14], "birthday": r[15],
+                        "imageSource": r[16], "userImageStatus": r[17],
+                    })
+                existing_hash = _users_content_hash(existing_as_dicts)
+                if incoming_hash == existing_hash:
+                    _logger.info(
+                        "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED (hash=%s), "
+                        "skipping DELETE+INSERT for %d users",
+                        incoming_hash[:12], len(users),
+                    )
+                    # Skip to next section — preserve device_sync_state hashes
+                    users = None  # sentinel: skip the INSERT loop below
+
+            if users is not None:
+                cur.execute("DELETE FROM sync_users")
+                for u in users:
+                    if not isinstance(u, dict):
+                        continue
+                    fps = u.get("fingerprints") or []
+                    if not isinstance(fps, list):
+                        fps = []
+                    am_id = u.get("activeMembershipId")
+                    m_id = u.get("membershipId")
+                    if am_id is None or str(am_id).strip() == "":
+                        am_id = m_id
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO sync_users (
+                            user_id, active_membership_id, membership_id,
+                            full_name, phone, email, valid_from, valid_to,
+                            first_card_id, second_card_id, image,
+                            fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
+                            image_source, user_image_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            u.get("userId"), am_id, m_id,
+                            u.get("fullName"), u.get("phone"), u.get("email"),
+                            u.get("validFrom"), u.get("validTo"),
+                            u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
+                            json.dumps(fps, ensure_ascii=False),
+                            u.get("faceId"),
+                            u.get("accountUsernameId") or u.get("account_username_id"),
+                            u.get("qrCodePayload"), u.get("birthday"),
+                            u.get("imageSource"),
+                            u.get("userImageStatus"),
+                        ),
+                    )
+
+                new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                _logger.info(
+                    "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
+                    new_count,
+                )
         else:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 
@@ -2692,6 +2756,15 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
 
 
 # -----------------------------
+def clear_device_sync_hashes(*, device_id: int) -> int:
+    """F-015: Clear all sync hashes for a device to force full re-sync on next cycle."""
+    did = int(device_id)
+    with get_conn() as conn:
+        cursor = conn.execute("DELETE FROM device_sync_state WHERE device_id=?", (did,))
+        conn.commit()
+        return cursor.rowcount
+
+
 # Realtime RTLog cursor/state
 # -----------------------------
 @dataclass

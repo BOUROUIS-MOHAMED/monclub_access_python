@@ -653,6 +653,7 @@ class DeviceAttendanceMaintenanceEngine:
         item: Dict[str, Any] = {
             "localRowId": int(row.id),
             "eventId": _safe_str(row.event_id, ""),
+            "activeMembership": int(pin) if pin > 0 else None,
             "deviceId": int(row.device_id) if row.device_id is not None else None,
             "deviceName": _safe_str(device.get("name"), ""),
             "doorId": int(row.door_id) if row.door_id is not None else None,
@@ -669,11 +670,13 @@ class DeviceAttendanceMaintenanceEngine:
         }
 
         if user:
-            item["userId"] = _safe_int(user.get("userId") or user.get("user_id"), 0) or None
-            item["activeMembershipId"] = _safe_int(
+            active_membership_id = _safe_int(
                 user.get("activeMembershipId") or user.get("active_membership_id"),
                 0,
-            ) or None
+            ) or (int(pin) if pin > 0 else None)
+            item["userId"] = _safe_int(user.get("userId") or user.get("user_id"), 0) or None
+            item["activeMembership"] = active_membership_id
+            item["activeMembershipId"] = active_membership_id
             item["membershipId"] = _safe_int(user.get("membershipId") or user.get("membership_id"), 0) or None
             item["userFullName"] = _safe_str(user.get("fullName") or user.get("full_name"), "")
             item["userPhone"] = _safe_str(user.get("phone"), "")
@@ -728,7 +731,7 @@ class DeviceAttendanceMaintenanceEngine:
         try:
             response = api.sync_access_history(
                 token=token_value,
-                payload={"items": items},
+                payload=items,
                 timeout=15,
             )
         except MonClubApiHttpError as exc:

@@ -38,7 +38,7 @@ class UltraDeviceWorker(threading.Thread):
         self._settings = settings
         self._popup_q = popup_q
         self._history_q = history_q
-        self._stop = stop_event
+        self._stop_evt = stop_event
         self._device_id = int(device.get("id", 0))
         self._device_name = str(device.get("name", ""))
         self._sdk: Optional[PullSDKDevice] = None
@@ -85,7 +85,7 @@ class UltraDeviceWorker(threading.Thread):
         logger.info(f"{self._prefix} started")
         self._pre_populate_seen()
 
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             # Yield the TCP connection to UltraSyncScheduler when requested
             if self._sync_pause.is_set():
                 if self._connected:
@@ -94,8 +94,8 @@ class UltraDeviceWorker(threading.Thread):
                     )
                     self._disconnect()
                 self._sync_paused_ack.set()
-                while self._sync_pause.is_set() and not self._stop.is_set():
-                    self._stop.wait(0.5)
+                while self._sync_pause.is_set() and not self._stop_evt.is_set():
+                    self._stop_evt.wait(0.5)
                 self._sync_paused_ack.clear()
                 logger.info(f"{self._prefix} sync pause ended — will reconnect")
                 continue
@@ -104,7 +104,7 @@ class UltraDeviceWorker(threading.Thread):
             if not self._connected:
                 self._connect()
                 if not self._connected:
-                    self._stop.wait(5.0)
+                    self._stop_evt.wait(5.0)
                     continue
 
             # Poll RTLog with watchdog
@@ -126,7 +126,7 @@ class UltraDeviceWorker(threading.Thread):
                 )
                 sleep_ms = self._empty_sleep_ms
 
-            self._stop.wait(sleep_ms / 1000.0)
+            self._stop_evt.wait(sleep_ms / 1000.0)
 
         self._disconnect()
         logger.info(f"{self._prefix} stopped")
@@ -167,8 +167,8 @@ class UltraDeviceWorker(threading.Thread):
         if self._sdk:
             try:
                 self._sdk.disconnect()
-            except Exception:
-                pass
+            except Exception as _disc_exc:
+                logger.debug(f"{self._prefix} disconnect error (non-fatal): {_disc_exc}")
         self._sdk = None
         self._connected = False
 
@@ -190,6 +190,12 @@ class UltraDeviceWorker(threading.Thread):
 
     def resume_from_sync(self):
         """Allow worker to reconnect after sync engine has disconnected."""
+        # Invalidate the in-memory state cache so the first event after
+        # reconnect forces a fresh DB load.  Without this the worker can
+        # process post-sync events against the stale pre-sync snapshot for
+        # up to _CACHE_TTL_SEC seconds, defeating the sync entirely.
+        self._cached_state = None
+        self._cached_state_ts = 0.0
         self._sync_pause.clear()
 
     # ------------------------------------------------------------------ #
@@ -292,7 +298,7 @@ class UltraDeviceWorker(threading.Thread):
                 return
             self._card_cooldown[card_no] = now_mono
             # Prune old entries to avoid unbounded growth
-            if len(self._card_cooldown) > 5000:
+            if len(self._card_cooldown) > 2000:
                 cutoff = now_mono - self._card_cooldown_sec * 2
                 self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
 
@@ -834,6 +840,11 @@ class UltraSyncScheduler:
         """Register per-device worker references so _sync_device can pause them."""
         self._workers = workers
 
+    def force_resync(self, device_id: int):
+        """F-015: Clear in-memory hash for a device to force re-push on next cycle."""
+        self._last_hash.pop(device_id, None)
+        self._logger.info("[UltraSyncScheduler] force_resync: cleared hash for device_id=%s", device_id)
+
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
         self._stop.clear()
@@ -864,8 +875,32 @@ class UltraSyncScheduler:
             if not self._stop.is_set():
                 self._sync_all()
 
+    def _check_worker_health(self):
+        """Restart dead UltraDeviceWorker threads."""
+        for device_id, worker in list(self._workers.items()):
+            if not worker.is_alive():
+                self._logger.error("[ULTRA:%s] worker thread died — restarting", device_id)
+                try:
+                    new_worker = UltraDeviceWorker(
+                        device=worker._device,
+                        settings=worker._settings,
+                        popup_q=worker._popup_q,
+                        history_q=worker._history_q,
+                        stop_event=worker._stop_evt,
+                    )
+                    new_worker.start()
+                    self._workers[device_id] = new_worker
+                    self._logger.info("[ULTRA:%s] worker restarted OK", device_id)
+                except Exception as e:
+                    self._logger.error("[ULTRA:%s] worker restart FAILED: %s", device_id, e)
+
     def _sync_all(self):
         """Push user data to all ULTRA devices (with hash-based skip)."""
+        # Check worker health before each sync cycle
+        try:
+            self._check_worker_health()
+        except Exception as e:
+            self._logger.warning("[ULTRA] _check_worker_health error: %s", e)
         for d in self._devices:
             device_id = d.get("id")
             try:
@@ -1004,6 +1039,11 @@ class UltraEngine:
             maxsize=int(_g.get("history_queue_max", 5000))
         )
         self._running = False
+        self._watchdog_thread: Optional[threading.Thread] = None
+        # How often the watchdog checks worker liveness (seconds).
+        # Deliberately shorter than any sync interval so a dead worker is
+        # caught quickly regardless of the configured sync cadence.
+        self._watchdog_interval_sec: float = 30.0
 
     @property
     def running(self) -> bool:
@@ -1086,6 +1126,51 @@ class UltraEngine:
         self._sync_scheduler.set_workers(self._workers)
         self._sync_scheduler.start([d for d, _settings in prepared_devices])
 
+        # Start the watchdog — monitors worker liveness every 30 s, independent
+        # of the sync interval, so a crashed worker is restarted promptly.
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            daemon=True,
+            name="UltraWatchdog",
+        )
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self):
+        """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
+
+        This is intentionally independent of UltraSyncScheduler._check_worker_health:
+        that helper only runs on the sync interval (≥15 min by default), leaving a long
+        window where a crashed worker goes undetected.  This watchdog fires every 30 s
+        so access recovery happens within one poll cycle.
+        """
+        self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
+        while not self._stop_event.wait(self._watchdog_interval_sec):
+            for device_id, worker in list(self._workers.items()):
+                if worker.is_alive():
+                    continue
+                self._logger.error(
+                    "[ULTRA:%s] watchdog: worker thread is dead — restarting", device_id
+                )
+                try:
+                    new_worker = UltraDeviceWorker(
+                        device=worker._device,
+                        settings=worker._settings,
+                        popup_q=self._popup_q,
+                        history_q=self._history_q,
+                        stop_event=self._stop_event,
+                    )
+                    new_worker.start()
+                    # Both UltraEngine and UltraSyncScheduler share the same dict
+                    # reference (set via set_workers), so a single update keeps both
+                    # in sync without a second call to set_workers.
+                    self._workers[device_id] = new_worker
+                    self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
+                except Exception as exc:
+                    self._logger.error(
+                        "[ULTRA:%s] watchdog: worker restart FAILED: %s", device_id, exc
+                    )
+        self._logger.info("[ULTRA] Watchdog stopped")
+
     def stop(self):
         """Stop all workers and sync scheduler."""
         if not self._running:
@@ -1096,6 +1181,10 @@ class UltraEngine:
         # Stop sync scheduler
         if self._sync_scheduler:
             self._sync_scheduler.stop()
+
+        # Stop watchdog (stop_event already set; just wait for it to exit)
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            self._watchdog_thread.join(timeout=5)
 
         # Stop workers
         for device_id, worker in self._workers.items():

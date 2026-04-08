@@ -454,14 +454,35 @@ class DeviceSyncEngine:
         if chosen is None:
             return 0, last_err or "userauthorize: no compatible field pattern worked"
 
+        # F-015: Push remaining doors one-by-one with a retry each.
+        # ZKTeco SetDeviceData accepts one record per call — multi-record batches
+        # can silently lose records, so we push individually and track failures.
         ok_count = 1
+        failed_doors: List[int] = []
+
         for door in door_ids[1:]:
-            try:
-                data = patterns[chosen](int(door)) + "\r\n"
-                sdk.set_device_data(table="userauthorize", data=data, options="")
-                ok_count += 1
-            except Exception as ex:
-                last_err = str(ex)
+            pushed = False
+            for attempt in range(2):
+                try:
+                    data = patterns[chosen](int(door)) + "\r\n"
+                    sdk.set_device_data(table="userauthorize", data=data, options="")
+                    ok_count += 1
+                    pushed = True
+                    break
+                except Exception as ex:
+                    last_err = str(ex)
+                    if attempt == 0:
+                        import time as _time
+                        _time.sleep(0.05)
+            if not pushed:
+                failed_doors.append(door)
+
+        if failed_doors:
+            last_err = f"userauthorize: failed doors {failed_doors}: {last_err}"
+            self.logger.error(
+                f"[DeviceSync] Pin={pin} userauthorize INCOMPLETE: "
+                f"ok={ok_count}/{len(door_ids)} failed_doors={failed_doors}"
+            )
 
         return ok_count, last_err
 
@@ -848,17 +869,24 @@ class DeviceSyncEngine:
                     pushed_users += 1
 
                     # 2) authorize (respect backend timezone id)
+                    auth_complete = True
                     try:
-                        _, auth_err = self._push_userauthorize(
+                        auth_ok_count, auth_err = self._push_userauthorize(
                             sdk,
                             pin=pin,
                             door_ids=door_ids,
                             authorize_timezone_id=int(authorize_timezone_id),
                         )
                         if auth_err:
-                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize warn: {auth_err}")
+                            auth_complete = (auth_ok_count == len(door_ids))
+                            self.logger.warning(
+                                f"[DeviceSync] Device id={dev_id} Pin={pin} authorize "
+                                f"{'PARTIAL' if not auth_complete else 'warn'}: "
+                                f"{auth_ok_count}/{len(door_ids)} doors — {auth_err}"
+                            )
                     except Exception as ex:
-                        self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize warn: {ex}")
+                        auth_complete = False
+                        self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
 
                     # 3) templates
                     if templates:
@@ -876,19 +904,34 @@ class DeviceSyncEngine:
                                 f"[DeviceSync] Device id={dev_id} Pin={pin} templates pushed OK: count={ok_count}"
                             )
 
-                    # persist applied hash only on success
-                    save_device_sync_state(
-                        device_id=did,
-                        pin=pin,
-                        desired_hash=desired_hashes.get(pin) or "",
-                        ok=True,
-                        error=None,
-                    )
-                    ok_synced += 1
+                    # F-015: persist applied hash only when ALL doors were authorized.
+                    # If any door auth failed, DELETE the sync state row entirely.
+                    # Reason: the DB SQL keeps the OLD hash on ok=False (by design), so
+                    # calling save(ok=False) would leave the matching hash in place and the
+                    # pin would be skipped on the next cycle.  Deleting the row ensures
+                    # prev_hashes.get(pin) returns "" on the next cycle, which doesn't
+                    # match the computed desired hash, forcing a full re-push.
+                    if auth_complete:
+                        save_device_sync_state(
+                            device_id=did,
+                            pin=pin,
+                            desired_hash=desired_hashes.get(pin) or "",
+                            ok=True,
+                            error=None,
+                        )
+                        ok_synced += 1
+                        self.logger.debug(
+                            "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin,
+                        )
+                    else:
+                        delete_device_sync_state(device_id=did, pin=pin)
+                        failed_synced += 1
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s Pin=%s sync PARTIAL — "
+                            "sync state DELETED so next cycle retries all doors",
+                            dev_id, pin,
+                        )
                     self._set_progress(current=ok_synced + failed_synced)
-                    self.logger.debug(
-                        "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin
-                    )
 
                 except Exception as ex:
                     failed_synced += 1

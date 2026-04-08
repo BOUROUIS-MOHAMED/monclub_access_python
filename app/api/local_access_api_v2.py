@@ -2956,6 +2956,27 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
         except Exception: pass
 
 
+def _handle_device_force_resync(ctx: _Ctx) -> None:
+    """F-015: Clear sync hashes for a device to force full re-push of all users on next sync cycle."""
+    did = ctx.param_int("deviceId")
+    try:
+        from app.core.db import clear_device_sync_hashes
+        cleared = clear_device_sync_hashes(device_id=did)
+
+        # Also clear the UltraSyncScheduler in-memory hash so it doesn't skip the device
+        ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+        if ultra_eng:
+            sched = getattr(ultra_eng, "_sync_scheduler", None)
+            if sched:
+                sched.force_resync(did)
+
+        _logger.info("[LocalAPI] force-resync: device_id=%s cleared=%s sync hashes", did, cleared)
+        ctx.send_json(200, {"ok": True, "cleared": cleared, "message": f"Cleared {cleared} sync hashes. Next sync cycle will re-push all users."})
+    except Exception as e:
+        _logger.error("[LocalAPI] force-resync: device_id=%s error=%s", did, e)
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
 def _handle_device_users_push(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     body = ctx.body()

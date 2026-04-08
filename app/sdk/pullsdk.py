@@ -39,10 +39,14 @@ def _decode_sdk_bytes(data: bytes) -> str:
     return data.decode("latin-1", errors="replace")
 
 
+_GLOBAL_SDK_LOCK = threading.Lock()  # serialize DLL load + connect across all devices
+
+
 class PullSDK:
     """
     ctypes wrapper for plcommpro.dll (Pull SDK).
     """
+    _load_lock = threading.Lock()  # class-level: serialize DLL loading across instances
 
     def __init__(self, dll_path: str, logger):
         self.dll_path = str(Path(dll_path))
@@ -53,67 +57,70 @@ class PullSDK:
     def load(self) -> None:
         if self._dll is not None:
             return
-        try:
-            self.logger.info(f"Loading PullSDK DLL: {self.dll_path}")
-            self._dll = ctypes.WinDLL(self.dll_path)  # stdcall
+        with PullSDK._load_lock:
+            if self._dll is not None:
+                return  # another thread loaded while we waited for lock
+            try:
+                self.logger.info(f"Loading PullSDK DLL: {self.dll_path}")
+                self._dll = ctypes.WinDLL(self.dll_path)  # stdcall
 
-            # prototypes
-            self._dll.Connect.argtypes = [c_char_p]
-            self._dll.Connect.restype = c_void_p
+                # prototypes
+                self._dll.Connect.argtypes = [c_char_p]
+                self._dll.Connect.restype = c_void_p
 
-            self._dll.Disconnect.argtypes = [c_void_p]
-            self._dll.Disconnect.restype = c_int
+                self._dll.Disconnect.argtypes = [c_void_p]
+                self._dll.Disconnect.restype = c_int
 
-            # int GetDeviceData(HANDLE h, char* buffer, int buffersize, char* table, char* fields, char* filter, char* options);
-            self._dll.GetDeviceData.argtypes = [c_void_p, c_void_p, c_int, c_char_p, c_char_p, c_char_p, c_char_p]
-            self._dll.GetDeviceData.restype = c_int
+                # int GetDeviceData(HANDLE h, char* buffer, int buffersize, char* table, char* fields, char* filter, char* options);
+                self._dll.GetDeviceData.argtypes = [c_void_p, c_void_p, c_int, c_char_p, c_char_p, c_char_p, c_char_p]
+                self._dll.GetDeviceData.restype = c_int
 
-            # int SetDeviceData(HANDLE h, char* table, char* data, char* options);
-            self._dll.SetDeviceData.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
-            self._dll.SetDeviceData.restype = c_int
+                # int SetDeviceData(HANDLE h, char* table, char* data, char* options);
+                self._dll.SetDeviceData.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
+                self._dll.SetDeviceData.restype = c_int
 
-            # int DeleteDeviceData(HANDLE h, char* table, char* data, char* options);
-            if hasattr(self._dll, "DeleteDeviceData"):
-                self._dll.DeleteDeviceData.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
-                self._dll.DeleteDeviceData.restype = c_int
+                # int DeleteDeviceData(HANDLE h, char* table, char* data, char* options);
+                if hasattr(self._dll, "DeleteDeviceData"):
+                    self._dll.DeleteDeviceData.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
+                    self._dll.DeleteDeviceData.restype = c_int
 
-            # int ControlDevice(HANDLE h, int operationId, int param1, int param2, int param3, int param4, char* options);
-            if hasattr(self._dll, "ControlDevice"):
-                self._dll.ControlDevice.argtypes = [c_void_p, c_int, c_int, c_int, c_int, c_int, c_char_p]
-                self._dll.ControlDevice.restype = c_int
+                # int ControlDevice(HANDLE h, int operationId, int param1, int param2, int param3, int param4, char* options);
+                if hasattr(self._dll, "ControlDevice"):
+                    self._dll.ControlDevice.argtypes = [c_void_p, c_int, c_int, c_int, c_int, c_int, c_char_p]
+                    self._dll.ControlDevice.restype = c_int
 
-            # int GetRTLog(void *handle,char *Buffer, int BufferSize)
-            if hasattr(self._dll, "GetRTLog"):
-                self._dll.GetRTLog.argtypes = [c_void_p, c_void_p, c_int]
-                self._dll.GetRTLog.restype = c_int
+                # int GetRTLog(void *handle,char *Buffer, int BufferSize)
+                if hasattr(self._dll, "GetRTLog"):
+                    self._dll.GetRTLog.argtypes = [c_void_p, c_void_p, c_int]
+                    self._dll.GetRTLog.restype = c_int
 
-            # int GetRTLogExt(void *handle,char *Buffer, int BufferSize)
-            if hasattr(self._dll, "GetRTLogExt"):
-                self._dll.GetRTLogExt.argtypes = [c_void_p, c_void_p, c_int]
-                self._dll.GetRTLogExt.restype = c_int
+                # int GetRTLogExt(void *handle,char *Buffer, int BufferSize)
+                if hasattr(self._dll, "GetRTLogExt"):
+                    self._dll.GetRTLogExt.argtypes = [c_void_p, c_void_p, c_int]
+                    self._dll.GetRTLogExt.restype = c_int
 
-            self._dll.PullLastError.argtypes = []
-            self._dll.PullLastError.restype = c_int
+                self._dll.PullLastError.argtypes = []
+                self._dll.PullLastError.restype = c_int
 
-            # int GetDeviceDataCount(HANDLE h, char* table, char* filter, char* options);
-            if hasattr(self._dll, "GetDeviceDataCount"):
-                self._dll.GetDeviceDataCount.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
-                self._dll.GetDeviceDataCount.restype = c_int
+                # int GetDeviceDataCount(HANDLE h, char* table, char* filter, char* options);
+                if hasattr(self._dll, "GetDeviceDataCount"):
+                    self._dll.GetDeviceDataCount.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p]
+                    self._dll.GetDeviceDataCount.restype = c_int
 
-            # int GetDeviceParam(HANDLE h, char* buffer, int buffersize, char* itemname);
-            if hasattr(self._dll, "GetDeviceParam"):
-                self._dll.GetDeviceParam.argtypes = [c_void_p, c_void_p, c_int, c_char_p]
-                self._dll.GetDeviceParam.restype = c_int
+                # int GetDeviceParam(HANDLE h, char* buffer, int buffersize, char* itemname);
+                if hasattr(self._dll, "GetDeviceParam"):
+                    self._dll.GetDeviceParam.argtypes = [c_void_p, c_void_p, c_int, c_char_p]
+                    self._dll.GetDeviceParam.restype = c_int
 
-            # int SetDeviceParam(HANDLE h, char* item);
-            if hasattr(self._dll, "SetDeviceParam"):
-                self._dll.SetDeviceParam.argtypes = [c_void_p, c_char_p]
-                self._dll.SetDeviceParam.restype = c_int
+                # int SetDeviceParam(HANDLE h, char* item);
+                if hasattr(self._dll, "SetDeviceParam"):
+                    self._dll.SetDeviceParam.argtypes = [c_void_p, c_char_p]
+                    self._dll.SetDeviceParam.restype = c_int
 
-            self.logger.info("PullSDK loaded OK.")
-        except OSError as e:
-            self._dll = None
-            raise PullSDKError(f"Failed to load plcommpro.dll: {e}")
+                self.logger.info("PullSDK loaded OK.")
+            except OSError as e:
+                self._dll = None
+                raise PullSDKError(f"Failed to load plcommpro.dll: {e}")
 
     def connect(self, *, ip: str, port: int, timeout_ms: int, password: str, platform: str | None = None) -> None:
         self.load()
@@ -627,14 +634,17 @@ class PullSDKDevice:
             if not self.ip or int(self.port) <= 0:
                 raise PullSDKError(f"invalid device connection params ip={self.ip!r} port={self.port!r}")
 
-            self._sdk = PullSDK(self.dll_path, self.logger)
-            self._sdk.connect(
-                ip=str(self.ip),
-                port=int(self.port),
-                timeout_ms=int(self.timeout_ms),
-                password=str(self.password or ""),
-                platform=str(self.platform or "") if (self.platform or "").strip() else None,
-            )
+            # Serialize DLL creation + connect across all devices to prevent
+            # concurrent ctypes prototype registration corruption.
+            with _GLOBAL_SDK_LOCK:
+                self._sdk = PullSDK(self.dll_path, self.logger)
+                self._sdk.connect(
+                    ip=str(self.ip),
+                    port=int(self.port),
+                    timeout_ms=int(self.timeout_ms),
+                    password=str(self.password or ""),
+                    platform=str(self.platform or "") if (self.platform or "").strip() else None,
+                )
             self._connected = True
             self.logger.info(
                 "[PullSDKDevice][%s] connected OK: name=%r ip=%s port=%s",

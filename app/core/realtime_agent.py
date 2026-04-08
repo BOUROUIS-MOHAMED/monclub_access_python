@@ -189,6 +189,7 @@ class ImageCache:
 
         self._lock = threading.Lock()
         self._memo: Dict[str, str] = {}
+        self._memo_max: int = 2000  # bound to prevent unbounded memory growth
         self._hits = 0
 
         self.cache_dir = cache_dir
@@ -322,6 +323,11 @@ class ImageCache:
         with self._lock:
             if ok:
                 self._memo[s] = target
+                # Evict oldest entries if memo exceeds bound
+                if len(self._memo) > self._memo_max:
+                    excess = len(self._memo) - self._memo_max
+                    for _evict_key in list(self._memo.keys())[:excess]:
+                        self._memo.pop(_evict_key, None)
             self._hits += 1
             if self.prune_every_n > 0 and (self._hits % self.prune_every_n == 0):
                 self._maybe_prune()
@@ -1032,7 +1038,7 @@ class DecisionService(threading.Thread):
                     )
                     continue
                 self._card_cooldown[card_key] = now_mono
-                if len(self._card_cooldown) > 5000:
+                if len(self._card_cooldown) > 2000:
                     cutoff = now_mono - self._card_cooldown_sec * 2
                     self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
 
@@ -1470,10 +1476,12 @@ class AgentRealtimeEngine:
         """
         Primary: normalized table -> list_sync_devices_payload() (GymDeviceDto-shaped dicts).
         Fallback: raw sync_cache.payload_json (older DBs / before first sync).
+        Thread-safe: reads/writes to cache guarded by self._lock.
         """
         now_s = time.time()
-        if (now_s - float(self._devices_cache_at)) < float(self._devices_cache_ttl_sec) and self._devices_cache:
-            return [dict(x) for x in self._devices_cache]
+        with self._lock:
+            if (now_s - float(self._devices_cache_at)) < float(self._devices_cache_ttl_sec) and self._devices_cache:
+                return [dict(x) for x in self._devices_cache]
 
         devs: List[Dict[str, Any]] = []
 
@@ -1501,8 +1509,9 @@ class AgentRealtimeEngine:
             except Exception:
                 devs = []
 
-        self._devices_cache = devs
-        self._devices_cache_at = now_s
+        with self._lock:
+            self._devices_cache = devs
+            self._devices_cache_at = now_s
         return [dict(x) for x in devs]
 
     def get_global_settings(self) -> Dict[str, Any]:
@@ -1709,8 +1718,8 @@ class AgentRealtimeEngine:
             self._deciders.append(d)
             try:
                 d.start()
-            except Exception:
-                pass
+            except Exception as _ds_exc:
+                self.logger.error("[RT] DecisionService thread start FAILED: %s", _ds_exc)
 
         self.refresh_devices()
 
@@ -1767,6 +1776,64 @@ class AgentRealtimeEngine:
         self._notif = None
         self._hist = None
 
+    # ---------- thread health monitoring ----------
+
+    def _check_thread_health(self) -> None:
+        """Restart dead DecisionService / NotificationService / HistoryService threads."""
+        # DecisionService threads
+        for i, d in enumerate(self._deciders):
+            if d is not None and not d.is_alive():
+                self.logger.error("[RT] DecisionService thread #%d died — restarting", i)
+                new_d = DecisionService(
+                    logger=self.logger,
+                    event_queue=self._event_q,
+                    command_bus=self._cmd_bus,
+                    notify_q=self._notify_q,
+                    popup_q=self._popup_q,
+                    history_q=self._history_q,
+                    settings_provider=self._device_settings,
+                    global_settings=self.get_global_settings,
+                    notify_gate=self._notify_gate,
+                    decision_ema=self._decision_ema,
+                    device_name_provider=self._resolve_device_name,
+                )
+                try:
+                    new_d.start()
+                    self._deciders[i] = new_d
+                    self.logger.info("[RT] DecisionService thread #%d restarted OK", i)
+                except Exception as e:
+                    self.logger.error("[RT] DecisionService thread #%d restart FAILED: %s", i, e)
+
+        # NotificationService
+        if self._notif is not None and not self._notif.is_alive():
+            self.logger.error("[RT] NotificationService died — restarting")
+            try:
+                self._notif = NotificationService(
+                    logger=self.logger,
+                    notify_q=self._notify_q,
+                    global_settings=self.get_global_settings,
+                )
+                self._notif.start()
+                self.logger.info("[RT] NotificationService restarted OK")
+            except Exception as e:
+                self.logger.error("[RT] NotificationService restart FAILED: %s", e)
+
+        # HistoryService (only checked if it was started)
+        if self._hist is not None and hasattr(self._hist, 'is_alive') and not self._hist.is_alive():
+            g = self.get_global_settings()
+            if bool(g.get("history_service_enabled", False)):
+                self.logger.error("[RT] HistoryService died — restarting")
+                try:
+                    self._hist = HistoryService(
+                        logger=self.logger,
+                        history_q=self._history_q,
+                        global_settings=self.get_global_settings,
+                    )
+                    self._hist.start()
+                    self.logger.info("[RT] HistoryService restarted OK")
+                except Exception as e:
+                    self.logger.error("[RT] HistoryService restart FAILED: %s", e)
+
     # ---------- device orchestration (per-device mode) ----------
 
     def refresh_devices(self) -> None:
@@ -1777,6 +1844,12 @@ class AgentRealtimeEngine:
           - accessDataMode == "AGENT"
         Devices in DEVICE mode are ignored here.
         """
+        # Check thread health on each refresh cycle (~every 60s)
+        try:
+            self._check_thread_health()
+        except Exception as e:
+            self.logger.warning("[RT] _check_thread_health error: %s", e)
+
         devices = self._load_devices_cached()
 
         # index by id
@@ -1846,6 +1919,7 @@ class AgentRealtimeEngine:
 
         # Stop workers removed / not in AGENT anymore
         to_remove = existing_ids - desired_agent_ids
+        stopped_workers: list = []
         for did in sorted(to_remove):
             w = self._get_worker(did)
             if w:
@@ -1856,6 +1930,7 @@ class AgentRealtimeEngine:
                     w.stop()
                 except Exception:
                     pass
+                stopped_workers.append((did, w))
                 with self._lock:
                     self._workers.pop(did, None)
                 self._status_update(
@@ -1867,6 +1942,16 @@ class AgentRealtimeEngine:
                         last_error="removed_or_not_agent_mode",
                     )
                 )
+
+        # Wait for stopped workers to fully terminate (ensures TCP port is
+        # released before another engine starts a worker for the same device).
+        for did, w in stopped_workers:
+            try:
+                w.join(timeout=5)
+                if w.is_alive():
+                    self.logger.warning("[RT] DeviceWorker id=%s did not stop in 5s", did)
+            except Exception:
+                pass
 
     def set_device_enabled(self, device_id: int, enabled: bool) -> None:
         """
