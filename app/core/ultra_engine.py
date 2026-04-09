@@ -15,7 +15,7 @@ from app.core.access_verification import load_local_state, verify_totp
 from app.core.db import get_recent_access_history, insert_access_history, load_sync_cache
 from app.sdk.pullsdk import PullSDKDevice
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("zkapp")
 
 
 # ---------------------------------------------------------------------------
