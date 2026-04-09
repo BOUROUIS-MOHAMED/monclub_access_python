@@ -477,7 +477,8 @@ class PullSDK:
                     try:
                         self.set_device_data(table=table, data=row + "\r\n", options="")
                         ok += 1
-                    except PullSDKError:
+                    except PullSDKError as ex:
+                        self.logger.warning("set_device_data_batch row-by-row failed: %s | row=%s", ex, row[:80])
                         failed.append(row)
         return (ok, failed)
 

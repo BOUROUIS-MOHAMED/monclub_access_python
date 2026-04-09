@@ -1002,8 +1002,42 @@ class DeviceSyncEngine:
                     ok_u, failed_u = sdk.set_device_data_batch(table="user", rows=user_rows, chunk_size=50)
                     pushed_users = ok_u
                     if failed_u:
+                        # Batch + row-by-row both failed — retry with rc=-101 handling
+                        # (force-delete + retry without Name). This matches the per-pin
+                        # push path behavior for firmware that rejects certain fields.
                         self.logger.warning(
-                            "[DeviceSync] Device id=%s: %d user rows failed in batch push", dev_id, len(failed_u))
+                            "[DeviceSync] Device id=%s: %d user rows failed in batch, "
+                            "retrying with rc=-101 handling", dev_id, len(failed_u))
+                        for row in failed_u:
+                            # Extract Pin from "Pin=123\tName=...\tCardNo=..."
+                            pin = ""
+                            card_valid = ""
+                            for part in row.split("\t"):
+                                if part.startswith("Pin="):
+                                    pin = part[4:]
+                                elif part.startswith("CardNo="):
+                                    card_valid = part[7:]
+                            if not pin:
+                                continue
+                            try:
+                                # Force-delete first (handles duplicate pin on insert-only firmware)
+                                self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                                # Retry with minimal fields (no Name — handles unsupported field firmware)
+                                minimal_pairs = [f"Pin={pin}"]
+                                if card_valid:
+                                    minimal_pairs.append(f"CardNo={card_valid}")
+                                sdk.set_device_data(
+                                    table="user",
+                                    data="\t".join(minimal_pairs) + "\r\n",
+                                    options="",
+                                )
+                                pushed_users += 1
+                                self.logger.info(
+                                    "[DeviceSync] Device id=%s Pin=%s rc=-101 retry OK", dev_id, pin)
+                            except Exception as ex:
+                                self.logger.warning(
+                                    "[DeviceSync] Device id=%s Pin=%s rc=-101 retry FAILED: %s",
+                                    dev_id, pin, ex)
 
                 # Phase B: Batch push authorize rows
                 # Discover firmware profile if not cached (push 1 pin individually first)
