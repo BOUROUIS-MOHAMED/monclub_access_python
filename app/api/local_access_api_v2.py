@@ -2860,8 +2860,14 @@ def _handle_device_info(ctx: _Ctx) -> None:
         params = {}
         raw = ""
         items = ctx.q("items", default=(
-            "DeviceName,SerialNumber,ProductTime,FirmwareVersion,Platform,DeviceType,"
-            "LockCount,ReaderCount,DoorCount,IPAddress,NetMask,Gateway,MAC"
+            "~DeviceName,~SerialNumber,FirmVer,MachineType,"
+            "LockCount,ReaderCount,AuxInCount,AuxOutCount,"
+            "IPAddress,NetMask,GATEIPAddress,MAC,"
+            "~MaxUserCount,~MaxAttLogCount,~MaxUserFingerCount,"
+            "AntiPassback,InterLock,DeviceID,"
+            "Door1Drivertime,Door2Drivertime,Door3Drivertime,Door4Drivertime,"
+            "Door1SensorType,Door2SensorType,Door3SensorType,Door4SensorType,"
+            "Door1VerifyType,Door2VerifyType,Door3VerifyType,Door4VerifyType"
         ))
         if sdk.supports_get_device_param():
             raw = sdk.get_device_param(items=items, initial_size=65536)
