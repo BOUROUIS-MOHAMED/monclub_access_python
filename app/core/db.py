@@ -2717,6 +2717,7 @@ def list_optional_deals() -> List[Dict[str, Any]]:
 
 _sync_cache_lock = threading.Lock()
 _sync_cache_entry: tuple[float, "SyncCacheState | None"] = (0.0, None)
+_sync_cache_loading: "threading.Event | None" = None  # None = no load in progress
 _SYNC_CACHE_TTL = 5.0  # seconds
 
 
@@ -2728,16 +2729,47 @@ def invalidate_sync_cache() -> None:
 
 
 def load_sync_cache() -> "SyncCacheState | None":
-    global _sync_cache_entry
+    global _sync_cache_entry, _sync_cache_loading
     now = time.monotonic()
+
     with _sync_cache_lock:
         expires, cached = _sync_cache_entry
         if now < expires and cached is not None:
             return cached
-    result = _load_sync_cache_db()
-    with _sync_cache_lock:
-        _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
-    return result
+
+        # Cache expired. Is another thread already loading?
+        if _sync_cache_loading is not None:
+            evt = _sync_cache_loading  # wait for the in-flight loader
+        else:
+            # We are the loader thread.
+            evt = threading.Event()
+            _sync_cache_loading = evt
+            evt = None  # signal: "we are the loader"
+
+    if evt is not None:
+        # Another thread is loading — wait for it (bounded).
+        evt.wait(timeout=10.0)
+        with _sync_cache_lock:
+            _, cached = _sync_cache_entry
+        return cached
+
+    # We are the loader thread.
+    try:
+        result = _load_sync_cache_db()
+        with _sync_cache_lock:
+            _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
+            loading_evt = _sync_cache_loading
+            _sync_cache_loading = None
+        if loading_evt is not None:
+            loading_evt.set()  # wake all waiters
+        return result
+    except Exception:
+        with _sync_cache_lock:
+            loading_evt = _sync_cache_loading
+            _sync_cache_loading = None
+        if loading_evt is not None:
+            loading_evt.set()  # wake waiters even on failure
+        raise
 
 
 def _load_sync_cache_db() -> "SyncCacheState | None":

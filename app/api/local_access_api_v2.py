@@ -506,7 +506,26 @@ def _get_live_device_sync_progress(app: Any) -> Optional[Dict[str, Any]]:
     return main_progress or ultra_progress
 
 
+_status_payload_lock = threading.Lock()
+_status_payload_cache: tuple = (0.0, 0, None)  # (expires_at, app_id, payload)
+_STATUS_PAYLOAD_TTL = 1.0  # seconds
+
+
 def _build_status_payload(app: Any) -> Dict[str, Any]:
+    global _status_payload_cache
+    now = time.monotonic()
+    app_id = id(app)
+    with _status_payload_lock:
+        expires, cached_app_id, cached = _status_payload_cache
+        if now < expires and cached is not None and cached_app_id == app_id:
+            return cached
+    result = _build_status_payload_uncached(app)
+    with _status_payload_lock:
+        _status_payload_cache = (time.monotonic() + _STATUS_PAYLOAD_TTL, app_id, result)
+    return result
+
+
+def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
     from access.store import load_auth_token, load_sync_cache
 
     auth = load_auth_token()
@@ -634,7 +653,7 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
 
     idle_ticks = 0
     while True:
-        time.sleep(0.25)
+        time.sleep(1.0)
 
         payload = _build_status_payload(ctx.app)
         signature = _status_payload_signature(payload)
@@ -646,7 +665,7 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
             continue
 
         idle_ticks += 1
-        if idle_ticks >= 60:
+        if idle_ticks >= 15:
             idle_ticks = 0
             if not ctx.send_sse_event("ping", {"t": int(time.time())}):
                 return

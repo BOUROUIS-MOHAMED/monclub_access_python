@@ -227,7 +227,24 @@
       "Bash(git stash:*)",
       "Bash(python -m pytest tests/test_ultra_engine.py::TestProcessEventAllow::test_allow_event_puts_notification_on_popup_q -x -q)",
       "Bash(python -m pytest tests/ -x -q --ignore=tests/test_ultra_engine.py)",
-      "Bash(python -m pytest tests/test_ultra_engine.py -q)"
+      "Bash(python -m pytest tests/test_ultra_engine.py -q)",
+      "Bash(ls -la /c/Users/mohaa/Desktop/monclub_access_python/tests/test_*sync*)",
+      "Bash(python -m pytest tests/ -x -q --tb=short)",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as total_active_memberships FROM active_membership WHERE status='ACTIVE' OR available=1;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as total_active_memberships FROM active_membership;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as total_file_links FROM file_link;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as total_fingerprints FROM user_fingerprint;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as active_valid FROM active_membership am JOIN membership_model mm ON am.membership_id = mm.id JOIN gym_agent ga ON mm.gym_agent_id = ga.id WHERE am.available = 1;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT COUNT\\(*\\) as total_credentials FROM gym_access_credential;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT entity_type, role, COUNT\\(*\\) FROM file_link GROUP BY entity_type, role;\")",
+      "Bash(mysql -h localhost -P 3306 -u root --database=\"wigo-db\" -e \"SELECT am.status, COUNT\\(*\\) FROM active_membership am GROUP BY am.status;\")",
+      "Bash(python -m pytest tests/ -q --tb=short --ignore=tests/test_ultra_engine.py)",
+      "Bash(python -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python -m pytest tests/test_ultra_engine.py::TestProcessEventDeny::test_deny_event_scan_mode_is_rfid_card -v --tb=short)",
+      "Bash(mvn compile:*)",
+      "Bash(mvn test:*)",
+      "Bash(mvn -f \"D:\\\\projects\\\\MonClub\\\\monclub_backend\\\\pom.xml\" test -Dtest=\"MemberImageServiceTest\")",
+      "Bash(mvn -f \"D:\\\\projects\\\\MonClub\\\\monclub_backend\\\\pom.xml\" compile -q)"
     ]
   }
 }
