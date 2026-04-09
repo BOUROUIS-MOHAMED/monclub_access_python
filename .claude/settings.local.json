@@ -250,7 +250,8 @@
       "Bash(python -m pytest tests/test_batch_device_push.py -v)",
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:desarrollo.zktecolatinoamerica.com)",
-      "WebFetch(domain:usermanual.wiki)"
+      "WebFetch(domain:usermanual.wiki)",
+      "WebFetch(domain:www.housingdevices.com)"
     ]
   }
 }
