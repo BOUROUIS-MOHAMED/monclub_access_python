@@ -99,53 +99,62 @@ class UltraDeviceWorker(threading.Thread):
         self._pre_populate_seen()
 
         while not self._stop_evt.is_set():
-            # Yield the TCP connection to UltraSyncScheduler when requested
-            if self._sync_pause.is_set():
-                if self._connected:
-                    logger.info(
-                        f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
-                    )
-                    self._disconnect()
-                self._sync_paused_ack.set()
-                while self._sync_pause.is_set() and not self._stop_evt.is_set():
-                    self._stop_evt.wait(0.5)
-                self._sync_paused_ack.clear()
-                logger.info(f"{self._prefix} sync pause ended — will reconnect")
-                continue
-
-            # Connect if needed
-            if not self._connected:
-                self._connect()
-                if not self._connected:
-                    self._stop_evt.wait(5.0)
+            try:
+                # Yield the TCP connection to UltraSyncScheduler when requested
+                if self._sync_pause.is_set():
+                    if self._connected:
+                        logger.info(
+                            f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
+                        )
+                        self._disconnect()
+                    self._sync_paused_ack.set()
+                    while self._sync_pause.is_set() and not self._stop_evt.is_set():
+                        self._stop_evt.wait(0.5)
+                    self._sync_paused_ack.clear()
+                    logger.info(f"{self._prefix} sync pause ended — will reconnect")
                     continue
 
-            # Drain queued door-open commands (uses the already-connected SDK)
-            self._drain_commands()
+                # Connect if needed
+                if not self._connected:
+                    self._connect()
+                    if not self._connected:
+                        self._stop_evt.wait(5.0)
+                        continue
 
-            # Poll RTLog with watchdog
-            events = self._poll_with_watchdog()
-            if events is None:
-                # Watchdog timeout or error -> reconnect
-                self._disconnect()
-                continue
+                # Drain queued door-open commands (uses the already-connected SDK)
+                self._drain_commands()
 
-            if events:
-                self._empty_sleep_ms = float(self._empty_min)
-                for evt in events:
-                    self._process_event(evt)
-                sleep_ms = self._busy_min
-            else:
-                self._empty_sleep_ms = min(
-                    self._empty_sleep_ms * self._backoff,
-                    self._backoff_cap,
-                )
-                sleep_ms = self._empty_sleep_ms
+                # Poll RTLog with watchdog
+                events = self._poll_with_watchdog()
+                if events is None:
+                    # Watchdog timeout or error -> reconnect
+                    self._disconnect()
+                    continue
 
-            # Drain commands again after processing events for minimal latency
-            self._drain_commands()
+                if events:
+                    self._empty_sleep_ms = float(self._empty_min)
+                    for evt in events:
+                        self._process_event(evt)
+                    sleep_ms = self._busy_min
+                else:
+                    self._empty_sleep_ms = min(
+                        self._empty_sleep_ms * self._backoff,
+                        self._backoff_cap,
+                    )
+                    sleep_ms = self._empty_sleep_ms
 
-            self._stop_evt.wait(sleep_ms / 1000.0)
+                # Drain commands again after processing events for minimal latency
+                self._drain_commands()
+
+                self._stop_evt.wait(sleep_ms / 1000.0)
+
+            except Exception:
+                logger.exception(f"{self._prefix} unhandled exception in run loop — will retry in 5s")
+                try:
+                    self._disconnect()
+                except Exception:
+                    pass
+                self._stop_evt.wait(5.0)
 
         self._disconnect()
         logger.info(f"{self._prefix} stopped")
@@ -861,7 +870,12 @@ class UltraDeviceWorker(threading.Thread):
         now = time.monotonic()
         if self._cached_state is None or (now - self._cached_state_ts) > self._CACHE_TTL_SEC:
             logger.debug(f"{self._prefix} refreshing local state cache from DB")
-            self._cached_state = load_local_state()
+            result = load_local_state()
+            if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
+                logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
+                self._cached_state = ({}, {}, {})
+            else:
+                self._cached_state = result
             self._cached_state_ts = now
             creds, users_by_am, users_by_card = self._cached_state
             logger.debug(
