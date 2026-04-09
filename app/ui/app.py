@@ -1004,6 +1004,7 @@ class MainApp:
 
         def work():
             sync_online = False
+            _delta_changed_ids = None  # set when backend returns membersDeltaMode=True
             try:
                 api = self._api()
                 version_tokens = load_version_tokens() or None
@@ -1043,16 +1044,25 @@ class MainApp:
                 from app.core.db import invalidate_sync_cache
                 invalidate_sync_cache()
 
+                # Compute delta hints for device push optimization
+                if data.get("membersDeltaMode") and refresh.get("members"):
+                    _delta_changed_ids = {
+                        int(u["activeMembershipId"])
+                        for u in (data.get("users") or [])
+                        if isinstance(u, dict) and u.get("activeMembershipId") is not None
+                    }
+
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they
                 # are recognised on the next request (membersVersion, not currentMembersVersion).
                 new_tokens = {
                     param: data[field]
                     for param, field in (
-                        ("membersVersion",     "currentMembersVersion"),
-                        ("devicesVersion",     "currentDevicesVersion"),
-                        ("credentialsVersion", "currentCredentialsVersion"),
-                        ("settingsVersion",    "currentSettingsVersion"),
+                        ("membersVersion",      "currentMembersVersion"),
+                        ("devicesVersion",      "currentDevicesVersion"),
+                        ("credentialsVersion",  "currentCredentialsVersion"),
+                        ("settingsVersion",     "currentSettingsVersion"),
+                        ("membersUpdatedAfter", "currentMembersRefreshedAt"),
                     )
                     if data.get(field)
                 }
@@ -1091,7 +1101,10 @@ class MainApp:
                             if summary.get("DEVICE", 0) <= 0:
                                 self.logger.info("[DeviceSync] Skipped: no DEVICE-mode devices.")
                             else:
-                                self._device_sync_engine.run_blocking(cache=cache, source="timer")
+                                self._device_sync_engine.run_blocking(
+                                    cache=cache, source="timer",
+                                    changed_ids=_delta_changed_ids,
+                                )
                                 self._last_device_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                 self._last_device_sync_ok = True
                                 self._last_device_sync_error = None

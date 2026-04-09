@@ -4,6 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Tuple
 
@@ -17,6 +18,22 @@ from app.core.db import (
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
 from app.sdk.pullsdk import PullSDK, PullSDKError
+
+
+@dataclass
+class FirmwareProfile:
+    """
+    Records which SDK field-name pattern works for a specific ZKTeco device firmware.
+    Populated from SQLite on first use, updated on successful discovery.
+
+    Fields:
+        template_table       — "templatev10" or "template"
+        template_body_index  — index into the bodies list in _push_templates (0-4)
+        authorize_body_index — index into the patterns list in _push_userauthorize (0-3)
+    """
+    template_table: str | None = None
+    template_body_index: int | None = None
+    authorize_body_index: int | None = None
 
 
 # Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
@@ -153,6 +170,28 @@ class DeviceSyncEngine:
             "current": 0,
             "total": 0,
         }
+        # Phase 2: in-session firmware profile cache (device_id -> FirmwareProfile).
+        # L1 cache (memory) backed by L2 (SQLite via db.py).
+        # Keyed by device_id (stable integer), not IP (DHCP can reassign IPs).
+        self._firmware_profiles: dict[int, FirmwareProfile] = {}
+
+    def _get_firmware_profile(self, device_id: int) -> FirmwareProfile:
+        """
+        Returns the FirmwareProfile for this device, loading from SQLite if not in session cache.
+        Creates an empty profile if none exists yet (discovery happens on first push attempt).
+        """
+        if device_id not in self._firmware_profiles:
+            from app.core.db import load_firmware_profile
+            persisted = load_firmware_profile(device_id=device_id)
+            if persisted:
+                self._firmware_profiles[device_id] = FirmwareProfile(
+                    template_table=persisted["template_table"],
+                    template_body_index=persisted["template_body_index"],
+                    authorize_body_index=persisted["authorize_body_index"],
+                )
+            else:
+                self._firmware_profiles[device_id] = FirmwareProfile()
+        return self._firmware_profiles[device_id]
 
     def _set_progress(self, **changes: Any) -> None:
         with self._progress_cond:
@@ -175,7 +214,8 @@ class DeviceSyncEngine:
                 self._progress_cond.wait(timeout=max(0.0, float(timeout)))
             return dict(self._sync_progress), self._progress_seq
 
-    def run_blocking(self, *, cache, source: str = "timer") -> bool:
+    def run_blocking(self, *, cache, source: str = "timer",
+                     changed_ids: set | None = None) -> bool:
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip ({source}): already running")
@@ -183,7 +223,7 @@ class DeviceSyncEngine:
             self._running = True
 
         try:
-            self._sync_all_devices(cache=cache)
+            self._sync_all_devices(cache=cache, changed_ids=changed_ids)
             return True
         except Exception as e:
             self.logger.exception(f"[DeviceSync] Failed: {e}")
@@ -429,8 +469,13 @@ class DeviceSyncEngine:
         pin: str,
         door_bitmask: int,
         authorize_timezone_id: int,
+        device_id: int,
     ) -> Tuple[int, str | None]:
         """Push a single userauthorize record with a pre-computed bitmask.
+
+        Tries the cached firmware pattern first (1 SDK call). Falls back to the
+        full retry loop on cache miss or if the cached pattern stopped working
+        (e.g., after a firmware upgrade). Caches the winning pattern on success.
 
         door_bitmask is the OR of individual door bits (1=door1, 2=door2, 4=door3, 8=door4).
         For all 4 doors on a C3-400: bitmask = 1|2|4|8 = 15.
@@ -442,8 +487,7 @@ class DeviceSyncEngine:
         if tz < 1:
             tz = 1
 
-        # Try multiple field-name patterns for firmware compatibility.
-        # Pattern order: preferred (AuthorizeDoorId) first, legacy fallbacks after.
+        # Pattern list — order matters: preferred (AuthorizeDoorId) first, legacy fallbacks after.
         patterns = [
             f"Pin={pin}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}\r\n",
             f"Pin={pin}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}\r\n",
@@ -451,13 +495,41 @@ class DeviceSyncEngine:
             f"Pin={pin}\tDoorID={door_bitmask}\tTimeZone={tz}\r\n",
         ]
 
+        profile = self._get_firmware_profile(device_id)
+
+        # L1: try cached pattern first (1 SDK call)
+        if profile.authorize_body_index is not None:
+            cached_data = patterns[profile.authorize_body_index]
+            try:
+                sdk.set_device_data(table="userauthorize", data=cached_data, options="")
+                self.logger.debug("[DeviceSync] Pin=%s userauthorize OK (cached pattern=%d)",
+                                  pin, profile.authorize_body_index)
+                return 1, None
+            except Exception as ex:
+                # Cached pattern failed — firmware may have been upgraded. Clear and fall through.
+                self.logger.warning(
+                    "[DeviceSync] Pin=%s userauthorize cached pattern=%d FAILED (%s), "
+                    "clearing cache for device_id=%d",
+                    pin, profile.authorize_body_index, ex, device_id,
+                )
+                profile.authorize_body_index = None
+                from app.core.db import clear_firmware_profile
+                clear_firmware_profile(device_id=device_id)
+
+        # L2: retry loop — discover working pattern and cache it
         last_err = None
-        for data in patterns:
+        for i, data in enumerate(patterns):
             try:
                 sdk.set_device_data(table="userauthorize", data=data, options="")
-                self.logger.debug(
-                    "[DeviceSync] Pin=%s userauthorize OK: bitmask=%d",
-                    pin, door_bitmask,
+                self.logger.debug("[DeviceSync] Pin=%s userauthorize OK (pattern=%d)", pin, i)
+                # Cache discovery
+                profile.authorize_body_index = i
+                from app.core.db import save_firmware_profile
+                save_firmware_profile(
+                    device_id=device_id,
+                    template_table=profile.template_table or "templatev10",
+                    template_body_index=profile.template_body_index if profile.template_body_index is not None else 0,
+                    authorize_body_index=i,
                 )
                 return 1, None
             except Exception as ex:
@@ -469,17 +541,32 @@ class DeviceSyncEngine:
         )
         return 0, last_err or "userauthorize: no compatible field pattern worked"
 
-    def _push_templates(self, sdk: PullSDK, *, pin: str, templates: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
-        errs: List[str] = []
+    def _push_templates(
+        self,
+        sdk: PullSDK,
+        *,
+        pin: str,
+        templates: List[Dict[str, Any]],
+        device_id: int,
+    ) -> Tuple[int, List[str]]:
+        """Push fingerprint templates to device.
+
+        Tries the cached (table, body_index) combo first for each template (1 SDK call).
+        Falls back to the full retry loop on cache miss or if the cached combo fails.
+        Caches the winning combo on first successful discovery for the session.
+        """
+        failed_fp_errs: List[str] = []
         ok = 0
 
         def try_set(table: str, body: str) -> bool:
+            """Attempt SDK call. Returns True on success, False on any exception."""
             try:
                 sdk.set_device_data(table=table, data=body + "\r\n", options="")
                 return True
-            except Exception as ex:
-                errs.append(f"{table}: {ex}")
+            except Exception:
                 return False
+
+        profile = self._get_firmware_profile(device_id)
 
         for t in templates:
             fid = int(t.get("fingerId"))
@@ -493,35 +580,59 @@ class DeviceSyncEngine:
             preferred_tables = ["templatev10", "template"] if tv >= 10 else ["template", "templatev10"]
 
             bodies = [
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTmp={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tSize={size}\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTmp={tpl}",
+                lambda fid=fid, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tSize={size}\tTemplate={tpl}",
+                lambda fid=fid, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tTemplate={tpl}",
             ]
 
             pushed = False
-            for table in preferred_tables:
-                for bfn in bodies:
-                    if try_set(table, bfn()):
-                        pushed = True
+
+            # L1: try cached combo (1 SDK call)
+            if profile.template_table is not None and profile.template_body_index is not None:
+                cached_body = bodies[profile.template_body_index]()
+                if try_set(profile.template_table, cached_body):
+                    ok += 1
+                    pushed = True
+                else:
+                    # Cached combo failed — clear and fall through to retry loop
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s FingerID=%d cached template combo (%s, idx=%d) failed — "
+                        "clearing firmware cache for device_id=%d",
+                        pin, fid, profile.template_table, profile.template_body_index, device_id,
+                    )
+                    profile.template_table = None
+                    profile.template_body_index = None
+                    from app.core.db import clear_firmware_profile
+                    clear_firmware_profile(device_id=device_id)
+
+            # L2: retry loop (runs on cache miss or after cache clear)
+            if not pushed:
+                for table in preferred_tables:
+                    for i, bfn in enumerate(bodies):
+                        if try_set(table, bfn()):
+                            pushed = True
+                            ok += 1
+                            # Cache winning combo
+                            profile.template_table = table
+                            profile.template_body_index = i
+                            from app.core.db import save_firmware_profile
+                            save_firmware_profile(
+                                device_id=device_id,
+                                template_table=table,
+                                template_body_index=i,
+                                authorize_body_index=profile.authorize_body_index
+                                    if profile.authorize_body_index is not None else 0,
+                            )
+                            break
+                    if pushed:
                         break
-                if pushed:
-                    break
 
-            if pushed:
-                ok += 1
-            else:
-                errs.append(f"FingerID={fid}: failed to push template (no compatible schema/table)")
+            if not pushed:
+                failed_fp_errs.append(f"FingerID={fid}: failed to push template (no compatible schema/table)")
 
-        compact_errs: List[str] = []
-        seen = set()
-        for e in errs:
-            if e not in seen:
-                compact_errs.append(e)
-                seen.add(e)
-
-        return ok, compact_errs
+        return ok, failed_fp_errs
 
     def _delete_pin_if_exists(self, *, sdk: PullSDK, pin: str, device_pins: Set[str]) -> bool:
         if pin not in device_pins:
@@ -615,6 +726,7 @@ class DeviceSyncEngine:
         users: List[Dict[str, Any]],
         local_fp_index: Dict[str, List[Any]],
         default_door_id: int,
+        changed_ids: set | None = None,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
@@ -714,6 +826,19 @@ class DeviceSyncEngine:
                 pins_to_sync.add(pin)
                 templates_for_sync[pin] = templates
 
+        # Delta hint: when the backend reported only a subset of users changed,
+        # prune pins_to_sync to those users + any with a failed/missing prev sync.
+        # Stale-pin deletion is unaffected (uses desired_pins, not pins_to_sync).
+        if changed_ids is not None:
+            pins_to_sync = {
+                pin for pin in pins_to_sync
+                if (
+                    int(pin) in changed_ids          # changed per backend delta
+                    or not prev_state.get(pin, ("", True))[0]   # no stored hash (new)
+                    or not prev_state.get(pin, ("", True))[1]   # previous push failed
+                )
+            }
+
         _policy_str = str(device.get("pushingToDevicePolicy") or "ALL").strip().upper()
         self.logger.info(
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
@@ -754,8 +879,11 @@ class DeviceSyncEngine:
 
             # F-011: Drift detection — desired pins missing from device despite having a stored hash
             # indicate external removal. Force re-sync for those pins.
+            # In delta mode skip drift check for unchanged users; they'll be caught on the next full sync.
             for pin in desired_pins:
                 if pin not in device_pins and prev_hashes.get(pin) and pin not in pins_to_sync:
+                    if changed_ids is not None and int(pin) not in changed_ids:
+                        continue  # skip drift detection for unchanged users in delta mode
                     self.logger.info(
                         f"[DeviceSync] Device id={dev_id} Pin={pin}: "
                         f"not on device but hash stored — external removal detected, forcing re-sync"
@@ -883,6 +1011,7 @@ class DeviceSyncEngine:
                             pin=pin,
                             door_bitmask=door_bitmask,
                             authorize_timezone_id=int(authorize_timezone_id),
+                            device_id=int(dev_id) if dev_id is not None else 0,
                         )
                         if auth_err:
                             auth_complete = (auth_ok_count == len(door_ids))
@@ -897,7 +1026,8 @@ class DeviceSyncEngine:
 
                     # 3) templates
                     if templates:
-                        ok_count, errs = self._push_templates(sdk, pin=pin, templates=templates)
+                        ok_count, errs = self._push_templates(sdk, pin=pin, templates=templates,
+                                                               device_id=int(dev_id) if dev_id is not None else 0)
                         pushed_templates += ok_count
                         if errs:
                             warn_templates_users += 1
@@ -1017,7 +1147,7 @@ class DeviceSyncEngine:
             except Exception:
                 pass
 
-    def _sync_all_devices(self, *, cache) -> None:
+    def _sync_all_devices(self, *, cache, changed_ids: set | None = None) -> None:
         if not cache:
             self.logger.info("[DeviceSync] No cache -> skip")
             return
@@ -1046,8 +1176,10 @@ class DeviceSyncEngine:
 
         default_door_id = self._default_authorize_door_id()
         self.logger.info(
-            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d default_door_id=%s",
+            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d "
+            "default_door_id=%s changed_ids=%s",
             len(devices), len(users), len(local_fp_index), default_door_id,
+            len(changed_ids) if changed_ids is not None else "all",
         )
 
         device_mode_devices: List[Dict[str, Any]] = []
@@ -1091,6 +1223,7 @@ class DeviceSyncEngine:
                         users=users,
                         local_fp_index=local_fp_index,
                         default_door_id=default_door_id,
+                        changed_ids=changed_ids,
                     ): dev
                     for dev in device_mode_devices
                 }
