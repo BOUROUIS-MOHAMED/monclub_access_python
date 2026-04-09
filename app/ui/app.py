@@ -73,6 +73,10 @@ from app.core.ultra_engine import UltraEngine
 from access.api import LocalAccessApiServerV2
 from shared.api.monclub_api import MonClubApi, MonClubApiHttpError
 from app.core.change_detector import ChangeDetectorService
+from app.core.sync_scope import (
+    device_membership_scope_changed,
+    strip_member_version_tokens,
+)
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
@@ -1022,9 +1026,11 @@ class MainApp:
             _delta_changed_ids = None  # set when backend returns membersDeltaMode=True
             try:
                 api = self._api()
+                previous_cache = load_sync_cache()
+                previous_devices = list(getattr(previous_cache, "devices", []) or []) if previous_cache else []
                 version_tokens = load_version_tokens() or None
-                # First sync (no tokens) transfers full payload — allow more time.
-                # Delta syncs (tokens present) are small and fast — keep tight timeout.
+                # First sync (no tokens) transfers full payload - allow more time.
+                # Delta syncs (tokens present) are small and fast - keep tight timeout.
                 sync_timeout = 60 if version_tokens else 60
 
                 self.logger.info(
@@ -1055,9 +1061,73 @@ class MainApp:
                     "settings":    data.get("refreshSettings", True),
                 }
 
+                new_tokens = {
+                    param: data[field]
+                    for param, field in (
+                        ("membersVersion",      "currentMembersVersion"),
+                        ("devicesVersion",      "currentDevicesVersion"),
+                        ("credentialsVersion",  "currentCredentialsVersion"),
+                        ("settingsVersion",     "currentSettingsVersion"),
+                        ("membersUpdatedAfter", "currentMembersRefreshedAt"),
+                    )
+                    if data.get(field)
+                }
+
                 save_sync_cache_delta(data, refresh)
                 from app.core.db import invalidate_sync_cache
                 invalidate_sync_cache()
+
+                if (
+                    refresh.get("devices")
+                    and not refresh.get("members")
+                    and device_membership_scope_changed(previous_devices, data.get("devices") or [])
+                ):
+                    self.logger.warning(
+                        "[SYNC-DEBUG] Device membership scope changed without member refresh; "
+                        "forcing immediate member follow-up sync."
+                    )
+                    try:
+                        followup_tokens = strip_member_version_tokens(new_tokens)
+                        data = api.get_sync_data(
+                            token=auth.token,
+                            version_tokens=followup_tokens or None,
+                            timeout=sync_timeout,
+                        )
+                        refresh = {
+                            "members":     data.get("refreshMembers", True),
+                            "devices":     data.get("refreshDevices", True),
+                            "credentials": data.get("refreshCredentials", True),
+                            "settings":    data.get("refreshSettings", True),
+                        }
+                        save_sync_cache_delta(data, refresh)
+                        invalidate_sync_cache()
+                        if not refresh.get("members"):
+                            clear_version_tokens()
+                            new_tokens = {}
+                            self.logger.warning(
+                                "[SYNC-DEBUG] Forced member follow-up sync still returned refreshMembers=False; "
+                                "cleared version tokens for a full retry next cycle."
+                            )
+                        else:
+                            new_tokens = {
+                                param: data[field]
+                                for param, field in (
+                                    ("membersVersion",      "currentMembersVersion"),
+                                    ("devicesVersion",      "currentDevicesVersion"),
+                                    ("credentialsVersion",  "currentCredentialsVersion"),
+                                    ("settingsVersion",     "currentSettingsVersion"),
+                                    ("membersUpdatedAfter", "currentMembersRefreshedAt"),
+                                )
+                                if data.get(field)
+                            }
+                    except Exception as followup_ex:
+                        clear_version_tokens()
+                        new_tokens = {}
+                        self.logger.warning(
+                            "[SYNC-DEBUG] Forced member follow-up sync failed after device scope change; "
+                            "cleared version tokens for a full retry next cycle: %s",
+                            followup_ex,
+                        )
 
                 # Compute delta hints for device push optimization
                 if data.get("membersDeltaMode") and refresh.get("members"):
@@ -1070,17 +1140,6 @@ class MainApp:
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they
                 # are recognised on the next request (membersVersion, not currentMembersVersion).
-                new_tokens = {
-                    param: data[field]
-                    for param, field in (
-                        ("membersVersion",      "currentMembersVersion"),
-                        ("devicesVersion",      "currentDevicesVersion"),
-                        ("credentialsVersion",  "currentCredentialsVersion"),
-                        ("settingsVersion",     "currentSettingsVersion"),
-                        ("membersUpdatedAfter", "currentMembersRefreshedAt"),
-                    )
-                    if data.get(field)
-                }
                 if new_tokens:
                     save_version_tokens(new_tokens)
 

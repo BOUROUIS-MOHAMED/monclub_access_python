@@ -251,7 +251,8 @@
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:desarrollo.zktecolatinoamerica.com)",
       "WebFetch(domain:usermanual.wiki)",
-      "WebFetch(domain:www.housingdevices.com)"
+      "WebFetch(domain:www.housingdevices.com)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }
