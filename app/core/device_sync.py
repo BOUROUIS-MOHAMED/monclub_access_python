@@ -468,8 +468,13 @@ class DeviceSyncEngine:
         pin: str,
         door_bitmask: int,
         authorize_timezone_id: int,
+        device_id: int,
     ) -> Tuple[int, str | None]:
         """Push a single userauthorize record with a pre-computed bitmask.
+
+        Tries the cached firmware pattern first (1 SDK call). Falls back to the
+        full retry loop on cache miss or if the cached pattern stopped working
+        (e.g., after a firmware upgrade). Caches the winning pattern on success.
 
         door_bitmask is the OR of individual door bits (1=door1, 2=door2, 4=door3, 8=door4).
         For all 4 doors on a C3-400: bitmask = 1|2|4|8 = 15.
@@ -481,8 +486,7 @@ class DeviceSyncEngine:
         if tz < 1:
             tz = 1
 
-        # Try multiple field-name patterns for firmware compatibility.
-        # Pattern order: preferred (AuthorizeDoorId) first, legacy fallbacks after.
+        # Pattern list — order matters: preferred (AuthorizeDoorId) first, legacy fallbacks after.
         patterns = [
             f"Pin={pin}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}\r\n",
             f"Pin={pin}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}\r\n",
@@ -490,13 +494,41 @@ class DeviceSyncEngine:
             f"Pin={pin}\tDoorID={door_bitmask}\tTimeZone={tz}\r\n",
         ]
 
+        profile = self._get_firmware_profile(device_id)
+
+        # L1: try cached pattern first (1 SDK call)
+        if profile.authorize_body_index is not None:
+            cached_data = patterns[profile.authorize_body_index]
+            try:
+                sdk.set_device_data(table="userauthorize", data=cached_data, options="")
+                self.logger.debug("[DeviceSync] Pin=%s userauthorize OK (cached pattern=%d)",
+                                  pin, profile.authorize_body_index)
+                return 1, None
+            except Exception as ex:
+                # Cached pattern failed — firmware may have been upgraded. Clear and fall through.
+                self.logger.warning(
+                    "[DeviceSync] Pin=%s userauthorize cached pattern=%d FAILED (%s), "
+                    "clearing cache for device_id=%d",
+                    pin, profile.authorize_body_index, ex, device_id,
+                )
+                profile.authorize_body_index = None
+                from app.core.db import clear_firmware_profile
+                clear_firmware_profile(device_id=device_id)
+
+        # L2: retry loop — discover working pattern and cache it
         last_err = None
-        for data in patterns:
+        for i, data in enumerate(patterns):
             try:
                 sdk.set_device_data(table="userauthorize", data=data, options="")
-                self.logger.debug(
-                    "[DeviceSync] Pin=%s userauthorize OK: bitmask=%d",
-                    pin, door_bitmask,
+                self.logger.debug("[DeviceSync] Pin=%s userauthorize OK (pattern=%d)", pin, i)
+                # Cache discovery
+                profile.authorize_body_index = i
+                from app.core.db import save_firmware_profile
+                save_firmware_profile(
+                    device_id=device_id,
+                    template_table=profile.template_table or "templatev10",
+                    template_body_index=profile.template_body_index if profile.template_body_index is not None else 0,
+                    authorize_body_index=i,
                 )
                 return 1, None
             except Exception as ex:
@@ -508,17 +540,32 @@ class DeviceSyncEngine:
         )
         return 0, last_err or "userauthorize: no compatible field pattern worked"
 
-    def _push_templates(self, sdk: PullSDK, *, pin: str, templates: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
-        errs: List[str] = []
+    def _push_templates(
+        self,
+        sdk: PullSDK,
+        *,
+        pin: str,
+        templates: List[Dict[str, Any]],
+        device_id: int,
+    ) -> Tuple[int, List[str]]:
+        """Push fingerprint templates to device.
+
+        Tries the cached (table, body_index) combo first for each template (1 SDK call).
+        Falls back to the full retry loop on cache miss or if the cached combo fails.
+        Caches the winning combo on first successful discovery for the session.
+        """
+        failed_fp_errs: List[str] = []
         ok = 0
 
         def try_set(table: str, body: str) -> bool:
+            """Attempt SDK call. Returns True on success, False on any exception."""
             try:
                 sdk.set_device_data(table=table, data=body + "\r\n", options="")
                 return True
-            except Exception as ex:
-                errs.append(f"{table}: {ex}")
+            except Exception:
                 return False
+
+        profile = self._get_firmware_profile(device_id)
 
         for t in templates:
             fid = int(t.get("fingerId"))
@@ -532,35 +579,59 @@ class DeviceSyncEngine:
             preferred_tables = ["templatev10", "template"] if tv >= 10 else ["template", "templatev10"]
 
             bodies = [
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTmp={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tValid=1\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tSize={size}\tTemplate={tpl}",
-                lambda: f"Pin={pin}\tFingerID={fid}\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTmp={tpl}",
+                lambda fid=fid, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tValid=1\tTemplate={tpl}",
+                lambda fid=fid, size=size, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tSize={size}\tTemplate={tpl}",
+                lambda fid=fid, tpl=tpl: f"Pin={pin}\tFingerID={fid}\tTemplate={tpl}",
             ]
 
             pushed = False
-            for table in preferred_tables:
-                for bfn in bodies:
-                    if try_set(table, bfn()):
-                        pushed = True
+
+            # L1: try cached combo (1 SDK call)
+            if profile.template_table is not None and profile.template_body_index is not None:
+                cached_body = bodies[profile.template_body_index]()
+                if try_set(profile.template_table, cached_body):
+                    ok += 1
+                    pushed = True
+                else:
+                    # Cached combo failed — clear and fall through to retry loop
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s FingerID=%d cached template combo (%s, idx=%d) failed — "
+                        "clearing firmware cache for device_id=%d",
+                        pin, fid, profile.template_table, profile.template_body_index, device_id,
+                    )
+                    profile.template_table = None
+                    profile.template_body_index = None
+                    from app.core.db import clear_firmware_profile
+                    clear_firmware_profile(device_id=device_id)
+
+            # L2: retry loop (runs on cache miss or after cache clear)
+            if not pushed:
+                for table in preferred_tables:
+                    for i, bfn in enumerate(bodies):
+                        if try_set(table, bfn()):
+                            pushed = True
+                            ok += 1
+                            # Cache winning combo
+                            profile.template_table = table
+                            profile.template_body_index = i
+                            from app.core.db import save_firmware_profile
+                            save_firmware_profile(
+                                device_id=device_id,
+                                template_table=table,
+                                template_body_index=i,
+                                authorize_body_index=profile.authorize_body_index
+                                    if profile.authorize_body_index is not None else 0,
+                            )
+                            break
+                    if pushed:
                         break
-                if pushed:
-                    break
 
-            if pushed:
-                ok += 1
-            else:
-                errs.append(f"FingerID={fid}: failed to push template (no compatible schema/table)")
+            if not pushed:
+                failed_fp_errs.append(f"FingerID={fid}: failed to push template (no compatible schema/table)")
 
-        compact_errs: List[str] = []
-        seen = set()
-        for e in errs:
-            if e not in seen:
-                compact_errs.append(e)
-                seen.add(e)
-
-        return ok, compact_errs
+        return ok, failed_fp_errs
 
     def _delete_pin_if_exists(self, *, sdk: PullSDK, pin: str, device_pins: Set[str]) -> bool:
         if pin not in device_pins:
@@ -922,6 +993,7 @@ class DeviceSyncEngine:
                             pin=pin,
                             door_bitmask=door_bitmask,
                             authorize_timezone_id=int(authorize_timezone_id),
+                            device_id=int(dev_id) if dev_id is not None else 0,
                         )
                         if auth_err:
                             auth_complete = (auth_ok_count == len(door_ids))
@@ -936,7 +1008,8 @@ class DeviceSyncEngine:
 
                     # 3) templates
                     if templates:
-                        ok_count, errs = self._push_templates(sdk, pin=pin, templates=templates)
+                        ok_count, errs = self._push_templates(sdk, pin=pin, templates=templates,
+                                                               device_id=int(dev_id) if dev_id is not None else 0)
                         pushed_templates += ok_count
                         if errs:
                             warn_templates_users += 1
