@@ -1067,8 +1067,17 @@ class DeviceSyncEngine:
             if use_batch and pins_sorted:
                 # Pre-delete (only in non-nuke mode) to avoid rc=-101 on insert-only firmware
                 if not nuke_mode:
-                    for pin in pins_sorted:
+                    predelete_progress_cap = max(0, len(pins_sorted) - 1)
+                    predelete_progress_step = max(1, len(pins_sorted) // 100)
+                    for idx, pin in enumerate(pins_sorted, start=1):
                         self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                        if (
+                            predelete_progress_cap > 0
+                            and (idx == len(pins_sorted) or idx % predelete_progress_step == 0)
+                        ):
+                            # Batch sync can spend a long time deleting/replacing rows
+                            # before the final save-state phase completes.
+                            self._set_progress(current=min(predelete_progress_cap, idx))
 
                 # Phase A: Batch push user rows
                 # Use cached name_supported flag to skip Name field on firmware that rejects it.
