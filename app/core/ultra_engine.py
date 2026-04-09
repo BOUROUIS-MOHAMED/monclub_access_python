@@ -87,7 +87,7 @@ class UltraDeviceWorker(threading.Thread):
         # Local state cache (avoid per-event DB reads)
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
-        self._CACHE_TTL_SEC: float = 5.0
+        self._CACHE_TTL_SEC: float = 60.0  # sync data only changes on sync cycles (~60s)
 
     # ------------------------------------------------------------------ #
     # Main loop
