@@ -4,6 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Tuple
 
@@ -17,6 +18,22 @@ from app.core.db import (
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
 from app.sdk.pullsdk import PullSDK, PullSDKError
+
+
+@dataclass
+class FirmwareProfile:
+    """
+    Records which SDK field-name pattern works for a specific ZKTeco device firmware.
+    Populated from SQLite on first use, updated on successful discovery.
+
+    Fields:
+        template_table       — "templatev10" or "template"
+        template_body_index  — index into the bodies list in _push_templates (0-4)
+        authorize_body_index — index into the patterns list in _push_userauthorize (0-3)
+    """
+    template_table: str | None = None
+    template_body_index: int | None = None
+    authorize_body_index: int | None = None
 
 
 # Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
@@ -153,6 +170,28 @@ class DeviceSyncEngine:
             "current": 0,
             "total": 0,
         }
+        # Phase 2: in-session firmware profile cache (device_id -> FirmwareProfile).
+        # L1 cache (memory) backed by L2 (SQLite via db.py).
+        # Keyed by device_id (stable integer), not IP (DHCP can reassign IPs).
+        self._firmware_profiles: dict[int, FirmwareProfile] = {}
+
+    def _get_firmware_profile(self, device_id: int) -> FirmwareProfile:
+        """
+        Returns the FirmwareProfile for this device, loading from SQLite if not in session cache.
+        Creates an empty profile if none exists yet (discovery happens on first push attempt).
+        """
+        if device_id not in self._firmware_profiles:
+            from app.core.db import load_firmware_profile
+            persisted = load_firmware_profile(device_id=device_id)
+            if persisted:
+                self._firmware_profiles[device_id] = FirmwareProfile(
+                    template_table=persisted["template_table"],
+                    template_body_index=persisted["template_body_index"],
+                    authorize_body_index=persisted["authorize_body_index"],
+                )
+            else:
+                self._firmware_profiles[device_id] = FirmwareProfile()
+        return self._firmware_profiles[device_id]
 
     def _set_progress(self, **changes: Any) -> None:
         with self._progress_cond:
