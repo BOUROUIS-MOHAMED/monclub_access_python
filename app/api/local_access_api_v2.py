@@ -3751,7 +3751,7 @@ _discovery_cancel = threading.Event()
 def _handle_scanner_start(ctx: _Ctx) -> None:
     from app.core.card_scanner import get_scanner
     from app.core.config import load_config
-    body = ctx.json_body()
+    body = ctx.body()
     cfg = load_config()
     mode = _safe_str(body.get("mode"), cfg.scanner_mode) or "network"
     ip = _safe_str(body.get("ip"), cfg.scanner_network_ip) or ""
@@ -3794,7 +3794,7 @@ def _handle_scanner_discover(ctx: _Ctx) -> None:
         _discovery_devices = []
         _discovery_cancel.clear()
 
-    body = ctx.json_body()
+    body = ctx.body()
     subnet = _safe_str(body.get("subnet"), "") or None
 
     # Check if scanner is active — skip handshake to avoid conflicting with live_capture
