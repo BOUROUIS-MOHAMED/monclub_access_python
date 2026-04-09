@@ -916,11 +916,19 @@ class DeviceSyncEngine:
                     "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
                     dev_id, len(stale_pins), len(desired_pins),
                 )
-                for tbl in ("templatev10", "template", "userauthorize", "user"):
+                # Template tables are optional (templatev10 vs template depends on firmware).
+                # Best-effort clear — don't abort nuke if these fail.
+                for tbl in ("templatev10", "template"):
+                    try:
+                        sdk.clear_device_table(table=tbl)
+                    except PullSDKError:
+                        self.logger.debug("[DeviceSync] Device id=%s: clear %s skipped (table may not exist)", dev_id, tbl)
+                # Critical tables: userauthorize then user. Abort nuke if these fail.
+                for tbl in ("userauthorize", "user"):
                     try:
                         sdk.clear_device_table(table=tbl)
                     except PullSDKError as ex:
-                        self.logger.warning("[DeviceSync] Device id=%s: clear %s failed: %s — falling back", dev_id, tbl, ex)
+                        self.logger.warning("[DeviceSync] Device id=%s: clear %s failed: %s — falling back to individual delete", dev_id, tbl, ex)
                         nuke_mode = False
                         break
                 if nuke_mode:
