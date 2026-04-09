@@ -232,11 +232,12 @@ class UltraDeviceWorker(threading.Thread):
 
     def resume_from_sync(self):
         """Allow worker to reconnect after sync engine has disconnected."""
-        # Invalidate the in-memory state cache so the first event after
-        # reconnect forces a fresh DB load.  Without this the worker can
-        # process post-sync events against the stale pre-sync snapshot for
-        # up to _CACHE_TTL_SEC seconds, defeating the sync entirely.
-        self._cached_state = None
+        # Mark cache as stale (reset timestamp) but DON'T wipe the data.
+        # The stale cache is still valid for immediate TOTP verification —
+        # credentials/users rarely change within a single sync cycle.
+        # This avoids a blocking 5-second load_local_state() on the first
+        # event after resume, which delays the door-open command.
+        # The cache will refresh lazily on next TTL expiry (background-safe).
         self._cached_state_ts = 0.0
         self._sync_pause.clear()
 
@@ -880,22 +881,52 @@ class UltraDeviceWorker(threading.Thread):
     # ------------------------------------------------------------------ #
 
     def _get_cached_local_state(self):
-        """Return (creds, users_by_am, users_by_card) with 5-second cache."""
+        """Return (creds, users_by_am, users_by_card) with TTL-based cache.
+
+        If stale data exists, returns it immediately and reloads in the
+        background so the caller (TOTP verification + door command) is never
+        blocked by the 3-5 second load_local_state() SQLite query.
+        """
         now = time.monotonic()
-        if self._cached_state is None or (now - self._cached_state_ts) > self._CACHE_TTL_SEC:
-            logger.debug(f"{self._prefix} refreshing local state cache from DB")
-            result = load_local_state()
-            if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
-                logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
-                self._cached_state = ({}, {}, {})
+        needs_refresh = self._cached_state is None or (now - self._cached_state_ts) > self._CACHE_TTL_SEC
+
+        if needs_refresh:
+            if self._cached_state is not None:
+                # Stale data exists — return immediately, reload in background
+                if not getattr(self, "_cache_bg_loading", False):
+                    self._cache_bg_loading = True
+                    def _bg_load():
+                        try:
+                            result = load_local_state()
+                            if result and isinstance(result, (tuple, list)) and len(result) >= 3:
+                                self._cached_state = result
+                                self._cached_state_ts = time.monotonic()
+                                creds, uam, ucard = result
+                                logger.debug(
+                                    f"{self._prefix} bg cache refresh done: "
+                                    f"creds={len(creds)} users_by_am={len(uam)} users_by_card={len(ucard)}"
+                                )
+                        except Exception as e:
+                            logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
+                        finally:
+                            self._cache_bg_loading = False
+                    threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
+                return self._cached_state
             else:
-                self._cached_state = result
-            self._cached_state_ts = now
-            creds, users_by_am, users_by_card = self._cached_state
-            logger.debug(
-                f"{self._prefix} local state cache refreshed: "
-                f"creds={len(creds)} users_by_am={len(users_by_am)} users_by_card={len(users_by_card)}"
-            )
+                # No data at all — must load synchronously (first time only)
+                logger.debug(f"{self._prefix} refreshing local state cache from DB (sync, first load)")
+                result = load_local_state()
+                if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
+                    logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
+                    self._cached_state = ({}, {}, {})
+                else:
+                    self._cached_state = result
+                self._cached_state_ts = now
+                creds, users_by_am, users_by_card = self._cached_state
+                logger.debug(
+                    f"{self._prefix} local state cache refreshed: "
+                    f"creds={len(creds)} users_by_am={len(users_by_am)} users_by_card={len(users_by_card)}"
+                )
         return self._cached_state
 
     # ------------------------------------------------------------------ #
