@@ -1,3 +1,4 @@
+import { useState, useEffect } from "react";
 import { useApp } from "@/context/AppContext";
 import { usePopupStream } from "@/api/hooks";
 import { post } from "@/api/client";
@@ -6,10 +7,11 @@ import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import StatusChip from "@/components/StatusChip2";
+import ScanCardModal from "@/components/ScanCardModal";
 import { cn } from "@/lib/utils";
 import {
   RefreshCw, RotateCcw, Router, Bot, Users, CheckCircle, Monitor,
-  Bug, AlertTriangle, Play, Square, Upload,
+  Bug, AlertTriangle, Play, Square, Upload, CreditCard,
 } from "lucide-react";
 
 function Panel({
@@ -58,6 +60,18 @@ function StatusDot({ ok, pulse }: { ok: boolean; pulse?: boolean }) {
 export default function DashboardPage() {
   const { status, syncNow, hardSyncNow } = useApp();
   const { openPopupWindow, sendTestNotification } = usePopupStream();
+  const [scanOpen, setScanOpen] = useState(false);
+
+  // Listen for tray "Scanner carte" click
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    import("@tauri-apps/api/event").then(({ listen }) => {
+      listen("tray-scan-card", () => {
+        setScanOpen(true);
+      }).then((fn) => { unlisten = fn; });
+    }).catch(() => {/* not in Tauri context */});
+    return () => { if (unlisten) unlisten(); };
+  }, []);
 
   if (!status) return <p className="text-[13px] text-muted-foreground">Chargement…</p>;
 
@@ -165,6 +179,13 @@ export default function DashboardPage() {
           <span className="mx-1 opacity-40">·</span>
           <span className="text-foreground">{mode.AGENT}</span>
           <span>A</span>
+          {(mode.ULTRA ?? 0) > 0 && (
+            <>
+              <span className="mx-1 opacity-40">·</span>
+              <span className="text-violet-400">{mode.ULTRA}</span>
+              <span>U</span>
+            </>
+          )}
           {mode.UNKNOWN > 0 && (
             <>
               <span className="mx-1 opacity-40">·</span>
@@ -175,6 +196,16 @@ export default function DashboardPage() {
         </div>
 
         <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-[12px] gap-1.5 px-3 text-emerald-500 border-emerald-500/40 hover:bg-emerald-500/10 hover:text-emerald-400"
+            onClick={() => setScanOpen(true)}
+            title="Scanner une carte RFID"
+          >
+            <CreditCard className="h-3 w-3" />
+            Scan
+          </Button>
           <Button
             size="sm"
             variant="outline"
@@ -430,6 +461,16 @@ export default function DashboardPage() {
               </div>
               <div className="text-2xl font-bold font-mono tabular-nums">{mode.AGENT}</div>
             </div>
+            {(mode.ULTRA ?? 0) > 0 && (
+              <div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
+                  Ultra
+                </div>
+                <div className="text-2xl font-bold font-mono tabular-nums text-violet-400">
+                  {mode.ULTRA}
+                </div>
+              </div>
+            )}
             {mode.UNKNOWN > 0 && (
               <div>
                 <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
@@ -444,6 +485,16 @@ export default function DashboardPage() {
         </Panel>
 
       </div>
+
+      <ScanCardModal
+        open={scanOpen}
+        onClose={(cardNumber) => {
+          setScanOpen(false);
+          if (cardNumber) {
+            console.log("Scanned card:", cardNumber);
+          }
+        }}
+      />
     </div>
   );
 }

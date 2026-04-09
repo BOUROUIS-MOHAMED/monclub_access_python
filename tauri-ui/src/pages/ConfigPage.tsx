@@ -33,7 +33,10 @@ import {
 } from "@/components/ui/alert";
 import {
   Settings, Save, Lock, Unlock, Loader2, CheckCircle, Download, Info,
+  CreditCard, Wifi, Usb, Search, Radio,
 } from "lucide-react";
+import type { DiscoveredDevice } from "@/api/types";
+import { useScanCard } from "@/hooks/useScanCard";
 
 export default function ConfigPage() {
   const { status } = useApp();
@@ -54,6 +57,9 @@ export default function ConfigPage() {
 
   // Update info
   const [updateDialog, setUpdateDialog] = useState(false);
+
+  // Card scanner discovery
+  const { startDiscover, discovering, discoveredDevices } = useScanCard();
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
@@ -175,6 +181,121 @@ export default function ConfigPage() {
               onCheckedChange={(checked: boolean) => { void handleStartupToggle(checked); }}
             />
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Card scanner settings — always visible */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <CreditCard className="h-4 w-4" /> Lecteur de cartes
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Mode toggle */}
+          <div className="flex items-center justify-between">
+            <div className="space-y-1">
+              <Label>Mode de connexion</Label>
+              <p className="text-sm text-muted-foreground">
+                {cfg.scanner_mode === "network"
+                  ? "SCR100 via le réseau (TCP/IP port 4370)"
+                  : "Lecteur USB branché directement (HID)"}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Usb className={`h-4 w-4 ${cfg.scanner_mode === "usb" ? "text-primary" : "text-muted-foreground"}`} />
+              <Switch
+                checked={cfg.scanner_mode === "network"}
+                onCheckedChange={(checked: boolean) => {
+                  update("scanner_mode", checked ? "network" : "usb");
+                  patch("/config", { scanner_mode: checked ? "network" : "usb" }).catch(() => {});
+                }}
+              />
+              <Wifi className={`h-4 w-4 ${cfg.scanner_mode === "network" ? "text-primary" : "text-muted-foreground"}`} />
+            </div>
+          </div>
+
+          {/* Network mode settings */}
+          {cfg.scanner_mode === "network" && (
+            <div className="space-y-3 pt-2 border-t border-border/40">
+              <div className="flex items-end gap-2">
+                <div className="flex-1 space-y-1">
+                  <Label htmlFor="scanner-ip">Adresse IP du SCR100</Label>
+                  <Input
+                    id="scanner-ip"
+                    placeholder="192.168.1.201"
+                    value={cfg.scanner_network_ip || ""}
+                    onChange={(e) => update("scanner_network_ip", e.target.value)}
+                    onBlur={() => {
+                      patch("/config", { scanner_network_ip: cfg.scanner_network_ip || "" }).catch(() => {});
+                    }}
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => startDiscover()}
+                  disabled={discovering}
+                  title="Scanner le réseau pour trouver les appareils ZKTeco (port 4370)"
+                >
+                  {discovering ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Search className="h-4 w-4" />
+                  )}
+                  {discovering ? "Scan..." : "Détecter"}
+                </Button>
+              </div>
+
+              {/* Discovered devices list */}
+              {discoveredDevices.length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-xs text-muted-foreground">
+                    {discoveredDevices.length} appareil(s) trouvé(s) :
+                  </p>
+                  {discoveredDevices.map((dev: DiscoveredDevice) => (
+                    <button
+                      key={dev.ip}
+                      className="w-full flex items-center justify-between px-3 py-2 rounded-md border border-border hover:bg-accent text-left text-sm transition-colors"
+                      onClick={() => {
+                        update("scanner_network_ip", dev.ip);
+                        patch("/config", { scanner_network_ip: dev.ip }).catch(() => {});
+                      }}
+                    >
+                      <span className="flex items-center gap-2">
+                        <Radio className="h-3.5 w-3.5 text-emerald-500" />
+                        <code className="text-xs font-mono">{dev.ip}</code>
+                        {dev.serialNumber && (
+                          <span className="text-xs text-muted-foreground">
+                            — {dev.serialNumber}
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-xs text-muted-foreground">{dev.model}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {!discovering && discoveredDevices.length === 0 && cfg.scanner_network_ip && (
+                <p className="text-xs text-muted-foreground">
+                  IP configurée : <code className="bg-muted px-1 rounded">{cfg.scanner_network_ip}</code>
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* USB mode info */}
+          {cfg.scanner_mode === "usb" && (
+            <div className="pt-2 border-t border-border/40">
+              <Alert>
+                <Usb className="h-4 w-4" />
+                <AlertDescription className="text-xs">
+                  Branchez le lecteur USB RFID. Aucune configuration requise — le lecteur sera détecté automatiquement comme clavier HID.
+                </AlertDescription>
+              </Alert>
+            </div>
+          )}
         </CardContent>
       </Card>
 

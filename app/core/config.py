@@ -206,6 +206,15 @@ class AppConfig:
     login_email: str = ""
 
     # -------------------------
+    # Card scanner (SCR100 / USB HID)
+    # -------------------------
+    scanner_mode: str = "network"           # "network" or "usb"
+    scanner_network_ip: str = ""            # SCR100 IP address
+    scanner_network_port: int = 4370        # Always 4370 for ZKTeco
+    scanner_network_timeout_ms: int = 5000  # Connection timeout
+    scanner_usb_device_path: str = ""       # Optional: specific HID device path
+
+    # -------------------------
     # Backward-compatible accessors
     # -------------------------
     @property
@@ -446,6 +455,15 @@ class AppConfig:
 
         if cfg.login_email is None:
             cfg.login_email = ""
+
+        # scanner
+        cfg.scanner_mode = _safe_str(getattr(cfg, "scanner_mode", "network"), "network").strip().lower()
+        if cfg.scanner_mode not in ("network", "usb"):
+            cfg.scanner_mode = "network"
+        cfg.scanner_network_ip = _safe_str(getattr(cfg, "scanner_network_ip", ""), "").strip()
+        cfg.scanner_network_port = _clamp_int(getattr(cfg, "scanner_network_port", 4370), 4370, 1, 65535)
+        cfg.scanner_network_timeout_ms = _clamp_int(getattr(cfg, "scanner_network_timeout_ms", 5000), 5000, 1000, 30000)
+        cfg.scanner_usb_device_path = _safe_str(getattr(cfg, "scanner_usb_device_path", ""), "").strip()
 
         # update system
         cfg.update_enabled = bool(getattr(cfg, "update_enabled", True)) if getattr(cfg, "update_enabled", None) is not None else True

@@ -71,7 +71,8 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
     try {
       const res = await post<{ ok: boolean; error?: string }>(
         "/auth/verify-admin-password",
-        { password }
+        { password },
+        25_000,
       );
       if (res.ok) {
         const exp = Date.now() + SESSION_MS;
@@ -83,7 +84,10 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
         setError(res.error ?? "Mot de passe incorrect");
       }
     } catch (e: any) {
-      setError(e?.message ?? "Erreur d'authentification");
+      const msg = e?.name === "AbortError" || (e?.message ?? "").includes("timed out")
+        ? "Le serveur ne r\u00e9pond pas. V\u00e9rifiez votre connexion internet."
+        : (e?.message ?? "Erreur d'authentification");
+      setError(msg);
     } finally {
       setLoading(false);
     }

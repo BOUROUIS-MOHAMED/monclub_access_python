@@ -2731,6 +2731,24 @@ def list_device_sync_hashes(*, device_id: int) -> Dict[str, str]:
         return out
 
 
+def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
+    """Return {pin: (desired_hash, last_ok)} so callers can detect pins that need retry."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, desired_hash, last_ok FROM device_sync_state WHERE device_id=?",
+            (did,),
+        ).fetchall()
+        out: Dict[str, tuple] = {}
+        for r in rows:
+            p = str(r["pin"] or "")
+            h = str(r["desired_hash"] or "")
+            ok = bool(int(r["last_ok"] or 0))
+            if p:
+                out[p] = (h, ok)
+        return out
+
+
 def list_device_sync_pins(*, device_id: int) -> List[str]:
     did = int(device_id)
     with get_conn() as conn:

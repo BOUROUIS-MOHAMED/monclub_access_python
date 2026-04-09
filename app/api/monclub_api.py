@@ -175,7 +175,7 @@ class MonClubApi:
 
         return data
 
-    def validate_statistics_password(self, *, token: str, password: str, timeout: int = 10) -> bool:
+    def validate_statistics_password(self, *, token: str, password: str, timeout: int = 15) -> bool:
         """Validate the gym statistics/admin-agent password against the backend.
 
         Returns True if the password is correct, False if wrong (401).

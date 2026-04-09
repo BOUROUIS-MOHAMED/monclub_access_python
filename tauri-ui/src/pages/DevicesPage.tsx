@@ -123,7 +123,7 @@ export default function DevicesPage() {
                 <CardHeader className="pb-2">
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-sm">{name}</CardTitle>
-                    <Badge variant={mode === "AGENT" ? "default" : mode === "DEVICE" ? "secondary" : "outline"} className="text-[10px]">{mode}</Badge>
+                    <Badge variant={mode === "ULTRA" ? "default" : mode === "AGENT" ? "default" : mode === "DEVICE" ? "secondary" : "outline"} className={cn("text-[10px]", mode === "ULTRA" && "bg-violet-500 hover:bg-violet-600")}>{mode}</Badge>
                   </div>
                   <p className="text-xs text-muted-foreground font-mono">{ip}:{d.port || 4370}</p>
                 </CardHeader>

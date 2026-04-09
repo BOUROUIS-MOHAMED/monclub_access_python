@@ -25,6 +25,7 @@ export interface SessionBlock {
 export interface ModeBlock {
   DEVICE: number;
   AGENT: number;
+  ULTRA: number;
   UNKNOWN: number;
 }
 
@@ -1417,6 +1418,29 @@ export interface TvStartupPreflightResponse {
     infoCount: number;
   };
   metadata: Record<string, unknown>;
+}
+
+// ─── Card Scanner ───
+export interface ScannerStatus {
+  state: "idle" | "connecting" | "scanning" | "error";
+  error: string;
+  lastResult: {
+    cardNumber: string;
+    timestamp: number;
+    source: "network" | "usb";
+  } | null;
+}
+
+export interface DiscoveredDevice {
+  ip: string;
+  port: number;
+  serialNumber: string;
+  model: string;
+}
+
+export interface DiscoverStatus {
+  running: boolean;
+  devices: DiscoveredDevice[];
 }
 
 export interface TvStartupRunResponse {

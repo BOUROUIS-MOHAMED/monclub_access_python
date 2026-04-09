@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Set, Tuple
 from app.core.db import (
     list_fingerprints,
     list_device_sync_hashes,
+    list_device_sync_hashes_and_status,
     save_device_sync_state,
     delete_device_sync_state,
     prune_device_sync_state,
@@ -426,70 +427,47 @@ class DeviceSyncEngine:
         sdk: PullSDK,
         *,
         pin: str,
-        door_ids: List[int],
+        door_bitmask: int,
         authorize_timezone_id: int,
     ) -> Tuple[int, str | None]:
-        if not door_ids:
-            door_ids = [self._default_authorize_door_id()]
+        """Push a single userauthorize record with a pre-computed bitmask.
+
+        door_bitmask is the OR of individual door bits (1=door1, 2=door2, 4=door3, 8=door4).
+        For all 4 doors on a C3-400: bitmask = 1|2|4|8 = 15.
+        """
+        if door_bitmask <= 0:
+            door_bitmask = self._default_authorize_door_id()
 
         tz = int(authorize_timezone_id or 1)
         if tz < 1:
             tz = 1
 
+        # Try multiple field-name patterns for firmware compatibility.
+        # Pattern order: preferred (AuthorizeDoorId) first, legacy fallbacks after.
         patterns = [
-            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZone={tz}",
-            lambda door: f"Pin={pin}\tDoorID={door}\tTimeZoneID={tz}",
-            lambda door: f"Pin={pin}\tAuthorizeDoorId={door}\tAuthorizeTimezoneId={tz}",
+            f"Pin={pin}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}\r\n",
+            f"Pin={pin}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}\r\n",
+            f"Pin={pin}\tDoorID={door_bitmask}\tTimeZoneID={tz}\r\n",
+            f"Pin={pin}\tDoorID={door_bitmask}\tTimeZone={tz}\r\n",
         ]
 
         last_err = None
-        chosen = None
-
-        first_door = int(door_ids[0])
-        for i, pfn in enumerate(patterns):
+        for data in patterns:
             try:
-                data = pfn(first_door) + "\r\n"
                 sdk.set_device_data(table="userauthorize", data=data, options="")
-                chosen = i
-                last_err = None
-                break
+                self.logger.debug(
+                    "[DeviceSync] Pin=%s userauthorize OK: bitmask=%d",
+                    pin, door_bitmask,
+                )
+                return 1, None
             except Exception as ex:
                 last_err = str(ex)
 
-        if chosen is None:
-            return 0, last_err or "userauthorize: no compatible field pattern worked"
-
-        # F-015: Push remaining doors one-by-one with a retry each.
-        # ZKTeco SetDeviceData accepts one record per call — multi-record batches
-        # can silently lose records, so we push individually and track failures.
-        ok_count = 1
-        failed_doors: List[int] = []
-
-        for door in door_ids[1:]:
-            pushed = False
-            for attempt in range(2):
-                try:
-                    data = patterns[chosen](int(door)) + "\r\n"
-                    sdk.set_device_data(table="userauthorize", data=data, options="")
-                    ok_count += 1
-                    pushed = True
-                    break
-                except Exception as ex:
-                    last_err = str(ex)
-                    if attempt == 0:
-                        import time as _time
-                        _time.sleep(0.05)
-            if not pushed:
-                failed_doors.append(door)
-
-        if failed_doors:
-            last_err = f"userauthorize: failed doors {failed_doors}: {last_err}"
-            self.logger.error(
-                f"[DeviceSync] Pin={pin} userauthorize INCOMPLETE: "
-                f"ok={ok_count}/{len(door_ids)} failed_doors={failed_doors}"
-            )
-
-        return ok_count, last_err
+        self.logger.error(
+            "[DeviceSync] Pin=%s userauthorize FAILED all patterns: bitmask=%d err=%s",
+            pin, door_bitmask, last_err,
+        )
+        return 0, last_err or "userauthorize: no compatible field pattern worked"
 
     def _push_templates(self, sdk: PullSDK, *, pin: str, templates: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
         errs: List[str] = []
@@ -600,13 +578,13 @@ class DeviceSyncEngine:
         *,
         pin: str,
         user: Dict[str, Any],
-        door_ids: List[int],
+        door_bitmask: int,
         templates: List[Dict[str, Any]],
         authorize_timezone_id: int,
     ) -> str:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
-        doors_norm = ",".join(str(x) for x in _norm_int_list(door_ids))
+        doors_norm = str(door_bitmask)
         tz = int(authorize_timezone_id or 1)
 
         tpl_parts: List[str] = []
@@ -648,26 +626,38 @@ class DeviceSyncEngine:
         if authorize_timezone_id < 1:
             authorize_timezone_id = 1
 
-        # Resolve physical door numbers for userauthorize.
-        # doorPresets contain the REAL physical door numbers (1-4 on C3-400).
-        # The backend's doorIds may contain a bitmask value like 15 (=all doors)
-        # which causes the C3 to fire ALL relays on a single card scan.
-        # Using individual door numbers (one authorize row per door) ensures only
-        # the scanned reader's relay fires.
-        presets = device.get("doorPresets") or []
-        physical_doors = sorted(set(
-            int(p.get("doorNumber") or p.get("door_number") or 0)
-            for p in presets if isinstance(p, dict)
-            and (p.get("doorNumber") or p.get("door_number"))
-        ))
-        physical_doors = [d for d in physical_doors if d > 0]
+        # Resolve AuthorizeDoorId bitmask for userauthorize.
+        # AuthorizeDoorId is a bitmask: door1=1, door2=2, door3=4, door4=8.
+        #
+        # Priority: use doorIds from the backend (already bitmask values set in
+        # the dashboard, e.g. [1, 2, 4, 8]).  OR them to get combined bitmask.
+        # Fallback: compute bitmask from doorPresets physical door numbers.
+        door_ids_raw = device.get("doorIds") or []
+        door_ids_list = _norm_int_list(door_ids_raw)
 
-        if physical_doors:
-            door_ids = physical_doors
+        if door_ids_list:
+            # doorIds from backend are already bitmask values — OR them together
+            door_bitmask = 0
+            for v in door_ids_list:
+                door_bitmask |= int(v)
+            door_ids = door_ids_list  # keep list for hash/log
         else:
-            door_ids_raw = device.get("doorIds") or []
-            door_ids = _norm_int_list(door_ids_raw)
-            if not door_ids:
+            # Fallback: compute bitmask from doorPresets physical door numbers
+            presets = device.get("doorPresets") or []
+            physical_doors = sorted(set(
+                int(p.get("doorNumber") or p.get("door_number") or 0)
+                for p in presets if isinstance(p, dict)
+                and (p.get("doorNumber") or p.get("door_number"))
+            ))
+            physical_doors = [d for d in physical_doors if d > 0]
+
+            if physical_doors:
+                door_bitmask = 0
+                for d in physical_doors:
+                    door_bitmask |= 1 << (int(d) - 1)
+                door_ids = physical_doors
+            else:
+                door_bitmask = int(default_door_id)
                 door_ids = [int(default_door_id)]
 
         if dev_id is None:
@@ -697,7 +687,9 @@ class DeviceSyncEngine:
             if p and p.isdigit():
                 known_server_pins.add(p)
 
-        prev_hashes = list_device_sync_hashes(device_id=did)
+        prev_state = list_device_sync_hashes_and_status(device_id=did)
+        # Also keep a simple hash dict for backward compat with prune logic
+        prev_hashes = {p: h for p, (h, _ok) in prev_state.items()}
 
         pins_to_sync: Set[str] = set()
         desired_hashes: Dict[str, str] = {}
@@ -711,12 +703,14 @@ class DeviceSyncEngine:
             dh = self._compute_desired_hash(
                 pin=pin,
                 user=u,
-                door_ids=door_ids,
+                door_bitmask=door_bitmask,
                 templates=templates,
                 authorize_timezone_id=authorize_timezone_id,
             )
             desired_hashes[pin] = dh
-            if prev_hashes.get(pin) != dh:
+            prev_hash, prev_ok = prev_state.get(pin, ("", True))
+            # Sync if: hash changed OR previous attempt failed
+            if prev_hash != dh or not prev_ok:
                 pins_to_sync.add(pin)
                 templates_for_sync[pin] = templates
 
@@ -724,7 +718,7 @@ class DeviceSyncEngine:
         self.logger.info(
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
             f"desired={len(desired_pins)} to_sync={len(pins_to_sync)} "
-            f"doors={door_ids} tz={authorize_timezone_id} policy={_policy_str}"
+            f"door_bitmask={door_bitmask} doorIds={door_ids} tz={authorize_timezone_id} policy={_policy_str}"
         )
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
@@ -879,7 +873,7 @@ class DeviceSyncEngine:
                         auth_ok_count, auth_err = self._push_userauthorize(
                             sdk,
                             pin=pin,
-                            door_ids=door_ids,
+                            door_bitmask=door_bitmask,
                             authorize_timezone_id=int(authorize_timezone_id),
                         )
                         if auth_err:
@@ -909,13 +903,11 @@ class DeviceSyncEngine:
                                 f"[DeviceSync] Device id={dev_id} Pin={pin} templates pushed OK: count={ok_count}"
                             )
 
-                    # F-015: persist applied hash only when ALL doors were authorized.
-                    # If any door auth failed, DELETE the sync state row entirely.
-                    # Reason: the DB SQL keeps the OLD hash on ok=False (by design), so
-                    # calling save(ok=False) would leave the matching hash in place and the
-                    # pin would be skipped on the next cycle.  Deleting the row ensures
-                    # prev_hashes.get(pin) returns "" on the next cycle, which doesn't
-                    # match the computed desired hash, forcing a full re-push.
+                    # Persist sync state: save hash on success, mark error on failure.
+                    # On failure we save with ok=False which preserves the OLD hash
+                    # (the DB CASE clause only updates hash when ok=True).  Next cycle,
+                    # list_device_sync_hashes_and_status returns ok=False for this pin,
+                    # which triggers a retry without needing to delete-and-re-push.
                     if auth_complete:
                         save_device_sync_state(
                             device_id=did,
@@ -929,11 +921,17 @@ class DeviceSyncEngine:
                             "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin,
                         )
                     else:
-                        delete_device_sync_state(device_id=did, pin=pin)
+                        save_device_sync_state(
+                            device_id=did,
+                            pin=pin,
+                            desired_hash=desired_hashes.get(pin) or "",
+                            ok=False,
+                            error=auth_err or "authorize incomplete",
+                        )
                         failed_synced += 1
                         self.logger.warning(
-                            "[DeviceSync] Device id=%s Pin=%s sync PARTIAL — "
-                            "sync state DELETED so next cycle retries all doors",
+                            "[DeviceSync] Device id=%s Pin=%s sync FAILED — "
+                            "state saved with ok=False, will retry next cycle",
                             dev_id, pin,
                         )
                     self._set_progress(current=ok_synced + failed_synced)

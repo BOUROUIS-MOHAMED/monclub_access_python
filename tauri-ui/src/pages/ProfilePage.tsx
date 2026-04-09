@@ -173,6 +173,7 @@ export default function ProfilePage() {
         <Section title="System">
           <KV label="Appareils (DEVICE)" value={status.mode?.DEVICE ?? 0} />
           <KV label="Appareils (AGENT)" value={status.mode?.AGENT ?? 0} />
+          <KV label="Appareils (ULTRA)" value={status.mode?.ULTRA ?? 0} />
           <KV
             label="Last sync"
             value={status.sync?.lastSyncAt ? formatDate(status.sync.lastSyncAt) : "Never"}
