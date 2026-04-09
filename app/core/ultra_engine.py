@@ -58,10 +58,15 @@ class UltraDeviceWorker(threading.Thread):
         self._poll_ema_ms = 0.0
         self._prefix = f"[ULTRA:{self._device_id}]"
         # Card-level cooldown: prevents duplicate door opens when the C3
-        # controller fires multiple events for the same card/QR scan
-        # (e.g. one per door on a multi-door panel).
+        # controller fires multiple events for the same card/QR scan.
+        # Uses anti_fraude_duration from dashboard (seconds) when available,
+        # falls back to replay_block_window_seconds (default 10s).
         self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
-        self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 10))
+        _af_duration = settings.get("anti_fraude_duration")
+        if _af_duration is not None and int(_af_duration) > 0:
+            self._card_cooldown_sec = float(_af_duration)
+        else:
+            self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 10))
 
         # Adaptive sleep settings (same as AGENT mode)
         self._busy_min = int(settings.get("busy_sleep_min_ms", 0))

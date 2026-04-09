@@ -1398,21 +1398,27 @@ class DeviceSyncEngine:
                             dev_id, param_str, ex,
                         )
 
-            # [Anti-fraud] Push hardware anti-passback parameter to ZKTeco controller.
-            # AntiPassback=1 + AntiPassbackTime enables card-level hardware dedup.
-            # NOTE: Parameter names are for C3-200/C3-400 series; verify against
-            # the PullSDK reference for other models. Failure is non-fatal — the
-            # software AntiFraudGuard remains the primary enforcer in all modes.
+            # [Anti-fraud] Push DoorIntertime (Punch Interval) to C3 controller.
+            # DoorXIntertime=N prevents the same card from being accepted on
+            # door X within N seconds (range 0-255). This is the correct C3
+            # parameter for re-entry prevention — NOT AntiPassback (which is
+            # about in/out tracking). Failure is non-fatal — the software
+            # AntiFraudGuard and ULTRA _card_cooldown remain backup enforcers.
             _af_card = bool(device.get("anti_fraude_card", True))
-            _af_duration = int(device.get("anti_fraude_duration") or 30)
-            _af_param = (
-                f"AntiPassback=1&AntiPassbackTime={_af_duration}"
-                if _af_card else "AntiPassback=0"
-            )
+            _af_duration = min(int(device.get("anti_fraude_duration") or 30), 255)
+            _af_params = []
+            if _af_card and _af_duration > 0:
+                for p in presets:
+                    if not isinstance(p, dict):
+                        continue
+                    dn = p.get("doorNumber") or p.get("door_number")
+                    if dn is not None:
+                        _af_params.append(f"Door{int(dn)}Intertime={_af_duration}")
+            _af_param = ",".join(_af_params) if _af_params else "AntiPassback=0"
             try:
                 sdk.set_device_param(items=_af_param)
                 self.logger.info(
-                    "[DeviceSync] Device id=%s anti-passback param OK (%s)",
+                    "[DeviceSync] Device id=%s anti-fraud param OK (%s)",
                     dev_id, _af_param,
                 )
             except Exception as _af_ex:
