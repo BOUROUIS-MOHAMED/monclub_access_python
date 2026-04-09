@@ -16,14 +16,23 @@ from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
+# Test-only override: set _DB_PATH to a temp path in tests via monkeypatch.
+# Production code always leaves this as None (falls through to current_access_runtime_db_path).
+_DB_PATH: str | None = None
+
 # -----------------------------
 # SQLite connection helpers
 # -----------------------------
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    ensure_dirs()
-    db_path = current_access_runtime_db_path()
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if _DB_PATH is not None:
+        import pathlib
+        db_path = pathlib.Path(_DB_PATH)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        ensure_dirs()
+        db_path = current_access_runtime_db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
@@ -816,6 +825,20 @@ def init_db() -> None:
             """
         )
 
+        # Phase 2: firmware profile cache
+        # Keyed by device_id (stable int) — not IP (DHCP can reassign IPs).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_firmware_profiles (
+                device_id            INTEGER PRIMARY KEY,
+                template_table       TEXT    NOT NULL,
+                template_body_index  INTEGER NOT NULL,
+                authorize_body_index INTEGER NOT NULL,
+                updated_at           TEXT    NOT NULL
+            );
+            """
+        )
+
         conn.commit()
 
     # F-014: On startup, reset any stale processing locks in the offline queue
@@ -862,6 +885,65 @@ def clear_version_tokens() -> None:
     """Delete all saved version tokens (call on logout/login/cache-clear)."""
     with get_conn() as conn:
         conn.execute("DELETE FROM sync_version_tokens")
+
+
+# -----------------------------
+# Phase 2: Firmware profile cache
+# -----------------------------
+
+def save_firmware_profile(
+    *,
+    device_id: int,
+    template_table: str,
+    template_body_index: int,
+    authorize_body_index: int,
+) -> None:
+    """
+    Upsert the firmware profile for a ZKTeco device.
+    Keyed by device_id (stable integer) — not IP (DHCP can change IPs).
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO sync_firmware_profiles
+                (device_id, template_table, template_body_index, authorize_body_index, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                template_table       = excluded.template_table,
+                template_body_index  = excluded.template_body_index,
+                authorize_body_index = excluded.authorize_body_index,
+                updated_at           = excluded.updated_at
+            """,
+            (device_id, template_table, template_body_index, authorize_body_index, now_iso()),
+        )
+        conn.commit()
+
+
+def load_firmware_profile(*, device_id: int) -> dict | None:
+    """
+    Load the cached firmware profile for a device, or None if not cached.
+    Returns dict with keys: template_table, template_body_index, authorize_body_index.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT template_table, template_body_index, authorize_body_index "
+            "FROM sync_firmware_profiles WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "template_table": row[0],
+        "template_body_index": row[1],
+        "authorize_body_index": row[2],
+    }
+
+
+def clear_firmware_profile(*, device_id: int) -> None:
+    """Remove the cached firmware profile for a device (e.g., after firmware upgrade detected)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM sync_firmware_profiles WHERE device_id = ?", (device_id,))
+        conn.commit()
         conn.commit()
 
 
