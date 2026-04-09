@@ -40,6 +40,15 @@ class UltraDeviceWorker(threading.Thread):
         self._history_q = history_q
         self._stop_evt = stop_event
         self._device_id = int(device.get("id", 0))
+        logger.debug(
+            "[ULTRA:%s] __init__: name=%r ip=%s port=%s totp=%s rfid=%s "
+            "cooldown=%.1fs poll_timeout=%.1fs",
+            device.get("id"), device.get("name"),
+            device.get("ipAddress", "?"), device.get("portNumber", "?"),
+            settings.get("totp_enabled", True), settings.get("rfid_enabled", True),
+            float(settings.get("replay_block_window_seconds", 10)),
+            float(settings.get("rtlog_poll_timeout_sec", 15.0)),
+        )
         self._device_name = str(device.get("name", ""))
         self._sdk: Optional[PullSDKDevice] = None
         self._seen: Deque[str] = deque(maxlen=10_000)
@@ -70,6 +79,10 @@ class UltraDeviceWorker(threading.Thread):
         # Sync-pause handshake: set by UltraSyncScheduler before it connects to the device
         self._sync_pause = threading.Event()      # set = paused for sync
         self._sync_paused_ack = threading.Event() # set = worker confirmed disconnect
+
+        # Command queue: door open requests executed inline between polls
+        # (avoids TCP disconnect/reconnect needed by the old pause approach).
+        self._cmd_queue: "queue.Queue" = queue.Queue(maxsize=10)
 
         # Local state cache (avoid per-event DB reads)
         self._cached_state: Optional[tuple] = None
@@ -107,6 +120,9 @@ class UltraDeviceWorker(threading.Thread):
                     self._stop_evt.wait(5.0)
                     continue
 
+            # Drain queued door-open commands (uses the already-connected SDK)
+            self._drain_commands()
+
             # Poll RTLog with watchdog
             events = self._poll_with_watchdog()
             if events is None:
@@ -125,6 +141,9 @@ class UltraDeviceWorker(threading.Thread):
                     self._backoff_cap,
                 )
                 sleep_ms = self._empty_sleep_ms
+
+            # Drain commands again after processing events for minimal latency
+            self._drain_commands()
 
             self._stop_evt.wait(sleep_ms / 1000.0)
 
@@ -197,6 +216,54 @@ class UltraDeviceWorker(threading.Thread):
         self._cached_state = None
         self._cached_state_ts = 0.0
         self._sync_pause.clear()
+
+    # ------------------------------------------------------------------ #
+    # Command queue: door open requests from API/tray, executed inline
+    # ------------------------------------------------------------------ #
+
+    def request_door_open(self, door_id: int, pulse_ms: int, timeout: float = 2.0) -> Dict[str, Any]:
+        """Thread-safe: enqueue a door-open command, wait for result.
+
+        Called from the HTTP handler thread.  The worker drains the queue
+        between polls and executes via its already-connected SDK, avoiding
+        the TCP disconnect/reconnect cycle that caused 5s latency.
+        """
+        result_event = threading.Event()
+        result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
+        try:
+            self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box))
+        except queue.Full:
+            return {"ok": False, "error": "command queue full"}
+
+        result_event.wait(timeout=timeout)
+        return result_box
+
+    def _drain_commands(self):
+        """Execute pending door-open commands using the current SDK connection."""
+        while not self._cmd_queue.empty():
+            try:
+                door_id, pulse_ms, result_event, result_box = self._cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if self._sdk is None or not self._connected:
+                    result_box["ok"] = False
+                    result_box["error"] = "not connected"
+                else:
+                    ok = self._sdk.open_door(door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
+                    result_box["ok"] = bool(ok)
+                    result_box["error"] = "" if ok else "open_door returned False"
+                    logger.info(
+                        f"{self._prefix} CMD door_open: door={door_id} pulse={pulse_ms}ms ok={ok}"
+                    )
+            except Exception as e:
+                result_box["ok"] = False
+                result_box["error"] = str(e)
+                logger.warning(
+                    f"{self._prefix} CMD door_open FAILED: door={door_id} err={e}"
+                )
+            finally:
+                result_event.set()
 
     # ------------------------------------------------------------------ #
     # RTLog polling with watchdog (15s timeout)
@@ -346,11 +413,18 @@ class UltraDeviceWorker(threading.Thread):
         digits = int(self._settings.get("totp_digits", 7))
         expected_len = len(prefix) + digits
 
-        return (
+        matched = (
             len(code) == expected_len
             and code.startswith(prefix)
             and code[len(prefix):].isdigit()
         )
+        if not matched and len(code) > 0:
+            logger.debug(
+                f"{self._prefix} TOTP format check MISS: code_len={len(code)} "
+                f"expected_len={expected_len} prefix_match={code[:len(prefix)] == prefix} "
+                f"code_preview={code[:2]}***{code[-2:] if len(code) > 2 else ''}"
+            )
+        return matched
 
     # ------------------------------------------------------------------ #
     # ALLOW handler (passive observation, enrichment only)
@@ -848,15 +922,21 @@ class UltraSyncScheduler:
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
         self._stop.clear()
+        self._logger.info(
+            "[UltraSyncScheduler] starting: %d device(s), ids=%s",
+            len(devices), [d.get("id") for d in devices],
+        )
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="UltraSyncScheduler"
         )
         self._thread.start()
 
     def stop(self):
+        self._logger.info("[UltraSyncScheduler] stopping")
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._logger.info("[UltraSyncScheduler] stopped")
 
     def _run(self):
         """Sync loop: push data to each ULTRA device on its configured interval."""
@@ -876,31 +956,25 @@ class UltraSyncScheduler:
                 self._sync_all()
 
     def _check_worker_health(self):
-        """Restart dead UltraDeviceWorker threads."""
-        for device_id, worker in list(self._workers.items()):
-            if not worker.is_alive():
-                self._logger.error("[ULTRA:%s] worker thread died — restarting", device_id)
-                try:
-                    new_worker = UltraDeviceWorker(
-                        device=worker._device,
-                        settings=worker._settings,
-                        popup_q=worker._popup_q,
-                        history_q=worker._history_q,
-                        stop_event=worker._stop_evt,
-                    )
-                    new_worker.start()
-                    self._workers[device_id] = new_worker
-                    self._logger.info("[ULTRA:%s] worker restarted OK", device_id)
-                except Exception as e:
-                    self._logger.error("[ULTRA:%s] worker restart FAILED: %s", device_id, e)
+        """Deprecated: worker restarts are handled exclusively by the watchdog thread.
+        Kept as no-op for backward compat in case external code calls it."""
+        pass
 
     def _sync_all(self):
         """Push user data to all ULTRA devices (with hash-based skip)."""
+        self._logger.info(
+            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s)",
+            len(self._devices),
+        )
+        t0 = time.time()
         # Check worker health before each sync cycle
         try:
             self._check_worker_health()
         except Exception as e:
             self._logger.warning("[ULTRA] _check_worker_health error: %s", e)
+        synced = 0
+        skipped = 0
+        failed = 0
         for d in self._devices:
             device_id = d.get("id")
             try:
@@ -915,8 +989,15 @@ class UltraSyncScheduler:
                 self._next_sync_at[device_id] = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(next_t)
                 )
+                synced += 1
             except Exception as e:
+                failed += 1
                 self._logger.error("[ULTRA:%s] sync failed: %s", device_id, e)
+        elapsed = time.time() - t0
+        self._logger.info(
+            "[UltraSyncScheduler] _sync_all: cycle done in %.1fs — synced=%d skipped=%d failed=%d",
+            elapsed, synced, skipped, failed,
+        )
 
     def _sync_device(self, device: Dict[str, Any]):
         """Push data to a single device with hash-based change detection.
@@ -951,10 +1032,17 @@ class UltraSyncScheduler:
         current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
 
         if self._last_hash.get(device_id) == current_hash:
-            self._logger.info("[ULTRA:%s] sync skip: hash unchanged", device_id)
+            self._logger.info(
+                "[ULTRA:%s] sync skip: hash unchanged (users=%d hash=%s)",
+                device_id, len(users), current_hash[:12],
+            )
             return
 
-        self._logger.info("[ULTRA:%s] sync push started", device_id)
+        self._logger.info(
+            "[ULTRA:%s] sync push started: users=%d prev_hash=%s new_hash=%s",
+            device_id, len(users),
+            (self._last_hash.get(device_id) or "none")[:12], current_hash[:12],
+        )
 
         device_copy = dict(device or {})
         device_copy["accessDataMode"] = "DEVICE"
@@ -1041,9 +1129,10 @@ class UltraEngine:
         self._running = False
         self._watchdog_thread: Optional[threading.Thread] = None
         # How often the watchdog checks worker liveness (seconds).
-        # Deliberately shorter than any sync interval so a dead worker is
-        # caught quickly regardless of the configured sync cadence.
-        self._watchdog_interval_sec: float = 30.0
+        # Short interval for fast recovery of dead workers.
+        self._watchdog_interval_sec: float = 10.0
+        # Lock to prevent concurrent worker replacement by watchdog / other threads.
+        self._worker_restart_lock = threading.Lock()
 
     @property
     def running(self) -> bool:
@@ -1087,6 +1176,26 @@ class UltraEngine:
             return
 
         self._logger.info("[ULTRA] Starting with %d device(s)", len(ultra_devices))
+
+        # TOTP diagnostic: log credential count and system time at startup
+        try:
+            from app.core.db import list_sync_gym_access_credentials
+            creds = list_sync_gym_access_credentials()
+            enabled_with_secret = sum(
+                1 for c in creds if isinstance(c, dict)
+                and c.get("enabled") and (c.get("secretHex") or c.get("secret_hex", "")).strip()
+            )
+            self._logger.info(
+                "[ULTRA] TOTP credentials: total=%d enabled_with_secret=%d system_time=%d",
+                len(creds), enabled_with_secret, int(time.time()),
+            )
+            if enabled_with_secret == 0:
+                self._logger.warning(
+                    "[ULTRA] WARNING: No enabled TOTP credentials with valid secretHex — "
+                    "TOTP rescue will NEVER work until credentials are synced!"
+                )
+        except Exception as _e:
+            self._logger.warning("[ULTRA] Could not check TOTP credentials: %s", _e)
 
         from app.core.settings_reader import normalize_device_settings
 
@@ -1138,37 +1247,37 @@ class UltraEngine:
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
 
-        This is intentionally independent of UltraSyncScheduler._check_worker_health:
-        that helper only runs on the sync interval (≥15 min by default), leaving a long
-        window where a crashed worker goes undetected.  This watchdog fires every 30 s
-        so access recovery happens within one poll cycle.
+        This is the SOLE restart mechanism.  UltraSyncScheduler._check_worker_health
+        is now a no-op — all restarts go through this watchdog to avoid race conditions.
         """
         self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
         while not self._stop_event.wait(self._watchdog_interval_sec):
             for device_id, worker in list(self._workers.items()):
                 if worker.is_alive():
                     continue
-                self._logger.error(
-                    "[ULTRA:%s] watchdog: worker thread is dead — restarting", device_id
-                )
-                try:
-                    new_worker = UltraDeviceWorker(
-                        device=worker._device,
-                        settings=worker._settings,
-                        popup_q=self._popup_q,
-                        history_q=self._history_q,
-                        stop_event=self._stop_event,
-                    )
-                    new_worker.start()
-                    # Both UltraEngine and UltraSyncScheduler share the same dict
-                    # reference (set via set_workers), so a single update keeps both
-                    # in sync without a second call to set_workers.
-                    self._workers[device_id] = new_worker
-                    self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
-                except Exception as exc:
+                with self._worker_restart_lock:
+                    # Double-check inside lock: another thread may have restarted it
+                    current = self._workers.get(device_id)
+                    if current is not None and current.is_alive():
+                        continue
                     self._logger.error(
-                        "[ULTRA:%s] watchdog: worker restart FAILED: %s", device_id, exc
+                        "[ULTRA:%s] watchdog: worker thread is dead — restarting", device_id
                     )
+                    try:
+                        new_worker = UltraDeviceWorker(
+                            device=worker._device,
+                            settings=worker._settings,
+                            popup_q=self._popup_q,
+                            history_q=self._history_q,
+                            stop_event=self._stop_event,
+                        )
+                        new_worker.start()
+                        self._workers[device_id] = new_worker
+                        self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
+                    except Exception as exc:
+                        self._logger.error(
+                            "[ULTRA:%s] watchdog: worker restart FAILED: %s", device_id, exc
+                        )
         self._logger.info("[ULTRA] Watchdog stopped")
 
     def stop(self):

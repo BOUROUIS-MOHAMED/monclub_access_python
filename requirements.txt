@@ -1,10 +1,7 @@
 pystray
 pillow
-
-
-
-
-# Uses only Python stdlib (Tkinter, ctypes, sqlite3, logging).
-# Keep empty on purpose.
-
 winotify
+
+# Card scanner
+pyzk>=0.9
+pywinusb>=0.4

@@ -398,6 +398,7 @@ def _handle_status(ctx: _Ctx) -> None:
     devices = list(cache.devices) if cache else []
     dev_count = 0
     agent_count = 0
+    ultra_count = 0
     for d in devices:
         if isinstance(d, dict):
             adm = str(d.get("accessDataMode") or d.get("access_data_mode") or "").upper()
@@ -405,13 +406,13 @@ def _handle_status(ctx: _Ctx) -> None:
                 dev_count += 1
             elif adm == "AGENT":
                 agent_count += 1
-    unknown_count = len(devices) - dev_count - agent_count
+            elif adm == "ULTRA":
+                ultra_count += 1
+    unknown_count = len(devices) - dev_count - agent_count - ultra_count
 
     try:
         mode = ctx.app.get_access_mode_summary()
     except Exception:
-        ultra_count = 0
-        unknown_count = len(devices) - dev_count - agent_count
         mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
 
     # H-005: Real sync telemetry from MainApp instead of placeholders
@@ -541,6 +542,7 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
     devices = list(cache.devices) if cache else []
     dev_count = 0
     agent_count = 0
+    ultra_count = 0
     for d in devices:
         if isinstance(d, dict):
             adm = str(d.get("accessDataMode") or d.get("access_data_mode") or "").upper()
@@ -548,13 +550,13 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
                 dev_count += 1
             elif adm == "AGENT":
                 agent_count += 1
-    unknown_count = len(devices) - dev_count - agent_count
+            elif adm == "ULTRA":
+                ultra_count += 1
+    unknown_count = len(devices) - dev_count - agent_count - ultra_count
 
     try:
         mode = app.get_access_mode_summary()
     except Exception:
-        ultra_count = 0
-        unknown_count = len(devices) - dev_count - agent_count
         mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
 
     sync = {
@@ -759,7 +761,7 @@ def _handle_tv_auth_status(ctx: _Ctx) -> None:
             "contractDaysRemaining": None,
             "contractWarning": False,
         },
-        "mode": {"DEVICE": 0, "AGENT": 0, "UNKNOWN": 0},
+        "mode": {"DEVICE": 0, "AGENT": 0, "ULTRA": 0, "UNKNOWN": 0},
         "sync": {"running": False, "lastSyncAt": None, "lastOk": True, "lastError": None},
         "deviceSync": {"lastRunAt": None, "lastOk": True, "lastError": None},
         "pullsdk": {"connected": False, "deviceId": None, "ip": None, "since": None, "lastError": None},
@@ -1115,6 +1117,7 @@ def _handle_tv_config_restart_api(ctx: _Ctx) -> None:
 # ==================== 4) SYNC + CACHE ====================
 
 def _handle_sync_now(ctx: _Ctx) -> None:
+    _logger.info("[LocalAPI] sync_now: manual sync triggered")
     try:
         ctx.app.after(0, ctx.app.request_sync_now)
     except Exception:
@@ -1183,9 +1186,14 @@ def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_devices(ctx: _Ctx) -> None:
-    from access.store import load_sync_cache
-    cache = load_sync_cache()
-    ctx.send_json(200, {"devices": list(cache.devices) if cache else []})
+    from app.core.db import list_sync_devices_payload
+    try:
+        devices = list_sync_devices_payload()
+    except Exception:
+        from access.store import load_sync_cache
+        cache = load_sync_cache()
+        devices = list(cache.devices) if cache else []
+    ctx.send_json(200, {"devices": devices})
 
 
 def _handle_sync_cache_infrastructures(ctx: _Ctx) -> None:
@@ -2793,11 +2801,13 @@ def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
 
 def _handle_device_connect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    _logger.info("[LocalAPI] device_connect: deviceId=%s", did)
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
         return
     sdk, err = _connect_device(ctx, did)
     if err:
+        _logger.warning("[LocalAPI] device_connect FAILED: deviceId=%s err=%s", did, err)
         ctx.send_json(500, {"ok": False, "error": err})
         return
     with _device_sdk_lock:
@@ -2806,11 +2816,13 @@ def _handle_device_connect(ctx: _Ctx) -> None:
             try: old.disconnect()
             except Exception: pass
         _device_sdk_pool[did] = sdk
+    _logger.info("[LocalAPI] device_connect OK: deviceId=%s", did)
     ctx.send_json(200, {"ok": True})
 
 
 def _handle_device_disconnect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    _logger.info("[LocalAPI] device_disconnect: deviceId=%s", did)
     with _device_sdk_lock:
         sdk = _device_sdk_pool.pop(did, None)
     if sdk:
@@ -2917,49 +2929,25 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
         except Exception:
             pass
 
-    # Try ULTRA engine (for ULTRA-mode devices).
-    # CRITICAL: must pause the RTLog worker before connecting — the C3-200 only allows
-    # one TCP connection at a time.  Without pausing, the worker and the door-open code
-    # race for the TCP slot, causing ControlDevice to fail on a stale handle (HTTP 500).
+    # Try ULTRA engine: use the worker's command queue to open the door
+    # via its already-connected SDK.  No TCP disconnect/reconnect needed.
     ultra_eng = getattr(ctx.app, "_ultra_engine", None)
     if ultra_eng and ultra_eng.running:
         worker = ultra_eng._workers.get(did)
         if worker:
             _logger.info(
-                "[LocalAPI] ULTRA door open: device_id=%s door=%s pulse_sec=%s — pausing RTLog worker",
+                "[LocalAPI] ULTRA door open via command queue: device_id=%s door=%s pulse_sec=%s",
                 did, door, pulse_sec,
             )
-            worker.pause_for_sync(timeout=5.0)
-            try:
-                from access.store import get_sync_device as _get_sync_device
-                device_obj = _get_sync_device(did) or {}
-                try:
-                    from app.sdk.pullsdk import PullSDKDevice as _PSDev
-                    pdev = _PSDev(device_payload=device_obj, logger=ctx.app.logger)
-                    if not pdev.connect():
-                        ctx.send_json(500, {"ok": False, "error": "ULTRA: PullSDKDevice connect failed"})
-                        return
-                    try:
-                        ok = pdev.open_door(door_id=door, pulse_time_ms=pulse_sec * 1000)
-                        _logger.info(
-                            "[LocalAPI] ULTRA door open: device_id=%s door=%s ok=%s",
-                            did, door, ok,
-                        )
-                        ctx.send_json(200, {"ok": ok, "rc": 0, "source": "ultra"})
-                    except Exception as _e:
-                        _logger.warning(
-                            "[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s",
-                            did, door, _e,
-                        )
-                        ctx.send_json(500, {"ok": False, "error": str(_e)})
-                    finally:
-                        try: pdev.disconnect()
-                        except Exception: pass
-                except Exception as _e:
-                    ctx.send_json(500, {"ok": False, "error": str(_e)})
-            finally:
-                worker.resume_from_sync()
-                _logger.info("[LocalAPI] ULTRA door open: device_id=%s RTLog worker resumed", did)
+            result = worker.request_door_open(door_id=door, pulse_ms=pulse_sec * 1000, timeout=2.0)
+            ok = bool(result.get("ok", False))
+            err = result.get("error", "")
+            if ok:
+                _logger.info("[LocalAPI] ULTRA door open OK: device_id=%s door=%s", did, door)
+                ctx.send_json(200, {"ok": True, "rc": 0, "source": "ultra"})
+            else:
+                _logger.warning("[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s", did, door, err)
+                ctx.send_json(500, {"ok": False, "error": err or "door open failed"})
             return
 
     # Fallback: direct PullSDK connect (DEVICE-mode or unmanaged devices)
@@ -3024,14 +3012,17 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         user_data = "\t".join(pairs) + "\r\n"
         sdk.set_device_data(table="user", data=user_data, options="")
 
-        # Push authorize
+        # Push authorize — AuthorizeDoorId is a BITMASK (door1=1, door2=2, door3=4, door4=8).
+        # Push ONE record with the combined bitmask for all doors.
         auth_result = "OK"
+        bitmask = 0
         for door in door_ids:
-            try:
-                auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={int(door)}\r\n"
-                sdk.set_device_data(table="userauthorize", data=auth_data, options="")
-            except Exception as ex:
-                auth_result = str(ex)
+            bitmask |= 1 << (int(door) - 1)
+        try:
+            auth_data = f"Pin={pin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId={bitmask}\r\n"
+            sdk.set_device_data(table="userauthorize", data=auth_data, options="")
+        except Exception as ex:
+            auth_result = str(ex)
 
         # Push templates
         tpl_ok = 0
@@ -3748,7 +3739,110 @@ def _handle_fingerprints_delete(ctx: _Ctx) -> None:
         ctx.send_json(400, {"ok": False, "error": str(e)})
 
 
-# ==================== 8) LOGS ====================
+# ==================== 8) SCANNER ====================
+
+# Module-level discovery state (protected by _discovery_lock)
+_discovery_lock = threading.Lock()
+_discovery_running = False
+_discovery_devices: list = []
+_discovery_cancel = threading.Event()
+
+
+def _handle_scanner_start(ctx: _Ctx) -> None:
+    from app.core.card_scanner import get_scanner
+    from app.core.config import load_config
+    body = ctx.json_body()
+    cfg = load_config()
+    mode = _safe_str(body.get("mode"), cfg.scanner_mode) or "network"
+    ip = _safe_str(body.get("ip"), cfg.scanner_network_ip) or ""
+    port = _safe_int(body.get("port"), cfg.scanner_network_port) or 4370
+    timeout_ms = _safe_int(body.get("timeout_ms"), cfg.scanner_network_timeout_ms) or 5000
+    usb_device_path = _safe_str(body.get("usb_device_path"), cfg.scanner_usb_device_path) or ""
+
+    scanner = get_scanner()
+    started = scanner.start_scan(
+        mode=mode,
+        ip=ip,
+        port=port,
+        timeout_ms=timeout_ms,
+        usb_device_path=usb_device_path,
+    )
+    if started:
+        ctx.send_json(200, {"ok": True})
+    else:
+        ctx.send_json(409, {"ok": False, "error": "Scanner already active"})
+
+
+def _handle_scanner_stop(ctx: _Ctx) -> None:
+    from app.core.card_scanner import get_scanner
+    get_scanner().stop_scan()
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_scanner_status(ctx: _Ctx) -> None:
+    from app.core.card_scanner import get_scanner
+    ctx.send_json(200, {"ok": True, "scanner": get_scanner().get_status()})
+
+
+def _handle_scanner_discover(ctx: _Ctx) -> None:
+    global _discovery_running, _discovery_devices, _discovery_cancel
+    with _discovery_lock:
+        if _discovery_running:
+            ctx.send_json(409, {"ok": False, "error": "Discovery already running"})
+            return
+        _discovery_running = True
+        _discovery_devices = []
+        _discovery_cancel.clear()
+
+    body = ctx.json_body()
+    subnet = _safe_str(body.get("subnet"), "") or None
+
+    # Check if scanner is active — skip handshake to avoid conflicting with live_capture
+    from app.core.card_scanner import get_scanner
+    from app.core.card_scanner import ScannerState
+    scanner_active = get_scanner().state in (ScannerState.SCANNING, ScannerState.CONNECTING)
+
+    def _run_discovery() -> None:
+        global _discovery_running, _discovery_devices
+        try:
+            from app.core.network_discovery import scan_subnet
+            results = scan_subnet(
+                subnet=subnet,
+                do_handshake=(not scanner_active),
+                cancel_event=_discovery_cancel,
+            )
+            with _discovery_lock:
+                _discovery_devices = results
+        except Exception as e:
+            logger.error(f"Discovery error: {e}")
+        finally:
+            with _discovery_lock:
+                _discovery_running = False
+
+    threading.Thread(target=_run_discovery, daemon=True, name="scanner-discover").start()
+    ctx.send_json(200, {"ok": True})
+
+
+def _handle_scanner_discover_status(ctx: _Ctx) -> None:
+    with _discovery_lock:
+        running = _discovery_running
+        devices = list(_discovery_devices)
+    ctx.send_json(200, {
+        "ok": True,
+        "running": running,
+        "devices": [
+            {
+                "ip": d.ip,
+                "port": d.port,
+                "serialNumber": d.serial_number,
+                "model": d.model,
+            }
+            for d in devices
+        ],
+    })
+
+
+# ==================== 9) LOGS ====================
 
 def _serialize_log_entry(entry: Any) -> Dict[str, Any]:
     repeat_count = max(1, _safe_int(getattr(entry, "repeat_count", 1), 1))
@@ -4712,15 +4806,12 @@ class LocalApiServerV2:
 
         class Handler(BaseHTTPRequestHandler):
             def _dispatch(self, method: str) -> None:
+                import time as _dispatch_time
+                _t0 = _dispatch_time.monotonic()
                 try:
                     parsed = urlparse(self.path)
                     path = parsed.path or ""
                     qs = parse_qs(parsed.query or "")
-
-                    try:
-                        server.app.logger.debug("[LocalAPI v2] >> %s %s", method, path)
-                    except Exception:
-                        pass
 
                     handler_fn, params = router.match(method, path)
                     if handler_fn is None:
@@ -4765,7 +4856,22 @@ class LocalApiServerV2:
                             self.wfile.write(body)
                             return
 
+                    try:
+                        server.app.logger.debug(
+                            "[LocalAPI] >> %s %s handler=%s",
+                            method, path, getattr(handler_fn, "__name__", "?"),
+                        )
+                    except Exception:
+                        pass
                     handler_fn(ctx)
+                    try:
+                        _elapsed = (_dispatch_time.monotonic() - _t0) * 1000
+                        server.app.logger.debug(
+                            "[LocalAPI] << %s %s handler=%s %.0fms",
+                            method, path, fn_name, _elapsed,
+                        )
+                    except Exception:
+                        pass
                 except Exception as e:
                     try:
                         body = _json_bytes({"ok": False, "error": str(e)})

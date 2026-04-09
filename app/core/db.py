@@ -400,7 +400,11 @@ def init_db() -> None:
                 pushing_to_device_policy TEXT,
 
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+
+                anti_fraude_card     INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_qr_code  INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_duration INTEGER NOT NULL DEFAULT 30
             );
             """
         )
@@ -453,6 +457,10 @@ def init_db() -> None:
 
         _ensure_column(conn, "sync_devices", "authorize_timezone_id", "authorize_timezone_id INTEGER")
         _ensure_column(conn, "sync_devices", "pushing_to_device_policy", "pushing_to_device_policy TEXT")
+
+        _ensure_column(conn, "sync_devices", "anti_fraude_card",     "anti_fraude_card INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",  "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_duration", "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
 
         # F-015: Deduplicate sync_devices by id before adding unique index
         conn.execute("""
@@ -1233,7 +1241,9 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             authorize_timezone_id, pushing_to_device_policy,
 
-            created_at, updated_at
+            created_at, updated_at,
+
+            anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration
         )
         VALUES (
             ?, ?, ?, ?,
@@ -1251,7 +1261,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?,
-            ?, ?
+            ?, ?,
+            ?, ?, ?
         )
         """,
         (
@@ -1320,6 +1331,10 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             _safe_str(d.get("createdAt"), ""),
             _safe_str(d.get("updatedAt"), ""),
+
+            _bool_to_i(d.get("antiFraudeCard", True), default=1),
+            _bool_to_i(d.get("antiFraudeQrCode", True), default=1),
+            _to_int_or_none(d.get("antiFraudeDuration", 30)) or 30,
         ),
     )
 
@@ -2180,6 +2195,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "createdAt": g("createdAt", "created_at"),
         "updatedAt": g("updatedAt", "updated_at"),
 
+        "antiFraudeCard":     _boolish(g("anti_fraude_card",    default=1), True),
+        "antiFraudeQrCode":   _boolish(g("anti_fraude_qr_code", default=1), True),
+        "antiFraudeDuration": _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
+
         # attached later by list_sync_devices_payload (synced presets)
         "doorPresets": g("doorPresets", "door_presets", default=None) or [],
     }
@@ -2709,6 +2728,24 @@ def list_device_sync_hashes(*, device_id: int) -> Dict[str, str]:
             h = str(r["desired_hash"] or "")
             if p:
                 out[p] = h
+        return out
+
+
+def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
+    """Return {pin: (desired_hash, last_ok)} so callers can detect pins that need retry."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, desired_hash, last_ok FROM device_sync_state WHERE device_id=?",
+            (did,),
+        ).fetchall()
+        out: Dict[str, tuple] = {}
+        for r in rows:
+            p = str(r["pin"] or "")
+            h = str(r["desired_hash"] or "")
+            ok = bool(int(r["last_ok"] or 0))
+            if p:
+                out[p] = (h, ok)
         return out
 
 

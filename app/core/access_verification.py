@@ -228,6 +228,17 @@ def verify_totp(
     cur = _totp_counter(now, period)
     allowed_ctrs = list(range(cur - int(drift), cur + int(drift) + 1))
 
+    # TOTP diagnostic: count eligible credentials
+    _eligible_creds = sum(
+        1 for c in creds_payload if isinstance(c, dict) and c.get("enabled")
+        and (c.get("secretHex") or "").strip() and _totp_is_hex((c.get("secretHex") or "").strip())
+    )
+    logger.debug(
+        "verify_totp: code_len=%d prefix=%r digits=%d eligible_creds=%d "
+        "now=%d counter=%d drift=%d period=%d",
+        len(raw), prefix, digits, _eligible_creds, now, cur, drift, period,
+    )
+
     hits: List[Dict[str, Any]] = []
     for c in creds_payload:
         if not isinstance(c, dict):

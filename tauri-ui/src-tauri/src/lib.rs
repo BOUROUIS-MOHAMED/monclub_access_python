@@ -357,6 +357,8 @@ fn rebuild_tray_menu(
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
     // ── Sync Now ──
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
+    // ── Scan Card ──
+    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner carte").build(app)?;
 
     // ── Open submenu (devices → presets) ──
     let mut open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir porte");
@@ -424,6 +426,7 @@ fn rebuild_tray_menu(
         .item(&popup_item)
         .item(&open_menu)
         .item(&sync_item)
+        .item(&scan_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -541,6 +544,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
     let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
     let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
+    let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner carte").build(app)?;
     let open_sub = SubmenuBuilder::with_id(app, "tray_open", "Ouvrir porte")
         .item(
             &MenuItemBuilder::with_id("tray_no_devices", "Chargement…")
@@ -556,6 +560,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
         .item(&popup_item)
         .item(&open_sub)
         .item(&sync_item)
+        .item(&scan_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -585,6 +590,12 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
                 "tray_sync" => {
                     let p = port;
                     std::thread::spawn(move || post_sync_now(p));
+                }
+                "tray_scan" => {
+                    show_main_window(&app);
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.emit("tray-scan-card", ());
+                    }
                 }
                 "tray_quit" => {
                     let p = port;

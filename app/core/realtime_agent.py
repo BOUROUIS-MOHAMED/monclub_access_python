@@ -25,6 +25,7 @@ from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
 from app.sdk.pullsdk import PullSDKDevice
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
+from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
     verify_totp,
     verify_card,
@@ -944,6 +945,7 @@ class DecisionService(threading.Thread):
         notify_gate: NotificationGate,
         decision_ema: EMA,
         device_name_provider: Optional[Callable[[int], str]] = None,
+        guard: "AntiFraudGuard | None" = None,
     ):
         super().__init__(daemon=True)
         self.logger = logger
@@ -957,6 +959,7 @@ class DecisionService(threading.Thread):
         self.notify_gate = notify_gate
         self.decision_ema = decision_ema
         self.device_name_provider = device_name_provider or (lambda did: f"device-{did}")
+        self._guard: AntiFraudGuard = guard if guard is not None else AntiFraudGuard()
 
         self._cache_lock = threading.Lock()
         # L-005: Cache TTL now configurable from backend settings (default 30s)
@@ -971,12 +974,6 @@ class DecisionService(threading.Thread):
         self._users_cache_at = 0.0
         self._users_by_active_membership_id: Dict[int, Dict[str, Any]] = {}
         self._users_by_card: Dict[str, List[Dict[str, Any]]] = {}
-
-        # Card-level cooldown: prevents duplicate door opens when the C3
-        # controller fires multiple events for the same card/QR scan
-        # (e.g. one per door on a multi-door controller).
-        self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
-        self._card_cooldown_sec = 10.0  # seconds — matches replay_block_window_seconds default
 
         self.stop_event = threading.Event()
 
@@ -1025,44 +1022,59 @@ class DecisionService(threading.Thread):
             if access_history_exists(ev.event_id):
                 continue
 
-            # Card-level cooldown: the C3-400 fires separate events per door for
-            # a single card/QR scan. Without this, the turnstile re-opens.
-            card_key = f"{ev.device_id}:{ev.card_no}" if ev.card_no else ""
-            if card_key:
-                now_mono = _now_ms() / 1000.0
-                last_seen = self._card_cooldown.get(card_key, 0.0)
-                if (now_mono - last_seen) < self._card_cooldown_sec:
-                    self.logger.debug(
-                        "[RT] SKIP card cooldown: device=%s card=%r elapsed=%.1fs",
-                        ev.device_id, ev.card_no, now_mono - last_seen,
-                    )
-                    continue
-                self._card_cooldown[card_key] = now_mono
-                if len(self._card_cooldown) > 2000:
-                    cutoff = now_mono - self._card_cooldown_sec * 2
-                    self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
-
             settings = self.settings_provider(ev.device_id)
             queue_ms = _now_ms() - ev.queued_at if ev.queued_at > 0 else 0.0
             t0 = _now_ms()
 
-            t_load = _now_ms()
-            creds_payload, users_by_am, users_by_card = self._load_local_state()
-            load_ms = _now_ms() - t_load
+            # [Anti-fraud] Card pre-check (before verify_totp).
+            # Card anti-fraud only — QR TOTP strings rotate so they can't be
+            # pre-checked here; QR is checked post-verify using the stable cred_id.
+            _af_card_blocked = False
+            _af_remaining = 0.0
+            if settings.get("anti_fraude_card") and ev.card_no:
+                _af_card_blocked, _af_remaining = self._guard.check(
+                    ev.device_id, str(ev.card_no), "card"
+                )
 
-            t_verify = _now_ms()
-            vr = self._verify_totp(
-                scanned=ev.card_no,
-                settings=settings,
-                creds_payload=creds_payload,
-                users_by_am=users_by_am,
-                users_by_card=users_by_card,
-            )
-            verify_ms = _now_ms() - t_verify
+            if _af_card_blocked:
+                vr: dict = {
+                    "allowed": False,
+                    "reason": "DENY_ANTI_FRAUD_CARD",
+                    "_af_remaining": _af_remaining,
+                    "scanMode": "",
+                }
+                load_ms = 0.0
+                verify_ms = 0.0
+            else:
+                t_load = _now_ms()
+                creds_payload, users_by_am, users_by_card = self._load_local_state()
+                load_ms = _now_ms() - t_load
+
+                t_verify = _now_ms()
+                vr = self._verify_totp(
+                    scanned=ev.card_no,
+                    settings=settings,
+                    creds_payload=creds_payload,
+                    users_by_am=users_by_am,
+                    users_by_card=users_by_card,
+                )
+                verify_ms = _now_ms() - t_verify
 
             allowed = bool(vr.get("allowed", False))
             reason = _safe_str(vr.get("reason", "DENY"))
             scan_mode = _safe_str(vr.get("scanMode", ""), "")
+
+            # [Anti-fraud] QR post-verify check using stable credential ID.
+            _af_qr_blocked = False
+            cred_id: str | None = vr.get("credId")
+            if allowed and scan_mode == "QR_TOTP" and settings.get("anti_fraude_qr_code") and cred_id:
+                _af_qr_blocked, _af_remaining = self._guard.check(
+                    ev.device_id, cred_id, "qr"
+                )
+                if _af_qr_blocked:
+                    allowed = False
+                    reason = "DENY_ANTI_FRAUD_QR"
+                    vr = {**vr, "allowed": False, "reason": reason, "_af_remaining": _af_remaining}
 
             action = "OPEN_DOOR" if allowed else "NONE"
             door_id = ev.door_id if ev.door_id is not None else _safe_int(settings.get("door_entry_id"), 1)
@@ -1117,6 +1129,17 @@ class DecisionService(threading.Thread):
                         ev.event_id,
                         ex,
                     )
+
+            # [Anti-fraud] Record successful grant after history is claimed.
+            # Conditions: allowed=True AND not pre/post-blocked AND rowcount>0.
+            # Gating on _history_claimed > 0 prevents extending the block window
+            # on duplicate events that were deduped and never written to history.
+            if allowed and not _af_card_blocked and not _af_qr_blocked and _history_claimed > 0:
+                _af_duration = float(settings.get("anti_fraude_duration", 30))
+                if scan_mode == "QR_TOTP" and cred_id:
+                    self._guard.record(ev.device_id, cred_id, "qr", _af_duration)
+                elif ev.card_no:
+                    self._guard.record(ev.device_id, str(ev.card_no), "card", _af_duration)
 
             cmd_res = CommandResult(ok=True, error="", cmd_ms=0.0)
             if action == "OPEN_DOOR":
@@ -1189,7 +1212,16 @@ class DecisionService(threading.Thread):
                 except Exception:
                     pass
             else:
-                msg = f"reason={reason} | deviceId={ev.device_id} door={door_id} | code={ev.card_no or '-'}"
+                if reason in ("DENY_ANTI_FRAUD_CARD", "DENY_ANTI_FRAUD_QR"):
+                    _af_rem = vr.get("_af_remaining", 0.0) if isinstance(vr, dict) else 0.0
+                    _kind_label = "Carte" if reason == "DENY_ANTI_FRAUD_CARD" else "QR Code"
+                    msg = (
+                        f"Accès refusé — anti-fraude actif "
+                        f"({AntiFraudGuard.format_remaining(_af_rem)} restant) [{_kind_label}]"
+                        f" | deviceId={ev.device_id} door={door_id}"
+                    )
+                else:
+                    msg = f"reason={reason} | deviceId={ev.device_id} door={door_id} | code={ev.card_no or '-'}"
                 if scan_mode:
                     msg += f" | mode={scan_mode}"
                 took2 = vr.get("tookMs")
@@ -1459,6 +1491,7 @@ class AgentRealtimeEngine:
         self._cmd_bus = DeviceCommandBus(workers_provider=self._get_worker)
         self._deciders: List[DecisionService] = []
         self._notify_gate = NotificationGate(global_settings=self.get_global_settings)
+        self._guard = AntiFraudGuard()  # shared across all DecisionService workers
 
         # cache devices list (avoid hitting sqlite too often)
         self._devices_cache_at = 0.0
@@ -1714,6 +1747,7 @@ class AgentRealtimeEngine:
                 notify_gate=self._notify_gate,
                 decision_ema=self._decision_ema,
                 device_name_provider=self._resolve_device_name,
+                guard=self._guard,
             )
             self._deciders.append(d)
             try:

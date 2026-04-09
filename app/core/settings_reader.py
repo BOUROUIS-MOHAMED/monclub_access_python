@@ -361,6 +361,10 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "rfid_min_digits": int(rfid_min_digits),
         "rfid_max_digits": int(rfid_max_digits),
 
+        "anti_fraude_card":     _boolish(dev.get("antiFraudeCard"), True),
+        "anti_fraude_qr_code":  _boolish(dev.get("antiFraudeQrCode"), True),
+        "anti_fraude_duration": _clamp_int(dev.get("antiFraudeDuration"), default=30, lo=5, hi=300),
+
         # internal defaults (not in backend models yet)
         "replay_block_window_seconds": 10,
         "replay_lru_size": 2000,

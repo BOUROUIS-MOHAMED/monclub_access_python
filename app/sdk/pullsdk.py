@@ -401,6 +401,8 @@ class PullSDK:
             options: str = "",
             initial_size: int | None = None,
     ) -> List[Dict[str, str]]:
+        import time as _ptime
+        _t0 = _ptime.monotonic()
         rc, text = self.get_device_data_text(
             table=table,
             fields=fields,
@@ -409,8 +411,13 @@ class PullSDK:
             initial_size=initial_size,
         )
         if rc == 0 or not text.strip():
+            _el = (_ptime.monotonic() - _t0) * 1000
+            self.logger.debug(f"get_device_data_rows: table={table} rc={rc} rows=0 {_el:.0f}ms")
             return []
-        return parse_device_text(text)
+        rows = parse_device_text(text)
+        _el = (_ptime.monotonic() - _t0) * 1000
+        self.logger.debug(f"get_device_data_rows: table={table} rc={rc} rows={len(rows)} {_el:.0f}ms")
+        return rows
 
     def get_device_data_count(self, *, table: str, filter_expr: str = "", options: str = "") -> int:
         h = self._require_handle()
@@ -805,7 +812,10 @@ class PullSDKDevice:
 
     def _poll_rtlog_once_locked(self) -> List[Dict[str, Any]]:
         """Internal: called under _sdk_lock."""
+        import time as _ptime
+        _t0 = _ptime.monotonic()
         if not self.ensure_connected():
+            self.logger.debug(f"[PullSDKDevice][{self.device_id}] poll_rtlog: not connected")
             return []
 
         assert self._sdk is not None
@@ -852,6 +862,11 @@ class PullSDKDevice:
                         }
                     )
 
+                _el = (_ptime.monotonic() - _t0) * 1000
+                if out:
+                    self.logger.debug(
+                        f"[PullSDKDevice][{self.device_id}] poll_rtlog: {len(out)} event(s) via rtlogext {_el:.0f}ms"
+                    )
                 return out
         except Exception as e:
             # Don't disconnect here; just fall back
