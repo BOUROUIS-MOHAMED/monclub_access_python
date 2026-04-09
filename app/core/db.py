@@ -834,6 +834,7 @@ def init_db() -> None:
                 template_table       TEXT    NOT NULL,
                 template_body_index  INTEGER NOT NULL,
                 authorize_body_index INTEGER NOT NULL,
+                name_supported       INTEGER DEFAULT NULL,
                 updated_at           TEXT    NOT NULL
             );
             """
@@ -897,24 +898,27 @@ def save_firmware_profile(
     template_table: str,
     template_body_index: int,
     authorize_body_index: int,
+    name_supported: bool | None = None,
 ) -> None:
     """
     Upsert the firmware profile for a ZKTeco device.
     Keyed by device_id (stable integer) — not IP (DHCP can change IPs).
     """
+    name_val = None if name_supported is None else (1 if name_supported else 0)
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO sync_firmware_profiles
-                (device_id, template_table, template_body_index, authorize_body_index, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+                (device_id, template_table, template_body_index, authorize_body_index, name_supported, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 template_table       = excluded.template_table,
                 template_body_index  = excluded.template_body_index,
                 authorize_body_index = excluded.authorize_body_index,
+                name_supported       = excluded.name_supported,
                 updated_at           = excluded.updated_at
             """,
-            (device_id, template_table, template_body_index, authorize_body_index, now_iso()),
+            (device_id, template_table, template_body_index, authorize_body_index, name_val, now_iso()),
         )
         conn.commit()
 
@@ -926,16 +930,18 @@ def load_firmware_profile(*, device_id: int) -> dict | None:
     """
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT template_table, template_body_index, authorize_body_index "
+            "SELECT template_table, template_body_index, authorize_body_index, name_supported "
             "FROM sync_firmware_profiles WHERE device_id = ?",
             (device_id,),
         ).fetchone()
     if row is None:
         return None
+    ns = row[3]
     return {
         "template_table": row[0],
         "template_body_index": row[1],
         "authorize_body_index": row[2],
+        "name_supported": None if ns is None else bool(ns),
     }
 
 

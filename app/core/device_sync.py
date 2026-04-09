@@ -34,6 +34,7 @@ class FirmwareProfile:
     template_table: str | None = None
     template_body_index: int | None = None
     authorize_body_index: int | None = None
+    name_supported: bool | None = None  # None=unknown, True=OK, False=rc=-101 on Name field
 
 
 # Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
@@ -188,10 +189,22 @@ class DeviceSyncEngine:
                     template_table=persisted["template_table"],
                     template_body_index=persisted["template_body_index"],
                     authorize_body_index=persisted["authorize_body_index"],
+                    name_supported=persisted.get("name_supported"),
                 )
             else:
                 self._firmware_profiles[device_id] = FirmwareProfile()
         return self._firmware_profiles[device_id]
+
+    def _save_firmware_profile(self, profile: FirmwareProfile, device_id: int) -> None:
+        """Persist the firmware profile to SQLite (L2 cache)."""
+        from app.core.db import save_firmware_profile
+        save_firmware_profile(
+            device_id=device_id,
+            template_table=profile.template_table or "",
+            template_body_index=profile.template_body_index or 0,
+            authorize_body_index=profile.authorize_body_index or 0,
+            name_supported=profile.name_supported,
+        )
 
     def _set_progress(self, **changes: Any) -> None:
         with self._progress_cond:
@@ -983,6 +996,10 @@ class DeviceSyncEngine:
                         self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
 
                 # Phase A: Batch push user rows
+                # Use cached name_supported flag to skip Name field on firmware that rejects it.
+                profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
+                use_name = profile.name_supported is not False  # True or None (unknown) → include Name
+
                 user_rows = []
                 pin_to_user = {}
                 for pin in pins_sorted:
@@ -992,7 +1009,9 @@ class DeviceSyncEngine:
                     full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
                     card = _pin_str(u.get("firstCardId") or "")
                     card_valid = card if (card and card.isdigit()) else ""
-                    pairs = [f"Pin={pin}", f"Name={full_name}"]
+                    pairs = [f"Pin={pin}"]
+                    if use_name:
+                        pairs.append(f"Name={full_name}")
                     if card_valid:
                         pairs.append(f"CardNo={card_valid}")
                     user_rows.append("\t".join(pairs))
@@ -1001,15 +1020,61 @@ class DeviceSyncEngine:
                 if user_rows:
                     ok_u, failed_u = sdk.set_device_data_batch(table="user", rows=user_rows, chunk_size=50)
                     pushed_users = ok_u
-                    if failed_u:
-                        # Batch + row-by-row both failed — retry with rc=-101 handling
-                        # (force-delete + retry without Name). This matches the per-pin
-                        # push path behavior for firmware that rejects certain fields.
+
+                    if not failed_u and profile.name_supported is None and use_name:
+                        # Name field accepted — cache this discovery
+                        profile.name_supported = True
+                        self._save_firmware_profile(profile, int(dev_id) if dev_id is not None else 0)
+                        self.logger.info("[DeviceSync] Device id=%s: Name field supported — cached", dev_id)
+
+                    if failed_u and use_name:
+                        # Name field likely rejected (rc=-101). Retry WITHOUT Name and cache the result.
                         self.logger.warning(
-                            "[DeviceSync] Device id=%s: %d user rows failed in batch, "
-                            "retrying with rc=-101 handling", dev_id, len(failed_u))
+                            "[DeviceSync] Device id=%s: %d user rows failed with Name field, "
+                            "retrying without Name", dev_id, len(failed_u))
+                        retry_rows = []
                         for row in failed_u:
-                            # Extract Pin from "Pin=123\tName=...\tCardNo=..."
+                            parts = {p.split("=", 1)[0]: p.split("=", 1)[1]
+                                     for p in row.split("\t") if "=" in p}
+                            rp = [f"Pin={parts.get('Pin', '')}"]
+                            if parts.get("CardNo"):
+                                rp.append(f"CardNo={parts['CardNo']}")
+                            retry_rows.append("\t".join(rp))
+                        ok_r, failed_r = sdk.set_device_data_batch(table="user", rows=retry_rows, chunk_size=50)
+                        pushed_users += ok_r
+                        if ok_r > 0:
+                            # Confirmed: Name field not supported on this firmware
+                            profile.name_supported = False
+                            self._save_firmware_profile(profile, int(dev_id) if dev_id is not None else 0)
+                            self.logger.info(
+                                "[DeviceSync] Device id=%s: Name field NOT supported — cached (won't retry next time)",
+                                dev_id)
+                        if failed_r:
+                            # Even without Name, some rows failed — try individual with force-delete
+                            for row in failed_r:
+                                pin = ""
+                                card_valid = ""
+                                for part in row.split("\t"):
+                                    if part.startswith("Pin="):
+                                        pin = part[4:]
+                                    elif part.startswith("CardNo="):
+                                        card_valid = part[7:]
+                                if not pin:
+                                    continue
+                                try:
+                                    self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                                    mp = [f"Pin={pin}"]
+                                    if card_valid:
+                                        mp.append(f"CardNo={card_valid}")
+                                    sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
+                                    pushed_users += 1
+                                except Exception as ex:
+                                    self.logger.warning(
+                                        "[DeviceSync] Device id=%s Pin=%s force-delete retry FAILED: %s",
+                                        dev_id, pin, ex)
+                    elif failed_u and not use_name:
+                        # Already using minimal fields but still failing — individual force-delete
+                        for row in failed_u:
                             pin = ""
                             card_valid = ""
                             for part in row.split("\t"):
@@ -1020,23 +1085,15 @@ class DeviceSyncEngine:
                             if not pin:
                                 continue
                             try:
-                                # Force-delete first (handles duplicate pin on insert-only firmware)
                                 self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
-                                # Retry with minimal fields (no Name — handles unsupported field firmware)
-                                minimal_pairs = [f"Pin={pin}"]
+                                mp = [f"Pin={pin}"]
                                 if card_valid:
-                                    minimal_pairs.append(f"CardNo={card_valid}")
-                                sdk.set_device_data(
-                                    table="user",
-                                    data="\t".join(minimal_pairs) + "\r\n",
-                                    options="",
-                                )
+                                    mp.append(f"CardNo={card_valid}")
+                                sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
                                 pushed_users += 1
-                                self.logger.info(
-                                    "[DeviceSync] Device id=%s Pin=%s rc=-101 retry OK", dev_id, pin)
                             except Exception as ex:
                                 self.logger.warning(
-                                    "[DeviceSync] Device id=%s Pin=%s rc=-101 retry FAILED: %s",
+                                    "[DeviceSync] Device id=%s Pin=%s force-delete retry FAILED: %s",
                                     dev_id, pin, ex)
 
                 # Phase B: Batch push authorize rows
@@ -1142,12 +1199,20 @@ class DeviceSyncEngine:
                                 dev_id, pin, card,
                             )
 
-                        pairs = [f"Pin={pin}", f"Name={full_name}"]
+                        _did = int(dev_id) if dev_id is not None else 0
+                        _profile = self._get_firmware_profile(_did)
+                        _use_name = _profile.name_supported is not False
+                        pairs = [f"Pin={pin}"]
+                        if _use_name:
+                            pairs.append(f"Name={full_name}")
                         if card_valid:
                             pairs.append(f"CardNo={card_valid}")
                         _user_data = "\t".join(pairs) + "\r\n"
                         try:
                             sdk.set_device_data(table="user", data=_user_data, options="")
+                            if _profile.name_supported is None and _use_name:
+                                _profile.name_supported = True
+                                self._save_firmware_profile(_profile, _did)
                         except PullSDKError as _set_err:
                             if "rc=-101" not in str(_set_err):
                                 raise
@@ -1163,6 +1228,11 @@ class DeviceSyncEngine:
                             if card_valid:
                                 minimal_pairs.append(f"CardNo={card_valid}")
                             sdk.set_device_data(table="user", data="\t".join(minimal_pairs) + "\r\n", options="")
+                            if _use_name and _profile.name_supported is None:
+                                _profile.name_supported = False
+                                self._save_firmware_profile(_profile, _did)
+                                self.logger.info(
+                                    "[DeviceSync] Device id=%s: Name field NOT supported — cached", dev_id)
                         pushed_users += 1
 
                         auth_complete = True
