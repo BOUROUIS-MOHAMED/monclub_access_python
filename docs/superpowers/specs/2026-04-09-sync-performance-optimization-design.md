@@ -119,6 +119,12 @@ AFTER:
 
 The fallback to `am.getUserImage()` preserves legacy behavior (members without FileLink entries use the old `user_image` column).
 
+### Notes
+
+- **`JOIN FETCH` improvement:** The existing per-call `findActiveByEntityAndRole` does NOT join-fetch `storedFile`, relying on lazy loading (a hidden N+1 within the N+1). The batch query explicitly includes `JOIN FETCH l.storedFile`, eliminating this entirely.
+- **`IN` clause size:** MySQL handles `IN` clauses of 1,400+ IDs without issue. If member count grows past ~5,000, chunk the batch into groups of 1,000 IDs. This is not needed at current scale.
+- **`computeIfAbsent` ordering dependency:** The batch method relies on the query's `ORDER BY l.createdAt DESC` to ensure the first FileLink per entity is the most recent. Add a code comment noting this dependency.
+
 ### Files Modified
 - `FileLinkRepository.java` — add `findActiveByEntityIdsAndRole()`
 - `MemberImageService.java` — add `resolveAccessImageUrlsBatch()`
@@ -169,7 +175,7 @@ class FirmwareProfile:
     authorize_body_index: int | None = None # e.g., 2
 ```
 
-Storage: `dict[str, FirmwareProfile]` keyed by device IP, stored in memory (lost on restart — acceptable, re-detected in ~10 seconds on first user).
+Storage: `dict[int, FirmwareProfile]` keyed by **device ID** (not IP — IPs can change via DHCP), stored in memory initially. Consider persisting to SQLite (`sync_firmware_profiles` table) to avoid the ~14 SDK call penalty on every app restart. The SQLite infrastructure already exists in `db.py`.
 
 #### _push_templates() modification
 
@@ -253,27 +259,32 @@ Add new fields to `ActiveMemberResponse`:
 ### Backend Logic
 
 ```
-IF membersVersion matches AND membersUpdatedAfter is provided:
-    // True delta: only changed members
-    changedMembers = query WHERE updated_at > membersUpdatedAfter
+IF membersVersion matches (nothing changed):
+    // Nothing changed — skip entire section (existing behavior)
+    response.refreshMembers = false
+    response.users = []
+
+ELSE IF membersVersion does NOT match AND membersUpdatedAfter is provided:
+    // Delta mode: only changed members since last sync timestamp
+    changedMembers = query WHERE active_membership.updated_at > membersUpdatedAfter
                           OR user.updated_at > membersUpdatedAfter
+                          OR file_link.updated_at > membersUpdatedAfter (for image changes)
     validMemberIds = query all valid membership IDs (lightweight: just IDs)
     
+    response.refreshMembers = true
     response.membersDeltaMode = true
     response.validMemberIds = validMemberIds
     response.users = changedMembers (with images, fingerprints)
-    
-ELSE IF membersVersion does NOT match:
-    // Full refresh (same as today)
+
+ELSE (membersVersion does NOT match AND no membersUpdatedAfter):
+    // Full refresh (backward compatible, first sync, or force refresh)
+    response.refreshMembers = true
     response.membersDeltaMode = false
     response.validMemberIds = null
     response.users = ALL members
-
-ELSE:
-    // Nothing changed
-    response.refreshMembers = false
-    response.users = []
 ```
+
+**Note:** The `membersUpdatedAfter` timestamp comes from the server's clock (sent as part of the previous response). Both generation and comparison happen server-side, so clock skew is not a concern.
 
 ### Client Logic (db.py)
 
@@ -281,14 +292,17 @@ ELSE:
 def save_sync_cache_delta(data, refresh):
     if refresh["members"]:
         if data.get("membersDeltaMode"):
-            # Partial update
+            # Partial update — H-006 guard does NOT apply here.
+            # In delta mode, users=[] is valid (only deletions occurred).
+            # Delete detection uses validMemberIds, not users list size.
             upsert_users(data["users"])           # Insert or replace changed users
             server_ids = set(data["validMemberIds"])
             local_ids = set(get_all_cached_user_ids())
             removed_ids = local_ids - server_ids
             delete_users_by_ids(removed_ids)      # Remove expired/deleted members
         else:
-            # Full replace (same as today, H-006 guard applies)
+            # Full replace — H-006 guard applies (refuse to clear if 0 users
+            # returned but local cache has >10, indicating a backend error)
             replace_cached_users(data["users"])
 ```
 
@@ -381,6 +395,12 @@ def _sync_one_device(self, device, users, changed_ids, removed_ids, ...):
         # (existing logic unchanged)
         ...
 ```
+
+### What This Actually Optimizes
+
+**Note:** The existing code already has hash-based change detection that skips unchanged users during push. The real optimization here is **skipping the hash computation loop itself** — iterating 1,200 users, collecting their templates, and computing SHA-1 hashes takes significant time even when nothing changed. With delta hints, we skip that entire loop for unchanged users.
+
+Additionally, inter-device parallelism already exists (`ThreadPoolExecutor(max_workers=4)` at line 1086 of `device_sync.py`). This phase does NOT add inter-device parallelism — it adds intra-device selectivity.
 
 ### Safety Net
 
