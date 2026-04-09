@@ -98,6 +98,14 @@ class UltraDeviceWorker(threading.Thread):
         logger.info(f"{self._prefix} started")
         self._pre_populate_seen()
 
+        # Pre-warm the local state cache eagerly so the first scan doesn't
+        # block for 30+ seconds loading 1,275 users from SQLite.
+        try:
+            self._get_cached_local_state()
+            logger.info(f"{self._prefix} local state cache pre-warmed")
+        except Exception as e:
+            logger.warning(f"{self._prefix} cache pre-warm failed: {e} (will retry on first event)")
+
         while not self._stop_evt.is_set():
             try:
                 # Yield the TCP connection to UltraSyncScheduler when requested
