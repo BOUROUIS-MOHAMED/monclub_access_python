@@ -972,8 +972,23 @@ class MainApp:
                 pass
             self._sync_after_id = None
 
-        interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
-        base_interval = int(max(10, int(interval_cfg)))
+        # Use backend-driven agentSyncBackendRefreshMin (in minutes) if available,
+        # otherwise fall back to local config sync_interval_sec (in seconds).
+        # The backend setting is configured in the dashboard under Access Software Settings.
+        backend_min = None
+        try:
+            from app.core.db import get_backend_global_settings
+            gs = get_backend_global_settings() or {}
+            val = gs.get("agent_sync_backend_refresh_min")
+            if val is not None and int(val) > 0:
+                backend_min = int(val)
+        except Exception:
+            pass
+        if backend_min is not None:
+            base_interval = backend_min * 60  # convert minutes to seconds
+        else:
+            interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
+            base_interval = int(max(10, int(interval_cfg)))
 
         # Exponential backoff on consecutive failures (cap at 10 min)
         if self._sync_fail_count > 0:
