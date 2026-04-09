@@ -244,7 +244,10 @@
       "Bash(mvn compile:*)",
       "Bash(mvn test:*)",
       "Bash(mvn -f \"D:\\\\projects\\\\MonClub\\\\monclub_backend\\\\pom.xml\" test -Dtest=\"MemberImageServiceTest\")",
-      "Bash(mvn -f \"D:\\\\projects\\\\MonClub\\\\monclub_backend\\\\pom.xml\" compile -q)"
+      "Bash(mvn -f \"D:\\\\projects\\\\MonClub\\\\monclub_backend\\\\pom.xml\" compile -q)",
+      "Bash(grep -n \"\\\\\\\\\\\\\\\\r\\\\\\\\\\\\\\\\n.*\\\\\\\\\\\\\\\\r\\\\\\\\\\\\\\\\n\\\\|Pin=.*Pin=\\\\|delete_device_data.*delete_device_data\" /c/Users/mohaa/Desktop/monclub_access_python/app/core/device_sync.py)",
+      "Bash(python -m pytest tests/ --ignore=tests/test_ultra_engine.py -q)",
+      "Bash(python -m pytest tests/test_batch_device_push.py -v)"
     ]
   }
 }
