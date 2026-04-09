@@ -908,6 +908,37 @@ class DeviceSyncEngine:
                 door_bitmask,
             )
 
+            # ── Nuke-and-repave: when more users need deleting than keeping,
+            #    it's faster to clear all tables and re-push desired users. ──
+            nuke_mode = len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
+            if nuke_mode:
+                self.logger.info(
+                    "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
+                    dev_id, len(stale_pins), len(desired_pins),
+                )
+                for tbl in ("templatev10", "template", "userauthorize", "user"):
+                    try:
+                        sdk.clear_device_table(table=tbl)
+                    except PullSDKError as ex:
+                        self.logger.warning("[DeviceSync] Device id=%s: clear %s failed: %s — falling back", dev_id, tbl, ex)
+                        nuke_mode = False
+                        break
+                if nuke_mode:
+                    # Device is now empty — push ALL desired users
+                    pins_to_sync = set(desired_pins)
+                    stale_pins = []
+                    device_pins = set()
+                    # Collect templates for pins that weren't in the original pins_to_sync
+                    for pin in desired_pins:
+                        if pin not in templates_for_sync:
+                            u = desired.get(pin)
+                            if isinstance(u, dict):
+                                templates_for_sync[pin] = self._collect_templates_for_pin(
+                                    user=u, pin=pin, local_fp_index=local_fp_index,
+                                    fingerprint_enabled=fingerprint_enabled,
+                                )
+
+            # ── Delete stale pins (skipped when nuke mode cleared everything) ──
             deleted = 0
             for p in stale_pins:
                 try:
@@ -931,163 +962,220 @@ class DeviceSyncEngine:
                 total=len(pins_to_sync),
             )
 
-            for pin in sorted(pins_to_sync):
-                u = desired.get(pin)
-                if not isinstance(u, dict):
-                    continue
+            # ── Batch push: user + authorize rows in chunks of 50 ──────────
+            # In nuke mode the device is clear — no pre-delete needed.
+            # In normal mode we pre-delete pins individually before batch push.
+            use_batch = nuke_mode or len(pins_to_sync) > 5
+            pins_sorted = sorted(pins_to_sync)
 
-                full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
-                card = _pin_str(u.get("firstCardId") or "")
-                templates = templates_for_sync.get(pin) or []
+            if use_batch and pins_sorted:
+                # Pre-delete (only in non-nuke mode) to avoid rc=-101 on insert-only firmware
+                if not nuke_mode:
+                    for pin in pins_sorted:
+                        self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
 
-                self.logger.debug(
-                    "[DeviceSync] Device id=%s syncing Pin=%s name=%r card=%r templates=%d",
-                    dev_id, pin, full_name, card, len(templates),
-                )
-
-                try:
-                    # Delete user row + auth + templates before re-inserting.
-                    # SetDeviceData is insert-only on most firmware; leaving the user row
-                    # causes rc=-101 (duplicate). _delete_pin_if_exists skips safely if
-                    # the pin isn't on the device.
-                    self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
-
-                    # 1) user (overwrite)
-                    # Only include CardNo if it is a non-empty numeric string.
-                    # Non-numeric card IDs (e.g. "aaa") are rejected by device firmware.
+                # Phase A: Batch push user rows
+                user_rows = []
+                pin_to_user = {}
+                for pin in pins_sorted:
+                    u = desired.get(pin)
+                    if not isinstance(u, dict):
+                        continue
+                    full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
+                    card = _pin_str(u.get("firstCardId") or "")
                     card_valid = card if (card and card.isdigit()) else ""
-                    if card and not card_valid:
-                        self.logger.warning(
-                            "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric — skipping CardNo",
-                            dev_id, pin, card,
-                        )
-
                     pairs = [f"Pin={pin}", f"Name={full_name}"]
                     if card_valid:
                         pairs.append(f"CardNo={card_valid}")
-                    _user_data = "\t".join(pairs) + "\r\n"
-                    try:
-                        sdk.set_device_data(table="user", data=_user_data, options="")
-                    except PullSDKError as _set_err:
-                        if "rc=-101" not in str(_set_err):
-                            raise
-                        # rc=-101 has two common causes on ZKTeco C3-200 firmware:
-                        #   (a) Duplicate pin — GetDeviceData returned incomplete pin list so
-                        #       _delete_pin_if_exists skipped a pin that already exists.
-                        #   (b) Unsupported field — some C3-200 firmware variants do not have a
-                        #       Name column and reject SetDeviceData when Name= is included.
-                        # Strategy: force-delete the stale row (handles a), then retry with
-                        # minimal fields only — Pin + CardNo, no Name (handles b).
+                    user_rows.append("\t".join(pairs))
+                    pin_to_user[pin] = u
+
+                if user_rows:
+                    ok_u, failed_u = sdk.set_device_data_batch(table="user", rows=user_rows, chunk_size=50)
+                    pushed_users = ok_u
+                    if failed_u:
                         self.logger.warning(
-                            "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 "
-                            "— force-delete + retry without Name",
-                            dev_id, pin,
-                        )
-                        # Clear auth/templates first so the user delete won't fail on constraints.
-                        self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                            "[DeviceSync] Device id=%s: %d user rows failed in batch push", dev_id, len(failed_u))
+
+                # Phase B: Batch push authorize rows
+                # Discover firmware profile if not cached (push 1 pin individually first)
+                profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
+                if profile.authorize_body_index is None and pins_sorted:
+                    # No cached pattern — discover by pushing first user individually
+                    first_pin = pins_sorted[0]
+                    self._push_userauthorize(
+                        sdk, pin=first_pin, door_bitmask=door_bitmask,
+                        authorize_timezone_id=int(authorize_timezone_id),
+                        device_id=int(dev_id) if dev_id is not None else 0,
+                    )
+                    profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
+                    remaining_pins = pins_sorted[1:]
+                else:
+                    remaining_pins = pins_sorted
+
+                if profile.authorize_body_index is not None and remaining_pins:
+                    tz = int(authorize_timezone_id)
+                    patterns = [
+                        lambda p: f"Pin={p}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}",
+                        lambda p: f"Pin={p}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}",
+                        lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZoneID={tz}",
+                        lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZone={tz}",
+                    ]
+                    pattern_fn = patterns[profile.authorize_body_index]
+                    auth_rows = [pattern_fn(p) for p in remaining_pins if desired.get(p)]
+                    if auth_rows:
+                        ok_a, failed_a = sdk.set_device_data_batch(
+                            table="userauthorize", rows=auth_rows, chunk_size=50)
+                        if failed_a:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s: %d authorize rows failed in batch", dev_id, len(failed_a))
+                elif remaining_pins:
+                    # No cached pattern available — fall back to per-pin authorize
+                    for pin in remaining_pins:
                         try:
-                            sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
-                        except Exception as _del_ex:
-                            self.logger.debug(
-                                "[DeviceSync] Device id=%s Pin=%s force-delete user: %s (continuing to retry)",
-                                dev_id, pin, _del_ex,
+                            self._push_userauthorize(
+                                sdk, pin=pin, door_bitmask=door_bitmask,
+                                authorize_timezone_id=int(authorize_timezone_id),
+                                device_id=int(dev_id) if dev_id is not None else 0,
                             )
-                        # Retry with minimal fields only (no Name).
-                        minimal_pairs = [f"Pin={pin}"]
-                        if card_valid:
-                            minimal_pairs.append(f"CardNo={card_valid}")
-                        sdk.set_device_data(table="user", data="\t".join(minimal_pairs) + "\r\n", options="")
-                        self.logger.info(
-                            "[DeviceSync] Device id=%s Pin=%s retry without Name OK",
-                            dev_id, pin,
-                        )
-                    pushed_users += 1
+                        except Exception as ex:
+                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
 
-                    # 2) authorize (respect backend timezone id)
-                    auth_complete = True
-                    try:
-                        auth_ok_count, auth_err = self._push_userauthorize(
-                            sdk,
-                            pin=pin,
-                            door_bitmask=door_bitmask,
-                            authorize_timezone_id=int(authorize_timezone_id),
-                            device_id=int(dev_id) if dev_id is not None else 0,
-                        )
-                        if auth_err:
-                            auth_complete = (auth_ok_count == len(door_ids))
-                            self.logger.warning(
-                                f"[DeviceSync] Device id={dev_id} Pin={pin} authorize "
-                                f"{'PARTIAL' if not auth_complete else 'warn'}: "
-                                f"{auth_ok_count}/{len(door_ids)} doors — {auth_err}"
-                            )
-                    except Exception as ex:
-                        auth_complete = False
-                        self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
-
-                    # 3) templates
+                # Phase C: Push templates individually (binary data — too large to batch)
+                for pin in pins_sorted:
+                    templates = templates_for_sync.get(pin) or []
                     if templates:
-                        ok_count, errs = self._push_templates(sdk, pin=pin, templates=templates,
-                                                               device_id=int(dev_id) if dev_id is not None else 0)
-                        pushed_templates += ok_count
-                        if errs:
+                        try:
+                            ok_count, errs = self._push_templates(
+                                sdk, pin=pin, templates=templates,
+                                device_id=int(dev_id) if dev_id is not None else 0)
+                            pushed_templates += ok_count
+                            if errs:
+                                warn_templates_users += 1
+                                self.logger.warning(
+                                    f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
+                                    f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
+                        except Exception as ex:
                             warn_templates_users += 1
-                            # M-006: Log all errors (not just first 3) and include count
-                            self.logger.warning(
-                                f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)} total): "
-                                f"{errs[:5]}{'...' if len(errs) > 5 else ''}"
-                            )
-                        else:
-                            self.logger.debug(
-                                f"[DeviceSync] Device id={dev_id} Pin={pin} templates pushed OK: count={ok_count}"
-                            )
+                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
 
-                    # Persist sync state: save hash on success, mark error on failure.
-                    # On failure we save with ok=False which preserves the OLD hash
-                    # (the DB CASE clause only updates hash when ok=True).  Next cycle,
-                    # list_device_sync_hashes_and_status returns ok=False for this pin,
-                    # which triggers a retry without needing to delete-and-re-push.
-                    if auth_complete:
+                # Phase D: Save device sync state for all pushed pins
+                for pin in pins_sorted:
+                    if desired.get(pin):
                         save_device_sync_state(
-                            device_id=did,
-                            pin=pin,
+                            device_id=did, pin=pin,
                             desired_hash=desired_hashes.get(pin) or "",
-                            ok=True,
-                            error=None,
+                            ok=True, error=None,
                         )
                         ok_synced += 1
-                        self.logger.debug(
-                            "[DeviceSync] Device id=%s Pin=%s sync OK", dev_id, pin,
-                        )
-                    else:
-                        save_device_sync_state(
-                            device_id=did,
-                            pin=pin,
-                            desired_hash=desired_hashes.get(pin) or "",
-                            ok=False,
-                            error=auth_err or "authorize incomplete",
-                        )
-                        failed_synced += 1
-                        self.logger.warning(
-                            "[DeviceSync] Device id=%s Pin=%s sync FAILED — "
-                            "state saved with ok=False, will retry next cycle",
-                            dev_id, pin,
-                        )
-                    self._set_progress(current=ok_synced + failed_synced)
+                self._set_progress(current=ok_synced)
+                self.logger.info(
+                    "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
+                    dev_id, pushed_users, len(pins_sorted), pushed_templates,
+                )
 
-                except Exception as ex:
-                    failed_synced += 1
-                    self._set_progress(current=ok_synced + failed_synced)
-                    save_device_sync_state(
-                        device_id=did,
-                        pin=pin,
-                        desired_hash=None,  # keep previous hash so it retries next run
-                        ok=False,
-                        error=str(ex),
+            else:
+                # ── Per-pin push (small sync ≤5 pins, or batch not applicable) ──
+                for pin in pins_sorted:
+                    u = desired.get(pin)
+                    if not isinstance(u, dict):
+                        continue
+
+                    full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
+                    card = _pin_str(u.get("firstCardId") or "")
+                    templates = templates_for_sync.get(pin) or []
+
+                    self.logger.debug(
+                        "[DeviceSync] Device id=%s syncing Pin=%s name=%r card=%r templates=%d",
+                        dev_id, pin, full_name, card, len(templates),
                     )
-                    self.logger.warning(
-                        "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s",
-                        dev_id, pin, ex,
-                    )
+
+                    try:
+                        self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+
+                        card_valid = card if (card and card.isdigit()) else ""
+                        if card and not card_valid:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric — skipping CardNo",
+                                dev_id, pin, card,
+                            )
+
+                        pairs = [f"Pin={pin}", f"Name={full_name}"]
+                        if card_valid:
+                            pairs.append(f"CardNo={card_valid}")
+                        _user_data = "\t".join(pairs) + "\r\n"
+                        try:
+                            sdk.set_device_data(table="user", data=_user_data, options="")
+                        except PullSDKError as _set_err:
+                            if "rc=-101" not in str(_set_err):
+                                raise
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 "
+                                "— force-delete + retry without Name", dev_id, pin)
+                            self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                            try:
+                                sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
+                            except Exception:
+                                pass
+                            minimal_pairs = [f"Pin={pin}"]
+                            if card_valid:
+                                minimal_pairs.append(f"CardNo={card_valid}")
+                            sdk.set_device_data(table="user", data="\t".join(minimal_pairs) + "\r\n", options="")
+                        pushed_users += 1
+
+                        auth_complete = True
+                        try:
+                            auth_ok_count, auth_err = self._push_userauthorize(
+                                sdk, pin=pin, door_bitmask=door_bitmask,
+                                authorize_timezone_id=int(authorize_timezone_id),
+                                device_id=int(dev_id) if dev_id is not None else 0,
+                            )
+                            if auth_err:
+                                auth_complete = (auth_ok_count == len(door_ids))
+                                self.logger.warning(
+                                    f"[DeviceSync] Device id={dev_id} Pin={pin} authorize "
+                                    f"{'PARTIAL' if not auth_complete else 'warn'}: "
+                                    f"{auth_ok_count}/{len(door_ids)} doors — {auth_err}")
+                        except Exception as ex:
+                            auth_complete = False
+                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
+
+                        if templates:
+                            ok_count, errs = self._push_templates(
+                                sdk, pin=pin, templates=templates,
+                                device_id=int(dev_id) if dev_id is not None else 0)
+                            pushed_templates += ok_count
+                            if errs:
+                                warn_templates_users += 1
+                                self.logger.warning(
+                                    f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
+                                    f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
+
+                        if auth_complete:
+                            save_device_sync_state(
+                                device_id=did, pin=pin,
+                                desired_hash=desired_hashes.get(pin) or "",
+                                ok=True, error=None,
+                            )
+                            ok_synced += 1
+                        else:
+                            save_device_sync_state(
+                                device_id=did, pin=pin,
+                                desired_hash=desired_hashes.get(pin) or "",
+                                ok=False, error=auth_err or "authorize incomplete",
+                            )
+                            failed_synced += 1
+                        self._set_progress(current=ok_synced + failed_synced)
+
+                    except Exception as ex:
+                        failed_synced += 1
+                        self._set_progress(current=ok_synced + failed_synced)
+                        save_device_sync_state(
+                            device_id=did, pin=pin,
+                            desired_hash=None, ok=False, error=str(ex),
+                        )
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
             pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
 

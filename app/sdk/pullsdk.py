@@ -442,6 +442,64 @@ class PullSDK:
             raise PullSDKError(f"SetDeviceData FAILED table={table} rc={rc} PullLastError={err}")
         return rc
 
+    def set_device_data_batch(self, *, table: str, rows: list, chunk_size: int = 50) -> tuple:
+        """
+        Send multiple rows to the device in batched SetDeviceData calls.
+
+        Each row is a tab-separated key=value string (without trailing \\r\\n).
+        Rows are grouped into chunks of ``chunk_size`` and each chunk is sent as
+        a single SetDeviceData call with rows separated by \\r\\n.
+
+        Returns ``(ok_count, failed_rows)`` where *failed_rows* is a list of row
+        strings that could not be written (empty on full success).
+
+        On chunk failure the method falls back to row-by-row for that chunk so
+        a single bad record does not block the rest.
+        """
+        if not rows:
+            return (0, [])
+
+        ok = 0
+        failed: list = []
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i + chunk_size]
+            data = "\r\n".join(chunk) + "\r\n"
+            try:
+                self.set_device_data(table=table, data=data, options="")
+                ok += len(chunk)
+            except PullSDKError:
+                # Chunk failed — fall back to row-by-row for this chunk
+                self.logger.warning(
+                    "set_device_data_batch chunk failed (table=%s, rows=%d), falling back to row-by-row",
+                    table, len(chunk),
+                )
+                for row in chunk:
+                    try:
+                        self.set_device_data(table=table, data=row + "\r\n", options="")
+                        ok += 1
+                    except PullSDKError:
+                        failed.append(row)
+        return (ok, failed)
+
+    def clear_device_table(self, *, table: str) -> int:
+        """
+        Delete ALL records from a device table by passing an empty filter.
+
+        Equivalent to ``DeleteDeviceData(handle, table, "", "")``.
+        Used by nuke-and-repave when more users need deleting than keeping.
+        """
+        h = self._require_handle()
+        self.load()
+        if self._dll is None or not hasattr(self._dll, "DeleteDeviceData"):
+            raise PullSDKError("DeleteDeviceData not available in this plcommpro.dll build.")
+
+        self.logger.info(f"ClearDeviceTable(table={table}) — deleting ALL rows")
+        rc = int(self._dll.DeleteDeviceData(c_void_p(h), encode_ansi(table), encode_ansi(""), encode_ansi("")))
+        if rc < 0:
+            err = self.pull_last_error()
+            raise PullSDKError(f"ClearDeviceTable FAILED table={table} rc={rc} PullLastError={err}")
+        return rc
+
     def supports_delete_device_data(self) -> bool:
         self.load()
         return self._dll is not None and hasattr(self._dll, "DeleteDeviceData")
