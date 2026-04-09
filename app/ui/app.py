@@ -977,7 +977,7 @@ class MainApp:
         # The backend setting is configured in the dashboard under Access Software Settings.
         backend_min = None
         try:
-            from app.core.db import get_backend_global_settings
+            from app.core.settings_reader import get_backend_global_settings
             gs = get_backend_global_settings() or {}
             val = gs.get("agent_sync_backend_refresh_min")
             if val is not None and int(val) > 0:

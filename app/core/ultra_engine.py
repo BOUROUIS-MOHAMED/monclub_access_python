@@ -120,6 +120,12 @@ class UltraDeviceWorker(threading.Thread):
                         self._stop_evt.wait(0.5)
                     self._sync_paused_ack.clear()
                     logger.info(f"{self._prefix} sync pause ended — will reconnect")
+                    # Pre-warm cache after sync invalidated it (resume_from_sync sets _cached_state=None).
+                    # Without this, the first event after resume blocks 5+ seconds loading from SQLite.
+                    try:
+                        self._get_cached_local_state()
+                    except Exception:
+                        pass
                     continue
 
                 # Connect if needed
