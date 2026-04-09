@@ -264,6 +264,55 @@ class DeviceSyncEngine:
             return int(DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK)
         return int(v)
 
+    def _resolve_push_context(
+        self,
+        *,
+        device: Dict[str, Any],
+        default_door_id: int,
+    ) -> Tuple[List[int], int, int, bool]:
+        authorize_timezone_id = _to_int(device.get("authorizeTimezoneId"), default=1) or 1
+        if authorize_timezone_id < 1:
+            authorize_timezone_id = 1
+
+        fingerprint_enabled = _boolish(
+            device.get("fingerprintEnabled") or device.get("fingerprint_enabled"),
+            default=False,
+        )
+
+        # Resolve AuthorizeDoorId bitmask for userauthorize.
+        # AuthorizeDoorId is a bitmask: door1=1, door2=2, door3=4, door4=8.
+        #
+        # Priority: use doorIds from the backend (already bitmask values set in
+        # the dashboard, e.g. [1, 2, 4, 8]). OR them to get combined bitmask.
+        # Fallback: compute bitmask from doorPresets physical door numbers.
+        door_ids_raw = device.get("doorIds") or []
+        door_ids_list = _norm_int_list(door_ids_raw)
+
+        if door_ids_list:
+            door_bitmask = 0
+            for v in door_ids_list:
+                door_bitmask |= int(v)
+            door_ids = door_ids_list
+        else:
+            presets = device.get("doorPresets") or []
+            physical_doors = sorted(set(
+                int(p.get("doorNumber") or p.get("door_number") or 0)
+                for p in presets if isinstance(p, dict)
+                and (p.get("doorNumber") or p.get("door_number"))
+            ))
+            physical_doors = [d for d in physical_doors if d > 0]
+
+            if physical_doors:
+                door_bitmask = 0
+                for d in physical_doors:
+                    door_bitmask |= 1 << (int(d) - 1)
+                door_ids = physical_doors
+            else:
+                door_bitmask = int(default_door_id)
+                door_ids = [int(default_door_id)]
+
+        return door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled
+
     def _sdk_read_initial_bytes(self) -> int:
         """
         Backend-driven knob used when reading device data (PullSDK initial_size).
@@ -732,6 +781,71 @@ class DeviceSyncEngine:
         )
         return _sha1_hex(payload)
 
+    def build_device_sync_fingerprint(
+        self,
+        *,
+        device: Dict[str, Any],
+        users: List[Dict[str, Any]],
+        local_fp_index: Dict[str, List[Any]] | None = None,
+    ) -> Tuple[str, int]:
+        normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
+        default_door_id = self._default_authorize_door_id()
+        door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled = self._resolve_push_context(
+            device=normalized_device,
+            default_door_id=default_door_id,
+        )
+        desired = self._filter_users_for_device(
+            users=users,
+            device=normalized_device,
+            default_door_id=default_door_id,
+        )
+
+        if local_fp_index is None:
+            local_fp_index = {}
+            try:
+                recs = list_fingerprints()
+                for r in recs:
+                    pin = _pin_str(getattr(r, "pin", "") or "")
+                    if not pin:
+                        continue
+                    local_fp_index.setdefault(pin, []).append(r)
+            except Exception:
+                local_fp_index = {}
+
+        policy = str(normalized_device.get("pushingToDevicePolicy") or "").strip().upper()
+        allowed_memberships = _norm_int_list(normalized_device.get("allowedMemberships") or [])
+        fingerprint_parts = [
+            f"allowedMemberships={','.join(str(v) for v in allowed_memberships)}",
+            f"doorIds={','.join(str(v) for v in door_ids)}",
+            f"doorBitmask={door_bitmask}",
+            f"authorizeTimezoneId={authorize_timezone_id}",
+            f"policy={policy}",
+            f"fingerprintEnabled={1 if fingerprint_enabled else 0}",
+        ]
+
+        for pin in sorted(desired):
+            user = desired.get(pin)
+            if not isinstance(user, dict):
+                continue
+            templates = self._collect_templates_for_pin(
+                user=user,
+                pin=pin,
+                local_fp_index=local_fp_index,
+                fingerprint_enabled=fingerprint_enabled,
+            )
+            fingerprint_parts.append(
+                self._compute_desired_hash(
+                    pin=pin,
+                    user=user,
+                    door_bitmask=door_bitmask,
+                    templates=templates,
+                    authorize_timezone_id=authorize_timezone_id,
+                )
+            )
+
+        payload = "\n".join(fingerprint_parts)
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest(), len(desired)
+
     def _sync_one_device(
         self,
         *,
@@ -747,43 +861,10 @@ class DeviceSyncEngine:
         port = _to_int(device.get("portNumber"), default=4370) or 4370
         pwd = device.get("password") or ""
 
-        authorize_timezone_id = _to_int(device.get("authorizeTimezoneId"), default=1) or 1
-        if authorize_timezone_id < 1:
-            authorize_timezone_id = 1
-
-        # Resolve AuthorizeDoorId bitmask for userauthorize.
-        # AuthorizeDoorId is a bitmask: door1=1, door2=2, door3=4, door4=8.
-        #
-        # Priority: use doorIds from the backend (already bitmask values set in
-        # the dashboard, e.g. [1, 2, 4, 8]).  OR them to get combined bitmask.
-        # Fallback: compute bitmask from doorPresets physical door numbers.
-        door_ids_raw = device.get("doorIds") or []
-        door_ids_list = _norm_int_list(door_ids_raw)
-
-        if door_ids_list:
-            # doorIds from backend are already bitmask values — OR them together
-            door_bitmask = 0
-            for v in door_ids_list:
-                door_bitmask |= int(v)
-            door_ids = door_ids_list  # keep list for hash/log
-        else:
-            # Fallback: compute bitmask from doorPresets physical door numbers
-            presets = device.get("doorPresets") or []
-            physical_doors = sorted(set(
-                int(p.get("doorNumber") or p.get("door_number") or 0)
-                for p in presets if isinstance(p, dict)
-                and (p.get("doorNumber") or p.get("door_number"))
-            ))
-            physical_doors = [d for d in physical_doors if d > 0]
-
-            if physical_doors:
-                door_bitmask = 0
-                for d in physical_doors:
-                    door_bitmask |= 1 << (int(d) - 1)
-                door_ids = physical_doors
-            else:
-                door_bitmask = int(default_door_id)
-                door_ids = [int(default_door_id)]
+        door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled = self._resolve_push_context(
+            device=device,
+            default_door_id=default_door_id,
+        )
 
         if dev_id is None:
             self.logger.warning(f"[DeviceSync] Skip device name={dev_name!r}: missing id")
@@ -796,12 +877,6 @@ class DeviceSyncEngine:
         if not ip:
             self.logger.warning(f"[DeviceSync] Skip device id={dev_id} name={dev_name!r}: missing ipAddress")
             return
-
-        # F-013: Read fingerprint_enabled per device — controls whether fingerprint templates are pushed
-        fingerprint_enabled = _boolish(
-            device.get("fingerprintEnabled") or device.get("fingerprint_enabled"),
-            default=False,
-        )
 
         desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
         desired_pins = set(desired.keys())

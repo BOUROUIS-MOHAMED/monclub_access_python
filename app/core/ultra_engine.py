@@ -1,7 +1,5 @@
 """ULTRA mode engine: device-firmware RFID/FP + PC-side RTLog observer + TOTP rescue."""
 
-import hashlib
-import json
 import logging
 import queue
 import threading
@@ -1037,10 +1035,7 @@ class UltraSyncScheduler:
         for d in self._devices:
             device_id = d.get("id")
             try:
-                self._sync_device(d)
-                self._last_sync_at[device_id] = time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                )
+                did_sync = self._sync_device(d)
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 15)
                 ) * 60
@@ -1048,7 +1043,13 @@ class UltraSyncScheduler:
                 self._next_sync_at[device_id] = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(next_t)
                 )
-                synced += 1
+                if did_sync:
+                    self._last_sync_at[device_id] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                    )
+                    synced += 1
+                else:
+                    skipped += 1
             except Exception as e:
                 failed += 1
                 self._logger.error("[ULTRA:%s] sync failed: %s", device_id, e)
@@ -1058,7 +1059,7 @@ class UltraSyncScheduler:
             elapsed, synced, skipped, failed,
         )
 
-    def _sync_device(self, device: Dict[str, Any]):
+    def _sync_device(self, device: Dict[str, Any]) -> bool:
         """Push data to a single device with hash-based change detection.
 
         Reuses DeviceSyncEngine by temporarily treating this ULTRA device
@@ -1070,36 +1071,25 @@ class UltraSyncScheduler:
         cache = load_sync_cache()
         if cache is None:
             self._logger.warning("[ULTRA:%s] sync skip: no sync cache available", device_id)
-            return
+            return False
 
-        # Compute hash of current user payload for this device
         users = getattr(cache, "users", []) or []
-        # M-004: Include card numbers and fingerprint hashes in payload hash,
-        # not just activeMembershipId. Otherwise card-only changes are missed.
-        payload_str = json.dumps(
-            sorted([
-                (
-                    u.get("activeMembershipId", ""),
-                    u.get("firstCardId", ""),
-                    u.get("secondCardId", ""),
-                    u.get("fingerprintsHash", ""),
-                )
-                for u in users if u
-            ]),
-            sort_keys=True,
+        engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+        current_hash, desired_users = engine.build_device_sync_fingerprint(
+            device=device,
+            users=list(users),
         )
-        current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
 
         if self._last_hash.get(device_id) == current_hash:
             self._logger.info(
-                "[ULTRA:%s] sync skip: hash unchanged (users=%d hash=%s)",
-                device_id, len(users), current_hash[:12],
+                "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
+                device_id, desired_users, current_hash[:12],
             )
-            return
+            return False
 
         self._logger.info(
-            "[ULTRA:%s] sync push started: users=%d prev_hash=%s new_hash=%s",
-            device_id, len(users),
+            "[ULTRA:%s] sync push started: desired_users=%d prev_hash=%s new_hash=%s",
+            device_id, desired_users,
             (self._last_hash.get(device_id) or "none")[:12], current_hash[:12],
         )
 
@@ -1127,12 +1117,12 @@ class UltraSyncScheduler:
             )
 
         try:
-            engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
             with self._active_sync_lock:
                 self._active_sync_engine = engine
             engine.run_blocking(cache=filtered_cache, source="ultra_sync")
             self._last_hash[device_id] = current_hash
             self._logger.info("[ULTRA:%s] sync push complete", device_id)
+            return True
         finally:
             with self._active_sync_lock:
                 if self._active_sync_engine is engine:
@@ -1140,7 +1130,7 @@ class UltraSyncScheduler:
             if worker:
                 worker.resume_from_sync()
                 self._logger.info(
-                    "[ULTRA:%s] sync: worker resumed — will reconnect for RTLog polling", device_id
+                    "[ULTRA:%s] sync: worker resumed - will reconnect for RTLog polling", device_id
                 )
 
     def get_sync_status(self) -> Dict[int, Dict[str, Any]]:

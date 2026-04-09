@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from app.core.access_types import AccessEvent
 from app.core.db import normalize_access_history_source
+from app.core.device_sync import DeviceSyncEngine
 from app.core.realtime_agent import CommandResult, DecisionService, EMA, NotificationGate
 from app.core.ultra_engine import UltraDeviceWorker, UltraSyncScheduler
 
@@ -156,6 +157,7 @@ def test_ultra_sync_scheduler_syncs_only_target_device_with_device_mode_copy() -
         ],
     )
     engine_instance = MagicMock()
+    engine_instance.build_device_sync_fingerprint.return_value = ("hash-1", 1)
 
     with (
         patch("app.core.ultra_engine.load_sync_cache", return_value=cache),
@@ -168,3 +170,78 @@ def test_ultra_sync_scheduler_syncs_only_target_device_with_device_mode_copy() -
     assert len(filtered_cache.devices) == 1
     assert filtered_cache.devices[0]["id"] == 42
     assert filtered_cache.devices[0]["accessDataMode"] == "DEVICE"
+
+
+def test_device_sync_fingerprint_changes_when_allowed_memberships_change() -> None:
+    engine = DeviceSyncEngine(cfg=SimpleNamespace(), logger=_DummyLogger())
+    device = {
+        "id": 42,
+        "name": "ultra-target",
+        "ipAddress": "192.168.1.50",
+        "portNumber": 4370,
+        "accessDataMode": "DEVICE",
+        "doorIds": [1],
+        "allowedMemberships": [7],
+        "authorizeTimezoneId": 1,
+        "pushingToDevicePolicy": "ALL",
+    }
+    users = [{
+        "userId": 1,
+        "activeMembershipId": 101,
+        "membershipId": 7,
+        "fullName": "Alice Doe",
+        "firstCardId": "555",
+        "fingerprints": [],
+    }]
+
+    with patch("app.core.device_sync.get_backend_global_settings", return_value={}):
+        hash_with_membership, desired_with_membership = engine.build_device_sync_fingerprint(
+            device=device,
+            users=users,
+            local_fp_index={},
+        )
+        hash_without_membership, desired_without_membership = engine.build_device_sync_fingerprint(
+            device={**device, "allowedMemberships": [8]},
+            users=users,
+            local_fp_index={},
+        )
+
+    assert desired_with_membership == 1
+    assert desired_without_membership == 0
+    assert hash_with_membership != hash_without_membership
+
+
+def test_ultra_sync_scheduler_resyncs_when_device_fingerprint_changes() -> None:
+    scheduler = UltraSyncScheduler(cfg=object(), logger_inst=_DummyLogger())
+    device = {
+        "id": 42,
+        "name": "ultra-target",
+        "ipAddress": "192.168.1.50",
+        "portNumber": 4370,
+        "accessDataMode": "ULTRA",
+        "allowedMemberships": [7],
+        "_settings": {"ultra_sync_interval_minutes": 15},
+    }
+    cache = SimpleNamespace(
+        users=[{
+            "userId": 1,
+            "activeMembershipId": 101,
+            "membershipId": 7,
+            "fullName": "Alice Doe",
+        }],
+        devices=[device],
+    )
+    first_engine = MagicMock()
+    first_engine.build_device_sync_fingerprint.return_value = ("hash-1", 1)
+    second_engine = MagicMock()
+    second_engine.build_device_sync_fingerprint.return_value = ("hash-2", 0)
+
+    with (
+        patch("app.core.ultra_engine.load_sync_cache", return_value=cache),
+        patch("app.core.device_sync.DeviceSyncEngine", side_effect=[first_engine, second_engine]),
+    ):
+        assert scheduler._sync_device(device) is True
+        assert scheduler._sync_device({**device, "allowedMemberships": [8]}) is True
+
+    assert first_engine.run_blocking.call_count == 1
+    assert second_engine.run_blocking.call_count == 1

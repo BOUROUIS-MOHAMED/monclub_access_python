@@ -149,6 +149,35 @@ def test_build_status_payload_uses_ultra_sync_progress_when_main_engine_is_idle(
     }
 
 
+def test_build_status_payload_hides_stale_progress_when_no_sync_is_running() -> None:
+    engine = DeviceSyncEngine(cfg=SimpleNamespace(), logger=MagicMock())
+    engine._set_progress(
+        running=False,
+        deviceName="Front Door",
+        deviceId=7,
+        current=0,
+        total=1276,
+    )
+    app = _StatusStreamApp(engine)
+    app._ultra_engine = _UltraProgressEngine({
+        "running": False,
+        "deviceName": "door 1",
+        "deviceId": 5,
+        "current": 0,
+        "total": 1276,
+    })
+    app._ultra_engine.running = False
+
+    with (
+        patch("access.store.load_auth_token", return_value=_make_auth()),
+        patch("access.store.load_sync_cache", return_value=_make_cache()),
+        _patched_status_dependencies(),
+    ):
+        payload = local_access_api_v2._build_status_payload(app)
+
+    assert payload["deviceSync"]["progress"] is None
+
+
 def test_status_stream_emits_updated_status_when_device_sync_changes() -> None:
     engine = DeviceSyncEngine(cfg=SimpleNamespace(), logger=MagicMock())
     app = _StatusStreamApp(engine)
@@ -178,7 +207,7 @@ def test_status_stream_emits_updated_status_when_device_sync_changes() -> None:
 
     status_events = [data for event, data in ctx.events if event == "status"]
     assert len(status_events) == 2
-    assert status_events[0]["deviceSync"]["progress"]["running"] is False
+    assert status_events[0]["deviceSync"]["progress"] is None
     assert status_events[1]["deviceSync"]["progress"]["running"] is True
     assert status_events[1]["deviceSync"]["progress"]["current"] == 1
 

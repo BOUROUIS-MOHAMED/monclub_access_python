@@ -503,7 +503,7 @@ def _get_live_device_sync_progress(app: Any) -> Optional[Dict[str, Any]]:
     if ultra_progress and ultra_progress.get("running"):
         return ultra_progress
 
-    return main_progress or ultra_progress
+    return None
 
 
 _status_payload_lock = threading.Lock()
