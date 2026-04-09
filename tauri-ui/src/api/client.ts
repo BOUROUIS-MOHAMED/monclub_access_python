@@ -40,37 +40,50 @@ function hdrs(includeJsonBody = false): Record<string, string> {
   return h;
 }
 
-async function parse<T>(res: Response): Promise<T> {
+async function parse<T>(res: Response, method: string, path: string, t0: number): Promise<T> {
   const txt = await res.text();
+  const elapsed = Date.now() - t0;
   let json: any;
-  try { json = JSON.parse(txt); } catch { throw new ApiError(txt || `HTTP ${res.status}`, res.status); }
-  if (!res.ok && json.ok === false) throw new ApiError(json.error || `HTTP ${res.status}`, res.status);
-  if (!res.ok) throw new ApiError(json.error || txt, res.status);
+  try { json = JSON.parse(txt); } catch { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms (non-JSON)`); throw new ApiError(txt || `HTTP ${res.status}`, res.status); }
+  if (!res.ok && json.ok === false) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR: ${json.error}`); throw new ApiError(json.error || `HTTP ${res.status}`, res.status); }
+  if (!res.ok) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR`); throw new ApiError(json.error || txt, res.status); }
+  console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms OK`);
   return json as T;
 }
 
 export async function get<T>(path: string, params?: Record<string, string>): Promise<T> {
   let url = `${_baseUrl}${PFX}${path}`;
   if (params) { const q = new URLSearchParams(params).toString(); if (q) url += `?${q}`; }
-  return parse<T>(await fetch(url, { headers: hdrs(false) }));
+  const t0 = Date.now();
+  try { return await parse<T>(await fetch(url, { headers: hdrs(false) }), "GET", path, t0); }
+  catch (e) { console.debug(`[API] GET ${path} FAILED: ${e}`); throw e; }
 }
 
 export async function post<T>(path: string, body?: unknown, timeoutMs = 15_000): Promise<T> {
-  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
-    method: "POST", headers: hdrs(true),
-    body: body != null ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(timeoutMs),
-  }));
+  const t0 = Date.now();
+  try {
+    return await parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
+      method: "POST", headers: hdrs(true),
+      body: body != null ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    }), "POST", path, t0);
+  } catch (e) { console.debug(`[API] POST ${path} FAILED: ${e}`); throw e; }
 }
 
 export async function patch<T>(path: string, body: unknown): Promise<T> {
-  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
-    method: "PATCH", headers: hdrs(true), body: JSON.stringify(body),
-  }));
+  const t0 = Date.now();
+  try {
+    return await parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, {
+      method: "PATCH", headers: hdrs(true), body: JSON.stringify(body),
+    }), "PATCH", path, t0);
+  } catch (e) { console.debug(`[API] PATCH ${path} FAILED: ${e}`); throw e; }
 }
 
 export async function del<T>(path: string): Promise<T> {
-  return parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, { method: "DELETE", headers: hdrs(false) }));
+  const t0 = Date.now();
+  try {
+    return await parse<T>(await fetch(`${_baseUrl}${PFX}${path}`, { method: "DELETE", headers: hdrs(false) }), "DELETE", path, t0);
+  } catch (e) { console.debug(`[API] DELETE ${path} FAILED: ${e}`); throw e; }
 }
 
 // SSE helper
@@ -93,9 +106,11 @@ export function openSSE(
   // The SSE handler would accept ?ticket= (single-use, 30s TTL) instead of
   // ?token=. TODO: implement when a loopback log-forwarding risk is confirmed.
   if (_token) url += `${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(_token)}`;
+  console.debug(`[SSE] opening: ${path}`);
   const es = new EventSource(url);
   let wasOpen = false;
   es.onopen = () => {
+    console.debug(`[SSE] connected: ${path} (reconnect=${wasOpen})`);
     if (wasOpen && opts?.onReconnect) opts.onReconnect();
     wasOpen = true;
   };

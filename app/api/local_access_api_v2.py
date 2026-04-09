@@ -1117,6 +1117,7 @@ def _handle_tv_config_restart_api(ctx: _Ctx) -> None:
 # ==================== 4) SYNC + CACHE ====================
 
 def _handle_sync_now(ctx: _Ctx) -> None:
+    _logger.info("[LocalAPI] sync_now: manual sync triggered")
     try:
         ctx.app.after(0, ctx.app.request_sync_now)
     except Exception:
@@ -2800,11 +2801,13 @@ def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
 
 def _handle_device_connect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    _logger.info("[LocalAPI] device_connect: deviceId=%s", did)
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
         return
     sdk, err = _connect_device(ctx, did)
     if err:
+        _logger.warning("[LocalAPI] device_connect FAILED: deviceId=%s err=%s", did, err)
         ctx.send_json(500, {"ok": False, "error": err})
         return
     with _device_sdk_lock:
@@ -2813,11 +2816,13 @@ def _handle_device_connect(ctx: _Ctx) -> None:
             try: old.disconnect()
             except Exception: pass
         _device_sdk_pool[did] = sdk
+    _logger.info("[LocalAPI] device_connect OK: deviceId=%s", did)
     ctx.send_json(200, {"ok": True})
 
 
 def _handle_device_disconnect(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    _logger.info("[LocalAPI] device_disconnect: deviceId=%s", did)
     with _device_sdk_lock:
         sdk = _device_sdk_pool.pop(did, None)
     if sdk:
@@ -4801,15 +4806,12 @@ class LocalApiServerV2:
 
         class Handler(BaseHTTPRequestHandler):
             def _dispatch(self, method: str) -> None:
+                import time as _dispatch_time
+                _t0 = _dispatch_time.monotonic()
                 try:
                     parsed = urlparse(self.path)
                     path = parsed.path or ""
                     qs = parse_qs(parsed.query or "")
-
-                    try:
-                        server.app.logger.debug("[LocalAPI v2] >> %s %s", method, path)
-                    except Exception:
-                        pass
 
                     handler_fn, params = router.match(method, path)
                     if handler_fn is None:
@@ -4854,7 +4856,22 @@ class LocalApiServerV2:
                             self.wfile.write(body)
                             return
 
+                    try:
+                        server.app.logger.debug(
+                            "[LocalAPI] >> %s %s handler=%s",
+                            method, path, getattr(handler_fn, "__name__", "?"),
+                        )
+                    except Exception:
+                        pass
                     handler_fn(ctx)
+                    try:
+                        _elapsed = (_dispatch_time.monotonic() - _t0) * 1000
+                        server.app.logger.debug(
+                            "[LocalAPI] << %s %s handler=%s %.0fms",
+                            method, path, fn_name, _elapsed,
+                        )
+                    except Exception:
+                        pass
                 except Exception as e:
                     try:
                         body = _json_bytes({"ok": False, "error": str(e)})

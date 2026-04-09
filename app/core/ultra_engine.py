@@ -40,6 +40,15 @@ class UltraDeviceWorker(threading.Thread):
         self._history_q = history_q
         self._stop_evt = stop_event
         self._device_id = int(device.get("id", 0))
+        logger.debug(
+            "[ULTRA:%s] __init__: name=%r ip=%s port=%s totp=%s rfid=%s "
+            "cooldown=%.1fs poll_timeout=%.1fs",
+            device.get("id"), device.get("name"),
+            device.get("ipAddress", "?"), device.get("portNumber", "?"),
+            settings.get("totp_enabled", True), settings.get("rfid_enabled", True),
+            float(settings.get("replay_block_window_seconds", 10)),
+            float(settings.get("rtlog_poll_timeout_sec", 15.0)),
+        )
         self._device_name = str(device.get("name", ""))
         self._sdk: Optional[PullSDKDevice] = None
         self._seen: Deque[str] = deque(maxlen=10_000)
@@ -913,15 +922,21 @@ class UltraSyncScheduler:
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
         self._stop.clear()
+        self._logger.info(
+            "[UltraSyncScheduler] starting: %d device(s), ids=%s",
+            len(devices), [d.get("id") for d in devices],
+        )
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="UltraSyncScheduler"
         )
         self._thread.start()
 
     def stop(self):
+        self._logger.info("[UltraSyncScheduler] stopping")
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._logger.info("[UltraSyncScheduler] stopped")
 
     def _run(self):
         """Sync loop: push data to each ULTRA device on its configured interval."""
@@ -947,11 +962,19 @@ class UltraSyncScheduler:
 
     def _sync_all(self):
         """Push user data to all ULTRA devices (with hash-based skip)."""
+        self._logger.info(
+            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s)",
+            len(self._devices),
+        )
+        t0 = time.time()
         # Check worker health before each sync cycle
         try:
             self._check_worker_health()
         except Exception as e:
             self._logger.warning("[ULTRA] _check_worker_health error: %s", e)
+        synced = 0
+        skipped = 0
+        failed = 0
         for d in self._devices:
             device_id = d.get("id")
             try:
@@ -966,8 +989,15 @@ class UltraSyncScheduler:
                 self._next_sync_at[device_id] = time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(next_t)
                 )
+                synced += 1
             except Exception as e:
+                failed += 1
                 self._logger.error("[ULTRA:%s] sync failed: %s", device_id, e)
+        elapsed = time.time() - t0
+        self._logger.info(
+            "[UltraSyncScheduler] _sync_all: cycle done in %.1fs — synced=%d skipped=%d failed=%d",
+            elapsed, synced, skipped, failed,
+        )
 
     def _sync_device(self, device: Dict[str, Any]):
         """Push data to a single device with hash-based change detection.
@@ -1002,10 +1032,17 @@ class UltraSyncScheduler:
         current_hash = hashlib.sha256(payload_str.encode()).hexdigest()
 
         if self._last_hash.get(device_id) == current_hash:
-            self._logger.info("[ULTRA:%s] sync skip: hash unchanged", device_id)
+            self._logger.info(
+                "[ULTRA:%s] sync skip: hash unchanged (users=%d hash=%s)",
+                device_id, len(users), current_hash[:12],
+            )
             return
 
-        self._logger.info("[ULTRA:%s] sync push started", device_id)
+        self._logger.info(
+            "[ULTRA:%s] sync push started: users=%d prev_hash=%s new_hash=%s",
+            device_id, len(users),
+            (self._last_hash.get(device_id) or "none")[:12], current_hash[:12],
+        )
 
         device_copy = dict(device or {})
         device_copy["accessDataMode"] = "DEVICE"

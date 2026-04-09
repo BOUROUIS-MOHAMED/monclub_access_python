@@ -771,6 +771,14 @@ class DeviceSyncEngine:
 
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
             stale_pins = sorted([p for p in device_pins if p in known_server_pins and p not in desired_pins])
+            self.logger.info(
+                "[DeviceSync] Device id=%s: device_pins=%d desired=%d to_sync=%d "
+                "stale=%d drift_resynced=%d door_bitmask=%d",
+                dev_id, len(device_pins), len(desired_pins), len(pins_to_sync),
+                len(stale_pins),
+                sum(1 for p in desired_pins if p not in device_pins and prev_hashes.get(p)),
+                door_bitmask,
+            )
 
             deleted = 0
             for p in stale_pins:
