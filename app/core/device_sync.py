@@ -214,7 +214,8 @@ class DeviceSyncEngine:
                 self._progress_cond.wait(timeout=max(0.0, float(timeout)))
             return dict(self._sync_progress), self._progress_seq
 
-    def run_blocking(self, *, cache, source: str = "timer") -> bool:
+    def run_blocking(self, *, cache, source: str = "timer",
+                     changed_ids: set | None = None) -> bool:
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip ({source}): already running")
@@ -222,7 +223,7 @@ class DeviceSyncEngine:
             self._running = True
 
         try:
-            self._sync_all_devices(cache=cache)
+            self._sync_all_devices(cache=cache, changed_ids=changed_ids)
             return True
         except Exception as e:
             self.logger.exception(f"[DeviceSync] Failed: {e}")
@@ -725,6 +726,7 @@ class DeviceSyncEngine:
         users: List[Dict[str, Any]],
         local_fp_index: Dict[str, List[Any]],
         default_door_id: int,
+        changed_ids: set | None = None,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
@@ -824,6 +826,19 @@ class DeviceSyncEngine:
                 pins_to_sync.add(pin)
                 templates_for_sync[pin] = templates
 
+        # Delta hint: when the backend reported only a subset of users changed,
+        # prune pins_to_sync to those users + any with a failed/missing prev sync.
+        # Stale-pin deletion is unaffected (uses desired_pins, not pins_to_sync).
+        if changed_ids is not None:
+            pins_to_sync = {
+                pin for pin in pins_to_sync
+                if (
+                    int(pin) in changed_ids          # changed per backend delta
+                    or not prev_state.get(pin, ("", True))[0]   # no stored hash (new)
+                    or not prev_state.get(pin, ("", True))[1]   # previous push failed
+                )
+            }
+
         _policy_str = str(device.get("pushingToDevicePolicy") or "ALL").strip().upper()
         self.logger.info(
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
@@ -864,8 +879,11 @@ class DeviceSyncEngine:
 
             # F-011: Drift detection — desired pins missing from device despite having a stored hash
             # indicate external removal. Force re-sync for those pins.
+            # In delta mode skip drift check for unchanged users; they'll be caught on the next full sync.
             for pin in desired_pins:
                 if pin not in device_pins and prev_hashes.get(pin) and pin not in pins_to_sync:
+                    if changed_ids is not None and int(pin) not in changed_ids:
+                        continue  # skip drift detection for unchanged users in delta mode
                     self.logger.info(
                         f"[DeviceSync] Device id={dev_id} Pin={pin}: "
                         f"not on device but hash stored — external removal detected, forcing re-sync"
@@ -1129,7 +1147,7 @@ class DeviceSyncEngine:
             except Exception:
                 pass
 
-    def _sync_all_devices(self, *, cache) -> None:
+    def _sync_all_devices(self, *, cache, changed_ids: set | None = None) -> None:
         if not cache:
             self.logger.info("[DeviceSync] No cache -> skip")
             return
@@ -1158,8 +1176,10 @@ class DeviceSyncEngine:
 
         default_door_id = self._default_authorize_door_id()
         self.logger.info(
-            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d default_door_id=%s",
+            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d "
+            "default_door_id=%s changed_ids=%s",
             len(devices), len(users), len(local_fp_index), default_door_id,
+            len(changed_ids) if changed_ids is not None else "all",
         )
 
         device_mode_devices: List[Dict[str, Any]] = []
@@ -1203,6 +1223,7 @@ class DeviceSyncEngine:
                         users=users,
                         local_fp_index=local_fp_index,
                         default_door_id=default_door_id,
+                        changed_ids=changed_ids,
                     ): dev
                     for dev in device_mode_devices
                 }
