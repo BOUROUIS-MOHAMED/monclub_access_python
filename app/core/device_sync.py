@@ -1,7 +1,6 @@
 # monclub_access_python/app/core/device_sync.py
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import threading
 from dataclasses import dataclass
@@ -15,6 +14,8 @@ from app.core.db import (
     save_device_sync_state,
     delete_device_sync_state,
     prune_device_sync_state,
+    upsert_device_mirror_pin,
+    delete_device_mirror_pin,
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
 from app.sdk.pullsdk import PullSDK, PullSDKError
@@ -39,6 +40,13 @@ class FirmwareProfile:
 
 # Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
 DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK = 15
+
+# ── Pushing policy constants ──────────────────────────────────────────────────
+# Resolved from device.pushingToDevicePolicy (backend enum value).
+# Controls HOW member data is pushed to a ZKTeco device during sync.
+_PUSH_POLICY_INCREMENTAL   = "INCREMENTAL"    # delta: hash-based, delete stale + changed-then-insert
+_PUSH_POLICY_FULL_REPLACE  = "FULL_REPLACE"   # nuke all tables then push entire desired roster
+_PUSH_POLICY_ADDITIVE_ONLY = "ADDITIVE_ONLY"  # push changed/new (delete-then-insert), never remove stale
 
 
 def _parse_dt_any(s: str) -> datetime | None:
@@ -153,9 +161,15 @@ class DeviceSyncEngine:
     - This engine only syncs devices where accessDataMode == DEVICE.
     - Global defaults (default_authorize_door_id, sdk_read_initial_bytes, etc.) come from
       GymAccessSoftwareSettingsDto cached in SQLite, via settings_reader.get_backend_global_settings().
+
+    IMPORTANT CHANGE (Apr 2026):
+    - Per-device persistent worker threads replace the ThreadPoolExecutor approach.
+    - _sync_all_devices dispatches SyncJob to DeviceWorkerManager (non-blocking).
+    - Each device has its own daemon thread with latest-wins queue semantics.
     """
 
     def __init__(self, *, cfg, logger):
+        from app.core.device_worker import DeviceWorkerManager
         self.cfg = cfg
         self.logger = logger
         self._run_lock = threading.Lock()
@@ -163,7 +177,7 @@ class DeviceSyncEngine:
         self._progress_cond = threading.Condition()
         self._progress_seq = 0
         # Live progress readable by the status API (dict value assignments are
-        # atomic under CPython GIL — safe across ThreadPoolExecutor workers).
+        # atomic under CPython GIL — safe across worker threads).
         self._sync_progress: Dict[str, Any] = {
             "running": False,
             "deviceName": "",
@@ -175,6 +189,11 @@ class DeviceSyncEngine:
         # L1 cache (memory) backed by L2 (SQLite via db.py).
         # Keyed by device_id (stable integer), not IP (DHCP can reassign IPs).
         self._firmware_profiles: dict[int, FirmwareProfile] = {}
+        # Per-device persistent worker threads (P2).
+        self._worker_manager = DeviceWorkerManager(
+            sync_fn=self._sync_one_device,
+            logger=logger,
+        )
 
     def _get_firmware_profile(self, device_id: int) -> FirmwareProfile:
         """
@@ -227,6 +246,10 @@ class DeviceSyncEngine:
                 self._progress_cond.wait(timeout=max(0.0, float(timeout)))
             return dict(self._sync_progress), self._progress_seq
 
+    def stop_workers(self) -> None:
+        """Stop all per-device worker threads. Call on logout / shutdown."""
+        self._worker_manager.stop_all()
+
     def run_blocking(self, *, cache, source: str = "timer",
                      changed_ids: set | None = None) -> bool:
         with self._run_lock:
@@ -263,6 +286,31 @@ class DeviceSyncEngine:
         if v is None or int(v) < 1:
             return int(DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK)
         return int(v)
+
+    def _resolve_push_policy(self, device: Dict[str, Any]) -> str:
+        """
+        Map device.pushingToDevicePolicy (backend enum string) to one of the three
+        canonical push-policy constants.  Defaults to INCREMENTAL.
+
+        Backend enum → policy mapping:
+          DELETE_ALL_BEFORE_PUSHING                             → FULL_REPLACE
+          DELETE_ALL_KNOWING_PINS_BUT_NO_LONGER_DESIRED_*      → INCREMENTAL (default)
+          DELETE_ALL_NOT_DESIRED_PINS_BEFORE_PUSHING           → INCREMENTAL
+          PUSH_WITHOUT_DELETING                                → ADDITIVE_ONLY
+          DELETE_ALL_NOT_KNOWING_PINS_AND_DONT_PUSH            → FULL_REPLACE (clear, no push — treated as reset)
+        """
+        raw = str(device.get("pushingToDevicePolicy") or "").strip().upper()
+        if not raw:
+            return _PUSH_POLICY_INCREMENTAL
+        # Explicit FULL_REPLACE triggers
+        if raw in ("DELETE_ALL_BEFORE_PUSHING", "FULL_REPLACE",
+                   "DELETE_ALL_NOT_KNOWING_PINS_AND_DONT_PUSH"):
+            return _PUSH_POLICY_FULL_REPLACE
+        # Explicit ADDITIVE_ONLY triggers
+        if raw in ("PUSH_WITHOUT_DELETING", "ADDITIVE_ONLY"):
+            return _PUSH_POLICY_ADDITIVE_ONLY
+        # Everything else: INCREMENTAL (safe default)
+        return _PUSH_POLICY_INCREMENTAL
 
     def _resolve_push_context(
         self,
@@ -728,6 +776,37 @@ class DeviceSyncEngine:
             return False
         return True
 
+    def _delete_pin_unconditional(self, *, sdk: PullSDK, pin: str) -> bool:
+        """
+        Delete a pin from ALL tables WITHOUT consulting device_pins first.
+        ZKTeco DeleteDeviceData is idempotent — deleting a non-existent record
+        returns success (or a benign error) on all known firmware versions.
+
+        Use this for pins_to_sync pre-delete (ensures clean insert even when
+        device_pins is stale or the read step returned an empty set).
+        Do NOT use for the stale-pins pass — use _delete_pin_if_exists there so
+        that we confirm the pin is on the device before issuing SDK calls.
+        """
+        cond = f"Pin={pin}"
+        for table in ("templatev10", "template"):
+            try:
+                sdk.delete_device_data(table=table, data=cond, options="")
+            except Exception as ex:
+                self.logger.debug(
+                    "[DeviceSync] _delete_pin_unconditional %s Pin=%s (non-fatal): %s", table, pin, ex)
+        try:
+            sdk.delete_device_data(table="userauthorize", data=cond, options="")
+        except Exception as ex:
+            self.logger.debug(
+                "[DeviceSync] _delete_pin_unconditional userauthorize Pin=%s (non-fatal): %s", pin, ex)
+        try:
+            sdk.delete_device_data(table="user", data=cond, options="")
+            return True
+        except Exception as ex:
+            self.logger.warning(
+                "[DeviceSync] _delete_pin_unconditional user Pin=%s FAILED: %s", pin, ex)
+            return False
+
     def _delete_auth_and_templates_best_effort(self, *, sdk: PullSDK, pin: str) -> None:
         if not sdk.supports_delete_device_data():
             return
@@ -878,6 +957,9 @@ class DeviceSyncEngine:
             self.logger.warning(f"[DeviceSync] Skip device id={dev_id} name={dev_name!r}: missing ipAddress")
             return
 
+        # P1: resolve effective push policy for this device
+        policy = self._resolve_push_policy(device)
+
         desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
         desired_pins = set(desired.keys())
 
@@ -917,7 +999,8 @@ class DeviceSyncEngine:
         # Delta hint: when the backend reported only a subset of users changed,
         # prune pins_to_sync to those users + any with a failed/missing prev sync.
         # Stale-pin deletion is unaffected (uses desired_pins, not pins_to_sync).
-        if changed_ids is not None:
+        # Skip delta pruning for FULL_REPLACE — that policy always pushes everything.
+        if changed_ids is not None and policy != _PUSH_POLICY_FULL_REPLACE:
             pins_to_sync = {
                 pin for pin in pins_to_sync
                 if (
@@ -927,11 +1010,10 @@ class DeviceSyncEngine:
                 )
             }
 
-        _policy_str = str(device.get("pushingToDevicePolicy") or "ALL").strip().upper()
         self.logger.info(
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
             f"desired={len(desired_pins)} to_sync={len(pins_to_sync)} "
-            f"door_bitmask={door_bitmask} doorIds={door_ids} tz={authorize_timezone_id} policy={_policy_str}"
+            f"door_bitmask={door_bitmask} doorIds={door_ids} tz={authorize_timezone_id} policy={policy}"
         )
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
@@ -996,9 +1078,32 @@ class DeviceSyncEngine:
                 door_bitmask,
             )
 
-            # ── Nuke-and-repave: when more users need deleting than keeping,
-            #    it's faster to clear all tables and re-push desired users. ──
-            nuke_mode = len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
+            # ── P1: Policy-driven nuke decision ──────────────────────────────
+            # FULL_REPLACE  → always clear all tables (policy mandate).
+            # ADDITIVE_ONLY → never delete anything; skip stale-pin removal too.
+            # INCREMENTAL   → heuristic nuke when deleting > keeping (optimization).
+            if policy == _PUSH_POLICY_FULL_REPLACE:
+                nuke_mode = True
+                pins_to_sync = set(desired.keys())  # push entire roster
+                stale_pins = []                      # tables will be cleared anyway
+                self.logger.info(
+                    "[DeviceSync] Device id=%s: FULL_REPLACE policy — "
+                    "clearing all tables, pushing all %d members",
+                    dev_id, len(pins_to_sync),
+                )
+            elif policy == _PUSH_POLICY_ADDITIVE_ONLY:
+                nuke_mode = False
+                _ignored_stale = len(stale_pins)
+                stale_pins = []  # never remove stale pins in ADDITIVE_ONLY
+                if _ignored_stale > 0:
+                    self.logger.info(
+                        "[DeviceSync] Device id=%s: ADDITIVE_ONLY policy — "
+                        "%d stale pin(s) left on device intentionally",
+                        dev_id, _ignored_stale,
+                    )
+            else:
+                # INCREMENTAL: heuristic nuke-and-repave
+                nuke_mode = len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
             if nuke_mode:
                 self.logger.info(
                     "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
@@ -1041,6 +1146,10 @@ class DeviceSyncEngine:
                     if self._delete_pin_if_exists(sdk=sdk, pin=p, device_pins=device_pins):
                         deleted += 1
                     delete_device_sync_state(device_id=did, pin=p)
+                    try:
+                        delete_device_mirror_pin(device_id=did, pin=p)
+                    except Exception:
+                        pass
                 except Exception as ex:
                     self.logger.warning(f"[DeviceSync] Delete stale Pin={p} failed: {ex}")
 
@@ -1065,12 +1174,17 @@ class DeviceSyncEngine:
             pins_sorted = sorted(pins_to_sync)
 
             if use_batch and pins_sorted:
-                # Pre-delete (only in non-nuke mode) to avoid rc=-101 on insert-only firmware
+                # P0 fix: Unconditional delete-before-insert for each changed pin.
+                # _delete_pin_unconditional does NOT check device_pins first — it
+                # always issues the SDK delete, which is idempotent on all ZKTeco
+                # firmware (deleting a non-existent pin is a no-op, not an error).
+                # This prevents the silent-failure where firmware returns rc=0 on a
+                # duplicate-pin insert (appearing to succeed but keeping the old CardNo).
                 if not nuke_mode:
                     predelete_progress_cap = max(0, len(pins_sorted) - 1)
                     predelete_progress_step = max(1, len(pins_sorted) // 100)
                     for idx, pin in enumerate(pins_sorted, start=1):
-                        self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                        self._delete_pin_unconditional(sdk=sdk, pin=pin)
                         if (
                             predelete_progress_cap > 0
                             and (idx == len(pins_sorted) or idx % predelete_progress_step == 0)
@@ -1242,15 +1356,30 @@ class DeviceSyncEngine:
                             warn_templates_users += 1
                             self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
 
-                # Phase D: Save device sync state for all pushed pins
+                # Phase D: Save device sync state + write-through mirror for all pushed pins
                 for pin in pins_sorted:
-                    if desired.get(pin):
+                    u = desired.get(pin)
+                    if u:
                         save_device_sync_state(
                             device_id=did, pin=pin,
                             desired_hash=desired_hashes.get(pin) or "",
                             ok=True, error=None,
                         )
                         ok_synced += 1
+                        # P7: update device content mirror (write-through)
+                        try:
+                            _u_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
+                            _u_card = _pin_str(u.get("firstCardId") or "")
+                            _u_fps = len(templates_for_sync.get(pin) or [])
+                            upsert_device_mirror_pin(
+                                device_id=did, pin=pin,
+                                full_name=_u_name, card_no=_u_card or None,
+                                door_bitmask=door_bitmask,
+                                authorize_tz_id=int(authorize_timezone_id),
+                                fp_count=_u_fps, push_ok=True,
+                            )
+                        except Exception:
+                            pass
                 self._set_progress(current=ok_synced)
                 self.logger.info(
                     "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
@@ -1274,7 +1403,10 @@ class DeviceSyncEngine:
                     )
 
                     try:
-                        self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                        # P0 fix: unconditional delete — never rely on device_pins
+                        # being accurate (it may be empty/stale if the read failed or
+                        # returned no rows). See _delete_pin_unconditional docstring.
+                        self._delete_pin_unconditional(sdk=sdk, pin=pin)
 
                         card_valid = card if (card and card.isdigit()) else ""
                         if card and not card_valid:
@@ -1354,6 +1486,17 @@ class DeviceSyncEngine:
                                 ok=True, error=None,
                             )
                             ok_synced += 1
+                            # P7: write-through device content mirror
+                            try:
+                                upsert_device_mirror_pin(
+                                    device_id=did, pin=pin,
+                                    full_name=full_name, card_no=card or None,
+                                    door_bitmask=door_bitmask,
+                                    authorize_tz_id=int(authorize_timezone_id),
+                                    fp_count=len(templates), push_ok=True,
+                                )
+                            except Exception:
+                                pass
                         else:
                             save_device_sync_state(
                                 device_id=did, pin=pin,
@@ -1361,6 +1504,17 @@ class DeviceSyncEngine:
                                 ok=False, error=auth_err or "authorize incomplete",
                             )
                             failed_synced += 1
+                            # P7: record failed push in mirror so dashboard can show drift
+                            try:
+                                upsert_device_mirror_pin(
+                                    device_id=did, pin=pin,
+                                    full_name=full_name, card_no=card or None,
+                                    door_bitmask=door_bitmask,
+                                    authorize_tz_id=int(authorize_timezone_id),
+                                    fp_count=len(templates), push_ok=False,
+                                )
+                            except Exception:
+                                pass
                         self._set_progress(current=ok_synced + failed_synced)
 
                     except Exception as ex:
@@ -1502,45 +1656,20 @@ class DeviceSyncEngine:
             "[DeviceSync] device_mode_devices to sync: %d", len(device_mode_devices)
         )
 
-        # F-008: Run device syncs in parallel (max_workers=4, safe bounded parallelism)
-        self._set_progress(running=True)
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(
-                        self._sync_one_device,
-                        device=dev,
-                        users=users,
-                        local_fp_index=local_fp_index,
-                        default_door_id=default_door_id,
-                        changed_ids=changed_ids,
-                    ): dev
-                    for dev in device_mode_devices
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    dev = futures[future]
-                    dev_id = dev.get("id")
-                    dev_name = dev.get("name", "")
-                    try:
-                        future.result()
-                        self.logger.info(
-                            "[DeviceSync] device id=%s name=%r sync future completed OK", dev_id, dev_name
-                        )
-                    except PullSDKError as ex:
-                        self.logger.warning(
-                            "[DeviceSync] device id=%s name=%r sync FAILED (PullSDK): %s",
-                            dev_id, dev_name, ex,
-                        )
-                    except Exception as e:
-                        self.logger.error(
-                            "[DeviceSync] device id=%s name=%r sync FAILED (unexpected): %s",
-                            dev_id, dev_name, e,
-                        )
-        finally:
-            self._set_progress(
-                running=False,
-                deviceName="",
-                deviceId=None,
-                current=0,
-                total=0,
-            )
+        # P2: Dispatch to per-device persistent worker threads (non-blocking, latest-wins).
+        # Workers are reconciled first so new/removed devices are handled before dispatch.
+        from app.core.device_worker import SyncJob
+        self._worker_manager.update_devices(device_mode_devices)
+        job = SyncJob(
+            users=users,
+            local_fp_index=local_fp_index,
+            default_door_id=default_door_id,
+            changed_ids=changed_ids,
+        )
+        dispatched = self._worker_manager.dispatch_all(job)
+        self._set_progress(running=True, current=0, total=dispatched)
+        self.logger.info(
+            "[DeviceSync] dispatched SyncJob to %d device workers (changed_ids=%s)",
+            dispatched,
+            len(changed_ids) if changed_ids is not None else "all",
+        )

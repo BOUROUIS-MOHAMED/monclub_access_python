@@ -840,6 +840,54 @@ def init_db() -> None:
             """
         )
 
+        # P7: Device content mirror — write-through copy of what was last pushed to each device.
+        # Updated after every successful per-pin push; used for drift detection and dashboard visibility.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_content_mirror (
+                device_id       INTEGER NOT NULL,
+                pin             TEXT    NOT NULL,
+                full_name       TEXT,
+                card_no         TEXT,
+                door_bitmask    INTEGER,
+                authorize_tz_id INTEGER,
+                fp_count        INTEGER NOT NULL DEFAULT 0,
+                pushed_at       TEXT    NOT NULL,
+                push_ok         INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (device_id, pin)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dcm_device ON device_content_mirror(device_id);"
+        )
+
+        # P6: Member shadow — lightweight local copy of backend member state for diff detection.
+        # Enables Access to classify changes as NEW/MODIFIED/DELETED and route to affected devices
+        # without fetching the full roster from the backend on every sync.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_shadow (
+                active_membership_id  INTEGER PRIMARY KEY,
+                pin                   TEXT,
+                full_name             TEXT,
+                card_id               TEXT,
+                second_card_id        TEXT,
+                membership_id         INTEGER,
+                valid_from            TEXT,
+                valid_to              TEXT,
+                fp_hash               TEXT,
+                updated_at            TEXT    NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ms_membership ON member_shadow(membership_id);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ms_card ON member_shadow(card_id) WHERE card_id IS NOT NULL;"
+        )
+
         conn.commit()
 
     # F-014: On startup, reset any stale processing locks in the offline queue
@@ -950,6 +998,234 @@ def clear_firmware_profile(*, device_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM sync_firmware_profiles WHERE device_id = ?", (device_id,))
         conn.commit()
+
+
+# -----------------------------
+# P7: Device content mirror
+# -----------------------------
+
+def upsert_device_mirror_pin(
+    *,
+    device_id: int,
+    pin: str,
+    full_name: str | None,
+    card_no: str | None,
+    door_bitmask: int | None,
+    authorize_tz_id: int | None,
+    fp_count: int = 0,
+    push_ok: bool = True,
+) -> None:
+    """Write-through update after a successful per-pin push to a ZKTeco device."""
+    import time as _time
+    pushed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO device_content_mirror
+                (device_id, pin, full_name, card_no, door_bitmask, authorize_tz_id,
+                 fp_count, pushed_at, push_ok)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, pin) DO UPDATE SET
+                full_name       = excluded.full_name,
+                card_no         = excluded.card_no,
+                door_bitmask    = excluded.door_bitmask,
+                authorize_tz_id = excluded.authorize_tz_id,
+                fp_count        = excluded.fp_count,
+                pushed_at       = excluded.pushed_at,
+                push_ok         = excluded.push_ok
+            """,
+            (device_id, pin, full_name, card_no, door_bitmask, authorize_tz_id,
+             fp_count, pushed_at, 1 if push_ok else 0),
+        )
+        conn.commit()
+
+
+def delete_device_mirror_pin(*, device_id: int, pin: str) -> None:
+    """Remove a pin from the content mirror (called when pin is deleted from device)."""
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM device_content_mirror WHERE device_id=? AND pin=?",
+            (device_id, pin),
+        )
+        conn.commit()
+
+
+def list_device_mirror(*, device_id: int) -> List[Dict[str, Any]]:
+    """Return all mirror rows for a device (used by API + drift detection)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM device_content_mirror WHERE device_id=? ORDER BY pin",
+            (device_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_device_mirror(*, device_id: int) -> None:
+    """Wipe the entire mirror for a device (called on FULL_REPLACE before re-push)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM device_content_mirror WHERE device_id=?", (device_id,))
+        conn.commit()
+
+
+# -----------------------------
+# P6: Member shadow
+# -----------------------------
+
+def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
+    """
+    Upsert the local shadow copy of backend member state.
+    Called after every successful getSyncData response so the shadow
+    always reflects the last known backend state.
+    """
+    if not users:
+        return
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_conn() as conn:
+        for u in users:
+            amid = u.get("activeMembershipId") or u.get("active_membership_id")
+            if amid is None:
+                continue
+            try:
+                amid = int(amid)
+            except (TypeError, ValueError):
+                continue
+            # Build fingerprint hash from fingerprints list (if any)
+            fps = u.get("fingerprints") or []
+            if fps:
+                import hashlib as _hashlib
+                fp_str = json.dumps(
+                    sorted([f.get("fingerId") for f in fps if isinstance(f, dict)]),
+                    sort_keys=True,
+                )
+                fp_hash = _hashlib.sha1(fp_str.encode()).hexdigest()
+            else:
+                fp_hash = None
+
+            conn.execute(
+                """
+                INSERT INTO member_shadow
+                    (active_membership_id, pin, full_name, card_id, second_card_id,
+                     membership_id, valid_from, valid_to, fp_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(active_membership_id) DO UPDATE SET
+                    pin            = excluded.pin,
+                    full_name      = excluded.full_name,
+                    card_id        = excluded.card_id,
+                    second_card_id = excluded.second_card_id,
+                    membership_id  = excluded.membership_id,
+                    valid_from     = excluded.valid_from,
+                    valid_to       = excluded.valid_to,
+                    fp_hash        = excluded.fp_hash,
+                    updated_at     = excluded.updated_at
+                """,
+                (
+                    amid,
+                    str(u.get("activeMembershipId") or u.get("active_membership_id") or amid),
+                    u.get("fullName") or u.get("full_name"),
+                    u.get("firstCardId") or u.get("first_card_id"),
+                    u.get("secondCardId") or u.get("second_card_id"),
+                    u.get("membershipId") or u.get("membership_id"),
+                    u.get("validFrom") or u.get("valid_from"),
+                    u.get("validTo") or u.get("valid_to"),
+                    fp_hash,
+                    now,
+                ),
+            )
+        conn.commit()
+
+
+def delete_member_shadow(*, active_membership_ids: List[int]) -> None:
+    """Remove shadow rows for deleted members."""
+    if not active_membership_ids:
+        return
+    placeholders = ",".join("?" * len(active_membership_ids))
+    with get_conn() as conn:
+        conn.execute(
+            f"DELETE FROM member_shadow WHERE active_membership_id IN ({placeholders})",
+            active_membership_ids,
+        )
+        conn.commit()
+
+
+def get_member_shadow_cards() -> Dict[int, str | None]:
+    """Return {activeMembershipId: cardId} for all shadow rows."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT active_membership_id, card_id FROM member_shadow"
+        ).fetchall()
+        return {int(r["active_membership_id"]): r["card_id"] for r in rows}
+
+
+def diff_member_shadow(
+    *,
+    incoming_users: List[Dict[str, Any]],
+    valid_member_ids: List[int] | None = None,
+) -> Dict[str, List[int]]:
+    """
+    Compare incoming users against the local shadow and return classified changes.
+
+    Returns:
+        {
+          "new":      [activeMembershipId, ...],   — not in shadow
+          "modified": [activeMembershipId, ...],   — in shadow but fields changed
+          "deleted":  [activeMembershipId, ...],   — in shadow but not in valid_member_ids
+        }
+
+    Uses only the fields that affect device access: card, name, fp_hash, validity dates.
+    """
+    with get_conn() as conn:
+        shadow_rows = conn.execute("SELECT * FROM member_shadow").fetchall()
+        shadow = {int(r["active_membership_id"]): dict(r) for r in shadow_rows}
+
+    incoming_ids: set[int] = set()
+    new_ids: List[int] = []
+    modified_ids: List[int] = []
+
+    for u in incoming_users or []:
+        amid_raw = u.get("activeMembershipId") or u.get("active_membership_id")
+        if amid_raw is None:
+            continue
+        try:
+            amid = int(amid_raw)
+        except (TypeError, ValueError):
+            continue
+        incoming_ids.add(amid)
+
+        fps = u.get("fingerprints") or []
+        if fps:
+            import hashlib as _hashlib
+            fp_str = json.dumps(
+                sorted([f.get("fingerId") for f in fps if isinstance(f, dict)]),
+                sort_keys=True,
+            )
+            fp_hash = _hashlib.sha1(fp_str.encode()).hexdigest()
+        else:
+            fp_hash = None
+
+        if amid not in shadow:
+            new_ids.append(amid)
+            continue
+
+        s = shadow[amid]
+        changed = (
+            (u.get("firstCardId") or u.get("first_card_id")) != s.get("card_id")
+            or (u.get("secondCardId") or u.get("second_card_id")) != s.get("second_card_id")
+            or (u.get("fullName") or u.get("full_name")) != s.get("full_name")
+            or fp_hash != s.get("fp_hash")
+            or (u.get("validFrom") or u.get("valid_from")) != s.get("valid_from")
+            or (u.get("validTo") or u.get("valid_to")) != s.get("valid_to")
+        )
+        if changed:
+            modified_ids.append(amid)
+
+    deleted_ids: List[int] = []
+    if valid_member_ids is not None:
+        valid_set = set(valid_member_ids)
+        for amid in shadow:
+            if amid not in valid_set and amid not in incoming_ids:
+                deleted_ids.append(amid)
+
+    return {"new": new_ids, "modified": modified_ids, "deleted": deleted_ids}
 
 
 # -----------------------------

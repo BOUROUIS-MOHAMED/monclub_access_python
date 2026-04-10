@@ -418,6 +418,10 @@ class MainApp:
                 self._change_detector.stop()
             except Exception:
                 pass
+        try:
+            self._device_sync_engine.stop_workers()
+        except Exception:
+            pass
         # Shutdown ULTRA engine (with lock to prevent race with sync_tick)
         try:
             with self._ultra_lock:
@@ -635,6 +639,10 @@ class MainApp:
             except Exception:
                 pass
             self._change_detector = None
+        try:
+            self._device_sync_engine.stop_workers()
+        except Exception:
+            pass
         self._active_view = "login"
 
     def show_restricted(self):
@@ -1136,6 +1144,55 @@ class MainApp:
                         for u in (data.get("users") or [])
                         if isinstance(u, dict) and u.get("activeMembershipId") is not None
                     }
+
+                # P6: Member shadow diff — detect actual field changes and update shadow.
+                # For full member refreshes this can narrow _delta_changed_ids to only
+                # members whose access-relevant fields actually changed (card, name, fps, dates).
+                if refresh.get("members"):
+                    _incoming_users = data.get("users") or []
+                    _valid_ids_raw = data.get("validMemberIds")
+                    try:
+                        from app.core.db import (
+                            diff_member_shadow, upsert_member_shadow, delete_member_shadow,
+                        )
+                        _valid_ids = (
+                            [int(x) for x in _valid_ids_raw if x is not None]
+                            if _valid_ids_raw is not None else None
+                        )
+                        _diff = diff_member_shadow(
+                            incoming_users=_incoming_users,
+                            valid_member_ids=_valid_ids,
+                        )
+                        _shadow_changed = set(_diff["new"] + _diff["modified"])
+                        _shadow_deleted = _diff["deleted"]
+                        self.logger.info(
+                            "[ShadowDiff] new=%d modified=%d deleted=%d",
+                            len(_diff["new"]), len(_diff["modified"]), len(_shadow_deleted),
+                        )
+                        # For full refreshes (not delta): if shadow shows only a subset
+                        # changed, narrow _delta_changed_ids so we don't re-push every pin.
+                        if not data.get("membersDeltaMode") and _incoming_users:
+                            if _shadow_changed:
+                                _delta_changed_ids = _shadow_changed
+                                self.logger.info(
+                                    "[ShadowDiff] narrowed changed_ids to %d/%d via shadow diff",
+                                    len(_shadow_changed), len(_incoming_users),
+                                )
+                            elif not _shadow_deleted:
+                                # Nothing changed at all — skip device push entirely this cycle
+                                _delta_changed_ids = set()
+                                self.logger.info(
+                                    "[ShadowDiff] no member changes detected, "
+                                    "setting changed_ids=empty to skip pin push"
+                                )
+                        # Write updated shadow entries
+                        upsert_member_shadow(users=_incoming_users)
+                        if _shadow_deleted:
+                            delete_member_shadow(active_membership_ids=_shadow_deleted)
+                    except Exception as _shadow_exc:
+                        self.logger.warning(
+                            "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
+                        )
 
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they

@@ -563,6 +563,34 @@ class DeviceAttendanceMaintenanceEngine:
                         rows_read,
                         rows_inserted,
                     )
+
+                    # P5: Clear transaction table immediately after every successful read.
+                    # Prevents record accumulation (which slows RTLog reads and TOTP lookups).
+                    # Records are already in local SQLite — safe to clear from device.
+                    # The 2-5 AM purge window remains as a safety-net drain.
+                    _auto_clear = _boolish(global_settings.get("clear_transactions_after_read", True), True)
+                    if _auto_clear:
+                        try:
+                            sdk_device.delete_all_transaction_rows()
+                            save_device_attendance_state(
+                                device_id=device_id,
+                                last_purge_at=now_iso(),
+                                last_purge_deleted_count=int(rows_read),
+                                last_purge_error="",
+                            )
+                            summary["devicePurged"] = 1
+                            summary["rowsPurged"] += int(rows_read)
+                            self.logger.info(
+                                "[DeviceAttendance] device=%s name=%r auto-cleared %s transaction(s) after read",
+                                device_id, device_name, rows_read,
+                            )
+                        except Exception as _clr_exc:
+                            # Non-fatal: cleared on next cycle or by 2AM safety-net purge
+                            self.logger.warning(
+                                "[DeviceAttendance] device=%s name=%r auto-clear after read failed (non-fatal): %s",
+                                device_id, device_name, _clr_exc,
+                            )
+
                 except Exception as exc:
                     save_device_attendance_state(
                         device_id=device_id,
