@@ -44,6 +44,7 @@ def test_strip_member_version_tokens_keeps_non_member_tokens() -> None:
     }
 
     assert strip_member_version_tokens(tokens) == {
+        "membersUpdatedAfter": "2026-04-09T17:43:28",
         "devicesVersion": "devices-token",
         "credentialsVersion": "creds-token",
         "settingsVersion": "settings-token",
@@ -63,6 +64,7 @@ def test_apply_trigger_hint_to_version_tokens_forces_member_refresh_for_membersh
         tokens,
         {"entityType": "ACTIVE_MEMBERSHIP", "operation": "UPDATE"},
     ) == {
+        "membersUpdatedAfter": "2026-04-09T17:43:28",
         "devicesVersion": "devices-token",
         "credentialsVersion": "creds-token",
         "settingsVersion": "settings-token",
