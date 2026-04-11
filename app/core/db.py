@@ -38,6 +38,7 @@ def get_conn() -> Iterator[sqlite3.Connection]:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
     finally:
@@ -886,6 +887,86 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ms_card ON member_shadow(card_id) WHERE card_id IS NOT NULL;"
+        )
+
+        # -----------------------------
+        # sync observability
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_run_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_type        TEXT NOT NULL,
+                trigger_source  TEXT NOT NULL,
+                trigger_hint    TEXT,
+                status          TEXT NOT NULL,
+                members_total   INTEGER NOT NULL DEFAULT 0,
+                members_changed INTEGER NOT NULL DEFAULT 0,
+                devices_synced  INTEGER NOT NULL DEFAULT 0,
+                duration_ms     INTEGER NOT NULL DEFAULT 0,
+                error_message   TEXT,
+                raw_response    TEXT,
+                created_at      TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_run_history_created_at "
+            "ON sync_run_history(created_at DESC);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_run_history_status "
+            "ON sync_run_history(status);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_run_history_trigger_source "
+            "ON sync_run_history(trigger_source);"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_batch_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_run_id     INTEGER REFERENCES sync_run_history(id) ON DELETE SET NULL,
+                device_id       INTEGER NOT NULL,
+                device_name     TEXT NOT NULL,
+                policy          TEXT NOT NULL,
+                pins_attempted  INTEGER NOT NULL DEFAULT 0,
+                pins_success    INTEGER NOT NULL DEFAULT 0,
+                pins_failed     INTEGER NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL,
+                duration_ms     INTEGER NOT NULL DEFAULT 0,
+                error_message   TEXT,
+                created_at      TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_history_created_at "
+            "ON push_batch_history(created_at DESC);"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_batch_history_device_id "
+            "ON push_batch_history(device_id);"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS push_pin_history (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id      INTEGER NOT NULL REFERENCES push_batch_history(id) ON DELETE CASCADE,
+                pin           TEXT NOT NULL,
+                full_name     TEXT,
+                operation     TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                error_message TEXT,
+                duration_ms   INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_push_pin_history_batch_id "
+            "ON push_pin_history(batch_id);"
         )
 
         conn.commit()
@@ -3364,6 +3445,353 @@ def clear_all_device_sync_hashes() -> int:
         cursor = conn.execute("DELETE FROM device_sync_state")
         conn.commit()
         return cursor.rowcount
+
+
+# -----------------------------
+# Sync observability
+# -----------------------------
+
+def _normalize_page_size(*, page: int, size: int, max_size: int = 200) -> tuple[int, int]:
+    page_num = max(int(page), 0)
+    page_size = max(int(size), 1)
+    if page_size > max_size:
+        page_size = max_size
+    return page_num, page_size
+
+
+def insert_sync_run(
+    *,
+    run_type: str,
+    trigger_source: str,
+    trigger_hint: str | None = None,
+    status: str = "IN_PROGRESS",
+    created_at: str,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO sync_run_history (
+                run_type, trigger_source, trigger_hint, status, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(run_type).strip().upper(),
+                str(trigger_source).strip().upper(),
+                trigger_hint,
+                str(status).strip().upper(),
+                created_at,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_sync_run(
+    *,
+    id: int,
+    status: str,
+    members_total: int = 0,
+    members_changed: int = 0,
+    devices_synced: int = 0,
+    duration_ms: int = 0,
+    error_message: str | None = None,
+    raw_response: str | None = None,
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE sync_run_history
+               SET status = ?,
+                   members_total = ?,
+                   members_changed = ?,
+                   devices_synced = ?,
+                   duration_ms = ?,
+                   error_message = ?,
+                   raw_response = ?
+             WHERE id = ?
+            """,
+            (
+                str(status).strip().upper(),
+                int(members_total or 0),
+                int(members_changed or 0),
+                int(devices_synced or 0),
+                int(duration_ms or 0),
+                error_message,
+                raw_response,
+                int(id),
+            ),
+        )
+        conn.commit()
+
+
+def get_sync_run(id: int) -> Dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM sync_run_history WHERE id = ?", (int(id),)).fetchone()
+    return dict(row) if row else None
+
+
+def list_sync_runs(
+    *,
+    page: int,
+    size: int,
+    run_type: str | None = None,
+    status: str | None = None,
+) -> Dict[str, Any]:
+    page_num, page_size = _normalize_page_size(page=page, size=size)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if run_type:
+        clauses.append("run_type = ?")
+        params.append(str(run_type).strip().upper())
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status).strip().upper())
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_conn() as conn:
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM sync_run_history {where_sql}",
+                params,
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT
+                id,
+                run_type,
+                trigger_source,
+                trigger_hint,
+                status,
+                members_total,
+                members_changed,
+                devices_synced,
+                duration_ms,
+                error_message,
+                created_at
+            FROM sync_run_history
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, page_num * page_size],
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in rows],
+        "total": total,
+        "page": page_num,
+        "size": page_size,
+    }
+
+
+def insert_push_batch(
+    *,
+    sync_run_id: int | None,
+    device_id: int,
+    device_name: str,
+    policy: str,
+    status: str = "IN_PROGRESS",
+    created_at: str,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO push_batch_history (
+                sync_run_id,
+                device_id,
+                device_name,
+                policy,
+                status,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(sync_run_id) if sync_run_id is not None else None,
+                int(device_id),
+                str(device_name or ""),
+                str(policy).strip().upper(),
+                str(status).strip().upper(),
+                created_at,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_push_batch(
+    *,
+    id: int,
+    pins_attempted: int,
+    pins_success: int,
+    pins_failed: int,
+    status: str,
+    duration_ms: int,
+    error_message: str | None = None,
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE push_batch_history
+               SET pins_attempted = ?,
+                   pins_success = ?,
+                   pins_failed = ?,
+                   status = ?,
+                   duration_ms = ?,
+                   error_message = ?
+             WHERE id = ?
+            """,
+            (
+                int(pins_attempted or 0),
+                int(pins_success or 0),
+                int(pins_failed or 0),
+                str(status).strip().upper(),
+                int(duration_ms or 0),
+                error_message,
+                int(id),
+            ),
+        )
+        conn.commit()
+
+
+def insert_push_pin(
+    *,
+    batch_id: int,
+    pin: str,
+    full_name: str | None,
+    operation: str,
+    status: str,
+    error_message: str | None = None,
+    duration_ms: int = 0,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO push_pin_history (
+                batch_id,
+                pin,
+                full_name,
+                operation,
+                status,
+                error_message,
+                duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(batch_id),
+                str(pin),
+                full_name,
+                str(operation).strip().upper(),
+                str(status).strip().upper(),
+                error_message,
+                int(duration_ms or 0),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_push_batch(batch_id: int) -> Dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM push_batch_history WHERE id = ?",
+            (int(batch_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_push_batch_pins(batch_id: int) -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, batch_id, pin, full_name, operation, status, error_message, duration_ms
+            FROM push_pin_history
+            WHERE batch_id = ?
+            ORDER BY id ASC
+            """,
+            (int(batch_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_push_batches(
+    *,
+    page: int,
+    size: int,
+    device_id: int | None = None,
+    status: str | None = None,
+) -> Dict[str, Any]:
+    page_num, page_size = _normalize_page_size(page=page, size=size)
+    clauses: List[str] = []
+    params: List[Any] = []
+    if device_id is not None:
+        clauses.append("device_id = ?")
+        params.append(int(device_id))
+    if status:
+        clauses.append("status = ?")
+        params.append(str(status).strip().upper())
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with get_conn() as conn:
+        total = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM push_batch_history {where_sql}",
+                params,
+            ).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"""
+            SELECT
+                id,
+                sync_run_id,
+                device_id,
+                device_name,
+                policy,
+                pins_attempted,
+                pins_success,
+                pins_failed,
+                status,
+                duration_ms,
+                error_message,
+                created_at
+            FROM push_batch_history
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*params, page_size, page_num * page_size],
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in rows],
+        "total": total,
+        "page": page_num,
+        "size": page_size,
+    }
+
+
+def prune_sync_run_history(*, retention_days: int = 30) -> int:
+    days = max(int(retention_days), 1)
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM sync_run_history
+            WHERE julianday('now') - julianday(created_at) > ?
+            """,
+            (days,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def prune_push_batch_history(*, retention_days: int = 30) -> int:
+    days = max(int(retention_days), 1)
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM push_batch_history
+            WHERE julianday('now') - julianday(created_at) > ?
+            """,
+            (days,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 # Realtime RTLog cursor/state

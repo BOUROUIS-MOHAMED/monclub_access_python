@@ -26,6 +26,8 @@ import {
   Users,
   Fingerprint,
   Bot,
+  Activity,
+  Send,
   FileText,
   Settings,
   Database,
@@ -44,6 +46,8 @@ const NAV = [
   { to: "/users", label: "Utilisateurs", icon: Users },
   { to: "/enroll", label: "Enrôlement", icon: Fingerprint },
   { to: "/agent", label: "Agent", icon: Bot },
+  { to: "/sync-history", label: "Historique sync", icon: Activity },
+  { to: "/push-history", label: "Historique push", icon: Send },
   { to: "/logs", label: "Logs", icon: FileText },
   { to: "/local-db", label: "Base locale", icon: Database },
 ] as const;

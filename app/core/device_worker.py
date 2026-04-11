@@ -40,6 +40,7 @@ class SyncJob:
     local_fp_index: Dict[str, List[Any]]
     default_door_id: int
     changed_ids: Optional[Set[int]] = field(default=None)
+    sync_run_id: Optional[int] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,7 @@ class DeviceWorker:
                 local_fp_index=job.local_fp_index,
                 default_door_id=job.default_door_id,
                 changed_ids=job.changed_ids,
+                sync_run_id=job.sync_run_id,
             )
         except Exception as exc:
             self._logger.exception(

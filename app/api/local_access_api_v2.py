@@ -646,7 +646,9 @@ def _status_payload_signature(payload: Dict[str, Any]) -> str:
 def _handle_status_stream_sse(ctx: _Ctx) -> None:
     ctx.send_sse_start()
 
-    payload = _build_status_payload(ctx.app)
+    # SSE should reflect in-memory progress changes immediately; bypass the
+    # short-lived snapshot cache used by one-off status requests.
+    payload = _build_status_payload_uncached(ctx.app)
     last_signature = _status_payload_signature(payload)
     if not ctx.send_sse_event("status", payload):
         return
@@ -655,7 +657,7 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
     while True:
         time.sleep(1.0)
 
-        payload = _build_status_payload(ctx.app)
+        payload = _build_status_payload_uncached(ctx.app)
         signature = _status_payload_signature(payload)
         if signature != last_signature:
             last_signature = signature
@@ -700,7 +702,12 @@ def _handle_auth_login(ctx: _Ctx) -> None:
 
         # trigger sync + redirect evaluation on main thread
         try:
-            ctx.app.after(0, ctx.app.request_sync_now)
+            _schedule_sync_request(
+                ctx.app,
+                trigger_source="SYNC_NOW_API",
+                run_type="TRIGGERED",
+                trigger_hint={"reason": "AUTH_LOGIN"},
+            )
             ctx.app.after(100, ctx.app.evaluate_access_and_redirect)
         except Exception:
             pass
@@ -1135,10 +1142,31 @@ def _handle_tv_config_restart_api(ctx: _Ctx) -> None:
 
 # ==================== 4) SYNC + CACHE ====================
 
+def _schedule_sync_request(
+    app,
+    *,
+    trigger_source: str,
+    run_type: str,
+    trigger_hint: Dict[str, Any] | None = None,
+) -> None:
+    app.after(
+        0,
+        lambda: app.request_sync_now(
+            trigger_source=trigger_source,
+            run_type=run_type,
+            trigger_hint=trigger_hint,
+        ),
+    )
+
+
 def _handle_sync_now(ctx: _Ctx) -> None:
     _logger.info("[LocalAPI] sync_now: manual sync triggered")
     try:
-        ctx.app.after(0, ctx.app.request_sync_now)
+        _schedule_sync_request(
+            ctx.app,
+            trigger_source="SYNC_NOW_API",
+            run_type="TRIGGERED",
+        )
     except Exception:
         pass
     ctx.send_json(200, {"ok": True, "message": "sync triggered"})
@@ -1158,11 +1186,67 @@ def _handle_sync_hard_reset(ctx: _Ctx) -> None:
                 for device_id in list(getattr(sched, "_last_hash", {}).keys()):
                     sched.force_resync(device_id)
 
-        ctx.app.after(0, ctx.app.request_sync_now)
+        _schedule_sync_request(
+            ctx.app,
+            trigger_source="SYNC_NOW_API",
+            run_type="HARD_RESET",
+            trigger_hint={"hardReset": True},
+        )
         ctx.send_json(200, {"ok": True, "cleared": cleared, "message": "Hard reset: all sync hashes cleared, full push triggered"})
     except Exception as e:
         _logger.exception("[LocalAPI] hard-reset failed")
         ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_sync_history_list(ctx: _Ctx) -> None:
+    from app.core.db import list_sync_runs
+
+    page = max(0, ctx.q_int("page", default=0))
+    size = max(1, min(ctx.q_int("size", default=50), 200))
+    run_type = ctx.q("runType", "run_type", default="").strip() or None
+    status = ctx.q("status", default="").strip() or None
+    result = list_sync_runs(page=page, size=size, run_type=run_type, status=status)
+    ctx.send_json(200, {"ok": True, **result})
+
+
+def _handle_sync_history_detail(ctx: _Ctx) -> None:
+    from app.core.db import get_sync_run
+
+    run_id = ctx.param_int("id")
+    if run_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "Invalid sync run id"})
+        return
+    row = get_sync_run(run_id)
+    if row is None:
+        ctx.send_json(404, {"ok": False, "error": "Sync run not found"})
+        return
+    ctx.send_json(200, {"ok": True, "item": row})
+
+
+def _handle_push_history_list(ctx: _Ctx) -> None:
+    from app.core.db import list_push_batches
+
+    page = max(0, ctx.q_int("page", default=0))
+    size = max(1, min(ctx.q_int("size", default=50), 200))
+    device_id = ctx.q_int("deviceId", "device_id", default=0) or None
+    status = ctx.q("status", default="").strip() or None
+    result = list_push_batches(page=page, size=size, device_id=device_id, status=status)
+    ctx.send_json(200, {"ok": True, **result})
+
+
+def _handle_push_history_pins(ctx: _Ctx) -> None:
+    from app.core.db import get_push_batch, get_push_batch_pins
+
+    batch_id = ctx.param_int("batchId")
+    if batch_id <= 0:
+        ctx.send_json(400, {"ok": False, "error": "Invalid push batch id"})
+        return
+    batch = get_push_batch(batch_id)
+    if batch is None:
+        ctx.send_json(404, {"ok": False, "error": "Push batch not found"})
+        return
+    pins = get_push_batch_pins(batch_id)
+    ctx.send_json(200, {"ok": True, "batch": batch, "pins": pins, "total": len(pins)})
 
 
 def _handle_sync_cache_meta(ctx: _Ctx) -> None:

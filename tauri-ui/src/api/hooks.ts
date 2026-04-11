@@ -4,7 +4,7 @@ import { get, post, patch, del, openSSE, ApiError } from "./client";
 import type {
   StatusResponse, LoginRequest, LoginResponse, AppConfig,
   UserDto, AgentStatusResponse, AgentDeviceSnap,
-  UpdateStatusResponse, LogLine, LocalFingerprintDto, PopupEvent,
+  UpdateStatusResponse, LogLine, LocalFingerprintDto, PopupEvent, DeviceTableResponse,
 } from "./types";
 import { normalizeLogLine, upsertLogLine } from "@/lib/logs";
 
@@ -145,6 +145,11 @@ export function usePullSdk() {
     doorOpen: (deviceId: number, doorNumber: number, pulseSeconds: number) =>
       post(`/devices/${deviceId}/door/open`, { doorNumber, pulseSeconds }),
     getInfo: (deviceId: number) => get<any>(`/devices/${deviceId}/info`),
+    getTable: (
+      deviceId: number,
+      tableName: string,
+      params?: Record<string, string>,
+    ) => get<DeviceTableResponse>(`/devices/${deviceId}/table/${tableName}`, params),
   };
 }
 

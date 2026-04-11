@@ -19,6 +19,20 @@ import {
 } from "lucide-react";
 
 interface DoorPreset { id: number; deviceId: number; doorNumber: number; pulseSeconds: number; doorName: string; }
+interface DeviceContentState {
+  tableName: string | null;
+  rows: Record<string, unknown>[];
+  count: number;
+  loading: boolean;
+  error: string | null;
+}
+
+const CONTENT_TABLES = [
+  { key: "user", label: "Utilisateurs" },
+  { key: "userauthorize", label: "Autorisations" },
+  { key: "templatev10", label: "Empreintes" },
+  { key: "transaction", label: "Transactions" },
+] as const;
 
 export default function DevicesPage() {
   const { data, loading, error, reload } = useDevices();
@@ -37,6 +51,7 @@ export default function DevicesPage() {
   const [infoDialog, setInfoDialog] = useState<{
     deviceId: number; cached: Record<string, unknown>; live: any | null;
     liveError: string | null; liveLoading: boolean; presets: DoorPreset[]; presetsLoading: boolean;
+    content: DeviceContentState;
   } | null>(null);
 
   const devices = data?.devices ?? [];
@@ -69,7 +84,22 @@ export default function DevicesPage() {
 
   const handleInfo = useCallback((deviceId: number) => {
     const cachedDev = devices.find((d: any) => (d.id ?? d.deviceId) === deviceId) || {};
-    setInfoDialog({ deviceId, cached: cachedDev as Record<string, unknown>, live: null, liveError: null, liveLoading: false, presets: [], presetsLoading: true });
+    setInfoDialog({
+      deviceId,
+      cached: cachedDev as Record<string, unknown>,
+      live: null,
+      liveError: null,
+      liveLoading: false,
+      presets: [],
+      presetsLoading: true,
+      content: {
+        tableName: null,
+        rows: [],
+        count: 0,
+        loading: false,
+        error: null,
+      },
+    });
     loadPresets(deviceId);
   }, [devices, loadPresets]);
 
@@ -80,6 +110,39 @@ export default function DevicesPage() {
     catch (e) { setInfoDialog((p) => p ? { ...p, liveError: String(e), liveLoading: false } : p); }
   }, [infoDialog, pullsdk]);
 
+  const handleFetchContent = useCallback(async (tableName: string) => {
+    if (!infoDialog) return;
+    setInfoDialog((p) => p ? {
+      ...p,
+      content: { ...p.content, tableName, loading: true, error: null, rows: [] },
+    } : p);
+    try {
+      const res = await pullsdk.getTable(infoDialog.deviceId, tableName, { maxRows: "250" });
+      setInfoDialog((p) => p ? {
+        ...p,
+        content: {
+          tableName,
+          rows: res.rows || [],
+          count: res.count || 0,
+          loading: false,
+          error: null,
+        },
+      } : p);
+    } catch (e) {
+      setInfoDialog((p) => p ? {
+        ...p,
+        content: {
+          ...p.content,
+          tableName,
+          rows: [],
+          count: 0,
+          loading: false,
+          error: String(e),
+        },
+      } : p);
+    }
+  }, [infoDialog, pullsdk]);
+
   const isConnected = (d: any) => {
     const did = d.id ?? d.deviceId;
     if (did && connectedIds.has(did)) return true;
@@ -88,6 +151,9 @@ export default function DevicesPage() {
   };
 
   const HIDE_KEYS = new Set(["payload_json", "raw_payload"]);
+  const contentColumns = infoDialog?.content.rows[0]
+    ? Object.keys(infoDialog.content.rows[0]).filter((key) => !HIDE_KEYS.has(key)).slice(0, 8)
+    : [];
 
   return (
     <div className="space-y-4">
@@ -180,6 +246,7 @@ export default function DevicesPage() {
             <TabsList className="w-full justify-start">
               <TabsTrigger value="cached">Cache</TabsTrigger>
               <TabsTrigger value="presets">Presets portes</TabsTrigger>
+              <TabsTrigger value="content">Contenu</TabsTrigger>
               <TabsTrigger value="live">Live (PullSDK)</TabsTrigger>
             </TabsList>
             <TabsContent value="cached" className="flex-1 overflow-auto">
@@ -220,6 +287,81 @@ export default function DevicesPage() {
                 ) : (
                   <Alert variant="info"><AlertDescription>Aucun preset de porte configuré pour cet appareil.</AlertDescription></Alert>
                 )
+              )}
+            </TabsContent>
+            <TabsContent value="content" className="flex-1 overflow-auto space-y-3">
+              <Alert variant="info">
+                <AlertDescription>
+                  Lit directement les tables PullSDK de l&apos;appareil. Utilisez ce panneau pour inspecter les utilisateurs, autorisations, empreintes et transactions en live.
+                </AlertDescription>
+              </Alert>
+              <div className="flex flex-wrap gap-2">
+                {CONTENT_TABLES.map((table) => (
+                  <Button
+                    key={table.key}
+                    size="sm"
+                    variant={infoDialog?.content.tableName === table.key ? "default" : "outline"}
+                    onClick={() => void handleFetchContent(table.key)}
+                    disabled={!!infoDialog?.content.loading}
+                  >
+                    {table.label}
+                  </Button>
+                ))}
+              </div>
+              {infoDialog?.content.loading && (
+                <div className="py-6 flex justify-center">
+                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                </div>
+              )}
+              {infoDialog?.content.error && (
+                <Alert variant="destructive">
+                  <AlertDescription>{infoDialog.content.error}</AlertDescription>
+                </Alert>
+              )}
+              {!infoDialog?.content.loading && !infoDialog?.content.error && !infoDialog?.content.tableName && (
+                <p className="text-sm text-muted-foreground text-center py-8">
+                  Choisissez une table pour lancer la lecture live.
+                </p>
+              )}
+              {!!infoDialog?.content.tableName && !infoDialog?.content.loading && !infoDialog?.content.error && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="font-mono text-[10px]">
+                      {infoDialog.content.tableName}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      {infoDialog.content.count} ligne(s) renvoyée(s)
+                    </span>
+                  </div>
+                  <div className="rounded-md border overflow-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          {contentColumns.map((column) => (
+                            <TableHead key={column} className="whitespace-nowrap">{column}</TableHead>
+                          ))}
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {infoDialog.content.rows.length > 0 && contentColumns.length > 0 ? infoDialog.content.rows.map((row, index) => (
+                          <TableRow key={`${infoDialog.content.tableName}-${index}`}>
+                            {contentColumns.map((column) => (
+                              <TableCell key={column} className="text-xs max-w-[240px] truncate">
+                                {typeof row[column] === "object" ? JSON.stringify(row[column]) : String(row[column] ?? "")}
+                              </TableCell>
+                            ))}
+                          </TableRow>
+                        )) : (
+                          <TableRow>
+                            <TableCell colSpan={Math.max(contentColumns.length, 1)} className="text-center py-8 text-sm text-muted-foreground">
+                              Aucune ligne disponible pour cette table.
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
               )}
             </TabsContent>
             <TabsContent value="live" className="flex-1 overflow-auto space-y-3">

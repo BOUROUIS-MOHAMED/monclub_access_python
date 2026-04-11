@@ -13,6 +13,8 @@ import UsersPage from "./pages/UsersPage";
 import EnrollPage from "./pages/EnrollPage";
 import AgentPage from "./pages/AgentPage";
 import LogsPage from "./pages/LogsPage";
+import SyncHistoryPage from "./pages/SyncHistoryPage";
+import PushHistoryPage from "./pages/PushHistoryPage";
 import ConfigPage from "./pages/ConfigPage";
 import LocalDbPage from "./pages/LocalDbPage";
 import ProfilePage from "./pages/ProfilePage";
@@ -64,6 +66,8 @@ function AppRoutes() {
         <Route path="users" element={<UsersPage />} />
         <Route path="enroll" element={<EnrollPage />} />
         <Route path="agent" element={<AgentPage />} />
+        <Route path="sync-history" element={<SyncHistoryPage />} />
+        <Route path="push-history" element={<PushHistoryPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route path="local-db" element={<LocalDbPage />} />

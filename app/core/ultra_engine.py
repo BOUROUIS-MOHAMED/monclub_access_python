@@ -363,6 +363,16 @@ class UltraDeviceWorker(threading.Thread):
 
     def _process_event(self, evt: Dict[str, Any]):
         """Classify RTLog event and route to appropriate handler."""
+        if not hasattr(self, "_card_cooldown") or not isinstance(self._card_cooldown, dict):
+            self._card_cooldown = {}
+        if not hasattr(self, "_card_cooldown_sec"):
+            settings = getattr(self, "_settings", {}) or {}
+            anti_fraude_duration = settings.get("anti_fraude_duration")
+            if anti_fraude_duration is not None and int(anti_fraude_duration) > 0:
+                self._card_cooldown_sec = float(anti_fraude_duration)
+            else:
+                self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 0))
+
         card_no = str(evt.get("cardNo", "") or "").strip()
         event_type_raw = evt.get("eventType", "")
         event_time = str(evt.get("eventTime", "") or "").strip()

@@ -11,6 +11,8 @@ try:
 except ImportError:
     _requests = None  # type: ignore
 
+from app.core.sync_observability import SyncTriggerContext
+
 _MEMBERS_VERSION_PATH = "/api/v1/manager/gym/access/v1/members-version"
 
 
@@ -191,6 +193,10 @@ class ChangeDetectorService:
             )
             self._last_known_version = parsed_version
             try:
+                self._app._pending_sync_context = SyncTriggerContext(
+                    run_type="TRIGGERED",
+                    trigger_source="CHANGE_DETECTOR",
+                )
                 self._app.after(0, self._app.request_sync_now)
             except Exception as exc:
                 self._logger.warning(

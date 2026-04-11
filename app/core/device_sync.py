@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set, Tuple
@@ -16,6 +17,9 @@ from app.core.db import (
     prune_device_sync_state,
     upsert_device_mirror_pin,
     delete_device_mirror_pin,
+    insert_push_batch,
+    insert_push_pin,
+    update_push_batch,
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
 from app.sdk.pullsdk import PullSDK, PullSDKError
@@ -86,6 +90,14 @@ def _safe_template_text(s: str) -> str:
     if not s:
         return ""
     return str(s).replace("\r", "").replace("\n", "").replace("\t", "").strip()
+
+
+def _batch_row_field(row: str, key: str) -> str:
+    prefix = f"{key}="
+    for part in str(row or "").split("\t"):
+        if part.startswith(prefix):
+            return part[len(prefix):]
+    return ""
 
 
 def _to_int(v, default: int | None = None) -> int | None:
@@ -250,8 +262,14 @@ class DeviceSyncEngine:
         """Stop all per-device worker threads. Call on logout / shutdown."""
         self._worker_manager.stop_all()
 
-    def run_blocking(self, *, cache, source: str = "timer",
-                     changed_ids: set | None = None) -> bool:
+    def run_blocking(
+        self,
+        *,
+        cache,
+        source: str = "timer",
+        changed_ids: set | None = None,
+        sync_run_id: int | None = None,
+    ) -> bool:
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip ({source}): already running")
@@ -259,7 +277,7 @@ class DeviceSyncEngine:
             self._running = True
 
         try:
-            self._sync_all_devices(cache=cache, changed_ids=changed_ids)
+            self._sync_all_devices(cache=cache, changed_ids=changed_ids, sync_run_id=sync_run_id)
             return True
         except Exception as e:
             self.logger.exception(f"[DeviceSync] Failed: {e}")
@@ -933,12 +951,19 @@ class DeviceSyncEngine:
         local_fp_index: Dict[str, List[Any]],
         default_door_id: int,
         changed_ids: set | None = None,
+        sync_run_id: int | None = None,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
         ip = (device.get("ipAddress") or "").strip()
         port = _to_int(device.get("portNumber"), default=4370) or 4370
         pwd = device.get("password") or ""
+        batch_id: int | None = None
+        batch_started_iso: str | None = None
+        batch_started_perf = time.perf_counter()
+        pins_sorted: List[str] = []
+        pin_outcomes: Dict[str, Dict[str, Any]] = {}
+        batch_error: str | None = None
 
         door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled = self._resolve_push_context(
             device=device,
@@ -1014,6 +1039,16 @@ class DeviceSyncEngine:
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
             f"desired={len(desired_pins)} to_sync={len(pins_to_sync)} "
             f"door_bitmask={door_bitmask} doorIds={door_ids} tz={authorize_timezone_id} policy={policy}"
+        )
+
+        batch_started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        batch_id = insert_push_batch(
+            sync_run_id=sync_run_id,
+            device_id=did,
+            device_name=dev_name or f"Device {did}",
+            policy=policy,
+            status="IN_PROGRESS",
+            created_at=batch_started_iso,
         )
 
         sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
@@ -1250,13 +1285,8 @@ class DeviceSyncEngine:
                         if failed_r:
                             # Even without Name, some rows failed — try individual with force-delete
                             for row in failed_r:
-                                pin = ""
-                                card_valid = ""
-                                for part in row.split("\t"):
-                                    if part.startswith("Pin="):
-                                        pin = part[4:]
-                                    elif part.startswith("CardNo="):
-                                        card_valid = part[7:]
+                                pin = _batch_row_field(row, "Pin")
+                                card_valid = _batch_row_field(row, "CardNo")
                                 if not pin:
                                     continue
                                 try:
@@ -1267,19 +1297,20 @@ class DeviceSyncEngine:
                                     sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
                                     pushed_users += 1
                                 except Exception as ex:
+                                    pin_outcomes[pin] = {
+                                        "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                        "status": "FAILED",
+                                        "error_message": str(ex),
+                                        "duration_ms": 0,
+                                    }
                                     self.logger.warning(
                                         "[DeviceSync] Device id=%s Pin=%s force-delete retry FAILED: %s",
                                         dev_id, pin, ex)
                     elif failed_u and not use_name:
                         # Already using minimal fields but still failing — individual force-delete
                         for row in failed_u:
-                            pin = ""
-                            card_valid = ""
-                            for part in row.split("\t"):
-                                if part.startswith("Pin="):
-                                    pin = part[4:]
-                                elif part.startswith("CardNo="):
-                                    card_valid = part[7:]
+                            pin = _batch_row_field(row, "Pin")
+                            card_valid = _batch_row_field(row, "CardNo")
                             if not pin:
                                 continue
                             try:
@@ -1290,6 +1321,12 @@ class DeviceSyncEngine:
                                 sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
                                 pushed_users += 1
                             except Exception as ex:
+                                pin_outcomes[pin] = {
+                                    "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                    "status": "FAILED",
+                                    "error_message": str(ex),
+                                    "duration_ms": 0,
+                                }
                                 self.logger.warning(
                                     "[DeviceSync] Device id=%s Pin=%s force-delete retry FAILED: %s",
                                     dev_id, pin, ex)
@@ -1324,6 +1361,16 @@ class DeviceSyncEngine:
                         ok_a, failed_a = sdk.set_device_data_batch(
                             table="userauthorize", rows=auth_rows, chunk_size=50)
                         if failed_a:
+                            for row in failed_a:
+                                pin = _batch_row_field(row, "Pin")
+                                if not pin:
+                                    continue
+                                pin_outcomes[pin] = {
+                                    "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                    "status": "FAILED",
+                                    "error_message": "authorize batch failed",
+                                    "duration_ms": 0,
+                                }
                             self.logger.warning(
                                 "[DeviceSync] Device id=%s: %d authorize rows failed in batch", dev_id, len(failed_a))
                 elif remaining_pins:
@@ -1336,6 +1383,12 @@ class DeviceSyncEngine:
                                 device_id=int(dev_id) if dev_id is not None else 0,
                             )
                         except Exception as ex:
+                            pin_outcomes[pin] = {
+                                "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                "status": "FAILED",
+                                "error_message": str(ex),
+                                "duration_ms": 0,
+                            }
                             self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
 
                 # Phase C: Push templates individually (binary data — too large to batch)
@@ -1360,23 +1413,36 @@ class DeviceSyncEngine:
                 for pin in pins_sorted:
                     u = desired.get(pin)
                     if u:
+                        _u_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
+                        _u_card = _pin_str(u.get("firstCardId") or "")
+                        _u_fps = len(templates_for_sync.get(pin) or [])
+                        pin_error = pin_outcomes.get(pin, {}).get("error_message")
+                        pin_ok = not pin_error
                         save_device_sync_state(
-                            device_id=did, pin=pin,
+                            device_id=did,
+                            pin=pin,
                             desired_hash=desired_hashes.get(pin) or "",
-                            ok=True, error=None,
+                            ok=pin_ok,
+                            error=None if pin_ok else str(pin_error),
                         )
-                        ok_synced += 1
+                        pin_outcomes[pin] = {
+                            "full_name": _u_name,
+                            "status": "SUCCESS" if pin_ok else "FAILED",
+                            "error_message": None if pin_ok else str(pin_error),
+                            "duration_ms": 0,
+                        }
+                        if pin_ok:
+                            ok_synced += 1
+                        else:
+                            failed_synced += 1
                         # P7: update device content mirror (write-through)
                         try:
-                            _u_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
-                            _u_card = _pin_str(u.get("firstCardId") or "")
-                            _u_fps = len(templates_for_sync.get(pin) or [])
                             upsert_device_mirror_pin(
                                 device_id=did, pin=pin,
                                 full_name=_u_name, card_no=_u_card or None,
                                 door_bitmask=door_bitmask,
                                 authorize_tz_id=int(authorize_timezone_id),
-                                fp_count=_u_fps, push_ok=True,
+                                fp_count=_u_fps, push_ok=pin_ok,
                             )
                         except Exception:
                             pass
@@ -1393,6 +1459,7 @@ class DeviceSyncEngine:
                     if not isinstance(u, dict):
                         continue
 
+                    pin_started_perf = time.perf_counter()
                     full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
                     card = _pin_str(u.get("firstCardId") or "")
                     templates = templates_for_sync.get(pin) or []
@@ -1485,6 +1552,12 @@ class DeviceSyncEngine:
                                 desired_hash=desired_hashes.get(pin) or "",
                                 ok=True, error=None,
                             )
+                            pin_outcomes[pin] = {
+                                "full_name": full_name,
+                                "status": "SUCCESS",
+                                "error_message": None,
+                                "duration_ms": int((time.perf_counter() - pin_started_perf) * 1000),
+                            }
                             ok_synced += 1
                             # P7: write-through device content mirror
                             try:
@@ -1503,6 +1576,12 @@ class DeviceSyncEngine:
                                 desired_hash=desired_hashes.get(pin) or "",
                                 ok=False, error=auth_err or "authorize incomplete",
                             )
+                            pin_outcomes[pin] = {
+                                "full_name": full_name,
+                                "status": "FAILED",
+                                "error_message": auth_err or "authorize incomplete",
+                                "duration_ms": int((time.perf_counter() - pin_started_perf) * 1000),
+                            }
                             failed_synced += 1
                             # P7: record failed push in mirror so dashboard can show drift
                             try:
@@ -1524,6 +1603,12 @@ class DeviceSyncEngine:
                             device_id=did, pin=pin,
                             desired_hash=None, ok=False, error=str(ex),
                         )
+                        pin_outcomes[pin] = {
+                            "full_name": full_name,
+                            "status": "FAILED",
+                            "error_message": str(ex),
+                            "duration_ms": int((time.perf_counter() - pin_started_perf) * 1000),
+                        }
                         self.logger.warning(
                             "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
@@ -1585,13 +1670,62 @@ class DeviceSyncEngine:
                 f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned}"
             )
 
+        except Exception as ex:
+            batch_error = str(ex)
+            raise
         finally:
+            if batch_id is not None:
+                if batch_error and pins_sorted:
+                    for pin in pins_sorted:
+                        if pin not in pin_outcomes:
+                            pin_outcomes[pin] = {
+                                "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                "status": "FAILED",
+                                "error_message": batch_error,
+                                "duration_ms": 0,
+                            }
+                for pin in sorted(pin_outcomes.keys()):
+                    outcome = pin_outcomes[pin]
+                    insert_push_pin(
+                        batch_id=batch_id,
+                        pin=pin,
+                        full_name=outcome.get("full_name"),
+                        operation="UPSERT",
+                        status=outcome.get("status") or "FAILED",
+                        error_message=outcome.get("error_message"),
+                        duration_ms=int(outcome.get("duration_ms") or 0),
+                    )
+                pins_attempted = len(pins_sorted)
+                pins_success = sum(1 for outcome in pin_outcomes.values() if outcome.get("status") == "SUCCESS")
+                pins_failed = max(pins_attempted - pins_success, 0)
+                duration_ms = int((time.perf_counter() - batch_started_perf) * 1000)
+                if batch_error and pins_success == 0:
+                    batch_status = "FAILED"
+                elif batch_error or pins_failed > 0:
+                    batch_status = "PARTIAL" if pins_success > 0 else "FAILED"
+                else:
+                    batch_status = "SUCCESS"
+                update_push_batch(
+                    id=batch_id,
+                    pins_attempted=pins_attempted,
+                    pins_success=pins_success,
+                    pins_failed=pins_failed,
+                    status=batch_status,
+                    duration_ms=duration_ms,
+                    error_message=batch_error,
+                )
             try:
                 sdk.disconnect()
             except Exception:
                 pass
 
-    def _sync_all_devices(self, *, cache, changed_ids: set | None = None) -> None:
+    def _sync_all_devices(
+        self,
+        *,
+        cache,
+        changed_ids: set | None = None,
+        sync_run_id: int | None = None,
+    ) -> None:
         if not cache:
             self.logger.info("[DeviceSync] No cache -> skip")
             return
@@ -1665,6 +1799,7 @@ class DeviceSyncEngine:
             local_fp_index=local_fp_index,
             default_door_id=default_door_id,
             changed_ids=changed_ids,
+            sync_run_id=sync_run_id,
         )
         dispatched = self._worker_manager.dispatch_all(job)
         self._set_progress(running=True, current=0, total=dispatched)

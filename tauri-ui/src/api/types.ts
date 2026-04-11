@@ -398,6 +398,77 @@ export interface DbTableQueryResponse {
   offset?: number;
 }
 
+export interface SyncRunHistoryRow {
+  id: number;
+  run_type: string;
+  trigger_source: string;
+  trigger_hint?: string | null;
+  status: string;
+  members_total: number;
+  members_changed: number;
+  devices_synced: number;
+  duration_ms: number;
+  error_message?: string | null;
+  raw_response?: string | null;
+  created_at: string;
+}
+
+export interface SyncRunHistoryResponse {
+  ok: boolean;
+  items: SyncRunHistoryRow[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+export interface PushBatchHistoryRow {
+  id: number;
+  sync_run_id?: number | null;
+  device_id: number;
+  device_name: string;
+  policy: string;
+  pins_attempted: number;
+  pins_success: number;
+  pins_failed: number;
+  status: string;
+  duration_ms: number;
+  error_message?: string | null;
+  created_at: string;
+}
+
+export interface PushBatchHistoryResponse {
+  ok: boolean;
+  items: PushBatchHistoryRow[];
+  total: number;
+  page: number;
+  size: number;
+}
+
+export interface PushPinHistoryRow {
+  id: number;
+  batch_id: number;
+  pin: string;
+  full_name?: string | null;
+  operation: string;
+  status: string;
+  error_message?: string | null;
+  duration_ms: number;
+}
+
+export interface PushBatchPinsResponse {
+  ok: boolean;
+  batch: PushBatchHistoryRow;
+  pins: PushPinHistoryRow[];
+  total: number;
+}
+
+export interface DeviceTableResponse {
+  ok: boolean;
+  table: string;
+  rows: Record<string, unknown>[];
+  count: number;
+}
+
 export interface AccessHistoryRecord {
   eventId: string;
   deviceId: number | null;
