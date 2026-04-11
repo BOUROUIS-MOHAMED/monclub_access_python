@@ -254,6 +254,19 @@ class MainApp:
         ensure_dirs()
         init_db()
 
+        # Cleanup stale IN_PROGRESS sync runs from the previous session
+        # (e.g. the app was killed or crashed mid-sync).
+        try:
+            from app.core.db import cleanup_stale_in_progress_sync_runs
+            _stale = cleanup_stale_in_progress_sync_runs()
+            if _stale > 0:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "[SyncHistory] Cleaned %d stale IN_PROGRESS sync run(s) from previous session", _stale
+                )
+        except Exception:
+            pass
+
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.cfg = load_access_app_config()
 
@@ -1505,7 +1518,24 @@ class MainApp:
         def _work_guarded():
             try:
                 _work_original()
+            except Exception:
+                self.logger.exception("[SyncHistory] work() crashed unexpectedly -- sync run may be orphaned")
             finally:
+                # Safety net: if work() crashed before its own finalization block, the
+                # sync run row may still be IN_PROGRESS. Detect and finalize it here.
+                try:
+                    if sync_run_id is not None:
+                        from app.core.db import get_sync_run, update_sync_run
+                        row = get_sync_run(sync_run_id)
+                        if row and str(row.get("status", "")).upper() == "IN_PROGRESS":
+                            update_sync_run(
+                                id=sync_run_id,
+                                status="FAILED",
+                                duration_ms=int((time.perf_counter() - sync_started_perf) * 1000),
+                                error_message="Sync work crashed or was interrupted before completing",
+                            )
+                except Exception as _fin_ex:
+                    self.logger.warning("[SyncHistory] Safety-net finalization failed: %s", _fin_ex)
                 self._sync_work_running = False
         self._sync_work_running = True
         threading.Thread(target=_work_guarded, daemon=True).start()

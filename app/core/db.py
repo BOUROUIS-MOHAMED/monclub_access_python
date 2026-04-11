@@ -3794,6 +3794,25 @@ def prune_push_batch_history(*, retention_days: int = 30) -> int:
         return int(cur.rowcount or 0)
 
 
+def cleanup_stale_in_progress_sync_runs() -> int:
+    """Mark any IN_PROGRESS sync runs left over from a previous session as INTERRUPTED.
+
+    Called once at application startup to prevent phantom IN_PROGRESS rows appearing
+    in the historique page after a crash or force-quit.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE sync_run_history
+               SET status        = 'INTERRUPTED',
+                   error_message = 'Application restarted while sync was in progress'
+             WHERE status = 'IN_PROGRESS'
+            """
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 # Realtime RTLog cursor/state
 # -----------------------------
 @dataclass

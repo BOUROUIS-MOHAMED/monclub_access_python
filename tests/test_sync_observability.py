@@ -531,3 +531,32 @@ def test_device_sync_records_push_batch_and_pin_rows(tmp_path, monkeypatch):
     assert len(pins) == 3
     assert all(pin["operation"] == "UPSERT" for pin in pins)
     assert all(pin["status"] == "SUCCESS" for pin in pins)
+
+
+def test_cleanup_stale_in_progress_sync_runs(tmp_path, monkeypatch):
+    """Stale IN_PROGRESS rows from a previous session are marked INTERRUPTED."""
+    db = _reload_db_module(tmp_path, monkeypatch)
+
+    # Insert one IN_PROGRESS and one SUCCESS run
+    stale_id = db.insert_sync_run(
+        run_type="PERIODIC",
+        trigger_source="TIMER",
+        status="IN_PROGRESS",
+        created_at="2026-04-11T09:00:00",
+    )
+    done_id = db.insert_sync_run(
+        run_type="PERIODIC",
+        trigger_source="TIMER",
+        status="SUCCESS",
+        created_at="2026-04-11T09:05:00",
+    )
+    db.update_sync_run(id=done_id, status="SUCCESS", duration_ms=1000)
+
+    cleaned = db.cleanup_stale_in_progress_sync_runs()
+
+    assert cleaned == 1
+    stale_row = db.get_sync_run(stale_id)
+    done_row = db.get_sync_run(done_id)
+    assert stale_row["status"] == "INTERRUPTED"
+    assert "restarted" in stale_row["error_message"]
+    assert done_row["status"] == "SUCCESS"  # untouched
