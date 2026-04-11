@@ -47,7 +47,7 @@ def device_membership_scope_changed(
 def strip_member_version_tokens(tokens: dict[str, Any] | None) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in (tokens or {}).items():
-        if key in {"membersVersion", "membersUpdatedAfter"} or value is None:
+        if key == "membersVersion" or value is None:
             continue
         out[str(key)] = str(value)
     return out

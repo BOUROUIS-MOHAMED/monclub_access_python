@@ -1090,6 +1090,7 @@ class MainApp:
             members_changed = 0
             devices_dispatched = 0
             _delta_changed_ids = None  # set when backend returns membersDeltaMode=True
+
             try:
                 from app.core.db import insert_sync_run
 
