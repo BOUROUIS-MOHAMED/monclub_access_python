@@ -1487,6 +1487,7 @@ class MainApp:
             try:
                 if sync_run_id is not None:
                     from app.core.db import prune_push_batch_history, prune_sync_run_history, update_sync_run
+                    import json
 
                     final_status = "SUCCESS"
                     final_error = device_sync_issue
