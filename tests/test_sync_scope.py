@@ -1,4 +1,5 @@
 from app.core.sync_scope import (
+    apply_trigger_hint_to_version_tokens,
     build_device_membership_scope,
     device_membership_scope_changed,
     strip_member_version_tokens,
@@ -46,4 +47,40 @@ def test_strip_member_version_tokens_keeps_non_member_tokens() -> None:
         "devicesVersion": "devices-token",
         "credentialsVersion": "creds-token",
         "settingsVersion": "settings-token",
+    }
+
+
+def test_apply_trigger_hint_to_version_tokens_forces_member_refresh_for_membership_updates() -> None:
+    tokens = {
+        "membersVersion": "members-token",
+        "membersUpdatedAfter": "2026-04-09T17:43:28",
+        "devicesVersion": "devices-token",
+        "credentialsVersion": "creds-token",
+        "settingsVersion": "settings-token",
+    }
+
+    assert apply_trigger_hint_to_version_tokens(
+        tokens,
+        {"entityType": "ACTIVE_MEMBERSHIP", "operation": "UPDATE"},
+    ) == {
+        "devicesVersion": "devices-token",
+        "credentialsVersion": "creds-token",
+        "settingsVersion": "settings-token",
+    }
+
+
+def test_apply_trigger_hint_to_version_tokens_keeps_member_tokens_for_other_entities() -> None:
+    tokens = {
+        "membersVersion": "members-token",
+        "membersUpdatedAfter": "2026-04-09T17:43:28",
+        "devicesVersion": "devices-token",
+    }
+
+    assert apply_trigger_hint_to_version_tokens(
+        tokens,
+        {"entityType": "GYM_DEVICE", "operation": "UPDATE"},
+    ) == {
+        "membersVersion": "members-token",
+        "membersUpdatedAfter": "2026-04-09T17:43:28",
+        "devicesVersion": "devices-token",
     }

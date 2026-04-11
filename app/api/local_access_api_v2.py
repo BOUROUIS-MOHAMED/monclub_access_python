@@ -18,6 +18,7 @@ import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import traceback
@@ -228,6 +229,21 @@ class _AppHTTPServerV2(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.app = app
         self.router = router
+
+    def handle_error(self, request, client_address) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError)):
+            try:
+                self.app.logger.info(
+                    "[LocalAPI] client disconnected: %s:%s — %s",
+                    client_address[0],
+                    client_address[1],
+                    type(exc).__name__,
+                )
+            except Exception:
+                pass
+            return
+        super().handle_error(request, client_address)
 
 
 class _Router:
@@ -1159,13 +1175,38 @@ def _schedule_sync_request(
     )
 
 
+def _sync_trigger_hint_from_body(body: Any) -> Dict[str, Any] | None:
+    if not isinstance(body, dict):
+        return None
+
+    hint: Dict[str, Any] = {}
+    field_names = {
+        "entityType": ("entityType", "entity_type"),
+        "entityId": ("entityId", "entity_id"),
+        "operation": ("operation",),
+        "priority": ("priority",),
+        "reason": ("reason",),
+        "forceMemberRefresh": ("forceMemberRefresh", "force_member_refresh"),
+    }
+    for output_key, aliases in field_names.items():
+        for alias in aliases:
+            value = body.get(alias)
+            if value in (None, ""):
+                continue
+            hint[output_key] = value
+            break
+    return hint or None
+
+
 def _handle_sync_now(ctx: _Ctx) -> None:
-    _logger.info("[LocalAPI] sync_now: manual sync triggered")
+    trigger_hint = _sync_trigger_hint_from_body(ctx.body())
+    _logger.info("[LocalAPI] sync_now: manual sync triggered hint=%s", trigger_hint)
     try:
         _schedule_sync_request(
             ctx.app,
             trigger_source="SYNC_NOW_API",
             run_type="TRIGGERED",
+            trigger_hint=trigger_hint,
         )
     except Exception:
         pass

@@ -4,6 +4,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _reload_db_module(tmp_path, monkeypatch):
     import app.core.db as db_module
@@ -285,6 +287,48 @@ def test_request_sync_now_stores_pending_context_and_schedules():
     assert app._pending_sync_context.trigger_hint == {"hardReset": True}
 
 
+def test_main_app_initializes_scheduler_before_first_after(monkeypatch):
+    import app.ui.app as app_module
+
+    class StopInit(Exception):
+        pass
+
+    cfg = SimpleNamespace(
+        plcomm_dll_path="C:/sdk/plcommpro.dll",
+        zkfp_dll_path="C:/sdk/libzkfp.dll",
+        log_level="INFO",
+    )
+    logger = MagicMock()
+
+    monkeypatch.setattr(app_module, "add_windows_dll_search_paths", lambda: None)
+    monkeypatch.setattr(app_module, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(app_module, "init_db", lambda: None)
+    monkeypatch.setattr(app_module, "load_access_app_config", lambda: cfg)
+    monkeypatch.setattr(app_module.MainApp, "_resolve_sdk_dll", lambda self, path: path)
+    monkeypatch.setattr(app_module, "require_32bit_python_for_32bit_dll", lambda path: None)
+    monkeypatch.setattr(app_module, "setup_logging", lambda *args, **kwargs: logger)
+    monkeypatch.setattr(app_module, "get_access_config_status", lambda: {})
+    monkeypatch.setattr(app_module, "get_access_storage_status", lambda: {})
+    monkeypatch.setattr(app_module, "check_zkemkeeper_registration", lambda: {"ok": True})
+    monkeypatch.setattr(app_module, "UpdateManager", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(app_module, "DeviceSyncEngine", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(app_module, "DeviceAttendanceMaintenanceEngine", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(app_module, "AgentRealtimeEngine", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(app_module, "UltraEngine", lambda **kwargs: SimpleNamespace())
+    monkeypatch.setattr(app_module.MainApp, "_sync_startup_registration", lambda self: None)
+
+    def assert_scheduler_initialized(self, delay_ms, callback):
+        assert self._scheduled == []
+        assert hasattr(self, "_sched_lock")
+        assert self._sched_id_counter == 0
+        raise StopInit
+
+    monkeypatch.setattr(app_module.MainApp, "after", assert_scheduler_initialized)
+
+    with pytest.raises(StopInit):
+        app_module.MainApp()
+
+
 def test_sync_handlers_schedule_expected_trigger_metadata():
     from app.api import local_access_api_v2 as api_module
 
@@ -303,7 +347,7 @@ def test_sync_handlers_schedule_expected_trigger_metadata():
         request_sync_now=lambda **kwargs: requests.append(kwargs),
         _ultra_engine=None,
     )
-    ctx = SimpleNamespace(app=app, send_json=send_json)
+    ctx = SimpleNamespace(app=app, send_json=send_json, body=lambda: {})
 
     api_module._handle_sync_now(ctx)
     assert responses[-1][0] == 200
@@ -325,6 +369,92 @@ def test_sync_handlers_schedule_expected_trigger_metadata():
         "run_type": "HARD_RESET",
         "trigger_hint": {"hardReset": True},
     }
+
+
+def test_sync_now_handler_preserves_dashboard_trigger_hint():
+    from app.api import local_access_api_v2 as api_module
+
+    scheduled = []
+    requests = []
+    responses = []
+
+    def after(delay, callback):
+        scheduled.append((delay, callback))
+
+    def send_json(status, payload):
+        responses.append((status, payload))
+
+    app = SimpleNamespace(
+        after=after,
+        request_sync_now=lambda **kwargs: requests.append(kwargs),
+        _ultra_engine=None,
+    )
+    hint = {
+        "entityType": "ACTIVE_MEMBERSHIP",
+        "entityId": 77,
+        "operation": "UPDATE",
+        "priority": "HIGH",
+    }
+    ctx = SimpleNamespace(app=app, send_json=send_json, body=lambda: dict(hint))
+
+    api_module._handle_sync_now(ctx)
+
+    assert responses[-1][0] == 200
+    scheduled.pop(0)[1]()
+    assert requests.pop(0) == {
+        "trigger_source": "SYNC_NOW_API",
+        "run_type": "TRIGGERED",
+        "trigger_hint": hint,
+    }
+
+
+def test_local_api_server_suppresses_connection_abort_tracebacks(monkeypatch):
+    from app.api import local_access_api_v2 as api_module
+
+    delegated = []
+    monkeypatch.setattr(
+        api_module.ThreadingHTTPServer,
+        "handle_error",
+        lambda self, request, client_address: delegated.append((request, client_address)),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "sys",
+        SimpleNamespace(exc_info=lambda: (ConnectionAbortedError, ConnectionAbortedError("closed"), None)),
+    )
+
+    server = object.__new__(api_module._AppHTTPServerV2)
+    server.app = SimpleNamespace(logger=MagicMock())
+    request = object()
+
+    api_module._AppHTTPServerV2.handle_error(server, request, ("127.0.0.1", 25298))
+
+    assert delegated == []
+    server.app.logger.info.assert_called_once()
+
+
+def test_local_api_server_delegates_unexpected_errors(monkeypatch):
+    from app.api import local_access_api_v2 as api_module
+
+    delegated = []
+    monkeypatch.setattr(
+        api_module.ThreadingHTTPServer,
+        "handle_error",
+        lambda self, request, client_address: delegated.append((request, client_address)),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "sys",
+        SimpleNamespace(exc_info=lambda: (ValueError, ValueError("boom"), None)),
+    )
+
+    server = object.__new__(api_module._AppHTTPServerV2)
+    server.app = SimpleNamespace(logger=MagicMock())
+    request = object()
+
+    api_module._AppHTTPServerV2.handle_error(server, request, ("127.0.0.1", 25298))
+
+    assert delegated == [(request, ("127.0.0.1", 25298))]
 
 
 def test_build_sync_response_summary_is_compact():

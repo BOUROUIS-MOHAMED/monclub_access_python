@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 def _normalized_membership_ids(values: Any) -> tuple[int, ...]:
@@ -51,3 +51,26 @@ def strip_member_version_tokens(tokens: dict[str, Any] | None) -> dict[str, str]
             continue
         out[str(key)] = str(value)
     return out
+
+
+def apply_trigger_hint_to_version_tokens(
+    tokens: Mapping[str, Any] | None,
+    trigger_hint: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    normalized = {
+        str(key): str(value)
+        for key, value in (tokens or {}).items()
+        if value is not None
+    }
+    if not normalized:
+        return None
+
+    entity_type = ""
+    if isinstance(trigger_hint, Mapping):
+        entity_type = str(
+            trigger_hint.get("entityType") or trigger_hint.get("entity_type") or ""
+        ).strip().upper()
+
+    if entity_type == "ACTIVE_MEMBERSHIP":
+        return strip_member_version_tokens(normalized)
+    return normalized
