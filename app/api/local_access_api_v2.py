@@ -1422,6 +1422,12 @@ def _handle_sync_now(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True, "message": "sync triggered"})
 
 
+def _handle_sync_fast_patch_bundle(ctx: _Ctx) -> None:
+    bundle = ctx.body()
+    result = ctx.app.apply_fast_patch_bundle(bundle)
+    ctx.send_json(200 if result.get("ok") else 409, result)
+
+
 def _handle_sync_hard_reset(ctx: _Ctx) -> None:
     """Clear all device sync hashes so the next sync re-pushes every user, then trigger sync."""
     try:
@@ -5203,8 +5209,10 @@ class LocalApiServerV2:
                         "_handle_health", "_handle_v1_health",
                         # Dashboard (browser) callers cannot obtain the session token.
                         # sync/now is harmless (just triggers a data fetch).
+                        # fast-patch-bundle applies backend-confirmed canonical payloads.
                         # enroll/start still requires physical ZK device interaction.
-                        "_handle_sync_now", "_handle_enroll_start", "_handle_enroll_retry_push",
+                        "_handle_sync_now", "_handle_sync_fast_patch_bundle",
+                        "_handle_enroll_start", "_handle_enroll_retry_push",
                     }
                     fn_name = getattr(handler_fn, "__name__", "")
                     if fn_name not in _AUTH_EXEMPT:

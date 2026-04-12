@@ -980,6 +980,14 @@ class DecisionService(threading.Thread):
     def stop(self) -> None:
         self.stop_event.set()
 
+    def reset_fast_patch_caches(self) -> None:
+        with self._cache_lock:
+            self._creds_cache_at = 0.0
+            self._creds_cache = []
+            self._users_cache_at = 0.0
+            self._users_by_active_membership_id = {}
+            self._users_by_card = {}
+
     def _load_local_state(
         self,
     ) -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
@@ -1568,6 +1576,20 @@ class AgentRealtimeEngine:
             self._global_cache = gs
             self._global_cache_at = now_s
         return dict(gs)
+
+    def reset_fast_patch_caches(self) -> None:
+        with self._lock:
+            self._devices_cache_at = 0.0
+            self._devices_cache = []
+            self._global_cache_at = 0.0
+            self._global_cache = {}
+
+        for decider in list(getattr(self, "_deciders", [])):
+            try:
+                if hasattr(decider, "reset_fast_patch_caches"):
+                    decider.reset_fast_patch_caches()
+            except Exception:
+                self.logger.warning("[RT] failed to reset DecisionService caches", exc_info=True)
 
     def _device_settings(self, device_id: int) -> Dict[str, Any]:
         did = int(device_id)
