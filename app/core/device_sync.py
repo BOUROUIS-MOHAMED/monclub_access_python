@@ -343,15 +343,23 @@ class DeviceSyncEngine:
             users = getattr(cache, "users", []) or []
 
             local_fp_index: Dict[str, List[Any]] = {}
-            try:
-                recs = list_fingerprints()
-                for r in recs:
-                    pin = _pin_str(getattr(r, "pin", "") or "")
-                    if not pin:
-                        continue
-                    local_fp_index.setdefault(pin, []).append(r)
-            except Exception:
-                local_fp_index = {}
+            raw_fingerprint_enabled = normalized_device.get("fingerprintEnabled")
+            if raw_fingerprint_enabled is None:
+                raw_fingerprint_enabled = normalized_device.get("fingerprint_enabled")
+            fingerprint_enabled = _boolish(
+                raw_fingerprint_enabled,
+                default=True,
+            )
+            if fingerprint_enabled:
+                try:
+                    recs = list_fingerprints()
+                    for r in recs:
+                        pin = _pin_str(getattr(r, "pin", "") or "")
+                        if not pin:
+                            continue
+                        local_fp_index.setdefault(pin, []).append(r)
+                except Exception:
+                    local_fp_index = {}
 
             default_door_id = self._default_authorize_door_id()
             self._set_progress(
@@ -439,10 +447,10 @@ class DeviceSyncEngine:
         if authorize_timezone_id < 1:
             authorize_timezone_id = 1
 
-        fingerprint_enabled = _boolish(
-            device.get("fingerprintEnabled") or device.get("fingerprint_enabled"),
-            default=False,
-        )
+        raw_fingerprint_enabled = device.get("fingerprintEnabled")
+        if raw_fingerprint_enabled is None:
+            raw_fingerprint_enabled = device.get("fingerprint_enabled")
+        fingerprint_enabled = _boolish(raw_fingerprint_enabled, default=False)
 
         # Resolve AuthorizeDoorId bitmask for userauthorize.
         # AuthorizeDoorId is a bitmask: door1=1, door2=2, door3=4, door4=8.
@@ -531,6 +539,7 @@ class DeviceSyncEngine:
             "authorizeTimezoneId": int(tz_id),
             "pushingToDevicePolicy": pushing_policy,
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
+            "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
 
             # Anti-fraud settings (per-device)
             "anti_fraude_card":     _boolish(g("anti_fraude_card",    "antiFraudeCard",    default=True), True),

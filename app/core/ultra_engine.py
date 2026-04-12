@@ -990,6 +990,8 @@ class UltraSyncScheduler:
         self._pending_sync_requested = False
         self._pending_full_sync = False
         self._pending_changed_ids: Set[int] = set()
+        self._pending_all_devices = False
+        self._pending_device_ids: Set[int] = set()
         self._pending_reason = "manual"
 
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
@@ -1026,6 +1028,7 @@ class UltraSyncScheduler:
         self,
         *,
         changed_ids: set[int] | None = None,
+        device_ids: set[int] | None = None,
         reason: str = "manual",
     ) -> None:
         normalized_reason = str(reason or "manual").strip().lower() or "manual"
@@ -1036,6 +1039,13 @@ class UltraSyncScheduler:
                 if member_id is not None
             }
         )
+        normalized_device_ids = (
+            None if device_ids is None else {
+                int(device_id)
+                for device_id in device_ids
+                if device_id is not None
+            }
+        )
         with self._pending_sync_lock:
             self._pending_sync_requested = True
             self._pending_reason = normalized_reason
@@ -1044,24 +1054,33 @@ class UltraSyncScheduler:
                 self._pending_changed_ids.clear()
             elif not self._pending_full_sync:
                 self._pending_changed_ids.update(normalized_changed_ids)
+            if normalized_device_ids is None:
+                self._pending_all_devices = True
+                self._pending_device_ids.clear()
+            elif not self._pending_all_devices:
+                self._pending_device_ids.update(normalized_device_ids)
         self._logger.info(
-            "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s",
+            "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s device_ids=%s",
             normalized_reason,
             "all" if normalized_changed_ids is None else len(normalized_changed_ids),
+            "all" if normalized_device_ids is None else len(normalized_device_ids),
         )
         self._wake_sync.set()
 
-    def _drain_pending_sync_request(self) -> tuple[set[int] | None, str] | None:
+    def _drain_pending_sync_request(self) -> tuple[set[int] | None, set[int] | None, str] | None:
         with self._pending_sync_lock:
             if not self._pending_sync_requested:
                 return None
             reason = self._pending_reason
             changed_ids = None if self._pending_full_sync else set(self._pending_changed_ids)
+            device_ids = None if self._pending_all_devices else set(self._pending_device_ids)
             self._pending_sync_requested = False
             self._pending_full_sync = False
             self._pending_changed_ids.clear()
+            self._pending_all_devices = False
+            self._pending_device_ids.clear()
             self._pending_reason = "manual"
-            return changed_ids, reason
+            return changed_ids, device_ids, reason
 
     def _run(self):
         """Sync loop: push data to each ULTRA device on its configured interval."""
@@ -1084,8 +1103,8 @@ class UltraSyncScheduler:
                 pending = self._drain_pending_sync_request()
                 if pending is None:
                     continue
-                changed_ids, reason = pending
-                self._sync_all(changed_ids=changed_ids, reason=reason)
+                changed_ids, device_ids, reason = pending
+                self._sync_all(changed_ids=changed_ids, device_ids=device_ids, reason=reason)
                 continue
             self._sync_all(reason="timer")
 
@@ -1094,13 +1113,24 @@ class UltraSyncScheduler:
         Kept as no-op for backward compat in case external code calls it."""
         pass
 
-    def _sync_all(self, *, changed_ids: set[int] | None = None, reason: str = "timer"):
+    def _sync_all(
+        self,
+        *,
+        changed_ids: set[int] | None = None,
+        device_ids: set[int] | None = None,
+        reason: str = "timer",
+    ):
         """Push user data to all ULTRA devices (with hash-based skip)."""
+        devices = self._devices if device_ids is None else [
+            device for device in self._devices
+            if device.get("id") is not None and int(device.get("id")) in device_ids
+        ]
         self._logger.info(
-            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s) reason=%s changed_ids=%s",
-            len(self._devices),
+            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s) reason=%s changed_ids=%s device_ids=%s",
+            len(devices),
             reason,
             "all" if changed_ids is None else len(changed_ids),
+            "all" if device_ids is None else len(device_ids),
         )
         t0 = time.time()
         # Check worker health before each sync cycle
@@ -1111,7 +1141,7 @@ class UltraSyncScheduler:
         synced = 0
         skipped = 0
         failed = 0
-        for d in self._devices:
+        for d in devices:
             device_id = d.get("id")
             try:
                 did_sync = self._sync_device(d, changed_ids=changed_ids)
@@ -1483,12 +1513,14 @@ class UltraEngine:
         self,
         *,
         changed_ids: set[int] | None = None,
+        device_ids: set[int] | None = None,
         reason: str = "manual",
     ) -> bool:
         if not self._running or not self._sync_scheduler:
             return False
         self._sync_scheduler.request_sync_now(
             changed_ids=changed_ids,
+            device_ids=device_ids,
             reason=reason,
         )
         return True

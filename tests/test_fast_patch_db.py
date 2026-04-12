@@ -371,3 +371,50 @@ def test_apply_fast_patch_bundle_replaces_credentials_infrastructures_and_member
     assert [row["accountId"] for row in creds] == [3, 4]
     assert [row["name"] for row in infra] == ["Main Hall", "VIP Room"]
     assert [row["title"] for row in memberships] == ["Gold", "VIP"]
+
+
+def test_apply_fast_patch_bundle_merges_targeted_credentials_without_deleting_other_accounts(db):
+    db.apply_fast_patch_bundle(
+        _bundle(
+            _item(
+                kind="SECTION_REPLACE",
+                entity_type="CREDENTIALS",
+                revision="2026-04-12T12:03:00Z",
+                payload={
+                    "gymAccessCredentials": [
+                        _credential(3, secret_hex="abc123"),
+                        _credential(4, secret_hex="def456"),
+                    ]
+                },
+            ),
+            bundle_id="bundle-credentials-seed",
+        )
+    )
+
+    result = db.apply_fast_patch_bundle(
+        _bundle(
+            _item(
+                kind="SECTION_REPLACE",
+                entity_type="CREDENTIALS",
+                revision="2026-04-12T12:03:01Z",
+                payload={
+                    "mergeMode": "UPSERT_ONLY",
+                    "gymAccessCredentials": [
+                        {
+                            **_credential(3, secret_hex="updated999"),
+                            "grantedActiveMembershipIds": [11],
+                        }
+                    ],
+                },
+            ),
+            bundle_id="bundle-credentials-merge",
+        )
+    )
+
+    creds = db.list_sync_gym_access_credentials()
+
+    assert result == {"applied": 1, "skipped": 0, "ignored": None}
+    assert [row["accountId"] for row in creds] == [3, 4]
+    assert creds[0]["secretHex"] == "updated999"
+    assert creds[0]["grantedActiveMembershipIds"] == [11]
+    assert creds[1]["secretHex"] == "def456"

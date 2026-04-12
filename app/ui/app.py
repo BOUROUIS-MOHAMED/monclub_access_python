@@ -613,6 +613,7 @@ class MainApp:
         *,
         refresh: Dict[str, Any],
         changed_ids: set[int] | None,
+        device_ids: set[int] | None = None,
         reason: str,
     ) -> bool:
         if not (refresh.get("members") or refresh.get("devices")):
@@ -628,6 +629,13 @@ class MainApp:
                 for member_id in changed_ids
                 if member_id is not None
             }
+        requested_device_ids = None
+        if device_ids is not None:
+            requested_device_ids = {
+                int(device_id)
+                for device_id in device_ids
+                if device_id is not None
+            }
 
         with self._ultra_lock:
             if not self._ultra_engine.running:
@@ -635,15 +643,17 @@ class MainApp:
             started = bool(
                 self._ultra_engine.request_sync_now(
                     changed_ids=requested_changed_ids,
+                    device_ids=requested_device_ids,
                     reason=normalized_reason,
                 )
             )
 
         if started:
             self.logger.info(
-                "[ULTRA] immediate sync requested: reason=%s changed_ids=%s",
+                "[ULTRA] immediate sync requested: reason=%s changed_ids=%s device_ids=%s",
                 normalized_reason,
                 "all" if requested_changed_ids is None else len(requested_changed_ids),
+                "all" if requested_device_ids is None else len(requested_device_ids),
             )
         return started
 
@@ -1006,6 +1016,17 @@ class MainApp:
             for member_id in list(((item.get("impact") or {}).get("affectedMemberIds") or []))
             if member_id is not None
         }
+        affected_device_ids = {
+            int(device_id)
+            for item in items
+            for device_id in list(((item.get("impact") or {}).get("affectedDeviceIds") or []))
+            if device_id is not None
+        }
+        normalized_types = {
+            str(item.get("entityType") or "").strip().upper()
+            for item in items
+            if item.get("entityType") is not None
+        }
         needs_member_refresh = bool(affected_member_ids) or any(
             str(item.get("entityType") or "").strip().upper() == "ACTIVE_MEMBERSHIP"
             for item in items
@@ -1015,15 +1036,25 @@ class MainApp:
             or bool((item.get("impact") or {}).get("requiresDeviceRescope"))
             for item in items
         )
+        is_fast_member_bundle = bool(items) and all(
+            (
+                str(item.get("entityType") or "").strip().upper() == "ACTIVE_MEMBERSHIP"
+            ) or (
+                str(item.get("entityType") or "").strip().upper() == "CREDENTIALS"
+                and str(((item.get("payload") or {}).get("mergeMode") or "")).strip().upper() == "UPSERT_ONLY"
+            )
+            for item in items
+        ) and normalized_types.issubset({"ACTIVE_MEMBERSHIP", "CREDENTIALS"})
 
         if needs_member_refresh or needs_device_refresh:
             self._request_running_ultra_sync(
                 refresh={"members": needs_member_refresh, "devices": needs_device_refresh},
                 changed_ids=None if needs_device_refresh else affected_member_ids,
+                device_ids=affected_device_ids or None,
                 reason="FAST_PATCH_BUNDLE",
             )
 
-        if bool((bundle or {}).get("requiresReconcile", True)):
+        if bool((bundle or {}).get("requiresReconcile", True)) and not is_fast_member_bundle:
             self.request_sync_now(
                 trigger_source="FAST_PATCH_BUNDLE",
                 run_type="TRIGGERED",

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 
-def test_apply_fast_patch_bundle_invalidates_caches_and_requests_member_ultra_sync(monkeypatch):
+def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member_ultra_sync_without_immediate_reconcile(monkeypatch):
     import app.ui.app as app_module
 
     invalidate = MagicMock()
@@ -29,6 +29,24 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_member_ultra_sy
                 "entityId": 9,
                 "revision": "2026-04-12T12:00:00Z",
                 "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+            },
+            {
+                "kind": "SECTION_REPLACE",
+                "entityType": "CREDENTIALS",
+                "revision": "2026-04-12T12:00:00Z",
+                "payload": {
+                    "mergeMode": "UPSERT_ONLY",
+                    "gymAccessCredentials": [
+                        {
+                            "accountId": 501,
+                            "gymId": 42,
+                            "secretHex": "abc123",
+                            "enabled": True,
+                            "grantedActiveMembershipIds": [9],
+                        }
+                    ],
+                },
+                "impact": {"affectedMemberIds": [9], "affectedDeviceIds": []},
             }
         ],
     }
@@ -41,13 +59,10 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_member_ultra_sy
     app._request_running_ultra_sync.assert_called_once_with(
         refresh={"members": True, "devices": False},
         changed_ids={9},
+        device_ids={7},
         reason="FAST_PATCH_BUNDLE",
     )
-    app.request_sync_now.assert_called_once_with(
-        trigger_source="FAST_PATCH_BUNDLE",
-        run_type="TRIGGERED",
-        trigger_hint={"reason": "fast_patch_bundle"},
-    )
+    app.request_sync_now.assert_not_called()
 
 
 def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
@@ -85,6 +100,7 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
     app._request_running_ultra_sync.assert_called_once_with(
         refresh={"members": False, "devices": True},
         changed_ids=None,
+        device_ids={7},
         reason="FAST_PATCH_BUNDLE",
     )
 

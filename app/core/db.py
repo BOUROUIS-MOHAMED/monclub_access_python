@@ -2294,9 +2294,17 @@ def _replace_sync_credentials(cur: sqlite3.Cursor, rows: List[Dict[str, Any]]) -
     return {"mode": "replace", "deleted": None, "upserted": len(rows)}
 
 
-def _sync_gym_access_credentials_rows(cur: sqlite3.Cursor, payload_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _sync_gym_access_credentials_rows(
+    cur: sqlite3.Cursor,
+    payload_rows: List[Dict[str, Any]],
+    *,
+    merge_mode: str | None = None,
+) -> Dict[str, Any]:
     normalized_rows = [_normalize_sync_credential_payload_row(c) for c in payload_rows if isinstance(c, dict)]
+    merge_only = str(merge_mode or "").strip().upper() == "UPSERT_ONLY"
     if not normalized_rows:
+        if merge_only:
+            return {"mode": "merge", "deleted": 0, "upserted": 0}
         cur.execute("DELETE FROM sync_gym_access_credentials")
         return {"mode": "replace", "deleted": None, "upserted": 0}
 
@@ -2342,7 +2350,7 @@ def _sync_gym_access_credentials_rows(cur: sqlite3.Cursor, payload_rows: List[Di
         for key, row in incoming_by_key.items()
         if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
     ]
-    to_delete = [key for key in existing_by_key if key not in incoming_by_key]
+    to_delete = [] if merge_only else [key for key in existing_by_key if key not in incoming_by_key]
 
     if to_delete:
         chunk_size = 200
@@ -2374,7 +2382,11 @@ def _sync_gym_access_credentials_rows(cur: sqlite3.Cursor, payload_rows: List[Di
             [_sync_credential_params(row) for row in to_upsert],
         )
 
-    return {"mode": "delta", "deleted": len(to_delete), "upserted": len(to_upsert)}
+    return {
+        "mode": "merge" if merge_only else "delta",
+        "deleted": len(to_delete),
+        "upserted": len(to_upsert),
+    }
 
 
 def _upsert_sync_meta_row(
@@ -2606,7 +2618,11 @@ def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> None:
 
     if kind == "SECTION_REPLACE" and entity_type == "CREDENTIALS":
         rows = payload.get("gymAccessCredentials") or payload.get("gym_access_credentials") or []
-        _sync_gym_access_credentials_rows(cur, rows if isinstance(rows, list) else [])
+        _sync_gym_access_credentials_rows(
+            cur,
+            rows if isinstance(rows, list) else [],
+            merge_mode=payload.get("mergeMode"),
+        )
         return
 
     if kind == "SECTION_REPLACE" and entity_type == "INFRASTRUCTURES":

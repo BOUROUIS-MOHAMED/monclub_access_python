@@ -14,7 +14,7 @@ def test_ultra_sync_scheduler_request_sync_now_wakes_without_waiting_interval(mo
     device = {"id": 5, "_settings": {"ultra_sync_interval_minutes": 999}}
     calls: list[tuple[str, set[int] | None]] = []
 
-    def fake_sync_all(self, *, changed_ids=None, reason="timer"):
+    def fake_sync_all(self, *, changed_ids=None, device_ids=None, reason="timer"):
         normalized = None if changed_ids is None else set(changed_ids)
         calls.append((reason, normalized))
         if len(calls) >= 2:
@@ -92,3 +92,29 @@ def test_ultra_sync_scheduler_sync_device_passes_changed_ids(monkeypatch):
     assert did_sync is True
     assert run_one_device_calls == [{11}]
     worker.resume_from_sync.assert_called_once()
+
+
+def test_ultra_sync_scheduler_sync_all_limits_to_targeted_devices(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    scheduler = ultra_module.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    scheduler._devices = [
+        {"id": 5, "name": "Door 1", "accessDataMode": "ULTRA"},
+        {"id": 6, "name": "Door 2", "accessDataMode": "ULTRA"},
+    ]
+
+    synced_device_ids: list[int] = []
+
+    def fake_sync_device(self, device, *, changed_ids=None):
+        synced_device_ids.append(int(device["id"]))
+        return True
+
+    monkeypatch.setattr(
+        scheduler,
+        "_sync_device",
+        types.MethodType(fake_sync_device, scheduler),
+    )
+
+    scheduler._sync_all(changed_ids={11}, device_ids={6}, reason="member_delta")
+
+    assert synced_device_ids == [6]
