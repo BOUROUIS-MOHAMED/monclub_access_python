@@ -92,6 +92,10 @@ class UltraDeviceWorker(threading.Thread):
         self._cached_state_ts: float = 0.0
         self._CACHE_TTL_SEC: float = 60.0  # sync data only changes on sync cycles (~60s)
 
+    def reset_fast_patch_caches(self) -> None:
+        self._cached_state = None
+        self._cached_state_ts = 0.0
+
     # ------------------------------------------------------------------ #
     # Main loop
     # ------------------------------------------------------------------ #
@@ -1466,6 +1470,14 @@ class UltraEngine:
         if not self._sync_scheduler:
             return None, 0
         return self._sync_scheduler.get_active_progress_snapshot()
+
+    def reset_fast_patch_caches(self) -> None:
+        for worker in list(getattr(self, "_workers", {}).values()):
+            try:
+                if hasattr(worker, "reset_fast_patch_caches"):
+                    worker.reset_fast_patch_caches()
+            except Exception:
+                self._logger.warning("[ULTRA] failed to reset worker cache", exc_info=True)
 
     def request_sync_now(
         self,

@@ -30,6 +30,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/feedback/sounds/sync-complete", "_handle_feedback_sound_sync_complete_post"),
     ("DELETE", "/api/v2/feedback/sounds/sync-complete", "_handle_feedback_sound_sync_complete_delete"),
     ("POST", "/api/v2/sync/now", "_handle_sync_now"),
+    ("POST", "/api/v2/sync/fast-patch-bundle", "_handle_sync_fast_patch_bundle"),
     ("POST", "/api/v2/sync/hard-reset", "_handle_sync_hard_reset"),
     ("GET", "/api/v2/sync-history", "_handle_sync_history_list"),
     ("GET", "/api/v2/sync-history/{id}", "_handle_sync_history_detail"),

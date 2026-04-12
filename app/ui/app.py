@@ -974,6 +974,64 @@ class MainApp:
             "zkemkeeper": getattr(self, "_zkemkeeper_status", None),
         }
 
+    def reset_runtime_fast_patch_caches(self) -> None:
+        try:
+            agent_engine = getattr(self, "_agent_engine", None)
+            if agent_engine and hasattr(agent_engine, "reset_fast_patch_caches"):
+                agent_engine.reset_fast_patch_caches()
+        except Exception:
+            self.logger.warning("[FastPatch] failed to reset agent caches", exc_info=True)
+
+        try:
+            ultra_engine = getattr(self, "_ultra_engine", None)
+            if ultra_engine and hasattr(ultra_engine, "reset_fast_patch_caches"):
+                ultra_engine.reset_fast_patch_caches()
+        except Exception:
+            self.logger.warning("[FastPatch] failed to reset ULTRA caches", exc_info=True)
+
+    def apply_fast_patch_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
+        from app.core.db import apply_fast_patch_bundle, invalidate_sync_cache
+
+        db_result = apply_fast_patch_bundle(bundle if isinstance(bundle, dict) else {})
+        if db_result.get("ignored") == "duplicate_bundle":
+            return {"ok": True, "duplicate": True, **db_result}
+
+        invalidate_sync_cache()
+        self.reset_runtime_fast_patch_caches()
+
+        items = [item for item in list((bundle or {}).get("items") or []) if isinstance(item, dict)]
+        affected_member_ids = {
+            int(member_id)
+            for item in items
+            for member_id in list(((item.get("impact") or {}).get("affectedMemberIds") or []))
+            if member_id is not None
+        }
+        needs_member_refresh = bool(affected_member_ids) or any(
+            str(item.get("entityType") or "").strip().upper() == "ACTIVE_MEMBERSHIP"
+            for item in items
+        )
+        needs_device_refresh = any(
+            str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
+            or bool((item.get("impact") or {}).get("requiresDeviceRescope"))
+            for item in items
+        )
+
+        if needs_member_refresh or needs_device_refresh:
+            self._request_running_ultra_sync(
+                refresh={"members": needs_member_refresh, "devices": needs_device_refresh},
+                changed_ids=None if needs_device_refresh else affected_member_ids,
+                reason="FAST_PATCH_BUNDLE",
+            )
+
+        if bool((bundle or {}).get("requiresReconcile", True)):
+            self.request_sync_now(
+                trigger_source="FAST_PATCH_BUNDLE",
+                run_type="TRIGGERED",
+                trigger_hint={"reason": "fast_patch_bundle"},
+            )
+
+        return {"ok": True, **db_result}
+
     # ======================= API helpers =======================
     def _api(self) -> MonClubApi:
         return MonClubApi(endpoints=build_access_api_endpoints(self.cfg), logger=self.logger)

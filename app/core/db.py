@@ -196,6 +196,25 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fast_patch_bundles (
+                bundle_id TEXT PRIMARY KEY,
+                generated_at TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fast_patch_revisions (
+                patch_key TEXT PRIMARY KEY,
+                revision TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
         # -----------------------------
         # contract meta
         # -----------------------------
@@ -2356,6 +2375,307 @@ def _sync_gym_access_credentials_rows(cur: sqlite3.Cursor, payload_rows: List[Di
         )
 
     return {"mode": "delta", "deleted": len(to_delete), "upserted": len(to_upsert)}
+
+
+def _upsert_sync_meta_row(
+    cur: sqlite3.Cursor,
+    *,
+    contract_status: bool,
+    contract_end_date: str | None,
+    updated_at: str,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO sync_meta (id, contract_status, contract_end_date, updated_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            contract_status=excluded.contract_status,
+            contract_end_date=excluded.contract_end_date,
+            updated_at=excluded.updated_at
+        """,
+        (1 if contract_status else 0, _safe_str(contract_end_date, ""), updated_at),
+    )
+
+
+def _upsert_sync_access_software_settings_row(
+    cur: sqlite3.Cursor,
+    settings: Dict[str, Any],
+    *,
+    updated_at: str,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO sync_access_software_settings (
+            id, gym_id, access_server_host, access_server_port, access_server_enabled,
+            image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
+            event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
+            decision_workers, decision_ema_alpha,
+            history_retention_days, notification_rate_limit_per_minute, notification_dedupe_window_sec,
+            notification_service_enabled, history_service_enabled,
+            agent_sync_backend_refresh_min,
+            default_authorize_door_id, sdk_read_initial_bytes,
+            optional_data_sync_delay_minutes,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            gym_id=excluded.gym_id,
+            access_server_host=excluded.access_server_host,
+            access_server_port=excluded.access_server_port,
+            access_server_enabled=excluded.access_server_enabled,
+            image_cache_enabled=excluded.image_cache_enabled,
+            image_cache_timeout_sec=excluded.image_cache_timeout_sec,
+            image_cache_max_bytes=excluded.image_cache_max_bytes,
+            image_cache_max_files=excluded.image_cache_max_files,
+            event_queue_max=excluded.event_queue_max,
+            notification_queue_max=excluded.notification_queue_max,
+            history_queue_max=excluded.history_queue_max,
+            popup_queue_max=excluded.popup_queue_max,
+            decision_workers=excluded.decision_workers,
+            decision_ema_alpha=excluded.decision_ema_alpha,
+            history_retention_days=excluded.history_retention_days,
+            notification_rate_limit_per_minute=excluded.notification_rate_limit_per_minute,
+            notification_dedupe_window_sec=excluded.notification_dedupe_window_sec,
+            notification_service_enabled=excluded.notification_service_enabled,
+            history_service_enabled=excluded.history_service_enabled,
+            agent_sync_backend_refresh_min=excluded.agent_sync_backend_refresh_min,
+            default_authorize_door_id=excluded.default_authorize_door_id,
+            sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
+            optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at
+        """,
+        (
+            1,
+            _to_int_or_none(settings.get("gymId") if "gymId" in settings else settings.get("gym_id")),
+            _safe_str(settings.get("accessServerHost") if "accessServerHost" in settings else settings.get("access_server_host"), ""),
+            _to_int_or_none(settings.get("accessServerPort") if "accessServerPort" in settings else settings.get("access_server_port")),
+            _bool_to_i(settings.get("accessServerEnabled", True), default=1),
+            _bool_to_i(settings.get("imageCacheEnabled", True), default=1),
+            _to_int_or_none(settings.get("imageCacheTimeoutSec", 2)),
+            _to_int_or_none(settings.get("imageCacheMaxBytes", 5242880)),
+            _to_int_or_none(settings.get("imageCacheMaxFiles", 1000)),
+            _to_int_or_none(settings.get("eventQueueMax", 5000)),
+            _to_int_or_none(settings.get("notificationQueueMax", 5000)),
+            _to_int_or_none(settings.get("historyQueueMax", 5000)),
+            _to_int_or_none(settings.get("popupQueueMax", 5000)),
+            _to_int_or_none(settings.get("decisionWorkers", 1)),
+            _to_float_or_none(settings.get("decisionEmaAlpha", 0.2)),
+            _to_int_or_none(settings.get("historyRetentionDays", 30)),
+            _to_int_or_none(settings.get("notificationRateLimitPerMinute", 30)),
+            _to_int_or_none(settings.get("notificationDedupeWindowSec", 30)),
+            _bool_to_i(settings.get("notificationServiceEnabled", True), default=1),
+            _bool_to_i(settings.get("historyServiceEnabled", True), default=1),
+            _to_int_or_none(settings.get("agentSyncBackendRefreshMin", 30)),
+            _to_int_or_none(settings.get("defaultAuthorizeDoorId", 15)),
+            _to_int_or_none(settings.get("sdkReadInitialBytes", 1048576)),
+            _to_int_or_none(settings.get("optionalDataSyncDelayMinutes", 60)),
+            _safe_str(settings.get("createdAt"), ""),
+            _safe_str(settings.get("updatedAt"), updated_at) or updated_at,
+        ),
+    )
+
+
+def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
+    fps = member.get("fingerprints") or []
+    if not isinstance(fps, list):
+        fps = []
+
+    active_membership_id = member.get("activeMembershipId")
+    membership_id = member.get("membershipId")
+    if active_membership_id is None or str(active_membership_id).strip() == "":
+        active_membership_id = membership_id
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO sync_users (
+            user_id,
+            active_membership_id,
+            membership_id,
+            full_name, phone, email, valid_from, valid_to,
+            first_card_id, second_card_id, image,
+            fingerprints_json,
+            face_id, account_username_id, qr_code_payload, birthday,
+            image_source, user_image_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            member.get("userId"),
+            active_membership_id,
+            membership_id,
+            member.get("fullName"),
+            member.get("phone"),
+            member.get("email"),
+            member.get("validFrom"),
+            member.get("validTo"),
+            member.get("firstCardId"),
+            member.get("secondCardId"),
+            member.get("image"),
+            json.dumps(fps, ensure_ascii=False),
+            member.get("faceId"),
+            member.get("accountUsernameId") or member.get("account_username_id"),
+            member.get("qrCodePayload"),
+            member.get("birthday"),
+            member.get("imageSource"),
+            member.get("userImageStatus"),
+        ),
+    )
+
+
+def _replace_sync_memberships(cur: sqlite3.Cursor, memberships: List[Dict[str, Any]]) -> None:
+    cur.execute("DELETE FROM sync_memberships")
+    for membership in memberships:
+        if not isinstance(membership, dict):
+            continue
+        cur.execute(
+            "INSERT INTO sync_memberships (id, title, description, price, duration_in_days) VALUES (?, ?, ?, ?, ?)",
+            (
+                membership.get("id"),
+                membership.get("title"),
+                membership.get("description"),
+                membership.get("price"),
+                membership.get("durationInDays"),
+            ),
+        )
+
+
+def _replace_sync_infrastructures(cur: sqlite3.Cursor, infrastructures: List[Dict[str, Any]]) -> None:
+    cur.execute("DELETE FROM sync_infrastructures")
+    for infrastructure in infrastructures:
+        if not isinstance(infrastructure, dict):
+            continue
+        cur.execute(
+            """
+            INSERT INTO sync_infrastructures (id, name, gym_agent_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                infrastructure.get("id"),
+                infrastructure.get("name"),
+                json.dumps(infrastructure.get("gymAgent") or {}, ensure_ascii=False),
+                infrastructure.get("createdAt"),
+                infrastructure.get("updatedAt"),
+            ),
+        )
+
+
+def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> None:
+    kind = str(item.get("kind") or "").strip().upper()
+    entity_type = str(item.get("entityType") or "").strip().upper()
+    payload = item.get("payload") or {}
+    revision = str(item.get("revision") or now_iso())
+
+    if kind == "ENTITY_UPSERT" and entity_type == "ACTIVE_MEMBERSHIP":
+        member = payload.get("member")
+        if not isinstance(member, dict):
+            raise ValueError("ACTIVE_MEMBERSHIP upsert requires payload.member")
+        _upsert_sync_user_row(cur, member)
+        return
+
+    if kind == "ENTITY_DELETE" and entity_type == "ACTIVE_MEMBERSHIP":
+        active_membership_id = _to_int_or_none(item.get("entityId"))
+        cur.execute("DELETE FROM sync_users WHERE active_membership_id = ?", (active_membership_id,))
+        return
+
+    if kind == "ENTITY_UPSERT" and entity_type == "GYM_DEVICE":
+        device = payload.get("device")
+        if not isinstance(device, dict):
+            raise ValueError("GYM_DEVICE upsert requires payload.device")
+        device_id = _to_int_or_none(device.get("id") or item.get("entityId"))
+        cur.execute("DELETE FROM sync_device_door_presets WHERE device_id = ?", (device_id,))
+        cur.execute("DELETE FROM sync_devices WHERE id = ?", (device_id,))
+        _insert_device_row(cur, device)
+        return
+
+    if kind == "ENTITY_DELETE" and entity_type == "GYM_DEVICE":
+        device_id = _to_int_or_none(item.get("entityId"))
+        cur.execute("DELETE FROM sync_device_door_presets WHERE device_id = ?", (device_id,))
+        cur.execute("DELETE FROM sync_devices WHERE id = ?", (device_id,))
+        return
+
+    if kind == "SECTION_REPLACE" and entity_type == "SETTINGS":
+        access_settings = payload.get("accessSoftwareSettings") or payload.get("access_software_settings")
+        if isinstance(access_settings, dict):
+            _upsert_sync_access_software_settings_row(cur, access_settings, updated_at=revision)
+        _upsert_sync_meta_row(
+            cur,
+            contract_status=bool(payload.get("contractStatus", False)),
+            contract_end_date=payload.get("contractEndDate"),
+            updated_at=revision,
+        )
+        return
+
+    if kind == "SECTION_REPLACE" and entity_type == "CREDENTIALS":
+        rows = payload.get("gymAccessCredentials") or payload.get("gym_access_credentials") or []
+        _sync_gym_access_credentials_rows(cur, rows if isinstance(rows, list) else [])
+        return
+
+    if kind == "SECTION_REPLACE" and entity_type == "INFRASTRUCTURES":
+        rows = payload.get("infrastructures") or payload.get("infrastructure") or []
+        _replace_sync_infrastructures(cur, rows if isinstance(rows, list) else [])
+        return
+
+    if kind == "SECTION_REPLACE" and entity_type == "MEMBERSHIP_TYPE":
+        rows = payload.get("membership") or payload.get("memberships") or []
+        _replace_sync_memberships(cur, rows if isinstance(rows, list) else [])
+        return
+
+    raise ValueError(f"Unsupported fast patch item: {kind} {entity_type}")
+
+
+def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    from app.core.fast_patch import patch_key
+
+    bundle_id = str(bundle.get("bundleId") or "").strip() or str(uuid.uuid4())
+    generated_at = str(bundle.get("generatedAt") or now_iso())
+    items = [item for item in list(bundle.get("items") or []) if isinstance(item, dict)]
+
+    applied = 0
+    skipped = 0
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        duplicate = cur.execute(
+            "SELECT 1 FROM fast_patch_bundles WHERE bundle_id = ?",
+            (bundle_id,),
+        ).fetchone()
+        if duplicate:
+            return {"applied": 0, "skipped": 0, "ignored": "duplicate_bundle"}
+
+        cur.execute(
+            """
+            INSERT INTO fast_patch_bundles (bundle_id, generated_at, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (bundle_id, generated_at, now_iso()),
+        )
+
+        for item in items:
+            key = patch_key(item.get("entityType"), item.get("entityId"))
+            revision = str(item.get("revision") or generated_at)
+            existing = cur.execute(
+                "SELECT revision FROM fast_patch_revisions WHERE patch_key = ?",
+                (key,),
+            ).fetchone()
+            if existing and revision <= str(existing["revision"] or ""):
+                skipped += 1
+                continue
+
+            _apply_fast_patch_item(cur, item)
+            cur.execute(
+                """
+                INSERT INTO fast_patch_revisions (patch_key, revision, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(patch_key) DO UPDATE SET
+                    revision=excluded.revision,
+                    updated_at=excluded.updated_at
+                """,
+                (key, revision, now_iso()),
+            )
+            applied += 1
+
+        conn.commit()
+
+    return {"applied": applied, "skipped": skipped, "ignored": None}
 
 
 def save_sync_cache_delta(data: dict, refresh: dict) -> None:
