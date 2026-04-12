@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, List, Set, Tuple
 
 from app.core.db import (
     list_fingerprints,
@@ -180,10 +180,11 @@ class DeviceSyncEngine:
     - Each device has its own daemon thread with latest-wins queue semantics.
     """
 
-    def __init__(self, *, cfg, logger):
+    def __init__(self, *, cfg, logger, feedback_callback: Callable[[str, Dict[str, Any]], None] | None = None):
         from app.core.device_worker import DeviceWorkerManager
         self.cfg = cfg
         self.logger = logger
+        self._feedback_callback = feedback_callback
         self._run_lock = threading.Lock()
         self._running = False
         self._progress_cond = threading.Condition()
@@ -206,6 +207,14 @@ class DeviceSyncEngine:
             sync_fn=self._sync_one_device,
             logger=logger,
         )
+
+    def _emit_feedback_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self._feedback_callback:
+            return
+        try:
+            self._feedback_callback(event_type, dict(payload))
+        except Exception:
+            self.logger.debug("[DeviceSync] feedback callback failed for %s", event_type, exc_info=True)
 
     def _get_firmware_profile(self, device_id: int) -> FirmwareProfile:
         """
@@ -283,6 +292,96 @@ class DeviceSyncEngine:
             self.logger.exception(f"[DeviceSync] Failed: {e}")
             return True
         finally:
+            with self._run_lock:
+                self._running = False
+
+    def run_one_device_blocking(
+        self,
+        *,
+        cache,
+        device: Dict[str, Any],
+        source: str = "timer",
+        changed_ids: set | None = None,
+        sync_run_id: int | None = None,
+    ) -> bool:
+        """
+        Synchronously push a single device on the current thread.
+
+        ULTRA mode needs this direct path because the regular run_blocking()
+        dispatches to persistent background workers and returns immediately.
+        For RTLog TCP handoff we must keep the worker paused until the actual
+        device push has completed.
+        """
+        with self._run_lock:
+            if self._running:
+                self.logger.info(f"[DeviceSync] Skip single-device ({source}): already running")
+                return False
+            self._running = True
+
+        try:
+            if not cache:
+                self.logger.info("[DeviceSync] No cache -> skip single-device sync")
+                return False
+
+            normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
+            dev_id = normalized_device.get("id")
+            dev_name = normalized_device.get("name", "")
+
+            if not _boolish(normalized_device.get("active"), default=True):
+                self.logger.info(
+                    "[DeviceSync] Skip single-device id=%s name=%r: active=False",
+                    dev_id, dev_name,
+                )
+                return False
+            if not _boolish(normalized_device.get("accessDevice"), default=True):
+                self.logger.info(
+                    "[DeviceSync] Skip single-device id=%s name=%r: accessDevice=False",
+                    dev_id, dev_name,
+                )
+                return False
+
+            users = getattr(cache, "users", []) or []
+
+            local_fp_index: Dict[str, List[Any]] = {}
+            try:
+                recs = list_fingerprints()
+                for r in recs:
+                    pin = _pin_str(getattr(r, "pin", "") or "")
+                    if not pin:
+                        continue
+                    local_fp_index.setdefault(pin, []).append(r)
+            except Exception:
+                local_fp_index = {}
+
+            default_door_id = self._default_authorize_door_id()
+            self._set_progress(
+                running=True,
+                deviceName=str(dev_name or ""),
+                deviceId=dev_id,
+                current=0,
+                total=1,
+            )
+            self._sync_one_device(
+                device=normalized_device,
+                users=users,
+                local_fp_index=local_fp_index,
+                default_door_id=default_door_id,
+                changed_ids=changed_ids,
+                sync_run_id=sync_run_id,
+            )
+            self._set_progress(current=1)
+            return True
+        except Exception as e:
+            self.logger.exception(f"[DeviceSync] Single-device sync failed: {e}")
+            return False
+        finally:
+            self._set_progress(
+                running=False,
+                deviceName="",
+                deviceId=None,
+                current=0,
+                total=0,
+            )
             with self._run_lock:
                 self._running = False
 
@@ -997,6 +1096,7 @@ class DeviceSyncEngine:
         prev_state = list_device_sync_hashes_and_status(device_id=did)
         # Also keep a simple hash dict for backward compat with prune logic
         prev_hashes = {p: h for p, (h, _ok) in prev_state.items()}
+        deletion_only_delta = changed_ids is not None and len(changed_ids) == 0
 
         pins_to_sync: Set[str] = set()
         desired_hashes: Dict[str, str] = {}
@@ -1024,8 +1124,13 @@ class DeviceSyncEngine:
         # Delta hint: when the backend reported only a subset of users changed,
         # prune pins_to_sync to those users + any with a failed/missing prev sync.
         # Stale-pin deletion is unaffected (uses desired_pins, not pins_to_sync).
-        # Skip delta pruning for FULL_REPLACE — that policy always pushes everything.
-        if changed_ids is not None and policy != _PUSH_POLICY_FULL_REPLACE:
+        # Skip delta pruning for FULL_REPLACE - that policy always pushes everything.
+        if deletion_only_delta and policy != _PUSH_POLICY_FULL_REPLACE:
+            # Deletion-only deltas should only remove stale pins; they should not
+            # retry or re-push the full desired roster.
+            pins_to_sync = set()
+            templates_for_sync = {}
+        elif changed_ids is not None and policy != _PUSH_POLICY_FULL_REPLACE:
             pins_to_sync = {
                 pin for pin in pins_to_sync
                 if (
@@ -1103,7 +1208,8 @@ class DeviceSyncEngine:
                             )
 
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
-            stale_pins = sorted([p for p in device_pins if p in known_server_pins and p not in desired_pins])
+            tracked_server_pins = set(known_server_pins) | set(prev_state.keys())
+            stale_pins = sorted([p for p in device_pins if p in tracked_server_pins and p not in desired_pins])
             self.logger.info(
                 "[DeviceSync] Device id=%s: device_pins=%d desired=%d to_sync=%d "
                 "stale=%d drift_resynced=%d door_bitmask=%d",
@@ -1138,7 +1244,10 @@ class DeviceSyncEngine:
                     )
             else:
                 # INCREMENTAL: heuristic nuke-and-repave
-                nuke_mode = len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
+                nuke_mode = (
+                    False if deletion_only_delta
+                    else len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
+                )
             if nuke_mode:
                 self.logger.info(
                     "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
@@ -1714,6 +1823,16 @@ class DeviceSyncEngine:
                     duration_ms=duration_ms,
                     error_message=batch_error,
                 )
+                if batch_status == "SUCCESS":
+                    self._emit_feedback_event(
+                        "device_push_success",
+                        {
+                            "syncRunId": sync_run_id,
+                            "batchId": batch_id,
+                            "deviceId": did,
+                            "deviceName": dev_name,
+                        },
+                    )
             try:
                 sdk.disconnect()
             except Exception:

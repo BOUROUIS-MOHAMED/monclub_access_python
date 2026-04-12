@@ -1,4 +1,3 @@
-import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import TvApp from "@/tv/TvApp";
@@ -15,11 +14,7 @@ async function bootstrap() {
   const runtimeContext = getDesktopRuntimeContext();
   const ShellApp = runtimeContext.role === "tv" ? TvApp : App;
 
-  root.render(
-    <React.StrictMode>
-      <ShellApp />
-    </React.StrictMode>,
-  );
+  root.render(<ShellApp />);
 }
 
 void bootstrap();

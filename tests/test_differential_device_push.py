@@ -44,9 +44,12 @@ def _patch_sdk(monkeypatch, device_pins=None):
     sdk_instance = MagicMock()
     sdk_cls.return_value = sdk_instance
     device_pins = device_pins or []
-    sdk_instance.get_all_device_data.return_value = [
+    rows = [
         {"Pin": p} for p in device_pins
     ]
+    sdk_instance.get_all_device_data.return_value = rows
+    sdk_instance.get_device_data_rows.return_value = rows
+    sdk_instance.supports_delete_device_data.return_value = True
     sdk_instance.set_device_data.return_value = None
     sdk_instance.delete_device_data.return_value = None
     sdk_instance.__enter__ = lambda s: s
@@ -124,3 +127,79 @@ def test_changed_ids_still_retries_failed_users(tmp_path, monkeypatch):
 
     # Users 2 (changed) and 3 (failed prev) should be pushed; user 1 skipped
     assert sdk_inst.set_device_data.call_count == 2 * _CALLS_PER_USER
+
+
+def test_empty_changed_ids_skips_retry_pushes_for_deletion_only_delta(tmp_path, monkeypatch):
+    """Deletion-only deltas should not retry unrelated desired users."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+
+    from app.core.db import save_device_sync_state
+    save_device_sync_state(device_id=1, pin="1", desired_hash="hash_1", ok=False, error="timeout")
+
+    sdk_cls, sdk_inst = _patch_sdk(monkeypatch, device_pins=["1"])
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=make_device(),
+            users=[make_user(1)],
+            local_fp_index={},
+            default_door_id=15,
+            changed_ids=set(),  # deletion-only delta
+        )
+
+    assert sdk_inst.set_device_data.call_count == 0
+
+
+def test_empty_changed_ids_deletes_stale_tracked_pins_without_full_repush(tmp_path, monkeypatch):
+    """Deletion-only deltas should remove tracked stale pins without re-pushing the full roster."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+
+    from app.core.db import save_device_sync_state
+    save_device_sync_state(device_id=1, pin="1", desired_hash="hash_1", ok=True, error=None)
+    save_device_sync_state(device_id=1, pin="2", desired_hash="hash_2", ok=True, error=None)
+    save_device_sync_state(device_id=1, pin="3", desired_hash="hash_3", ok=True, error=None)
+
+    sdk_cls, sdk_inst = _patch_sdk(monkeypatch, device_pins=["1", "2", "3"])
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=make_device(),
+            users=[make_user(1), make_user(2)],
+            local_fp_index={},
+            default_door_id=15,
+            changed_ids=set(),  # deletion-only delta
+        )
+
+    assert sdk_inst.set_device_data.call_count == 0
+    assert any(
+        call.kwargs.get("table") == "user" and call.kwargs.get("data") == "Pin=3"
+        for call in sdk_inst.delete_device_data.call_args_list
+    )
+
+
+def test_run_one_device_blocking_executes_sync_inline(monkeypatch):
+    from app.core.device_sync import DeviceSyncEngine
+
+    engine = DeviceSyncEngine(cfg=MagicMock(), logger=logging.getLogger("test"))
+    calls = []
+
+    monkeypatch.setattr("app.core.device_sync.list_fingerprints", lambda: [])
+    monkeypatch.setattr(
+        engine,
+        "_sync_one_device",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    started = engine.run_one_device_blocking(
+        cache=MagicMock(users=[make_user(7)]),
+        device=make_device(dev_id=7, ip="10.0.0.7"),
+        source="ultra_sync",
+        changed_ids=set(),
+        sync_run_id=123,
+    )
+
+    assert started is True
+    assert len(calls) == 1
+    assert calls[0]["device"]["id"] == 7
+    assert calls[0]["changed_ids"] == set()
+    assert calls[0]["sync_run_id"] == 123

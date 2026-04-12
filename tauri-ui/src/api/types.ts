@@ -129,9 +129,43 @@ export interface AppConfig {
   start_minimized_to_tray: boolean;
   start_on_system_startup: boolean;
   login_email: string;
+  push_success_sound_enabled: boolean;
+  sync_success_sound_enabled: boolean;
+  push_success_animation_enabled: boolean;
+  sync_success_animation_enabled: boolean;
+  push_success_repeat_mode: "per_device" | "per_run";
+  push_success_sound_source: "default" | "custom";
+  sync_success_sound_source: "default" | "custom";
+  push_success_custom_sound_path: string;
+  sync_success_custom_sound_path: string;
   autostart_bindings_enabled?: boolean;
   [key: string]: unknown;
 }
+
+export type FeedbackEventType = "device_push_success" | "sync_completed_success";
+
+export interface BaseFeedbackEvent {
+  seq: number;
+  type: FeedbackEventType;
+  at: string;
+}
+
+export interface DevicePushSuccessEvent extends BaseFeedbackEvent {
+  type: "device_push_success";
+  syncRunId: number | null;
+  batchId: number | null;
+  deviceId: number | null;
+  deviceName: string;
+}
+
+export interface SyncCompletedSuccessEvent extends BaseFeedbackEvent {
+  type: "sync_completed_success";
+  syncRunId: number | null;
+  runType: string;
+  triggerSource: string;
+}
+
+export type FeedbackEvent = DevicePushSuccessEvent | SyncCompletedSuccessEvent;
 
 // ─── D) Sync cache DTOs ───
 export interface DoorPresetDto {

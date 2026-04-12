@@ -533,6 +533,48 @@ def test_device_sync_records_push_batch_and_pin_rows(tmp_path, monkeypatch):
     assert all(pin["status"] == "SUCCESS" for pin in pins)
 
 
+def test_device_sync_emits_feedback_event_on_successful_batch(tmp_path, monkeypatch):
+    db = _reload_db_module(tmp_path, monkeypatch)
+    from app.core.device_sync import DeviceSyncEngine
+
+    events: list[tuple[str, dict]] = []
+    engine = DeviceSyncEngine(
+        cfg=SimpleNamespace(plcomm_dll_path="", timeout_ms=5000),
+        logger=logging.getLogger("test"),
+        feedback_callback=lambda event_type, payload: events.append((event_type, payload)),
+    )
+    users = [_make_user(1), _make_user(2)]
+    device = _make_device(dev_id=7)
+    run_id = db.insert_sync_run(
+        run_type="PERIODIC",
+        trigger_source="TIMER",
+        status="IN_PROGRESS",
+        created_at="2026-04-11T10:00:00",
+    )
+
+    sdk_cls, _sdk_inst = _patch_sdk(device_pins=[])
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        engine._sync_one_device(
+            device=device,
+            users=users,
+            local_fp_index={},
+            default_door_id=15,
+            sync_run_id=run_id,
+        )
+
+    assert events == [
+        (
+            "device_push_success",
+            {
+                "syncRunId": run_id,
+                "batchId": 1,
+                "deviceId": 7,
+                "deviceName": "TestDevice",
+            },
+        )
+    ]
+
+
 def test_cleanup_stale_in_progress_sync_runs(tmp_path, monkeypatch):
     """Stale IN_PROGRESS rows from a previous session are marked INTERRUPTED."""
     db = _reload_db_module(tmp_path, monkeypatch)

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
+import DashboardSuccessBeacon from "@/components/DashboardSuccessBeacon";
 import StatusChip from "@/components/StatusChip2";
 import ScanCardModal from "@/components/ScanCardModal";
 import { cn } from "@/lib/utils";
@@ -228,6 +229,7 @@ export default function DashboardPage() {
             <RotateCcw className={cn("h-3 w-3", sync.running && "animate-spin")} />
             {sync.running ? "En cours…" : "Hard Reset"}
           </Button>
+          <DashboardSuccessBeacon />
         </div>
       </div>
 

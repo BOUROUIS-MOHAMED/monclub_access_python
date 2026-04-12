@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
+import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from "react";
 import { get, post, openSSE, ApiError } from "@/api/client";
 import type { StatusResponse, LoginRequest, LoginResponse } from "@/api/types";
 
@@ -23,21 +23,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState>({
     status: null, coreReady: false, loading: true, error: null,
   });
+  const refreshInFlightRef = useRef<Promise<void> | null>(null);
 
   const refreshStatus = useCallback(async () => {
+    if (refreshInFlightRef.current) {
+      await refreshInFlightRef.current;
+      return;
+    }
+
+    const task = (async () => {
+      try {
+        const s = await get<StatusResponse>("/status");
+        setState({ status: s, coreReady: true, loading: false, error: null });
+      } catch (e) {
+        // If the server is completely unreachable (fetch failed / network error),
+        // keep loading=true so the splash stays visible instead of showing login.
+        const isNetworkError = !(e instanceof ApiError);
+        setState((p) => ({
+          ...p,
+          loading: isNetworkError && !p.status,   // stay on splash until first successful response
+          coreReady: p.coreReady,
+          error: String(e),
+        }));
+      }
+    })();
+
+    refreshInFlightRef.current = task;
     try {
-      const s = await get<StatusResponse>("/status");
-      setState({ status: s, coreReady: true, loading: false, error: null });
-    } catch (e) {
-      // If the server is completely unreachable (fetch failed / network error),
-      // keep loading=true so the splash stays visible instead of showing login.
-      const isNetworkError = !(e instanceof ApiError);
-      setState((p) => ({
-        ...p,
-        loading: isNetworkError && !p.status,   // stay on splash until first successful response
-        coreReady: p.coreReady,
-        error: String(e),
-      }));
+      await task;
+    } finally {
+      if (refreshInFlightRef.current === task) {
+        refreshInFlightRef.current = null;
+      }
     }
   }, []);
 
@@ -63,8 +80,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [refreshStatus]);
 
   useEffect(() => {
-    refreshStatus();
-    const id = setInterval(refreshStatus, 5000);
+    void refreshStatus();
+    const id = setInterval(() => {
+      void refreshStatus();
+    }, 15000);
     return () => clearInterval(id);
   }, [refreshStatus]);
 
@@ -80,9 +99,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
           loading: false,
           error: null,
         }));
-      },
-      {
-        onReconnect: () => { void refreshStatus(); },
       },
     );
     return () => sse.close();

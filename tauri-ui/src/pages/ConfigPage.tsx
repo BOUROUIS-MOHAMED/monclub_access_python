@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { get, patch } from "@/api/client";
 import { useApp } from "@/context/AppContext";
 import {
@@ -20,6 +20,9 @@ import {
   Switch,
 } from "@/components/ui/switch";
 import {
+  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+} from "@/components/ui/select";
+import {
   Separator,
 } from "@/components/ui/separator";
 import {
@@ -33,10 +36,18 @@ import {
 } from "@/components/ui/alert";
 import {
   Settings, Save, Lock, Unlock, Loader2, CheckCircle, Download, Info,
-  CreditCard, Wifi, Usb, Search, Radio,
+  CreditCard, Wifi, Usb, Search, Radio, Music4, Sparkles, Upload, RotateCcw,
 } from "lucide-react";
 import type { DiscoveredDevice } from "@/api/types";
 import { useScanCard } from "@/hooks/useScanCard";
+import {
+  DEFAULT_FEEDBACK_ANIMATIONS,
+  DEFAULT_FEEDBACK_SOUNDS,
+  currentFeedbackFileName,
+  resetFeedbackSound,
+  uploadFeedbackSound,
+  type FeedbackSoundKind,
+} from "@/lib/feedback";
 
 export default function ConfigPage() {
   const { status } = useApp();
@@ -60,22 +71,43 @@ export default function ConfigPage() {
 
   // Card scanner discovery
   const { startDiscover, discovering, discoveredDevices } = useScanCard();
+  const devicePushSoundInputRef = useRef<HTMLInputElement | null>(null);
+  const syncCompleteSoundInputRef = useRef<HTMLInputElement | null>(null);
+  const [soundUploading, setSoundUploading] = useState({
+    devicePush: false,
+    syncComplete: false,
+  });
+
+  const broadcastFeedbackConfig = useCallback((nextCfg: Record<string, any>) => {
+    if (typeof window === "undefined") return;
+    window.dispatchEvent(new CustomEvent("access-feedback-config-updated", { detail: nextCfg }));
+  }, []);
 
   const loadConfig = useCallback(async () => {
     setLoading(true);
     try {
       const res = await get<any>("/config");
-      setCfg(res.config || res || {});
+      const nextCfg = res.config || res || {};
+      setCfg(nextCfg);
       setServerSettings(res.serverSettings || {});
+      broadcastFeedbackConfig(nextCfg);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); }
-  }, []);
+  }, [broadcastFeedbackConfig]);
 
   useEffect(() => { loadConfig(); }, [loadConfig]);
 
   const handleSave = async () => {
     setSaving(true); setError(null); setSuccess(false);
-    try { await patch("/config", cfg); setSuccess(true); setDirty(false); setTimeout(() => setSuccess(false), 3000); }
+    try {
+      const res = await patch<any>("/config", cfg);
+      const nextCfg = res.config || cfg;
+      setCfg(nextCfg);
+      broadcastFeedbackConfig(nextCfg);
+      setSuccess(true);
+      setDirty(false);
+      setTimeout(() => setSuccess(false), 3000);
+    }
     catch (e) { setError(String(e)); }
     finally { setSaving(false); }
   };
@@ -84,6 +116,71 @@ export default function ConfigPage() {
     setCfg((p) => ({ ...p, [key]: value }));
     setDirty(true);
   };
+
+  const patchFeedbackConfig = useCallback(async (changes: Record<string, any>) => {
+    setError(null);
+    const optimistic = { ...cfg, ...changes };
+    setCfg(optimistic);
+    broadcastFeedbackConfig(optimistic);
+    try {
+      const res = await patch<any>("/config", changes);
+      const nextCfg = res.config || optimistic;
+      setCfg(nextCfg);
+      broadcastFeedbackConfig(nextCfg);
+    } catch (e) {
+      setError(String(e));
+      await loadConfig();
+    }
+  }, [broadcastFeedbackConfig, cfg, loadConfig]);
+
+  const handleFeedbackSoundUpload = useCallback(async (kind: FeedbackSoundKind, file: File | null) => {
+    if (!file) return;
+    setError(null);
+    setSoundUploading((prev) => ({
+      ...prev,
+      devicePush: kind === "device-push" ? true : prev.devicePush,
+      syncComplete: kind === "sync-complete" ? true : prev.syncComplete,
+    }));
+    try {
+      await uploadFeedbackSound(kind, file);
+      await loadConfig();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSoundUploading((prev) => ({
+        ...prev,
+        devicePush: kind === "device-push" ? false : prev.devicePush,
+        syncComplete: kind === "sync-complete" ? false : prev.syncComplete,
+      }));
+      if (kind === "device-push" && devicePushSoundInputRef.current) {
+        devicePushSoundInputRef.current.value = "";
+      }
+      if (kind === "sync-complete" && syncCompleteSoundInputRef.current) {
+        syncCompleteSoundInputRef.current.value = "";
+      }
+    }
+  }, [loadConfig]);
+
+  const handleFeedbackSoundReset = useCallback(async (kind: FeedbackSoundKind) => {
+    setError(null);
+    setSoundUploading((prev) => ({
+      ...prev,
+      devicePush: kind === "device-push" ? true : prev.devicePush,
+      syncComplete: kind === "sync-complete" ? true : prev.syncComplete,
+    }));
+    try {
+      await resetFeedbackSound(kind);
+      await loadConfig();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSoundUploading((prev) => ({
+        ...prev,
+        devicePush: kind === "device-push" ? false : prev.devicePush,
+        syncComplete: kind === "sync-complete" ? false : prev.syncComplete,
+      }));
+    }
+  }, [loadConfig]);
 
   const handleStartupToggle = async (enabled: boolean) => {
     const previous = Boolean(cfg.start_on_system_startup ?? false);
@@ -109,6 +206,10 @@ export default function ConfigPage() {
   const currentVersionDisplay = updates?.currentVersion && updates.currentVersion !== "0.0.0"
     ? updates.currentVersion
     : (updates?.currentReleaseId || "dev");
+  const devicePushCustomFileName = currentFeedbackFileName(cfg.push_success_custom_sound_path);
+  const syncCompleteCustomFileName = currentFeedbackFileName(cfg.sync_success_custom_sound_path);
+  const devicePushUploading = soundUploading.devicePush;
+  const syncCompleteUploading = soundUploading.syncComplete;
 
   if (loading) {
     return <div className="flex items-center justify-center py-20"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
@@ -296,6 +397,211 @@ export default function ConfigPage() {
               </Alert>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Music4 className="h-4 w-4" /> Feedback
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          <div className="space-y-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label>Push appareil réussi</Label>
+                <p className="text-sm text-muted-foreground">
+                  Son et animation quand les données sont poussées avec succès vers un appareil ZKTeco.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.device_push_success}</code>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Animation : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_ANIMATIONS.device_push_success}</code>
+                </p>
+              </div>
+              <div className="grid min-w-[180px] gap-3">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="push-success-sound-switch" className="text-xs">Son</Label>
+                  <Switch
+                    id="push-success-sound-switch"
+                    checked={Boolean(cfg.push_success_sound_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ push_success_sound_enabled: checked }); }}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="push-success-animation-switch" className="text-xs">Animation</Label>
+                  <Switch
+                    id="push-success-animation-switch"
+                    checked={Boolean(cfg.push_success_animation_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ push_success_animation_enabled: checked }); }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Répétition</Label>
+                <Select
+                  value={String(cfg.push_success_repeat_mode || "per_device")}
+                  onValueChange={(value) => { void patchFeedbackConfig({ push_success_repeat_mode: value }); }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="per_device">Pour chaque appareil réussi</SelectItem>
+                    <SelectItem value="per_run">Une seule fois par synchronisation</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Source du son</Label>
+                <Select
+                  value={String(cfg.push_success_sound_source || "default")}
+                  onValueChange={(value) => { void patchFeedbackConfig({ push_success_sound_source: value }); }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Son par défaut</SelectItem>
+                    <SelectItem value="custom">Son personnalisé</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={devicePushSoundInputRef}
+                type="file"
+                accept=".mp3,.wav,.ogg,.m4a,audio/*"
+                className="hidden"
+                onChange={(event) => { void handleFeedbackSoundUpload("device-push", event.target.files?.[0] ?? null); }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={devicePushUploading}
+                onClick={() => devicePushSoundInputRef.current?.click()}
+              >
+                {devicePushUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {devicePushCustomFileName ? "Remplacer le son" : "Choisir un son"}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={devicePushUploading || !devicePushCustomFileName}
+                onClick={() => { void handleFeedbackSoundReset("device-push"); }}
+              >
+                <RotateCcw className="h-4 w-4" /> Réinitialiser
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {devicePushCustomFileName ? `Actuel : ${devicePushCustomFileName}` : "Aucun son personnalisé sélectionné."}
+              </span>
+            </div>
+          </div>
+
+          <Separator />
+
+          <div className="space-y-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label>Synchronisation terminée</Label>
+                <p className="text-sm text-muted-foreground">
+                  Son et animation quand une synchronisation complète se termine avec succès.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.sync_completed_success}</code>
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Animation : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_ANIMATIONS.sync_completed_success}</code>
+                </p>
+              </div>
+              <div className="grid min-w-[180px] gap-3">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="sync-success-sound-switch" className="text-xs">Son</Label>
+                  <Switch
+                    id="sync-success-sound-switch"
+                    checked={Boolean(cfg.sync_success_sound_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ sync_success_sound_enabled: checked }); }}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="sync-success-animation-switch" className="text-xs">Animation</Label>
+                  <Switch
+                    id="sync-success-animation-switch"
+                    checked={Boolean(cfg.sync_success_animation_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ sync_success_animation_enabled: checked }); }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Source du son</Label>
+                <Select
+                  value={String(cfg.sync_success_sound_source || "default")}
+                  onValueChange={(value) => { void patchFeedbackConfig({ sync_success_sound_source: value }); }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Son par défaut</SelectItem>
+                    <SelectItem value="custom">Son personnalisé</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Style</Label>
+                <div className="flex h-9 items-center gap-2 rounded-md border border-input px-3 text-sm text-muted-foreground">
+                  <Sparkles className="h-4 w-4 text-amber-400" />
+                  Confetti et célébration
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={syncCompleteSoundInputRef}
+                type="file"
+                accept=".mp3,.wav,.ogg,.m4a,audio/*"
+                className="hidden"
+                onChange={(event) => { void handleFeedbackSoundUpload("sync-complete", event.target.files?.[0] ?? null); }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={syncCompleteUploading}
+                onClick={() => syncCompleteSoundInputRef.current?.click()}
+              >
+                {syncCompleteUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {syncCompleteCustomFileName ? "Remplacer le son" : "Choisir un son"}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={syncCompleteUploading || !syncCompleteCustomFileName}
+                onClick={() => { void handleFeedbackSoundReset("sync-complete"); }}
+              >
+                <RotateCcw className="h-4 w-4" /> Réinitialiser
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {syncCompleteCustomFileName ? `Actuel : ${syncCompleteCustomFileName}` : "Aucun son personnalisé sélectionné."}
+              </span>
+            </div>
+          </div>
         </CardContent>
       </Card>
 

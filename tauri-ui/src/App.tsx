@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { AccessFeedbackProvider } from "@/components/AccessFeedbackProvider";
 import { AppProvider, useApp } from "./context/AppContext";
 import { EnrollmentProvider } from "./context/EnrollmentContext";
 import { useEnrollmentListener } from "./hooks/useEnrollmentListener";
@@ -87,7 +88,18 @@ export default function App() {
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
             <Route path="/tray-panel" element={<AppProvider><TrayPanelPage /></AppProvider>} />
-            <Route path="*" element={<AppProvider><EnrollmentProvider><AppRoutes /></EnrollmentProvider></AppProvider>} />
+            <Route
+              path="*"
+              element={(
+                <AppProvider>
+                  <AccessFeedbackProvider>
+                    <EnrollmentProvider>
+                      <AppRoutes />
+                    </EnrollmentProvider>
+                  </AccessFeedbackProvider>
+                </AppProvider>
+              )}
+            />
           </Routes>
         </BrowserRouter>
       </TooltipProvider>

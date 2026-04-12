@@ -88,6 +88,20 @@ def _ensure_bool(v: Any, default: bool) -> bool:
     return default
 
 
+def _normalize_feedback_repeat_mode(v: Any) -> str:
+    s = _safe_str(v, "per_device").strip().lower()
+    if s in {"per_device", "per_run"}:
+        return s
+    return "per_device"
+
+
+def _normalize_feedback_sound_source(v: Any) -> str:
+    s = _safe_str(v, "default").strip().lower()
+    if s in {"default", "custom"}:
+        return s
+    return "default"
+
+
 def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     x = _safe_int(v, default)
     if x < lo:
@@ -213,6 +227,19 @@ class AppConfig:
     scanner_network_port: int = 4370        # Always 4370 for ZKTeco
     scanner_network_timeout_ms: int = 5000  # Connection timeout
     scanner_usb_device_path: str = ""       # Optional: specific HID device path
+
+    # -------------------------
+    # Dashboard feedback
+    # -------------------------
+    push_success_sound_enabled: bool = True
+    sync_success_sound_enabled: bool = True
+    push_success_animation_enabled: bool = True
+    sync_success_animation_enabled: bool = True
+    push_success_repeat_mode: str = "per_device"   # per_device | per_run
+    push_success_sound_source: str = "default"     # default | custom
+    sync_success_sound_source: str = "default"     # default | custom
+    push_success_custom_sound_path: str = ""
+    sync_success_custom_sound_path: str = ""
 
     # -------------------------
     # Backward-compatible accessors
@@ -464,6 +491,29 @@ class AppConfig:
         cfg.scanner_network_port = _clamp_int(getattr(cfg, "scanner_network_port", 4370), 4370, 1, 65535)
         cfg.scanner_network_timeout_ms = _clamp_int(getattr(cfg, "scanner_network_timeout_ms", 5000), 5000, 1000, 30000)
         cfg.scanner_usb_device_path = _safe_str(getattr(cfg, "scanner_usb_device_path", ""), "").strip()
+
+        # dashboard feedback
+        cfg.push_success_sound_enabled = _ensure_bool(getattr(cfg, "push_success_sound_enabled", True), True)
+        cfg.sync_success_sound_enabled = _ensure_bool(getattr(cfg, "sync_success_sound_enabled", True), True)
+        cfg.push_success_animation_enabled = _ensure_bool(getattr(cfg, "push_success_animation_enabled", True), True)
+        cfg.sync_success_animation_enabled = _ensure_bool(getattr(cfg, "sync_success_animation_enabled", True), True)
+        cfg.push_success_repeat_mode = _normalize_feedback_repeat_mode(
+            getattr(cfg, "push_success_repeat_mode", "per_device")
+        )
+        cfg.push_success_sound_source = _normalize_feedback_sound_source(
+            getattr(cfg, "push_success_sound_source", "default")
+        )
+        cfg.sync_success_sound_source = _normalize_feedback_sound_source(
+            getattr(cfg, "sync_success_sound_source", "default")
+        )
+        cfg.push_success_custom_sound_path = _safe_str(
+            getattr(cfg, "push_success_custom_sound_path", ""),
+            "",
+        ).strip()
+        cfg.sync_success_custom_sound_path = _safe_str(
+            getattr(cfg, "sync_success_custom_sound_path", ""),
+            "",
+        ).strip()
 
         # update system
         cfg.update_enabled = bool(getattr(cfg, "update_enabled", True)) if getattr(cfg, "update_enabled", None) is not None else True

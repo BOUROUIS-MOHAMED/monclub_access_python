@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import threading
 
 
 def _fail_full_cache(*args, **kwargs):
@@ -181,3 +182,45 @@ def test_member_shadow_delta_path_skips_full_diff(monkeypatch):
     assert changed_ids == {5}
     assert upserted == [{"activeMembershipId": 5, "fullName": "Updated User"}]
     assert deleted == [77]
+
+
+def test_request_running_ultra_sync_delegates_delta_ids():
+    import app.ui.app as app_module
+
+    request_sync_now = MagicMock()
+    app = SimpleNamespace(
+        _ultra_lock=threading.Lock(),
+        _ultra_engine=SimpleNamespace(running=True, request_sync_now=request_sync_now),
+        logger=MagicMock(),
+    )
+
+    started = app_module.MainApp._request_running_ultra_sync(
+        app,
+        refresh={"members": True, "devices": False},
+        changed_ids={42},
+        reason="SYNC_NOW_API",
+    )
+
+    assert started is True
+    request_sync_now.assert_called_once_with(changed_ids={42}, reason="sync_now_api")
+
+
+def test_request_running_ultra_sync_preserves_deletion_only_delta():
+    import app.ui.app as app_module
+
+    request_sync_now = MagicMock()
+    app = SimpleNamespace(
+        _ultra_lock=threading.Lock(),
+        _ultra_engine=SimpleNamespace(running=True, request_sync_now=request_sync_now),
+        logger=MagicMock(),
+    )
+
+    started = app_module.MainApp._request_running_ultra_sync(
+        app,
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        reason="CHANGE_DETECTOR",
+    )
+
+    assert started is True
+    request_sync_now.assert_called_once_with(changed_ids=set(), reason="change_detector")

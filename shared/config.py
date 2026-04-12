@@ -55,6 +55,15 @@ ACCESS_CONFIG_FIELDS = (
     "start_on_system_startup",
     "login_email",
     "log_level",
+    "push_success_sound_enabled",
+    "sync_success_sound_enabled",
+    "push_success_animation_enabled",
+    "sync_success_animation_enabled",
+    "push_success_repeat_mode",
+    "push_success_sound_source",
+    "sync_success_sound_source",
+    "push_success_custom_sound_path",
+    "sync_success_custom_sound_path",
 )
 
 TV_CONFIG_FIELDS = (
@@ -124,6 +133,15 @@ class AccessConfigSection:
     start_on_system_startup: bool = False
     login_email: str = ""
     log_level: str = "DEBUG"
+    push_success_sound_enabled: bool = True
+    sync_success_sound_enabled: bool = True
+    push_success_animation_enabled: bool = True
+    sync_success_animation_enabled: bool = True
+    push_success_repeat_mode: str = "per_device"
+    push_success_sound_source: str = "default"
+    sync_success_sound_source: str = "default"
+    push_success_custom_sound_path: str = ""
+    sync_success_custom_sound_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -355,6 +373,15 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         start_on_system_startup=bool(getattr(cfg, "start_on_system_startup", False)),
         login_email=str(getattr(cfg, "login_email", "") or ""),
         log_level=str(getattr(cfg, "log_level", "DEBUG") or "DEBUG"),
+        push_success_sound_enabled=bool(getattr(cfg, "push_success_sound_enabled", True)),
+        sync_success_sound_enabled=bool(getattr(cfg, "sync_success_sound_enabled", True)),
+        push_success_animation_enabled=bool(getattr(cfg, "push_success_animation_enabled", True)),
+        sync_success_animation_enabled=bool(getattr(cfg, "sync_success_animation_enabled", True)),
+        push_success_repeat_mode=str(getattr(cfg, "push_success_repeat_mode", "per_device") or "per_device"),
+        push_success_sound_source=str(getattr(cfg, "push_success_sound_source", "default") or "default"),
+        sync_success_sound_source=str(getattr(cfg, "sync_success_sound_source", "default") or "default"),
+        push_success_custom_sound_path=str(getattr(cfg, "push_success_custom_sound_path", "") or ""),
+        sync_success_custom_sound_path=str(getattr(cfg, "sync_success_custom_sound_path", "") or ""),
     )
 
 

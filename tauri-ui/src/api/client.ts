@@ -115,7 +115,7 @@ export function openSSE(
     wasOpen = true;
   };
   es.onmessage = (e) => { try { onEvent("message", JSON.parse(e.data)); } catch { onEvent("message", e.data); } };
-  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping","enroll_started","phase"]) {
+  for (const t of ["log","step","progress","result","success","failed","error","cancelled","status","device_status","popup","ping","enroll_started","phase","device_push_success","sync_completed_success"]) {
     es.addEventListener(t, ((e: MessageEvent) => {
       try { onEvent(t, JSON.parse(e.data)); } catch { onEvent(t, e.data); }
     }) as EventListener);

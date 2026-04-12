@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import base64
+import mimetypes
 import os
 import queue
 import re
@@ -27,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+from shared.desktop_paths import get_desktop_path_layout
 
 _logger = logging.getLogger(__name__)
 
@@ -318,6 +321,15 @@ class _Ctx:
         self.handler.send_response(status)
         _cors_headers(self.handler)
         self.handler.send_header("Content-Type", "application/json; charset=utf-8")
+        self.handler.send_header("Content-Length", str(len(body)))
+        self.handler.end_headers()
+        self.handler.wfile.write(body)
+
+    def send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
+        body = payload or b""
+        self.handler.send_response(status)
+        _cors_headers(self.handler)
+        self.handler.send_header("Content-Type", content_type or "application/octet-stream")
         self.handler.send_header("Content-Length", str(len(body)))
         self.handler.end_headers()
         self.handler.wfile.write(body)
@@ -1155,6 +1167,202 @@ def _handle_tv_config_patch(ctx: _Ctx) -> None:
 
 def _handle_tv_config_restart_api(ctx: _Ctx) -> None:
     _handle_config_restart_api(ctx)
+
+
+# ==================== 3.5) FEEDBACK ====================
+
+_FEEDBACK_SOUND_SPECS: Dict[str, Dict[str, str]] = {
+    "device-push": {
+        "source_field": "push_success_sound_source",
+        "path_field": "push_success_custom_sound_path",
+        "base_name": "device-push-success",
+    },
+    "sync-complete": {
+        "source_field": "sync_success_sound_source",
+        "path_field": "sync_success_custom_sound_path",
+        "base_name": "sync-complete-success",
+    },
+}
+
+_FEEDBACK_SOUND_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a"}
+_FEEDBACK_SOUND_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _feedback_sound_spec(kind: str) -> Dict[str, str]:
+    spec = _FEEDBACK_SOUND_SPECS.get(str(kind or "").strip().lower())
+    if not spec:
+        raise ValueError("Unsupported feedback sound kind")
+    return spec
+
+
+def _feedback_storage_dir() -> Path:
+    root = get_desktop_path_layout().access_data_dir / "feedback"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _feedback_custom_sound_path(cfg: Any, kind: str) -> Path | None:
+    spec = _feedback_sound_spec(kind)
+    raw = _safe_str(getattr(cfg, spec["path_field"], ""), "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw)
+    except Exception:
+        return None
+
+
+def _feedback_sound_mime_type(path: Path) -> str:
+    guessed, _ = mimetypes.guess_type(str(path))
+    return guessed or "application/octet-stream"
+
+
+def _read_feedback_sound_bytes(kind: str, cfg: Any) -> tuple[Path, bytes, str] | None:
+    spec = _feedback_sound_spec(kind)
+    source = _safe_str(getattr(cfg, spec["source_field"], "default"), "default").strip().lower()
+    custom_path = _feedback_custom_sound_path(cfg, kind)
+    if source != "custom" or custom_path is None or not custom_path.exists():
+        return None
+    payload = custom_path.read_bytes()
+    return custom_path, payload, _feedback_sound_mime_type(custom_path)
+
+
+def _save_feedback_sound_upload(kind: str, cfg: Any, body: Dict[str, Any]) -> Dict[str, Any]:
+    spec = _feedback_sound_spec(kind)
+    file_name = _safe_str(body.get("fileName"), "").strip()
+    content_base64 = _safe_str(body.get("contentBase64"), "").strip()
+    if not file_name or not content_base64:
+        raise ValueError("fileName and contentBase64 are required")
+
+    ext = Path(file_name).suffix.lower()
+    if ext not in _FEEDBACK_SOUND_EXTENSIONS:
+        raise ValueError("Unsupported audio file type")
+
+    try:
+        payload = base64.b64decode(content_base64, validate=True)
+    except Exception as exc:
+        raise ValueError("Invalid base64 audio payload") from exc
+
+    if not payload:
+        raise ValueError("Audio payload is empty")
+    if len(payload) > _FEEDBACK_SOUND_MAX_BYTES:
+        raise ValueError("Audio payload is too large")
+
+    storage_dir = _feedback_storage_dir()
+    base_name = spec["base_name"]
+    for existing in storage_dir.glob(f"{base_name}.*"):
+        try:
+            existing.unlink()
+        except Exception:
+            pass
+
+    target = storage_dir / f"{base_name}{ext}"
+    target.write_bytes(payload)
+
+    setattr(cfg, spec["source_field"], "custom")
+    setattr(cfg, spec["path_field"], str(target))
+    return {
+        "fileName": target.name,
+        "path": str(target),
+        "sizeBytes": len(payload),
+    }
+
+
+def _reset_feedback_sound(kind: str, cfg: Any) -> None:
+    spec = _feedback_sound_spec(kind)
+    custom_path = _feedback_custom_sound_path(cfg, kind)
+    if custom_path and custom_path.exists():
+        try:
+            custom_path.unlink()
+        except Exception:
+            pass
+    setattr(cfg, spec["source_field"], "default")
+    setattr(cfg, spec["path_field"], "")
+
+
+def _handle_feedback_events_sse(ctx: _Ctx) -> None:
+    ctx.send_sse_start()
+    last_seq = 0
+    last_ping = time.time()
+    while True:
+        try:
+            events = ctx.app.get_feedback_events_since(last_seq, limit=20)
+        except Exception:
+            events = []
+
+        if events:
+            for event in events:
+                seq = _safe_int(event.get("seq"), last_seq)
+                if seq > last_seq:
+                    last_seq = seq
+                event_type = _safe_str(event.get("type"), "feedback").strip() or "feedback"
+                if not ctx.send_sse_event(event_type, event):
+                    return
+            last_ping = time.time()
+            continue
+
+        if time.time() - last_ping >= 15:
+            last_ping = time.time()
+            if not ctx.send_sse_event("ping", {"t": int(last_ping)}):
+                return
+
+        time.sleep(0.1)
+
+
+def _handle_feedback_sound_get(ctx: _Ctx, kind: str) -> None:
+    try:
+        resolved = _read_feedback_sound_bytes(kind, ctx.app.cfg)
+        if not resolved:
+            ctx.send_json(404, {"ok": False, "error": "Custom feedback sound not found"})
+            return
+        _path, payload, content_type = resolved
+        ctx.send_bytes(200, payload, content_type)
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc)})
+
+
+def _handle_feedback_sound_post(ctx: _Ctx, kind: str) -> None:
+    try:
+        info = _save_feedback_sound_upload(kind, ctx.app.cfg, ctx.body())
+        ctx.app.persist_config()
+        ctx.send_json(200, {"ok": True, **info})
+    except ValueError as exc:
+        ctx.send_json(400, {"ok": False, "error": str(exc)})
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc)})
+
+
+def _handle_feedback_sound_delete(ctx: _Ctx, kind: str) -> None:
+    try:
+        _reset_feedback_sound(kind, ctx.app.cfg)
+        ctx.app.persist_config()
+        ctx.send_json(200, {"ok": True})
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc)})
+
+
+def _handle_feedback_sound_device_push_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "device-push")
+
+
+def _handle_feedback_sound_device_push_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "device-push")
+
+
+def _handle_feedback_sound_device_push_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "device-push")
+
+
+def _handle_feedback_sound_sync_complete_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "sync-complete")
+
+
+def _handle_feedback_sound_sync_complete_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "sync-complete")
+
+
+def _handle_feedback_sound_sync_complete_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "sync-complete")
 
 
 # ==================== 4) SYNC + CACHE ====================

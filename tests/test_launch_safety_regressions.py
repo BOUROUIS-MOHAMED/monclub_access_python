@@ -165,7 +165,7 @@ def test_ultra_sync_scheduler_syncs_only_target_device_with_device_mode_copy() -
     ):
         scheduler._sync_device(target_device)
 
-    _, kwargs = engine_instance.run_blocking.call_args
+    _, kwargs = engine_instance.run_one_device_blocking.call_args
     filtered_cache = kwargs["cache"]
     assert len(filtered_cache.devices) == 1
     assert filtered_cache.devices[0]["id"] == 42
@@ -243,5 +243,5 @@ def test_ultra_sync_scheduler_resyncs_when_device_fingerprint_changes() -> None:
         assert scheduler._sync_device(device) is True
         assert scheduler._sync_device({**device, "allowedMemberships": [8]}) is True
 
-    assert first_engine.run_blocking.call_count == 1
-    assert second_engine.run_blocking.call_count == 1
+    assert first_engine.run_one_device_blocking.call_count == 1
+    assert second_engine.run_one_device_blocking.call_count == 1

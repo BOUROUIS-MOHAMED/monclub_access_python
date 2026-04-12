@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from types import SimpleNamespace
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Set
 
 from app.core.access_types import HistoryRecord, NotificationRequest
 from app.core.access_verification import load_local_state, verify_totp
@@ -973,6 +973,7 @@ class UltraSyncScheduler:
         self._cfg = cfg
         self._logger = logger_inst
         self._stop = threading.Event()
+        self._wake_sync = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._devices: List[Dict[str, Any]] = []
         self._last_hash: Dict[int, str] = {}  # device_id -> payload hash
@@ -981,6 +982,11 @@ class UltraSyncScheduler:
         self._workers: Dict[int, "UltraDeviceWorker"] = {}
         self._active_sync_lock = threading.Lock()
         self._active_sync_engine: Optional[Any] = None
+        self._pending_sync_lock = threading.Lock()
+        self._pending_sync_requested = False
+        self._pending_full_sync = False
+        self._pending_changed_ids: Set[int] = set()
+        self._pending_reason = "manual"
 
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
         """Register per-device worker references so _sync_device can pause them."""
@@ -994,6 +1000,7 @@ class UltraSyncScheduler:
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
         self._stop.clear()
+        self._wake_sync.clear()
         self._logger.info(
             "[UltraSyncScheduler] starting: %d device(s), ids=%s",
             len(devices), [d.get("id") for d in devices],
@@ -1006,14 +1013,56 @@ class UltraSyncScheduler:
     def stop(self):
         self._logger.info("[UltraSyncScheduler] stopping")
         self._stop.set()
+        self._wake_sync.set()
         if self._thread:
             self._thread.join(timeout=10)
         self._logger.info("[UltraSyncScheduler] stopped")
 
+    def request_sync_now(
+        self,
+        *,
+        changed_ids: set[int] | None = None,
+        reason: str = "manual",
+    ) -> None:
+        normalized_reason = str(reason or "manual").strip().lower() or "manual"
+        normalized_changed_ids = (
+            None if changed_ids is None else {
+                int(member_id)
+                for member_id in changed_ids
+                if member_id is not None
+            }
+        )
+        with self._pending_sync_lock:
+            self._pending_sync_requested = True
+            self._pending_reason = normalized_reason
+            if normalized_changed_ids is None:
+                self._pending_full_sync = True
+                self._pending_changed_ids.clear()
+            elif not self._pending_full_sync:
+                self._pending_changed_ids.update(normalized_changed_ids)
+        self._logger.info(
+            "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s",
+            normalized_reason,
+            "all" if normalized_changed_ids is None else len(normalized_changed_ids),
+        )
+        self._wake_sync.set()
+
+    def _drain_pending_sync_request(self) -> tuple[set[int] | None, str] | None:
+        with self._pending_sync_lock:
+            if not self._pending_sync_requested:
+                return None
+            reason = self._pending_reason
+            changed_ids = None if self._pending_full_sync else set(self._pending_changed_ids)
+            self._pending_sync_requested = False
+            self._pending_full_sync = False
+            self._pending_changed_ids.clear()
+            self._pending_reason = "manual"
+            return changed_ids, reason
+
     def _run(self):
         """Sync loop: push data to each ULTRA device on its configured interval."""
         # Immediate first sync
-        self._sync_all()
+        self._sync_all(reason="startup")
 
         while not self._stop.is_set():
             # Find the shortest interval among all ULTRA devices
@@ -1023,20 +1072,31 @@ class UltraSyncScheduler:
                 interval = int(settings.get("ultra_sync_interval_minutes", 15)) * 60
                 min_interval = min(min_interval, interval)
 
-            self._stop.wait(min_interval)
-            if not self._stop.is_set():
-                self._sync_all()
+            woke_for_sync = self._wake_sync.wait(min_interval)
+            if self._stop.is_set():
+                break
+            if woke_for_sync:
+                self._wake_sync.clear()
+                pending = self._drain_pending_sync_request()
+                if pending is None:
+                    continue
+                changed_ids, reason = pending
+                self._sync_all(changed_ids=changed_ids, reason=reason)
+                continue
+            self._sync_all(reason="timer")
 
     def _check_worker_health(self):
         """Deprecated: worker restarts are handled exclusively by the watchdog thread.
         Kept as no-op for backward compat in case external code calls it."""
         pass
 
-    def _sync_all(self):
+    def _sync_all(self, *, changed_ids: set[int] | None = None, reason: str = "timer"):
         """Push user data to all ULTRA devices (with hash-based skip)."""
         self._logger.info(
-            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s)",
+            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s) reason=%s changed_ids=%s",
             len(self._devices),
+            reason,
+            "all" if changed_ids is None else len(changed_ids),
         )
         t0 = time.time()
         # Check worker health before each sync cycle
@@ -1050,7 +1110,7 @@ class UltraSyncScheduler:
         for d in self._devices:
             device_id = d.get("id")
             try:
-                did_sync = self._sync_device(d)
+                did_sync = self._sync_device(d, changed_ids=changed_ids)
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 15)
                 ) * 60
@@ -1070,11 +1130,16 @@ class UltraSyncScheduler:
                 self._logger.error("[ULTRA:%s] sync failed: %s", device_id, e)
         elapsed = time.time() - t0
         self._logger.info(
-            "[UltraSyncScheduler] _sync_all: cycle done in %.1fs — synced=%d skipped=%d failed=%d",
-            elapsed, synced, skipped, failed,
+            "[UltraSyncScheduler] _sync_all: cycle done in %.1fs — synced=%d skipped=%d failed=%d reason=%s",
+            elapsed, synced, skipped, failed, reason,
         )
 
-    def _sync_device(self, device: Dict[str, Any]) -> bool:
+    def _sync_device(
+        self,
+        device: Dict[str, Any],
+        *,
+        changed_ids: set[int] | None = None,
+    ) -> bool:
         """Push data to a single device with hash-based change detection.
 
         Reuses DeviceSyncEngine by temporarily treating this ULTRA device
@@ -1134,7 +1199,15 @@ class UltraSyncScheduler:
         try:
             with self._active_sync_lock:
                 self._active_sync_engine = engine
-            engine.run_blocking(cache=filtered_cache, source="ultra_sync")
+            did_run = engine.run_one_device_blocking(
+                cache=filtered_cache,
+                device=device_copy,
+                source="ultra_sync",
+                changed_ids=changed_ids,
+            )
+            if not did_run:
+                self._logger.warning("[ULTRA:%s] sync push failed or was skipped", device_id)
+                return False
             self._last_hash[device_id] = current_hash
             self._logger.info("[ULTRA:%s] sync push complete", device_id)
             return True
@@ -1393,3 +1466,17 @@ class UltraEngine:
         if not self._sync_scheduler:
             return None, 0
         return self._sync_scheduler.get_active_progress_snapshot()
+
+    def request_sync_now(
+        self,
+        *,
+        changed_ids: set[int] | None = None,
+        reason: str = "manual",
+    ) -> bool:
+        if not self._running or not self._sync_scheduler:
+            return False
+        self._sync_scheduler.request_sync_now(
+            changed_ids=changed_ids,
+            reason=reason,
+        )
+        return True
