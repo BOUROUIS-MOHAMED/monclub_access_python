@@ -3222,6 +3222,36 @@ def _load_sync_cache_db() -> "SyncCacheState | None":
         )
 
 
+def load_sync_contract_meta() -> Dict[str, Any] | None:
+    """Direct query for contract snapshot metadata without loading the full sync cache."""
+    with get_conn() as conn:
+        meta = conn.execute(
+            "SELECT contract_status, contract_end_date, updated_at FROM sync_meta WHERE id=1"
+        ).fetchone()
+        if meta:
+            return {
+                "contractStatus": bool(int(meta["contract_status"] or 0)),
+                "contractEndDate": meta["contract_end_date"],
+                "updatedAt": meta["updated_at"],
+            }
+
+        raw = conn.execute("SELECT updated_at, payload_json FROM sync_cache WHERE id=1").fetchone()
+
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw["payload_json"] or "{}")
+    except Exception:
+        return None
+
+    return {
+        "contractStatus": bool(data.get("contractStatus", False)),
+        "contractEndDate": data.get("contractEndDate"),
+        "updatedAt": raw["updated_at"],
+    }
+
+
 def list_sync_users() -> List[Dict[str, Any]]:
     """Direct query — avoids loading memberships/devices/infra via load_sync_cache() hot path."""
     with get_conn() as conn:

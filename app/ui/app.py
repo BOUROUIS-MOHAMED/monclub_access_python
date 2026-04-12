@@ -505,8 +505,13 @@ class MainApp:
 
     # ======================= Per-device mode helpers =======================
     def get_access_mode_summary(self) -> Dict[str, int]:
-        cache = load_sync_cache()
-        devices = getattr(cache, "devices", []) if cache else []
+        try:
+            from app.core.db import list_sync_devices_payload
+
+            devices = list_sync_devices_payload()
+        except Exception:
+            cache = load_sync_cache()
+            devices = getattr(cache, "devices", []) if cache else []
         dev = ag = ultra = unk = 0
         for d in devices or []:
             if not isinstance(d, dict):
@@ -1079,9 +1084,13 @@ class MainApp:
         )
         self._pending_sync_context = None
 
+        sync_run_id: int | None = None
+        sync_started_perf = 0.0
+
         def work():
+            nonlocal sync_run_id, sync_started_perf
             sync_online = False
-            sync_run_id: int | None = None
+            sync_run_id = None
             sync_started_perf = time.perf_counter()
             sync_error_message: str | None = None
             device_sync_issue: str | None = None
@@ -1165,7 +1174,11 @@ class MainApp:
                     if data.get(field)
                 }
 
+                _cache_write_started = time.perf_counter()
                 save_sync_cache_delta(data, refresh)
+                _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
+                if _cache_write_ms >= 250:
+                    self.logger.info("[SYNC-DEBUG] local cache write took %dms", _cache_write_ms)
                 from app.core.db import invalidate_sync_cache
                 invalidate_sync_cache()
 
@@ -1239,6 +1252,7 @@ class MainApp:
                         from app.core.db import (
                             diff_member_shadow, upsert_member_shadow, delete_member_shadow,
                         )
+                        _shadow_started = time.perf_counter()
                         _valid_ids = (
                             [int(x) for x in _valid_ids_raw if x is not None]
                             if _valid_ids_raw is not None else None
@@ -1273,6 +1287,9 @@ class MainApp:
                         upsert_member_shadow(users=_incoming_users)
                         if _shadow_deleted:
                             delete_member_shadow(active_membership_ids=_shadow_deleted)
+                        _shadow_ms = int((time.perf_counter() - _shadow_started) * 1000)
+                        if _shadow_ms >= 250:
+                            self.logger.info("[SYNC-DEBUG] shadow diff/write took %dms", _shadow_ms)
                     except Exception as _shadow_exc:
                         self.logger.warning(
                             "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
@@ -1330,19 +1347,19 @@ class MainApp:
                                 "skippedReason": "RESTRICTED",
                             }
                     else:
-                        cache = load_sync_cache()
-                        if cache:
-                            summary = self.get_access_mode_summary()
-                            if summary.get("DEVICE", 0) <= 0:
-                                self.logger.info("[DeviceSync] Skipped: no DEVICE-mode devices.")
-                                if sync_response_summary is not None:
-                                    sync_response_summary["devicePush"] = {
-                                        "enabled": True,
-                                        "started": False,
-                                        "devicesDispatched": 0,
-                                        "skippedReason": "NO_DEVICE_MODE_DEVICES",
-                                    }
-                            else:
+                        summary = self.get_access_mode_summary()
+                        if summary.get("DEVICE", 0) <= 0:
+                            self.logger.info("[DeviceSync] Skipped: no DEVICE-mode devices.")
+                            if sync_response_summary is not None:
+                                sync_response_summary["devicePush"] = {
+                                    "enabled": True,
+                                    "started": False,
+                                    "devicesDispatched": 0,
+                                    "skippedReason": "NO_DEVICE_MODE_DEVICES",
+                                }
+                        else:
+                            cache = load_sync_cache()
+                            if cache:
                                 started = self._device_sync_engine.run_blocking(
                                     cache=cache, source=trigger_context.trigger_source.lower(),
                                     changed_ids=_delta_changed_ids,
@@ -1363,15 +1380,15 @@ class MainApp:
                                 self._last_device_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                                 self._last_device_sync_ok = bool(started)
                                 self._last_device_sync_error = None if started else device_sync_issue
-                        else:
-                            self.logger.info("[DeviceSync] Skipped: no cache yet")
-                            if sync_response_summary is not None:
-                                sync_response_summary["devicePush"] = {
-                                    "enabled": True,
-                                    "started": False,
-                                    "devicesDispatched": 0,
-                                    "skippedReason": "NO_CACHE",
-                                }
+                            else:
+                                self.logger.info("[DeviceSync] Skipped: no cache yet")
+                                if sync_response_summary is not None:
+                                    sync_response_summary["devicePush"] = {
+                                        "enabled": True,
+                                        "started": False,
+                                        "devicesDispatched": 0,
+                                        "skippedReason": "NO_CACHE",
+                                    }
                 else:
                     self.logger.debug("[DeviceSync] Skipped: device sync disabled.")
                     if sync_response_summary is not None:
@@ -1419,25 +1436,22 @@ class MainApp:
                 ultra_count = summary.get("ULTRA", 0)
 
                 self.logger.info("[ULTRA] sync_tick: mode_summary=%s", summary)
-                cache = load_sync_cache() if ultra_count > 0 else None
                 ultra_devices = []
-                if cache:
-                    from app.core.db import _coerce_device_row_to_payload, _expand_device_json_fields
-                    all_devices = getattr(cache, "devices", []) or []
-                    # Normalize DB snake_case rows → camelCase payload dicts so that
-                    # accessDataMode / ipAddress / portNumber keys are always present.
-                    normalized_devices = [
-                        _coerce_device_row_to_payload(_expand_device_json_fields(d))
-                        if isinstance(d, dict) else d
-                        for d in all_devices
-                    ]
+                if ultra_count > 0:
+                    try:
+                        from app.core.db import list_sync_devices_payload
+
+                        normalized_devices = list_sync_devices_payload()
+                    except Exception:
+                        cache = load_sync_cache()
+                        normalized_devices = (getattr(cache, "devices", []) or []) if cache else []
                     ultra_devices = [
                         d for d in normalized_devices
                         if isinstance(d, dict) and str(d.get("accessDataMode", "")).strip().upper() == "ULTRA"
                     ]
                     self.logger.info(
                         "[ULTRA] sync_tick: all_devices=%d ultra_devices=%d ids=%s",
-                        len(all_devices), len(ultra_devices),
+                        len(normalized_devices), len(ultra_devices),
                         [d.get("id") for d in ultra_devices],
                     )
 
@@ -1560,19 +1574,33 @@ class MainApp:
                 days_expired = age.days
                 reasons.append(f"Votre session a expirée (dernière connexion il y a {days_expired} jours). Veuillez vous reconnecter.")
 
-        cache = load_sync_cache()
-        if cache:
-            contract_status = getattr(cache, "contract_status", getattr(cache, "contractStatus", None))
-            contract_end_date = getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None))
+        try:
+            from app.core.db import load_sync_contract_meta
 
-            if contract_status is False:
-                reasons.append("Contract inactive (status=false from backend).")
+            contract_meta = load_sync_contract_meta()
+        except Exception:
+            contract_meta = None
 
-            if contract_end_date:
-                end_dt = _parse_dt_any(str(contract_end_date))
-                if end_dt and end_dt < datetime.now():
-                    reasons.append(f"Contract expired (contractEndDate={contract_end_date}).")
+        if contract_meta is None:
+            cache = load_sync_cache()
+            if cache:
+                contract_status = getattr(cache, "contract_status", getattr(cache, "contractStatus", None))
+                contract_end_date = getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None))
+            else:
+                contract_status = None
+                contract_end_date = None
         else:
+            contract_status = contract_meta.get("contractStatus")
+            contract_end_date = contract_meta.get("contractEndDate")
+
+        if contract_status is False:
+            reasons.append("Contract inactive (status=false from backend).")
+
+        if contract_end_date:
+            end_dt = _parse_dt_any(str(contract_end_date))
+            if end_dt and end_dt < datetime.now():
+                reasons.append(f"Contract expired (contractEndDate={contract_end_date}).")
+        elif contract_meta is None:
             self.logger.warning("No sync cache yet (contract checks cannot be evaluated offline).")
 
         return reasons
@@ -1596,18 +1624,28 @@ class MainApp:
                 if days_remaining <= 7:
                     result["loginWarning"] = True
 
-        cache = load_sync_cache()
-        if cache:
-            contract_end_date = getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None))
-            end_dt = _parse_dt_any(str(contract_end_date or ""))
-            if end_dt is not None:
-                remaining = end_dt - datetime.now()
-                days_remaining = remaining.days
-                if days_remaining < 0:
-                    days_remaining = 0
-                result["contractDaysRemaining"] = days_remaining
-                if days_remaining <= 10:
-                    result["contractWarning"] = True
+        try:
+            from app.core.db import load_sync_contract_meta
+
+            contract_meta = load_sync_contract_meta()
+        except Exception:
+            contract_meta = None
+
+        if contract_meta is None:
+            cache = load_sync_cache()
+            contract_end_date = getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None)) if cache else None
+        else:
+            contract_end_date = contract_meta.get("contractEndDate")
+
+        end_dt = _parse_dt_any(str(contract_end_date or ""))
+        if end_dt is not None:
+            remaining = end_dt - datetime.now()
+            days_remaining = remaining.days
+            if days_remaining < 0:
+                days_remaining = 0
+            result["contractDaysRemaining"] = days_remaining
+            if days_remaining <= 10:
+                result["contractWarning"] = True
         return result
 
     def evaluate_access_and_redirect(self):

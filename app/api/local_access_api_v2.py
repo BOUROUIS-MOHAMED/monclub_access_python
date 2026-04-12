@@ -542,7 +542,8 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
 
 
 def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
-    from access.store import load_auth_token, load_sync_cache
+    from access.store import load_auth_token
+    from app.core.db import list_sync_devices_payload, load_sync_contract_meta
 
     auth = load_auth_token()
     reasons = []
@@ -550,7 +551,8 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         reasons = app._restriction_reasons() if auth else []
     except Exception:
         pass
-    cache = load_sync_cache()
+    contract_meta = load_sync_contract_meta()
+    devices = list_sync_devices_payload()
 
     session = {
         "loggedIn": bool(auth and auth.token),
@@ -558,8 +560,8 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "reasons": reasons,
         "email": (auth.email if auth else None),
         "lastLoginAt": (auth.last_login_at if auth else None),
-        "contractStatus": bool(cache and cache.contract_status),
-        "contractEndDate": (cache.contract_end_date if cache else None),
+        "contractStatus": bool(contract_meta and contract_meta.get("contractStatus")),
+        "contractEndDate": (contract_meta.get("contractEndDate") if contract_meta else None),
     }
 
     try:
@@ -574,7 +576,6 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         session["contractDaysRemaining"] = None
         session["contractWarning"] = False
 
-    devices = list(cache.devices) if cache else []
     dev_count = 0
     agent_count = 0
     ultra_count = 0
@@ -596,8 +597,8 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
 
     sync = {
         "running": bool(getattr(app, "_sync_work_running", False)),
-        "lastSyncAt": getattr(app, "_last_sync_at", None) or (cache.updated_at if cache else None),
-        "lastOk": getattr(app, "_last_sync_ok", bool(cache)),
+        "lastSyncAt": getattr(app, "_last_sync_at", None) or (contract_meta.get("updatedAt") if contract_meta else None),
+        "lastOk": getattr(app, "_last_sync_ok", bool(contract_meta)),
         "lastError": getattr(app, "_last_sync_error", None),
     }
 
@@ -1291,28 +1292,36 @@ def _handle_push_history_pins(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_meta(ctx: _Ctx) -> None:
-    from access.store import load_sync_cache
-    cache = load_sync_cache()
-    if not cache:
+    from app.core.db import (
+        list_sync_devices_payload,
+        list_sync_gym_access_credentials,
+        list_sync_infrastructures,
+        list_sync_memberships,
+        list_sync_users,
+        load_sync_contract_meta,
+    )
+
+    contract_meta = load_sync_contract_meta()
+    if not contract_meta:
         ctx.send_json(200, {"hasSyncData": False})
         return
     ctx.send_json(200, {
         "hasSyncData": True,
-        "contractStatus": cache.contract_status,
-        "contractEndDate": cache.contract_end_date,
-        "lastSyncAt": getattr(cache, "updated_at", None),
-        "userCount": len(cache.users),
-        "deviceCount": len(cache.devices),
-        "membershipCount": len(cache.membership),
-        "infrastructureCount": len(cache.infrastructures),
-        "credentialCount": len(cache.gym_access_credentials),
+        "contractStatus": contract_meta.get("contractStatus"),
+        "contractEndDate": contract_meta.get("contractEndDate"),
+        "lastSyncAt": contract_meta.get("updatedAt"),
+        "userCount": len(list_sync_users()),
+        "deviceCount": len(list_sync_devices_payload()),
+        "membershipCount": len(list_sync_memberships()),
+        "infrastructureCount": len(list_sync_infrastructures()),
+        "credentialCount": len(list_sync_gym_access_credentials()),
     })
 
 
 def _handle_sync_cache_users(ctx: _Ctx) -> None:
-    from access.store import load_sync_cache
-    cache = load_sync_cache()
-    users = list(cache.users) if cache else []
+    from app.core.db import list_sync_users
+
+    users = list_sync_users()
     limit = ctx.q_int("limit", default=0)
     offset = ctx.q_int("offset", default=0)
     total = len(users)
@@ -1324,9 +1333,9 @@ def _handle_sync_cache_users(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
-    from access.store import load_sync_cache
-    cache = load_sync_cache()
-    ctx.send_json(200, {"memberships": list(cache.membership) if cache else []})
+    from app.core.db import list_sync_memberships
+
+    ctx.send_json(200, {"memberships": list_sync_memberships()})
 
 
 def _handle_sync_cache_devices(ctx: _Ctx) -> None:
@@ -1341,9 +1350,9 @@ def _handle_sync_cache_devices(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_infrastructures(ctx: _Ctx) -> None:
-    from access.store import load_sync_cache
-    cache = load_sync_cache()
-    ctx.send_json(200, {"infrastructures": list(cache.infrastructures) if cache else []})
+    from app.core.db import list_sync_infrastructures
+
+    ctx.send_json(200, {"infrastructures": list_sync_infrastructures()})
 
 
 def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
