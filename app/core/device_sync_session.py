@@ -68,3 +68,15 @@ class DeviceSyncSession:
             return SyncChunk(phase=phase_name, items=rows[start:end])
 
         raise StopIteration("sync session exhausted")
+
+    def has_pending_work(self) -> bool:
+        phase_index = self._phase_index
+        phase_offset = self._phase_offset
+
+        while phase_index < len(self._phases):
+            _, rows, _ = self._phases[phase_index]
+            if phase_offset < len(rows):
+                return True
+            phase_index += 1
+            phase_offset = 0
+        return False

@@ -51,3 +51,16 @@ def test_resume_advances_to_user_phase_after_deletes():
     assert len(fifth.items) == 1
     assert sixth.phase == "TEMPLATE"
     assert len(sixth.items) == 5
+
+
+def test_has_pending_work_becomes_false_after_final_chunk():
+    session = DeviceSyncSession.full(
+        device_id=9,
+        user_rows=[{"pin": "1"}],
+    )
+
+    assert session.has_pending_work() is True
+
+    session.next_chunk()
+
+    assert session.has_pending_work() is False
