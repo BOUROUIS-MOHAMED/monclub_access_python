@@ -2,193 +2,376 @@
 
 **Date:** 2026-04-12
 **Status:** Draft
-**Problem:** The current ULTRA flow already supports targeted sync and a long-lived RTLog worker, but sync still pauses the worker and temporarily hands device ownership to another path for pushes. That handoff creates unnecessary contention in the exact part of the system where low latency matters most.
+**Problem:** The current device runtime already has useful building blocks such as long-lived workers, targeted sync, and queued door-open commands. The remaining bottleneck is split ownership: urgent access work and heavy sync work still compete for the same device session, and some flows still pause one worker so another path can take over the socket. That ownership model is the wrong shape for the latency target.
 
 ---
 
 ## Overview
 
-Move device ownership toward a per-device actor model.
+Move the device runtime to a **generic per-device actor model** for **all device types from day one**.
 
-Each device actor becomes the single owner of:
+Each device gets one long-lived actor. That actor becomes the single normal owner of:
 
-- the live device connection
+- device connection/session state
 - RTLog polling
-- open-door commands from tray or access logic
-- targeted member push or delete work
-- periodic reconcile sync work
+- tray and API open-door commands
+- targeted member add, update, and delete work
+- device configuration refresh
+- background reconcile sync
 
-The actor processes those actions through a priority queue so urgent door and access actions are never trapped behind bulk sync work.
+The actor processes all work through a priority mailbox. Full sync is no longer one long blocking job. It is split into fixed-size chunks, and the actor re-checks the mailbox after every chunk so urgent work can jump ahead.
 
-This is the follow-up track after fast patch pipeline delivery.
+This is the downstream execution refactor that follows the fast-patch pipeline.
 
 ## Goals
 
-- Eliminate the current RTLog-worker pause and TCP handoff pattern for ULTRA devices.
-- Make urgent commands execute ahead of bulk sync work.
-- Preserve correct TOTP and tray open-door behavior.
-- Reduce the time between a local membership decision and actual device update.
-- Keep one clear owner per device connection.
+- Enforce `one device, one owner` across the entire Access runtime.
+- Apply the same actor model to every device type from the start.
+- Eliminate the RTLog-worker pause and TCP handoff pattern.
+- Guarantee that urgent door and access actions run before background sync work.
+- Keep TOTP, tray open-door, and RTLog rescue working correctly.
+- Allow fast-patch member updates to reach device actors immediately.
+- Rebuild safely on app restart from local DB plus immediate reconcile.
 
 ## Non-Goals
 
-- Rewriting every sync subsystem in one step.
-- Changing dashboard or backend contracts as part of this phase.
-- Replacing existing access verification logic.
-- Adding generic thread count without clear ownership rules.
+- Persisting raw in-flight command queues across restart.
+- Rewriting dashboard or backend contracts in this phase.
+- Replacing the current access verification rules or TOTP logic.
+- Solving latency by simply adding more threads without ownership boundaries.
 
 ## Current State
 
-The Access app already has important pieces of this design:
+The current Access runtime already contains parts of the target model:
 
-- a long-lived ULTRA worker for RTLog
-- a scheduler that can accumulate `changed_ids`
-- a command queue for some open-door actions
-- device sync code that can accept targeted member changes
+- per-device workers in `app/core/ultra_engine.py`
+- a command queue for door-open operations
+- targeted member sync support in `app/core/device_sync.py`
+- sync orchestration in `app/ui/app.py`
 
-The missing piece is unified ownership. During sync, the scheduler still pauses the RTLog worker so another path can take the socket and push updates. That means the most latency-sensitive path and the most I/O-heavy path still compete.
+The missing piece is unified ownership. Sync still pauses an RTLog worker and temporarily takes over the connection to perform pushes. That creates contention in the most latency-sensitive path. The current sync path also contains long-running batch phases that cannot yield to urgent device work.
 
 ## Chosen Design
 
-Use **one actor per device** with a strict priority queue and a single connection owner.
+Use a **generic per-device actor shell** for every device, with **device-family adapters** underneath it.
 
-High-level loop:
+High-level runtime:
 
-1. actor holds or manages the device connection
-2. actor polls RTLog with short cadence
-3. actor drains any queued higher-priority actions between poll windows
-4. actor performs small targeted writes immediately
-5. actor performs background reconcile work only when no higher-priority work is pending
+1. `ActorRegistry` starts one actor per active device
+2. `CommandRouter` translates tray, local API, fast patch, RTLog, and reconcile events into actor messages
+3. each `DeviceActor` owns its mailbox, connection state, health state, and current sync session
+4. each actor uses a `DeviceAdapter` that knows how to talk to that specific device family
+5. full sync runs as an interruptible chunked session, not as one large blocking operation
 
-No other component should open a second competing connection to the same device during normal operation.
+No other subsystem should normally open a second competing connection to the same device.
+
+## Architecture
+
+### DeviceActor
+
+One long-lived thread or loop per device.
+
+Responsibilities:
+
+- own the device session
+- manage mailbox execution
+- poll RTLog where supported
+- execute open-door commands
+- run targeted member changes
+- run chunked reconcile sync
+- expose health and queue status
+
+### DeviceAdapter
+
+One adapter interface per device family.
+
+Suggested adapter operations:
+
+- `connect()`
+- `disconnect()`
+- `poll_rtlog_once()`
+- `open_door()`
+- `upsert_member()`
+- `delete_member()`
+- `apply_config()`
+- `begin_sync_session()`
+- `run_sync_chunk()`
+
+The actor stays generic. Adapter differences live behind this interface.
+
+### ActorMailbox
+
+One mailbox per actor with:
+
+- priority ordering
+- message coalescing
+- sync interruption points between chunks
+
+### SyncSession
+
+A per-device sync object that stores:
+
+- sync type (`targeted` or `full`)
+- current phase
+- current cursor
+- desired member set snapshot
+- pending delete set
+- pending upsert set
+- pending template work
+- config/apply checkpoint
+
+The actor keeps the `SyncSession` in memory and resumes it after urgent work.
+
+### ActorRegistry
+
+Responsible for:
+
+- building actors from the current device list
+- restarting failed actors
+- stopping removed devices
+- replacing actors after device config changes
+
+### CommandRouter
+
+The only normal translation layer from external events to actor messages.
+
+Producers include:
+
+- tray and local open-door commands
+- RTLog events
+- fast-patch bundle application
+- sync scheduler and reconcile timers
+- device settings changes
 
 ## Message Types
 
 Suggested actor messages:
 
 - `OPEN_DOOR`
-- `PROCESS_RTLOG_RESULT`
-- `FAST_PATCH_UPSERT_MEMBER`
-- `FAST_PATCH_DELETE_MEMBER`
-- `TARGETED_SYNC`
-- `FULL_RECONCILE_SYNC`
+- `RTLOG_TICK`
+- `RTLOG_REACTION`
+- `MEMBER_UPSERT`
+- `MEMBER_DELETE`
+- `TARGETED_SYNC_START`
+- `FULL_SYNC_START`
+- `SYNC_NEXT_CHUNK`
 - `DEVICE_CONFIG_REFRESH`
-- `FORCE_RESYNC`
+- `RECONNECT`
 - `SHUTDOWN`
 
-Not every message type needs to exist on day one, but the ownership model should be designed for this set.
+Not every adapter will implement RTLog in the same way, but the actor shell should be designed around this common message set.
 
-## Priority Model
+## Effective Priority
 
 Recommended priority order:
 
 1. `OPEN_DOOR`
-2. `PROCESS_RTLOG_RESULT`
-3. `FAST_PATCH_DELETE_MEMBER`
-4. `FAST_PATCH_UPSERT_MEMBER`
-5. `TARGETED_SYNC`
-6. `FULL_RECONCILE_SYNC`
-7. `DEVICE_CONFIG_REFRESH`
+2. `RTLOG_REACTION`
+3. `MEMBER_DELETE`
+4. `MEMBER_UPSERT`
+5. `DEVICE_CONFIG_REFRESH`
+6. `TARGETED_SYNC_START`
+7. `SYNC_NEXT_CHUNK`
+8. `RTLOG_TICK`
+9. `FULL_SYNC_START`
+10. `RECONNECT`
+11. `SHUTDOWN`
 
 Why this order:
 
-- open door is the most user-visible and time-sensitive action
-- RTLog processing is the live access path and must remain hot
-- deletes and revokes matter more than adds because stale access is a security problem
-- targeted sync should win over full sync
-- full reconcile should remain the background safety net
+- open door is the most visible and time-sensitive action
+- RTLog reaction is the live access path
+- deletes and revokes are more urgent than adds
+- config refresh should not leave the actor syncing against stale device assumptions
+- targeted sync should beat full reconcile
+- full reconcile remains important, but it is explicitly background work
 
-## Queue Behavior
+## Mailbox Behavior
 
-The queue should support:
+The mailbox must support:
 
-- message coalescing for repeated member updates
-- promotion of deletes over older queued upserts for the same member
-- collapsing repeated full-sync requests into one pending reconcile
-- bounded backlog metrics so the app can expose queue pressure
+- priority ordering
+- coalescing of repeated member operations
+- promotion of delete over older upsert
+- collapse of repeated reconcile requests
+- bounded queue metrics
+
+Coalescing rules:
+
+- latest `MEMBER_UPSERT(memberId)` replaces older queued upserts for that member
+- `MEMBER_DELETE(memberId)` removes older queued upserts for the same member and wins
+- repeated `FULL_SYNC_START` collapses to one pending reconcile request
+- repeated `TARGETED_SYNC_START` merges member ids for the same device
+- repeated `DEVICE_CONFIG_REFRESH` collapses to one latest config snapshot
 
 Examples:
 
-- ten updates for the same member should end as one latest upsert
-- a queued upsert followed by a delete for the same member should end as delete
-- multiple timer-based reconcile requests should collapse into one
+- ten updates for the same member should result in one latest upsert
+- a queued upsert followed by a delete should end as delete
+- multiple timer-based reconcile requests should become one reconcile session
+
+## Fixed Chunking Policy
+
+Full sync must be interruptible, but the chosen policy is **fixed per-operation chunk sizes**, not adaptive chunk sizing.
+
+Recommended chunk sizes:
+
+- delete chunk: `20` pins
+- user upsert chunk: `25` users
+- authorize chunk: `25` users
+- template chunk: `5` users worth of templates
+
+Rules:
+
+- after **every chunk**, the actor returns to the mailbox and re-checks higher-priority work
+- template work uses the smallest chunk because it is typically the slowest and least predictable
+- if a user has many templates, that user's template work can end the chunk early
+
+This means a large sync can still take a long time overall, but it cannot monopolize the actor for the entire duration.
+
+## Sync Execution Model
+
+Instead of one blocking “sync device now” operation:
+
+1. actor receives `TARGETED_SYNC_START` or `FULL_SYNC_START`
+2. actor builds a `SyncSession`
+3. actor runs one chunk
+4. actor re-checks mailbox
+5. if a higher-priority message arrived, actor handles it immediately
+6. actor later resumes the same `SyncSession` with `SYNC_NEXT_CHUNK`
+
+This is the key latency guarantee:
+
+- tray open-door does not wait behind a 1200-user reconcile
+- fast-patch delete does not wait behind template-heavy sync
+- RTLog rescue stays hot
+
+## Sync Phases
+
+Suggested phase order inside `SyncSession`:
+
+1. device state snapshot / connect validation
+2. stale delete phase
+3. user phase
+4. authorize phase
+5. template phase
+6. config/apply verification phase
+7. final state commit / sync metadata update
+
+Each phase advances through chunk-sized cursors.
 
 ## Actor State
 
-Each device actor should own a small state object:
+Each actor should own a small focused state object:
 
 - device metadata
 - connection/session state
-- last-known firmware profile
-- last sync fingerprint or hash
-- pending queue summary
+- adapter family/profile
+- current mailbox summary
+- current sync session and cursor
 - last RTLog timestamp
+- last successful door command timestamp
 - last successful push timestamp
-- health and retry counters
+- retry and reconnect counters
+- last error
 
-This keeps device behavior local and makes debugging easier.
+This keeps device behavior local and debuggable.
 
 ## Interaction With Fast Patch
 
-The fast-patch pipeline is the preferred producer for urgent member updates.
+The fast-patch pipeline is the preferred producer for urgent membership changes.
 
-After local Access accepts a fast patch:
+After Access accepts a fast patch:
 
 - it determines affected devices
-- it sends targeted actor messages only to those devices
-- the actor applies the member add, update, or delete without waiting for a full sync cycle
+- it sends `MEMBER_UPSERT` or `MEMBER_DELETE` to those device actors
+- actors apply those changes immediately without waiting for a full reconcile cycle
 
-Normal reconcile still exists. If the actor sees a mismatch, a later full reconcile can repair it.
+Normal reconcile remains the safety net. If an actor later detects drift, a full sync can repair it.
 
-## ULTRA First, Then Broader Adoption
+## Restart And Recovery
 
-This design should start with ULTRA devices because that is where RTLog latency and TCP ownership matter most.
+The chosen restart model is:
 
-Suggested rollout:
+- rebuild actor state from local DB
+- immediately enqueue reconcile
+- do **not** persist raw command queues
 
-1. keep current non-ULTRA sync path unchanged
-2. actorize ULTRA ownership first
-3. prove door latency and targeted push behavior improve
-4. decide later whether non-ULTRA devices should use the same actor shell or keep the existing engine
+Startup sequence:
 
-That keeps the scope controlled while solving the bottleneck that matters most.
+1. load local DB and sync metadata
+2. rebuild device registry
+3. start one actor per active device
+4. enqueue `FULL_SYNC_START` for each active device
+
+Reasons:
+
+- no stale old open-door commands are replayed
+- no raw command queue corruption risk
+- local DB remains the durable desired-state source
+- reconcile repairs device drift after restart
+
+## Failure Handling
+
+### Device offline
+
+Actor keeps mailbox state in memory, retries connect with backoff, and exposes degraded state.
+
+### Sync interrupted by urgent work
+
+Actor stores `SyncSession` cursor and resumes later from the next chunk.
+
+### Config changed mid-sync
+
+Actor stops the current sync session, applies config refresh, and starts a new reconcile session.
+
+### Delete arrives during sync
+
+Delete wins over older queued upsert and is executed before more sync chunks continue.
+
+### Actor crash or unhandled worker exception
+
+Registry restarts the actor, rebuilds state from local DB, and enqueues reconcile.
+
+### Access restart
+
+Actors are rebuilt from device list, then reconcile from local DB.
 
 ## Connection Strategy
 
-The actor should be the only normal writer and reader for its device connection.
+The actor is the only normal reader and writer for its device session.
 
 Instead of:
 
-- RTLog worker owns the socket
-- sync path pauses worker
-- sync path opens or reuses another connection
+- worker owns socket
+- sync pauses worker
+- second path takes connection
 - worker resumes later
 
 The target state is:
 
-- actor owns the socket
-- actor interleaves read windows and write commands
-- actor serializes all device interaction in one place
+- actor owns session
+- actor interleaves RTLog polling and mailbox work
+- actor itself reconnects if needed
+- no second subsystem steals the device connection
 
-If a device or SDK limitation forces occasional reconnect, that reconnect should still be initiated by the actor itself, not by a second owner.
+If a device family truly requires reconnects, the reconnect is still initiated by the actor through its adapter.
 
-## Failure Handling
+## Health And Status Model
 
-### Device temporarily offline
+Each actor should expose:
 
-Actor keeps queue state, retries with backoff, and preserves higher-priority messages.
+- `state`: `starting`, `ready`, `syncing`, `degraded`, `offline`, `stopped`
+- `connected`
+- `queueDepth`
+- `highestPendingPriority`
+- `lastRTLogAt`
+- `lastDoorCommandAt`
+- `lastSuccessfulSyncAt`
+- `syncCursor`
+- `lastError`
 
-### Repeated push failure for one member
-
-Actor records failure, exposes it in status, and leaves full reconcile available as repair.
-
-### Queue overload
-
-Actor coalesces member messages and collapses full syncs so the queue does not grow without bound.
-
-### Connection reset during RTLog load
-
-Actor reconnects and resumes ownership without requiring another subsystem to take over.
+This is required so the system never becomes a silent black hole.
 
 ## Observability
 
@@ -196,33 +379,38 @@ Add actor-level metrics and logs for:
 
 - queue depth by priority
 - enqueue-to-start latency
-- command execution duration
+- per-chunk execution duration
 - reconnect count
 - sync coalescing count
-- dropped stale member messages
+- stale member messages dropped
+- sync defer count
 - RTLog idle and active time
 
-This is required so we can tell whether the actor model is actually reducing contention.
+This is how we verify whether actorization really improves contention.
 
 ## Testing
 
 ### Unit
 
-- queue coalescing and priority ordering
-- delete dominates earlier upsert for same member
-- full sync collapse behavior
+- priority ordering
+- delete dominates older upsert for same member
+- full-sync collapse behavior
+- targeted-sync merge behavior
+- sync cursor resumes correctly after interruption
 
 ### Integration
 
-- open-door command is not blocked by pending full sync
-- fast-patch delete reaches device actor before background reconcile
-- actor reconnect logic preserves pending work
+- open-door command is not blocked by pending sync chunks
+- fast-patch delete reaches actor before background reconcile resumes
+- config refresh interrupts sync and starts new reconcile
+- actor reconnect preserves mailbox state
 
 ### Regression
 
 - TOTP-driven open-door path still works
 - tray open-door still works
 - RTLog processing still feeds existing access feedback flows
+- fast-patch member change still becomes targeted device work
 
 ## Files Likely To Change
 
@@ -230,18 +418,27 @@ This is required so we can tell whether the actor model is actually reducing con
 
 - `app/core/ultra_engine.py`
 - `app/core/device_sync.py`
-- any worker or scheduler split used by ULTRA polling
-- sync orchestration in `app/ui/app.py`
+- `app/ui/app.py`
 
-Additional small state or queue helpers may deserve their own focused modules instead of expanding `ultra_engine.py` further.
+Likely new focused modules:
+
+- `app/core/device_actor.py`
+- `app/core/device_adapter.py`
+- `app/core/device_mailbox.py`
+- `app/core/device_sync_session.py`
+- `app/core/device_registry.py`
+
+Exact filenames can follow existing repo style, but these responsibilities should be split into focused modules rather than expanding `ultra_engine.py` further.
 
 ## Rollout Order
 
-1. ship fast patch pipeline first
-2. measure remaining `local cache updated -> device actually updated` latency
-3. actorize ULTRA device ownership
-4. remove the worker-pause handoff only after the actor path is proven stable
-5. evaluate whether the same model should expand to the rest of the device stack
+1. keep fast patch pipeline as the upstream freshness path
+2. introduce generic actor shell and mailbox
+3. route open-door commands through actors first
+4. route targeted fast-patch member work through actors
+5. move reconcile sync to chunked actor-owned sessions
+6. remove socket handoff and pause-for-sync behavior
+7. validate latency and failure behavior across all device families
 
 ## Relationship To Fast Patch
 
@@ -249,4 +446,5 @@ This design is intentionally downstream from:
 
 `docs/superpowers/specs/2026-04-12-fast-patch-pipeline-design.md`
 
-Fast patch solves freshness first. The actor model solves device-side execution and connection ownership second.
+Fast patch solves freshness first.
+The actor model solves device-side execution, connection ownership, interruption, and queue priority second.
