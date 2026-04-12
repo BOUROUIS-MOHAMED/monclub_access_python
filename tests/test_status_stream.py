@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -79,20 +80,39 @@ def _make_auth() -> SimpleNamespace:
     )
 
 
+@contextmanager
 def _patched_status_dependencies():
-    return patch.multiple(
-        local_access_api_v2,
-        _build_update_status_payload=MagicMock(return_value={
-            "updateAvailable": False,
-            "downloaded": False,
-            "downloading": False,
-            "progress": None,
-            "progressPercent": None,
-            "currentReleaseId": None,
-            "lastCheckAt": None,
-            "lastError": None,
-        }),
-    )
+    cache = _make_cache()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.multiple(
+                local_access_api_v2,
+                _build_update_status_payload=MagicMock(return_value={
+                    "updateAvailable": False,
+                    "downloaded": False,
+                    "downloading": False,
+                    "progress": None,
+                    "progressPercent": None,
+                    "currentReleaseId": None,
+                    "lastCheckAt": None,
+                    "lastError": None,
+                }),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "app.core.db.load_sync_contract_meta",
+                return_value={
+                    "contractStatus": cache.contract_status,
+                    "contractEndDate": cache.contract_end_date,
+                    "updatedAt": cache.updated_at,
+                },
+            )
+        )
+        stack.enter_context(
+            patch("app.core.db.list_sync_devices_payload", return_value=list(cache.devices))
+        )
+        yield
 
 
 def test_build_status_payload_includes_live_device_sync_progress() -> None:
@@ -203,7 +223,11 @@ def test_status_stream_emits_updated_status_when_device_sync_changes() -> None:
             total=3,
         )
 
-        worker.join(timeout=1.0)
+        deadline = time.time() + 2.0
+        while ctx._status_sent < 2 and time.time() < deadline:
+            time.sleep(0.01)
+
+        worker.join(timeout=0.5)
 
     status_events = [data for event, data in ctx.events if event == "status"]
     assert len(status_events) == 2

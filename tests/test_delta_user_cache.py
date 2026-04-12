@@ -99,6 +99,20 @@ def _make_sync_data(users, delta_mode=False, valid_ids=None):
     }
 
 
+def _make_credential(*, cred_id: int, account_id: int, gym_id: int = 58, secret_hex: str = "abc123", granted_ids=None):
+    return {
+        "id": cred_id,
+        "gymId": gym_id,
+        "accountId": account_id,
+        "secretHex": secret_hex,
+        "enabled": True,
+        "rotatedAt": f"2026-04-{cred_id:02d}T00:00:00",
+        "createdAt": f"2026-04-{cred_id:02d}T00:00:00",
+        "updatedAt": f"2026-04-{cred_id:02d}T00:00:00",
+        "grantedActiveMembershipIds": list(granted_ids or [account_id]),
+    }
+
+
 def test_save_sync_cache_delta_full_mode_replaces_all_users(db):
     """Full mode (membersDeltaMode=False) replaces all users in cache."""
     # Pre-populate cache with 3 users
@@ -145,3 +159,46 @@ def test_save_sync_cache_delta_delta_mode_with_no_changes_deletes_removed(db):
     ids = set(db.get_all_cached_user_am_ids())
     assert {1, 2}.issubset(ids)
     assert 3 not in ids
+
+
+def test_save_sync_cache_delta_credentials_refresh_preserves_unchanged_rowids(db):
+    initial = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    initial["gymAccessCredentials"] = [
+        _make_credential(cred_id=2, account_id=20, secret_hex="remove-me"),
+        _make_credential(cred_id=1, account_id=10, secret_hex="keep-me"),
+    ]
+    db.save_sync_cache_delta(
+        initial,
+        {"members": False, "devices": False, "credentials": True, "settings": False},
+    )
+
+    with db.get_conn() as conn:
+        keep_rowid_before = conn.execute(
+            "SELECT rowid FROM sync_gym_access_credentials WHERE gym_id=? AND account_id=?",
+            (58, 10),
+        ).fetchone()[0]
+
+    refreshed = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    refreshed["gymAccessCredentials"] = [
+        _make_credential(cred_id=1, account_id=10, secret_hex="keep-me"),
+        _make_credential(cred_id=3, account_id=30, secret_hex="new-one"),
+    ]
+    db.save_sync_cache_delta(
+        refreshed,
+        {"members": False, "devices": False, "credentials": True, "settings": False},
+    )
+
+    with db.get_conn() as conn:
+        keep_rowid_after = conn.execute(
+            "SELECT rowid FROM sync_gym_access_credentials WHERE gym_id=? AND account_id=?",
+            (58, 10),
+        ).fetchone()[0]
+        keys = {
+            tuple(row)
+            for row in conn.execute(
+                "SELECT gym_id, account_id FROM sync_gym_access_credentials ORDER BY account_id"
+            ).fetchall()
+        }
+
+    assert keep_rowid_after == keep_rowid_before
+    assert keys == {(58, 10), (58, 30)}

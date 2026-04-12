@@ -147,3 +147,37 @@ def test_status_payload_uses_direct_contract_and_device_snapshots(monkeypatch):
     assert payload["session"]["contractEndDate"] == "2026-06-30"
     assert payload["sync"]["lastSyncAt"] == "2026-04-12T00:56:28Z"
     assert payload["mode"] == {"DEVICE": 0, "AGENT": 0, "ULTRA": 2, "UNKNOWN": 0}
+
+
+def test_member_shadow_delta_path_skips_full_diff(monkeypatch):
+    import app.ui.app as app_module
+
+    upserted = []
+    deleted = []
+    app = SimpleNamespace(logger=MagicMock())
+
+    monkeypatch.setattr(
+        "app.core.db.diff_member_shadow",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("full shadow diff should be skipped in delta mode")),
+    )
+    monkeypatch.setattr("app.core.db.list_member_shadow_deleted_ids", lambda *, valid_member_ids: [77])
+    monkeypatch.setattr("app.core.db.upsert_member_shadow", lambda *, users: upserted.extend(users))
+    monkeypatch.setattr(
+        "app.core.db.delete_member_shadow",
+        lambda *, active_membership_ids: deleted.extend(active_membership_ids),
+    )
+
+    changed_ids = app_module.MainApp._apply_member_shadow_sync(
+        app,
+        data={
+            "membersDeltaMode": True,
+            "users": [{"activeMembershipId": 5, "fullName": "Updated User"}],
+            "validMemberIds": [5],
+        },
+        refresh={"members": True},
+        delta_changed_ids={5},
+    )
+
+    assert changed_ids == {5}
+    assert upserted == [{"activeMembershipId": 5, "fullName": "Updated User"}]
+    assert deleted == [77]

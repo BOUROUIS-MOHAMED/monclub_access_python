@@ -1228,6 +1228,29 @@ def delete_member_shadow(*, active_membership_ids: List[int]) -> None:
         conn.commit()
 
 
+def list_member_shadow_deleted_ids(*, valid_member_ids: List[int]) -> List[int]:
+    """Return shadow ids that are missing from the backend valid-id set."""
+    valid_set = set()
+    for raw_id in valid_member_ids or []:
+        try:
+            valid_set.add(int(raw_id))
+        except (TypeError, ValueError):
+            continue
+
+    with get_conn() as conn:
+        rows = conn.execute("SELECT active_membership_id FROM member_shadow").fetchall()
+
+    deleted_ids: List[int] = []
+    for row in rows:
+        try:
+            amid = int(row["active_membership_id"])
+        except (TypeError, ValueError):
+            continue
+        if amid not in valid_set:
+            deleted_ids.append(amid)
+    return deleted_ids
+
+
 def get_member_shadow_cards() -> Dict[int, str | None]:
     """Return {activeMembershipId: cardId} for all shadow rows."""
     with get_conn() as conn:
@@ -2196,6 +2219,145 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         conn.commit()
 
 
+def _normalize_sync_credential_payload_row(c: Dict[str, Any]) -> Dict[str, Any]:
+    granted_ids = c.get("grantedActiveMembershipIds")
+    if not isinstance(granted_ids, list):
+        granted_ids = []
+
+    return {
+        "id": _to_int_or_none(c.get("id")),
+        "gym_id": _to_int_or_none(c.get("gymId") if "gymId" in c else c.get("gym_id")),
+        "account_id": _to_int_or_none(c.get("accountId") if "accountId" in c else c.get("account_id")),
+        "secret_hex": str((c.get("secretHex") if "secretHex" in c else c.get("secret_hex")) or ""),
+        "enabled": 1 if bool(c.get("enabled", False)) else 0,
+        "rotated_at": c.get("rotatedAt") or c.get("rotated_at"),
+        "created_at": c.get("createdAt") or c.get("created_at"),
+        "updated_at": c.get("updatedAt") or c.get("updated_at"),
+        "granted_active_membership_ids_json": json.dumps(granted_ids, ensure_ascii=False),
+    }
+
+
+def _sync_credential_identity(row: Dict[str, Any]) -> tuple[int, int] | None:
+    gym_id = row.get("gym_id")
+    account_id = row.get("account_id")
+    if gym_id is None or account_id is None:
+        return None
+    return (int(gym_id), int(account_id))
+
+
+def _sync_credential_params(row: Dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        row.get("id"),
+        row.get("gym_id"),
+        row.get("account_id"),
+        row.get("secret_hex"),
+        row.get("enabled"),
+        row.get("rotated_at"),
+        row.get("created_at"),
+        row.get("updated_at"),
+        row.get("granted_active_membership_ids_json"),
+    )
+
+
+def _replace_sync_credentials(cur: sqlite3.Cursor, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cur.execute("DELETE FROM sync_gym_access_credentials")
+    if rows:
+        cur.executemany(
+            """
+            INSERT INTO sync_gym_access_credentials (
+                id, gym_id, account_id, secret_hex, enabled,
+                rotated_at, created_at, updated_at,
+                granted_active_membership_ids_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_sync_credential_params(row) for row in rows],
+        )
+    return {"mode": "replace", "deleted": None, "upserted": len(rows)}
+
+
+def _sync_gym_access_credentials_rows(cur: sqlite3.Cursor, payload_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized_rows = [_normalize_sync_credential_payload_row(c) for c in payload_rows if isinstance(c, dict)]
+    if not normalized_rows:
+        cur.execute("DELETE FROM sync_gym_access_credentials")
+        return {"mode": "replace", "deleted": None, "upserted": 0}
+
+    incoming_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
+    for row in normalized_rows:
+        key = _sync_credential_identity(row)
+        if key is None:
+            return _replace_sync_credentials(cur, normalized_rows)
+        incoming_by_key[key] = row
+
+    existing_rows = [
+        dict(r)
+        for r in cur.execute(
+            """
+            SELECT
+                id, gym_id, account_id, secret_hex, enabled,
+                rotated_at, created_at, updated_at,
+                granted_active_membership_ids_json
+            FROM sync_gym_access_credentials
+            """
+        ).fetchall()
+    ]
+    existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
+    for row in existing_rows:
+        key = _sync_credential_identity(row)
+        if key is None:
+            return _replace_sync_credentials(cur, normalized_rows)
+        existing_by_key[key] = row
+
+    fields = (
+        "id",
+        "gym_id",
+        "account_id",
+        "secret_hex",
+        "enabled",
+        "rotated_at",
+        "created_at",
+        "updated_at",
+        "granted_active_membership_ids_json",
+    )
+    to_upsert = [
+        row
+        for key, row in incoming_by_key.items()
+        if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
+    ]
+    to_delete = [key for key in existing_by_key if key not in incoming_by_key]
+
+    if to_delete:
+        chunk_size = 200
+        for i in range(0, len(to_delete), chunk_size):
+            chunk = to_delete[i:i + chunk_size]
+            predicates = " OR ".join(["(gym_id=? AND account_id=?)"] * len(chunk))
+            params: List[Any] = []
+            for gym_id, account_id in chunk:
+                params.extend([gym_id, account_id])
+            cur.execute(f"DELETE FROM sync_gym_access_credentials WHERE {predicates}", params)
+
+    if to_upsert:
+        cur.executemany(
+            """
+            INSERT INTO sync_gym_access_credentials (
+                id, gym_id, account_id, secret_hex, enabled,
+                rotated_at, created_at, updated_at,
+                granted_active_membership_ids_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id, gym_id) DO UPDATE SET
+                id=excluded.id,
+                secret_hex=excluded.secret_hex,
+                enabled=excluded.enabled,
+                rotated_at=excluded.rotated_at,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                granted_active_membership_ids_json=excluded.granted_active_membership_ids_json
+            """,
+            [_sync_credential_params(row) for row in to_upsert],
+        )
+
+    return {"mode": "delta", "deleted": len(to_delete), "upserted": len(to_upsert)}
+
+
 def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
@@ -2519,33 +2681,16 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
 
         # Conditional: credentials
         if refresh.get("credentials", True):
-            cur.execute("DELETE FROM sync_gym_access_credentials")
-            for c in (data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []):
-                if not isinstance(c, dict):
-                    continue
-                granted_ids = c.get("grantedActiveMembershipIds")
-                if not isinstance(granted_ids, list):
-                    granted_ids = []
-                cur.execute(
-                    """
-                    INSERT INTO sync_gym_access_credentials (
-                        id, gym_id, account_id, secret_hex, enabled,
-                        rotated_at, created_at, updated_at,
-                        granted_active_membership_ids_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        _to_int_or_none(c.get("id")),
-                        _to_int_or_none(c.get("gymId") if "gymId" in c else c.get("gym_id")),
-                        _to_int_or_none(c.get("accountId") if "accountId" in c else c.get("account_id")),
-                        str((c.get("secretHex") if "secretHex" in c else c.get("secret_hex")) or ""),
-                        1 if bool(c.get("enabled", False)) else 0,
-                        c.get("rotatedAt") or c.get("rotated_at"),
-                        c.get("createdAt") or c.get("created_at"),
-                        c.get("updatedAt") or c.get("updated_at"),
-                        json.dumps(granted_ids, ensure_ascii=False),
-                    ),
-                )
+            _creds_summary = _sync_gym_access_credentials_rows(
+                cur,
+                list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []),
+            )
+            _logger.info(
+                "[SYNC-DEBUG] credentials sync: mode=%s upserted=%s deleted=%s",
+                _creds_summary.get("mode"),
+                _creds_summary.get("upserted"),
+                _creds_summary.get("deleted"),
+            )
 
         # Conditional: settings (infrastructures)
         if refresh.get("settings", True):
