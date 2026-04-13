@@ -239,6 +239,23 @@ begin
   end;
 end;
 
+procedure RegisterZkemkeeper();
+var
+  Regsvr: string;
+  DllPath: string;
+begin
+  if IsWin64 then
+    Regsvr := ExpandConstant('{syswow64}\regsvr32.exe')
+  else
+    Regsvr := ExpandConstant('{sys}\regsvr32.exe');
+
+  DllPath := ExpandConstant('{app}\current\sdk\zkemkeeper.dll');
+  if FileExists(DllPath) then
+    ExecAndLog('"' + Regsvr + '" /s "' + DllPath + '"')
+  else
+    Log('ZKEMKeeper DLL not found: ' + DllPath);
+end;
+
 function IsWebView2RuntimePresent(var Version: string): Boolean;
 begin
   Version := '';
@@ -494,6 +511,12 @@ begin
   Sleep(900);
 
   DeleteTreeIfExists(ExpandConstant('{app}\current'));
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RegisterZkemkeeper();
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

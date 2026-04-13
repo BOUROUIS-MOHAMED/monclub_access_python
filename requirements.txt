@@ -5,3 +5,4 @@ winotify
 # Card scanner
 pyzk>=0.9
 pywinusb>=0.4
+pywin32>=306
