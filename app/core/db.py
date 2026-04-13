@@ -2643,26 +2643,49 @@ def _sync_gym_access_credentials_rows(
             return _replace_sync_credentials(cur, normalized_rows)
         incoming_by_key[key] = row
 
-    t_fetch = time.perf_counter()
-    existing_rows = [
-        dict(r)
-        for r in cur.execute(
-            """
-            SELECT
-                id, gym_id, account_id, secret_hex, enabled,
-                rotated_at, created_at, updated_at,
-                granted_active_membership_ids_json
-            FROM sync_gym_access_credentials
-            """
+    existing_keys_fetch_ms = 0.0
+    existing_fetch_ms = 0.0
+    existing_key_set: set[tuple[int, int]] = set()
+    if not merge_only:
+        t_keys = time.perf_counter()
+        existing_keys = cur.execute(
+            "SELECT gym_id, account_id FROM sync_gym_access_credentials"
         ).fetchall()
-    ]
-    existing_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
+        existing_keys_fetch_ms = (time.perf_counter() - t_keys) * 1000.0
+        for gym_id, account_id in existing_keys:
+            if gym_id is None or account_id is None:
+                return _replace_sync_credentials(cur, normalized_rows)
+            existing_key_set.add((int(gym_id), int(account_id)))
+
     existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
-    for row in existing_rows:
-        key = _sync_credential_identity(row)
-        if key is None:
-            return _replace_sync_credentials(cur, normalized_rows)
-        existing_by_key[key] = row
+    if incoming_by_key:
+        t_fetch = time.perf_counter()
+        incoming_keys = list(incoming_by_key.keys())
+        chunk_size = 200
+        for i in range(0, len(incoming_keys), chunk_size):
+            chunk = incoming_keys[i:i + chunk_size]
+            predicates = " OR ".join(["(gym_id=? AND account_id=?)"] * len(chunk))
+            params: List[Any] = []
+            for gym_id, account_id in chunk:
+                params.extend([gym_id, account_id])
+            rows = cur.execute(
+                f"""
+                SELECT
+                    id, gym_id, account_id, secret_hex, enabled,
+                    rotated_at, created_at, updated_at,
+                    granted_active_membership_ids_json
+                FROM sync_gym_access_credentials
+                WHERE {predicates}
+                """,
+                params,
+            ).fetchall()
+            for r in rows:
+                row = dict(r)
+                key = _sync_credential_identity(row)
+                if key is None:
+                    return _replace_sync_credentials(cur, normalized_rows)
+                existing_by_key[key] = row
+        existing_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
 
     t_diff = time.perf_counter()
     fields = (
@@ -2681,7 +2704,7 @@ def _sync_gym_access_credentials_rows(
         for key, row in incoming_by_key.items()
         if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
     ]
-    to_delete = [] if merge_only else [key for key in existing_by_key if key not in incoming_by_key]
+    to_delete = [] if merge_only else [key for key in existing_key_set if key not in incoming_by_key]
     diff_ms = (time.perf_counter() - t_diff) * 1000.0
 
     delete_ms = 0.0
@@ -2726,6 +2749,7 @@ def _sync_gym_access_credentials_rows(
         "upserted": len(to_upsert),
         "normalize_ms": round(normalize_ms, 3),
         "existing_fetch_ms": round(existing_fetch_ms, 3),
+        "existing_keys_fetch_ms": round(existing_keys_fetch_ms, 3),
         "diff_ms": round(diff_ms, 3),
         "delete_ms": round(delete_ms, 3),
         "upsert_ms": round(upsert_ms, 3),
@@ -3321,6 +3345,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
             profile["credentials_deleted"] = creds_summary.get("deleted")
             profile["credentials_normalize_ms"] = creds_summary.get("normalize_ms")
             profile["credentials_existing_fetch_ms"] = creds_summary.get("existing_fetch_ms")
+            profile["credentials_existing_keys_fetch_ms"] = creds_summary.get("existing_keys_fetch_ms")
             profile["credentials_diff_ms"] = creds_summary.get("diff_ms")
             profile["credentials_delete_ms"] = creds_summary.get("delete_ms")
             profile["credentials_upsert_ms"] = creds_summary.get("upsert_ms")
@@ -6497,6 +6522,4 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
             card_set.add(card2)
 
     return out
-
-
 
