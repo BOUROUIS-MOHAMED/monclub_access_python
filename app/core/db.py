@@ -2657,8 +2657,13 @@ def _sync_gym_access_credentials_rows(
                 return _replace_sync_credentials(cur, normalized_rows)
             existing_key_set.add((int(gym_id), int(account_id)))
 
+    # If the backend sends a large credential payload (common in delta),
+    # diffing against existing rows requires a full-row read that is very slow
+    # due to large JSON columns. Prefer upserting all incoming rows and only
+    # compute deletes by key set.
+    prefer_upsert_all = bool(incoming_by_key)
     existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
-    if incoming_by_key:
+    if not prefer_upsert_all and incoming_by_key:
         t_fetch = time.perf_counter()
         incoming_keys = list(incoming_by_key.keys())
         chunk_size = 200
@@ -2699,11 +2704,14 @@ def _sync_gym_access_credentials_rows(
         "updated_at",
         "granted_active_membership_ids_json",
     )
-    to_upsert = [
-        row
-        for key, row in incoming_by_key.items()
-        if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
-    ]
+    if prefer_upsert_all:
+        to_upsert = list(incoming_by_key.values())
+    else:
+        to_upsert = [
+            row
+            for key, row in incoming_by_key.items()
+            if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
+        ]
     to_delete = [] if merge_only else [key for key in existing_key_set if key not in incoming_by_key]
     diff_ms = (time.perf_counter() - t_diff) * 1000.0
 
@@ -2753,6 +2761,7 @@ def _sync_gym_access_credentials_rows(
         "diff_ms": round(diff_ms, 3),
         "delete_ms": round(delete_ms, 3),
         "upsert_ms": round(upsert_ms, 3),
+        "upsert_all": prefer_upsert_all,
     }
 
 
@@ -3349,6 +3358,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
             profile["credentials_diff_ms"] = creds_summary.get("diff_ms")
             profile["credentials_delete_ms"] = creds_summary.get("delete_ms")
             profile["credentials_upsert_ms"] = creds_summary.get("upsert_ms")
+            profile["credentials_upsert_all"] = creds_summary.get("upsert_all")
 
         # Conditional: settings (infrastructures)
         if refresh.get("settings", True):
@@ -6522,4 +6532,3 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
             card_set.add(card2)
 
     return out
-
