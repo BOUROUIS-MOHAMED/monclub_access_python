@@ -298,26 +298,33 @@ export default function ConfigPage() {
             <div className="space-y-1">
               <Label>Mode de connexion</Label>
               <p className="text-sm text-muted-foreground">
-                {cfg.scanner_mode === "network"
+                {cfg.scanner_mode === "usb"
                   ? "SCR100 via le réseau (TCP/IP port 4370)"
                   : "Lecteur USB branché directement (HID)"}
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Usb className={`h-4 w-4 ${cfg.scanner_mode === "usb" ? "text-primary" : "text-muted-foreground"}`} />
-              <Switch
-                checked={cfg.scanner_mode === "network"}
-                onCheckedChange={(checked: boolean) => {
-                  update("scanner_mode", checked ? "network" : "usb");
-                  patch("/config", { scanner_mode: checked ? "network" : "usb" }).catch(() => {});
+              <Select
+                value={cfg.scanner_mode || "network"}
+                onValueChange={(value) => {
+                  update("scanner_mode", value);
+                  patch("/config", { scanner_mode: value }).catch(() => {});
                 }}
-              />
-              <Wifi className={`h-4 w-4 ${cfg.scanner_mode === "network" ? "text-primary" : "text-muted-foreground"}`} />
+              >
+                <SelectTrigger className="w-[240px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="network"><Wifi className="h-3.5 w-3.5" /> SCR100 r‚seau</SelectItem>
+                  <SelectItem value="zkemkeeper"><Radio className="h-3.5 w-3.5" /> SCR100 ZKEMKeeper</SelectItem>
+                  <SelectItem value="usb"><Usb className="h-3.5 w-3.5" /> Lecteur USB HID</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </div>
 
           {/* Network mode settings */}
-          {cfg.scanner_mode === "network" && (
+          {(cfg.scanner_mode === "network" || cfg.scanner_mode === "zkemkeeper") && (
             <div className="space-y-3 pt-2 border-t border-border/40">
               <div className="flex items-end gap-2">
                 <div className="flex-1 space-y-1">
