@@ -244,6 +244,10 @@ class TestIsTotpFormat:
         # Even though format is correct, if totp disabled → False
         assert worker._is_totp_format("91234567") is False
 
+    def test_totp_validation_disabled_returns_false(self):
+        worker = self._worker(totp_validation=False)
+        assert worker._is_totp_format("91234567") is False
+
     def test_ultra_totp_rescue_disabled_returns_false(self):
         worker = self._worker(ultra_totp_rescue_enabled=False)
         assert worker._is_totp_format("91234567") is False

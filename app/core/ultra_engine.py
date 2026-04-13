@@ -740,6 +740,8 @@ class UltraDeviceWorker(threading.Thread):
         """Check if scanned code matches TOTP format: prefix + N digits."""
         if not self._settings.get("totp_enabled", True):
             return False
+        if not self._settings.get("totp_validation", True):
+            return False
         if not self._settings.get("ultra_totp_rescue_enabled", True):
             return False
 

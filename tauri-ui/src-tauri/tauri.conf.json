@@ -1,6 +1,6 @@
 {
   "productName": "MonClub Access",
-  "version": "0.1.0",
+  "version": "1.1.8",
   "identifier": "com.monclub.access",
   "build": {
     "beforeDevCommand": "npm run dev",

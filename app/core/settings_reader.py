@@ -170,6 +170,7 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         "access_server_host": _safe_str(raw.get("accessServerHost"), ""),
         "access_server_port": _safe_int(raw.get("accessServerPort"), 8788),
         "access_server_enabled": _boolish(raw.get("accessServerEnabled"), True),
+        "totp_validation": _boolish(raw.get("totpValidation", raw.get("totp_validation")), True),
 
         "image_cache_enabled": _boolish(raw.get("imageCacheEnabled"), True),
         "image_cache_timeout_sec": _clamp_int(raw.get("imageCacheTimeoutSec"), 2, 0, 60),

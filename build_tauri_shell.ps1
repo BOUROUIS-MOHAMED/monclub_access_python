@@ -15,6 +15,21 @@ Set-Location $ROOT
 
 . (Join-Path $ROOT "packaging\desktop_components.ps1")
 $meta = Get-DesktopComponentMetadata -Component $Component
+$versionInfo = Get-DesktopComponentVersionInfo -Component $Component
+
+function Sync-TauriShellVersionFiles {
+  param([string]$TargetComponent)
+
+  $syncScript = Join-Path $ROOT "packaging\sync_tauri_version_files.py"
+  if (-not (Test-Path -LiteralPath $syncScript -PathType Leaf)) {
+    throw "Tauri version sync script not found: $syncScript"
+  }
+
+  & python $syncScript --repo-root $ROOT --component $TargetComponent
+  if ($LASTEXITCODE -ne 0) {
+    throw "sync_tauri_version_files.py failed for $TargetComponent with exit code $LASTEXITCODE"
+  }
+}
 
 $tauriDir = Join-Path $ROOT "tauri-ui"
 $sourceExe = Join-Path $tauriDir ("src-tauri\target\{0}\monclub-access-ui.exe" -f $Profile)
@@ -36,6 +51,7 @@ $iconRestoreDir = $null
 Write-Host "== Build Tauri shell ==" -ForegroundColor Cyan
 Write-Host "Component : $($meta.DisplayName)"
 Write-Host "Profile   : $Profile"
+Write-Host "Version   : $($versionInfo.Version)"
 Write-Host "Source EXE: $sourceExe"
 Write-Host "Staged EXE: $stagedExe"
 
@@ -47,6 +63,9 @@ if ($DryRun) {
 if (-not (Test-Path $tauriDir)) {
   throw "tauri-ui folder not found: $tauriDir"
 }
+
+Write-Host "Synchronizing Tauri version metadata..." -ForegroundColor Yellow
+Sync-TauriShellVersionFiles -TargetComponent $Component
 
 Push-Location $tauriDir
 try {

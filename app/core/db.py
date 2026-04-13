@@ -504,6 +504,7 @@ def init_db() -> None:
                 access_server_host TEXT,
                 access_server_port INTEGER,
                 access_server_enabled INTEGER,
+                totp_validation INTEGER,
 
                 image_cache_enabled INTEGER,
                 image_cache_timeout_sec INTEGER,
@@ -543,6 +544,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_access_software_settings", "access_server_host", "access_server_host TEXT")
         _ensure_column(conn, "sync_access_software_settings", "access_server_port", "access_server_port INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "access_server_enabled", "access_server_enabled INTEGER")
+        _ensure_column(conn, "sync_access_software_settings", "totp_validation", "totp_validation INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "image_cache_enabled", "image_cache_enabled INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "image_cache_timeout_sec", "image_cache_timeout_sec INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "image_cache_max_bytes", "image_cache_max_bytes INTEGER")
@@ -2327,6 +2329,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         access_server_host,
                         access_server_port,
                         access_server_enabled,
+                        totp_validation,
 
                         image_cache_enabled,
                         image_cache_timeout_sec,
@@ -2357,12 +2360,13 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         gym_id=excluded.gym_id,
                         access_server_host=excluded.access_server_host,
                         access_server_port=excluded.access_server_port,
                         access_server_enabled=excluded.access_server_enabled,
+                        totp_validation=excluded.totp_validation,
 
                         image_cache_enabled=excluded.image_cache_enabled,
                         image_cache_timeout_sec=excluded.image_cache_timeout_sec,
@@ -2400,6 +2404,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         _safe_str(s.get("accessServerHost") if "accessServerHost" in s else s.get("access_server_host"), ""),
                         _to_int_or_none(s.get("accessServerPort") if "accessServerPort" in s else s.get("access_server_port")),
                         _bool_to_i(s.get("accessServerEnabled", True), default=1),
+                        _bool_to_i(s.get("totpValidation", s.get("totp_validation", True)), default=1),
 
                         _bool_to_i(s.get("imageCacheEnabled", True), default=1),
                         _to_int_or_none(s.get("imageCacheTimeoutSec", 2)),
@@ -2790,7 +2795,7 @@ def _upsert_sync_access_software_settings_row(
     cur.execute(
         """
         INSERT INTO sync_access_software_settings (
-            id, gym_id, access_server_host, access_server_port, access_server_enabled,
+            id, gym_id, access_server_host, access_server_port, access_server_enabled, totp_validation,
             image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
             event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
             decision_workers, decision_ema_alpha,
@@ -2800,12 +2805,13 @@ def _upsert_sync_access_software_settings_row(
             default_authorize_door_id, sdk_read_initial_bytes,
             optional_data_sync_delay_minutes,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             gym_id=excluded.gym_id,
             access_server_host=excluded.access_server_host,
             access_server_port=excluded.access_server_port,
             access_server_enabled=excluded.access_server_enabled,
+            totp_validation=excluded.totp_validation,
             image_cache_enabled=excluded.image_cache_enabled,
             image_cache_timeout_sec=excluded.image_cache_timeout_sec,
             image_cache_max_bytes=excluded.image_cache_max_bytes,
@@ -2834,6 +2840,7 @@ def _upsert_sync_access_software_settings_row(
             _safe_str(settings.get("accessServerHost") if "accessServerHost" in settings else settings.get("access_server_host"), ""),
             _to_int_or_none(settings.get("accessServerPort") if "accessServerPort" in settings else settings.get("access_server_port")),
             _bool_to_i(settings.get("accessServerEnabled", True), default=1),
+            _bool_to_i(settings.get("totpValidation", settings.get("totp_validation", True)), default=1),
             _bool_to_i(settings.get("imageCacheEnabled", True), default=1),
             _to_int_or_none(settings.get("imageCacheTimeoutSec", 2)),
             _to_int_or_none(settings.get("imageCacheMaxBytes", 5242880)),
@@ -3692,6 +3699,7 @@ def _coerce_sync_access_software_settings_row_to_payload(
         "accessServerHost": d.get("access_server_host"),
         "accessServerPort": d.get("access_server_port"),
         "accessServerEnabled": bool(int(d.get("access_server_enabled") or 0)),
+        "totpValidation": True if d.get("totp_validation") is None else bool(int(d.get("totp_validation") or 0)),
         "imageCacheEnabled": bool(int(d.get("image_cache_enabled") or 0)),
         "imageCacheTimeoutSec": d.get("image_cache_timeout_sec"),
         "imageCacheMaxBytes": d.get("image_cache_max_bytes"),
@@ -3727,6 +3735,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
             SELECT
                 gym_id,
                 access_server_host, access_server_port, access_server_enabled,
+                totp_validation,
                 image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
                 event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
                 decision_workers, decision_ema_alpha,

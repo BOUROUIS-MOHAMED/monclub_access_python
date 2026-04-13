@@ -43,6 +43,7 @@ def _make_settings(
     *,
     rfid_enabled: bool = True,
     totp_enabled: bool = True,
+    totp_validation: bool = True,
     totp_period_seconds: int = 30,
     totp_drift_steps: int = 1,
     totp_digits: int = 7,
@@ -55,6 +56,7 @@ def _make_settings(
     return {
         "rfid_enabled": rfid_enabled,
         "totp_enabled": totp_enabled,
+        "totp_validation": totp_validation,
         "totp_period_seconds": totp_period_seconds,
         "totp_drift_steps": totp_drift_steps,
         "totp_digits": totp_digits,
@@ -452,6 +454,18 @@ class TestVerifyTotp:
             users_by_card={},
         )
         assert result["allowed"] is False
+
+    def test_totp_validation_disabled_valid_card_falls_back_to_rfid(self):
+        user = {"activeMembershipId": 7}
+        result = verify_totp(
+            scanned="12345",
+            settings=self._settings(totp_enabled=True, totp_validation=False),
+            creds_payload=[],
+            users_by_am={7: user},
+            users_by_card={"12345": [user]},
+        )
+        assert result["allowed"] is True
+        assert result["scanMode"] == "RFID_ONLY"
 
     # ── wrong prefix (length mismatch → RFID direct) ──
 

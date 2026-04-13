@@ -151,7 +151,7 @@ def _device(device_id: int, *, name: str = "Gate A", access_mode: str = "ULTRA")
     }
 
 
-def _settings(*, port: int) -> dict:
+def _settings(*, port: int, totp_validation: bool = True) -> dict:
     return {
         "accessSoftwareSettings": {
             "id": 1,
@@ -159,6 +159,7 @@ def _settings(*, port: int) -> dict:
             "accessServerHost": "127.0.0.1",
             "accessServerPort": port,
             "accessServerEnabled": True,
+            "totpValidation": totp_validation,
             "imageCacheEnabled": True,
             "imageCacheTimeoutSec": 2,
             "imageCacheMaxBytes": 5242880,
@@ -308,7 +309,7 @@ def test_apply_fast_patch_bundle_replaces_settings_and_contract_snapshot(db):
                 kind="SECTION_REPLACE",
                 entity_type="SETTINGS",
                 revision="2026-04-12T12:02:00Z",
-                payload=_settings(port=8765),
+                payload=_settings(port=8765, totp_validation=False),
             ),
             bundle_id="bundle-settings",
         )
@@ -316,6 +317,7 @@ def test_apply_fast_patch_bundle_replaces_settings_and_contract_snapshot(db):
 
     assert result == {"applied": 1, "skipped": 0, "ignored": None}
     assert db.load_sync_access_software_settings()["accessServerPort"] == 8765
+    assert db.load_sync_access_software_settings()["totpValidation"] is False
     assert db.load_sync_contract_meta() == {
         "contractStatus": True,
         "contractEndDate": "2026-12-31",

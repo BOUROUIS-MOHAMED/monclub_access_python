@@ -177,6 +177,7 @@ def verify_totp(
     t0 = time.perf_counter()
 
     totp_enabled = bool(settings.get("totp_enabled", True))
+    totp_validation = bool(settings.get("totp_validation", True))
 
     period = _safe_int(settings.get("totp_period_seconds", 30))
     drift = _safe_int(settings.get("totp_drift_steps", 1))
@@ -197,7 +198,7 @@ def verify_totp(
 
     raw = (scanned or "").strip()
 
-    if not totp_enabled:
+    if (not totp_enabled) or (not totp_validation):
         # TOTP disabled means "use RFID only" — not "allow everyone"
         vr = verify_card(scanned=scanned, settings=settings, users_by_card=users_by_card)
         if vr.get("allowed"):
