@@ -42,3 +42,15 @@ def test_connect_and_read_card(monkeypatch):
     scanner.connect(ip="192.168.0.10", port=4370, timeout_ms=3000)
     card = scanner.read_card_once()
     assert card == "1234567"
+
+
+def test_zkemkeeper_mode_sets_error_on_missing_ip():
+    from app.core.card_scanner import CardScanner, ScannerState
+
+    scanner = CardScanner()
+    ok = scanner.start_scan(mode="zkemkeeper", ip="")
+    assert ok is True
+    import time
+    time.sleep(0.2)
+    assert scanner.state in (ScannerState.ERROR, ScannerState.IDLE)
+    assert "zkemkeeper" in (scanner.error or "").lower()

@@ -4,6 +4,7 @@ Unified card scanner engine.
 Supports two modes:
   - "network": ZKTeco SCR100 via pyzk (TCP port 4370, live_capture)
   - "usb": Generic USB HID RFID reader (pywinusb, direct HID report reading)
+  - "zkemkeeper": ZKTeco SCR100 via ZKEMKeeper COM
 """
 import logging
 import re
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 class ScannerMode(str, Enum):
     NETWORK = "network"
     USB = "usb"
+    ZKEMKEEPER = "zkemkeeper"
 
 
 class ScannerState(str, Enum):
@@ -108,6 +110,13 @@ class CardScanner:
                 args=(usb_device_path,),
                 daemon=True,
                 name="card-scanner-usb",
+            )
+        elif mode == ScannerMode.ZKEMKEEPER:
+            self._thread = threading.Thread(
+                target=self._zkemkeeper_scan_loop,
+                args=(ip, port, timeout_ms),
+                daemon=True,
+                name="card-scanner-zkemkeeper",
             )
         else:
             self._thread = threading.Thread(
@@ -218,6 +227,47 @@ class CardScanner:
                 except Exception as e:
                     logger.warning(f"Scanner disconnect error: {e}")
 
+            with self._lock:
+                if self._state != ScannerState.ERROR:
+                    self._state = ScannerState.IDLE
+
+    # ÄÄ ZKEMKeeper (SCR100) scan loop ÄÄ
+    def _zkemkeeper_scan_loop(self, ip: str, port: int, timeout_ms: int) -> None:
+        scanner = None
+        try:
+            from app.core.zkemkeeper_scanner import ZkemkeeperError, ZkemkeeperScanner
+
+            if not ip:
+                raise ZkemkeeperError("SCR100 IP address is required")
+
+            scanner = ZkemkeeperScanner()
+            scanner.connect(ip=ip, port=port, timeout_ms=timeout_ms)
+
+            with self._lock:
+                self._state = ScannerState.SCANNING
+
+            card = scanner.read_card_once(poll_sec=max(1, timeout_ms / 1000))
+            card = validate_card_number(card)
+            if card:
+                result = ScanResult(card_number=card, source="zkemkeeper")
+                with self._lock:
+                    self._last_result = result
+                if self._on_card:
+                    try:
+                        self._on_card(result)
+                    except Exception as e:
+                        logger.error(f"on_card callback error: {e}")
+        except Exception as e:
+            self._error = f"ZKEMKeeper scanner error: {e}"
+            logger.error(self._error)
+            with self._lock:
+                self._state = ScannerState.ERROR
+        finally:
+            if scanner is not None:
+                try:
+                    scanner.disconnect()
+                except Exception:
+                    pass
             with self._lock:
                 if self._state != ScannerState.ERROR:
                     self._state = ScannerState.IDLE
