@@ -35,7 +35,7 @@ const CONTENT_TABLES = [
 ] as const;
 
 export default function DevicesPage() {
-  const { data, loading, error, reload } = useDevices();
+  const { data, loading, error, reload } = useDevices(false);
   const pullsdk = usePullSdk();
   const { status } = useApp();
 

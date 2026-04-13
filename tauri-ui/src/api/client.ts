@@ -90,7 +90,7 @@ export async function del<T>(path: string): Promise<T> {
 export function openSSE(
   path: string,
   onEvent: (type: string, data: any) => void,
-  optionsOrOnError?: ((e: Event) => void) | { onError?: (e: Event) => void; onReconnect?: () => void },
+  optionsOrOnError?: ((e: Event) => void) | { onError?: (e: Event) => void; onReconnect?: () => void; onOpen?: () => void },
 ): EventSource {
   // Backward compat: third arg can be a plain onError callback or an options object
   const opts = typeof optionsOrOnError === "function"
@@ -111,6 +111,7 @@ export function openSSE(
   let wasOpen = false;
   es.onopen = () => {
     console.debug(`[SSE] connected: ${path} (reconnect=${wasOpen})`);
+    if (opts?.onOpen) opts.onOpen();
     if (wasOpen && opts?.onReconnect) opts.onReconnect();
     wasOpen = true;
   };

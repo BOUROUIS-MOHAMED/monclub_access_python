@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import queue
 import sqlite3
 import threading
 import time
@@ -10,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs, now_iso
@@ -19,26 +21,228 @@ from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth
 # Test-only override: set _DB_PATH to a temp path in tests via monkeypatch.
 # Production code always leaves this as None (falls through to current_access_runtime_db_path).
 _DB_PATH: str | None = None
+_DB_WRITE_PROFILE_LOG_THRESHOLD_MS = 250.0
+_db_write_profiles_lock = threading.Lock()
+_db_write_profiles: Dict[str, Dict[str, Any]] = {}
+_db_write_profiles_order: List[str] = []
+_db_writer_state_lock = threading.Lock()
+_db_writer_thread: threading.Thread | None = None
+_db_writer_queue: "queue.Queue[_DbWriteJob | None] | None" = None
+_db_writer_db_path: str | None = None
+_db_writer_local = threading.local()
+
+
+def _resolve_db_path():
+    if _DB_PATH is not None:
+        import pathlib
+
+        db_path = pathlib.Path(_DB_PATH)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        return db_path
+    ensure_dirs()
+    db_path = current_access_runtime_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return db_path
+
+
+def _open_sqlite_connection(
+    db_path,
+    *,
+    timeout: float = 30.0,
+    wal_autocheckpoint: int = 1000,
+) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA wal_autocheckpoint={int(wal_autocheckpoint)}")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+@dataclass
+class _DbWriteJob:
+    label: str
+    operation: Callable[[sqlite3.Connection, Dict[str, Any]], Any]
+    submitted_at: float = field(default_factory=time.perf_counter)
+    done: threading.Event = field(default_factory=threading.Event)
+    result: Any = None
+    error: BaseException | None = None
+    profile: Dict[str, Any] | None = None
+
+
+def _record_db_write_profile(label: str, profile: Dict[str, Any]) -> None:
+    snapshot = dict(profile or {})
+    snapshot["label"] = label
+    with _db_write_profiles_lock:
+        _db_write_profiles[label] = snapshot
+        _db_write_profiles_order.append(label)
+        if len(_db_write_profiles_order) > 32:
+            _db_write_profiles_order[:] = _db_write_profiles_order[-32:]
+
+
+def get_last_db_write_profile(label: str | None = None) -> Dict[str, Any] | None:
+    with _db_write_profiles_lock:
+        if label is not None:
+            profile = _db_write_profiles.get(str(label))
+            return dict(profile) if profile is not None else None
+        if not _db_write_profiles_order:
+            return None
+        last_label = _db_write_profiles_order[-1]
+        profile = _db_write_profiles.get(last_label)
+        return dict(profile) if profile is not None else None
+
+
+def _shutdown_db_writer_for_tests() -> None:
+    global _db_writer_thread, _db_writer_queue, _db_writer_db_path
+    with _db_writer_state_lock:
+        thread = _db_writer_thread
+        work_q = _db_writer_queue
+        _db_writer_thread = None
+        _db_writer_queue = None
+        _db_writer_db_path = None
+    if work_q is not None:
+        work_q.put(None)
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+
+
+def _ensure_db_writer() -> "queue.Queue[_DbWriteJob | None]":
+    global _db_writer_thread, _db_writer_queue, _db_writer_db_path
+
+    db_path = str(_resolve_db_path())
+    with _db_writer_state_lock:
+        thread = _db_writer_thread
+        work_q = _db_writer_queue
+        if thread is not None and thread.is_alive() and work_q is not None and _db_writer_db_path == db_path:
+            return work_q
+
+    _shutdown_db_writer_for_tests()
+
+    work_q = queue.Queue()
+    thread = threading.Thread(
+        target=_db_writer_loop,
+        args=(db_path, work_q),
+        name="DbWriter",
+        daemon=True,
+    )
+    with _db_writer_state_lock:
+        _db_writer_queue = work_q
+        _db_writer_thread = thread
+        _db_writer_db_path = db_path
+    thread.start()
+    return work_q
+
+
+def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> None:
+    logger = logging.getLogger(__name__)
+    conn = _open_sqlite_connection(db_path)
+    _db_writer_local.connection = conn
+    _db_writer_local.ident = threading.get_ident()
+    try:
+        while True:
+            job = work_q.get()
+            if job is None:
+                break
+
+            total_started = time.perf_counter()
+            profile: Dict[str, Any] = {
+                "label": job.label,
+                "queue_wait_ms": round((total_started - job.submitted_at) * 1000.0, 3),
+                "writer_thread": threading.current_thread().name,
+            }
+            try:
+                begin_started = time.perf_counter()
+                conn.execute("BEGIN IMMEDIATE")
+                profile["begin_wait_ms"] = round((time.perf_counter() - begin_started) * 1000.0, 3)
+
+                tx_started = time.perf_counter()
+                result = job.operation(conn, profile)
+                profile["transaction_ms"] = round((time.perf_counter() - tx_started) * 1000.0, 3)
+
+                commit_started = time.perf_counter()
+                conn.commit()
+                profile["commit_ms"] = round((time.perf_counter() - commit_started) * 1000.0, 3)
+                profile["total_ms"] = round((time.perf_counter() - total_started) * 1000.0, 3)
+                job.result = result
+            except BaseException as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                profile.setdefault("begin_wait_ms", 0.0)
+                profile.setdefault("transaction_ms", 0.0)
+                profile.setdefault("commit_ms", 0.0)
+                profile["total_ms"] = round((time.perf_counter() - total_started) * 1000.0, 3)
+                profile["error"] = repr(exc)
+                job.error = exc
+            finally:
+                _record_db_write_profile(job.label, profile)
+                # Log if processing was slow OR if the job waited long in queue.
+                # queue_wait_ms is NOT included in total_ms, so we check both.
+                _log_threshold = _DB_WRITE_PROFILE_LOG_THRESHOLD_MS
+                if (
+                    float(profile.get("total_ms") or 0.0) >= _log_threshold
+                    or float(profile.get("queue_wait_ms") or 0.0) >= _log_threshold
+                ):
+                    logger.info("[DB-WRITE] %s profile=%s", job.label, profile)
+                job.profile = profile
+                job.done.set()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _db_writer_local.connection = None
+        _db_writer_local.ident = None
+
+
+def _run_db_write_sync(
+    label: str,
+    operation: Callable[[sqlite3.Connection, Dict[str, Any]], Any],
+) -> Any:
+    if getattr(_db_writer_local, "ident", None) == threading.get_ident():
+        conn = getattr(_db_writer_local, "connection", None)
+        if conn is None:
+            raise RuntimeError("DB writer thread missing active connection")
+        profile: Dict[str, Any] = {
+            "label": label,
+            "queue_wait_ms": 0.0,
+            "begin_wait_ms": 0.0,
+            "writer_thread": threading.current_thread().name,
+        }
+        started = time.perf_counter()
+        result = operation(conn, profile)
+        profile["transaction_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        profile["commit_ms"] = 0.0
+        profile["total_ms"] = profile["transaction_ms"]
+        _record_db_write_profile(label, profile)
+        return result
+
+    work_q = _ensure_db_writer()
+    job = _DbWriteJob(label=str(label), operation=operation)
+    work_q.put(job)
+    if not job.done.wait(timeout=60.0):
+        raise TimeoutError(f"Timed out waiting for DB writer job '{label}'")
+    if job.error is not None:
+        raise job.error
+    return job.result
+
+
+@contextmanager
+def _profile_write_step(profile: Dict[str, Any], key: str) -> Iterator[None]:
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        profile[key] = round((time.perf_counter() - started) * 1000.0, 3)
 
 # -----------------------------
 # SQLite connection helpers
 # -----------------------------
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    if _DB_PATH is not None:
-        import pathlib
-        db_path = pathlib.Path(_DB_PATH)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        ensure_dirs()
-        db_path = current_access_runtime_db_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA wal_autocheckpoint=1000")
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = _open_sqlite_connection(_resolve_db_path())
     try:
         yield conn
     finally:
@@ -1009,7 +1213,8 @@ def save_version_tokens(tokens: dict) -> None:
     """Upsert version tokens. keys: membersVersion, devicesVersion, credentialsVersion, settingsVersion."""
     if not tokens:
         return
-    with get_conn() as conn:
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         for key, value in tokens.items():
             if value is None:
                 continue
@@ -1020,7 +1225,8 @@ def save_version_tokens(tokens: dict) -> None:
                 """,
                 (key, str(value)),
             )
-        conn.commit()
+
+    _run_db_write_sync("save_version_tokens", _write)
 
 
 def load_version_tokens() -> dict:
@@ -1032,8 +1238,10 @@ def load_version_tokens() -> dict:
 
 def clear_version_tokens() -> None:
     """Delete all saved version tokens (call on logout/login/cache-clear)."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute("DELETE FROM sync_version_tokens")
+
+    _run_db_write_sync("clear_version_tokens", _write)
 
 
 # -----------------------------
@@ -1180,7 +1388,8 @@ def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
     if not users:
         return
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    with get_conn() as conn:
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         for u in users:
             amid = u.get("activeMembershipId") or u.get("active_membership_id")
             if amid is None:
@@ -1231,7 +1440,8 @@ def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
                     now,
                 ),
             )
-        conn.commit()
+
+    _run_db_write_sync("upsert_member_shadow", _write)
 
 
 def delete_member_shadow(*, active_membership_ids: List[int]) -> None:
@@ -1239,12 +1449,14 @@ def delete_member_shadow(*, active_membership_ids: List[int]) -> None:
     if not active_membership_ids:
         return
     placeholders = ",".join("?" * len(active_membership_ids))
-    with get_conn() as conn:
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             f"DELETE FROM member_shadow WHERE active_membership_id IN ({placeholders})",
             active_membership_ids,
         )
-        conn.commit()
+
+    _run_db_write_sync("delete_member_shadow", _write)
 
 
 def list_member_shadow_deleted_ids(*, valid_member_ids: List[int]) -> List[int]:
@@ -1268,6 +1480,103 @@ def list_member_shadow_deleted_ids(*, valid_member_ids: List[int]) -> List[int]:
         if amid not in valid_set:
             deleted_ids.append(amid)
     return deleted_ids
+
+
+def apply_member_shadow_delta(
+    *,
+    users: List[Dict[str, Any]],
+    valid_member_ids: List[int] | None = None,
+) -> List[int]:
+    """
+    Apply delta-mode member shadow changes in one DB transaction.
+
+    This keeps the sync hot path from paying separate SQLite lock waits for
+    read -> upsert -> delete when only a handful of members changed.
+    """
+    normalized_valid_ids: set[int] | None = None
+    if valid_member_ids is not None:
+        normalized_valid_ids = set()
+        for raw_id in valid_member_ids:
+            try:
+                normalized_valid_ids.add(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+
+    deleted_ids: List[int] = []
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> List[int]:
+        if normalized_valid_ids is not None:
+            rows = conn.execute(
+                "SELECT active_membership_id FROM member_shadow"
+            ).fetchall()
+            for row in rows:
+                try:
+                    amid = int(row["active_membership_id"])
+                except (TypeError, ValueError):
+                    continue
+                if amid not in normalized_valid_ids:
+                    deleted_ids.append(amid)
+
+        for u in users or []:
+            amid = u.get("activeMembershipId") or u.get("active_membership_id")
+            if amid is None:
+                continue
+            try:
+                amid = int(amid)
+            except (TypeError, ValueError):
+                continue
+
+            fps = u.get("fingerprints") or []
+            if fps:
+                fp_str = json.dumps(
+                    sorted([f.get("fingerId") for f in fps if isinstance(f, dict)]),
+                    sort_keys=True,
+                )
+                fp_hash = hashlib.sha1(fp_str.encode()).hexdigest()
+            else:
+                fp_hash = None
+
+            conn.execute(
+                """
+                INSERT INTO member_shadow
+                    (active_membership_id, pin, full_name, card_id, second_card_id,
+                     membership_id, valid_from, valid_to, fp_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(active_membership_id) DO UPDATE SET
+                    pin            = excluded.pin,
+                    full_name      = excluded.full_name,
+                    card_id        = excluded.card_id,
+                    second_card_id = excluded.second_card_id,
+                    membership_id  = excluded.membership_id,
+                    valid_from     = excluded.valid_from,
+                    valid_to       = excluded.valid_to,
+                    fp_hash        = excluded.fp_hash,
+                    updated_at     = excluded.updated_at
+                """,
+                (
+                    amid,
+                    str(u.get("activeMembershipId") or u.get("active_membership_id") or amid),
+                    u.get("fullName") or u.get("full_name"),
+                    u.get("firstCardId") or u.get("first_card_id"),
+                    u.get("secondCardId") or u.get("second_card_id"),
+                    u.get("membershipId") or u.get("membership_id"),
+                    u.get("validFrom") or u.get("valid_from"),
+                    u.get("validTo") or u.get("valid_to"),
+                    fp_hash,
+                    now,
+                ),
+            )
+
+        if deleted_ids:
+            placeholders = ",".join("?" * len(deleted_ids))
+            conn.execute(
+                f"DELETE FROM member_shadow WHERE active_membership_id IN ({placeholders})",
+                deleted_ids,
+            )
+        return deleted_ids
+
+    return list(_run_db_write_sync("apply_member_shadow_delta", _write))
 
 
 def get_member_shadow_cards() -> Dict[int, str | None]:
@@ -1476,6 +1785,23 @@ def insert_fingerprint(
 def list_fingerprints() -> List[FingerprintRecord]:
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM fingerprints ORDER BY id DESC").fetchall()
+        return [FingerprintRecord(**dict(r)) for r in rows]
+
+
+def list_fingerprints_by_pins(*, pins: List[str] | set[str] | tuple[str, ...]) -> List[FingerprintRecord]:
+    normalized = sorted({
+        str(pin or "").strip()
+        for pin in (pins or [])
+        if str(pin or "").strip()
+    })
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM fingerprints WHERE pin IN ({placeholders}) ORDER BY id DESC",
+            tuple(normalized),
+        ).fetchall()
         return [FingerprintRecord(**dict(r)) for r in rows]
 
 
@@ -2300,13 +2626,15 @@ def _sync_gym_access_credentials_rows(
     *,
     merge_mode: str | None = None,
 ) -> Dict[str, Any]:
+    t0 = time.perf_counter()
     normalized_rows = [_normalize_sync_credential_payload_row(c) for c in payload_rows if isinstance(c, dict)]
+    normalize_ms = (time.perf_counter() - t0) * 1000.0
     merge_only = str(merge_mode or "").strip().upper() == "UPSERT_ONLY"
     if not normalized_rows:
         if merge_only:
-            return {"mode": "merge", "deleted": 0, "upserted": 0}
+            return {"mode": "merge", "deleted": 0, "upserted": 0, "normalize_ms": normalize_ms}
         cur.execute("DELETE FROM sync_gym_access_credentials")
-        return {"mode": "replace", "deleted": None, "upserted": 0}
+        return {"mode": "replace", "deleted": None, "upserted": 0, "normalize_ms": normalize_ms}
 
     incoming_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
     for row in normalized_rows:
@@ -2315,6 +2643,7 @@ def _sync_gym_access_credentials_rows(
             return _replace_sync_credentials(cur, normalized_rows)
         incoming_by_key[key] = row
 
+    t_fetch = time.perf_counter()
     existing_rows = [
         dict(r)
         for r in cur.execute(
@@ -2327,6 +2656,7 @@ def _sync_gym_access_credentials_rows(
             """
         ).fetchall()
     ]
+    existing_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
     existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
     for row in existing_rows:
         key = _sync_credential_identity(row)
@@ -2334,6 +2664,7 @@ def _sync_gym_access_credentials_rows(
             return _replace_sync_credentials(cur, normalized_rows)
         existing_by_key[key] = row
 
+    t_diff = time.perf_counter()
     fields = (
         "id",
         "gym_id",
@@ -2351,8 +2682,11 @@ def _sync_gym_access_credentials_rows(
         if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
     ]
     to_delete = [] if merge_only else [key for key in existing_by_key if key not in incoming_by_key]
+    diff_ms = (time.perf_counter() - t_diff) * 1000.0
 
+    delete_ms = 0.0
     if to_delete:
+        t_del = time.perf_counter()
         chunk_size = 200
         for i in range(0, len(to_delete), chunk_size):
             chunk = to_delete[i:i + chunk_size]
@@ -2361,8 +2695,11 @@ def _sync_gym_access_credentials_rows(
             for gym_id, account_id in chunk:
                 params.extend([gym_id, account_id])
             cur.execute(f"DELETE FROM sync_gym_access_credentials WHERE {predicates}", params)
+        delete_ms = (time.perf_counter() - t_del) * 1000.0
 
+    upsert_ms = 0.0
     if to_upsert:
+        t_up = time.perf_counter()
         cur.executemany(
             """
             INSERT INTO sync_gym_access_credentials (
@@ -2381,11 +2718,17 @@ def _sync_gym_access_credentials_rows(
             """,
             [_sync_credential_params(row) for row in to_upsert],
         )
+        upsert_ms = (time.perf_counter() - t_up) * 1000.0
 
     return {
         "mode": "merge" if merge_only else "delta",
         "deleted": len(to_delete),
         "upserted": len(to_upsert),
+        "normalize_ms": round(normalize_ms, 3),
+        "existing_fetch_ms": round(existing_fetch_ms, 3),
+        "diff_ms": round(diff_ms, 3),
+        "delete_ms": round(delete_ms, 3),
+        "upsert_ms": round(upsert_ms, 3),
     }
 
 
@@ -2719,336 +3062,296 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     contract_end_date = (data.get("contractEndDate") or "").strip()
     access_settings = data.get("accessSoftwareSettings") or data.get("access_software_settings") or None
     memberships = data.get("membership") or data.get("memberships") or []
-
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, Any]:
         cur = conn.cursor()
+        profile["members_refresh"] = bool(refresh.get("members", True))
+        profile["devices_refresh"] = bool(refresh.get("devices", True))
+        profile["credentials_refresh"] = bool(refresh.get("credentials", True))
+        profile["settings_refresh"] = bool(refresh.get("settings", True))
 
-        # Always: update contract meta
-        cur.execute(
-            """
-            INSERT INTO sync_meta (id, contract_status, contract_end_date, updated_at)
-            VALUES (1, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                contract_status=excluded.contract_status,
-                contract_end_date=excluded.contract_end_date,
-                updated_at=excluded.updated_at
-            """,
-            (1 if contract_status else 0, contract_end_date, updated_at),
-        )
-
-        # Always: update access software settings
-        if isinstance(access_settings, dict):
-            s = access_settings
-            try:
-                cur.execute(
-                    """
-                    INSERT INTO sync_access_software_settings (
-                        id, gym_id, access_server_host, access_server_port, access_server_enabled,
-                        image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
-                        event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
-                        decision_workers, decision_ema_alpha,
-                        history_retention_days, notification_rate_limit_per_minute, notification_dedupe_window_sec,
-                        notification_service_enabled, history_service_enabled,
-                        agent_sync_backend_refresh_min,
-                        default_authorize_door_id, sdk_read_initial_bytes,
-                        optional_data_sync_delay_minutes,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        gym_id=excluded.gym_id,
-                        access_server_host=excluded.access_server_host,
-                        access_server_port=excluded.access_server_port,
-                        access_server_enabled=excluded.access_server_enabled,
-                        image_cache_enabled=excluded.image_cache_enabled,
-                        image_cache_timeout_sec=excluded.image_cache_timeout_sec,
-                        image_cache_max_bytes=excluded.image_cache_max_bytes,
-                        image_cache_max_files=excluded.image_cache_max_files,
-                        event_queue_max=excluded.event_queue_max,
-                        notification_queue_max=excluded.notification_queue_max,
-                        history_queue_max=excluded.history_queue_max,
-                        popup_queue_max=excluded.popup_queue_max,
-                        decision_workers=excluded.decision_workers,
-                        decision_ema_alpha=excluded.decision_ema_alpha,
-                        history_retention_days=excluded.history_retention_days,
-                        notification_rate_limit_per_minute=excluded.notification_rate_limit_per_minute,
-                        notification_dedupe_window_sec=excluded.notification_dedupe_window_sec,
-                        notification_service_enabled=excluded.notification_service_enabled,
-                        history_service_enabled=excluded.history_service_enabled,
-                        agent_sync_backend_refresh_min=excluded.agent_sync_backend_refresh_min,
-                        default_authorize_door_id=excluded.default_authorize_door_id,
-                        sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
-                        optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
-                        created_at=excluded.created_at,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        1,
-                        _to_int_or_none(s.get("gymId") if "gymId" in s else s.get("gym_id")),
-                        _safe_str(s.get("accessServerHost") if "accessServerHost" in s else s.get("access_server_host"), ""),
-                        _to_int_or_none(s.get("accessServerPort") if "accessServerPort" in s else s.get("access_server_port")),
-                        _bool_to_i(s.get("accessServerEnabled", True), default=1),
-                        _bool_to_i(s.get("imageCacheEnabled", True), default=1),
-                        _to_int_or_none(s.get("imageCacheTimeoutSec", 2)),
-                        _to_int_or_none(s.get("imageCacheMaxBytes", 5242880)),
-                        _to_int_or_none(s.get("imageCacheMaxFiles", 1000)),
-                        _to_int_or_none(s.get("eventQueueMax", 5000)),
-                        _to_int_or_none(s.get("notificationQueueMax", 5000)),
-                        _to_int_or_none(s.get("historyQueueMax", 5000)),
-                        _to_int_or_none(s.get("popupQueueMax", 5000)),
-                        _to_int_or_none(s.get("decisionWorkers", 1)),
-                        _to_float_or_none(s.get("decisionEmaAlpha", 0.2)),
-                        _to_int_or_none(s.get("historyRetentionDays", 30)),
-                        _to_int_or_none(s.get("notificationRateLimitPerMinute", 30)),
-                        _to_int_or_none(s.get("notificationDedupeWindowSec", 30)),
-                        _bool_to_i(s.get("notificationServiceEnabled", True), default=1),
-                        _bool_to_i(s.get("historyServiceEnabled", True), default=1),
-                        _to_int_or_none(s.get("agentSyncBackendRefreshMin", 30)),
-                        _to_int_or_none(s.get("defaultAuthorizeDoorId", 15)),
-                        _to_int_or_none(s.get("sdkReadInitialBytes", 1048576)),
-                        _to_int_or_none(s.get("optionalDataSyncDelayMinutes", 60)),
-                        _safe_str(s.get("createdAt"), ""),
-                        _safe_str(s.get("updatedAt"), updated_at) or updated_at,
-                    ),
-                )
-            except Exception:
-                pass  # never break sync
-
-        # Always: update membership types
-        cur.execute("DELETE FROM sync_memberships")
-        for m in memberships:
-            if not isinstance(m, dict):
-                continue
-            cur.execute(
-                "INSERT INTO sync_memberships (id, title, description, price, duration_in_days) VALUES (?, ?, ?, ?, ?)",
-                (m.get("id"), m.get("title"), m.get("description"), m.get("price"), m.get("durationInDays")),
+        # Contract meta must stay current for every delta, even when the backend
+        # only refreshed one section.
+        with _profile_write_step(profile, "meta_ms"):
+            _upsert_sync_meta_row(
+                cur,
+                contract_status=contract_status,
+                contract_end_date=contract_end_date,
+                updated_at=updated_at,
             )
+
+        if refresh.get("settings", True):
+            with _profile_write_step(profile, "settings_ms"):
+                if isinstance(access_settings, dict):
+                    try:
+                        _upsert_sync_access_software_settings_row(
+                            cur,
+                            access_settings,
+                            updated_at=updated_at,
+                        )
+                    except Exception:
+                        pass  # never break sync
+                _replace_sync_memberships(cur, memberships if isinstance(memberships, list) else [])
 
         # Conditional: members (users + fingerprints)
         if refresh.get("members", True):
-            users = data.get("users") or []
-            delta_mode = bool(data.get("membersDeltaMode", False))
-            valid_ids = data.get("validMemberIds")
+            with _profile_write_step(profile, "members_ms"):
+                users = data.get("users") or []
+                delta_mode = bool(data.get("membersDeltaMode", False))
+                valid_ids = data.get("validMemberIds")
+                profile["members_delta_mode"] = delta_mode
+                profile["incoming_users"] = len(users) if isinstance(users, list) else 0
 
-            if delta_mode:
-                # Delta mode: upsert changed users + delete ones absent from validMemberIds
-                if users:
-                    for u in users:
-                        if not isinstance(u, dict):
-                            continue
-                        fps = u.get("fingerprints") or []
-                        if not isinstance(fps, list):
-                            fps = []
-                        am_id = u.get("activeMembershipId")
-                        m_id = u.get("membershipId")
-                        if am_id is None or str(am_id).strip() == "":
-                            am_id = m_id
-                        cur.execute(
-                            """
-                            INSERT OR REPLACE INTO sync_users (
-                                user_id, active_membership_id, membership_id,
-                                full_name, phone, email, valid_from, valid_to,
-                                first_card_id, second_card_id, image,
-                                fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                image_source, user_image_status
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                u.get("userId"), am_id, m_id,
-                                u.get("fullName"), u.get("phone"), u.get("email"),
-                                u.get("validFrom"), u.get("validTo"),
-                                u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
-                                json.dumps(fps, ensure_ascii=False),
-                                u.get("faceId"),
-                                u.get("accountUsernameId") or u.get("account_username_id"),
-                                u.get("qrCodePayload"), u.get("birthday"),
-                                u.get("imageSource"),
-                                u.get("userImageStatus"),
-                            ),
-                        )
-                if valid_ids is not None:
-                    valid_set = set(valid_ids)
-                    cached_rows = cur.execute(
-                        "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL"
-                    ).fetchall()
-                    ids_to_remove = {r[0] for r in cached_rows} - valid_set
-                    ids_list = list(ids_to_remove)
-                    for i in range(0, len(ids_list), 500):
-                        chunk = ids_list[i:i + 500]
-                        placeholders = ",".join("?" * len(chunk))
-                        cur.execute(
-                            f"DELETE FROM sync_users WHERE active_membership_id IN ({placeholders})",
-                            chunk,
-                        )
-            else:
-                # Full replace mode
-                old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
-                _logger.info(
-                    "[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=True, "
-                    "incoming_users=%d, old_db_count=%d",
-                    len(users), old_count,
-                )
-                if not users:
-                    if old_count > 10:
-                        _logger.error(
-                            f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
-                            f"but local cache has {old_count}. Refusing to clear — likely backend error."
-                        )
-                        conn.commit()
-                        return
-                    else:
+                if delta_mode:
+                    # Delta mode: upsert changed users + delete ones absent from validMemberIds
+                    upserted_count = 0
+                    members_upsert_ms = 0.0
+                    members_validset_ms = 0.0
+                    members_cached_fetch_ms = 0.0
+                    members_delete_ms = 0.0
+                    deleted_count = 0
+                    if users:
+                        t_upsert = time.perf_counter()
+                        for u in users:
+                            if not isinstance(u, dict):
+                                continue
+                            fps = u.get("fingerprints") or []
+                            if not isinstance(fps, list):
+                                fps = []
+                            am_id = u.get("activeMembershipId")
+                            m_id = u.get("membershipId")
+                            if am_id is None or str(am_id).strip() == "":
+                                am_id = m_id
+                            cur.execute(
+                                """
+                                INSERT OR REPLACE INTO sync_users (
+                                    user_id, active_membership_id, membership_id,
+                                    full_name, phone, email, valid_from, valid_to,
+                                    first_card_id, second_card_id, image,
+                                    fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
+                                    image_source, user_image_status
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    u.get("userId"), am_id, m_id,
+                                    u.get("fullName"), u.get("phone"), u.get("email"),
+                                    u.get("validFrom"), u.get("validTo"),
+                                    u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
+                                    json.dumps(fps, ensure_ascii=False),
+                                    u.get("faceId"),
+                                    u.get("accountUsernameId") or u.get("account_username_id"),
+                                    u.get("qrCodePayload"), u.get("birthday"),
+                                    u.get("imageSource"),
+                                    u.get("userImageStatus"),
+                                ),
+                            )
+                            upserted_count += 1
+                        members_upsert_ms = (time.perf_counter() - t_upsert) * 1000.0
+                    if valid_ids is not None:
+                        t_valid = time.perf_counter()
+                        valid_set = set(valid_ids)
+                        members_validset_ms = (time.perf_counter() - t_valid) * 1000.0
+                        t_fetch = time.perf_counter()
+                        cached_rows = cur.execute(
+                            "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL"
+                        ).fetchall()
+                        members_cached_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
+                        ids_to_remove = {r[0] for r in cached_rows} - valid_set
+                        ids_list = list(ids_to_remove)
+                        deleted_count = len(ids_list)
+                        t_delete = time.perf_counter()
+                        for i in range(0, len(ids_list), 500):
+                            chunk = ids_list[i:i + 500]
+                            placeholders = ",".join("?" * len(chunk))
+                            cur.execute(
+                                f"DELETE FROM sync_users WHERE active_membership_id IN ({placeholders})",
+                                chunk,
+                            )
+                        members_delete_ms = (time.perf_counter() - t_delete) * 1000.0
+                    profile["members_upserted"] = upserted_count
+                    profile["members_deleted"] = deleted_count
+                    profile["members_upsert_ms"] = round(members_upsert_ms, 3)
+                    profile["members_validset_ms"] = round(members_validset_ms, 3)
+                    profile["members_cached_fetch_ms"] = round(members_cached_fetch_ms, 3)
+                    profile["members_delete_ms"] = round(members_delete_ms, 3)
+                else:
+                    # Full replace mode
+                    old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                    _logger.info(
+                        "[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=True, "
+                        "incoming_users=%d, old_db_count=%d",
+                        len(users), old_count,
+                    )
+                    if not users:
+                        if old_count > 10:
+                            _logger.error(
+                                f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
+                                f"but local cache has {old_count}. Refusing to clear — likely backend error."
+                            )
+                            return {"credentials": None}
                         _logger.warning(
                             "[SYNC-DEBUG] H-006 NOT triggered (old_count=%d <= 10). "
                             "Will DELETE all sync_users with 0 replacements!",
                             old_count,
                         )
 
-                # --- Content-hash guard: skip DELETE+INSERT if user data is unchanged ---
-                # This prevents unnecessary DB churn and device re-sync when backend
-                # returns refreshMembers=True but user data is actually the same.
-                def _users_content_hash(user_list):
-                    """Compute a SHA-1 hash of the user list content for comparison."""
-                    h = hashlib.sha1()
-                    for u in sorted(user_list, key=lambda x: (x.get("userId") or 0, x.get("activeMembershipId") or x.get("membershipId") or 0)):
-                        am_id = u.get("activeMembershipId")
-                        m_id = u.get("membershipId")
-                        if am_id is None or str(am_id).strip() == "":
-                            am_id = m_id
-                        fps = u.get("fingerprints") or []
-                        row = (
-                            f"{u.get('userId')}|{am_id}|{m_id}|"
-                            f"{u.get('fullName')}|{u.get('phone')}|{u.get('email')}|"
-                            f"{u.get('validFrom')}|{u.get('validTo')}|"
-                            f"{u.get('firstCardId')}|{u.get('secondCardId')}|"
-                            f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
-                            f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
-                            f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
-                            f"{u.get('imageSource')}|{u.get('userImageStatus')}"
-                        )
-                        h.update(row.encode("utf-8", errors="replace"))
-                    return h.hexdigest()
+                    # --- Content-hash guard: skip DELETE+INSERT if user data is unchanged ---
+                    # This prevents unnecessary DB churn and device re-sync when backend
+                    # returns refreshMembers=True but user data is actually the same.
+                    def _users_content_hash(user_list):
+                        """Compute a SHA-1 hash of the user list content for comparison."""
+                        h = hashlib.sha1()
+                        for u in sorted(user_list, key=lambda x: (x.get("userId") or 0, x.get("activeMembershipId") or x.get("membershipId") or 0)):
+                            am_id = u.get("activeMembershipId")
+                            m_id = u.get("membershipId")
+                            if am_id is None or str(am_id).strip() == "":
+                                am_id = m_id
+                            fps = u.get("fingerprints") or []
+                            row = (
+                                f"{u.get('userId')}|{am_id}|{m_id}|"
+                                f"{u.get('fullName')}|{u.get('phone')}|{u.get('email')}|"
+                                f"{u.get('validFrom')}|{u.get('validTo')}|"
+                                f"{u.get('firstCardId')}|{u.get('secondCardId')}|"
+                                f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
+                                f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
+                                f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
+                                f"{u.get('imageSource')}|{u.get('userImageStatus')}"
+                            )
+                            h.update(row.encode("utf-8", errors="replace"))
+                        return h.hexdigest()
 
-                if users and old_count > 0:
-                    incoming_hash = _users_content_hash(users)
-                    # Build equivalent dicts from existing DB rows for comparison
-                    existing_rows = cur.execute(
-                        "SELECT user_id, active_membership_id, membership_id, "
-                        "full_name, phone, email, valid_from, valid_to, "
-                        "first_card_id, second_card_id, image, fingerprints_json, "
-                        "face_id, account_username_id, qr_code_payload, birthday, "
-                        "image_source, user_image_status FROM sync_users"
-                    ).fetchall()
-                    existing_as_dicts = []
-                    for r in existing_rows:
-                        fps_raw = r[11] or "[]"
-                        try:
-                            fps_parsed = json.loads(fps_raw)
-                        except Exception:
-                            fps_parsed = []
-                        existing_as_dicts.append({
-                            "userId": r[0], "activeMembershipId": r[1], "membershipId": r[2],
-                            "fullName": r[3], "phone": r[4], "email": r[5],
-                            "validFrom": r[6], "validTo": r[7],
-                            "firstCardId": r[8], "secondCardId": r[9], "image": r[10],
-                            "fingerprints": fps_parsed,
-                            "faceId": r[12], "accountUsernameId": r[13],
-                            "qrCodePayload": r[14], "birthday": r[15],
-                            "imageSource": r[16], "userImageStatus": r[17],
-                        })
-                    existing_hash = _users_content_hash(existing_as_dicts)
-                    if incoming_hash == existing_hash:
+                    if users and old_count > 0:
+                        incoming_hash = _users_content_hash(users)
+                        # Build equivalent dicts from existing DB rows for comparison
+                        existing_rows = cur.execute(
+                            "SELECT user_id, active_membership_id, membership_id, "
+                            "full_name, phone, email, valid_from, valid_to, "
+                            "first_card_id, second_card_id, image, fingerprints_json, "
+                            "face_id, account_username_id, qr_code_payload, birthday, "
+                            "image_source, user_image_status FROM sync_users"
+                        ).fetchall()
+                        existing_as_dicts = []
+                        for r in existing_rows:
+                            fps_raw = r[11] or "[]"
+                            try:
+                                fps_parsed = json.loads(fps_raw)
+                            except Exception:
+                                fps_parsed = []
+                            existing_as_dicts.append({
+                                "userId": r[0], "activeMembershipId": r[1], "membershipId": r[2],
+                                "fullName": r[3], "phone": r[4], "email": r[5],
+                                "validFrom": r[6], "validTo": r[7],
+                                "firstCardId": r[8], "secondCardId": r[9], "image": r[10],
+                                "fingerprints": fps_parsed,
+                                "faceId": r[12], "accountUsernameId": r[13],
+                                "qrCodePayload": r[14], "birthday": r[15],
+                                "imageSource": r[16], "userImageStatus": r[17],
+                            })
+                        existing_hash = _users_content_hash(existing_as_dicts)
+                        if incoming_hash == existing_hash:
+                            _logger.info(
+                                "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED (hash=%s), "
+                                "skipping DELETE+INSERT for %d users",
+                                incoming_hash[:12], len(users),
+                            )
+                            # Skip to next section — preserve device_sync_state hashes
+                            users = None  # sentinel: skip the INSERT loop below
+
+                    if users is not None:
+                        cur.execute("DELETE FROM sync_users")
+                        for u in users:
+                            if not isinstance(u, dict):
+                                continue
+                            fps = u.get("fingerprints") or []
+                            if not isinstance(fps, list):
+                                fps = []
+                            am_id = u.get("activeMembershipId")
+                            m_id = u.get("membershipId")
+                            if am_id is None or str(am_id).strip() == "":
+                                am_id = m_id
+                            cur.execute(
+                                """
+                                INSERT OR REPLACE INTO sync_users (
+                                    user_id, active_membership_id, membership_id,
+                                    full_name, phone, email, valid_from, valid_to,
+                                    first_card_id, second_card_id, image,
+                                    fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
+                                    image_source, user_image_status
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    u.get("userId"), am_id, m_id,
+                                    u.get("fullName"), u.get("phone"), u.get("email"),
+                                    u.get("validFrom"), u.get("validTo"),
+                                    u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
+                                    json.dumps(fps, ensure_ascii=False),
+                                    u.get("faceId"),
+                                    u.get("accountUsernameId") or u.get("account_username_id"),
+                                    u.get("qrCodePayload"), u.get("birthday"),
+                                    u.get("imageSource"),
+                                    u.get("userImageStatus"),
+                                ),
+                            )
+
+                        new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
                         _logger.info(
-                            "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED (hash=%s), "
-                            "skipping DELETE+INSERT for %d users",
-                            incoming_hash[:12], len(users),
+                            "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
+                            new_count,
                         )
-                        # Skip to next section — preserve device_sync_state hashes
-                        users = None  # sentinel: skip the INSERT loop below
-
-                if users is not None:
-                    cur.execute("DELETE FROM sync_users")
-                    for u in users:
-                        if not isinstance(u, dict):
-                            continue
-                        fps = u.get("fingerprints") or []
-                        if not isinstance(fps, list):
-                            fps = []
-                        am_id = u.get("activeMembershipId")
-                        m_id = u.get("membershipId")
-                        if am_id is None or str(am_id).strip() == "":
-                            am_id = m_id
-                        cur.execute(
-                            """
-                            INSERT OR REPLACE INTO sync_users (
-                                user_id, active_membership_id, membership_id,
-                                full_name, phone, email, valid_from, valid_to,
-                                first_card_id, second_card_id, image,
-                                fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                image_source, user_image_status
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                u.get("userId"), am_id, m_id,
-                                u.get("fullName"), u.get("phone"), u.get("email"),
-                                u.get("validFrom"), u.get("validTo"),
-                                u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
-                                json.dumps(fps, ensure_ascii=False),
-                                u.get("faceId"),
-                                u.get("accountUsernameId") or u.get("account_username_id"),
-                                u.get("qrCodePayload"), u.get("birthday"),
-                                u.get("imageSource"),
-                                u.get("userImageStatus"),
-                            ),
-                        )
-
-                    new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
-                    _logger.info(
-                        "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
-                        new_count,
-                    )
         else:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 
         # Conditional: devices
         if refresh.get("devices", True):
-            cur.execute("DELETE FROM sync_devices")
-            cur.execute("DELETE FROM sync_device_door_presets")
-            for d in (data.get("devices") or []):
-                _insert_device_row(cur, d)
+            with _profile_write_step(profile, "devices_ms"):
+                cur.execute("DELETE FROM sync_devices")
+                cur.execute("DELETE FROM sync_device_door_presets")
+                for d in (data.get("devices") or []):
+                    _insert_device_row(cur, d)
 
+        creds_summary: Dict[str, Any] | None = None
         # Conditional: credentials
         if refresh.get("credentials", True):
-            _creds_summary = _sync_gym_access_credentials_rows(
-                cur,
-                list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []),
-            )
-            _logger.info(
-                "[SYNC-DEBUG] credentials sync: mode=%s upserted=%s deleted=%s",
-                _creds_summary.get("mode"),
-                _creds_summary.get("upserted"),
-                _creds_summary.get("deleted"),
-            )
+            with _profile_write_step(profile, "credentials_ms"):
+                creds_summary = _sync_gym_access_credentials_rows(
+                    cur,
+                    list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []),
+                )
+            profile["credentials_mode"] = creds_summary.get("mode")
+            profile["credentials_upserted"] = creds_summary.get("upserted")
+            profile["credentials_deleted"] = creds_summary.get("deleted")
+            profile["credentials_normalize_ms"] = creds_summary.get("normalize_ms")
+            profile["credentials_existing_fetch_ms"] = creds_summary.get("existing_fetch_ms")
+            profile["credentials_diff_ms"] = creds_summary.get("diff_ms")
+            profile["credentials_delete_ms"] = creds_summary.get("delete_ms")
+            profile["credentials_upsert_ms"] = creds_summary.get("upsert_ms")
 
         # Conditional: settings (infrastructures)
         if refresh.get("settings", True):
-            cur.execute("DELETE FROM sync_infrastructures")
-            for z in (data.get("infrastructures") or data.get("infrastructure") or []):
-                if not isinstance(z, dict):
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO sync_infrastructures (id, name, gym_agent_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        z.get("id"),
-                        z.get("name"),
-                        json.dumps(z.get("gymAgent") or {}, ensure_ascii=False),
-                        z.get("createdAt"),
-                        z.get("updatedAt"),
-                    ),
+            with _profile_write_step(profile, "infrastructures_ms"):
+                _replace_sync_infrastructures(
+                    cur,
+                    (data.get("infrastructures") or data.get("infrastructure") or []),
                 )
 
-        conn.commit()
+        return {"credentials": creds_summary}
+
+    result = _run_db_write_sync("save_sync_cache_delta", _write) or {}
+    _creds_summary = result.get("credentials")
+    if _creds_summary:
+        _logger.info(
+            "[SYNC-DEBUG] credentials sync: mode=%s upserted=%s deleted=%s",
+            _creds_summary.get("mode"),
+            _creds_summary.get("upserted"),
+            _creds_summary.get("deleted"),
+        )
+    profile = get_last_db_write_profile("save_sync_cache_delta")
+    if profile:
+        queue_wait = float(profile.get("queue_wait_ms") or 0.0)
+        total = float(profile.get("total_ms") or 0.0)
+        # Always log if queue wait is significant — this diagnoses DbWriter backlog
+        # even when the actual transaction is fast (total_ms < threshold).
+        if queue_wait >= 100.0 or total >= 100.0:
+            _logger.info("[SYNC-DEBUG] save_sync_cache_delta profile=%s", profile)
 
 
 def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
@@ -3118,7 +3421,6 @@ def _load_synced_door_presets_index() -> Dict[int, List[Dict[str, Any]]]:
     """
     Returns {device_id: [ {id, deviceId, doorNumber, pulseSeconds, doorName}, ... ] }
     """
-    idx: Dict[int, List[Dict[str, Any]]] = {}
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -3127,24 +3429,61 @@ def _load_synced_door_presets_index() -> Dict[int, List[Dict[str, Any]]]:
             ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
             """
         ).fetchall()
+    return _build_synced_door_presets_index_from_rows([dict(r) for r in rows])
 
-        for r in rows:
-            did = _to_int_or_none(r["device_id"])  # type: ignore[index]
-            if did is None:
-                continue
-            rid = _to_int_or_none(r["remote_id"])  # type: ignore[index]
-            idx.setdefault(int(did), []).append(
-                {
-                    "id": rid,
-                    "deviceId": int(did),
-                    "doorNumber": _to_int_or_none(r["door_number"]),  # type: ignore[index]
-                    "pulseSeconds": _to_int_or_none(r["pulse_seconds"]),  # type: ignore[index]
-                    "doorName": _safe_str(r["door_name"], ""),  # type: ignore[index]
-                    "createdAt": _safe_str(r["created_at"], ""),  # type: ignore[index]
-                    "updatedAt": _safe_str(r["updated_at"], ""),  # type: ignore[index]
-                }
-            )
+
+def _build_synced_door_presets_index_from_rows(rows: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    idx: Dict[int, List[Dict[str, Any]]] = {}
+    for r in rows:
+        did = _to_int_or_none(r.get("device_id"))
+        if did is None:
+            continue
+        rid = _to_int_or_none(r.get("remote_id"))
+        idx.setdefault(int(did), []).append(
+            {
+                "id": rid,
+                "deviceId": int(did),
+                "doorNumber": _to_int_or_none(r.get("door_number")),
+                "pulseSeconds": _to_int_or_none(r.get("pulse_seconds")),
+                "doorName": _safe_str(r.get("door_name"), ""),
+                "createdAt": _safe_str(r.get("created_at"), ""),
+                "updatedAt": _safe_str(r.get("updated_at"), ""),
+            }
+        )
     return idx
+
+
+def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]]:
+    try:
+        did = int(device_id)
+    except Exception:
+        return []
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+            FROM sync_device_door_presets
+            WHERE device_id = ?
+            ORDER BY door_number ASC, remote_id ASC, id ASC
+            """,
+            (did,),
+        ).fetchall()
+
+    payload: List[Dict[str, Any]] = []
+    for r in rows:
+        payload.append(
+            {
+                "id": _to_int_or_none(r["remote_id"]),  # type: ignore[index]
+                "deviceId": _to_int_or_none(r["device_id"]) or did,  # type: ignore[index]
+                "doorNumber": _to_int_or_none(r["door_number"]) or 1,  # type: ignore[index]
+                "pulseSeconds": _to_int_or_none(r["pulse_seconds"]) or 3,  # type: ignore[index]
+                "doorName": _safe_str(r["door_name"], ""),  # type: ignore[index]
+                "createdAt": _safe_str(r["created_at"], ""),  # type: ignore[index]
+                "updatedAt": _safe_str(r["updated_at"], ""),  # type: ignore[index]
+            }
+        )
+    return payload
 
 
 def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -3310,6 +3649,41 @@ def _coerce_gym_access_credential_row_to_payload(c: Dict[str, Any]) -> Dict[str,
     }
 
 
+def _coerce_sync_access_software_settings_row_to_payload(
+    row: Dict[str, Any] | sqlite3.Row | None,
+) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    d = dict(row)
+    return {
+        "gymId": d.get("gym_id"),
+        "accessServerHost": d.get("access_server_host"),
+        "accessServerPort": d.get("access_server_port"),
+        "accessServerEnabled": bool(int(d.get("access_server_enabled") or 0)),
+        "imageCacheEnabled": bool(int(d.get("image_cache_enabled") or 0)),
+        "imageCacheTimeoutSec": d.get("image_cache_timeout_sec"),
+        "imageCacheMaxBytes": d.get("image_cache_max_bytes"),
+        "imageCacheMaxFiles": d.get("image_cache_max_files"),
+        "eventQueueMax": d.get("event_queue_max"),
+        "notificationQueueMax": d.get("notification_queue_max"),
+        "historyQueueMax": d.get("history_queue_max"),
+        "popupQueueMax": d.get("popup_queue_max"),
+        "decisionWorkers": d.get("decision_workers"),
+        "decisionEmaAlpha": d.get("decision_ema_alpha"),
+        "historyRetentionDays": d.get("history_retention_days"),
+        "notificationRateLimitPerMinute": d.get("notification_rate_limit_per_minute"),
+        "notificationDedupeWindowSec": d.get("notification_dedupe_window_sec"),
+        "notificationServiceEnabled": bool(int(d.get("notification_service_enabled") or 0)),
+        "historyServiceEnabled": bool(int(d.get("history_service_enabled") or 0)),
+        "agentSyncBackendRefreshMin": d.get("agent_sync_backend_refresh_min"),
+        "defaultAuthorizeDoorId": d.get("default_authorize_door_id"),
+        "sdkReadInitialBytes": d.get("sdk_read_initial_bytes"),
+        "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
+        "createdAt": d.get("created_at"),
+        "updatedAt": d.get("updated_at"),
+    }
+
+
 def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
     """
     Returns a dict matching GymAccessSoftwareSettingsDto field names (camelCase),
@@ -3335,46 +3709,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
             WHERE id=1
             """
         ).fetchone()
-        if not r:
-            return None
-
-        d = dict(r)
-        return {
-            "gymId": d.get("gym_id"),
-            "accessServerHost": d.get("access_server_host"),
-            "accessServerPort": d.get("access_server_port"),
-            "accessServerEnabled": bool(int(d.get("access_server_enabled") or 0)),
-
-            "imageCacheEnabled": bool(int(d.get("image_cache_enabled") or 0)),
-            "imageCacheTimeoutSec": d.get("image_cache_timeout_sec"),
-            "imageCacheMaxBytes": d.get("image_cache_max_bytes"),
-            "imageCacheMaxFiles": d.get("image_cache_max_files"),
-
-            "eventQueueMax": d.get("event_queue_max"),
-            "notificationQueueMax": d.get("notification_queue_max"),
-            "historyQueueMax": d.get("history_queue_max"),
-            "popupQueueMax": d.get("popup_queue_max"),
-
-            "decisionWorkers": d.get("decision_workers"),
-            "decisionEmaAlpha": d.get("decision_ema_alpha"),
-
-            "historyRetentionDays": d.get("history_retention_days"),
-            "notificationRateLimitPerMinute": d.get("notification_rate_limit_per_minute"),
-            "notificationDedupeWindowSec": d.get("notification_dedupe_window_sec"),
-
-            "notificationServiceEnabled": bool(int(d.get("notification_service_enabled") or 0)),
-            "historyServiceEnabled": bool(int(d.get("history_service_enabled") or 0)),
-
-            "agentSyncBackendRefreshMin": d.get("agent_sync_backend_refresh_min"),
-
-            "defaultAuthorizeDoorId": d.get("default_authorize_door_id"),
-            "sdkReadInitialBytes": d.get("sdk_read_initial_bytes"),
-
-            "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
-
-            "createdAt": d.get("created_at"),
-            "updatedAt": d.get("updated_at"),
-        }
+    return _coerce_sync_access_software_settings_row_to_payload(r)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3565,142 +3900,259 @@ _sync_cache_loading: "threading.Event | None" = None  # None = no load in progre
 _SYNC_CACHE_TTL = 5.0  # seconds
 
 
-def invalidate_sync_cache() -> None:
-    """Force the next load_sync_cache() call to read from the DB."""
+def _finish_sync_cache_load(
+    *,
+    evt: threading.Event,
+    result: "SyncCacheState | None" = None,
+    success: bool,
+) -> None:
+    global _sync_cache_entry, _sync_cache_loading
+    with _sync_cache_lock:
+        if success:
+            _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
+        if _sync_cache_loading is evt:
+            _sync_cache_loading = None
+    evt.set()
+
+
+def _load_sync_cache_background(evt: threading.Event) -> None:
+    try:
+        result = _load_sync_cache_db()
+    except Exception:
+        _finish_sync_cache_load(evt=evt, success=False)
+        return
+    _finish_sync_cache_load(evt=evt, result=result, success=True)
+
+
+def refresh_sync_cache_async() -> bool:
+    """Start a background refresh of the sync cache if one is not already running."""
+    global _sync_cache_loading
+    with _sync_cache_lock:
+        if _sync_cache_loading is not None:
+            return False
+        evt = threading.Event()
+        _sync_cache_loading = evt
+    threading.Thread(
+        target=_load_sync_cache_background,
+        args=(evt,),
+        name="SyncCacheRefresh",
+        daemon=True,
+    ).start()
+    return True
+
+
+def invalidate_sync_cache(*, clear_cached: bool = False) -> None:
+    """Expire the sync cache; optionally drop the stale snapshot entirely."""
     global _sync_cache_entry
     with _sync_cache_lock:
-        _sync_cache_entry = (0.0, None)
+        _, cached = _sync_cache_entry
+        _sync_cache_entry = (0.0, None if clear_cached else cached)
 
 
 def load_sync_cache() -> "SyncCacheState | None":
     global _sync_cache_entry, _sync_cache_loading
     now = time.monotonic()
+    cached_snapshot: "SyncCacheState | None" = None
+    load_inline = False
+    start_background = False
+    evt: threading.Event | None = None
 
     with _sync_cache_lock:
         expires, cached = _sync_cache_entry
         if now < expires and cached is not None:
             return cached
+        cached_snapshot = cached
 
-        # Cache expired. Is another thread already loading?
         if _sync_cache_loading is not None:
-            evt = _sync_cache_loading  # wait for the in-flight loader
-        else:
-            # We are the loader thread.
+            evt = _sync_cache_loading
+        elif cached_snapshot is not None:
             evt = threading.Event()
             _sync_cache_loading = evt
-            evt = None  # signal: "we are the loader"
+            start_background = True
+        else:
+            evt = threading.Event()
+            _sync_cache_loading = evt
+            load_inline = True
 
-    if evt is not None:
-        # Another thread is loading — wait for it (bounded).
+    if start_background and evt is not None:
+        threading.Thread(
+            target=_load_sync_cache_background,
+            args=(evt,),
+            name="SyncCacheRefresh",
+            daemon=True,
+        ).start()
+        return cached_snapshot
+
+    if not load_inline:
+        if cached_snapshot is not None:
+            return cached_snapshot
+        assert evt is not None
         evt.wait(timeout=10.0)
         with _sync_cache_lock:
             _, cached = _sync_cache_entry
         return cached
 
-    # We are the loader thread.
+    assert evt is not None
     try:
         result = _load_sync_cache_db()
-        with _sync_cache_lock:
-            _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
-            loading_evt = _sync_cache_loading
-            _sync_cache_loading = None
-        if loading_evt is not None:
-            loading_evt.set()  # wake all waiters
+        _finish_sync_cache_load(evt=evt, result=result, success=True)
         return result
     except Exception:
-        with _sync_cache_lock:
-            loading_evt = _sync_cache_loading
-            _sync_cache_loading = None
-        if loading_evt is not None:
-            loading_evt.set()  # wake waiters even on failure
+        _finish_sync_cache_load(evt=evt, success=False)
         raise
 
 
-def _load_sync_cache_db() -> "SyncCacheState | None":
+def peek_sync_cache() -> "SyncCacheState | None":
+    """Return the current in-memory sync cache snapshot without triggering a refresh."""
+    with _sync_cache_lock:
+        _, cached = _sync_cache_entry
+        return cached
+
+
+def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
     with get_conn() as conn:
         meta = conn.execute("SELECT contract_status, contract_end_date, updated_at FROM sync_meta WHERE id=1").fetchone()
         if not meta:
             raw = conn.execute("SELECT updated_at, payload_json FROM sync_cache WHERE id=1").fetchone()
             if not raw:
                 return None
-            try:
-                data = json.loads(raw["payload_json"] or "{}")
-            except Exception:
-                return None
+            return {
+                "legacy_payload": {
+                    "updated_at": raw["updated_at"],
+                    "payload_json": raw["payload_json"],
+                }
+            }
 
-            users = list(data.get("users") or [])
-            norm_users: List[Dict[str, Any]] = []
-            for u in users:
-                if isinstance(u, dict):
-                    norm_users.append(_coerce_user_row_to_payload(u))
-
-            try:
-                norm_users.extend(list_projected_offline_users(base_users=norm_users))
-            except Exception:
-                pass
-            devs = list(data.get("devices") or [])
-            creds = list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or [])
-
-            return SyncCacheState(
-                contract_status=bool(data.get("contractStatus", False)),
-                contract_end_date=(data.get("contractEndDate") or ""),
-                access_software_settings=(data.get("accessSoftwareSettings") if isinstance(data.get("accessSoftwareSettings"), dict) else None),
-                users=norm_users,
-                membership=list(data.get("membership") or data.get("memberships") or []),
-                devices=devs,
-                infrastructures=list(data.get("infrastructures") or data.get("infrastructure") or []),
-                gym_access_credentials=[c for c in creds if isinstance(c, dict)],
-                updated_at=(raw["updated_at"] or ""),
-            )
-
-        contract_status = bool(int(meta["contract_status"]))
-        contract_end_date = meta["contract_end_date"] or ""
-        updated_at = meta["updated_at"] or ""
-
-        access_settings = load_sync_access_software_settings()
-
+        settings_row = conn.execute(
+            """
+            SELECT
+                gym_id,
+                access_server_host, access_server_port, access_server_enabled,
+                image_cache_enabled, image_cache_timeout_sec, image_cache_max_bytes, image_cache_max_files,
+                event_queue_max, notification_queue_max, history_queue_max, popup_queue_max,
+                decision_workers, decision_ema_alpha,
+                history_retention_days, notification_rate_limit_per_minute, notification_dedupe_window_sec,
+                notification_service_enabled, history_service_enabled,
+                agent_sync_backend_refresh_min,
+                default_authorize_door_id,
+                sdk_read_initial_bytes,
+                optional_data_sync_delay_minutes,
+                created_at, updated_at
+            FROM sync_access_software_settings
+            WHERE id=1
+            """
+        ).fetchone()
         users_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_users").fetchall()]
-        users = [_coerce_user_row_to_payload(u) for u in users_rows]
+        membership_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
+        devices_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_devices").fetchall()]
+        preset_rows = [
+            dict(r)
+            for r in conn.execute(
+                """
+                SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+                FROM sync_device_door_presets
+                ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
+                """
+            ).fetchall()
+        ]
+        infrastructures_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_infrastructures").fetchall()]
+        credential_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_gym_access_credentials").fetchall()]
+
+    return {
+        "meta_row": dict(meta),
+        "settings_row": dict(settings_row) if settings_row else None,
+        "users_rows": users_rows,
+        "membership_rows": membership_rows,
+        "devices_rows": devices_rows,
+        "preset_rows": preset_rows,
+        "infrastructures_rows": infrastructures_rows,
+        "credential_rows": credential_rows,
+    }
+
+
+def _build_sync_cache_state_from_snapshot(snapshot: Dict[str, Any] | None) -> "SyncCacheState | None":
+    if not snapshot:
+        return None
+
+    legacy_payload = snapshot.get("legacy_payload")
+    if legacy_payload is not None:
         try:
-            users.extend(list_projected_offline_users(base_users=users))
+            data = json.loads(legacy_payload.get("payload_json") or "{}")
+        except Exception:
+            return None
+
+        users = list(data.get("users") or [])
+        norm_users: List[Dict[str, Any]] = []
+        for u in users:
+            if isinstance(u, dict):
+                norm_users.append(_coerce_user_row_to_payload(u))
+
+        try:
+            norm_users.extend(list_projected_offline_users(base_users=norm_users))
         except Exception:
             pass
-
-        membership = [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
-
-        devices_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_devices").fetchall()]
-        devices_rows = [_expand_device_json_fields(d) for d in devices_rows]
-
-        presets_idx = _load_synced_door_presets_index()
-        for d in devices_rows:
-            try:
-                did = _to_int_or_none(d.get("id"))
-                d["door_presets"] = presets_idx.get(int(did), []) if did is not None else []
-            except Exception:
-                d["door_presets"] = []
-
-        infrastructures = [dict(r) for r in conn.execute("SELECT * FROM sync_infrastructures").fetchall()]
-        for inf in infrastructures:
-            try:
-                inf["gym_agent"] = json.loads(inf.get("gym_agent_json") or "{}")
-            except Exception:
-                inf["gym_agent"] = {}
-
-        creds_rows = [dict(r) for r in conn.execute("SELECT * FROM sync_gym_access_credentials").fetchall()]
-        creds_rows = [_expand_gym_access_credential_json_fields(c) for c in creds_rows]
-        creds_payload = [_coerce_gym_access_credential_row_to_payload(c) for c in creds_rows]
+        devs = list(data.get("devices") or [])
+        creds = list(data.get("gymAccessCredentials") or data.get("gym_access_credentials") or [])
 
         return SyncCacheState(
-            contract_status=contract_status,
-            contract_end_date=contract_end_date,
-            access_software_settings=access_settings,
-            users=users,
-            membership=membership,
-            devices=devices_rows,
-            infrastructures=infrastructures,
-            gym_access_credentials=creds_payload,
-            updated_at=updated_at,
+            contract_status=bool(data.get("contractStatus", False)),
+            contract_end_date=(data.get("contractEndDate") or ""),
+            access_software_settings=(data.get("accessSoftwareSettings") if isinstance(data.get("accessSoftwareSettings"), dict) else None),
+            users=norm_users,
+            membership=list(data.get("membership") or data.get("memberships") or []),
+            devices=devs,
+            infrastructures=list(data.get("infrastructures") or data.get("infrastructure") or []),
+            gym_access_credentials=[c for c in creds if isinstance(c, dict)],
+            updated_at=(legacy_payload.get("updated_at") or ""),
         )
+
+    meta = snapshot.get("meta_row") or {}
+    access_settings = _coerce_sync_access_software_settings_row_to_payload(snapshot.get("settings_row"))
+
+    users_rows = list(snapshot.get("users_rows") or [])
+    users = [_coerce_user_row_to_payload(u) for u in users_rows]
+    try:
+        users.extend(list_projected_offline_users(base_users=users))
+    except Exception:
+        pass
+
+    membership = list(snapshot.get("membership_rows") or [])
+
+    devices_rows = [_expand_device_json_fields(d) for d in list(snapshot.get("devices_rows") or [])]
+    presets_idx = _build_synced_door_presets_index_from_rows(list(snapshot.get("preset_rows") or []))
+    for d in devices_rows:
+        try:
+            did = _to_int_or_none(d.get("id"))
+            d["door_presets"] = presets_idx.get(int(did), []) if did is not None else []
+        except Exception:
+            d["door_presets"] = []
+
+    infrastructures = list(snapshot.get("infrastructures_rows") or [])
+    for inf in infrastructures:
+        try:
+            inf["gym_agent"] = json.loads(inf.get("gym_agent_json") or "{}")
+        except Exception:
+            inf["gym_agent"] = {}
+
+    creds_rows = [_expand_gym_access_credential_json_fields(c) for c in list(snapshot.get("credential_rows") or [])]
+    creds_payload = [_coerce_gym_access_credential_row_to_payload(c) for c in creds_rows]
+
+    return SyncCacheState(
+        contract_status=bool(int(meta.get("contract_status") or 0)),
+        contract_end_date=meta.get("contract_end_date") or "",
+        access_software_settings=access_settings,
+        users=users,
+        membership=membership,
+        devices=devices_rows,
+        infrastructures=infrastructures,
+        gym_access_credentials=creds_payload,
+        updated_at=meta.get("updated_at") or "",
+    )
+
+
+def _load_sync_cache_db() -> "SyncCacheState | None":
+    snapshot = _fetch_sync_cache_snapshot()
+    return _build_sync_cache_state_from_snapshot(snapshot)
 
 
 def load_sync_contract_meta() -> Dict[str, Any] | None:
@@ -3733,16 +4185,122 @@ def load_sync_contract_meta() -> Dict[str, Any] | None:
     }
 
 
+def _count_rows(table_name: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+    try:
+        return int(row["count"] if row is not None else 0)  # type: ignore[index]
+    except Exception:
+        return 0
+
+
+def count_sync_users() -> int:
+    return _count_rows("sync_users")
+
+
+def count_sync_memberships() -> int:
+    return _count_rows("sync_memberships")
+
+
+def count_sync_devices() -> int:
+    return _count_rows("sync_devices")
+
+
+def count_sync_infrastructures() -> int:
+    return _count_rows("sync_infrastructures")
+
+
+def count_sync_gym_access_credentials() -> int:
+    return _count_rows("sync_gym_access_credentials")
+
+
+def summarize_access_mode_counts(devices: Iterable[Dict[str, Any]] | None) -> Dict[str, int]:
+    summary = {"DEVICE": 0, "AGENT": 0, "ULTRA": 0, "UNKNOWN": 0}
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        raw_mode = device.get("accessDataMode")
+        if raw_mode in (None, ""):
+            raw_mode = device.get("access_data_mode")
+        normalized_mode = _safe_str(raw_mode, "").strip().upper()
+        if normalized_mode not in ("DEVICE", "AGENT", "ULTRA"):
+            normalized_mode = "UNKNOWN"
+        summary[normalized_mode] += 1
+    return summary
+
+
+def load_sync_device_mode_summary() -> Dict[str, int]:
+    summary = {"DEVICE": 0, "AGENT": 0, "ULTRA": 0, "UNKNOWN": 0}
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT UPPER(TRIM(COALESCE(access_data_mode, ''))) AS mode, COUNT(*) AS count
+            FROM sync_devices
+            GROUP BY UPPER(TRIM(COALESCE(access_data_mode, '')))
+            """
+        ).fetchall()
+    for row in rows:
+        raw_mode = _safe_str(row["mode"] if row is not None else "", "").upper()  # type: ignore[index]
+        count = _to_int_or_none(row["count"] if row is not None else 0) or 0  # type: ignore[index]
+        normalized_mode = raw_mode if raw_mode in ("DEVICE", "AGENT", "ULTRA") else "UNKNOWN"
+        summary[normalized_mode] += int(count)
+    return summary
+
+
+def list_sync_users_page(*, limit: int = 0, offset: int = 0) -> tuple[List[Dict[str, Any]], int]:
+    """Paged direct query for UI endpoints that should not hydrate the full sync cache."""
+    normalized_limit = max(0, int(limit or 0))
+    normalized_offset = max(0, int(offset or 0))
+    with get_conn() as conn:
+        total = int(conn.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0] or 0)
+        sql = "SELECT * FROM sync_users ORDER BY COALESCE(active_membership_id, membership_id, user_id)"
+        params: List[Any] = []
+        if normalized_limit > 0:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([normalized_limit, normalized_offset])
+        elif normalized_offset > 0:
+            sql += " LIMIT -1 OFFSET ?"
+            params.append(normalized_offset)
+        rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+    users = [_coerce_user_row_to_payload(r) for r in rows]
+    include_projected_offline = normalized_offset == 0 and (normalized_limit <= 0 or normalized_limit >= total)
+    if include_projected_offline:
+        try:
+            projected = list_projected_offline_users(base_users=users)
+            users.extend(projected)
+            total += len(projected)
+        except Exception:
+            pass
+    return users, total
+
+
 def list_sync_users() -> List[Dict[str, Any]]:
     """Direct query — avoids loading memberships/devices/infra via load_sync_cache() hot path."""
-    with get_conn() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM sync_users").fetchall()]
-    users = [_coerce_user_row_to_payload(r) for r in rows]
-    try:
-        users.extend(list_projected_offline_users(base_users=users))
-    except Exception:
-        pass
+    users, _total = list_sync_users_page(limit=0, offset=0)
     return users
+
+
+def list_sync_users_by_active_membership_ids(
+    active_membership_ids: List[int] | set[int] | tuple[int, ...],
+) -> List[Dict[str, Any]]:
+    normalized = sorted({
+        int(member_id)
+        for member_id in (active_membership_ids or [])
+        if member_id is not None
+    })
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    with get_conn() as conn:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                f"SELECT * FROM sync_users WHERE active_membership_id IN ({placeholders})",
+                tuple(normalized),
+            ).fetchall()
+        ]
+    return [_coerce_user_row_to_payload(r) for r in rows]
 
 
 def list_sync_memberships() -> List[Dict[str, Any]]:
@@ -3750,12 +4308,12 @@ def list_sync_memberships() -> List[Dict[str, Any]]:
         return [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
 
 
-def list_sync_devices() -> List[Dict[str, Any]]:
+def list_sync_devices(*, include_door_presets: bool = True) -> List[Dict[str, Any]]:
     with get_conn() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM sync_devices").fetchall()]
 
     out: List[Dict[str, Any]] = []
-    presets_idx = _load_synced_door_presets_index()
+    presets_idx = _load_synced_door_presets_index() if include_door_presets else {}
 
     for d in rows:
         for k in ("allowed_memberships_json", "installed_models_json", "door_ids_json"):
@@ -3791,8 +4349,63 @@ def get_sync_device(device_id: int) -> Optional[Dict[str, Any]]:
     return dd
 
 
-def list_sync_devices_payload() -> List[Dict[str, Any]]:
-    rows = list_sync_devices()
+def list_sync_devices_payload_from_cache(
+    cache: "SyncCacheState | None",
+    *,
+    include_door_presets: bool = True,
+) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    devices = list(getattr(cache, "devices", []) or []) if cache is not None else []
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        row = dict(device)
+        if not include_door_presets:
+            row["door_presets"] = []
+            row["doorPresets"] = []
+        payload.append(_coerce_device_row_to_payload(row))
+    return payload
+
+
+def list_sync_device_door_presets_payload_from_cache(
+    device_id: int,
+    cache: "SyncCacheState | None",
+) -> List[Dict[str, Any]] | None:
+    try:
+        did = int(device_id)
+    except Exception:
+        return None
+
+    devices = list(getattr(cache, "devices", []) or []) if cache is not None else []
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        if _to_int_or_none(device.get("id")) != did:
+            continue
+        raw_presets = device.get("door_presets")
+        if raw_presets is None:
+            raw_presets = device.get("doorPresets")
+        payload: List[Dict[str, Any]] = []
+        for preset in list(raw_presets or []):
+            if not isinstance(preset, dict):
+                continue
+            payload.append(
+                {
+                    "id": _to_int_or_none(preset.get("id")),
+                    "deviceId": _to_int_or_none(preset.get("deviceId")) or did,
+                    "doorNumber": _to_int_or_none(preset.get("doorNumber")) or 1,
+                    "pulseSeconds": _to_int_or_none(preset.get("pulseSeconds")) or 3,
+                    "doorName": _safe_str(preset.get("doorName"), ""),
+                    "createdAt": _safe_str(preset.get("createdAt"), ""),
+                    "updatedAt": _safe_str(preset.get("updatedAt"), ""),
+                }
+            )
+        return payload
+    return None
+
+
+def list_sync_devices_payload(*, include_door_presets: bool = True) -> List[Dict[str, Any]]:
+    rows = list_sync_devices(include_door_presets=include_door_presets)
     payload: List[Dict[str, Any]] = []
     for d in rows:
         p = _coerce_device_row_to_payload(d)
@@ -3878,6 +4491,64 @@ def list_device_sync_pins(*, device_id: int) -> List[str]:
         return [str(r["pin"] or "") for r in rows if str(r["pin"] or "").strip()]
 
 
+def save_device_sync_state_batch(
+    *,
+    device_id: int,
+    rows: "Iterable[tuple[str, str | None, bool, str | None]]",
+) -> int:
+    """
+    Batch-upsert multiple (pin, desired_hash, ok, error) rows for a single device
+    in ONE DbWriter transaction instead of one transaction per pin.
+
+    Calling ``save_device_sync_state`` N times for N pins = N DbWriter round-trips
+    (~2 ms each × 1277 pins = ~2.5 s per device). This function collapses them to
+    a single round-trip, preventing the DbWriter queue from backing up when the
+    next sync cycle tries to write ``save_sync_cache_delta``.
+
+    Returns the number of rows processed.
+    """
+    did = int(device_id)
+    updated_at = now_iso()
+
+    params_list: list[tuple] = []
+    for pin, desired_hash, ok, error in (rows or []):
+        p = str(pin or "").strip()
+        if not p:
+            continue
+        params_list.append((
+            did,
+            p,
+            str(desired_hash or "").strip() if desired_hash else "",
+            1 if bool(ok) else 0,
+            (str(error or "")[:1000]) if error else None,
+            updated_at,
+        ))
+
+    if not params_list:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            """
+            INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, pin) DO UPDATE SET
+                desired_hash = CASE
+                    WHEN excluded.last_ok = 1 THEN excluded.desired_hash
+                    ELSE device_sync_state.desired_hash
+                END,
+                last_ok = excluded.last_ok,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            params_list,
+        )
+        profile["rows"] = len(params_list)
+        return len(params_list)
+
+    return int(_run_db_write_sync("save_device_sync_state_batch", _write))
+
+
 def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None, ok: bool, error: str | None) -> None:
     did = int(device_id)
     p = str(pin or "").strip()
@@ -3888,7 +4559,7 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
     ok_i = 1 if bool(ok) else 0
     dh = str(desired_hash or "").strip() if desired_hash else ""
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at)
@@ -3904,7 +4575,8 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
             """,
             (did, p, dh, ok_i, err, now_iso()),
         )
-        conn.commit()
+
+    _run_db_write_sync("save_device_sync_state", _write)
 
 
 def delete_device_sync_state(*, device_id: int, pin: str) -> None:
@@ -3912,9 +4584,10 @@ def delete_device_sync_state(*, device_id: int, pin: str) -> None:
     p = str(pin or "").strip()
     if not p:
         return
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute("DELETE FROM device_sync_state WHERE device_id=? AND pin=?", (did, p))
-        conn.commit()
+
+    _run_db_write_sync("delete_device_sync_state", _write)
 
 
 def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
@@ -3925,8 +4598,8 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
     if not to_remove:
         return 0
 
-    deleted = 0
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        deleted = 0
         CHUNK = 300
         for i in range(0, len(to_remove), CHUNK):
             chunk = to_remove[i : i + CHUNK]
@@ -3936,26 +4609,29 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
                 (did, *chunk),
             )
             deleted += int(cur.rowcount or 0)
-        conn.commit()
-    return deleted
+        return deleted
+
+    return int(_run_db_write_sync("prune_device_sync_state", _write))
 
 
 # -----------------------------
 def clear_device_sync_hashes(*, device_id: int) -> int:
     """F-015: Clear all sync hashes for a device to force full re-sync on next cycle."""
     did = int(device_id)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cursor = conn.execute("DELETE FROM device_sync_state WHERE device_id=?", (did,))
-        conn.commit()
-        return cursor.rowcount
+        return int(cursor.rowcount or 0)
+
+    return int(_run_db_write_sync("clear_device_sync_hashes", _write))
 
 
 def clear_all_device_sync_hashes() -> int:
     """Hard-reset: clear sync hashes for ALL devices so next sync re-pushes every user."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cursor = conn.execute("DELETE FROM device_sync_state")
-        conn.commit()
-        return cursor.rowcount
+        return int(cursor.rowcount or 0)
+
+    return int(_run_db_write_sync("clear_all_device_sync_hashes", _write))
 
 
 # -----------------------------
@@ -3978,7 +4654,7 @@ def insert_sync_run(
     status: str = "IN_PROGRESS",
     created_at: str,
 ) -> int:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
             INSERT INTO sync_run_history (
@@ -3993,8 +4669,9 @@ def insert_sync_run(
                 created_at,
             ),
         )
-        conn.commit()
         return int(cur.lastrowid)
+
+    return int(_run_db_write_sync("insert_sync_run", _write))
 
 
 def update_sync_run(
@@ -4008,7 +4685,7 @@ def update_sync_run(
     error_message: str | None = None,
     raw_response: str | None = None,
 ) -> None:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
             UPDATE sync_run_history
@@ -4032,7 +4709,8 @@ def update_sync_run(
                 int(id),
             ),
         )
-        conn.commit()
+
+    _run_db_write_sync("update_sync_run", _write)
 
 
 def get_sync_run(id: int) -> Dict[str, Any] | None:
@@ -4103,7 +4781,7 @@ def insert_push_batch(
     status: str = "IN_PROGRESS",
     created_at: str,
 ) -> int:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
             INSERT INTO push_batch_history (
@@ -4124,8 +4802,9 @@ def insert_push_batch(
                 created_at,
             ),
         )
-        conn.commit()
         return int(cur.lastrowid)
+
+    return int(_run_db_write_sync("insert_push_batch", _write))
 
 
 def update_push_batch(
@@ -4138,7 +4817,7 @@ def update_push_batch(
     duration_ms: int,
     error_message: str | None = None,
 ) -> None:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
             UPDATE push_batch_history
@@ -4160,7 +4839,8 @@ def update_push_batch(
                 int(id),
             ),
         )
-        conn.commit()
+
+    _run_db_write_sync("update_push_batch", _write)
 
 
 def insert_push_pin(
@@ -4173,7 +4853,7 @@ def insert_push_pin(
     error_message: str | None = None,
     duration_ms: int = 0,
 ) -> int:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             """
             INSERT INTO push_pin_history (
@@ -4196,8 +4876,52 @@ def insert_push_pin(
                 int(duration_ms or 0),
             ),
         )
-        conn.commit()
         return int(cur.lastrowid)
+
+    return int(_run_db_write_sync("insert_push_pin", _write))
+
+
+def insert_push_pin_batch(
+    *,
+    batch_id: int,
+    rows: "Iterable[tuple[str, str | None, str, str, str | None, int]]",
+) -> int:
+    """
+    Batch-insert multiple push_pin_history rows in ONE DbWriter transaction.
+
+    Each row is a tuple of (pin, full_name, operation, status, error_message, duration_ms).
+    Replaces calling ``insert_push_pin`` N times, which would be N DbWriter round-trips.
+    Returns the number of rows inserted.
+    """
+    params_list: list[tuple] = []
+    bid = int(batch_id)
+    for pin, full_name, operation, status, error_message, duration_ms in (rows or []):
+        params_list.append((
+            bid,
+            str(pin),
+            full_name,
+            str(operation).strip().upper(),
+            str(status).strip().upper(),
+            error_message,
+            int(duration_ms or 0),
+        ))
+
+    if not params_list:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            """
+            INSERT INTO push_pin_history (
+                batch_id, pin, full_name, operation, status, error_message, duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            params_list,
+        )
+        profile["rows"] = len(params_list)
+        return len(params_list)
+
+    return int(_run_db_write_sync("insert_push_pin_batch", _write))
 
 
 def get_push_batch(batch_id: int) -> Dict[str, Any] | None:
@@ -5773,11 +6497,6 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
             card_set.add(card2)
 
     return out
-
-
-
-
-
 
 
 

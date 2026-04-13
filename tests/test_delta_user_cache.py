@@ -202,3 +202,85 @@ def test_save_sync_cache_delta_credentials_refresh_preserves_unchanged_rowids(db
 
     assert keep_rowid_after == keep_rowid_before
     assert keys == {(58, 10), (58, 30)}
+
+
+def test_save_sync_cache_delta_skips_settings_and_memberships_when_refresh_settings_false(db):
+    initial = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    initial["accessSoftwareSettings"] = {
+        "gymId": 58,
+        "accessServerHost": "127.0.0.1",
+        "accessServerPort": 8080,
+        "accessServerEnabled": True,
+        "createdAt": "2026-04-12T00:00:00Z",
+        "updatedAt": "2026-04-12T00:00:00Z",
+    }
+    initial["membership"] = [
+        {"id": 7, "title": "Gold", "description": "Initial", "price": 99.0, "durationInDays": 30},
+    ]
+    db.save_sync_cache_delta(
+        initial,
+        {"members": False, "devices": False, "credentials": False, "settings": True},
+    )
+
+    with db.get_conn() as conn:
+        settings_before = tuple(
+            conn.execute(
+                "SELECT access_server_host, access_server_port, updated_at FROM sync_access_software_settings WHERE id=1"
+            ).fetchone()
+        )
+        memberships_before = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, title, description, price, duration_in_days FROM sync_memberships"
+            ).fetchall()
+        ]
+
+    delta = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    delta["accessSoftwareSettings"] = {
+        "gymId": 58,
+        "accessServerHost": "10.10.10.10",
+        "accessServerPort": 9090,
+        "accessServerEnabled": True,
+        "createdAt": "2026-04-13T00:00:00Z",
+        "updatedAt": "2026-04-13T00:00:00Z",
+    }
+    delta["membership"] = [
+        {"id": 8, "title": "Platinum", "description": "Changed", "price": 199.0, "durationInDays": 60},
+    ]
+    db.save_sync_cache_delta(
+        delta,
+        {"members": False, "devices": False, "credentials": True, "settings": False},
+    )
+
+    with db.get_conn() as conn:
+        settings_after = tuple(
+            conn.execute(
+                "SELECT access_server_host, access_server_port, updated_at FROM sync_access_software_settings WHERE id=1"
+            ).fetchone()
+        )
+        memberships_after = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT id, title, description, price, duration_in_days FROM sync_memberships"
+            ).fetchall()
+        ]
+
+    assert settings_after == settings_before
+    assert memberships_after == memberships_before
+
+
+def test_apply_member_shadow_delta_updates_and_deletes_in_one_pass(db):
+    db.upsert_member_shadow(users=[_make_user(am_id=1, full_name="Alice Smith"), _make_user(am_id=2, full_name="Bob")])
+
+    deleted = db.apply_member_shadow_delta(
+        users=[_make_user(am_id=1, full_name="Alice Updated")],
+        valid_member_ids=[1],
+    )
+
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT active_membership_id, full_name FROM member_shadow ORDER BY active_membership_id"
+        ).fetchall()
+
+    assert deleted == [2]
+    assert [tuple(row) for row in rows] == [(1, "Alice Updated")]

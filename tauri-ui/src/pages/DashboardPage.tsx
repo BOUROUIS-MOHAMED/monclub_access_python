@@ -157,9 +157,6 @@ export default function DashboardPage() {
         <div className="flex items-center gap-1.5">
           <StatusDot ok={sync.lastOk} />
           <span className="text-muted-foreground">Sync</span>
-          <span className="font-mono font-medium">
-            {sync.lastSyncAt ? sync.lastSyncAt.replace("T", " ").slice(0, 16) : "—"}
-          </span>
         </div>
 
         <div className="h-3.5 w-px bg-border" />
@@ -167,9 +164,7 @@ export default function DashboardPage() {
         <div className="flex items-center gap-1.5">
           <StatusDot ok={status.pullsdk.connected} />
           <span className="text-muted-foreground">PullSDK</span>
-          <span className="font-medium">
-            {status.pullsdk.connected ? "Connecté" : "Non connecté"}
-          </span>
+        
         </div>
 
         <div className="h-3.5 w-px bg-border" />

@@ -10,15 +10,19 @@ from typing import Any, Callable, Dict, List, Set, Tuple
 
 from app.core.db import (
     list_fingerprints,
+    list_fingerprints_by_pins,
+    list_sync_users_by_active_membership_ids,
     list_device_sync_hashes,
     list_device_sync_hashes_and_status,
     save_device_sync_state,
+    save_device_sync_state_batch,
     delete_device_sync_state,
     prune_device_sync_state,
     upsert_device_mirror_pin,
     delete_device_mirror_pin,
     insert_push_batch,
     insert_push_pin,
+    insert_push_pin_batch,
     update_push_batch,
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
@@ -164,6 +168,68 @@ def _norm_int_list(xs: List[Any]) -> List[int]:
     return out
 
 
+@dataclass
+class _OneShotDeviceSyncSession:
+    device: Dict[str, Any]
+    users: List[Dict[str, Any]]
+    local_fp_index: Dict[str, List[Any]]
+    default_door_id: int
+    changed_ids: Set[int] | None
+    sync_run_id: int | None
+    pending: bool = True
+
+    def has_pending_work(self) -> bool:
+        return bool(self.pending)
+
+
+class _DeviceSyncActorAdapter:
+    def __init__(self, *, engine: "DeviceSyncEngine", device: Dict[str, Any]) -> None:
+        self._engine = engine
+        self._device = dict(device or {})
+
+    def update_device(self, device: Dict[str, Any]) -> None:
+        self._device = dict(device or {})
+
+    def build_full_sync_session(self, *, device_id: int) -> _OneShotDeviceSyncSession:
+        return self._build_session(changed_ids=None)
+
+    def build_targeted_sync_session(
+        self,
+        *,
+        device_id: int,
+        member_ids: set[int],
+    ) -> _OneShotDeviceSyncSession:
+        return self._build_session(changed_ids=set(int(member_id) for member_id in member_ids))
+
+    def run_sync_chunk(self, session: _OneShotDeviceSyncSession) -> bool:
+        if not session.pending:
+            return False
+        session.pending = False
+        self._engine._sync_one_device(
+            device=dict(session.device),
+            users=list(session.users),
+            local_fp_index=session.local_fp_index,
+            default_door_id=int(session.default_door_id),
+            changed_ids=None if session.changed_ids is None else set(session.changed_ids),
+            sync_run_id=session.sync_run_id,
+        )
+        return True
+
+    def _build_session(self, *, changed_ids: Set[int] | None) -> _OneShotDeviceSyncSession:
+        context = self._engine._get_actor_dispatch_context()
+        return _OneShotDeviceSyncSession(
+            device=self._engine._normalize_device(dict(self._device)),
+            users=list(context.get("users") or []),
+            local_fp_index={
+                str(pin): list(rows)
+                for pin, rows in (context.get("local_fp_index") or {}).items()
+            },
+            default_door_id=int(context.get("default_door_id") or DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK),
+            changed_ids=None if changed_ids is None else set(changed_ids),
+            sync_run_id=context.get("sync_run_id"),
+        )
+
+
 class DeviceSyncEngine:
     """
     Synchronizes ZKTeco controllers (PullSDK) from cached backend payload.
@@ -175,13 +241,13 @@ class DeviceSyncEngine:
       GymAccessSoftwareSettingsDto cached in SQLite, via settings_reader.get_backend_global_settings().
 
     IMPORTANT CHANGE (Apr 2026):
-    - Per-device persistent worker threads replace the ThreadPoolExecutor approach.
-    - _sync_all_devices dispatches SyncJob to DeviceWorkerManager (non-blocking).
-    - Each device has its own daemon thread with latest-wins queue semantics.
+    - Per-device actors replace the old ThreadPool/worker-manager approach.
+    - _sync_all_devices dispatches to DeviceActorRegistry (non-blocking).
+    - Each device keeps one serialized actor inbox for full and targeted sync work.
     """
 
     def __init__(self, *, cfg, logger, feedback_callback: Callable[[str, Dict[str, Any]], None] | None = None):
-        from app.core.device_worker import DeviceWorkerManager
+        from app.core.device_actor_registry import DeviceActorRegistry
         self.cfg = cfg
         self.logger = logger
         self._feedback_callback = feedback_callback
@@ -202,11 +268,48 @@ class DeviceSyncEngine:
         # L1 cache (memory) backed by L2 (SQLite via db.py).
         # Keyed by device_id (stable integer), not IP (DHCP can reassign IPs).
         self._firmware_profiles: dict[int, FirmwareProfile] = {}
-        # Per-device persistent worker threads (P2).
-        self._worker_manager = DeviceWorkerManager(
-            sync_fn=self._sync_one_device,
-            logger=logger,
+        self._dispatch_context_lock = threading.Lock()
+        self._actor_dispatch_context: Dict[str, Any] = {
+            "users": [],
+            "local_fp_index": {},
+            "default_door_id": self._default_authorize_door_id(),
+            "sync_run_id": None,
+        }
+        self._actor_registry = DeviceActorRegistry(
+            adapter_factory=self._build_actor_adapter,
         )
+
+    def _build_actor_adapter(self, device: Dict[str, Any]) -> "_DeviceSyncActorAdapter":
+        return _DeviceSyncActorAdapter(engine=self, device=device)
+
+    def _set_actor_dispatch_context(
+        self,
+        *,
+        users: List[Dict[str, Any]],
+        local_fp_index: Dict[str, List[Any]],
+        default_door_id: int,
+        sync_run_id: int | None,
+    ) -> None:
+        with self._dispatch_context_lock:
+            self._actor_dispatch_context = {
+                "users": list(users),
+                "local_fp_index": {
+                    str(pin): list(rows)
+                    for pin, rows in (local_fp_index or {}).items()
+                },
+                "default_door_id": int(default_door_id),
+                "sync_run_id": sync_run_id,
+            }
+
+    def _get_actor_dispatch_context(self) -> Dict[str, Any]:
+        with self._dispatch_context_lock:
+            context = dict(self._actor_dispatch_context)
+        context["users"] = list(context.get("users") or [])
+        context["local_fp_index"] = {
+            str(pin): list(rows)
+            for pin, rows in (context.get("local_fp_index") or {}).items()
+        }
+        return context
 
     def _emit_feedback_event(self, event_type: str, payload: Dict[str, Any]) -> None:
         if not self._feedback_callback:
@@ -269,7 +372,7 @@ class DeviceSyncEngine:
 
     def stop_workers(self) -> None:
         """Stop all per-device worker threads. Call on logout / shutdown."""
-        self._worker_manager.stop_all()
+        self._actor_registry.stop_all()
 
     def run_blocking(
         self,
@@ -312,6 +415,45 @@ class DeviceSyncEngine:
         For RTLog TCP handoff we must keep the worker paused until the actual
         device push has completed.
         """
+        return self._run_single_device_sync(
+            cache=cache,
+            device=device,
+            source=source,
+            changed_ids=changed_ids,
+            sync_run_id=sync_run_id,
+            sdk=None,
+        )
+
+    def run_one_device_on_connected_sdk(
+        self,
+        *,
+        sdk: PullSDK,
+        cache,
+        device: Dict[str, Any],
+        source: str = "timer",
+        changed_ids: set | None = None,
+        sync_run_id: int | None = None,
+    ) -> bool:
+        """Synchronously push a single device using an already-connected SDK."""
+        return self._run_single_device_sync(
+            cache=cache,
+            device=device,
+            source=source,
+            changed_ids=changed_ids,
+            sync_run_id=sync_run_id,
+            sdk=sdk,
+        )
+
+    def _run_single_device_sync(
+        self,
+        *,
+        cache,
+        device: Dict[str, Any],
+        source: str,
+        changed_ids: set | None,
+        sync_run_id: int | None,
+        sdk: PullSDK | None,
+    ) -> bool:
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip single-device ({source}): already running")
@@ -369,13 +511,18 @@ class DeviceSyncEngine:
                 current=0,
                 total=1,
             )
+            sync_kwargs = {
+                "device": normalized_device,
+                "users": users,
+                "local_fp_index": local_fp_index,
+                "default_door_id": default_door_id,
+                "changed_ids": changed_ids,
+                "sync_run_id": sync_run_id,
+            }
+            if sdk is not None:
+                sync_kwargs["sdk"] = sdk
             self._sync_one_device(
-                device=normalized_device,
-                users=users,
-                local_fp_index=local_fp_index,
-                default_door_id=default_door_id,
-                changed_ids=changed_ids,
-                sync_run_id=sync_run_id,
+                **sync_kwargs,
             )
             self._set_progress(current=1)
             return True
@@ -394,6 +541,288 @@ class DeviceSyncEngine:
                 self._running = False
 
     # ---------------- internal ----------------
+
+    def _build_local_fp_index_for_pins(
+        self,
+        *,
+        pins: set[str],
+        fingerprint_enabled: bool,
+    ) -> Dict[str, List[Any]]:
+        if not fingerprint_enabled or not pins:
+            return {}
+        try:
+            records = list_fingerprints_by_pins(pins=pins)
+        except Exception:
+            return {}
+
+        local_fp_index: Dict[str, List[Any]] = {}
+        for record in records:
+            pin = _pin_str(getattr(record, "pin", "") or "")
+            if not pin:
+                continue
+            local_fp_index.setdefault(pin, []).append(record)
+        return local_fp_index
+
+    def _push_pin_to_connected_sdk(
+        self,
+        *,
+        sdk: PullSDK,
+        device_id: int,
+        device_name: str,
+        pin: str,
+        user: Dict[str, Any],
+        desired_hash: str,
+        door_ids: List[int],
+        door_bitmask: int,
+        authorize_timezone_id: int,
+        templates: List[Dict[str, Any]],
+    ) -> bool:
+        full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
+        card = _pin_str(user.get("firstCardId") or "")
+        auth_err: str | None = None
+
+        try:
+            self._delete_pin_unconditional(sdk=sdk, pin=pin)
+
+            card_valid = card if (card and card.isdigit()) else ""
+            if card and not card_valid:
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric - skipping CardNo",
+                    device_id,
+                    pin,
+                    card,
+                )
+
+            profile = self._get_firmware_profile(device_id)
+            use_name = profile.name_supported is not False
+            pairs = [f"Pin={pin}"]
+            if use_name:
+                pairs.append(f"Name={full_name}")
+            if card_valid:
+                pairs.append(f"CardNo={card_valid}")
+
+            try:
+                sdk.set_device_data(table="user", data="\t".join(pairs) + "\r\n", options="")
+                if profile.name_supported is None and use_name:
+                    profile.name_supported = True
+                    self._save_firmware_profile(profile, device_id)
+            except PullSDKError as set_err:
+                if "rc=-101" not in str(set_err):
+                    raise
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 - retrying without Name",
+                    device_id,
+                    pin,
+                )
+                self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                try:
+                    sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
+                except Exception:
+                    pass
+                minimal_pairs = [f"Pin={pin}"]
+                if card_valid:
+                    minimal_pairs.append(f"CardNo={card_valid}")
+                sdk.set_device_data(
+                    table="user",
+                    data="\t".join(minimal_pairs) + "\r\n",
+                    options="",
+                )
+                if use_name and profile.name_supported is None:
+                    profile.name_supported = False
+                    self._save_firmware_profile(profile, device_id)
+
+            auth_complete = True
+            auth_ok_count, auth_err = self._push_userauthorize(
+                sdk,
+                pin=pin,
+                door_bitmask=door_bitmask,
+                authorize_timezone_id=int(authorize_timezone_id),
+                device_id=device_id,
+            )
+            if auth_err:
+                auth_complete = (auth_ok_count == len(door_ids))
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s Pin=%s authorize %s: %s/%s doors - %s",
+                    device_id,
+                    pin,
+                    "PARTIAL" if not auth_complete else "warn",
+                    auth_ok_count,
+                    len(door_ids),
+                    auth_err,
+                )
+
+            if templates:
+                _ok_count, errs = self._push_templates(
+                    sdk,
+                    pin=pin,
+                    templates=templates,
+                    device_id=device_id,
+                )
+                if errs:
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s Pin=%s template errors (%d): %s",
+                        device_id,
+                        pin,
+                        len(errs),
+                        errs[:5],
+                    )
+
+            save_device_sync_state(
+                device_id=device_id,
+                pin=pin,
+                desired_hash=desired_hash,
+                ok=bool(auth_complete),
+                error=None if auth_complete else (auth_err or "authorize incomplete"),
+            )
+            try:
+                upsert_device_mirror_pin(
+                    device_id=device_id,
+                    pin=pin,
+                    full_name=full_name,
+                    card_no=card or None,
+                    door_bitmask=door_bitmask,
+                    authorize_tz_id=int(authorize_timezone_id),
+                    fp_count=len(templates),
+                    push_ok=bool(auth_complete),
+                )
+            except Exception:
+                pass
+
+            self.logger.info(
+                "[DeviceSync] targeted member sync: device_id=%s device_name=%r pin=%s ok=%s",
+                device_id,
+                device_name,
+                pin,
+                bool(auth_complete),
+            )
+            return bool(auth_complete)
+        except Exception as exc:
+            save_device_sync_state(
+                device_id=device_id,
+                pin=pin,
+                desired_hash=desired_hash,
+                ok=False,
+                error=str(exc),
+            )
+            try:
+                upsert_device_mirror_pin(
+                    device_id=device_id,
+                    pin=pin,
+                    full_name=full_name,
+                    card_no=card or None,
+                    door_bitmask=door_bitmask,
+                    authorize_tz_id=int(authorize_timezone_id),
+                    fp_count=len(templates),
+                    push_ok=False,
+                )
+            except Exception:
+                pass
+            self.logger.warning(
+                "[DeviceSync] targeted member sync failed: device_id=%s device_name=%r pin=%s err=%s",
+                device_id,
+                device_name,
+                pin,
+                exc,
+            )
+            return False
+
+    def sync_member_on_connected_sdk(
+        self,
+        *,
+        sdk: PullSDK,
+        device: Dict[str, Any],
+        member_id: int,
+        source: str = "targeted_member_sync",
+    ) -> bool:
+        normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
+        dev_id = normalized_device.get("id")
+        dev_name = normalized_device.get("name", "")
+        if dev_id is None:
+            return False
+        did = int(_to_int(dev_id, default=0) or 0)
+        if did <= 0:
+            return False
+        if not _boolish(normalized_device.get("active"), default=True):
+            return False
+        if not _boolish(normalized_device.get("accessDevice"), default=True):
+            return False
+
+        pin = _pin_str(member_id)
+        if not pin or not pin.isdigit():
+            return False
+
+        default_door_id = self._default_authorize_door_id()
+        door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled = self._resolve_push_context(
+            device=normalized_device,
+            default_door_id=default_door_id,
+        )
+
+        target_users = list_sync_users_by_active_membership_ids({int(member_id)})
+        desired = self._filter_users_for_device(
+            users=target_users,
+            device=normalized_device,
+            default_door_id=default_door_id,
+        )
+        desired_user = desired.get(pin)
+
+        if not isinstance(desired_user, dict):
+            deleted = self._delete_pin_unconditional(sdk=sdk, pin=pin)
+            delete_device_sync_state(device_id=did, pin=pin)
+            try:
+                delete_device_mirror_pin(device_id=did, pin=pin)
+            except Exception:
+                pass
+            self.logger.info(
+                "[DeviceSync] targeted member delete: device_id=%s device_name=%r pin=%s deleted=%s source=%s",
+                did,
+                dev_name,
+                pin,
+                bool(deleted),
+                source,
+            )
+            return bool(deleted)
+
+        local_fp_index = self._build_local_fp_index_for_pins(
+            pins={pin},
+            fingerprint_enabled=fingerprint_enabled,
+        )
+        templates = self._collect_templates_for_pin(
+            user=desired_user,
+            pin=pin,
+            local_fp_index=local_fp_index,
+            fingerprint_enabled=fingerprint_enabled,
+        )
+        desired_hash = self._compute_desired_hash(
+            pin=pin,
+            user=desired_user,
+            door_bitmask=door_bitmask,
+            templates=templates,
+            authorize_timezone_id=authorize_timezone_id,
+        )
+
+        prev_hash, prev_ok = list_device_sync_hashes_and_status(device_id=did).get(pin, ("", True))
+        if prev_hash == desired_hash and prev_ok:
+            self.logger.info(
+                "[DeviceSync] targeted member sync skip: device_id=%s device_name=%r pin=%s unchanged source=%s",
+                did,
+                dev_name,
+                pin,
+                source,
+            )
+            return False
+
+        return self._push_pin_to_connected_sdk(
+            sdk=sdk,
+            device_id=did,
+            device_name=str(dev_name or ""),
+            pin=pin,
+            user=desired_user,
+            desired_hash=desired_hash,
+            door_ids=door_ids,
+            door_bitmask=door_bitmask,
+            authorize_timezone_id=authorize_timezone_id,
+            templates=templates,
+        )
 
     def _global_defaults(self) -> Dict[str, Any]:
         """
@@ -500,6 +929,25 @@ class DeviceSyncEngine:
             v = 16 * 1024 * 1024
         return int(v)
 
+    def _resolve_connect_timeout_ms(self, device: Dict[str, Any]) -> int:
+        timeout_ms = _to_int(
+            (
+                device.get("timeoutMs")
+                or device.get("timeout_ms")
+                or device.get("timeout")
+                or device.get("connectTimeoutMs")
+                or device.get("connect_timeout_ms")
+            ),
+            default=None,
+        )
+        if timeout_ms is None or int(timeout_ms) <= 0:
+            timeout_ms = _to_int(getattr(self.cfg, "timeout_ms", None), default=None)
+        if timeout_ms is None or int(timeout_ms) <= 0:
+            timeout_ms = 3000
+        # Keep connect waits bounded when a device is offline so one bad controller
+        # does not stall the whole local runtime for long stretches.
+        return max(500, min(int(timeout_ms), 15000))
+
     def _normalize_device(self, d: Dict[str, Any]) -> Dict[str, Any]:
         def g(*keys, default=None):
             for k in keys:
@@ -534,6 +982,10 @@ class DeviceSyncEngine:
             "password": g("password", default=""),
             "allowedMemberships": _as_list(allowed),
             "doorIds": _as_list(doors),
+            "timeoutMs": _to_int(
+                g("timeoutMs", "timeout_ms", "timeout", "connectTimeoutMs", "connect_timeout_ms", default=None),
+                default=None,
+            ),
 
             # NEW (from backend/device DTO)
             "authorizeTimezoneId": int(tz_id),
@@ -1060,6 +1512,7 @@ class DeviceSyncEngine:
         default_door_id: int,
         changed_ids: set | None = None,
         sync_run_id: int | None = None,
+        sdk: PullSDK | None = None,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
@@ -1165,23 +1618,33 @@ class DeviceSyncEngine:
             created_at=batch_started_iso,
         )
 
-        sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
+        disconnect_when_done = sdk is None
+        if sdk is None:
+            sdk = PullSDK(self.cfg.plcomm_dll_path, logger=self.logger)
         try:
-            import time as _time
-            t_connect = _time.time()
-            self.logger.info(
-                "[DeviceSync] Device id=%s name=%r connecting: ip=%s port=%s", dev_id, dev_name, ip, port
-            )
-            sdk.connect(
-                ip=ip,
-                port=int(port),
-                timeout_ms=int(getattr(self.cfg, "timeout_ms", 5000) or 5000),
-                password=str(pwd),
-            )
-            connect_ms = (_time.time() - t_connect) * 1000
-            self.logger.info(
-                "[DeviceSync] Device id=%s name=%r connected OK: connect_ms=%.0f", dev_id, dev_name, connect_ms
-            )
+            if disconnect_when_done:
+                import time as _time
+
+                t_connect = _time.time()
+                connect_timeout_ms = self._resolve_connect_timeout_ms(device)
+                self.logger.info(
+                    "[DeviceSync] Device id=%s name=%r connecting: ip=%s port=%s timeout_ms=%s",
+                    dev_id,
+                    dev_name,
+                    ip,
+                    port,
+                    connect_timeout_ms,
+                )
+                sdk.connect(
+                    ip=ip,
+                    port=int(port),
+                    timeout_ms=connect_timeout_ms,
+                    password=str(pwd),
+                )
+                connect_ms = (_time.time() - t_connect) * 1000
+                self.logger.info(
+                    "[DeviceSync] Device id=%s name=%r connected OK: connect_ms=%.0f", dev_id, dev_name, connect_ms
+                )
 
             rows = sdk.get_device_data_rows(
                 table="user",
@@ -1527,7 +1990,11 @@ class DeviceSyncEngine:
                             warn_templates_users += 1
                             self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
 
-                # Phase D: Save device sync state + write-through mirror for all pushed pins
+                # Phase D: Save device sync state + write-through mirror for all pushed pins.
+                # Build all state rows first (pure Python), then flush to DB in ONE batch
+                # transaction instead of one DbWriter round-trip per pin (N pins × ~2ms =
+                # ~2.5s serialised queue wait for a 1277-member club with 2 devices).
+                _batch_state_rows: list[tuple[str, str | None, bool, str | None]] = []
                 for pin in pins_sorted:
                     u = desired.get(pin)
                     if u:
@@ -1536,13 +2003,12 @@ class DeviceSyncEngine:
                         _u_fps = len(templates_for_sync.get(pin) or [])
                         pin_error = pin_outcomes.get(pin, {}).get("error_message")
                         pin_ok = not pin_error
-                        save_device_sync_state(
-                            device_id=did,
-                            pin=pin,
-                            desired_hash=desired_hashes.get(pin) or "",
-                            ok=pin_ok,
-                            error=None if pin_ok else str(pin_error),
-                        )
+                        _batch_state_rows.append((
+                            pin,
+                            desired_hashes.get(pin) or "",
+                            pin_ok,
+                            None if pin_ok else str(pin_error),
+                        ))
                         pin_outcomes[pin] = {
                             "full_name": _u_name,
                             "status": "SUCCESS" if pin_ok else "FAILED",
@@ -1564,6 +2030,15 @@ class DeviceSyncEngine:
                             )
                         except Exception:
                             pass
+                # Single DbWriter transaction for all N pins (replaces N round-trips).
+                if _batch_state_rows:
+                    try:
+                        save_device_sync_state_batch(device_id=did, rows=_batch_state_rows)
+                    except Exception as _batch_err:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s save_device_sync_state_batch failed "
+                            "(%d rows): %s", dev_id, len(_batch_state_rows), _batch_err
+                        )
                 self._set_progress(current=ok_synced)
                 self.logger.info(
                     "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
@@ -1802,17 +2277,27 @@ class DeviceSyncEngine:
                                 "error_message": batch_error,
                                 "duration_ms": 0,
                             }
-                for pin in sorted(pin_outcomes.keys()):
-                    outcome = pin_outcomes[pin]
-                    insert_push_pin(
-                        batch_id=batch_id,
-                        pin=pin,
-                        full_name=outcome.get("full_name"),
-                        operation="UPSERT",
-                        status=outcome.get("status") or "FAILED",
-                        error_message=outcome.get("error_message"),
-                        duration_ms=int(outcome.get("duration_ms") or 0),
+                # Batch all pin history rows in one DbWriter transaction
+                # (replaces N individual insert_push_pin round-trips).
+                _pin_batch_rows = [
+                    (
+                        pin,
+                        pin_outcomes[pin].get("full_name"),
+                        "UPSERT",
+                        pin_outcomes[pin].get("status") or "FAILED",
+                        pin_outcomes[pin].get("error_message"),
+                        int(pin_outcomes[pin].get("duration_ms") or 0),
                     )
+                    for pin in sorted(pin_outcomes.keys())
+                ]
+                if _pin_batch_rows:
+                    try:
+                        insert_push_pin_batch(batch_id=batch_id, rows=_pin_batch_rows)
+                    except Exception as _pin_batch_err:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s insert_push_pin_batch failed "
+                            "(%d rows): %s", dev_id, len(_pin_batch_rows), _pin_batch_err
+                        )
                 pins_attempted = len(pins_sorted)
                 pins_success = sum(1 for outcome in pin_outcomes.values() if outcome.get("status") == "SUCCESS")
                 pins_failed = max(pins_attempted - pins_success, 0)
@@ -1842,10 +2327,11 @@ class DeviceSyncEngine:
                             "deviceName": dev_name,
                         },
                     )
-            try:
-                sdk.disconnect()
-            except Exception:
-                pass
+            if disconnect_when_done:
+                try:
+                    sdk.disconnect()
+                except Exception:
+                    pass
 
     def _sync_all_devices(
         self,
@@ -1865,28 +2351,10 @@ class DeviceSyncEngine:
         devices_raw = getattr(cache, "devices", []) or []
         devices = [self._normalize_device(d) for d in devices_raw if isinstance(d, dict)]
 
-        local_fp_index: Dict[str, List[Any]] = {}
-        try:
-            recs = list_fingerprints()
-            for r in recs:
-                pin = _pin_str(getattr(r, "pin", "") or "")
-                if not pin:
-                    continue
-                local_fp_index.setdefault(pin, []).append(r)
-        except Exception:
-            local_fp_index = {}
-
         if not devices:
+            self._actor_registry.update_devices([])
             self.logger.info("[DeviceSync] No devices in cache -> skip")
             return
-
-        default_door_id = self._default_authorize_door_id()
-        self.logger.info(
-            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d "
-            "default_door_id=%s changed_ids=%s",
-            len(devices), len(users), len(local_fp_index), default_door_id,
-            len(changed_ids) if changed_ids is not None else "all",
-        )
 
         device_mode_devices: List[Dict[str, Any]] = []
         for d in devices:
@@ -1918,21 +2386,75 @@ class DeviceSyncEngine:
             "[DeviceSync] device_mode_devices to sync: %d", len(device_mode_devices)
         )
 
-        # P2: Dispatch to per-device persistent worker threads (non-blocking, latest-wins).
-        # Workers are reconciled first so new/removed devices are handled before dispatch.
-        from app.core.device_worker import SyncJob
-        self._worker_manager.update_devices(device_mode_devices)
-        job = SyncJob(
-            users=users,
+        self._actor_registry.update_devices(device_mode_devices)
+        if not device_mode_devices:
+            return
+
+        normalized_changed_ids = (
+            None
+            if changed_ids is None
+            else {
+                int(member_id)
+                for member_id in changed_ids
+                if member_id is not None
+            }
+        )
+        if normalized_changed_ids is not None and not normalized_changed_ids:
+            self._set_progress(running=False, current=0, total=0)
+            self.logger.info("[DeviceSync] delta sync no-op: changed_ids empty -> skip actor dispatch")
+            return
+
+        local_fp_index: Dict[str, List[Any]] = {}
+        uses_fingerprints = any(
+            _boolish(
+                d.get("fingerprintEnabled", d.get("fingerprint_enabled")),
+                default=False,
+            )
+            for d in device_mode_devices
+        )
+        if uses_fingerprints:
+            try:
+                recs = list_fingerprints()
+                for r in recs:
+                    pin = _pin_str(getattr(r, "pin", "") or "")
+                    if not pin:
+                        continue
+                    local_fp_index.setdefault(pin, []).append(r)
+            except Exception:
+                local_fp_index = {}
+
+        default_door_id = self._default_authorize_door_id()
+        self._set_actor_dispatch_context(
+            users=list(users),
             local_fp_index=local_fp_index,
             default_door_id=default_door_id,
-            changed_ids=changed_ids,
             sync_run_id=sync_run_id,
         )
-        dispatched = self._worker_manager.dispatch_all(job)
+        self.logger.info(
+            "[DeviceSync] _sync_all_devices: total_devices=%d users=%d fp_index_pins=%d "
+            "default_door_id=%s changed_ids=%s",
+            len(device_mode_devices),
+            len(users),
+            len(local_fp_index),
+            default_door_id,
+            len(normalized_changed_ids) if normalized_changed_ids is not None else "all",
+        )
+
+        device_ids = {
+            int(d.get("id"))
+            for d in device_mode_devices
+            if d.get("id") is not None
+        }
+        if normalized_changed_ids is None:
+            dispatched = self._actor_registry.enqueue_full_reconcile(device_ids=device_ids)
+        else:
+            dispatched = self._actor_registry.enqueue_targeted_sync(
+                device_ids=device_ids,
+                member_ids=set(normalized_changed_ids),
+            )
         self._set_progress(running=True, current=0, total=dispatched)
         self.logger.info(
-            "[DeviceSync] dispatched SyncJob to %d device workers (changed_ids=%s)",
+            "[DeviceSync] dispatched actor sync to %d device workers (changed_ids=%s)",
             dispatched,
-            len(changed_ids) if changed_ids is not None else "all",
+            len(normalized_changed_ids) if normalized_changed_ids is not None else "all",
         )

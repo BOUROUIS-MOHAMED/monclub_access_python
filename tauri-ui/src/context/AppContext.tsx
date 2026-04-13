@@ -23,6 +23,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState>({
     status: null, coreReady: false, loading: true, error: null,
   });
+  const [statusStreamConnected, setStatusStreamConnected] = useState(false);
   const refreshInFlightRef = useRef<Promise<void> | null>(null);
 
   const refreshStatus = useCallback(async () => {
@@ -71,27 +72,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const syncNow = useCallback(async () => {
     await post("/sync/now");
-    setTimeout(refreshStatus, 1500);
-  }, [refreshStatus]);
+    if (!statusStreamConnected) {
+      setTimeout(() => { void refreshStatus(); }, 1500);
+    }
+  }, [refreshStatus, statusStreamConnected]);
 
   const hardSyncNow = useCallback(async () => {
     await post("/sync/hard-reset");
-    setTimeout(refreshStatus, 1500);
-  }, [refreshStatus]);
+    if (!statusStreamConnected) {
+      setTimeout(() => { void refreshStatus(); }, 1500);
+    }
+  }, [refreshStatus, statusStreamConnected]);
 
   useEffect(() => {
     void refreshStatus();
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    if (statusStreamConnected) {
+      return undefined;
+    }
     const id = setInterval(() => {
       void refreshStatus();
     }, 15000);
     return () => clearInterval(id);
-  }, [refreshStatus]);
+  }, [refreshStatus, statusStreamConnected]);
 
   useEffect(() => {
     const sse = openSSE(
       "/status/stream",
       (type, data) => {
         if (type !== "status" || !data || typeof data !== "object") return;
+        setStatusStreamConnected(true);
         setState((prev) => ({
           ...prev,
           status: data as StatusResponse,
@@ -100,8 +112,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
           error: null,
         }));
       },
+      {
+        onOpen: () => {
+          setStatusStreamConnected(true);
+        },
+        onError: () => {
+          setStatusStreamConnected(false);
+        },
+        onReconnect: () => {
+          setStatusStreamConnected(true);
+          void refreshStatus();
+        },
+      },
     );
-    return () => sse.close();
+    return () => {
+      setStatusStreamConnected(false);
+      sse.close();
+    };
   }, [refreshStatus]);
 
   return (

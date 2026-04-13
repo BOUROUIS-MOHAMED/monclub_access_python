@@ -55,8 +55,11 @@ export function useConfig() {
 }
 
 // ── Sync cache devices (GET /api/v2/sync/cache/devices) ──
-export function useDevices() {
-  return useApi<{ devices: any[] }>(() => get("/sync/cache/devices"));
+export function useDevices(includeDoorPresets = true) {
+  return useApi<{ devices: any[] }>(
+    () => get("/sync/cache/devices", { includeDoorPresets: includeDoorPresets ? "1" : "0" }),
+    [includeDoorPresets],
+  );
 }
 
 // ── Sync cache users (GET /api/v2/sync/cache/users) ──

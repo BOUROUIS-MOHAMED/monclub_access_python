@@ -107,6 +107,26 @@ def _parse_dt_any(s: str) -> datetime | None:
         pass
     return None
 
+
+def _log_sync_cache_write_profile(logger: Any, elapsed_ms: int) -> None:
+    if int(elapsed_ms or 0) < 250:
+        return
+    logger.info("[SYNC-DEBUG] local cache write took %dms", int(elapsed_ms or 0))
+    try:
+        from app.core.db import get_last_db_write_profile
+
+        profile = get_last_db_write_profile("save_sync_cache_delta")
+        if profile:
+            logger.info("[SYNC-DEBUG] local cache write profile=%s", profile)
+    except Exception:
+        logger.debug("[SYNC-DEBUG] local cache write profile unavailable", exc_info=True)
+
+
+def _should_defer_ultra_reconnects(trigger_source: str) -> bool:
+    normalized = str(trigger_source or "").strip().upper()
+    return normalized in {"CHANGE_DETECTOR", "FAST_PATCH_BUNDLE", "SYNC_NOW_API"}
+
+
 def check_zkemkeeper_registration() -> Dict[str, Any]:
     """
     Returns a diagnostic dict about ZKEMKeeper COM registration.
@@ -513,27 +533,35 @@ class MainApp:
     # ======================= Per-device mode helpers =======================
     def get_access_mode_summary(self) -> Dict[str, int]:
         try:
-            from app.core.db import list_sync_devices_payload
+            from app.core.db import load_sync_device_mode_summary, peek_sync_cache, summarize_access_mode_counts
 
-            devices = list_sync_devices_payload()
+            cached = peek_sync_cache()
+            if cached is not None:
+                return summarize_access_mode_counts(getattr(cached, "devices", []) or [])
+            return load_sync_device_mode_summary()
         except Exception:
             cache = load_sync_cache()
             devices = getattr(cache, "devices", []) if cache else []
-        dev = ag = ultra = unk = 0
-        for d in devices or []:
-            if not isinstance(d, dict):
-                continue
-            raw = d.get("accessDataMode") or d.get("access_data_mode") or ""
-            m = str(raw).strip().upper()
-            if m == "DEVICE":
-                dev += 1
-            elif m == "AGENT":
-                ag += 1
-            elif m == "ULTRA":
-                ultra += 1
-            else:
-                unk += 1
-        return {"DEVICE": dev, "AGENT": ag, "ULTRA": ultra, "UNKNOWN": unk}
+        try:
+            from app.core.db import summarize_access_mode_counts
+
+            return summarize_access_mode_counts(devices)
+        except Exception:
+            dev = ag = ultra = unk = 0
+            for d in devices or []:
+                if not isinstance(d, dict):
+                    continue
+                raw = d.get("accessDataMode") or d.get("access_data_mode") or ""
+                m = str(raw).strip().upper()
+                if m == "DEVICE":
+                    dev += 1
+                elif m == "AGENT":
+                    ag += 1
+                elif m == "ULTRA":
+                    ultra += 1
+                else:
+                    unk += 1
+            return {"DEVICE": dev, "AGENT": ag, "ULTRA": ultra, "UNKNOWN": unk}
 
     def _apply_member_shadow_sync(
         self,
@@ -549,9 +577,9 @@ class MainApp:
         _valid_ids_raw = data.get("validMemberIds")
         try:
             from app.core.db import (
-                delete_member_shadow,
+                apply_member_shadow_delta,
                 diff_member_shadow,
-                list_member_shadow_deleted_ids,
+                delete_member_shadow,
                 upsert_member_shadow,
             )
 
@@ -561,18 +589,23 @@ class MainApp:
             )
 
             if data.get("membersDeltaMode"):
-                _shadow_deleted = (
-                    list_member_shadow_deleted_ids(valid_member_ids=_valid_ids)
-                    if _valid_ids is not None else []
+                _shadow_deleted = apply_member_shadow_delta(
+                    users=_incoming_users,
+                    valid_member_ids=_valid_ids,
                 )
+                deleted_ids = {
+                    int(member_id)
+                    for member_id in (_shadow_deleted or [])
+                    if member_id is not None
+                }
+                if deleted_ids:
+                    merged_ids = set(delta_changed_ids or set())
+                    merged_ids.update(deleted_ids)
+                    delta_changed_ids = merged_ids
                 self.logger.info(
                     "[ShadowDiff] delta fast-path: changed=%d deleted=%d",
                     len(_incoming_users), len(_shadow_deleted),
                 )
-                if _incoming_users:
-                    upsert_member_shadow(users=_incoming_users)
-                if _shadow_deleted:
-                    delete_member_shadow(active_membership_ids=_shadow_deleted)
                 return delta_changed_ids
 
             _diff = diff_member_shadow(
@@ -629,6 +662,12 @@ class MainApp:
                 for member_id in changed_ids
                 if member_id is not None
             }
+            if not requested_changed_ids:
+                self.logger.info(
+                    "[ULTRA] immediate sync skipped: reason=%s changed_ids=0",
+                    normalized_reason,
+                )
+                return False
         requested_device_ids = None
         if device_ids is not None:
             requested_device_ids = {
@@ -656,6 +695,33 @@ class MainApp:
                 "all" if requested_device_ids is None else len(requested_device_ids),
             )
         return started
+
+    def _defer_ultra_reconnects(self, *, trigger_source: str, duration_sec: float = 20.0) -> int:
+        if not _should_defer_ultra_reconnects(trigger_source):
+            return 0
+        try:
+            with self._ultra_lock:
+                ultra_eng = getattr(self, "_ultra_engine", None)
+                if not ultra_eng or not getattr(ultra_eng, "running", False):
+                    return 0
+                deferred = int(
+                    ultra_eng.defer_reconnects(
+                        duration_sec=float(duration_sec or 0.0),
+                        reason=str(trigger_source or "").strip().lower() or "sync",
+                    )
+                    or 0
+                )
+            if deferred > 0:
+                self.logger.info(
+                    "[ULTRA] deferred reconnect attempts during sync: workers=%d trigger_source=%s duration_sec=%.1f",
+                    deferred,
+                    str(trigger_source or ""),
+                    float(duration_sec or 0.0),
+                )
+            return deferred
+        except Exception as exc:
+            self.logger.debug("[ULTRA] failed to defer reconnect attempts: %s", exc, exc_info=True)
+            return 0
 
     # ======================= Log polling =======================
     def _poll_logs(self):
@@ -1000,13 +1066,22 @@ class MainApp:
             self.logger.warning("[FastPatch] failed to reset ULTRA caches", exc_info=True)
 
     def apply_fast_patch_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
-        from app.core.db import apply_fast_patch_bundle, invalidate_sync_cache
+        from app.core.db import (
+            apply_fast_patch_bundle,
+            invalidate_sync_cache,
+            refresh_sync_cache_async,
+        )
 
+        self._defer_ultra_reconnects(
+            trigger_source="FAST_PATCH_BUNDLE",
+            duration_sec=20.0,
+        )
         db_result = apply_fast_patch_bundle(bundle if isinstance(bundle, dict) else {})
         if db_result.get("ignored") == "duplicate_bundle":
             return {"ok": True, "duplicate": True, **db_result}
 
         invalidate_sync_cache()
+        refresh_sync_cache_async()
         self.reset_runtime_fast_patch_caches()
 
         items = [item for item in list((bundle or {}).get("items") or []) if isinstance(item, dict)]
@@ -1430,13 +1505,17 @@ class MainApp:
                     if data.get(field)
                 }
 
+                self._defer_ultra_reconnects(
+                    trigger_source=trigger_context.trigger_source,
+                    duration_sec=20.0,
+                )
                 _cache_write_started = time.perf_counter()
                 save_sync_cache_delta(data, refresh)
                 _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
-                if _cache_write_ms >= 250:
-                    self.logger.info("[SYNC-DEBUG] local cache write took %dms", _cache_write_ms)
-                from app.core.db import invalidate_sync_cache
+                _log_sync_cache_write_profile(self.logger, _cache_write_ms)
+                from app.core.db import invalidate_sync_cache, refresh_sync_cache_async
                 invalidate_sync_cache()
+                refresh_sync_cache_async()
 
                 if (
                     refresh.get("devices")
@@ -1460,8 +1539,13 @@ class MainApp:
                             "credentials": data.get("refreshCredentials", True),
                             "settings":    data.get("refreshSettings", True),
                         }
+                        self._defer_ultra_reconnects(
+                            trigger_source=trigger_context.trigger_source,
+                            duration_sec=20.0,
+                        )
                         save_sync_cache_delta(data, refresh)
                         invalidate_sync_cache()
+                        refresh_sync_cache_async()
                         if not refresh.get("members"):
                             clear_version_tokens()
                             new_tokens = {}
@@ -1577,8 +1661,22 @@ class MainApp:
                                 sync_response_summary["devicePush"] = {
                                     "enabled": True,
                                     "started": False,
+                                        "devicesDispatched": 0,
+                                        "skippedReason": "NO_DEVICE_MODE_DEVICES",
+                                    }
+                        elif (
+                            refresh.get("members")
+                            and not refresh.get("devices")
+                            and _delta_changed_ids is not None
+                            and len(_delta_changed_ids) == 0
+                        ):
+                            self.logger.info("[DeviceSync] Skipped: no member delta to push.")
+                            if sync_response_summary is not None:
+                                sync_response_summary["devicePush"] = {
+                                    "enabled": True,
+                                    "started": False,
                                     "devicesDispatched": 0,
-                                    "skippedReason": "NO_DEVICE_MODE_DEVICES",
+                                    "skippedReason": "NO_MEMBER_DELTA",
                                 }
                         else:
                             cache = load_sync_cache()
@@ -1812,14 +1910,21 @@ class MainApp:
                 days_expired = age.days
                 reasons.append(f"Votre session a expirée (dernière connexion il y a {days_expired} jours). Veuillez vous reconnecter.")
 
+        contract_meta = None
+        cache = None
         try:
-            from app.core.db import load_sync_contract_meta
+            from app.core.db import load_sync_contract_meta, peek_sync_cache
 
-            contract_meta = load_sync_contract_meta()
+            cache = peek_sync_cache()
+            if cache is None:
+                contract_meta = load_sync_contract_meta()
         except Exception:
             contract_meta = None
 
-        if contract_meta is None:
+        if cache is not None:
+            contract_status = getattr(cache, "contract_status", getattr(cache, "contractStatus", None))
+            contract_end_date = getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None))
+        elif contract_meta is None:
             cache = load_sync_cache()
             if cache:
                 contract_status = getattr(cache, "contract_status", getattr(cache, "contractStatus", None))

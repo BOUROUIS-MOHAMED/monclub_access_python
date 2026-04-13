@@ -47,6 +47,11 @@ class PullSDK:
     ctypes wrapper for plcommpro.dll (Pull SDK).
     """
     _load_lock = threading.Lock()  # class-level: serialize DLL loading across instances
+    # Class-level DLL cache: dll_path → ctypes.WinDLL (with all prototypes registered).
+    # After the first load (~200ms), every subsequent PullSDK instance that uses the same
+    # DLL path skips WinDLL() + all argtypes/restype registration and completes in ~1µs.
+    # This makes _GLOBAL_SDK_LOCK hold-time near-zero on retries.
+    _dll_cache: Dict[str, Any] = {}
 
     def __init__(self, dll_path: str, logger):
         self.dll_path = str(Path(dll_path))
@@ -57,9 +62,20 @@ class PullSDK:
     def load(self) -> None:
         if self._dll is not None:
             return
+        # Fast path: return cached DLL without acquiring any lock (~1µs).
+        # The dict assignment below is GIL-protected, so no lock needed for reads.
+        cached = PullSDK._dll_cache.get(self.dll_path)
+        if cached is not None:
+            self._dll = cached
+            return
         with PullSDK._load_lock:
             if self._dll is not None:
                 return  # another thread loaded while we waited for lock
+            # Re-check cache inside lock (double-checked locking).
+            cached = PullSDK._dll_cache.get(self.dll_path)
+            if cached is not None:
+                self._dll = cached
+                return
             try:
                 self.logger.info(f"Loading PullSDK DLL: {self.dll_path}")
                 self._dll = ctypes.WinDLL(self.dll_path)  # stdcall
@@ -118,6 +134,9 @@ class PullSDK:
                     self._dll.SetDeviceParam.restype = c_int
 
                 self.logger.info("PullSDK loaded OK.")
+                # Cache the fully-initialised DLL object for all future instances.
+                # GIL makes this dict write atomic — no extra lock needed.
+                PullSDK._dll_cache[self.dll_path] = self._dll
             except OSError as e:
                 self._dll = None
                 raise PullSDKError(f"Failed to load plcommpro.dll: {e}")
@@ -694,23 +713,33 @@ class PullSDKDevice:
             "[PullSDKDevice][%s] connect attempt: name=%r ip=%s port=%s timeout_ms=%s",
             self.device_id, self.name, self.ip, self.port, self.timeout_ms,
         )
+        # Declared before try so it's always accessible in the except block,
+        # even if an early-path exception (e.g. invalid params) fires before
+        # the SDK object is created.
+        _pending_sdk: Optional["PullSDK"] = None
         try:
             self.disconnect()
 
             if not self.ip or int(self.port) <= 0:
                 raise PullSDKError(f"invalid device connection params ip={self.ip!r} port={self.port!r}")
 
-            # Serialize DLL creation + connect across all devices to prevent
-            # concurrent ctypes prototype registration corruption.
+            # Serialize DLL load + prototype registration only (~100ms).
+            # PullSDK._load_lock (class-level) already handles this, but
+            # _GLOBAL_SDK_LOCK adds a belt-and-suspenders guarantee across
+            # all PullSDK instances.  The TCP connect (timeout_ms, up to 5s)
+            # runs OUTSIDE the lock so that multiple devices can connect in
+            # parallel instead of serializing the full timeout per device.
+            _pending_sdk = PullSDK(self.dll_path, self.logger)
             with _GLOBAL_SDK_LOCK:
-                self._sdk = PullSDK(self.dll_path, self.logger)
-                self._sdk.connect(
-                    ip=str(self.ip),
-                    port=int(self.port),
-                    timeout_ms=int(self.timeout_ms),
-                    password=str(self.password or ""),
-                    platform=str(self.platform or "") if (self.platform or "").strip() else None,
-                )
+                _pending_sdk.load()  # WinDLL + ctypes prototype registration only
+            _pending_sdk.connect(
+                ip=str(self.ip),
+                port=int(self.port),
+                timeout_ms=int(self.timeout_ms),
+                password=str(self.password or ""),
+                platform=str(self.platform or "") if (self.platform or "").strip() else None,
+            )
+            self._sdk = _pending_sdk
             self._connected = True
             self.logger.info(
                 "[PullSDKDevice][%s] connected OK: name=%r ip=%s port=%s",
@@ -720,6 +749,15 @@ class PullSDKDevice:
         except Exception as e:
             self._connected = False
             self._sdk = None
+            # Clean up the pending SDK instance in case the TCP connect
+            # succeeded but something raised afterward (prevents DLL handle
+            # leak).  PullSDK.disconnect() is a no-op when _h is None, so
+            # this is always safe.
+            if _pending_sdk is not None:
+                try:
+                    _pending_sdk.disconnect()
+                except Exception:
+                    pass
             try:
                 self.logger.warning(
                     "[PullSDKDevice][%s] connect FAILED: name=%r ip=%s port=%s error=%s",

@@ -30,6 +30,9 @@ class UltraDeviceWorker(threading.Thread):
         popup_q: "queue.Queue[NotificationRequest]",
         history_q: "queue.Queue[HistoryRecord]",
         stop_event: threading.Event,
+        cfg: Any | None = None,
+        on_full_sync_started: Any | None = None,
+        on_full_sync_finished: Any | None = None,
     ):
         super().__init__(daemon=True, name=f"UltraWorker-{device.get('id')}")
         self._device = device
@@ -37,6 +40,9 @@ class UltraDeviceWorker(threading.Thread):
         self._popup_q = popup_q
         self._history_q = history_q
         self._stop_evt = stop_event
+        self._cfg = cfg
+        self._on_full_sync_started = on_full_sync_started
+        self._on_full_sync_finished = on_full_sync_finished
         self._device_id = int(device.get("id", 0))
         logger.debug(
             "[ULTRA:%s] __init__: name=%r ip=%s port=%s totp=%s rfid=%s "
@@ -86,11 +92,31 @@ class UltraDeviceWorker(threading.Thread):
         # Command queue: door open requests executed inline between polls
         # (avoids TCP disconnect/reconnect needed by the old pause approach).
         self._cmd_queue: "queue.Queue" = queue.Queue(maxsize=10)
+        self._member_sync_lock = threading.Lock()
+        self._pending_member_syncs: Deque[int] = deque()
+        self._pending_member_sync_ids: Set[int] = set()
+        self._full_sync_lock = threading.Lock()
+        self._pending_full_sync_request: Dict[str, Any] | None = None
+        self._active_sync_lock = threading.Lock()
+        self._active_sync_engine: Optional[Any] = None
+        self._current_full_sync_reason = ""
+        self._last_full_sync_started_at = ""
+        self._last_full_sync_finished_at = ""
+        self._last_full_sync_duration_ms = 0.0
+        self._last_full_sync_error = ""
+        self._full_sync_running = False
 
         # Local state cache (avoid per-event DB reads)
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
         self._CACHE_TTL_SEC: float = 60.0  # sync data only changes on sync cycles (~60s)
+        self._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
+        self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 15.0))
+        self._connect_failures = 0
+        self._next_connect_at_mono = 0.0
+        self._last_connect_error = ""
+        self._last_connect_attempt_at = ""
+        self._last_connect_success_at = ""
 
     def reset_fast_patch_caches(self) -> None:
         self._cached_state = None
@@ -137,9 +163,12 @@ class UltraDeviceWorker(threading.Thread):
 
                 # Connect if needed
                 if not self._connected:
+                    wait_sec = self._connect_wait_remaining()
+                    if wait_sec > 0:
+                        self._stop_evt.wait(min(wait_sec, 1.0))
+                        continue
                     self._connect()
                     if not self._connected:
-                        self._stop_evt.wait(5.0)
                         continue
 
                 # Drain queued door-open commands (uses the already-connected SDK)
@@ -166,6 +195,9 @@ class UltraDeviceWorker(threading.Thread):
 
                 # Drain commands again after processing events for minimal latency
                 self._drain_commands()
+                self._drain_member_sync_commands(limit=1)
+                self._drain_full_sync_commands(limit=1)
+                self._drain_commands()
 
                 self._stop_evt.wait(sleep_ms / 1000.0)
 
@@ -184,28 +216,75 @@ class UltraDeviceWorker(threading.Thread):
     # Connection management
     # ------------------------------------------------------------------ #
 
+    def _connect_wait_remaining(self, *, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else float(now)
+        return max(0.0, float(self._next_connect_at_mono or 0.0) - current)
+
+    def _record_connect_failure(self, error: str) -> float:
+        self._connect_failures = min(int(self._connect_failures or 0) + 1, 8)
+        delay = min(
+            self._connect_retry_base_sec * (2 ** max(self._connect_failures - 1, 0)),
+            self._connect_retry_max_sec,
+        )
+        self._next_connect_at_mono = time.monotonic() + float(delay)
+        self._last_connect_error = str(error or "connect failed")
+        self._last_connect_attempt_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return float(delay)
+
+    def _record_connect_success(self) -> None:
+        self._connect_failures = 0
+        self._next_connect_at_mono = 0.0
+        self._last_connect_error = ""
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._last_connect_attempt_at = now_iso
+        self._last_connect_success_at = now_iso
+
+    def defer_reconnect(self, delay_sec: float, *, reason: str = "deferred") -> bool:
+        if self._connected:
+            return False
+        delay = max(0.0, float(delay_sec or 0.0))
+        target = time.monotonic() + delay
+        if target <= float(self._next_connect_at_mono or 0.0):
+            return False
+        self._next_connect_at_mono = target
+        self._last_connect_error = f"deferred: {str(reason or 'deferred')}"
+        return True
+
     def _connect(self):
         """Connect to device via PullSDK."""
         ip = self._device.get("ipAddress") or self._device.get("ip_address", "")
         port = self._device.get("portNumber") or self._device.get("port_number") or self._device.get("devicePort") or 4370
-        logger.info(f"{self._prefix} connect attempt: name={self._device_name!r} ip={ip} port={port}")
+        self._last_connect_attempt_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        logger.info(
+            "%s connect attempt: name=%r ip=%s port=%s failures=%s",
+            self._prefix,
+            self._device_name,
+            ip,
+            port,
+            self._connect_failures,
+        )
         try:
             self._sdk = PullSDKDevice(device_payload=self._device, logger=logger)
             ok = self._sdk.connect()
             if ok:
                 self._connected = True
+                self._record_connect_success()
                 logger.info(f"{self._prefix} connected OK: name={self._device_name!r} ip={ip} port={port}")
             else:
                 self._connected = False
                 self._sdk = None
+                delay = self._record_connect_failure("connect returned False")
                 logger.error(
                     f"{self._prefix} connect returned False: "
-                    f"name={self._device_name!r} ip={ip} port={port}"
+                    f"name={self._device_name!r} ip={ip} port={port} "
+                    f"next_retry_in={delay:.1f}s"
                 )
         except Exception as e:
+            delay = self._record_connect_failure(str(e))
             logger.error(
                 f"{self._prefix} connect FAILED: "
-                f"name={self._device_name!r} ip={ip} port={port} error={e}"
+                f"name={self._device_name!r} ip={ip} port={port} error={e} "
+                f"next_retry_in={delay:.1f}s"
             )
             self._connected = False
             self._sdk = None
@@ -269,6 +348,26 @@ class UltraDeviceWorker(threading.Thread):
         result_event.wait(timeout=timeout)
         return result_box
 
+    def request_member_sync(self, member_id: int) -> bool:
+        normalized_member_id = int(member_id)
+        with self._member_sync_lock:
+            if normalized_member_id in self._pending_member_sync_ids:
+                return False
+            self._pending_member_sync_ids.add(normalized_member_id)
+            self._pending_member_syncs.append(normalized_member_id)
+        return True
+
+    def request_full_sync(self, reason: str = "manual", fingerprint_hash: str | None = None) -> bool:
+        normalized_reason = str(reason or "manual").strip() or "manual"
+        with self._full_sync_lock:
+            if self._pending_full_sync_request is not None:
+                return False
+            self._pending_full_sync_request = {
+                "reason": normalized_reason,
+                "fingerprint_hash": str(fingerprint_hash or "").strip() or None,
+            }
+        return True
+
     def _drain_commands(self):
         """Execute pending door-open commands using the current SDK connection."""
         while not self._cmd_queue.empty():
@@ -295,6 +394,200 @@ class UltraDeviceWorker(threading.Thread):
                 )
             finally:
                 result_event.set()
+
+    def _drain_member_sync_commands(self, limit: int = 1) -> int:
+        if limit <= 0:
+            return 0
+
+        drained = 0
+        while drained < limit:
+            with self._member_sync_lock:
+                if not self._pending_member_syncs:
+                    break
+                member_id = int(self._pending_member_syncs.popleft())
+                self._pending_member_sync_ids.discard(member_id)
+
+            try:
+                if self._sdk is None or not self._connected:
+                    self.request_member_sync(member_id)
+                    break
+                raw_sdk = getattr(self._sdk, "_sdk", None)
+                if raw_sdk is None:
+                    self.request_member_sync(member_id)
+                    break
+                from app.core.device_sync import DeviceSyncEngine
+
+                engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
+                engine.sync_member_on_connected_sdk(
+                    sdk=raw_sdk,
+                    device=self._device,
+                    member_id=member_id,
+                    source="ultra_targeted_member_sync",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s targeted member sync failed: member_id=%s err=%s",
+                    self._prefix,
+                    member_id,
+                    exc,
+                )
+            drained += 1
+        return drained
+
+    def _drain_full_sync_commands(self, limit: int = 1) -> int:
+        if limit <= 0:
+            return 0
+
+        drained = 0
+        while drained < limit:
+            with self._full_sync_lock:
+                request = self._pending_full_sync_request
+                self._pending_full_sync_request = None
+            if request is None:
+                break
+            reason = str(request.get("reason") or "manual")
+            fingerprint_hash = str(request.get("fingerprint_hash") or "").strip() or None
+
+            try:
+                if self._sdk is None or not self._connected:
+                    self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
+                    break
+                raw_sdk = getattr(self._sdk, "_sdk", None)
+                if raw_sdk is None:
+                    self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
+                    break
+                cache = load_sync_cache()
+                if cache is None:
+                    logger.warning("%s full sync skipped: no sync cache available", self._prefix)
+                    self._mark_full_sync_finished(
+                        reason=reason,
+                        ok=False,
+                        duration_ms=0.0,
+                        error="no sync cache available",
+                    )
+                    self._notify_full_sync_finished(
+                        reason=reason,
+                        ok=False,
+                        fingerprint_hash=None,
+                        duration_ms=0.0,
+                        error="no sync cache available",
+                    )
+                    drained += 1
+                    continue
+
+                from app.core.device_sync import DeviceSyncEngine
+
+                device_copy = dict(self._device or {})
+                device_copy["accessDataMode"] = "DEVICE"
+                filtered_cache_attrs = dict(getattr(cache, "__dict__", {}))
+                filtered_cache_attrs["devices"] = [device_copy]
+                filtered_cache = SimpleNamespace(**filtered_cache_attrs)
+                engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
+                started_at = time.time()
+                started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
+                self._mark_full_sync_started(reason=reason, engine=engine, started_at=started_iso)
+                self._notify_full_sync_started(reason=reason)
+                engine.run_one_device_on_connected_sdk(
+                    sdk=raw_sdk,
+                    cache=filtered_cache,
+                    device=device_copy,
+                    source=reason,
+                    changed_ids=None,
+                )
+                duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
+                self._mark_full_sync_finished(
+                    reason=reason,
+                    ok=True,
+                    duration_ms=duration_ms,
+                    error="",
+                )
+                self._notify_full_sync_finished(
+                    reason=reason,
+                    ok=True,
+                    fingerprint_hash=fingerprint_hash,
+                    duration_ms=duration_ms,
+                    error="",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s full sync failed: reason=%s err=%s",
+                    self._prefix,
+                    reason,
+                    exc,
+                )
+                self._mark_full_sync_finished(
+                    reason=reason,
+                    ok=False,
+                    duration_ms=0.0,
+                    error=str(exc),
+                )
+                self._notify_full_sync_finished(
+                    reason=reason,
+                    ok=False,
+                    fingerprint_hash=None,
+                    duration_ms=0.0,
+                    error=str(exc),
+                )
+            drained += 1
+        return drained
+
+    def _mark_full_sync_started(self, *, reason: str, engine: Any, started_at: str) -> None:
+        with self._active_sync_lock:
+            self._active_sync_engine = engine
+            self._current_full_sync_reason = str(reason or "manual")
+            self._last_full_sync_started_at = started_at
+            self._full_sync_running = True
+            self._last_full_sync_error = ""
+
+    def _mark_full_sync_finished(
+        self,
+        *,
+        reason: str,
+        ok: bool,
+        duration_ms: float,
+        error: str,
+    ) -> None:
+        finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with self._active_sync_lock:
+            self._active_sync_engine = None
+            self._current_full_sync_reason = str(reason or "manual")
+            self._last_full_sync_finished_at = finished_at
+            self._last_full_sync_duration_ms = max(0.0, float(duration_ms or 0.0))
+            self._last_full_sync_error = "" if ok else str(error or "sync failed")
+            self._full_sync_running = False
+
+    def _notify_full_sync_started(self, *, reason: str) -> None:
+        cb = self._on_full_sync_started
+        if cb is None:
+            return
+        try:
+            cb(device_id=self._device_id, reason=str(reason or "manual"))
+        except Exception:
+            logger.debug("%s full sync started callback failed", self._prefix, exc_info=True)
+
+    def _notify_full_sync_finished(
+        self,
+        *,
+        reason: str,
+        ok: bool,
+        fingerprint_hash: str | None,
+        duration_ms: float,
+        error: str,
+    ) -> None:
+        cb = self._on_full_sync_finished
+        if cb is None:
+            return
+        try:
+            cb(
+                device_id=self._device_id,
+                reason=str(reason or "manual"),
+                ok=bool(ok),
+                fingerprint_hash=str(fingerprint_hash or "").strip() or None,
+                duration_ms=max(0.0, float(duration_ms or 0.0)),
+                error=str(error or ""),
+            )
+        except Exception:
+            logger.debug("%s full sync finished callback failed", self._prefix, exc_info=True)
 
     # ------------------------------------------------------------------ #
     # RTLog polling with watchdog (15s timeout)
@@ -963,7 +1256,28 @@ class UltraDeviceWorker(threading.Thread):
             "totp_failures": self._totp_failures,
             "door_cmd_failures": self._door_cmd_failures,
             "poll_ema_ms": round(self._poll_ema_ms, 1),
+            "connect_failures": int(self._connect_failures or 0),
+            "connect_retry_wait_ms": round(self._connect_wait_remaining() * 1000.0, 1),
+            "last_connect_error": self._last_connect_error,
+            "last_connect_attempt_at": self._last_connect_attempt_at,
+            "last_connect_success_at": self._last_connect_success_at,
+            "full_sync_running": self._full_sync_running,
+            "full_sync_reason": self._current_full_sync_reason,
+            "last_full_sync_started_at": self._last_full_sync_started_at,
+            "last_full_sync_finished_at": self._last_full_sync_finished_at,
+            "last_full_sync_duration_ms": round(self._last_full_sync_duration_ms, 1),
+            "last_full_sync_error": self._last_full_sync_error,
         }
+
+    def get_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:
+        with self._active_sync_lock:
+            engine = self._active_sync_engine
+        if engine and hasattr(engine, "get_progress_snapshot"):
+            try:
+                return engine.get_progress_snapshot()
+            except Exception:
+                return None, 0
+        return None, 0
 
 
 # ---------------------------------------------------------------------------
@@ -995,8 +1309,43 @@ class UltraSyncScheduler:
         self._pending_reason = "manual"
 
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
-        """Register per-device worker references so _sync_device can pause them."""
+        """Register per-device worker references so sync requests stay worker-owned."""
         self._workers = workers
+
+    def _handle_worker_full_sync_started(self, *, device_id: int, reason: str) -> None:
+        self._logger.info(
+            "[ULTRA:%s] full sync started on live worker: reason=%s",
+            device_id,
+            str(reason or "manual"),
+        )
+
+    def _handle_worker_full_sync_finished(
+        self,
+        *,
+        device_id: int,
+        reason: str,
+        ok: bool,
+        fingerprint_hash: str | None,
+        duration_ms: float,
+        error: str,
+    ) -> None:
+        if ok and fingerprint_hash:
+            self._last_hash[int(device_id)] = str(fingerprint_hash)
+            self._last_sync_at[int(device_id)] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if ok:
+            self._logger.info(
+                "[ULTRA:%s] full sync finished on live worker in %.0fms: reason=%s",
+                device_id,
+                max(0.0, float(duration_ms or 0.0)),
+                str(reason or "manual"),
+            )
+            return
+        self._logger.warning(
+            "[ULTRA:%s] full sync failed on live worker: reason=%s err=%s",
+            device_id,
+            str(reason or "manual"),
+            str(error or "sync failed"),
+        )
 
     def force_resync(self, device_id: int):
         """F-015: Clear in-memory hash for a device to force re-push on next cycle."""
@@ -1046,6 +1395,12 @@ class UltraSyncScheduler:
                 if device_id is not None
             }
         )
+        if normalized_changed_ids is not None and not normalized_changed_ids:
+            self._logger.info(
+                "[UltraSyncScheduler] request_sync_now skipped: reason=%s changed_ids=0",
+                normalized_reason,
+            )
+            return
         with self._pending_sync_lock:
             self._pending_sync_requested = True
             self._pending_reason = normalized_reason
@@ -1144,7 +1499,54 @@ class UltraSyncScheduler:
         for d in devices:
             device_id = d.get("id")
             try:
-                did_sync = self._sync_device(d, changed_ids=changed_ids)
+                routed = False
+                did_sync = False
+                worker = self._workers.get(int(device_id)) if device_id is not None else None
+                if worker and changed_ids:
+                    for member_id in sorted(changed_ids):
+                        if worker.request_member_sync(int(member_id)):
+                            routed = True
+                elif worker and changed_ids is None:
+                    from app.core.device_sync import DeviceSyncEngine
+
+                    cache = load_sync_cache()
+                    if cache is None:
+                        self._logger.warning("[ULTRA:%s] sync skip: no sync cache available", device_id)
+                        did_sync = False
+                    else:
+                        users = getattr(cache, "users", []) or []
+                        engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+                        current_hash, desired_users = engine.build_device_sync_fingerprint(
+                            device=d,
+                            users=list(users),
+                        )
+                        if self._last_hash.get(device_id) == current_hash:
+                            self._logger.info(
+                                "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
+                                device_id,
+                                desired_users,
+                                current_hash[:12],
+                            )
+                            did_sync = False
+                        else:
+                            routed = bool(
+                                worker.request_full_sync(
+                                    reason=reason,
+                                    fingerprint_hash=current_hash,
+                                )
+                            )
+                            if routed:
+                                self._logger.info(
+                                    "[ULTRA:%s] queued live-worker full sync: desired_users=%d prev_hash=%s new_hash=%s reason=%s",
+                                    device_id,
+                                    desired_users,
+                                    (self._last_hash.get(device_id) or "none")[:12],
+                                    current_hash[:12],
+                                    str(reason or "manual"),
+                                )
+                            did_sync = routed
+                else:
+                    did_sync = self._sync_device(d, changed_ids=changed_ids)
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 15)
                 ) * 60
@@ -1156,6 +1558,8 @@ class UltraSyncScheduler:
                     self._last_sync_at[device_id] = time.strftime(
                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
                     )
+                    synced += 1
+                elif routed:
                     synced += 1
                 else:
                     skipped += 1
@@ -1265,6 +1669,11 @@ class UltraSyncScheduler:
         }
 
     def get_active_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:
+        for worker in list(self._workers.values()):
+            if hasattr(worker, "get_progress_snapshot"):
+                progress, seq = worker.get_progress_snapshot()
+                if progress and bool(progress.get("running")):
+                    return progress, seq
         with self._active_sync_lock:
             engine = self._active_sync_engine
         if engine and hasattr(engine, "get_progress_snapshot"):
@@ -1297,6 +1706,17 @@ class UltraEngine:
         self._history_q: "queue.Queue[HistoryRecord]" = queue.Queue(
             maxsize=int(_g.get("history_queue_max", 5000))
         )
+        popup_replay_size = max(
+            16,
+            min(
+                int(_g.get("popup_queue_max", _g.get("notification_queue_max", 5000)) or 5000),
+                1000,
+            ),
+        )
+        self._popup_capture_lock = threading.Lock()
+        self._popup_events_lock = threading.Lock()
+        self._popup_events_seq = 0
+        self._popup_events_replay: Deque[tuple[int, Dict[str, Any]]] = deque(maxlen=popup_replay_size)
         self._running = False
         self._watchdog_thread: Optional[threading.Thread] = None
         # How often the watchdog checks worker liveness (seconds).
@@ -1316,6 +1736,42 @@ class UltraEngine:
     @property
     def history_q(self) -> "queue.Queue[HistoryRecord]":
         return self._history_q
+
+    def capture_popup_events(self, limit: int = 50) -> int:
+        drained = 0
+        target = max(1, int(limit or 1))
+        from app.core.realtime_agent import _popup_payload_from_request
+
+        with self._popup_capture_lock:
+            while drained < target:
+                try:
+                    req = self._popup_q.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+                payload = _popup_payload_from_request(req)
+                with self._popup_events_lock:
+                    self._popup_events_seq += 1
+                    self._popup_events_replay.append((self._popup_events_seq, payload))
+                drained += 1
+        return drained
+
+    def get_latest_popup_event_seq(self) -> int:
+        self.capture_popup_events(limit=100)
+        with self._popup_events_lock:
+            return int(self._popup_events_seq)
+
+    def get_popup_events_since(self, seq: int, limit: int = 10) -> List[tuple[int, Dict[str, Any]]]:
+        target = max(1, int(limit or 1))
+        self.capture_popup_events(limit=max(target * 2, 10))
+        with self._popup_events_lock:
+            rows = [
+                (event_seq, dict(payload))
+                for event_seq, payload in self._popup_events_replay
+                if int(event_seq) > int(seq)
+            ]
+        return rows[:target]
 
     def start(self, devices: List[Dict[str, Any]]):
         """Start ULTRA engine for the given devices."""
@@ -1383,7 +1839,9 @@ class UltraEngine:
                 settings.get("ultra_rtlog_enabled", True),
             )
 
-        # Start per-device workers first so scheduler can reference them
+        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
+
+        # Start per-device workers first so scheduler can route work to them
         for d, settings in prepared_devices:
             device_id = int(d.get("id", 0))
 
@@ -1393,6 +1851,9 @@ class UltraEngine:
                 popup_q=self._popup_q,
                 history_q=self._history_q,
                 stop_event=self._stop_event,
+                cfg=self._cfg,
+                on_full_sync_started=self._sync_scheduler._handle_worker_full_sync_started,
+                on_full_sync_finished=self._sync_scheduler._handle_worker_full_sync_finished,
             )
             self._workers[device_id] = worker
             try:
@@ -1401,8 +1862,7 @@ class UltraEngine:
             except Exception as _w_exc:
                 self._logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
 
-        # Start sync scheduler with worker references so it can pause them for TCP handoff
-        self._sync_scheduler = UltraSyncScheduler(self._cfg, self._logger)
+        # Start sync scheduler with worker references so it can route timed work
         self._sync_scheduler.set_workers(self._workers)
         self._sync_scheduler.start([d for d, _settings in prepared_devices])
 
@@ -1441,6 +1901,17 @@ class UltraEngine:
                             popup_q=self._popup_q,
                             history_q=self._history_q,
                             stop_event=self._stop_event,
+                            cfg=self._cfg,
+                            on_full_sync_started=(
+                                self._sync_scheduler._handle_worker_full_sync_started
+                                if self._sync_scheduler
+                                else None
+                            ),
+                            on_full_sync_finished=(
+                                self._sync_scheduler._handle_worker_full_sync_finished
+                                if self._sync_scheduler
+                                else None
+                            ),
                         )
                         new_worker.start()
                         self._workers[device_id] = new_worker
@@ -1509,6 +1980,23 @@ class UltraEngine:
             except Exception:
                 self._logger.warning("[ULTRA] failed to reset worker cache", exc_info=True)
 
+    def defer_reconnects(self, *, duration_sec: float, reason: str = "sync") -> int:
+        deferred = 0
+        for worker in list(getattr(self, "_workers", {}).values()):
+            try:
+                if hasattr(worker, "defer_reconnect") and worker.defer_reconnect(duration_sec, reason=str(reason or "sync")):
+                    deferred += 1
+            except Exception:
+                self._logger.debug("[ULTRA] failed to defer worker reconnect", exc_info=True)
+        if deferred > 0:
+            self._logger.info(
+                "[ULTRA] deferred reconnects: workers=%d duration_sec=%.1f reason=%s",
+                deferred,
+                float(duration_sec or 0.0),
+                str(reason or "sync"),
+            )
+        return deferred
+
     def request_sync_now(
         self,
         *,
@@ -1518,9 +2006,68 @@ class UltraEngine:
     ) -> bool:
         if not self._running or not self._sync_scheduler:
             return False
+        normalized_changed_ids = (
+            None
+            if changed_ids is None
+            else {
+                int(member_id)
+                for member_id in changed_ids
+                if member_id is not None
+            }
+        )
+        normalized_device_ids = (
+            set(self._workers.keys())
+            if device_ids is None
+            else {
+                int(device_id)
+                for device_id in device_ids
+                if device_id is not None
+            }
+        )
+        if normalized_changed_ids is not None and not normalized_changed_ids:
+            self._logger.info(
+                "[ULTRA] skip sync request: empty changed_ids reason=%s",
+                str(reason or "manual"),
+            )
+            return False
+        if normalized_changed_ids:
+            matched_workers = [
+                (device_id, worker)
+                for device_id, worker in sorted(self._workers.items())
+                if int(device_id) in normalized_device_ids
+            ]
+            if matched_workers:
+                for _device_id, worker in matched_workers:
+                    for member_id in sorted(normalized_changed_ids):
+                        if hasattr(worker, "request_member_sync"):
+                            worker.request_member_sync(int(member_id))
+                self._logger.info(
+                    "[ULTRA] routed targeted member sync to live workers: devices=%d members=%d reason=%s",
+                    len(matched_workers),
+                    len(normalized_changed_ids),
+                    str(reason or "manual"),
+                )
+                return True
+        if normalized_changed_ids is None:
+            routed_device_ids: set[int] = set()
+            for device_id, worker in sorted(self._workers.items()):
+                if int(device_id) not in normalized_device_ids:
+                    continue
+                if hasattr(worker, "request_full_sync") and worker.request_full_sync(reason=reason):
+                    routed_device_ids.add(int(device_id))
+            if routed_device_ids:
+                self._logger.info(
+                    "[ULTRA] routed full refresh to live workers: devices=%d reason=%s",
+                    len(routed_device_ids),
+                    str(reason or "manual"),
+                )
+                remaining_device_ids = set(normalized_device_ids) - routed_device_ids
+                if not remaining_device_ids:
+                    return True
+                normalized_device_ids = remaining_device_ids
         self._sync_scheduler.request_sync_now(
-            changed_ids=changed_ids,
-            device_ids=device_ids,
+            changed_ids=normalized_changed_ids,
+            device_ids=normalized_device_ids,
             reason=reason,
         )
         return True

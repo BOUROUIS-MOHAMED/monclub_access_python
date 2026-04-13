@@ -238,3 +238,61 @@ def test_status_stream_emits_updated_status_when_device_sync_changes() -> None:
 
 def test_access_routes_expose_status_stream_endpoint() -> None:
     assert ("GET", "/api/v2/status/stream", "_handle_status_stream_sse") in ACCESS_LOCAL_ROUTE_SPECS
+
+
+class _UltraPopupOnlyEngine:
+    def __init__(self, popup_events: list[tuple[int, dict[str, object]]]) -> None:
+        self.running = True
+        self._popup_events = list(popup_events)
+
+    def get_latest_popup_event_seq(self) -> int:
+        if not self._popup_events:
+            return 0
+        return int(self._popup_events[-1][0])
+
+    def get_popup_events_since(self, seq: int, limit: int = 10) -> list[tuple[int, dict[str, object]]]:
+        rows = [(event_seq, dict(payload)) for event_seq, payload in self._popup_events if event_seq > seq]
+        return rows[:limit]
+
+
+class _PopupStreamApp:
+    def __init__(self, ultra_engine: object | None = None) -> None:
+        self._agent_engine = None
+        self._ultra_engine = ultra_engine
+
+
+class _FakePopupStreamCtx:
+    def __init__(self, app: _PopupStreamApp, replay_last: int = 0) -> None:
+        self.app = app
+        self._replay_last = replay_last
+        self.events: list[tuple[str, object]] = []
+        self.handler = SimpleNamespace(client_address=("127.0.0.1", 5050))
+
+    def q_int(self, *names: str, default: int = 0) -> int:
+        return self._replay_last
+
+    def send_sse_start(self) -> None:
+        return None
+
+    def send_sse_event(self, event: str, data: object) -> bool:
+        self.events.append((event, data))
+        return event != "popup"
+
+
+def test_agent_events_sse_delivers_ultra_popup_when_agent_engine_is_absent() -> None:
+    popup_payload = {
+        "eventId": "ultra-evt-1",
+        "userFullName": "Mohamed Test",
+        "allowed": True,
+        "popupEnabled": True,
+    }
+    ctx = _FakePopupStreamCtx(
+        _PopupStreamApp(_UltraPopupOnlyEngine([(1, popup_payload)])),
+        replay_last=1,
+    )
+
+    with patch.object(local_access_api_v2.time, "sleep", lambda _seconds: None):
+        local_access_api_v2._handle_agent_events_sse(ctx)
+
+    popup_events = [data for event, data in ctx.events if event == "popup"]
+    assert popup_events == [popup_payload]

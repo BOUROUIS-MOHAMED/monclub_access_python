@@ -536,18 +536,52 @@ def _get_live_device_sync_progress(app: Any) -> Optional[Dict[str, Any]]:
 
 _status_payload_lock = threading.Lock()
 _status_payload_cache: tuple = (0.0, 0, None)  # (expires_at, app_id, payload)
+_status_payload_building: tuple[int, threading.Event] | None = None
 _STATUS_PAYLOAD_TTL = 1.0  # seconds
 
 
 def _build_status_payload(app: Any) -> Dict[str, Any]:
-    global _status_payload_cache
+    global _status_payload_cache, _status_payload_building
     now = time.monotonic()
     app_id = id(app)
+    build_evt: threading.Event | None = None
+    stale_cached: Dict[str, Any] | None = None
+    is_leader = False
     with _status_payload_lock:
         expires, cached_app_id, cached = _status_payload_cache
         if now < expires and cached is not None and cached_app_id == app_id:
             return cached
-    result = _build_status_payload_uncached(app)
+        if cached is not None and cached_app_id == app_id:
+            stale_cached = cached
+        if _status_payload_building is not None and _status_payload_building[0] == app_id:
+            if stale_cached is not None:
+                return stale_cached
+            build_evt = _status_payload_building[1]
+        else:
+            build_evt = threading.Event()
+            _status_payload_building = (app_id, build_evt)
+            is_leader = True
+
+    if not is_leader and build_evt is not None:
+        build_evt.wait(timeout=0.25)
+        with _status_payload_lock:
+            expires, cached_app_id, cached = _status_payload_cache
+            if cached is not None and cached_app_id == app_id:
+                return cached
+            if stale_cached is not None:
+                return stale_cached
+            _status_payload_building = (app_id, build_evt)
+            is_leader = True
+
+    try:
+        result = _build_status_payload_uncached(app)
+    finally:
+        with _status_payload_lock:
+            if build_evt is not None and _status_payload_building == (app_id, build_evt):
+                _status_payload_building = None
+        if build_evt is not None:
+            build_evt.set()
+
     with _status_payload_lock:
         _status_payload_cache = (time.monotonic() + _STATUS_PAYLOAD_TTL, app_id, result)
     return result
@@ -555,7 +589,7 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
 
 def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
     from access.store import load_auth_token
-    from app.core.db import list_sync_devices_payload, load_sync_contract_meta
+    from app.core.db import load_sync_contract_meta, load_sync_device_mode_summary, peek_sync_cache, summarize_access_mode_counts
 
     auth = load_auth_token()
     reasons = []
@@ -563,8 +597,15 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         reasons = app._restriction_reasons() if auth else []
     except Exception:
         pass
-    contract_meta = load_sync_contract_meta()
-    devices = list_sync_devices_payload()
+    cache = peek_sync_cache()
+    if cache is not None:
+        contract_meta = {
+            "contractStatus": getattr(cache, "contract_status", getattr(cache, "contractStatus", None)),
+            "contractEndDate": getattr(cache, "contract_end_date", getattr(cache, "contractEndDate", None)),
+            "updatedAt": getattr(cache, "updated_at", ""),
+        }
+    else:
+        contract_meta = load_sync_contract_meta()
 
     session = {
         "loggedIn": bool(auth and auth.token),
@@ -588,24 +629,13 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         session["contractDaysRemaining"] = None
         session["contractWarning"] = False
 
-    dev_count = 0
-    agent_count = 0
-    ultra_count = 0
-    for d in devices:
-        if isinstance(d, dict):
-            adm = str(d.get("accessDataMode") or d.get("access_data_mode") or "").upper()
-            if adm == "DEVICE":
-                dev_count += 1
-            elif adm == "AGENT":
-                agent_count += 1
-            elif adm == "ULTRA":
-                ultra_count += 1
-    unknown_count = len(devices) - dev_count - agent_count - ultra_count
-
     try:
         mode = app.get_access_mode_summary()
     except Exception:
-        mode = {"DEVICE": dev_count, "AGENT": agent_count, "ULTRA": ultra_count, "UNKNOWN": unknown_count}
+        if cache is not None:
+            mode = summarize_access_mode_counts(getattr(cache, "devices", []) or [])
+        else:
+            mode = load_sync_device_mode_summary()
 
     sync = {
         "running": bool(getattr(app, "_sync_work_running", False)),
@@ -675,9 +705,9 @@ def _status_payload_signature(payload: Dict[str, Any]) -> str:
 def _handle_status_stream_sse(ctx: _Ctx) -> None:
     ctx.send_sse_start()
 
-    # SSE should reflect in-memory progress changes immediately; bypass the
-    # short-lived snapshot cache used by one-off status requests.
-    payload = _build_status_payload_uncached(ctx.app)
+    # Share the short-lived status snapshot between GET /status and SSE clients
+    # so busy UI windows don't rebuild the same payload in parallel.
+    payload = _build_status_payload(ctx.app)
     last_signature = _status_payload_signature(payload)
     if not ctx.send_sse_event("status", payload):
         return
@@ -686,7 +716,7 @@ def _handle_status_stream_sse(ctx: _Ctx) -> None:
     while True:
         time.sleep(1.0)
 
-        payload = _build_status_payload_uncached(ctx.app)
+        payload = _build_status_payload(ctx.app)
         signature = _status_payload_signature(payload)
         if signature != last_signature:
             last_signature = signature
@@ -1507,11 +1537,11 @@ def _handle_push_history_pins(ctx: _Ctx) -> None:
 
 def _handle_sync_cache_meta(ctx: _Ctx) -> None:
     from app.core.db import (
-        list_sync_devices_payload,
-        list_sync_gym_access_credentials,
-        list_sync_infrastructures,
-        list_sync_memberships,
-        list_sync_users,
+        count_sync_devices,
+        count_sync_gym_access_credentials,
+        count_sync_infrastructures,
+        count_sync_memberships,
+        count_sync_users,
         load_sync_contract_meta,
     )
 
@@ -1524,25 +1554,20 @@ def _handle_sync_cache_meta(ctx: _Ctx) -> None:
         "contractStatus": contract_meta.get("contractStatus"),
         "contractEndDate": contract_meta.get("contractEndDate"),
         "lastSyncAt": contract_meta.get("updatedAt"),
-        "userCount": len(list_sync_users()),
-        "deviceCount": len(list_sync_devices_payload()),
-        "membershipCount": len(list_sync_memberships()),
-        "infrastructureCount": len(list_sync_infrastructures()),
-        "credentialCount": len(list_sync_gym_access_credentials()),
+        "userCount": count_sync_users(),
+        "deviceCount": count_sync_devices(),
+        "membershipCount": count_sync_memberships(),
+        "infrastructureCount": count_sync_infrastructures(),
+        "credentialCount": count_sync_gym_access_credentials(),
     })
 
 
 def _handle_sync_cache_users(ctx: _Ctx) -> None:
-    from app.core.db import list_sync_users
+    from app.core.db import list_sync_users_page
 
-    users = list_sync_users()
     limit = ctx.q_int("limit", default=0)
     offset = ctx.q_int("offset", default=0)
-    total = len(users)
-    if offset > 0:
-        users = users[offset:]
-    if limit > 0:
-        users = users[:limit]
+    users, total = list_sync_users_page(limit=limit, offset=offset)
     ctx.send_json(200, {"users": users, "total": total})
 
 
@@ -1553,13 +1578,27 @@ def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_devices(ctx: _Ctx) -> None:
-    from app.core.db import list_sync_devices_payload
+    from app.core.db import list_sync_devices_payload, list_sync_devices_payload_from_cache, peek_sync_cache
+    include_door_presets = _safe_bool(
+        ctx.q("includeDoorPresets", "include_door_presets", default="1"),
+        default=True,
+    )
     try:
-        devices = list_sync_devices_payload()
+        cache = peek_sync_cache()
+        if cache is not None:
+            devices = list_sync_devices_payload_from_cache(
+                cache,
+                include_door_presets=include_door_presets,
+            )
+        else:
+            devices = list_sync_devices_payload(include_door_presets=include_door_presets)
     except Exception:
         from access.store import load_sync_cache
         cache = load_sync_cache()
-        devices = list(cache.devices) if cache else []
+        devices = list_sync_devices_payload_from_cache(
+            cache,
+            include_door_presets=include_door_presets,
+        ) if cache else []
     ctx.send_json(200, {"devices": devices})
 
 
@@ -3481,12 +3520,32 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
 
 def _handle_device_door_presets_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
-    from access.store import get_sync_device_payload, list_device_door_presets
+    from access.store import list_device_door_presets
+    from app.core.db import (
+        list_sync_device_door_presets_payload,
+        list_sync_device_door_presets_payload_from_cache,
+        peek_sync_cache,
+    )
 
-    device_payload = get_sync_device_payload(did) or {}
-    synced_presets = device_payload.get("doorPresets")
+    cache = peek_sync_cache()
+    if cache is not None:
+        cached_presets = list_sync_device_door_presets_payload_from_cache(did, cache)
+        if cached_presets is not None:
+            ctx.send_json(200, {"presets": [
+                {
+                    "id": _safe_int((p or {}).get("id"), 0),
+                    "deviceId": _safe_int((p or {}).get("deviceId"), did),
+                    "doorNumber": _safe_int((p or {}).get("doorNumber"), 1),
+                    "pulseSeconds": _safe_int((p or {}).get("pulseSeconds"), 3),
+                    "doorName": _safe_str((p or {}).get("doorName"), ""),
+                }
+                for p in cached_presets
+                if isinstance(p, dict)
+            ]})
+            return
 
-    if isinstance(synced_presets, list) and synced_presets:
+    synced_presets = list_sync_device_door_presets_payload(did)
+    if synced_presets:
         ctx.send_json(200, {"presets": [
             {
                 "id": _safe_int((p or {}).get("id"), 0),
@@ -3629,7 +3688,11 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
     ctx.send_sse_start()
 
     # send initial status
-    ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    ctx.send_sse_event(
+        "status",
+        {"running": bool((eng and eng.is_running()) or (ultra_eng and ultra_eng.running))},
+    )
 
     # ?replayLast=N — send the last N popup events immediately on connect.
     # The popup display screen uses replayLast=1 so it shows the last entry
@@ -3643,80 +3706,88 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
             last_popup_seq = max(0, latest - replay_last)
         except Exception:
             last_popup_seq = 0
+    last_ultra_popup_seq = 0
+    if ultra_eng and ultra_eng.running:
+        try:
+            latest_ultra = ultra_eng.get_latest_popup_event_seq()
+            last_ultra_popup_seq = max(0, latest_ultra - replay_last)
+        except Exception:
+            last_ultra_popup_seq = 0
 
     last_snap: Dict[int, Dict[str, Any]] = {}
     while True:
         try:
             time.sleep(0.25)
 
-            if not eng or not eng.is_running():
-                eng = getattr(ctx.app, "_agent_engine", None)
-                alive = ctx.send_sse_event("status", {"running": bool(eng and eng.is_running())})
+            eng = getattr(ctx.app, "_agent_engine", None)
+            ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+            agent_running = bool(eng and eng.is_running())
+            ultra_running = bool(ultra_eng and ultra_eng.running)
+
+            if not agent_running and not ultra_running:
+                alive = ctx.send_sse_event("status", {"running": False})
                 if not alive:
                     return
                 time.sleep(1.0)
                 continue
 
             # device status changes
-            try:
-                snap = eng.get_status_snapshot()
-                if snap != last_snap:
-                    alive = ctx.send_sse_event("device_status", snap)
-                    if not alive:
-                        return
-                    last_snap = snap
-            except Exception:
-                pass
+            if agent_running:
+                try:
+                    snap = eng.get_status_snapshot()
+                    if snap != last_snap:
+                        alive = ctx.send_sse_event("device_status", snap)
+                        if not alive:
+                            return
+                        last_snap = snap
+                except Exception:
+                    pass
 
             # Fan out popup events to every SSE subscriber instead of letting
             # subscribers race on the same queue item.
-            try:
-                popup_events = eng.get_popup_events_since(last_popup_seq, limit=10)
-            except Exception:
-                popup_events = []
-            for popup_seq, payload in popup_events:
-                _logger.debug(
-                    "[SSE/agent_events] sending AGENT popup seq=%s allowed=%s user=%r client=%s:%s",
-                    popup_seq,
-                    payload.get("allowed"),
-                    payload.get("userFullName"),
-                    client_addr[0], client_addr[1],
-                )
-                alive = ctx.send_sse_event("popup", payload)
-                if not alive:
-                    _logger.info(
-                        "[SSE/agent_events] client disconnected (broken pipe) at popup seq=%s: %s:%s",
-                        popup_seq, client_addr[0], client_addr[1],
-                    )
-                    return
-                last_popup_seq = popup_seq
-
-            # ULTRA engine popup events — drain non-blocking from popup_q
-            ultra_eng = getattr(ctx.app, "_ultra_engine", None)
-            if ultra_eng and ultra_eng.running:
+            if agent_running:
                 try:
-                    from app.core.realtime_agent import _popup_payload_from_request
-                    for _ in range(10):
-                        try:
-                            req = ultra_eng.popup_q.get_nowait()
-                        except queue.Empty:
-                            break
-                        payload = _popup_payload_from_request(req)
-                        _logger.debug(
-                            "[SSE/agent_events] sending ULTRA popup allowed=%s user=%r client=%s:%s",
-                            payload.get("allowed"),
-                            payload.get("userFullName"),
+                    popup_events = eng.get_popup_events_since(last_popup_seq, limit=10)
+                except Exception:
+                    popup_events = []
+                for popup_seq, payload in popup_events:
+                    _logger.debug(
+                        "[SSE/agent_events] sending AGENT popup seq=%s allowed=%s user=%r client=%s:%s",
+                        popup_seq,
+                        payload.get("allowed"),
+                        payload.get("userFullName"),
+                        client_addr[0], client_addr[1],
+                    )
+                    alive = ctx.send_sse_event("popup", payload)
+                    if not alive:
+                        _logger.info(
+                            "[SSE/agent_events] client disconnected (broken pipe) at popup seq=%s: %s:%s",
+                            popup_seq, client_addr[0], client_addr[1],
+                        )
+                        return
+                    last_popup_seq = popup_seq
+
+            if ultra_running:
+                try:
+                    ultra_popup_events = ultra_eng.get_popup_events_since(last_ultra_popup_seq, limit=10)
+                except Exception:
+                    ultra_popup_events = []
+                for popup_seq, payload in ultra_popup_events:
+                    _logger.debug(
+                        "[SSE/agent_events] sending ULTRA popup seq=%s allowed=%s user=%r client=%s:%s",
+                        popup_seq,
+                        payload.get("allowed"),
+                        payload.get("userFullName"),
+                        client_addr[0], client_addr[1],
+                    )
+                    alive = ctx.send_sse_event("popup", payload)
+                    if not alive:
+                        _logger.info(
+                            "[SSE/agent_events] client disconnected (ULTRA popup): %s:%s",
                             client_addr[0], client_addr[1],
                         )
-                        alive = ctx.send_sse_event("popup", payload)
-                        if not alive:
-                            _logger.info(
-                                "[SSE/agent_events] client disconnected (ULTRA popup): %s:%s",
-                                client_addr[0], client_addr[1],
-                            )
-                            return
-                except Exception as _sse_exc:
-                    _logger.warning("[SSE/agent_events] ULTRA popup dispatch error: %s", _sse_exc)
+                        return
+                    last_ultra_popup_seq = popup_seq
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as _pipe_exc:
             _logger.info(

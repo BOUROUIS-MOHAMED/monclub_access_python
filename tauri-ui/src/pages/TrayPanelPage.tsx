@@ -196,13 +196,6 @@ export default function TrayPanelPage() {
   const deferredQuery = useDeferredValue(query.trim().toLowerCase());
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      void reload();
-    }, 10000);
-    return () => window.clearInterval(timer);
-  }, [reload]);
-
-  useEffect(() => {
     if (!notice) return undefined;
     const timer = window.setTimeout(() => setNotice(null), 3200);
     return () => window.clearTimeout(timer);

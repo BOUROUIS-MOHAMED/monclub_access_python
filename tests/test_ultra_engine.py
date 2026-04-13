@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 from collections import deque
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 from unittest.mock import MagicMock, patch, call
 
@@ -77,7 +78,11 @@ def _make_worker(
     worker._settings = settings
     worker._popup_q = popup_q
     worker._history_q = history_q
+    worker._cfg = None
+    worker._on_full_sync_started = None
+    worker._on_full_sync_finished = None
     worker._stop = stop_event
+    worker._stop_evt = stop_event
     worker._device_id = int(device.get("id", 0))
     worker._device_name = str(device.get("name", ""))
     worker._sdk = None
@@ -89,6 +94,8 @@ def _make_worker(
     worker._door_cmd_failures = 0
     worker._poll_ema_ms = 0.0
     worker._prefix = f"[ULTRA:{worker._device_id}]"
+    worker._card_cooldown = {}
+    worker._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 0))
 
     worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
     worker._busy_max = int(settings.get("busy_sleep_max_ms", 50))
@@ -102,6 +109,29 @@ def _make_worker(
     worker._cached_state = None
     worker._cached_state_ts = 0.0
     worker._CACHE_TTL_SEC = 5.0
+    worker._member_sync_lock = threading.Lock()
+    worker._pending_member_syncs = deque()
+    worker._pending_member_sync_ids = set()
+    worker._full_sync_lock = threading.Lock()
+    worker._pending_full_sync_request = None
+    worker._active_sync_lock = threading.Lock()
+    worker._active_sync_engine = None
+    worker._current_full_sync_reason = ""
+    worker._last_full_sync_started_at = ""
+    worker._last_full_sync_finished_at = ""
+    worker._last_full_sync_duration_ms = 0.0
+    worker._last_full_sync_error = ""
+    worker._full_sync_running = False
+    worker._cmd_queue = queue.Queue(maxsize=10)
+    worker._sync_pause = threading.Event()
+    worker._sync_paused_ack = threading.Event()
+    worker._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
+    worker._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 15.0))
+    worker._connect_failures = 0
+    worker._next_connect_at_mono = 0.0
+    worker._last_connect_error = ""
+    worker._last_connect_attempt_at = ""
+    worker._last_connect_success_at = ""
 
     return worker
 
@@ -840,6 +870,44 @@ class TestPopupQueueBehavior:
         assert req.device_name == "GymFront"
 
 
+@patch("app.core.settings_reader.get_backend_global_settings", return_value={})
+def test_ultra_engine_popup_replay_fans_out_to_multiple_consumers(_mock_settings):
+    from app.core.ultra_engine import UltraEngine
+
+    engine = UltraEngine(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    req = NotificationRequest(
+        event_id="evt-popup-1",
+        title="Acces",
+        message="ok",
+        image_path="",
+        popup_show_image=True,
+        user_full_name="Mohamed Test",
+        user_image="",
+        user_valid_from="",
+        user_valid_to="",
+        user_membership_id=77,
+        user_phone="555-0100",
+        device_id=5,
+        device_name="Front Gate",
+        allowed=True,
+        reason="DEVICE_ALLOWED",
+        scan_mode="RFID_CARD",
+        popup_duration_sec=3,
+        popup_enabled=True,
+        win_notify_enabled=False,
+    )
+
+    engine.popup_q.put_nowait(req)
+
+    latest_seq = engine.get_latest_popup_event_seq()
+    first_read = engine.get_popup_events_since(0, limit=10)
+    second_read = engine.get_popup_events_since(0, limit=10)
+
+    assert latest_seq == 1
+    assert first_read == second_read
+    assert first_read[0][1]["userFullName"] == "Mohamed Test"
+
+
 # ---------------------------------------------------------------------------
 # TestHistoryQueueBehavior
 # ---------------------------------------------------------------------------
@@ -960,6 +1028,68 @@ class TestGetSnapshot:
 
         snap = worker.get_snapshot()
         assert snap["events_processed"] == 3
+
+
+# ---------------------------------------------------------------------------
+# TestConnectBackoff
+# ---------------------------------------------------------------------------
+
+class TestConnectBackoff:
+    def test_connect_failure_schedules_retry_backoff(self):
+        worker = _make_worker(settings=_make_settings(connect_retry_base_sec=2, connect_retry_max_sec=15))
+        fake_sdk = MagicMock()
+        fake_sdk.connect.return_value = False
+
+        with (
+            patch("app.core.ultra_engine.PullSDKDevice", return_value=fake_sdk),
+            patch("app.core.ultra_engine.time.monotonic", return_value=100.0),
+        ):
+            worker._connect()
+
+        assert worker._connected is False
+        assert worker._connect_failures == 1
+        assert worker._last_connect_error == "connect returned False"
+        assert worker._connect_wait_remaining(now=101.0) == pytest.approx(1.0)
+
+    def test_connect_success_resets_retry_backoff(self):
+        worker = _make_worker()
+        worker._connect_failures = 3
+        worker._next_connect_at_mono = 250.0
+        worker._last_connect_error = "previous failure"
+        fake_sdk = MagicMock()
+        fake_sdk.connect.return_value = True
+
+        with patch("app.core.ultra_engine.PullSDKDevice", return_value=fake_sdk):
+            worker._connect()
+
+        assert worker._connected is True
+        assert worker._connect_failures == 0
+        assert worker._connect_wait_remaining(now=999.0) == 0.0
+        assert worker._last_connect_error == ""
+        assert worker._last_connect_success_at != ""
+
+    def test_defer_reconnect_extends_retry_window_for_disconnected_worker(self):
+        worker = _make_worker()
+        worker._connected = False
+        worker._next_connect_at_mono = 101.0
+
+        with patch("app.core.ultra_engine.time.monotonic", return_value=100.0):
+            changed = worker.defer_reconnect(12.0, reason="sync_write")
+
+        assert changed is True
+        assert worker._connect_wait_remaining(now=111.0) == pytest.approx(1.0)
+        assert worker._last_connect_error == "deferred: sync_write"
+
+    def test_defer_reconnect_does_not_touch_connected_worker(self):
+        worker = _make_worker()
+        worker._connected = True
+        worker._next_connect_at_mono = 101.0
+
+        with patch("app.core.ultra_engine.time.monotonic", return_value=100.0):
+            changed = worker.defer_reconnect(12.0, reason="sync_write")
+
+        assert changed is False
+        assert worker._connect_wait_remaining(now=100.5) == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------

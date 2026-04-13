@@ -244,9 +244,6 @@ export default function PopupWindow() {
 
   // handleEvent — the single entry point for all incoming events
   const handleEvent = useCallback((evt: PopupEvent) => {
-    // Only show popup for allowed (entered) users
-    if (!evt.allowed) return;
-
     // Deduplicate by person within MAX_SHOW_MS window — handles dual-engine duplicates
     const personKey = String(evt.userMembershipId ?? `${evt.userFullName}|${evt.deviceId}`);
     const lastAt = shownCooldownRef.current.get(personKey) ?? 0;
@@ -279,7 +276,7 @@ export default function PopupWindow() {
 
   // Channel 1 — Direct SSE from backend
   useEffect(() => {
-    const es = openSSE("/agent/events", (type, data) => {
+    const es = openSSE("/agent/events?replayLast=1", (type, data) => {
       if (type !== "popup" && type !== "notification") return;
       try {
         handleEvent(toPopupEvent(typeof data === "string" ? JSON.parse(data) : data));
@@ -327,14 +324,15 @@ export default function PopupWindow() {
 
   // ── Notification screen ───────────────────────────────────────────────────
   const n = current;
-  const isBirthday = isTodayBirthday(n.userBirthday);
+  const allowed = Boolean(n.allowed);
+  const isBirthday = allowed && isTodayBirthday(n.userBirthday);
   const initial = (n.userFullName || "?")[0].toUpperCase();
 
-  const accentColor = isBirthday ? "#f59e0b" : "#10b981";
-  const glowHex     = isBirthday ? "250,159,21"  : "16,185,129";
-  const statusLabel = isBirthday ? "Joyeux Anniversaire !" : "Accès Autorisé";
-  const statusIcon  = isBirthday ? "🎂" : "✓";
-  const noBgFrom    = isBirthday ? "#451a03" : "#022c22";
+  const accentColor = isBirthday ? "#f59e0b" : allowed ? "#10b981" : "#ef4444";
+  const glowHex     = isBirthday ? "250,159,21" : allowed ? "16,185,129" : "239,68,68";
+  const statusLabel = isBirthday ? "Joyeux Anniversaire !" : allowed ? "Accès Autorisé" : "Accès Refusé";
+  const statusIcon  = isBirthday ? "🎂" : allowed ? "✓" : "✕";
+  const noBgFrom    = isBirthday ? "#451a03" : allowed ? "#022c22" : "#450a0a";
   const noBgTo      = "#050505";
 
   return (
