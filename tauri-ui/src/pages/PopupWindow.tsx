@@ -199,7 +199,7 @@ export default function PopupWindow() {
     if (!evt.popupShowImage) { setImgSrc(null); return; }
     const img = (evt.userImage || evt.imagePath || "").trim();
     if (!img) { setImgSrc(null); return; }
-    if (img.startsWith("http") || img.startsWith("data:")) { setImgSrc(img); return; }
+    if (img.startsWith("data:")) { setImgSrc(img); return; }
     setImgSrc(`${API_BASE}/image-cache?url=${encodeURIComponent(img)}`);
   }, []);
 

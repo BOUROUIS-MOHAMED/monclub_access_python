@@ -14,6 +14,7 @@ SSE endpoints:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import base64
 import mimetypes
@@ -28,14 +29,16 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urljoin
 from shared.desktop_paths import get_desktop_path_layout
+import requests
 
 _logger = logging.getLogger(__name__)
 
 _SQLITE_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 from app.api.monclub_api import MonClubApiHttpError
+from app.core.app_const import MONCLUB_BASE_URL
 
 # TV boundary — imported through the phase 1 TV facade so new code does not
 # depend on the legacy implementation module directly.
@@ -148,6 +151,49 @@ def _qs_first(qs: Dict[str, List[str]], *names: str, default: str = "") -> str:
         if v and len(v) > 0:
             return (v[0] or "").strip()
     return default
+
+
+def _image_cache_dir() -> str:
+    try:
+        from access.storage import current_access_runtime_db_path
+        access_db_path = str(current_access_runtime_db_path())
+        base_dir = os.path.dirname(access_db_path) if access_db_path else os.getcwd()
+    except Exception:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, "cache", "images")
+
+
+def _normalize_image_url(raw: str) -> str:
+    s = _safe_str(raw, "").strip()
+    if not s:
+        return ""
+    if s.startswith("data:"):
+        return s
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    if s.startswith("//"):
+        return f"https:{s}"
+    if s.startswith("/"):
+        return urljoin(MONCLUB_BASE_URL.rstrip("/") + "/", s.lstrip("/"))
+    return urljoin(MONCLUB_BASE_URL.rstrip("/") + "/", s)
+
+
+def _image_cache_path(url: str) -> str:
+    cache_dir = _image_cache_dir()
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        pass
+    h = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
+    ext = os.path.splitext(urlparse(url).path or "")[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico", ".webp"):
+        ext = ".png"
+    return os.path.join(cache_dir, f"{h}{ext}")
+
+
+def _guess_image_mime(path: str) -> str:
+    m, _ = mimetypes.guess_type(path)
+    return m or "image/png"
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
@@ -382,6 +428,77 @@ def _handle_platform(ctx: _Ctx) -> None:
         "frozen": is_frozen(),
         "dataRoot": str(DATA_ROOT),
     })
+
+
+def _handle_image_cache(ctx: _Ctx) -> None:
+    raw = _safe_str(ctx.q("url", default=""), "").strip()
+    if not raw:
+        ctx.send_json(400, {"ok": False, "error": "missing url"})
+        return
+
+    # Allow direct local file path (desktop debug)
+    try:
+        if os.path.isabs(raw) and os.path.exists(raw) and os.path.isfile(raw):
+            with open(raw, "rb") as f:
+                data = f.read()
+            ctx.send_bytes(200, data, _guess_image_mime(raw))
+            return
+    except Exception:
+        pass
+
+    url = _normalize_image_url(raw)
+    if not url or url.startswith("data:"):
+        ctx.send_json(400, {"ok": False, "error": "unsupported image url"})
+        return
+
+    target = _image_cache_path(url)
+    try:
+        if os.path.exists(target) and os.path.isfile(target):
+            with open(target, "rb") as f:
+                data = f.read()
+            ctx.send_bytes(200, data, _guess_image_mime(target))
+            return
+    except Exception:
+        pass
+
+    # Fetch from backend with auth if available.
+    try:
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        token = _safe_str(getattr(auth, "token", None), "").strip()
+    except Exception:
+        token = ""
+
+    headers = {"User-Agent": "MonClubAccess/1.0", "Accept": "*/*"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        r = requests.get(url, headers=headers, timeout=2)
+        if r.status_code < 200 or r.status_code >= 300:
+            ctx.send_json(404, {"ok": False, "error": f"image fetch failed (HTTP {r.status_code})"})
+            return
+        data = r.content or b""
+        if not data:
+            ctx.send_json(404, {"ok": False, "error": "image empty"})
+            return
+        if len(data) > 5 * 1024 * 1024:
+            ctx.send_json(413, {"ok": False, "error": "image too large"})
+            return
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            tmp = target + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            try:
+                os.replace(tmp, target)
+            except Exception:
+                os.rename(tmp, target)
+        except Exception:
+            pass
+        ctx.send_bytes(200, data, _guess_image_mime(target))
+    except Exception:
+        ctx.send_json(502, {"ok": False, "error": "image fetch failed"})
 
 
 # ==================== 1.5) UNIFIED STATUS ====================
