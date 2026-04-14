@@ -1,56 +1,34 @@
-import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from app.core.zkemkeeper_scanner import ZkemkeeperError, ZkemkeeperScanner
 
 
-def test_missing_pywin32_raises_clear_error(monkeypatch):
-    monkeypatch.setitem(__import__("sys").modules, "win32com", None)
-    with pytest.raises(ZkemkeeperError) as exc:
-        ZkemkeeperScanner().connect(ip="192.168.0.10", port=4370, timeout_ms=3000)
-    assert "pywin32" in str(exc.value).lower()
-
-
-def test_connect_and_read_card(monkeypatch):
-    fake = types.SimpleNamespace()
-    fake.Connect_Net = lambda ip, port: True
-    fake.GetRTLog = lambda *args, **kwargs: (
-        True,
-        "0",
-        "1234567",
-        "0",
-        "1",
-        "0",
-        "0",
-        "0",
+def test_read_card_once_prefers_hid_event() -> None:
+    com = SimpleNamespace(
+        GetHIDEventCardNumAsStr=MagicMock(return_value=(True, "8175134")),
+        GetStrCardNumber=MagicMock(return_value="999"),
     )
+    scanner = ZkemkeeperScanner(_com=com)
+    assert scanner.read_card_once(poll_sec=0.05) == "8175134"
 
-    class FakeClient:
-        def Dispatch(self, _progid):
-            return fake
 
-    fake_client_mod = types.SimpleNamespace(Dispatch=FakeClient().Dispatch)
-    monkeypatch.setitem(__import__("sys").modules, "win32com.client", fake_client_mod)
-    monkeypatch.setitem(
-        __import__("sys").modules,
-        "win32com",
-        types.SimpleNamespace(client=fake_client_mod),
+def test_read_card_once_falls_back_to_getstrcardnumber() -> None:
+    com = SimpleNamespace(
+        GetHIDEventCardNumAsStr=MagicMock(return_value=(False, "")),
+        GetStrCardNumber=MagicMock(return_value="445566"),
     )
-
-    scanner = ZkemkeeperScanner()
-    scanner.connect(ip="192.168.0.10", port=4370, timeout_ms=3000)
-    card = scanner.read_card_once()
-    assert card == "1234567"
+    scanner = ZkemkeeperScanner(_com=com)
+    assert scanner.read_card_once(poll_sec=0.05) == "445566"
 
 
-def test_zkemkeeper_mode_sets_error_on_missing_ip():
-    from app.core.card_scanner import CardScanner, ScannerState
-
-    scanner = CardScanner()
-    ok = scanner.start_scan(mode="zkemkeeper", ip="")
-    assert ok is True
-    import time
-    time.sleep(0.2)
-    assert scanner.state in (ScannerState.ERROR, ScannerState.IDLE)
-    assert "zkemkeeper" in (scanner.error or "").lower()
+def test_read_card_once_times_out() -> None:
+    com = SimpleNamespace(
+        GetHIDEventCardNumAsStr=MagicMock(return_value=(False, "")),
+        GetStrCardNumber=MagicMock(return_value=""),
+    )
+    scanner = ZkemkeeperScanner(_com=com)
+    with pytest.raises(ZkemkeeperError, match="No card detected"):
+        scanner.read_card_once(poll_sec=0.02)

@@ -42,10 +42,30 @@ class ZkemkeeperScanner:
             raise ZkemkeeperError("Not connected")
         deadline = time.time() + poll_sec
         while time.time() < deadline:
-            ok, _userid, card, _state, _door, _event, _inout, _time = (
-                self._com.GetRTLog()
-            )
-            if ok and card:
-                return str(card).strip()
+            card = ""
+            try:
+                result = self._com.GetHIDEventCardNumAsStr()
+                if isinstance(result, tuple) and len(result) >= 2:
+                    ok, card = result[0], result[1]
+                elif isinstance(result, bool):
+                    ok = result
+                    card = ""
+                else:
+                    ok = False
+            except Exception:
+                ok = False
+                card = ""
+
+            card_str = str(card or "").strip()
+            if ok and card_str:
+                return card_str
+
+            try:
+                fallback = str(self._com.GetStrCardNumber() or "").strip()
+                if fallback:
+                    return fallback
+            except Exception:
+                pass
+
             time.sleep(0.2)
         raise ZkemkeeperError("No card detected before timeout")
