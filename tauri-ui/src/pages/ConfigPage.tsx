@@ -222,7 +222,7 @@ export default function ConfigPage() {
           <Settings className="h-5 w-5 text-primary" />
           <h1 className="text-lg font-semibold">Configuration</h1>
         </div>
-        {advancedUnlocked && dirty && (
+        {dirty && (
           <Button onClick={handleSave} disabled={saving}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
             Enregistrer
@@ -298,33 +298,28 @@ export default function ConfigPage() {
             <div className="space-y-1">
               <Label>Mode de connexion</Label>
               <p className="text-sm text-muted-foreground">
-                {cfg.scanner_mode === "usb"
-                  ? "SCR100 via le réseau (TCP/IP port 4370)"
-                  : "Lecteur USB branché directement (HID)"}
+                SCR100 via le réseau (TCP/IP port 4370)
               </p>
             </div>
             <div className="flex items-center gap-2">
               <Select
-                value={cfg.scanner_mode || "network"}
+                value={cfg.scanner_mode || "zkemkeeper"}
                 onValueChange={(value) => {
                   update("scanner_mode", value);
-                  patch("/config", { scanner_mode: value }).catch(() => {});
                 }}
               >
                 <SelectTrigger className="w-[240px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="network"><Wifi className="h-3.5 w-3.5" /> SCR100 r‚seau</SelectItem>
-                  <SelectItem value="zkemkeeper"><Radio className="h-3.5 w-3.5" /> SCR100 ZKEMKeeper</SelectItem>
-                  <SelectItem value="usb"><Usb className="h-3.5 w-3.5" /> Lecteur USB HID</SelectItem>
+                  <SelectItem value="zkemkeeper"><Wifi className="h-3.5 w-3.5" /> SCR100 ZKEMKeeper</SelectItem>
                 </SelectContent>
               </Select>
             </div>
           </div>
 
           {/* Network mode settings */}
-          {(cfg.scanner_mode === "network" || cfg.scanner_mode === "zkemkeeper") && (
+          {(cfg.scanner_mode === "zkemkeeper" || !cfg.scanner_mode) && (
             <div className="space-y-3 pt-2 border-t border-border/40">
               <div className="flex items-end gap-2">
                 <div className="flex-1 space-y-1">
@@ -334,9 +329,6 @@ export default function ConfigPage() {
                     placeholder="192.168.1.201"
                     value={cfg.scanner_network_ip || ""}
                     onChange={(e) => update("scanner_network_ip", e.target.value)}
-                    onBlur={() => {
-                      patch("/config", { scanner_network_ip: cfg.scanner_network_ip || "" }).catch(() => {});
-                    }}
                   />
                 </div>
                 <Button
@@ -367,7 +359,6 @@ export default function ConfigPage() {
                       className="w-full flex items-center justify-between px-3 py-2 rounded-md border border-border hover:bg-accent text-left text-sm transition-colors"
                       onClick={() => {
                         update("scanner_network_ip", dev.ip);
-                        patch("/config", { scanner_network_ip: dev.ip }).catch(() => {});
                       }}
                     >
                       <span className="flex items-center gap-2">
@@ -393,17 +384,6 @@ export default function ConfigPage() {
             </div>
           )}
 
-          {/* USB mode info */}
-          {cfg.scanner_mode === "usb" && (
-            <div className="pt-2 border-t border-border/40">
-              <Alert>
-                <Usb className="h-4 w-4" />
-                <AlertDescription className="text-xs">
-                  Branchez le lecteur USB RFID. Aucune configuration requise — le lecteur sera détecté automatiquement comme clavier HID.
-                </AlertDescription>
-              </Alert>
-            </div>
-          )}
         </CardContent>
       </Card>
 
