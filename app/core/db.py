@@ -5409,6 +5409,33 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
         return int(cur.rowcount or 0)
 
 
+def count_today_for_user_door(
+    *, user_id: int, device_id: int, door_id: int
+) -> int:
+    """
+    Number of successful (allowed=1) access_history rows for this user on
+    this device's given door since local midnight (today in local timezone).
+
+    Powers the anti-fraud daily-pass-limit alert in DecisionService.
+    Filters WHERE user_id IS NOT NULL implicitly — passing None short-circuits
+    SQLite's NULL-comparison rule and returns 0, so pre-feature rows never
+    participate. Uses ix_access_history_user_door_day composite index.
+    """
+    if user_id is None:
+        return 0
+    sql = """
+        SELECT COUNT(*) FROM access_history
+        WHERE user_id = ?
+          AND device_id = ?
+          AND door_id = ?
+          AND allowed = 1
+          AND date(created_at, 'localtime') = date('now', 'localtime')
+    """
+    with get_conn() as conn:
+        row = conn.execute(sql, (int(user_id), int(device_id), int(door_id))).fetchone()
+    return int(row[0]) if row else 0
+
+
 def prune_access_history(*, retention_days: int) -> int:
     days = int(retention_days)
     if days < 1:
