@@ -124,10 +124,16 @@ export function AccessFeedbackProvider({ children }: { children: ReactNode }) {
   // Effect Events are intentionally omitted from deps so the SSE connection
   // stays stable across config/beacon renders.
   useEffect(() => {
+    const ACCEPTED_EVENT_TYPES = new Set<string>([
+      "device_push_success",
+      "sync_completed_success",
+      "anti_fraud_duration",
+      "anti_fraud_daily_limit",
+    ]);
     const es = openSSE(
       "/feedback/events",
       (type, data) => {
-        if (type !== "device_push_success" && type !== "sync_completed_success") {
+        if (!ACCEPTED_EVENT_TYPES.has(type)) {
           return;
         }
         if (!data || typeof data !== "object") {
