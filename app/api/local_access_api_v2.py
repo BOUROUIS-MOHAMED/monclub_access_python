@@ -1528,6 +1528,30 @@ def _handle_feedback_sound_sync_complete_delete(ctx: _Ctx) -> None:
     _handle_feedback_sound_delete(ctx, "sync-complete")
 
 
+def _handle_feedback_sound_anti_fraud_duration_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_duration_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_duration_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "anti-fraud-daily-limit")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "anti-fraud-daily-limit")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "anti-fraud-daily-limit")
+
+
 # ==================== 4) SYNC + CACHE ====================
 
 def _schedule_sync_request(
