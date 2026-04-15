@@ -637,9 +637,10 @@ def init_db() -> None:
                 created_at TEXT,
                 updated_at TEXT,
 
-                anti_fraude_card     INTEGER NOT NULL DEFAULT 1,
-                anti_fraude_qr_code  INTEGER NOT NULL DEFAULT 1,
-                anti_fraude_duration INTEGER NOT NULL DEFAULT 30
+                anti_fraude_card             INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_qr_code          INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_duration         INTEGER NOT NULL DEFAULT 30,
+                anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -693,9 +694,10 @@ def init_db() -> None:
         _ensure_column(conn, "sync_devices", "authorize_timezone_id", "authorize_timezone_id INTEGER")
         _ensure_column(conn, "sync_devices", "pushing_to_device_policy", "pushing_to_device_policy TEXT")
 
-        _ensure_column(conn, "sync_devices", "anti_fraude_card",     "anti_fraude_card INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",  "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "sync_devices", "anti_fraude_duration", "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
+        _ensure_column(conn, "sync_devices", "anti_fraude_card",             "anti_fraude_card INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",          "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_duration",         "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
+        _ensure_column(conn, "sync_devices", "anti_fraude_daily_pass_limit", "anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0")
 
         # F-015: Deduplicate sync_devices by id before adding unique index
         conn.execute("""
@@ -837,6 +839,11 @@ def init_db() -> None:
         _ensure_column(conn, "access_history", "backend_next_retry_at", "backend_next_retry_at TEXT")
         _ensure_column(conn, "access_history", "backend_synced_at", "backend_synced_at TEXT")
         _ensure_column(conn, "access_history", "backend_last_error", "backend_last_error TEXT")
+        # Anti-fraud daily-limit feature: user_id resolved at insert time so
+        # count_today_for_user_door() can query directly by user without joining
+        # sync_users (JOIN is ambiguous for cards that get reassigned and
+        # undefined for QR credentials which have no card_no).
+        _ensure_column(conn, "access_history", "user_id", "user_id INTEGER")
         conn.execute("UPDATE access_history SET history_source='AGENT' WHERE history_source IS NULL OR history_source=''")
         conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
         conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
@@ -850,6 +857,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_access_history_source_time "
             "ON access_history(history_source, event_time);"
+        )
+        # Anti-fraud daily-pass-limit: composite index that bounds
+        # count_today_for_user_door(user_id, device_id, door_id) to O(log n)
+        # even as access_history grows. Partial index on allowed=1 would be
+        # tighter but SQLite partial-index predicate evaluation cost isn't
+        # worth it at gym-scale row counts; the full composite suffices.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_access_history_user_door_day "
+            "ON access_history(user_id, device_id, door_id, allowed, created_at);"
         )
 
         # -----------------------------
