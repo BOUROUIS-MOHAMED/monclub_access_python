@@ -52,7 +52,7 @@ AF_SETTINGS = {
 }
 
 
-def _make_ds(settings_override=None, guard=None):
+def _make_ds(settings_override=None, guard=None, feedback_callback=None):
     settings = {**AF_SETTINGS, **(settings_override or {})}
     cmd_bus = MagicMock()
     cmd_bus.open_door.return_value = CommandResult(ok=True, error="", cmd_ms=0.0)
@@ -68,6 +68,7 @@ def _make_ds(settings_override=None, guard=None):
         notify_gate=NotificationGate(global_settings=lambda: {}),
         decision_ema=EMA(alpha=0.1),
         guard=guard or AntiFraudGuard(),
+        feedback_callback=feedback_callback,
     )
     return ds, cmd_bus
 
@@ -220,3 +221,231 @@ class TestGuardRecord:
 
         blocked, _ = guard.check(DEVICE_ID, CARD_NO, "card")
         assert blocked is False  # allowed=False → not recorded
+
+
+# ---------------------------------------------------------------------------
+# Audio feedback for duration block (Task 2.8) and daily-limit alert (Task 2.9)
+# ---------------------------------------------------------------------------
+
+class TestAntiFraudAudioFeedback:
+    """Verify feedback_callback fires on anti-fraud events (sound/toast cues)."""
+
+    def test_duration_card_block_emits_anti_fraud_duration(self):
+        guard = AntiFraudGuard()
+        guard.record(DEVICE_ID, CARD_NO, "card", 30.0)  # pre-block
+        events = []
+        ds, _ = _make_ds(
+            guard=guard,
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=0),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+
+        kinds = [k for k, _ in events]
+        assert "anti-fraud-duration" in kinds
+        payload = next(p for k, p in events if k == "anti-fraud-duration")
+        assert payload["reason"] == "DENY_ANTI_FRAUD_CARD"
+        assert payload["device_id"] == DEVICE_ID
+        assert payload["remaining_seconds"] > 0
+
+    def test_duration_without_feedback_callback_is_silent(self):
+        """No callback = no emit = no error."""
+        guard = AntiFraudGuard()
+        guard.record(DEVICE_ID, CARD_NO, "card", 30.0)
+        ds, _ = _make_ds(guard=guard, feedback_callback=None)
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=0),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+        # No assertion beyond "didn't crash" — the test passes if _run_one_event returns
+
+    def test_daily_limit_zero_never_queries_count(self):
+        """limit=0 short-circuits the check — count_today_for_user_door not called."""
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 0,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=1),
+            patch("app.core.realtime_agent.count_today_for_user_door") as mock_count,
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    "user": {"userId": 99, "fullName": "Test User"},
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+            mock_count.assert_not_called()
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert daily_events == []
+
+    def test_daily_limit_below_limit_emits_nothing(self):
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 5,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=1),
+            patch("app.core.realtime_agent.count_today_for_user_door", return_value=3),
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    "user": {"userId": 99, "fullName": "Test User"},
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert daily_events == []
+
+    def test_daily_limit_at_limit_emits_nothing(self):
+        """Count == limit is OK (Nth entry is the last allowed silent one)."""
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 5,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=1),
+            patch("app.core.realtime_agent.count_today_for_user_door", return_value=5),
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    "user": {"userId": 99, "fullName": "Test User"},
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert daily_events == []
+
+    def test_daily_limit_above_limit_emits_alert(self):
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 5,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=1),
+            patch("app.core.realtime_agent.count_today_for_user_door", return_value=6),
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    "user": {"userId": 99, "fullName": "Karim Ahmed"},
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert len(daily_events) == 1
+        p = daily_events[0]
+        assert p["user_id"] == 99
+        assert p["full_name"] == "Karim Ahmed"
+        assert p["count_today"] == 6
+        assert p["limit"] == 5
+        assert p["device_id"] == DEVICE_ID
+
+    def test_daily_limit_skipped_when_user_id_not_resolved(self):
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 5,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=1),
+            patch("app.core.realtime_agent.count_today_for_user_door", return_value=99),
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    # No user dict → user_id unresolved
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert daily_events == []
+
+    def test_daily_limit_skipped_when_history_not_claimed(self):
+        events = []
+        ds, _ = _make_ds(
+            settings_override={
+                "save_history": True,
+                "anti_fraude_daily_pass_limit": 5,
+            },
+            feedback_callback=lambda kind, payload: events.append((kind, payload)),
+        )
+        ev = _make_event()
+
+        with (
+            patch("app.core.realtime_agent.access_history_exists", return_value=False),
+            patch("app.core.realtime_agent.insert_access_history", return_value=0),  # dedup
+            patch("app.core.realtime_agent.count_today_for_user_door", return_value=99),
+            patch.object(
+                ds, "_verify_totp",
+                return_value={
+                    "allowed": True, "reason": "GRANT", "scanMode": "RFID",
+                    "user": {"userId": 99, "fullName": "X"},
+                },
+            ),
+            patch.object(ds, "_load_local_state", return_value=([], {}, {})),
+        ):
+            _run_one_event(ds, ev)
+
+        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        assert daily_events == []
