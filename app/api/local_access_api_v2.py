@@ -4308,6 +4308,45 @@ _discovery_running = False
 _discovery_devices: list = []
 _discovery_cancel = threading.Event()
 
+def get_scan_session():
+    from app.core.scan_session import get_scan_session as _get_scan_session
+    return _get_scan_session()
+
+
+def _handle_scan_start(ctx: _Ctx) -> None:
+    from app.core.config import load_config
+    cfg = load_config()
+    body = ctx.body()
+    session = get_scan_session()
+    started = session.start(
+        mode=_safe_str(body.get("mode"), cfg.scanner_mode) or "zkemkeeper",
+        ip=_safe_str(body.get("ip"), cfg.scanner_network_ip) or "",
+        port=_safe_int(body.get("port"), cfg.scanner_network_port) or 4370,
+        timeout_ms=_safe_int(body.get("timeout_ms"), cfg.scanner_network_timeout_ms) or 5000,
+        usb_device_path=_safe_str(body.get("usb_device_path"), cfg.scanner_usb_device_path) or "",
+    )
+    if started:
+        ctx.send_json(200, {"ok": True})
+    else:
+        ctx.send_json(409, {"ok": False, "error": "Scan session already active"})
+
+
+def _handle_scan_stream(ctx: _Ctx) -> None:
+    session = get_scan_session()
+    ctx.send_sse_start()
+    if not ctx.send_sse_event("scan", {"status": "ready"}):
+        return
+    last_ping = time.time()
+    while True:
+        event = session.wait_event(timeout=0.5)
+        if event:
+            ctx.send_sse_event("scan", event)
+            return
+        if time.time() - last_ping > 10:
+            if not ctx.send_sse_event("ping", {"t": int(time.time())}):
+                return
+            last_ping = time.time()
+
 
 def _handle_scanner_start(ctx: _Ctx) -> None:
     from app.core.card_scanner import get_scanner
@@ -5401,6 +5440,7 @@ class LocalApiServerV2:
                         # enroll/start still requires physical ZK device interaction.
                         "_handle_sync_now", "_handle_sync_fast_patch_bundle",
                         "_handle_enroll_start", "_handle_enroll_retry_push",
+                        "_handle_scan_start", "_handle_scan_stream",
                     }
                     fn_name = getattr(handler_fn, "__name__", "")
                     if fn_name not in _AUTH_EXEMPT:
