@@ -5253,6 +5253,7 @@ def _build_access_history_insert_params(
     raw: Dict[str, Any] | None,
     history_source: str | None,
     backend_sync_state: str | None,
+    user_id: int | None = None,
 ) -> tuple[Any, ...]:
     return (
         now_iso(),
@@ -5272,6 +5273,7 @@ def _build_access_history_insert_params(
         json.dumps(raw or {}, ensure_ascii=False),
         normalize_access_history_source(history_source),
         normalize_access_history_sync_state(backend_sync_state),
+        int(user_id) if user_id is not None else None,
     )
 
 
@@ -5293,11 +5295,18 @@ def insert_access_history(
     raw: Dict[str, Any] | None,
     history_source: str | None = None,
     backend_sync_state: str | None = None,
+    user_id: int | None = None,
 ) -> int:
     """
     Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
     Returns rowcount: 1 if inserted (first worker to claim), 0 if already exists.
     F-013: callers should only open_door if return value is 1.
+
+    user_id is optional — resolved by DecisionService after verify_card/verify_totp
+    when available. It powers the anti-fraud daily-pass-limit counter
+    (count_today_for_user_door). Rows inserted before this feature shipped have
+    NULL user_id; the counter query filters WHERE user_id IS NOT NULL so those
+    rows never participate.
     """
     if not str(event_id or "").strip():
         return 0
@@ -5314,8 +5323,9 @@ def insert_access_history(
                     cmd_ok, cmd_error,
                     raw_json,
                     history_source,
-                    backend_sync_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    backend_sync_state,
+                    user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _build_access_history_insert_params(
                     event_id=event_id,
@@ -5334,6 +5344,7 @@ def insert_access_history(
                     raw=raw,
                     history_source=history_source,
                     backend_sync_state=backend_sync_state,
+                    user_id=user_id,
                 ),
             )
             conn.commit()
@@ -5368,6 +5379,7 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 raw=row.get("raw"),
                 history_source=row.get("history_source", row.get("historySource")),
                 backend_sync_state=row.get("backend_sync_state", row.get("backendSyncState")),
+                user_id=row.get("user_id", row.get("userId")),
             )
         )
     if not batch:
@@ -5383,8 +5395,9 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 cmd_ok, cmd_error,
                 raw_json,
                 history_source,
-                backend_sync_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                backend_sync_state,
+                user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             batch,
         )
