@@ -1329,6 +1329,22 @@ _FEEDBACK_SOUND_SPECS: Dict[str, Dict[str, str]] = {
         "path_field": "sync_success_custom_sound_path",
         "base_name": "sync-complete-success",
     },
+    # Anti-fraud duration block — fires when a card/QR is re-used within
+    # anti_fraude_duration seconds on the same device. The existing popup is
+    # augmented with this audio cue.
+    "anti-fraud-duration": {
+        "source_field": "anti_fraud_duration_sound_source",
+        "path_field": "anti_fraud_duration_custom_sound_path",
+        "base_name": "anti-fraud-duration-default",
+    },
+    # Anti-fraud daily-pass-limit — fires every time a user's successful entry
+    # count on a door crosses the configured daily limit. Alert only — the
+    # door still opens.
+    "anti-fraud-daily-limit": {
+        "source_field": "anti_fraud_daily_limit_sound_source",
+        "path_field": "anti_fraud_daily_limit_custom_sound_path",
+        "base_name": "anti-fraud-daily-limit-default",
+    },
 }
 
 _FEEDBACK_SOUND_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a"}
