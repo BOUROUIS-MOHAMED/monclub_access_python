@@ -2153,7 +2153,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             created_at, updated_at,
 
-            anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration
+            anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration,
+            anti_fraude_daily_pass_limit
         )
         VALUES (
             ?, ?, ?, ?,
@@ -2172,7 +2173,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?, ?,
             ?, ?,
             ?, ?,
-            ?, ?, ?
+            ?, ?, ?,
+            ?
         )
         """,
         (
@@ -2245,6 +2247,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _bool_to_i(d.get("antiFraudeCard", True), default=1),
             _bool_to_i(d.get("antiFraudeQrCode", True), default=1),
             _to_int_or_none(d.get("antiFraudeDuration", 30)) or 30,
+            _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
         ),
     )
 
@@ -3649,9 +3652,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "createdAt": g("createdAt", "created_at"),
         "updatedAt": g("updatedAt", "updated_at"),
 
-        "antiFraudeCard":     _boolish(g("anti_fraude_card",    default=1), True),
-        "antiFraudeQrCode":   _boolish(g("anti_fraude_qr_code", default=1), True),
-        "antiFraudeDuration": _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
+        "antiFraudeCard":             _boolish(g("anti_fraude_card",    default=1), True),
+        "antiFraudeQrCode":           _boolish(g("anti_fraude_qr_code", default=1), True),
+        "antiFraudeDuration":         _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
+        "antiFraudeDailyPassLimit":   int(g("anti_fraude_daily_pass_limit", default=0) or 0),
 
         # attached later by list_sync_devices_payload (synced presets)
         "doorPresets": g("doorPresets", "door_presets", default=None) or [],

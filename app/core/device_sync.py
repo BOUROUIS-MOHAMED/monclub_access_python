@@ -994,9 +994,10 @@ class DeviceSyncEngine:
             "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
 
             # Anti-fraud settings (per-device)
-            "anti_fraude_card":     _boolish(g("anti_fraude_card",    "antiFraudeCard",    default=True), True),
-            "anti_fraude_qr_code":  _boolish(g("anti_fraude_qr_code", "antiFraudeQrCode",  default=True), True),
-            "anti_fraude_duration": _to_int(g("anti_fraude_duration", "antiFraudeDuration", default=30), default=30) or 30,
+            "anti_fraude_card":             _boolish(g("anti_fraude_card",             "antiFraudeCard",             default=True), True),
+            "anti_fraude_qr_code":          _boolish(g("anti_fraude_qr_code",          "antiFraudeQrCode",           default=True), True),
+            "anti_fraude_duration":         _to_int(g("anti_fraude_duration",          "antiFraudeDuration",         default=30), default=30) or 30,
+            "anti_fraude_daily_pass_limit": _to_int(g("anti_fraude_daily_pass_limit",  "antiFraudeDailyPassLimit",   default=0),  default=0)  or 0,
         }
 
     def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
