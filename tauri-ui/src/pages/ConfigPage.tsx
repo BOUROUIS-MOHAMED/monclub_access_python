@@ -73,9 +73,13 @@ export default function ConfigPage() {
   const { startDiscover, discovering, discoveredDevices } = useScanCard();
   const devicePushSoundInputRef = useRef<HTMLInputElement | null>(null);
   const syncCompleteSoundInputRef = useRef<HTMLInputElement | null>(null);
+  const antiFraudDurationSoundInputRef = useRef<HTMLInputElement | null>(null);
+  const antiFraudDailyLimitSoundInputRef = useRef<HTMLInputElement | null>(null);
   const [soundUploading, setSoundUploading] = useState({
     devicePush: false,
     syncComplete: false,
+    antiFraudDuration: false,
+    antiFraudDailyLimit: false,
   });
 
   const broadcastFeedbackConfig = useCallback((nextCfg: Record<string, any>) => {
@@ -140,6 +144,8 @@ export default function ConfigPage() {
       ...prev,
       devicePush: kind === "device-push" ? true : prev.devicePush,
       syncComplete: kind === "sync-complete" ? true : prev.syncComplete,
+      antiFraudDuration: kind === "anti-fraud-duration" ? true : prev.antiFraudDuration,
+      antiFraudDailyLimit: kind === "anti-fraud-daily-limit" ? true : prev.antiFraudDailyLimit,
     }));
     try {
       await uploadFeedbackSound(kind, file);
@@ -151,13 +157,13 @@ export default function ConfigPage() {
         ...prev,
         devicePush: kind === "device-push" ? false : prev.devicePush,
         syncComplete: kind === "sync-complete" ? false : prev.syncComplete,
+        antiFraudDuration: kind === "anti-fraud-duration" ? false : prev.antiFraudDuration,
+        antiFraudDailyLimit: kind === "anti-fraud-daily-limit" ? false : prev.antiFraudDailyLimit,
       }));
-      if (kind === "device-push" && devicePushSoundInputRef.current) {
-        devicePushSoundInputRef.current.value = "";
-      }
-      if (kind === "sync-complete" && syncCompleteSoundInputRef.current) {
-        syncCompleteSoundInputRef.current.value = "";
-      }
+      if (kind === "device-push" && devicePushSoundInputRef.current) devicePushSoundInputRef.current.value = "";
+      if (kind === "sync-complete" && syncCompleteSoundInputRef.current) syncCompleteSoundInputRef.current.value = "";
+      if (kind === "anti-fraud-duration" && antiFraudDurationSoundInputRef.current) antiFraudDurationSoundInputRef.current.value = "";
+      if (kind === "anti-fraud-daily-limit" && antiFraudDailyLimitSoundInputRef.current) antiFraudDailyLimitSoundInputRef.current.value = "";
     }
   }, [loadConfig]);
 
@@ -167,6 +173,8 @@ export default function ConfigPage() {
       ...prev,
       devicePush: kind === "device-push" ? true : prev.devicePush,
       syncComplete: kind === "sync-complete" ? true : prev.syncComplete,
+      antiFraudDuration: kind === "anti-fraud-duration" ? true : prev.antiFraudDuration,
+      antiFraudDailyLimit: kind === "anti-fraud-daily-limit" ? true : prev.antiFraudDailyLimit,
     }));
     try {
       await resetFeedbackSound(kind);
@@ -178,6 +186,8 @@ export default function ConfigPage() {
         ...prev,
         devicePush: kind === "device-push" ? false : prev.devicePush,
         syncComplete: kind === "sync-complete" ? false : prev.syncComplete,
+        antiFraudDuration: kind === "anti-fraud-duration" ? false : prev.antiFraudDuration,
+        antiFraudDailyLimit: kind === "anti-fraud-daily-limit" ? false : prev.antiFraudDailyLimit,
       }));
     }
   }, [loadConfig]);
@@ -208,8 +218,12 @@ export default function ConfigPage() {
     : (updates?.currentReleaseId || "dev");
   const devicePushCustomFileName = currentFeedbackFileName(cfg.push_success_custom_sound_path);
   const syncCompleteCustomFileName = currentFeedbackFileName(cfg.sync_success_custom_sound_path);
+  const antiFraudDurationCustomFileName = currentFeedbackFileName(cfg.anti_fraud_duration_custom_sound_path);
+  const antiFraudDailyLimitCustomFileName = currentFeedbackFileName(cfg.anti_fraud_daily_limit_custom_sound_path);
   const devicePushUploading = soundUploading.devicePush;
   const syncCompleteUploading = soundUploading.syncComplete;
+  const antiFraudDurationUploading = soundUploading.antiFraudDuration;
+  const antiFraudDailyLimitUploading = soundUploading.antiFraudDailyLimit;
 
   if (loading) {
     return <div className="flex items-center justify-center py-20"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
@@ -586,6 +600,160 @@ export default function ConfigPage() {
               </Button>
               <span className="text-xs text-muted-foreground">
                 {syncCompleteCustomFileName ? `Actuel : ${syncCompleteCustomFileName}` : "Aucun son personnalisé sélectionné."}
+              </span>
+            </div>
+          </div>
+
+          <Separator />
+
+          {/* ── Anti-fraude durée ── */}
+          <div className="space-y-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label>Anti-fraude durée</Label>
+                <p className="text-sm text-muted-foreground">
+                  Son joué quand un utilisateur est refusé pour tentative de passage trop rapide (anti-fraude durée).
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_duration}</code>
+                </p>
+              </div>
+              <div className="grid min-w-[180px] gap-3">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="anti-fraud-duration-sound-switch" className="text-xs">Son</Label>
+                  <Switch
+                    id="anti-fraud-duration-sound-switch"
+                    checked={Boolean(cfg.anti_fraud_duration_sound_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ anti_fraud_duration_sound_enabled: checked }); }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Source du son</Label>
+                <Select
+                  value={String(cfg.anti_fraud_duration_sound_source || "default")}
+                  onValueChange={(value) => { void patchFeedbackConfig({ anti_fraud_duration_sound_source: value }); }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Son par défaut</SelectItem>
+                    <SelectItem value="custom">Son personnalisé</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={antiFraudDurationSoundInputRef}
+                type="file"
+                accept=".mp3,.wav,.ogg,.m4a,audio/*"
+                className="hidden"
+                onChange={(event) => { void handleFeedbackSoundUpload("anti-fraud-duration", event.target.files?.[0] ?? null); }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={antiFraudDurationUploading}
+                onClick={() => antiFraudDurationSoundInputRef.current?.click()}
+              >
+                {antiFraudDurationUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {antiFraudDurationCustomFileName ? "Remplacer le son" : "Choisir un son"}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={antiFraudDurationUploading || !antiFraudDurationCustomFileName}
+                onClick={() => { void handleFeedbackSoundReset("anti-fraud-duration"); }}
+              >
+                <RotateCcw className="h-4 w-4" /> Réinitialiser
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {antiFraudDurationCustomFileName ? `Actuel : ${antiFraudDurationCustomFileName}` : "Aucun son personnalisé sélectionné."}
+              </span>
+            </div>
+          </div>
+
+          <Separator />
+
+          {/* ── Limite journalière ── */}
+          <div className="space-y-3">
+            <div className="flex items-start justify-between gap-4">
+              <div className="space-y-1">
+                <Label>Limite de passages journalière</Label>
+                <p className="text-sm text-muted-foreground">
+                  Son joué quand un utilisateur dépasse sa limite de passages journalière (alerte seulement — l&apos;accès est accordé).
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Son par défaut : <code className="bg-muted px-1 rounded">{DEFAULT_FEEDBACK_SOUNDS.anti_fraud_daily_limit}</code>
+                </p>
+              </div>
+              <div className="grid min-w-[180px] gap-3">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="anti-fraud-daily-limit-sound-switch" className="text-xs">Son</Label>
+                  <Switch
+                    id="anti-fraud-daily-limit-sound-switch"
+                    checked={Boolean(cfg.anti_fraud_daily_limit_sound_enabled ?? true)}
+                    onCheckedChange={(checked: boolean) => { void patchFeedbackConfig({ anti_fraud_daily_limit_sound_enabled: checked }); }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Source du son</Label>
+                <Select
+                  value={String(cfg.anti_fraud_daily_limit_sound_source || "default")}
+                  onValueChange={(value) => { void patchFeedbackConfig({ anti_fraud_daily_limit_sound_source: value }); }}
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Son par défaut</SelectItem>
+                    <SelectItem value="custom">Son personnalisé</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={antiFraudDailyLimitSoundInputRef}
+                type="file"
+                accept=".mp3,.wav,.ogg,.m4a,audio/*"
+                className="hidden"
+                onChange={(event) => { void handleFeedbackSoundUpload("anti-fraud-daily-limit", event.target.files?.[0] ?? null); }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={antiFraudDailyLimitUploading}
+                onClick={() => antiFraudDailyLimitSoundInputRef.current?.click()}
+              >
+                {antiFraudDailyLimitUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {antiFraudDailyLimitCustomFileName ? "Remplacer le son" : "Choisir un son"}
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={antiFraudDailyLimitUploading || !antiFraudDailyLimitCustomFileName}
+                onClick={() => { void handleFeedbackSoundReset("anti-fraud-daily-limit"); }}
+              >
+                <RotateCcw className="h-4 w-4" /> Réinitialiser
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                {antiFraudDailyLimitCustomFileName ? `Actuel : ${antiFraudDailyLimitCustomFileName}` : "Aucun son personnalisé sélectionné."}
               </span>
             </div>
           </div>

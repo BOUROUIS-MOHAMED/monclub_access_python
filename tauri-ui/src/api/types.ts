@@ -142,8 +142,10 @@ export interface AppConfig {
   // as the sync/push sounds above. Played by the Tauri UI when it receives
   // an anti-fraud-duration or anti-fraud-daily-limit feedback event from the
   // access app's /api/v2/feedback/events SSE stream.
+  anti_fraud_duration_sound_enabled: boolean;
   anti_fraud_duration_sound_source: "default" | "custom";
   anti_fraud_duration_custom_sound_path: string;
+  anti_fraud_daily_limit_sound_enabled: boolean;
   anti_fraud_daily_limit_sound_source: "default" | "custom";
   anti_fraud_daily_limit_custom_sound_path: string;
   autostart_bindings_enabled?: boolean;

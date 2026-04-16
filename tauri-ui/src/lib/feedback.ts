@@ -37,12 +37,10 @@ export function isFeedbackSoundEnabled(cfg: AppConfig | null, eventType: Feedbac
   switch (eventType) {
     case "device_push_success": return Boolean(cfg.push_success_sound_enabled);
     case "sync_completed_success": return Boolean(cfg.sync_success_sound_enabled);
-    // Anti-fraud sounds follow the same per-app enable/disable toggle as sync
-    // sounds for now — if an operator has sync sounds off for a quiet floor
-    // they probably want anti-fraud sounds off too. Can be split later.
     case "anti_fraud_duration":
+      return Boolean(cfg.anti_fraud_duration_sound_enabled ?? true);
     case "anti_fraud_daily_limit":
-      return Boolean(cfg.sync_success_sound_enabled);
+      return Boolean(cfg.anti_fraud_daily_limit_sound_enabled ?? true);
   }
 }
 

@@ -494,7 +494,6 @@ export default function PopupWindow() {
 
         {/* info grid */}
         <div className="grid grid-cols-2 gap-x-10 gap-y-7 mb-8 relative z-10">
-          {n.userPhone ? <InfoCell label="Téléphone" value={n.userPhone} /> : null}
           {n.userValidFrom ? <InfoCell label="Début" value={n.userValidFrom.slice(0, 10)} /> : null}
           {n.userValidTo ? <InfoCell label="Fin" value={n.userValidTo.slice(0, 10)} /> : null}
           {!n.userPhone && !n.userValidFrom && !n.userValidTo && n.reason ? (

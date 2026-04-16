@@ -1075,7 +1075,7 @@ class DecisionService(threading.Thread):
                 # Audio cue fires regardless of show_notifications — this is a
                 # distinct "sound alert" preference (operator may silence popups
                 # on busy devices but still want to hear anti-fraud fires).
-                self._emit_feedback("anti-fraud-duration", {
+                self._emit_feedback("anti_fraud_duration", {
                     "user_id": None,
                     "full_name": "",
                     "device_id": int(ev.device_id),
@@ -1117,7 +1117,7 @@ class DecisionService(threading.Thread):
                     vr = {**vr, "allowed": False, "reason": reason, "_af_remaining": _af_remaining}
                     # QR credential resolved → we know the user for the alert payload.
                     _qr_user = vr.get("user") or {}
-                    self._emit_feedback("anti-fraud-duration", {
+                    self._emit_feedback("anti_fraud_duration", {
                         "user_id": _qr_user.get("userId"),
                         "full_name": _qr_user.get("fullName") or "",
                         "device_id": int(ev.device_id),
@@ -1235,7 +1235,7 @@ class DecisionService(threading.Thread):
                     )
                 if _count_today > _af_daily_limit:
                     _u = vr.get("user") if isinstance(vr, dict) else None
-                    self._emit_feedback("anti-fraud-daily-limit", {
+                    self._emit_feedback("anti_fraud_daily_limit", {
                         "user_id": int(_resolved_user_id),
                         "full_name": _safe_str((_u or {}).get("fullName"), "") if isinstance(_u, dict) else "",
                         "count_today": int(_count_today),
