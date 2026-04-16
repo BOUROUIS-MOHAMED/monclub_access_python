@@ -215,6 +215,17 @@ export interface DoorPresetDto {
   doorNumber: number;
   pulseSeconds: number;
   doorName: string;
+  favoriteEnabled?: boolean;
+  favoriteOrder?: number | null;
+  favoriteShortcut?: string | null;
+}
+
+export interface FavoriteDoorPresetDto extends DoorPresetDto {
+  deviceName: string;
+}
+
+export interface FavoritePresetsResponse {
+  favorites: FavoriteDoorPresetDto[];
 }
 
 export interface DeviceDto {

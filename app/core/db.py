@@ -721,12 +721,18 @@ def init_db() -> None:
                 pulse_seconds INTEGER NOT NULL,
                 door_name TEXT NOT NULL,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                favorite_enabled INTEGER NOT NULL DEFAULT 0,
+                favorite_order INTEGER,
+                favorite_shortcut TEXT
             );
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_ddp_device_id ON sync_device_door_presets(device_id);")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_ddp_remote_id ON sync_device_door_presets(remote_id);")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_enabled", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_order", "INTEGER")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_shortcut", "TEXT")
 
         # -----------------------------
         # infrastructures
@@ -2101,9 +2107,10 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                 continue
             cur.execute(
                 """
-                INSERT INTO sync_device_door_presets (
-                    remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO sync_device_door_presets (
+                    remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                    favorite_enabled, favorite_order, favorite_shortcut
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _to_int_or_none(p.get("id")),
@@ -2113,6 +2120,9 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                     _safe_str(p.get("doorName"), ""),
                     _safe_str(p.get("createdAt"), None),
                     _safe_str(p.get("updatedAt"), None),
+                    1 if p.get("favoriteEnabled") else 0,
+                    _to_int_or_none(p.get("favoriteOrder")),
+                    _safe_str(p.get("favoriteShortcut"), None),
                 ),
             )
 
@@ -3492,7 +3502,8 @@ def _load_synced_door_presets_index() -> Dict[int, List[Dict[str, Any]]]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                   favorite_enabled, favorite_order, favorite_shortcut
             FROM sync_device_door_presets
             ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
             """
@@ -3516,6 +3527,9 @@ def _build_synced_door_presets_index_from_rows(rows: List[Dict[str, Any]]) -> Di
                 "doorName": _safe_str(r.get("door_name"), ""),
                 "createdAt": _safe_str(r.get("created_at"), ""),
                 "updatedAt": _safe_str(r.get("updated_at"), ""),
+                "favoriteEnabled": bool(r.get("favorite_enabled")),
+                "favoriteOrder": r.get("favorite_order"),
+                "favoriteShortcut": r.get("favorite_shortcut"),
             }
         )
     return idx
@@ -3530,7 +3544,8 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                   favorite_enabled, favorite_order, favorite_shortcut
             FROM sync_device_door_presets
             WHERE device_id = ?
             ORDER BY door_number ASC, remote_id ASC, id ASC
@@ -3549,9 +3564,41 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
                 "doorName": _safe_str(r["door_name"], ""),  # type: ignore[index]
                 "createdAt": _safe_str(r["created_at"], ""),  # type: ignore[index]
                 "updatedAt": _safe_str(r["updated_at"], ""),  # type: ignore[index]
+                "favoriteEnabled": bool(r["favorite_enabled"]),  # type: ignore[index]
+                "favoriteOrder": r["favorite_order"],  # type: ignore[index]
+                "favoriteShortcut": r["favorite_shortcut"],  # type: ignore[index]
             }
         )
     return payload
+
+
+def list_favorite_presets() -> List[Dict[str, Any]]:
+    """Returns all synced door presets where favorite_enabled=1, sorted by favorite_order."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, d.name as device_name, d.ip_address, d.id as device_id_val
+            FROM sync_device_door_presets p
+            JOIN sync_devices d ON d.id = p.device_id
+            WHERE p.favorite_enabled = 1
+            ORDER BY p.favorite_order ASC NULLS LAST
+            """
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            result.append({
+                "id": row.get("remote_id") or row.get("id"),
+                "deviceId": row.get("device_id"),
+                "deviceName": row.get("device_name", ""),
+                "doorNumber": row.get("door_number"),
+                "pulseSeconds": row.get("pulse_seconds"),
+                "doorName": row.get("door_name", ""),
+                "favoriteEnabled": bool(row.get("favorite_enabled")),
+                "favoriteOrder": row.get("favorite_order"),
+                "favoriteShortcut": row.get("favorite_shortcut"),
+            })
+        return result
 
 
 def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -4120,7 +4167,8 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
             dict(r)
             for r in conn.execute(
                 """
-                SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+                SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                       favorite_enabled, favorite_order, favorite_shortcut
                 FROM sync_device_door_presets
                 ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
                 """
@@ -4469,6 +4517,9 @@ def list_sync_device_door_presets_payload_from_cache(
                     "doorName": _safe_str(preset.get("doorName"), ""),
                     "createdAt": _safe_str(preset.get("createdAt"), ""),
                     "updatedAt": _safe_str(preset.get("updatedAt"), ""),
+                    "favoriteEnabled": bool(preset.get("favoriteEnabled")),
+                    "favoriteOrder": preset.get("favoriteOrder"),
+                    "favoriteShortcut": preset.get("favoriteShortcut"),
                 }
             )
         return payload

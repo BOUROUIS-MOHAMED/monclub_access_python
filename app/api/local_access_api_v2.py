@@ -1777,6 +1777,15 @@ def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
     ctx.send_json(200, {"credentials": creds})
 
 
+def _handle_sync_cache_favorites(ctx: _Ctx) -> None:
+    """Returns all favorite door presets (favoriteEnabled=true), sorted by favoriteOrder."""
+    from app.core.db import list_favorite_presets
+    try:
+        favorites = list_favorite_presets()
+        ctx.send_json(200, {"favorites": favorites})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
 
 # ==================== 4.4) TV SYNC / CACHE / READINESS ====================
 

@@ -49,6 +49,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/sync/cache/devices", "_handle_sync_cache_devices"),
     ("GET", "/api/v2/sync/cache/infrastructures", "_handle_sync_cache_infrastructures"),
     ("GET", "/api/v2/sync/cache/credentials", "_handle_sync_cache_credentials"),
+    ("GET", "/api/v2/sync/cache/favorites", "_handle_sync_cache_favorites"),
     ("GET", "/api/v2/offline-creations/active", "_handle_offline_creations_active"),
     ("GET", "/api/v2/offline-creations/history", "_handle_offline_creations_history"),
     ("GET", "/api/v2/offline-creations/{localId}", "_handle_offline_creation_get"),
