@@ -258,7 +258,8 @@
       "Bash(grep -i \".java$\")",
       "Bash(grep -E \"\\\\.java$\")",
       "Bash(grep -i \".*\\\\.java$\")",
-      "Bash(xargs head:*)"
+      "Bash(xargs head:*)",
+      "Bash(grep -E \"\\\\.\\(ts|tsx|js\\)$\")"
     ]
   }
 }
