@@ -248,8 +248,8 @@ class TestAntiFraudAudioFeedback:
             _run_one_event(ds, ev)
 
         kinds = [k for k, _ in events]
-        assert "anti-fraud-duration" in kinds
-        payload = next(p for k, p in events if k == "anti-fraud-duration")
+        assert "anti_fraud_duration" in kinds
+        payload = next(p for k, p in events if k == "anti_fraud_duration")
         assert payload["reason"] == "DENY_ANTI_FRAUD_CARD"
         assert payload["device_id"] == DEVICE_ID
         assert payload["remaining_seconds"] > 0
@@ -296,7 +296,7 @@ class TestAntiFraudAudioFeedback:
         ):
             _run_one_event(ds, ev)
             mock_count.assert_not_called()
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert daily_events == []
 
     def test_daily_limit_below_limit_emits_nothing(self):
@@ -325,7 +325,7 @@ class TestAntiFraudAudioFeedback:
         ):
             _run_one_event(ds, ev)
 
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert daily_events == []
 
     def test_daily_limit_at_limit_emits_nothing(self):
@@ -354,7 +354,7 @@ class TestAntiFraudAudioFeedback:
             patch.object(ds, "_load_local_state", return_value=([], {}, {})),
         ):
             _run_one_event(ds, ev)
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert daily_events == []
 
     def test_daily_limit_above_limit_emits_alert(self):
@@ -383,7 +383,7 @@ class TestAntiFraudAudioFeedback:
         ):
             _run_one_event(ds, ev)
 
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert len(daily_events) == 1
         p = daily_events[0]
         assert p["user_id"] == 99
@@ -418,7 +418,7 @@ class TestAntiFraudAudioFeedback:
         ):
             _run_one_event(ds, ev)
 
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert daily_events == []
 
     def test_daily_limit_skipped_when_history_not_claimed(self):
@@ -447,5 +447,5 @@ class TestAntiFraudAudioFeedback:
         ):
             _run_one_event(ds, ev)
 
-        daily_events = [p for k, p in events if k == "anti-fraud-daily-limit"]
+        daily_events = [p for k, p in events if k == "anti_fraud_daily_limit"]
         assert daily_events == []

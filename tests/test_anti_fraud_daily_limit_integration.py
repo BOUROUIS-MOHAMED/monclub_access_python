@@ -151,7 +151,7 @@ def test_full_flow_fires_alert_above_limit():
     assert row[0] == 4, f"expected 4 allowed rows, got {row[0]}"
 
     # Verify feedback events: exactly ONE daily-limit alert (on the 4th entry)
-    daily_events = [p for k, p in events_emitted if k == "anti-fraud-daily-limit"]
+    daily_events = [p for k, p in events_emitted if k == "anti_fraud_daily_limit"]
     assert len(daily_events) == 1, (
         f"expected 1 daily-limit alert, got {len(daily_events)}: "
         f"{[e for e in events_emitted]}"
@@ -221,7 +221,7 @@ def test_full_flow_no_alert_when_limit_disabled():
         ds.stop()
         ds.join(timeout=1.0)
 
-    daily_events = [p for k, p in events_emitted if k == "anti-fraud-daily-limit"]
+    daily_events = [p for k, p in events_emitted if k == "anti_fraud_daily_limit"]
     assert daily_events == []
 
     _cleanup_test_rows()
