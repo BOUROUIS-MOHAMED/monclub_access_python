@@ -468,7 +468,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
         _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
         _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
-        _ensure_column(conn, "sync_users", "user_profile_image", "TEXT")
+        _ensure_column(conn, "sync_users", "user_profile_image", "user_profile_image TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception as _mig_exc:
