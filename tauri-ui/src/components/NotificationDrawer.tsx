@@ -50,7 +50,7 @@ export default function NotificationDrawer({ open, onClose, history, onClear }: 
                 <ListItem alignItems="flex-start" sx={{ px: 0, py: 1.5 }}>
                   <ListItemAvatar>
                     <Avatar
-                      src={evt.popupShowImage ? (evt.userImage || evt.imagePath || undefined) : undefined}
+                      src={evt.popupShowImage ? (evt.userImage || evt.userProfileImage || evt.imagePath || undefined) : undefined}
                       sx={{
                         bgcolor: evt.allowed ? "success.main" : "error.main",
                         width: 48, height: 48,

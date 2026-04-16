@@ -42,6 +42,7 @@ function toPopupEvent(raw: any): PopupEvent {
     userBirthday: raw?.userBirthday ? String(raw.userBirthday) : undefined,
     imageSource: raw?.imageSource ? String(raw.imageSource) : undefined,
     userImageStatus: raw?.userImageStatus ? String(raw.userImageStatus) : undefined,
+    userProfileImage: String(raw?.userProfileImage ?? ""),
   };
 }
 
@@ -172,6 +173,7 @@ export default function PopupWindow() {
   const shownCooldownRef = useRef<Map<string, number>>(new Map());
   const lastLocalRawRef = useRef<string>("");
   const goIdleRef = useRef<() => void>(() => {});
+  const fallbackChainRef = useRef<string[]>([]);
 
   // Keep phaseRef in sync
   const setPhaseSync = useCallback((p: "idle" | "showing") => {
@@ -195,12 +197,32 @@ export default function PopupWindow() {
       .catch(() => {});
   }, []);
 
+  function toCacheUrl(url: string): string {
+    if (url.startsWith("data:")) return url;
+    return `${API_BASE}/image-cache?url=${encodeURIComponent(url)}`;
+  }
+
+  function buildImageChain(evt: PopupEvent): string[] {
+    const candidates: string[] = [];
+    const am = (evt.userImage || evt.imagePath || "").trim();
+    const profile = (evt.userProfileImage || "").trim();
+    if (am) candidates.push(am);
+    if (profile && profile !== am) candidates.push(profile);
+    return candidates;
+  }
+
+  const handleImageError = useCallback(() => {
+    const next = fallbackChainRef.current.shift();
+    setImgSrc(next ? toCacheUrl(next) : null);
+  }, []);
+
   const resolveImage = useCallback((evt: PopupEvent) => {
     if (!evt.popupShowImage) { setImgSrc(null); return; }
-    const img = (evt.userImage || evt.imagePath || "").trim();
-    if (!img) { setImgSrc(null); return; }
-    if (img.startsWith("data:")) { setImgSrc(img); return; }
-    setImgSrc(`${API_BASE}/image-cache?url=${encodeURIComponent(img)}`);
+    const chain = buildImageChain(evt);
+    fallbackChainRef.current = chain.slice(1); // remaining fallbacks after the first
+    const first = chain[0];
+    if (!first) { setImgSrc(null); return; }
+    setImgSrc(toCacheUrl(first));
   }, []);
 
   // showEvent — transitions to "showing" state with proper timers
@@ -365,7 +387,7 @@ export default function PopupWindow() {
             src={imgSrc}
             alt=""
             className="absolute inset-0 w-full h-full object-cover object-top"
-            onError={() => setImgSrc(null)}
+            onError={handleImageError}
           />
         ) : (
           <div

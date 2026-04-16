@@ -1069,6 +1069,8 @@ export interface PopupEvent {
   imageSource?: string;
   /** "REQUIRED_CHANGE" | "OK" | undefined */
   userImageStatus?: string;
+  /** User profile image URL (USER_AVATAR), used as fallback when userImage fails or is empty */
+  userProfileImage?: string;
 }
 
 // ─── N) Host Monitor & Binding (A9) ───
