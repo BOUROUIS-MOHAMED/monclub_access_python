@@ -67,6 +67,7 @@ const ACCESS_PANEL_WIDTH: f64 = 428.0;
 const ACCESS_PANEL_HEIGHT: f64 = 608.0;
 const ACCESS_PANEL_MARGIN: f64 = 16.0;
 const POPUP_LABEL: &str = "access_popup";
+const FAVORITES_OVERLAY_LABEL: &str = "favorites-overlay";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -418,11 +419,13 @@ fn rebuild_tray_menu(
     // ── Separator + Quit ──
     let quit_item = MenuItemBuilder::with_id("tray_quit", "Quitter").build(app)?;
     let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
+    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Favoris").build(app)?;
     let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&show_item)
         .item(&panel_item)
+        .item(&favorites_item)
         .item(&popup_item)
         .item(&open_menu)
         .item(&sync_item)
@@ -537,11 +540,56 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+fn show_favorites_overlay_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) {
+        if win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
+        } else {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        return Ok(());
+    }
+
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        FAVORITES_OVERLAY_LABEL,
+        tauri::WebviewUrl::App("/favorites-overlay".into()),
+    )
+    .title("MonClub Favorites")
+    .inner_size(64.0, 400.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .transparent(true)
+    .build()?;
+    let _ = win.show();
+    Ok(())
+}
+
+#[tauri::command]
+fn resize_favorites_overlay(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) {
+        win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, height)))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// TODO(Task 6): Register global shortcuts for favorite door presets.
+// Requires adding tauri-plugin-global-shortcut to [dependencies] in Cargo.toml:
+//   tauri-plugin-global-shortcut = "2"
+// Then initialize with .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+// and implement register_favorite_shortcuts command that fetches favorites from
+// the local API and binds each favoriteShortcut value via GlobalShortcutExt.
+
 fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::error::Error>> {
     let icon = desktop_window_icon("access")?;
 
     let show_item = MenuItemBuilder::with_id("tray_show", "Afficher").build(app)?;
     let panel_item = MenuItemBuilder::with_id("tray_panel", "Show panel").build(app)?;
+    let favorites_item = MenuItemBuilder::with_id("tray_favorites", "Favoris").build(app)?;
     let popup_item = MenuItemBuilder::with_id("tray_popup", "Écran Notification").build(app)?;
     let sync_item = MenuItemBuilder::with_id("tray_sync", "Synchroniser").build(app)?;
     let scan_item = MenuItemBuilder::with_id("tray_scan", "Scanner carte").build(app)?;
@@ -557,6 +605,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
     let menu = MenuBuilder::new(app)
         .item(&show_item)
         .item(&panel_item)
+        .item(&favorites_item)
         .item(&popup_item)
         .item(&open_sub)
         .item(&sync_item)
@@ -583,6 +632,9 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
                 }
                 "tray_panel" => {
                     let _ = show_access_panel_window(&app);
+                }
+                "tray_favorites" => {
+                    let _ = show_favorites_overlay_window(&app);
                 }
                 "tray_popup" => {
                     let _ = show_popup_window(&app);
@@ -749,7 +801,8 @@ pub fn run() {
             refresh_tv_tray_menu,
             set_keep_background_on_close,
             destroy_access_panel_window,
-            focus_and_show_enrollment
+            focus_and_show_enrollment,
+            resize_favorites_overlay
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -778,6 +831,14 @@ pub fn run() {
                         let _ = window.hide();
                     }
                     _ => {}
+                }
+                return;
+            }
+
+            if window.label() == FAVORITES_OVERLAY_LABEL {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
                 }
                 return;
             }
