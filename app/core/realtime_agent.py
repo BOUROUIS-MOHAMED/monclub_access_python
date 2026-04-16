@@ -409,6 +409,7 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "userBirthday": req.user_birthday,
         "imageSource": req.image_source,
         "userImageStatus": req.user_image_status,
+        "userProfileImage": req.user_profile_image,
     }
 
 
@@ -1287,6 +1288,7 @@ class DecisionService(threading.Thread):
             user_phone = _safe_str((user or {}).get("phone"), "") if isinstance(user, dict) else ""
             user_id = _safe_str((user or {}).get("userId"), "") if isinstance(user, dict) else ""
             user_image = _safe_str((user or {}).get("image"), "") if isinstance(user, dict) else ""
+            user_profile_image = _safe_str((user or {}).get("userProfileImage"), "") if isinstance(user, dict) else ""
             am_id = vr.get("activeMembershipId")
             age = vr.get("ageSeconds")
             took = vr.get("tookMs")
@@ -1369,6 +1371,7 @@ class DecisionService(threading.Thread):
                 popup_duration_sec=_safe_int(settings.get("popup_duration_sec"), 3),
                 popup_enabled=bool(settings.get("popup_enabled", True)),
                 win_notify_enabled=bool(settings.get("win_notify_enabled", True)),
+                user_profile_image=user_profile_image,
             )
 
             # Windows notification (per-device winNotifyEnabled)

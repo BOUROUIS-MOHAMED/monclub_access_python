@@ -40,6 +40,7 @@ class NotificationRequest:
     user_birthday: str = ""
     image_source: str = ""
     user_image_status: str = ""
+    user_profile_image: str = ""
     popup_duration_sec: int = 3
     popup_enabled: bool = True
     win_notify_enabled: bool = True

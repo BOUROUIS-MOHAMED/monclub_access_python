@@ -468,6 +468,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
         _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
         _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
+        _ensure_column(conn, "sync_users", "user_profile_image", "TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception as _mig_exc:
@@ -1711,8 +1712,9 @@ def upsert_delta_users(users: list[dict]) -> None:
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id,
-                    qr_code_payload, birthday, image_source, user_image_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    qr_code_payload, birthday, image_source, user_image_status,
+                    user_profile_image
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"), am_id, m_id,
@@ -1724,6 +1726,7 @@ def upsert_delta_users(users: list[dict]) -> None:
                     u.get("accountUsernameId") or u.get("account_username_id"),
                     u.get("qrCodePayload"), u.get("birthday"),
                     u.get("imageSource"), u.get("userImageStatus"),
+                    u.get("userProfileImage"),
                 ),
             )
         conn.commit()
@@ -2484,8 +2487,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json,
                     face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -2506,6 +2509,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("birthday"),
                     u.get("imageSource"),
                     u.get("userImageStatus"),
+                    u.get("userProfileImage"),
                 ),
             )
 
@@ -2905,8 +2909,8 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             first_card_id, second_card_id, image,
             fingerprints_json,
             face_id, account_username_id, qr_code_payload, birthday,
-            image_source, user_image_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            image_source, user_image_status, user_profile_image
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             member.get("userId"),
@@ -2927,6 +2931,7 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             member.get("birthday"),
             member.get("imageSource"),
             member.get("userImageStatus"),
+            member.get("userProfileImage"),
         ),
     )
 
@@ -3183,8 +3188,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     full_name, phone, email, valid_from, valid_to,
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    image_source, user_image_status, user_profile_image
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -3197,6 +3202,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     u.get("qrCodePayload"), u.get("birthday"),
                                     u.get("imageSource"),
                                     u.get("userImageStatus"),
+                                    u.get("userProfileImage"),
                                 ),
                             )
                             upserted_count += 1
@@ -3269,7 +3275,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                 f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
                                 f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
                                 f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
-                                f"{u.get('imageSource')}|{u.get('userImageStatus')}"
+                                f"{u.get('imageSource')}|{u.get('userImageStatus')}|"
+                                f"{u.get('userProfileImage', '')}"
                             )
                             h.update(row.encode("utf-8", errors="replace"))
                         return h.hexdigest()
@@ -3282,7 +3289,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                             "full_name, phone, email, valid_from, valid_to, "
                             "first_card_id, second_card_id, image, fingerprints_json, "
                             "face_id, account_username_id, qr_code_payload, birthday, "
-                            "image_source, user_image_status FROM sync_users"
+                            "image_source, user_image_status, user_profile_image FROM sync_users"
                         ).fetchall()
                         existing_as_dicts = []
                         for r in existing_rows:
@@ -3300,6 +3307,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                 "faceId": r[12], "accountUsernameId": r[13],
                                 "qrCodePayload": r[14], "birthday": r[15],
                                 "imageSource": r[16], "userImageStatus": r[17],
+                                "userProfileImage": r[18],
                             })
                         existing_hash = _users_content_hash(existing_as_dicts)
                         if incoming_hash == existing_hash:
@@ -3330,8 +3338,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     full_name, phone, email, valid_from, valid_to,
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    image_source, user_image_status, user_profile_image
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -3344,6 +3352,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     u.get("qrCodePayload"), u.get("birthday"),
                                     u.get("imageSource"),
                                     u.get("userImageStatus"),
+                                    u.get("userProfileImage"),
                                 ),
                             )
 
@@ -3450,6 +3459,7 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "image": g("image"),
         "imageSource": g("imageSource", "image_source"),
         "userImageStatus": g("userImageStatus", "user_image_status"),
+        "userProfileImage": g("userProfileImage", "user_profile_image"),
         "fingerprints": fps,
         "faceId": g("faceId", "face_id"),
         "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
@@ -6528,6 +6538,7 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
                 "faceId": user_src.get("faceId"),
                 "qrCodePayload": user_src.get("qrCodePayload"),
                 "accountUsernameId": user_src.get("accountUsernameId") or account_username,
+                "userProfileImage": user_src.get("userProfileImage", ""),
                 "offlinePending": True,
                 "offlinePendingLocalId": r.get("local_id"),
                 "offlinePendingState": r.get("state"),
@@ -6581,6 +6592,7 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
             "faceId": None,
             "qrCodePayload": None,
             "accountUsernameId": acc_username,
+            "userProfileImage": "",
             "offlinePending": True,
             "offlinePendingLocalId": r.get("local_id"),
             "offlinePendingState": r.get("state"),

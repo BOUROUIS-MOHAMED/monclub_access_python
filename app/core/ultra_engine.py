@@ -797,6 +797,7 @@ class UltraDeviceWorker(threading.Thread):
         user_valid_to = ""
         image_source = ""
         user_image_status = ""
+        user_profile_image = ""
         scan_mode = "RFID_CARD"
 
         if isinstance(user, dict):
@@ -813,6 +814,7 @@ class UltraDeviceWorker(threading.Thread):
             user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
             image_source = str(user.get("imageSource", "") or "")
             user_image_status = str(user.get("userImageStatus", "") or "")
+            user_profile_image = str(user.get("userProfileImage", "") or "")
 
         if not user_name:
             logger.warning(
@@ -837,6 +839,7 @@ class UltraDeviceWorker(threading.Thread):
             user_valid_to=user_valid_to,
             image_source=image_source,
             user_image_status=user_image_status,
+            user_profile_image=user_profile_image,
         )
         self._enqueue_history(
             event_id=event_id,
@@ -881,6 +884,7 @@ class UltraDeviceWorker(threading.Thread):
         user_valid_to = ""
         image_source = ""
         user_image_status = ""
+        user_profile_image = ""
 
         if isinstance(user, dict):
             user_name = str(user.get("fullName", user.get("full_name", user.get("name", ""))) or "")
@@ -896,6 +900,7 @@ class UltraDeviceWorker(threading.Thread):
             user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
             image_source = str(user.get("imageSource", "") or "")
             user_image_status = str(user.get("userImageStatus", "") or "")
+            user_profile_image = str(user.get("userProfileImage", "") or "")
 
         cmd_ms = 0.0
         cmd_ok: Optional[bool] = None
@@ -954,6 +959,7 @@ class UltraDeviceWorker(threading.Thread):
             user_valid_to=user_valid_to,
             image_source=image_source,
             user_image_status=user_image_status,
+            user_profile_image=user_profile_image,
         )
         self._enqueue_history(
             event_id=event_id,
@@ -1042,6 +1048,7 @@ class UltraDeviceWorker(threading.Thread):
             user_phone="",
             user_valid_from="",
             user_valid_to="",
+            user_profile_image="",
         )
         self._enqueue_history(
             event_id=event_id,
@@ -1073,6 +1080,7 @@ class UltraDeviceWorker(threading.Thread):
         user_valid_to: str,
         image_source: str = "",
         user_image_status: str = "",
+        user_profile_image: str = "",
     ):
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
@@ -1103,6 +1111,7 @@ class UltraDeviceWorker(threading.Thread):
                 scan_mode=scan_mode,
                 image_source=image_source,
                 user_image_status=user_image_status,
+                user_profile_image=user_profile_image,
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
                 popup_enabled=True,
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),
