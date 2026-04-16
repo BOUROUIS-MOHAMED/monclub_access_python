@@ -21,7 +21,7 @@ export default function NotificationPopup({ popup, onDismiss }: Props) {
   const statusLabel = allowed ? "ACCÈS AUTORISÉ" : "ACCÈS REFUSÉ";
 
   const imageUrl = popup.popupShowImage
-    ? (popup.userImage || popup.imagePath || "")
+    ? (popup.userImage || popup.userProfileImage || popup.imagePath || "")
     : "";
 
   const formatDate = (d: string) => {

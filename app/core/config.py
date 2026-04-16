@@ -240,6 +240,13 @@ class AppConfig:
     sync_success_sound_source: str = "default"     # default | custom
     push_success_custom_sound_path: str = ""
     sync_success_custom_sound_path: str = ""
+    # Anti-fraud alert sounds — same default/custom pattern as the sync + push
+    # feedback sounds above. Per-app config (not per-device) so every connected
+    # device plays the same operator-chosen tone.
+    anti_fraud_duration_sound_source: str = "default"
+    anti_fraud_duration_custom_sound_path: str = ""
+    anti_fraud_daily_limit_sound_source: str = "default"
+    anti_fraud_daily_limit_custom_sound_path: str = ""
 
     # -------------------------
     # Backward-compatible accessors
@@ -512,6 +519,20 @@ class AppConfig:
         ).strip()
         cfg.sync_success_custom_sound_path = _safe_str(
             getattr(cfg, "sync_success_custom_sound_path", ""),
+            "",
+        ).strip()
+        cfg.anti_fraud_duration_sound_source = _normalize_feedback_sound_source(
+            getattr(cfg, "anti_fraud_duration_sound_source", "default")
+        )
+        cfg.anti_fraud_daily_limit_sound_source = _normalize_feedback_sound_source(
+            getattr(cfg, "anti_fraud_daily_limit_sound_source", "default")
+        )
+        cfg.anti_fraud_duration_custom_sound_path = _safe_str(
+            getattr(cfg, "anti_fraud_duration_custom_sound_path", ""),
+            "",
+        ).strip()
+        cfg.anti_fraud_daily_limit_custom_sound_path = _safe_str(
+            getattr(cfg, "anti_fraud_daily_limit_custom_sound_path", ""),
             "",
         ).strip()
 

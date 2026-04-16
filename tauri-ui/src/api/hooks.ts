@@ -279,3 +279,11 @@ export function usePopupStream(maxHistory = 50) {
 
   return { popup, history, badgeCount, dismiss, clearBadge, clearHistory, openPopupWindow, sendTestNotification };
 }
+
+// ── Favorite presets (GET /api/v2/sync/cache/favorites) ──
+export function useFavoritePresets() {
+  return useApi<{ favorites: any[] }>(
+    () => get("/sync/cache/favorites"),
+    [],
+  );
+}

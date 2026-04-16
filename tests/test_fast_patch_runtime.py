@@ -16,6 +16,7 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
         _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
     )
     bundle = {
@@ -76,6 +77,7 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
         _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
     )
     bundle = {
@@ -116,6 +118,7 @@ def test_apply_fast_patch_bundle_duplicate_short_circuits_runtime_actions(monkey
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
         _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
     )
 

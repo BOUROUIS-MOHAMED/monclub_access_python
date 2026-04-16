@@ -468,6 +468,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
         _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
         _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
+        _ensure_column(conn, "sync_users", "user_profile_image", "user_profile_image TEXT")
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception as _mig_exc:
@@ -637,9 +638,10 @@ def init_db() -> None:
                 created_at TEXT,
                 updated_at TEXT,
 
-                anti_fraude_card     INTEGER NOT NULL DEFAULT 1,
-                anti_fraude_qr_code  INTEGER NOT NULL DEFAULT 1,
-                anti_fraude_duration INTEGER NOT NULL DEFAULT 30
+                anti_fraude_card             INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_qr_code          INTEGER NOT NULL DEFAULT 1,
+                anti_fraude_duration         INTEGER NOT NULL DEFAULT 30,
+                anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -693,9 +695,10 @@ def init_db() -> None:
         _ensure_column(conn, "sync_devices", "authorize_timezone_id", "authorize_timezone_id INTEGER")
         _ensure_column(conn, "sync_devices", "pushing_to_device_policy", "pushing_to_device_policy TEXT")
 
-        _ensure_column(conn, "sync_devices", "anti_fraude_card",     "anti_fraude_card INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",  "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
-        _ensure_column(conn, "sync_devices", "anti_fraude_duration", "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
+        _ensure_column(conn, "sync_devices", "anti_fraude_card",             "anti_fraude_card INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",          "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
+        _ensure_column(conn, "sync_devices", "anti_fraude_duration",         "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
+        _ensure_column(conn, "sync_devices", "anti_fraude_daily_pass_limit", "anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0")
 
         # F-015: Deduplicate sync_devices by id before adding unique index
         conn.execute("""
@@ -718,12 +721,18 @@ def init_db() -> None:
                 pulse_seconds INTEGER NOT NULL,
                 door_name TEXT NOT NULL,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                favorite_enabled INTEGER NOT NULL DEFAULT 0,
+                favorite_order INTEGER,
+                favorite_shortcut TEXT
             );
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_ddp_device_id ON sync_device_door_presets(device_id);")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_ddp_remote_id ON sync_device_door_presets(remote_id);")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_enabled", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_order", "INTEGER")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_shortcut", "TEXT")
 
         # -----------------------------
         # infrastructures
@@ -837,6 +846,11 @@ def init_db() -> None:
         _ensure_column(conn, "access_history", "backend_next_retry_at", "backend_next_retry_at TEXT")
         _ensure_column(conn, "access_history", "backend_synced_at", "backend_synced_at TEXT")
         _ensure_column(conn, "access_history", "backend_last_error", "backend_last_error TEXT")
+        # Anti-fraud daily-limit feature: user_id resolved at insert time so
+        # count_today_for_user_door() can query directly by user without joining
+        # sync_users (JOIN is ambiguous for cards that get reassigned and
+        # undefined for QR credentials which have no card_no).
+        _ensure_column(conn, "access_history", "user_id", "user_id INTEGER")
         conn.execute("UPDATE access_history SET history_source='AGENT' WHERE history_source IS NULL OR history_source=''")
         conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
         conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
@@ -850,6 +864,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_access_history_source_time "
             "ON access_history(history_source, event_time);"
+        )
+        # Anti-fraud daily-pass-limit: composite index that bounds
+        # count_today_for_user_door(user_id, device_id, door_id) to O(log n)
+        # even as access_history grows. Partial index on allowed=1 would be
+        # tighter but SQLite partial-index predicate evaluation cost isn't
+        # worth it at gym-scale row counts; the full composite suffices.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_access_history_user_door_day "
+            "ON access_history(user_id, device_id, door_id, allowed, created_at);"
         )
 
         # -----------------------------
@@ -1695,8 +1718,9 @@ def upsert_delta_users(users: list[dict]) -> None:
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id,
-                    qr_code_payload, birthday, image_source, user_image_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    qr_code_payload, birthday, image_source, user_image_status,
+                    user_profile_image
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"), am_id, m_id,
@@ -1708,6 +1732,7 @@ def upsert_delta_users(users: list[dict]) -> None:
                     u.get("accountUsernameId") or u.get("account_username_id"),
                     u.get("qrCodePayload"), u.get("birthday"),
                     u.get("imageSource"), u.get("userImageStatus"),
+                    u.get("userProfileImage"),
                 ),
             )
         conn.commit()
@@ -2082,9 +2107,10 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                 continue
             cur.execute(
                 """
-                INSERT INTO sync_device_door_presets (
-                    remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO sync_device_door_presets (
+                    remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                    favorite_enabled, favorite_order, favorite_shortcut
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _to_int_or_none(p.get("id")),
@@ -2094,6 +2120,9 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                     _safe_str(p.get("doorName"), ""),
                     _safe_str(p.get("createdAt"), None),
                     _safe_str(p.get("updatedAt"), None),
+                    1 if p.get("favoriteEnabled") else 0,
+                    _to_int_or_none(p.get("favoriteOrder")),
+                    _safe_str(p.get("favoriteShortcut"), None),
                 ),
             )
 
@@ -2137,7 +2166,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             created_at, updated_at,
 
-            anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration
+            anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration,
+            anti_fraude_daily_pass_limit
         )
         VALUES (
             ?, ?, ?, ?,
@@ -2156,7 +2186,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?, ?,
             ?, ?,
             ?, ?,
-            ?, ?, ?
+            ?, ?, ?,
+            ?
         )
         """,
         (
@@ -2229,6 +2260,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _bool_to_i(d.get("antiFraudeCard", True), default=1),
             _bool_to_i(d.get("antiFraudeQrCode", True), default=1),
             _to_int_or_none(d.get("antiFraudeDuration", 30)) or 30,
+            _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
         ),
     )
 
@@ -2465,8 +2497,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json,
                     face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -2487,6 +2519,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("birthday"),
                     u.get("imageSource"),
                     u.get("userImageStatus"),
+                    u.get("userProfileImage"),
                 ),
             )
 
@@ -2886,8 +2919,8 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             first_card_id, second_card_id, image,
             fingerprints_json,
             face_id, account_username_id, qr_code_payload, birthday,
-            image_source, user_image_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            image_source, user_image_status, user_profile_image
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             member.get("userId"),
@@ -2908,6 +2941,7 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             member.get("birthday"),
             member.get("imageSource"),
             member.get("userImageStatus"),
+            member.get("userProfileImage"),
         ),
     )
 
@@ -3164,8 +3198,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     full_name, phone, email, valid_from, valid_to,
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    image_source, user_image_status, user_profile_image
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -3178,6 +3212,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     u.get("qrCodePayload"), u.get("birthday"),
                                     u.get("imageSource"),
                                     u.get("userImageStatus"),
+                                    u.get("userProfileImage"),
                                 ),
                             )
                             upserted_count += 1
@@ -3250,7 +3285,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                 f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
                                 f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
                                 f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
-                                f"{u.get('imageSource')}|{u.get('userImageStatus')}"
+                                f"{u.get('imageSource')}|{u.get('userImageStatus')}|"
+                                f"{u.get('userProfileImage', '')}"
                             )
                             h.update(row.encode("utf-8", errors="replace"))
                         return h.hexdigest()
@@ -3263,7 +3299,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                             "full_name, phone, email, valid_from, valid_to, "
                             "first_card_id, second_card_id, image, fingerprints_json, "
                             "face_id, account_username_id, qr_code_payload, birthday, "
-                            "image_source, user_image_status FROM sync_users"
+                            "image_source, user_image_status, user_profile_image FROM sync_users"
                         ).fetchall()
                         existing_as_dicts = []
                         for r in existing_rows:
@@ -3281,6 +3317,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                 "faceId": r[12], "accountUsernameId": r[13],
                                 "qrCodePayload": r[14], "birthday": r[15],
                                 "imageSource": r[16], "userImageStatus": r[17],
+                                "userProfileImage": r[18],
                             })
                         existing_hash = _users_content_hash(existing_as_dicts)
                         if incoming_hash == existing_hash:
@@ -3311,8 +3348,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     full_name, phone, email, valid_from, valid_to,
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    image_source, user_image_status, user_profile_image
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -3325,6 +3362,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                                     u.get("qrCodePayload"), u.get("birthday"),
                                     u.get("imageSource"),
                                     u.get("userImageStatus"),
+                                    u.get("userProfileImage"),
                                 ),
                             )
 
@@ -3431,6 +3469,7 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
         "image": g("image"),
         "imageSource": g("imageSource", "image_source"),
         "userImageStatus": g("userImageStatus", "user_image_status"),
+        "userProfileImage": g("userProfileImage", "user_profile_image"),
         "fingerprints": fps,
         "faceId": g("faceId", "face_id"),
         "accountUsernameId": g("accountUsernameId", "account_username_id", "usernameId", "username_id"),
@@ -3463,7 +3502,8 @@ def _load_synced_door_presets_index() -> Dict[int, List[Dict[str, Any]]]:
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                   favorite_enabled, favorite_order, favorite_shortcut
             FROM sync_device_door_presets
             ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
             """
@@ -3487,6 +3527,9 @@ def _build_synced_door_presets_index_from_rows(rows: List[Dict[str, Any]]) -> Di
                 "doorName": _safe_str(r.get("door_name"), ""),
                 "createdAt": _safe_str(r.get("created_at"), ""),
                 "updatedAt": _safe_str(r.get("updated_at"), ""),
+                "favoriteEnabled": bool(r.get("favorite_enabled")),
+                "favoriteOrder": r.get("favorite_order"),
+                "favoriteShortcut": r.get("favorite_shortcut"),
             }
         )
     return idx
@@ -3501,7 +3544,8 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+            SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                   favorite_enabled, favorite_order, favorite_shortcut
             FROM sync_device_door_presets
             WHERE device_id = ?
             ORDER BY door_number ASC, remote_id ASC, id ASC
@@ -3520,9 +3564,41 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
                 "doorName": _safe_str(r["door_name"], ""),  # type: ignore[index]
                 "createdAt": _safe_str(r["created_at"], ""),  # type: ignore[index]
                 "updatedAt": _safe_str(r["updated_at"], ""),  # type: ignore[index]
+                "favoriteEnabled": bool(r["favorite_enabled"]),  # type: ignore[index]
+                "favoriteOrder": r["favorite_order"],  # type: ignore[index]
+                "favoriteShortcut": r["favorite_shortcut"],  # type: ignore[index]
             }
         )
     return payload
+
+
+def list_favorite_presets() -> List[Dict[str, Any]]:
+    """Returns all synced door presets where favorite_enabled=1, sorted by favorite_order."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, d.name as device_name, d.ip_address, d.id as device_id_val
+            FROM sync_device_door_presets p
+            JOIN sync_devices d ON d.id = p.device_id
+            WHERE p.favorite_enabled = 1
+            ORDER BY p.favorite_order ASC NULLS LAST
+            """
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            result.append({
+                "id": row.get("remote_id") or row.get("id"),
+                "deviceId": row.get("device_id"),
+                "deviceName": row.get("device_name", ""),
+                "doorNumber": row.get("door_number"),
+                "pulseSeconds": row.get("pulse_seconds"),
+                "doorName": row.get("door_name", ""),
+                "favoriteEnabled": bool(row.get("favorite_enabled")),
+                "favoriteOrder": row.get("favorite_order"),
+                "favoriteShortcut": row.get("favorite_shortcut"),
+            })
+        return result
 
 
 def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -3633,9 +3709,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "createdAt": g("createdAt", "created_at"),
         "updatedAt": g("updatedAt", "updated_at"),
 
-        "antiFraudeCard":     _boolish(g("anti_fraude_card",    default=1), True),
-        "antiFraudeQrCode":   _boolish(g("anti_fraude_qr_code", default=1), True),
-        "antiFraudeDuration": _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
+        "antiFraudeCard":             _boolish(g("anti_fraude_card",    default=1), True),
+        "antiFraudeQrCode":           _boolish(g("anti_fraude_qr_code", default=1), True),
+        "antiFraudeDuration":         _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
+        "antiFraudeDailyPassLimit":   int(g("anti_fraude_daily_pass_limit", default=0) or 0),
 
         # attached later by list_sync_devices_payload (synced presets)
         "doorPresets": g("doorPresets", "door_presets", default=None) or [],
@@ -4090,7 +4167,8 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
             dict(r)
             for r in conn.execute(
                 """
-                SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at
+                SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
+                       favorite_enabled, favorite_order, favorite_shortcut
                 FROM sync_device_door_presets
                 ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
                 """
@@ -4439,6 +4517,9 @@ def list_sync_device_door_presets_payload_from_cache(
                     "doorName": _safe_str(preset.get("doorName"), ""),
                     "createdAt": _safe_str(preset.get("createdAt"), ""),
                     "updatedAt": _safe_str(preset.get("updatedAt"), ""),
+                    "favoriteEnabled": bool(preset.get("favoriteEnabled")),
+                    "favoriteOrder": preset.get("favoriteOrder"),
+                    "favoriteShortcut": preset.get("favoriteShortcut"),
                 }
             )
         return payload
@@ -5237,6 +5318,7 @@ def _build_access_history_insert_params(
     raw: Dict[str, Any] | None,
     history_source: str | None,
     backend_sync_state: str | None,
+    user_id: int | None = None,
 ) -> tuple[Any, ...]:
     return (
         now_iso(),
@@ -5256,6 +5338,7 @@ def _build_access_history_insert_params(
         json.dumps(raw or {}, ensure_ascii=False),
         normalize_access_history_source(history_source),
         normalize_access_history_sync_state(backend_sync_state),
+        int(user_id) if user_id is not None else None,
     )
 
 
@@ -5277,11 +5360,18 @@ def insert_access_history(
     raw: Dict[str, Any] | None,
     history_source: str | None = None,
     backend_sync_state: str | None = None,
+    user_id: int | None = None,
 ) -> int:
     """
     Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
     Returns rowcount: 1 if inserted (first worker to claim), 0 if already exists.
     F-013: callers should only open_door if return value is 1.
+
+    user_id is optional — resolved by DecisionService after verify_card/verify_totp
+    when available. It powers the anti-fraud daily-pass-limit counter
+    (count_today_for_user_door). Rows inserted before this feature shipped have
+    NULL user_id; the counter query filters WHERE user_id IS NOT NULL so those
+    rows never participate.
     """
     if not str(event_id or "").strip():
         return 0
@@ -5298,8 +5388,9 @@ def insert_access_history(
                     cmd_ok, cmd_error,
                     raw_json,
                     history_source,
-                    backend_sync_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    backend_sync_state,
+                    user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _build_access_history_insert_params(
                     event_id=event_id,
@@ -5318,6 +5409,7 @@ def insert_access_history(
                     raw=raw,
                     history_source=history_source,
                     backend_sync_state=backend_sync_state,
+                    user_id=user_id,
                 ),
             )
             conn.commit()
@@ -5352,6 +5444,7 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 raw=row.get("raw"),
                 history_source=row.get("history_source", row.get("historySource")),
                 backend_sync_state=row.get("backend_sync_state", row.get("backendSyncState")),
+                user_id=row.get("user_id", row.get("userId")),
             )
         )
     if not batch:
@@ -5367,13 +5460,41 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 cmd_ok, cmd_error,
                 raw_json,
                 history_source,
-                backend_sync_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                backend_sync_state,
+                user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             batch,
         )
         conn.commit()
         return int(cur.rowcount or 0)
+
+
+def count_today_for_user_door(
+    *, user_id: int, device_id: int, door_id: int
+) -> int:
+    """
+    Number of successful (allowed=1) access_history rows for this user on
+    this device's given door since local midnight (today in local timezone).
+
+    Powers the anti-fraud daily-pass-limit alert in DecisionService.
+    Filters WHERE user_id IS NOT NULL implicitly — passing None short-circuits
+    SQLite's NULL-comparison rule and returns 0, so pre-feature rows never
+    participate. Uses ix_access_history_user_door_day composite index.
+    """
+    if user_id is None:
+        return 0
+    sql = """
+        SELECT COUNT(*) FROM access_history
+        WHERE user_id = ?
+          AND device_id = ?
+          AND door_id = ?
+          AND allowed = 1
+          AND date(created_at, 'localtime') = date('now', 'localtime')
+    """
+    with get_conn() as conn:
+        row = conn.execute(sql, (int(user_id), int(device_id), int(door_id))).fetchone()
+    return int(row[0]) if row else 0
 
 
 def prune_access_history(*, retention_days: int) -> int:
@@ -6468,6 +6589,7 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
                 "faceId": user_src.get("faceId"),
                 "qrCodePayload": user_src.get("qrCodePayload"),
                 "accountUsernameId": user_src.get("accountUsernameId") or account_username,
+                "userProfileImage": user_src.get("userProfileImage", ""),
                 "offlinePending": True,
                 "offlinePendingLocalId": r.get("local_id"),
                 "offlinePendingState": r.get("state"),
@@ -6521,6 +6643,7 @@ def list_projected_offline_users(*, base_users: List[Dict[str, Any]] | None = No
             "faceId": None,
             "qrCodePayload": None,
             "accountUsernameId": acc_username,
+            "userProfileImage": "",
             "offlinePending": True,
             "offlinePendingLocalId": r.get("local_id"),
             "offlinePendingState": r.get("state"),

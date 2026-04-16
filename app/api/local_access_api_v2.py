@@ -1329,6 +1329,22 @@ _FEEDBACK_SOUND_SPECS: Dict[str, Dict[str, str]] = {
         "path_field": "sync_success_custom_sound_path",
         "base_name": "sync-complete-success",
     },
+    # Anti-fraud duration block — fires when a card/QR is re-used within
+    # anti_fraude_duration seconds on the same device. The existing popup is
+    # augmented with this audio cue.
+    "anti-fraud-duration": {
+        "source_field": "anti_fraud_duration_sound_source",
+        "path_field": "anti_fraud_duration_custom_sound_path",
+        "base_name": "anti-fraud-duration-default",
+    },
+    # Anti-fraud daily-pass-limit — fires every time a user's successful entry
+    # count on a door crosses the configured daily limit. Alert only — the
+    # door still opens.
+    "anti-fraud-daily-limit": {
+        "source_field": "anti_fraud_daily_limit_sound_source",
+        "path_field": "anti_fraud_daily_limit_custom_sound_path",
+        "base_name": "anti-fraud-daily-limit-default",
+    },
 }
 
 _FEEDBACK_SOUND_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a"}
@@ -1510,6 +1526,30 @@ def _handle_feedback_sound_sync_complete_post(ctx: _Ctx) -> None:
 
 def _handle_feedback_sound_sync_complete_delete(ctx: _Ctx) -> None:
     _handle_feedback_sound_delete(ctx, "sync-complete")
+
+
+def _handle_feedback_sound_anti_fraud_duration_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_duration_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_duration_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "anti-fraud-duration")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_get(ctx: _Ctx) -> None:
+    _handle_feedback_sound_get(ctx, "anti-fraud-daily-limit")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_post(ctx: _Ctx) -> None:
+    _handle_feedback_sound_post(ctx, "anti-fraud-daily-limit")
+
+
+def _handle_feedback_sound_anti_fraud_daily_limit_delete(ctx: _Ctx) -> None:
+    _handle_feedback_sound_delete(ctx, "anti-fraud-daily-limit")
 
 
 # ==================== 4) SYNC + CACHE ====================
@@ -1736,6 +1776,15 @@ def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
                 c["secretHex"] = sh[:4] + "..." + sh[-4:]
     ctx.send_json(200, {"credentials": creds})
 
+
+def _handle_sync_cache_favorites(ctx: _Ctx) -> None:
+    """Returns all favorite door presets (favoriteEnabled=true), sorted by favoriteOrder."""
+    from app.core.db import list_favorite_presets
+    try:
+        favorites = list_favorite_presets()
+        ctx.send_json(200, {"favorites": favorites})
+    except Exception as e:
+        ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
 # ==================== 4.4) TV SYNC / CACHE / READINESS ====================

@@ -23,6 +23,7 @@ import UpdatePage from "./pages/UpdatePage";
 import RestrictedPage from "./pages/RestrictedPage";
 import PopupWindow from "./pages/PopupWindow";
 import TrayPanelPage from "./pages/TrayPanelPage";
+import FavoritesOverlayPage from "./pages/FavoritesOverlayPage";
 
 function AppRoutes() {
   const { status, loading, error } = useApp();
@@ -88,6 +89,7 @@ export default function App() {
           <Routes>
             <Route path="/popup" element={<PopupWindow />} />
             <Route path="/tray-panel" element={<AppProvider><TrayPanelPage /></AppProvider>} />
+            <Route path="/favorites-overlay" element={<FavoritesOverlayPage />} />
             <Route
               path="*"
               element={(

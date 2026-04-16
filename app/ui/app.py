@@ -369,7 +369,11 @@ class MainApp:
             feedback_callback=self.publish_feedback_event,
         )
         self._device_attendance_engine = DeviceAttendanceMaintenanceEngine(cfg=self.cfg, logger=self.logger)
-        self._agent_engine = AgentRealtimeEngine(cfg=self.cfg, logger=self.logger)
+        self._agent_engine = AgentRealtimeEngine(
+            cfg=self.cfg,
+            logger=self.logger,
+            feedback_callback=self.publish_feedback_event,
+        )
         self._ultra_engine = UltraEngine(cfg=self.cfg, logger_inst=self.logger)
         self._ultra_history_consumer = None
         self._ultra_lock = threading.Lock()

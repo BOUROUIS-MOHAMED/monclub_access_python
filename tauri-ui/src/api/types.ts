@@ -138,11 +138,25 @@ export interface AppConfig {
   sync_success_sound_source: "default" | "custom";
   push_success_custom_sound_path: string;
   sync_success_custom_sound_path: string;
+  // Anti-fraud alert sounds — same "default" / "custom" + custom path pattern
+  // as the sync/push sounds above. Played by the Tauri UI when it receives
+  // an anti-fraud-duration or anti-fraud-daily-limit feedback event from the
+  // access app's /api/v2/feedback/events SSE stream.
+  anti_fraud_duration_sound_enabled: boolean;
+  anti_fraud_duration_sound_source: "default" | "custom";
+  anti_fraud_duration_custom_sound_path: string;
+  anti_fraud_daily_limit_sound_enabled: boolean;
+  anti_fraud_daily_limit_sound_source: "default" | "custom";
+  anti_fraud_daily_limit_custom_sound_path: string;
   autostart_bindings_enabled?: boolean;
   [key: string]: unknown;
 }
 
-export type FeedbackEventType = "device_push_success" | "sync_completed_success";
+export type FeedbackEventType =
+  | "device_push_success"
+  | "sync_completed_success"
+  | "anti_fraud_duration"
+  | "anti_fraud_daily_limit";
 
 export interface BaseFeedbackEvent {
   seq: number;
@@ -165,7 +179,34 @@ export interface SyncCompletedSuccessEvent extends BaseFeedbackEvent {
   triggerSource: string;
 }
 
-export type FeedbackEvent = DevicePushSuccessEvent | SyncCompletedSuccessEvent;
+export interface AntiFraudDurationEvent extends BaseFeedbackEvent {
+  type: "anti_fraud_duration";
+  user_id: number | null;
+  full_name: string;
+  device_id: number;
+  device_name: string;
+  door_id: number | null;
+  card_no: string;
+  remaining_seconds: number;
+  reason: "DENY_ANTI_FRAUD_CARD" | "DENY_ANTI_FRAUD_QR";
+}
+
+export interface AntiFraudDailyLimitEvent extends BaseFeedbackEvent {
+  type: "anti_fraud_daily_limit";
+  user_id: number;
+  full_name: string;
+  count_today: number;
+  limit: number;
+  device_id: number;
+  device_name: string;
+  door_id: number;
+}
+
+export type FeedbackEvent =
+  | DevicePushSuccessEvent
+  | SyncCompletedSuccessEvent
+  | AntiFraudDurationEvent
+  | AntiFraudDailyLimitEvent;
 
 // ─── D) Sync cache DTOs ───
 export interface DoorPresetDto {
@@ -174,6 +215,17 @@ export interface DoorPresetDto {
   doorNumber: number;
   pulseSeconds: number;
   doorName: string;
+  favoriteEnabled?: boolean;
+  favoriteOrder?: number | null;
+  favoriteShortcut?: string | null;
+}
+
+export interface FavoriteDoorPresetDto extends DoorPresetDto {
+  deviceName: string;
+}
+
+export interface FavoritePresetsResponse {
+  favorites: FavoriteDoorPresetDto[];
 }
 
 export interface DeviceDto {
@@ -1028,6 +1080,8 @@ export interface PopupEvent {
   imageSource?: string;
   /** "REQUIRED_CHANGE" | "OK" | undefined */
   userImageStatus?: string;
+  /** User profile image URL (USER_AVATAR), used as fallback when userImage fails or is empty */
+  userProfileImage?: string;
 }
 
 // ─── N) Host Monitor & Binding (A9) ───

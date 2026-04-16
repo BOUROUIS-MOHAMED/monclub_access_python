@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from app.core.db import (
+    count_today_for_user_door,
     insert_access_history,
     prune_access_history,
     list_sync_users,
@@ -408,6 +409,7 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "userBirthday": req.user_birthday,
         "imageSource": req.image_source,
         "userImageStatus": req.user_image_status,
+        "userProfileImage": req.user_profile_image,
     }
 
 
@@ -946,6 +948,7 @@ class DecisionService(threading.Thread):
         decision_ema: EMA,
         device_name_provider: Optional[Callable[[int], str]] = None,
         guard: "AntiFraudGuard | None" = None,
+        feedback_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     ):
         super().__init__(daemon=True)
         self.logger = logger
@@ -960,6 +963,10 @@ class DecisionService(threading.Thread):
         self.decision_ema = decision_ema
         self.device_name_provider = device_name_provider or (lambda did: f"device-{did}")
         self._guard: AntiFraudGuard = guard if guard is not None else AntiFraudGuard()
+        # Anti-fraud audio alerts are emitted via this callback (same channel as
+        # device-push / sync-complete feedback events). None disables audio —
+        # existing popups/notifications are unaffected.
+        self._feedback_callback = feedback_callback
 
         self._cache_lock = threading.Lock()
         # L-005: Cache TTL now configurable from backend settings (default 30s)
@@ -979,6 +986,19 @@ class DecisionService(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+
+    def _emit_feedback(self, kind: str, payload: Dict[str, Any]) -> None:
+        """Best-effort feedback emit; never raises — the decision path stays hot."""
+        cb = self._feedback_callback
+        if cb is None:
+            return
+        try:
+            cb(kind, payload)
+        except Exception as exc:  # pragma: no cover — defensive
+            try:
+                self.logger.warning("[RT] feedback emit failed kind=%s: %s", kind, exc)
+            except Exception:
+                pass
 
     def reset_fast_patch_caches(self) -> None:
         with self._cache_lock:
@@ -1053,6 +1073,19 @@ class DecisionService(threading.Thread):
                 }
                 load_ms = 0.0
                 verify_ms = 0.0
+                # Audio cue fires regardless of show_notifications — this is a
+                # distinct "sound alert" preference (operator may silence popups
+                # on busy devices but still want to hear anti-fraud fires).
+                self._emit_feedback("anti_fraud_duration", {
+                    "user_id": None,
+                    "full_name": "",
+                    "device_id": int(ev.device_id),
+                    "device_name": self.device_name_provider(int(ev.device_id)),
+                    "door_id": ev.door_id,
+                    "card_no": ev.card_no or "",
+                    "remaining_seconds": float(_af_remaining),
+                    "reason": "DENY_ANTI_FRAUD_CARD",
+                })
             else:
                 t_load = _now_ms()
                 creds_payload, users_by_am, users_by_card = self._load_local_state()
@@ -1083,6 +1116,18 @@ class DecisionService(threading.Thread):
                     allowed = False
                     reason = "DENY_ANTI_FRAUD_QR"
                     vr = {**vr, "allowed": False, "reason": reason, "_af_remaining": _af_remaining}
+                    # QR credential resolved → we know the user for the alert payload.
+                    _qr_user = vr.get("user") or {}
+                    self._emit_feedback("anti_fraud_duration", {
+                        "user_id": _qr_user.get("userId"),
+                        "full_name": _qr_user.get("fullName") or "",
+                        "device_id": int(ev.device_id),
+                        "device_name": self.device_name_provider(int(ev.device_id)),
+                        "door_id": ev.door_id,
+                        "card_no": ev.card_no or "",
+                        "remaining_seconds": float(_af_remaining),
+                        "reason": "DENY_ANTI_FRAUD_QR",
+                    })
 
             action = "OPEN_DOOR" if allowed else "NONE"
             door_id = ev.door_id if ev.door_id is not None else _safe_int(settings.get("door_entry_id"), 1)
@@ -1107,6 +1152,19 @@ class DecisionService(threading.Thread):
                 door_id, ev.poll_ms, queue_ms, load_ms, verify_ms, decision_ms, ev.event_id,
             )
 
+            # Resolve user_id from verify result (if any) so it's stored with the
+            # access_history row — enables count_today_for_user_door() to count
+            # directly by user without a runtime JOIN. user_id may be None for
+            # blocked/unknown-card paths; that's fine — NULL rows never participate
+            # in the daily counter.
+            _vr_user = vr.get("user") if isinstance(vr, dict) else None
+            try:
+                _resolved_user_id: int | None = int((_vr_user or {}).get("userId")) \
+                    if isinstance(_vr_user, dict) and (_vr_user or {}).get("userId") not in (None, "") \
+                    else None
+            except Exception:
+                _resolved_user_id = None
+
             # F-013: INSERT OR IGNORE into access_history BEFORE opening door.
             # rowcount==1 means this worker claimed the event; rowcount==0 means another worker already inserted it.
             # This prevents TOCTOU double door-open: the INSERT is atomic on the UNIQUE(event_id) constraint.
@@ -1128,6 +1186,7 @@ class DecisionService(threading.Thread):
                         cmd_ok=None,
                         cmd_error=None,
                         raw=dict(ev.raw),
+                        user_id=_resolved_user_id,
                     )
                 except Exception as ex:
                     _history_claimed = 0
@@ -1148,6 +1207,44 @@ class DecisionService(threading.Thread):
                     self._guard.record(ev.device_id, cred_id, "qr", _af_duration)
                 elif ev.card_no:
                     self._guard.record(ev.device_id, str(ev.card_no), "card", _af_duration)
+
+            # [Anti-fraud] Daily pass-limit alert (alert-only, never blocks).
+            # Fires every time an allowed entry puts the user's same-day count
+            # for this (device, door) strictly above the configured limit.
+            # Counter is computed from access_history which now includes the
+            # just-inserted row (history_claimed > 0) so the Nth entry sees
+            # count_today == N.
+            _af_daily_limit = int(settings.get("anti_fraude_daily_pass_limit") or 0)
+            if (
+                allowed
+                and _history_claimed > 0
+                and _af_daily_limit > 0
+                and _resolved_user_id is not None
+                and door_id is not None
+            ):
+                try:
+                    _count_today = count_today_for_user_door(
+                        user_id=int(_resolved_user_id),
+                        device_id=int(ev.device_id),
+                        door_id=int(door_id),
+                    )
+                except Exception as _cex:
+                    _count_today = 0
+                    self.logger.warning(
+                        "[RT][device=%s] daily count query failed for user_id=%s door_id=%s: %s",
+                        ev.device_id, _resolved_user_id, door_id, _cex,
+                    )
+                if _count_today > _af_daily_limit:
+                    _u = vr.get("user") if isinstance(vr, dict) else None
+                    self._emit_feedback("anti_fraud_daily_limit", {
+                        "user_id": int(_resolved_user_id),
+                        "full_name": _safe_str((_u or {}).get("fullName"), "") if isinstance(_u, dict) else "",
+                        "count_today": int(_count_today),
+                        "limit": int(_af_daily_limit),
+                        "device_id": int(ev.device_id),
+                        "device_name": self.device_name_provider(int(ev.device_id)),
+                        "door_id": int(door_id),
+                    })
 
             cmd_res = CommandResult(ok=True, error="", cmd_ms=0.0)
             if action == "OPEN_DOOR":
@@ -1191,6 +1288,7 @@ class DecisionService(threading.Thread):
             user_phone = _safe_str((user or {}).get("phone"), "") if isinstance(user, dict) else ""
             user_id = _safe_str((user or {}).get("userId"), "") if isinstance(user, dict) else ""
             user_image = _safe_str((user or {}).get("image"), "") if isinstance(user, dict) else ""
+            user_profile_image = _safe_str((user or {}).get("userProfileImage"), "") if isinstance(user, dict) else ""
             am_id = vr.get("activeMembershipId")
             age = vr.get("ageSeconds")
             took = vr.get("tookMs")
@@ -1273,6 +1371,7 @@ class DecisionService(threading.Thread):
                 popup_duration_sec=_safe_int(settings.get("popup_duration_sec"), 3),
                 popup_enabled=bool(settings.get("popup_enabled", True)),
                 win_notify_enabled=bool(settings.get("win_notify_enabled", True)),
+                user_profile_image=user_profile_image,
             )
 
             # Windows notification (per-device winNotifyEnabled)
@@ -1470,9 +1569,12 @@ class AgentRealtimeEngine:
     - Data mode is PER DEVICE (GymDevice.accessDataMode). This engine only runs on devices with accessDataMode=AGENT.
     """
 
-    def __init__(self, *, cfg, logger):
+    def __init__(self, *, cfg, logger, feedback_callback: Optional[Callable[[str, Dict[str, Any]], Any]] = None):
         self.cfg = cfg  # kept for legacy; not used for settings anymore
         self.logger = logger
+        # Forwarded to each DecisionService so anti-fraud audio alerts reach the
+        # app-level feedback queue (same channel as device-push / sync-complete).
+        self._feedback_callback = feedback_callback
 
         self._lock = threading.Lock()
         self._running = False
@@ -1770,6 +1872,7 @@ class AgentRealtimeEngine:
                 decision_ema=self._decision_ema,
                 device_name_provider=self._resolve_device_name,
                 guard=self._guard,
+                feedback_callback=self._feedback_callback,
             )
             self._deciders.append(d)
             try:
@@ -1844,6 +1947,7 @@ class AgentRealtimeEngine:
                     logger=self.logger,
                     event_queue=self._event_q,
                     command_bus=self._cmd_bus,
+                    feedback_callback=self._feedback_callback,
                     notify_q=self._notify_q,
                     popup_q=self._popup_q,
                     history_q=self._history_q,
