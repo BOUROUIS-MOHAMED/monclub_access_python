@@ -730,9 +730,9 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_ddp_device_id ON sync_device_door_presets(device_id);")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_ddp_remote_id ON sync_device_door_presets(remote_id);")
-        _ensure_column(conn, "sync_device_door_presets", "favorite_enabled", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "sync_device_door_presets", "favorite_order", "INTEGER")
-        _ensure_column(conn, "sync_device_door_presets", "favorite_shortcut", "TEXT")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_enabled", "favorite_enabled INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_order", "favorite_order INTEGER")
+        _ensure_column(conn, "sync_device_door_presets", "favorite_shortcut", "favorite_shortcut TEXT")
 
         # -----------------------------
         # infrastructures
