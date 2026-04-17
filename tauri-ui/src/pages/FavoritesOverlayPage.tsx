@@ -33,8 +33,8 @@ import {
   useState,
 } from "react";
 import { post } from "@/api/client";
-import { useQuickAccessState } from "@/api/hooks";
-import type { QuickAccessFavoriteDto } from "@/api/types";
+import { useFavoritePresets } from "@/api/hooks";
+import type { FavoriteDoorPresetDto } from "@/api/types";
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────────────
 let _invoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
@@ -51,8 +51,8 @@ async function tauriInvoke(cmd: string, args?: Record<string, unknown>): Promise
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function favoriteTitle(f: QuickAccessFavoriteDto): string {
-  return f.favoriteLabel?.trim() || f.doorName || `Favori ${f.favoriteSlot}`;
+function favoriteTitle(f: FavoriteDoorPresetDto, fallbackIndex: number): string {
+  return f.doorName?.trim() || `Favori ${f.favoriteOrder ?? fallbackIndex}`;
 }
 function slotBadge(slot: number): string {
   return slot >= 0 && slot <= 9 ? String(slot) : `F${slot - 9}`;
@@ -81,7 +81,7 @@ function ChevronLeftIcon({ className }: { className?: string }) {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function FavoritesOverlayPage() {
-  const { data: qa, loading, reload } = useQuickAccessState();
+  const { data: qa, loading, reload } = useFavoritePresets();
   const [flash, setFlash]       = useState<FlashState>(null);
   const [busyKey, setBusyKey]   = useState<string | null>(null);
   const [handleHovered, setHandleHovered] = useState(false);
@@ -173,15 +173,15 @@ export default function FavoritesOverlayPage() {
   const handleMouseLeave = useCallback(() => { scheduleCollapse(); }, [scheduleCollapse]);
 
   // ── Door open ─────────────────────────────────────────────────────────────
-  const handleOpen = useCallback(async (fav: QuickAccessFavoriteDto) => {
-    const key = `${fav.favoriteSlot}:${fav.presetId}`;
+  const handleOpen = useCallback(async (fav: FavoriteDoorPresetDto, index: number) => {
+    const key = String(fav.id);
     setBusyKey(key);
     try {
       await post(`/devices/${fav.deviceId}/door/open`, {
         doorNumber:   fav.doorNumber,
         pulseSeconds: fav.pulseSeconds,
       });
-      setFlash({ key, ok: true, msg: favoriteTitle(fav) });
+      setFlash({ key, ok: true, msg: favoriteTitle(fav, index) });
     } catch (err) {
       setFlash({ key, ok: false, msg: String(err) });
     } finally {
@@ -204,7 +204,7 @@ export default function FavoritesOverlayPage() {
         setKbIndex(i => clamp(i < 0 ? 0 : i - 1, 0, favorites.length - 1));
       } else if (e.key === "Enter" && kbIndex >= 0 && kbIndex < favorites.length) {
         e.preventDefault();
-        void handleOpen(favorites[kbIndex]);
+        void handleOpen(favorites[kbIndex], kbIndex);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -482,7 +482,7 @@ export default function FavoritesOverlayPage() {
 
                 {/* Items — stagger-in on panel open */}
                 {favorites.map((fav, i) => {
-                  const key    = `${fav.favoriteSlot}:${fav.presetId}`;
+                  const key    = String(fav.id);
                   const busy   = busyKey === key;
                   const didFlash = flash?.key === key;
                   const isOk   = didFlash && flash?.ok;
@@ -498,7 +498,7 @@ export default function FavoritesOverlayPage() {
                       key={key}
                       type="button"
                       disabled={busy}
-                      onClick={() => void handleOpen(fav)}
+                      onClick={() => void handleOpen(fav, i)}
                       onMouseEnter={() => setKbIndex(i)}
                       className={[
                         "group relative flex w-full items-center gap-3 rounded-2xl border px-3 py-2.5",
@@ -541,13 +541,13 @@ export default function FavoritesOverlayPage() {
                               : "bg-primary/12 text-primary group-hover:bg-primary/20 group-hover:scale-105",
                         ].join(" ")}
                       >
-                        {slotBadge(fav.favoriteSlot)}
+                        {slotBadge(fav.favoriteOrder ?? i)}
                       </span>
 
                       {/* Label */}
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
-                          {favoriteTitle(fav)}
+                          {favoriteTitle(fav, i)}
                         </div>
                         <div className="mt-0.5 flex items-center gap-1 text-[10px] text-muted-foreground">
                           <span className="truncate">{fav.deviceName || "Appareil"}</span>
