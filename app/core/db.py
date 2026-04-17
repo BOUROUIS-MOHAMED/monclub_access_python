@@ -3572,18 +3572,33 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
     return payload
 
 
-def list_favorite_presets() -> List[Dict[str, Any]]:
-    """Returns all synced door presets where favorite_enabled=1, sorted by favorite_order."""
+def list_favorite_presets(include_all: bool = False) -> List[Dict[str, Any]]:
+    """Returns door presets for the favorites overlay.
+
+    By default only presets with favorite_enabled=1 are returned, sorted by
+    favorite_order. When include_all=True the filter is dropped and every
+    synced preset is returned, ordered so marked favorites come first (then
+    by device, door number)."""
+    query = """
+        SELECT p.*, d.name as device_name, d.ip_address, d.id as device_id_val
+        FROM sync_device_door_presets p
+        JOIN sync_devices d ON d.id = p.device_id
+    """
+    if include_all:
+        query += """
+        ORDER BY
+            p.favorite_enabled DESC,
+            p.favorite_order ASC NULLS LAST,
+            d.id ASC,
+            p.door_number ASC
+        """
+    else:
+        query += """
+        WHERE p.favorite_enabled = 1
+        ORDER BY p.favorite_order ASC NULLS LAST
+        """
     with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT p.*, d.name as device_name, d.ip_address, d.id as device_id_val
-            FROM sync_device_door_presets p
-            JOIN sync_devices d ON d.id = p.device_id
-            WHERE p.favorite_enabled = 1
-            ORDER BY p.favorite_order ASC NULLS LAST
-            """
-        ).fetchall()
+        rows = conn.execute(query).fetchall()
         result: List[Dict[str, Any]] = []
         for r in rows:
             row = dict(r)

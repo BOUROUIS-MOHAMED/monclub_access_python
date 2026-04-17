@@ -70,6 +70,9 @@ ACCESS_CONFIG_FIELDS = (
     "scanner_network_port",
     "scanner_network_timeout_ms",
     "scanner_usb_device_path",
+    # Favorites overlay
+    "favorites_overlay_anchor",
+    "favorites_overlay_show_all_presets",
 )
 
 TV_CONFIG_FIELDS = (
@@ -153,6 +156,8 @@ class AccessConfigSection:
     scanner_network_port: int = 4370
     scanner_network_timeout_ms: int = 5000
     scanner_usb_device_path: str = ""
+    favorites_overlay_anchor: str = "right-center"
+    favorites_overlay_show_all_presets: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,7 +261,18 @@ def _write_component_defaults_if_missing(component: ConfigComponent, *, legacy_r
     return True
 
 
+# One-shot guard: migration only has meaningful work to do on the first call
+# per process. Subsequent calls would just re-read and re-validate files that
+# haven't changed. Re-running it on every /config GET and PATCH adds ~1 s of
+# file I/O on Windows (AV-scanned reads of 4 config files each call).
+_MIGRATION_DONE: bool = False
+
+
 def migrate_split_config_if_needed() -> None:
+    global _MIGRATION_DONE
+    if _MIGRATION_DONE:
+        return
+
     ensure_dirs()
     layout = get_desktop_path_layout()
     legacy_raw = _load_legacy_raw()
@@ -275,6 +291,7 @@ def migrate_split_config_if_needed() -> None:
             legacy_config_source_path=str(layout.legacy_config_path) if legacy_raw else "",
         )
         save_json(shared_path, asdict(shared_cfg))
+        _MIGRATION_DONE = True
         return
 
     changed = False
@@ -285,6 +302,8 @@ def migrate_split_config_if_needed() -> None:
         changed = True
     if changed:
         save_json(shared_path, shared_payload)
+
+    _MIGRATION_DONE = True
 
 
 def load_shared_install_config() -> SharedConfigSection:
@@ -398,6 +417,8 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         scanner_network_port=int(getattr(cfg, "scanner_network_port", 4370) or 4370),
         scanner_network_timeout_ms=int(getattr(cfg, "scanner_network_timeout_ms", 5000) or 5000),
         scanner_usb_device_path=str(getattr(cfg, "scanner_usb_device_path", "") or ""),
+        favorites_overlay_anchor=str(getattr(cfg, "favorites_overlay_anchor", "right-center") or "right-center"),
+        favorites_overlay_show_all_presets=bool(getattr(cfg, "favorites_overlay_show_all_presets", False)),
     )
 
 

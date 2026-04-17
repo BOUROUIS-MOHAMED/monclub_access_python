@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{
     image::Image,
@@ -540,41 +541,702 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+// ─── Favorites overlay — anchor-aware sizing and positioning ───
+//
+// 12 anchors: {right|left}-{top|center|bottom} and {top|bottom}-{left|center|right}.
+// Vertical edges (right/left) → window is tall and narrow when collapsed,
+// grows outward (away from the edge) when expanded.
+// Horizontal edges (top/bottom) → window is wide and short when collapsed,
+// grows perpendicular to the edge when expanded.
+
+const FAV_MARGIN: f64 = 8.0;
+// Collapsed dimension matches the handle pill's visual width (36px) so the
+// window never shows a transparent strip beside the pill — that strip
+// otherwise reads as a second "border" around the handle.
+const FAV_VERT_COLLAPSED_W: f64 = 36.0;
+const FAV_VERT_H: f64 = 400.0;
+const FAV_VERT_EXPANDED_W: f64 = 320.0;
+const FAV_HORZ_W: f64 = 400.0;
+const FAV_HORZ_COLLAPSED_H: f64 = 36.0;
+const FAV_HORZ_EXPANDED_H: f64 = 320.0;
+
+fn fav_edge_of(anchor: &str) -> &'static str {
+    if anchor.starts_with("right-") {
+        "right"
+    } else if anchor.starts_with("left-") {
+        "left"
+    } else if anchor.starts_with("top-") {
+        "top"
+    } else if anchor.starts_with("bottom-") {
+        "bottom"
+    } else {
+        "right"
+    }
+}
+
+/// Fetch the persisted `favorites_overlay_anchor` from Python's local API.
+/// Falls back to "right-center" if the API is unreachable or the value is
+/// missing/invalid. Runs on a blocking HTTP client — callers must not be
+/// holding critical UI locks.
+fn fetch_favorites_anchor(port: u16) -> String {
+    #[derive(Deserialize)]
+    struct ConfigResp {
+        #[serde(default)]
+        config: serde_json::Value,
+    }
+    let url = format!("{}/config", api_base(port));
+    let anchor = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .build()
+        .ok()
+        .and_then(|c| c.get(&url).header("X-Local-Token", local_api_token()).send().ok())
+        .and_then(|r| r.json::<ConfigResp>().ok())
+        .and_then(|r| {
+            r.config
+                .get("favorites_overlay_anchor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "right-center".to_string());
+
+    // Guard against unknown values.
+    const ALLOWED: &[&str] = &[
+        "right-top", "right-center", "right-bottom",
+        "left-top", "left-center", "left-bottom",
+        "top-left", "top-center", "top-right",
+        "bottom-left", "bottom-center", "bottom-right",
+    ];
+    if ALLOWED.contains(&anchor.as_str()) {
+        anchor
+    } else {
+        "right-center".to_string()
+    }
+}
+
+fn favorites_overlay_size(anchor: &str, expanded: bool) -> (f64, f64) {
+    match fav_edge_of(anchor) {
+        "right" | "left" => {
+            if expanded {
+                (FAV_VERT_EXPANDED_W, FAV_VERT_H)
+            } else {
+                (FAV_VERT_COLLAPSED_W, FAV_VERT_H)
+            }
+        }
+        _ => {
+            if expanded {
+                (FAV_HORZ_W, FAV_HORZ_EXPANDED_H)
+            } else {
+                (FAV_HORZ_W, FAV_HORZ_COLLAPSED_H)
+            }
+        }
+    }
+}
+
+fn favorites_overlay_position(
+    anchor: &str,
+    sx: f64,
+    sy: f64,
+    sw: f64,
+    sh: f64,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    let m = FAV_MARGIN;
+    let (mut x, mut y) = match anchor {
+        "right-top" => (sx + sw - w, sy + m),
+        "right-center" => (sx + sw - w, sy + (sh - h) / 2.0),
+        "right-bottom" => (sx + sw - w, sy + sh - h - m),
+        "left-top" => (sx, sy + m),
+        "left-center" => (sx, sy + (sh - h) / 2.0),
+        "left-bottom" => (sx, sy + sh - h - m),
+        "top-left" => (sx + m, sy),
+        "top-center" => (sx + (sw - w) / 2.0, sy),
+        "top-right" => (sx + sw - w - m, sy),
+        "bottom-left" => (sx + m, sy + sh - h),
+        "bottom-center" => (sx + (sw - w) / 2.0, sy + sh - h),
+        "bottom-right" => (sx + sw - w - m, sy + sh - h),
+        _ => (sx + sw - w, sy + (sh - h) / 2.0),
+    };
+    // Clamp into the work area so that a smaller-than-expected monitor or a
+    // weird DPI setup can't push the window off the visible desktop.
+    let max_x = sx + sw - w;
+    let max_y = sy + sh - h;
+    if x < sx { x = sx; }
+    if y < sy { y = sy; }
+    if x > max_x { x = max_x; }
+    if y > max_y { y = max_y; }
+    (x.round(), y.round())
+}
+
+/// Resolve the best monitor to place the overlay on. Prefers the monitor
+/// the window is currently on; falls back to the primary monitor; finally
+/// any available monitor. Returning None would leave the caller unable to
+/// compute a sane position, which on Windows has manifested as the window
+/// stuck at the default top-left corner.
+fn resolve_favorites_monitor(app: &AppHandle) -> Option<tauri::Monitor> {
+    if let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) {
+        if let Ok(Some(m)) = win.current_monitor() {
+            return Some(m);
+        }
+    }
+    if let Ok(Some(m)) = app.primary_monitor() {
+        return Some(m);
+    }
+    if let Ok(mut list) = app.available_monitors() {
+        if !list.is_empty() {
+            return Some(list.remove(0));
+        }
+    }
+    None
+}
+
+/// Low-level layout setter. Writes size and position without hiding the
+/// window first. Suitable for the initial-creation retry loop (where the
+/// window is brand new and has nowhere old to "flash" from) and for places
+/// that already manage their own visibility.
+fn write_favorites_overlay_layout(
+    app: &AppHandle,
+    anchor: &str,
+    expanded: bool,
+) -> Result<(), String> {
+    let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) else {
+        return Ok(());
+    };
+
+    let monitor = resolve_favorites_monitor(app)
+        .ok_or_else(|| "no monitor".to_string())?;
+
+    let scale = monitor.scale_factor();
+    let work = monitor.work_area();
+    let sx = work.position.x as f64 / scale;
+    let sy = work.position.y as f64 / scale;
+    let sw = work.size.width as f64 / scale;
+    let sh = work.size.height as f64 / scale;
+
+    let (w, h) = favorites_overlay_size(anchor, expanded);
+    let (x, y) = favorites_overlay_position(anchor, sx, sy, sw, sh, w, h);
+
+    let size = tauri::Size::Logical(tauri::LogicalSize::new(w, h));
+    let pos  = tauri::Position::Logical(tauri::LogicalPosition::new(x, y));
+
+    win.set_size(size).map_err(|e| e.to_string())?;
+    win.set_position(pos).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Public layout setter for anchor-change events. Cancels any in-flight
+/// hover animation and briefly hides the window across the size/position
+/// writes so the user never sees the half-applied intermediate state
+/// (NEW size at OLD position) — that was the "flash at the ancient place"
+/// the user reported when changing anchor in Settings.
+fn apply_favorites_overlay_layout(
+    app: &AppHandle,
+    anchor: &str,
+    expanded: bool,
+) -> Result<(), String> {
+    let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) else {
+        return Ok(());
+    };
+
+    // Kill any in-flight expand/collapse animation so it can't overwrite
+    // our final state with its stale interpolated values.
+    FAV_ANIM_GEN.fetch_add(1, Ordering::SeqCst);
+
+    let was_visible = win.is_visible().unwrap_or(true);
+    if was_visible {
+        let _ = win.hide();
+    }
+    let result = write_favorites_overlay_layout(app, anchor, expanded);
+    if was_visible {
+        let _ = win.show();
+    }
+    result
+}
+
 fn show_favorites_overlay_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    // Read the persisted anchor — needed both for the first-time create (to
+    // place the window correctly immediately, no top-left flash) and for
+    // every re-show (the user may have changed it while the window was
+    // hidden, and the previous layout may be stale or expanded).
+    let port = app
+        .state::<ApiPort>()
+        .0
+        .lock()
+        .map(|p| *p)
+        .unwrap_or(8788);
+    let anchor = fetch_favorites_anchor(port);
+
     if let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) {
         if win.is_visible().unwrap_or(false) {
             let _ = win.hide();
         } else {
+            // Re-show: always restore to the persisted anchor at the
+            // collapsed size. Stops the window from reappearing at
+            // the last (possibly-expanded) size or stale position.
+            let _ = apply_favorites_overlay_layout(app, &anchor, false);
             let _ = win.show();
             let _ = win.set_focus();
         }
         return Ok(());
     }
 
-    let win = tauri::WebviewWindowBuilder::new(
+    // First-time creation: compute the target position before build() so
+    // the window never flashes at Tauri's default top-left corner.
+    let monitor = resolve_favorites_monitor(app);
+    let (init_w, init_h) = favorites_overlay_size(&anchor, false);
+    let init_pos = monitor.map(|mon| {
+        let scale = mon.scale_factor();
+        let work = mon.work_area();
+        let sx = work.position.x as f64 / scale;
+        let sy = work.position.y as f64 / scale;
+        let sw = work.size.width as f64 / scale;
+        let sh = work.size.height as f64 / scale;
+        favorites_overlay_position(&anchor, sx, sy, sw, sh, init_w, init_h)
+    });
+
+    let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         FAVORITES_OVERLAY_LABEL,
         tauri::WebviewUrl::App("/favorites-overlay".into()),
     )
     .title("MonClub Favorites")
-    .inner_size(64.0, 400.0)
+    .inner_size(init_w, init_h)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
     .skip_taskbar(true)
     .transparent(true)
-    .build()?;
+    // `shadow(false)` disables the DWM-drawn shadow that Windows otherwise
+    // paints around any borderless top-level window. Without this, the user
+    // sees a faint dark rectangle outline around the transparent overlay
+    // window that reads as a "second background" behind the orange pill.
+    .shadow(false)
+    .visible(false);
+    if let Some((x, y)) = init_pos {
+        builder = builder.position(x, y);
+    }
+    let win = builder.build()?;
+
+    // Show the window FIRST so `current_monitor()` can resolve on the Win32
+    // side, then re-apply the layout to lock in the correct logical
+    // coordinates. Prior to this order we saw the window stuck at (0,0)
+    // because apply_layout was called while the window was still invisible
+    // and current_monitor/primary_monitor returned None on some systems.
     let _ = win.show();
+
+    // Defer slightly so the OS has a chance to associate the HWND with its
+    // monitor before we query it. Uses `write_*` (not `apply_*`) so we
+    // don't hide/show the newly-created window and cause a startup flicker.
+    {
+        let app = app.clone();
+        let anchor = anchor.clone();
+        std::thread::spawn(move || {
+            for delay_ms in [0_u64, 30, 90, 240] {
+                if delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+                if write_favorites_overlay_layout(&app, &anchor, false).is_ok() {
+                    break;
+                }
+            }
+        });
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn resize_favorites_overlay(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
-    if let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) {
-        win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, height)))
-            .map_err(|e| e.to_string())?;
-    }
+fn apply_favorites_overlay_anchor(
+    app: AppHandle,
+    anchor: String,
+    expanded: bool,
+) -> Result<(), String> {
+    // Anchor changes from ConfigPage / initial mount are instant — the user
+    // isn't in the middle of an animation, so snapping straight to the new
+    // layout is fine (and avoids surprising the user with a slide).
+    apply_favorites_overlay_layout(&app, &anchor, expanded)
+}
+
+// ── Animated expand / collapse ───────────────────────────────────────────
+//
+// Instant set_size() calls were the source of the "snap" the user saw on
+// hover/unhover: the Rust window jumped to its final size while the CSS
+// panel slide took ~280 ms. We now interpolate the window dimensions over
+// ~260 ms with an ease-out-cubic curve. The CSS panel transition (≈280 ms)
+// runs in parallel on the web side and both reach their destination at
+// roughly the same moment.
+//
+// A simple generation counter lets a newer animation cancel an older one in
+// flight — critical when the user sweeps the mouse in/out repeatedly.
+
+static FAV_ANIM_GEN: AtomicU64 = AtomicU64::new(0);
+
+const FAV_ANIM_DURATION_MS: u64 = 260;
+const FAV_ANIM_FRAME_MS: u64 = 12;
+
+fn ease_out_cubic(t: f64) -> f64 {
+    let u = 1.0 - t;
+    1.0 - u * u * u
+}
+
+fn animate_favorites_overlay(app: AppHandle, anchor: String, expanded: bool) {
+    // Claim this animation's slot. Any previous one running in parallel
+    // will see the counter advance and bail on its next frame.
+    let my_gen = FAV_ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+
+    std::thread::spawn(move || {
+        let Some(win) = app.get_webview_window(FAVORITES_OVERLAY_LABEL) else { return };
+        let Some(monitor) = resolve_favorites_monitor(&app) else { return };
+
+        let scale = monitor.scale_factor();
+        let work = monitor.work_area();
+        let sx = work.position.x as f64 / scale;
+        let sy = work.position.y as f64 / scale;
+        let sw_screen = work.size.width as f64 / scale;
+        let sh_screen = work.size.height as f64 / scale;
+
+        let Ok(cur_size) = win.inner_size() else { return };
+        let start_w = (cur_size.width as f64) / scale;
+        let start_h = (cur_size.height as f64) / scale;
+
+        let (target_w, target_h) = favorites_overlay_size(&anchor, expanded);
+
+        let frames = (FAV_ANIM_DURATION_MS / FAV_ANIM_FRAME_MS).max(1);
+
+        for i in 1..=frames {
+            if FAV_ANIM_GEN.load(Ordering::SeqCst) != my_gen {
+                return; // a newer animation superseded this one
+            }
+
+            let t = i as f64 / frames as f64;
+            let eased = ease_out_cubic(t);
+            let cur_w = start_w + (target_w - start_w) * eased;
+            let cur_h = start_h + (target_h - start_h) * eased;
+            let (x, y) = favorites_overlay_position(
+                &anchor, sx, sy, sw_screen, sh_screen, cur_w, cur_h,
+            );
+
+            let _ = win.set_size(tauri::Size::Logical(tauri::LogicalSize::new(cur_w, cur_h)));
+            let _ = win.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+
+            std::thread::sleep(std::time::Duration::from_millis(FAV_ANIM_FRAME_MS));
+        }
+        // Last frame (i == frames, eased == 1.0) already writes exact target
+        // values — no post-loop snap call, which would hide/show the window
+        // through apply_favorites_overlay_layout and cause a hover flicker.
+    });
+}
+
+#[tauri::command]
+fn expand_favorites_overlay(app: AppHandle, anchor: String) -> Result<(), String> {
+    animate_favorites_overlay(app, anchor, true);
     Ok(())
+}
+
+#[tauri::command]
+fn collapse_favorites_overlay(app: AppHandle, anchor: String) -> Result<(), String> {
+    animate_favorites_overlay(app, anchor, false);
+    Ok(())
+}
+
+// ── Global keyboard shortcuts for favorite door presets ─────────────────────
+//
+// The dashboard stores a per-preset shortcut like "CTRL_0" or "CTRL_SHIFT_1".
+// When the user hits that combo anywhere on Windows, this handler fires the
+// door-open API call and emits a Tauri event so any open window (overlay,
+// main, …) can show a toast confirming the action.
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteShortcutEntry {
+    #[serde(rename = "favoriteId")]
+    favorite_id: i64,
+    #[serde(rename = "deviceId")]
+    device_id: i64,
+    #[serde(rename = "doorNumber")]
+    door_number: i64,
+    #[serde(rename = "pulseSeconds")]
+    pulse_seconds: i64,
+    #[serde(rename = "doorName")]
+    door_name: String,
+    #[serde(rename = "deviceName", default)]
+    device_name: String,
+    shortcut: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteShortcutEvent {
+    favorite_id: i64,
+    door_name: String,
+    device_name: String,
+    shortcut: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+// ─── Favorites API response (used for startup shortcut registration) ─────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct FavoritePresetApi {
+    id: i64,
+    #[serde(rename = "deviceId")]
+    device_id: i64,
+    #[serde(rename = "doorNumber")]
+    door_number: i64,
+    #[serde(rename = "pulseSeconds")]
+    pulse_seconds: i64,
+    #[serde(rename = "doorName", default)]
+    door_name: String,
+    #[serde(rename = "deviceName", default)]
+    device_name: String,
+    #[serde(rename = "favoriteShortcut")]
+    favorite_shortcut: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FavoritesApiResponse {
+    favorites: Vec<FavoritePresetApi>,
+}
+
+/// Convert a persisted shortcut string (e.g. "CTRL_SHIFT_0") into a Tauri
+/// accelerator string the global-shortcut plugin accepts (e.g.
+/// "CommandOrControl+Shift+Digit0"). Returns None if the token set doesn't
+/// map to a recognised key.
+///
+/// The plugin uses `keyboard_types::Code` names for the key portion, not
+/// raw characters — so "0" must become "Digit0", "A" must become "KeyA".
+/// Using the raw characters silently fails to register and is why the
+/// captured shortcut never fires.
+fn parse_favorite_shortcut(raw: &str) -> Option<String> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut alt = false;
+    let mut meta = false;
+    let mut key: Option<String> = None;
+
+    for tok in raw.split(|c: char| c == '_' || c == '+').map(|s| s.trim()) {
+        if tok.is_empty() { continue; }
+        let upper = tok.to_ascii_uppercase();
+        match upper.as_str() {
+            "CTRL" | "CONTROL" => ctrl = true,
+            "SHIFT" => shift = true,
+            "ALT" | "OPTION" => alt = true,
+            "META" | "CMD" | "COMMAND" | "SUPER" | "WIN" => meta = true,
+            other => {
+                if other.len() == 1 {
+                    let c = other.chars().next().unwrap();
+                    if c.is_ascii_digit() {
+                        // "0" → "Digit0"
+                        key = Some(format!("Digit{}", c));
+                    } else if c.is_ascii_alphabetic() {
+                        // "A" → "KeyA"
+                        key = Some(format!("Key{}", c));
+                    }
+                } else if other.starts_with('F')
+                    && other[1..].chars().all(|c| c.is_ascii_digit())
+                {
+                    // Function keys already use their plain F1..F24 code names.
+                    key = Some(other.to_string());
+                } else {
+                    // Named keys — pass through as-is (e.g. "SPACE", "ENTER").
+                    // The plugin may reject unknown names, which surfaces as
+                    // "register failed" in the `skipped` array we return to JS.
+                    key = Some(
+                        other
+                            .chars()
+                            .enumerate()
+                            .map(|(i, c)| if i == 0 { c } else { c.to_ascii_lowercase() })
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+
+    let key = key?;
+    let mut parts = Vec::with_capacity(4);
+    if ctrl  { parts.push("CommandOrControl"); }
+    if shift { parts.push("Shift"); }
+    if alt   { parts.push("Alt"); }
+    if meta  { parts.push("Super"); }
+    let joined: String = if parts.is_empty() {
+        key
+    } else {
+        format!("{}+{}", parts.join("+"), key)
+    };
+    Some(joined)
+}
+
+/// If the accelerator ends with `DigitN`, also return a `NumpadN` variant so
+/// shortcuts fire from both the top-row number keys and the numeric keypad.
+fn numpad_variant(spec: &str) -> Option<String> {
+    let key_part = match spec.rfind('+') {
+        Some(pos) => &spec[pos + 1..],
+        None => spec,
+    };
+    if key_part.starts_with("Digit") && key_part.len() == 6 && key_part.chars().last()?.is_ascii_digit() {
+        let digit = &key_part[5..];
+        let prefix = spec.rfind('+').map(|p| format!("{}+", &spec[..p])).unwrap_or_default();
+        Some(format!("{}Numpad{}", prefix, digit))
+    } else {
+        None
+    }
+}
+
+/// Core registration logic — called both from the Tauri command (overlay) and
+/// from the startup background thread (tray-only mode).
+fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>) -> serde_json::Value {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+    eprintln!(
+        "[fav-shortcuts] registering {} entries: {:?}",
+        shortcuts.len(),
+        shortcuts.iter().map(|e| (&e.favorite_id, &e.shortcut)).collect::<Vec<_>>()
+    );
+
+    let gs = app.global_shortcut();
+    let _ = gs.unregister_all();
+
+    let mut registered: Vec<serde_json::Value> = Vec::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+
+    for entry in shortcuts {
+        let Some(spec) = parse_favorite_shortcut(&entry.shortcut) else {
+            skipped.push(serde_json::json!({
+                "favoriteId": entry.favorite_id,
+                "shortcut":   entry.shortcut,
+                "reason":     "unparseable",
+            }));
+            continue;
+        };
+
+        // Register primary accelerator + numpad variant (if applicable).
+        let mut specs = vec![spec.clone()];
+        if let Some(np) = numpad_variant(&spec) {
+            specs.push(np);
+        }
+
+        let mut any_ok = false;
+        for sc in specs {
+            let app_c = app.clone();
+            let entry_c = entry.clone();
+            match gs.on_shortcut(sc.as_str(), move |_app, _sc, ev| {
+                if ev.state() != ShortcutState::Pressed { return; }
+                let app = app_c.clone();
+                let e = entry_c.clone();
+                let _ = app.emit("favorite-shortcut-pressed", serde_json::json!({
+                    "favoriteId": e.favorite_id,
+                    "shortcut":   e.shortcut,
+                }));
+                std::thread::spawn(move || {
+                    let port = app
+                        .state::<ApiPort>()
+                        .0
+                        .lock()
+                        .map(|p| *p)
+                        .unwrap_or(8788);
+                    let url = format!("{}/devices/{}/door/open", api_base(port), e.device_id);
+                    let body = serde_json::json!({
+                        "doorNumber":   e.door_number,
+                        "pulseSeconds": e.pulse_seconds,
+                    });
+                    let (ok, err) = match reqwest::blocking::Client::new()
+                        .post(&url)
+                        .header("X-Local-Token", local_api_token())
+                        .json(&body)
+                        .send()
+                    {
+                        Ok(r) if r.status().is_success() => (true, None),
+                        Ok(r) => (false, Some(format!("HTTP {}", r.status()))),
+                        Err(e) => (false, Some(e.to_string())),
+                    };
+                    let payload = FavoriteShortcutEvent {
+                        favorite_id: e.favorite_id,
+                        door_name: e.door_name.clone(),
+                        device_name: e.device_name.clone(),
+                        shortcut: e.shortcut.clone(),
+                        ok,
+                        error: err,
+                    };
+                    let _ = app.emit("favorite-shortcut-triggered", payload);
+                });
+            }) {
+                Ok(_) => { any_ok = true; }
+                Err(e) => { eprintln!("[fav-shortcuts] failed {}: {}", sc, e); }
+            }
+        }
+
+        if any_ok {
+            registered.push(serde_json::json!({
+                "favoriteId": entry.favorite_id,
+                "shortcut":   entry.shortcut,
+                "resolved":   spec,
+            }));
+        } else {
+            skipped.push(serde_json::json!({
+                "favoriteId": entry.favorite_id,
+                "shortcut":   entry.shortcut,
+                "reason":     "register failed",
+            }));
+        }
+    }
+
+    eprintln!(
+        "[fav-shortcuts] done: registered={} skipped={}",
+        registered.len(), skipped.len(),
+    );
+    serde_json::json!({ "registered": registered, "skipped": skipped })
+}
+
+/// Fetch favorites from the local Python API and register shortcuts.
+/// Returns true on success (API reachable and shortcuts registered).
+fn fetch_and_register_shortcuts(app: &AppHandle, port: u16) -> bool {
+    let url = format!("{}/sync/cache/favorites", api_base(port));
+    let resp: FavoritesApiResponse = match reqwest::blocking::Client::new()
+        .get(&url)
+        .header("X-Local-Token", local_api_token())
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .ok()
+        .and_then(|r| if r.status().is_success() { r.json().ok() } else { None })
+    {
+        Some(r) => r,
+        None => return false,
+    };
+
+    let shortcuts: Vec<FavoriteShortcutEntry> = resp.favorites.into_iter()
+        .filter_map(|f| {
+            let sc = f.favorite_shortcut?.trim().to_string();
+            if sc.is_empty() { return None; }
+            Some(FavoriteShortcutEntry {
+                favorite_id:  f.id,
+                device_id:    f.device_id,
+                door_number:  f.door_number,
+                pulse_seconds: f.pulse_seconds,
+                door_name:    f.door_name,
+                device_name:  f.device_name,
+                shortcut:     sc,
+            })
+        })
+        .collect();
+
+    eprintln!("[fav-shortcuts] startup: {} shortcuts from API", shortcuts.len());
+    do_register_shortcuts(app, shortcuts);
+    true
+}
+
+#[tauri::command]
+fn register_favorite_shortcuts(
+    app: AppHandle,
+    shortcuts: Vec<FavoriteShortcutEntry>,
+) -> Result<serde_json::Value, String> {
+    Ok(do_register_shortcuts(&app, shortcuts))
+}
+
+#[tauri::command]
+fn unregister_favorite_shortcuts(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    app.global_shortcut().unregister_all().map_err(|e| e.to_string())
 }
 
 // TODO(Task 6): Register global shortcuts for favorite door presets.
@@ -792,6 +1454,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ApiPort(Mutex::new(initial_api_port)))
         .manage(KeepBackgroundOnClose(Mutex::new(true)))
         .invoke_handler(tauri::generate_handler![
@@ -802,7 +1465,11 @@ pub fn run() {
             set_keep_background_on_close,
             destroy_access_panel_window,
             focus_and_show_enrollment,
-            resize_favorites_overlay
+            apply_favorites_overlay_anchor,
+            expand_favorites_overlay,
+            collapse_favorites_overlay,
+            register_favorite_shortcuts,
+            unregister_favorite_shortcuts
         ])
         .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -817,6 +1484,31 @@ pub fn run() {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.hide();
                 }
+            }
+            // Register shortcuts at startup so they work from the tray without
+            // ever opening the favorites overlay window. Poll until the Python
+            // API is ready (it may take a few seconds to start).
+            if setup_role == "access" {
+                let startup_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    for attempt in 0..20u32 {
+                        if attempt > 0 {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                        }
+                        let port = startup_handle
+                            .state::<ApiPort>()
+                            .0
+                            .lock()
+                            .map(|p| *p)
+                            .unwrap_or(8788);
+                        if fetch_and_register_shortcuts(&startup_handle, port) {
+                            eprintln!("[fav-shortcuts] startup done on attempt {}", attempt + 1);
+                            return;
+                        }
+                        eprintln!("[fav-shortcuts] startup attempt {} failed, retrying…", attempt + 1);
+                    }
+                    eprintln!("[fav-shortcuts] startup gave up after 20 attempts");
+                });
             }
             Ok(())
         })

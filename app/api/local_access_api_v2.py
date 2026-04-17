@@ -1583,6 +1583,7 @@ def _sync_trigger_hint_from_body(body: Any) -> Dict[str, Any] | None:
         "priority": ("priority",),
         "reason": ("reason",),
         "forceMemberRefresh": ("forceMemberRefresh", "force_member_refresh"),
+        "forceDeviceRefresh": ("forceDeviceRefresh", "force_device_refresh"),
     }
     for output_key, aliases in field_names.items():
         for alias in aliases:
@@ -1778,11 +1779,20 @@ def _handle_sync_cache_credentials(ctx: _Ctx) -> None:
 
 
 def _handle_sync_cache_favorites(ctx: _Ctx) -> None:
-    """Returns all favorite door presets (favoriteEnabled=true), sorted by favoriteOrder."""
+    """Returns door presets for the favorites overlay.
+
+    By default only favoriteEnabled=true presets. Pass ?includeAll=true or
+    set the `favorites_overlay_show_all_presets` config flag to list every
+    synced preset (operator-chosen "always show all doors" mode).
+    """
     from app.core.db import list_favorite_presets
     try:
-        favorites = list_favorite_presets()
-        ctx.send_json(200, {"favorites": favorites})
+        include_all_q = ctx.q("includeAll", "include_all", default="").strip().lower()
+        include_all = include_all_q in ("1", "true", "yes", "on")
+        if not include_all:
+            include_all = bool(getattr(ctx.app.cfg, "favorites_overlay_show_all_presets", False))
+        favorites = list_favorite_presets(include_all=include_all)
+        ctx.send_json(200, {"favorites": favorites, "includeAll": include_all})
     except Exception as e:
         ctx.send_json(500, {"ok": False, "error": str(e)})
 

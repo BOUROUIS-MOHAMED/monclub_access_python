@@ -259,7 +259,8 @@
       "Bash(grep -E \"\\\\.java$\")",
       "Bash(grep -i \".*\\\\.java$\")",
       "Bash(xargs head:*)",
-      "Bash(grep -E \"\\\\.\\(ts|tsx|js\\)$\")"
+      "Bash(grep -E \"\\\\.\\(ts|tsx|js\\)$\")",
+      "Bash(cargo build *)"
     ]
   }
 }

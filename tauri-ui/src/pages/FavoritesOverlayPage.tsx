@@ -1,27 +1,29 @@
 /**
  * FavoritesOverlayPage — always-on-top floating dock for quick-access favourites.
  *
+ * Anchor model
+ * ────────────
+ *   The overlay can be pinned to 12 anchor points via the `favorites_overlay_anchor`
+ *   config key. Four edge families, each with three alignments:
+ *     right-{top,center,bottom}   → handle on right edge, panel grows leftward
+ *     left-{top,center,bottom}    → handle on left edge,  panel grows rightward
+ *     top-{left,center,right}     → handle on top edge,   panel grows downward
+ *     bottom-{left,center,right}  → handle on bottom edge, panel grows upward
+ *
+ *   On mount and on anchor change we invoke Rust commands to reposition and
+ *   resize the Tauri window. The web UI mirrors the orientation: handle pill,
+ *   chevron direction, and panel slide axis all follow the chosen edge.
+ *
  * Animation model
  * ───────────────
  *   panelMounted  → controls whether the panel is in the DOM
- *   panelOpen     → controls the CSS "open" state (translateX, opacity)
+ *   panelOpen     → controls the CSS "open" state (translate + opacity)
  *
- *   Open:   tauriInvoke(expand) → setPanelMounted(true) → rAF → setPanelOpen(true)
+ *   Open:   invoke(expand, anchor) → setPanelMounted(true) → rAF → setPanelOpen(true)
  *   Close:  setPanelOpen(false) → 270 ms timeout → setPanelMounted(false)
- *                                                → tauriInvoke(collapse)
+ *                                                → invoke(collapse, anchor)
  *   Mid-collapse re-hover: cancel timer, flip panelOpen back to true — the
  *   CSS transition reverses in place with no DOM flicker.
- *
- * Visual design
- * ─────────────
- *   • Collapsed handle: pill-shaped tab docked to the right edge with
- *     gradient primary fill, star glyph, vertical label, chevron hint.
- *   • Expanded panel: translucent frosted-glass surface
- *     (backdrop-filter: blur + saturate) so the desktop is visible behind.
- *   • List items stagger-animate in (opacity+translateY with per-item delay)
- *     so opening feels "alive" rather than a single block reveal.
- *   • Pressing ESC closes the panel; Arrow keys + Enter navigate and fire
- *     favourites when the panel is open.
  */
 
 import {
@@ -32,9 +34,34 @@ import {
   useRef,
   useState,
 } from "react";
-import { post } from "@/api/client";
+import { get, post } from "@/api/client";
 import { useFavoritePresets } from "@/api/hooks";
 import type { FavoriteDoorPresetDto } from "@/api/types";
+
+// ── Anchor ────────────────────────────────────────────────────────────────────
+type Anchor =
+  | "right-top" | "right-center" | "right-bottom"
+  | "left-top"  | "left-center"  | "left-bottom"
+  | "top-left"  | "top-center"   | "top-right"
+  | "bottom-left" | "bottom-center" | "bottom-right";
+
+type Edge = "right" | "left" | "top" | "bottom";
+
+const VALID_ANCHORS = new Set<string>([
+  "right-top","right-center","right-bottom",
+  "left-top","left-center","left-bottom",
+  "top-left","top-center","top-right",
+  "bottom-left","bottom-center","bottom-right",
+]);
+
+function normalizeAnchor(value: unknown): Anchor {
+  const s = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return (VALID_ANCHORS.has(s) ? s : "right-center") as Anchor;
+}
+
+function edgeOf(anchor: Anchor): Edge {
+  return anchor.split("-")[0] as Edge;
+}
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────────────
 let _invoke: ((cmd: string, args?: Record<string, unknown>) => Promise<unknown>) | null = null;
@@ -47,7 +74,9 @@ async function tauriInvoke(cmd: string, args?: Record<string, unknown>): Promise
       _invoke = undefined as unknown as null;
     }
   }
-  if (_invoke) await _invoke(cmd, args);
+  if (_invoke) {
+    try { await _invoke(cmd, args); } catch { /* noop — desktop only */ }
+  }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -71,9 +100,22 @@ function StarIcon({ className, size = 15 }: { className?: string; size?: number 
     </svg>
   );
 }
-function ChevronLeftIcon({ className }: { className?: string }) {
+/** Chevron rotated to point along the given axis. */
+function ChevronIcon({ direction, className }: { direction: Edge; className?: string }) {
+  // Base glyph points LEFT ("<"). Rotate to point in the panel-open direction.
+  const rot = direction === "left" ? 180
+            : direction === "top"  ? 90
+            : direction === "bottom" ? -90
+            : 0;
   return (
-    <svg width="8" height="14" viewBox="0 0 8 14" fill="none" className={className}>
+    <svg
+      width="8"
+      height="14"
+      viewBox="0 0 8 14"
+      fill="none"
+      className={className}
+      style={{ transform: `rotate(${rot}deg)` }}
+    >
       <path d="M6 1.5L2 7L6 12.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
@@ -86,23 +128,36 @@ export default function FavoritesOverlayPage() {
   const [busyKey, setBusyKey]   = useState<string | null>(null);
   const [handleHovered, setHandleHovered] = useState(false);
 
+  // Anchor (live) — reloaded from config on mount and on broadcast.
+  // `anchorLoaded` gates the very first paint so we never render with a
+  // stale default anchor (which would flash the handle on the wrong edge
+  // before /config replies).
+  const [anchor, setAnchor] = useState<Anchor>("right-center");
+  const [anchorLoaded, setAnchorLoaded] = useState(false);
+  const edge = edgeOf(anchor);
+  const isVertical = edge === "right" || edge === "left";
+
   // Two-phase open/close animation
   const [panelMounted, setPanelMounted] = useState(false);
   const [panelOpen,    setPanelOpen]    = useState(false);
 
-  // Keyboard-driven selection (independent of DOM focus so mouse users
-  // never see a stale focus ring)
+  // Manual refresh flag for the in-panel "sync" button.
+  const [syncing, setSyncing] = useState(false);
+
   const [kbIndex, setKbIndex] = useState<number>(-1);
 
   const collapseTimer = useRef<number | null>(null);
   const unmountTimer  = useRef<number | null>(null);
 
+  // Track the last-applied anchor so `loadAnchor` can bail out when nothing
+  // actually changed. Without this, the native `resize` event that fires
+  // during a hover-expand would re-trigger loadAnchor → apply(collapsed) →
+  // Rust resize back → visible "big → small" flicker.
+  const lastAppliedAnchor = useRef<Anchor | null>(null);
+
   const favorites = qa?.favorites ?? [];
 
-  // ── Document-level transparency ───────────────────────────────────────────
-  // Tauri creates this window with transparent(true); Tailwind base would
-  // paint bg-background on <body> — neutralise that so the desktop shows
-  // through during the resize animation.
+  // ── Transparency enforcement ─────────────────────────────────────────────
   useLayoutEffect(() => {
     const html = document.documentElement;
     const body = document.body;
@@ -115,8 +170,186 @@ export default function FavoritesOverlayPage() {
     }
   }, []);
 
-  // ── Reload when mounted ───────────────────────────────────────────────────
+  // ── Load anchor from /config and apply to window ─────────────────────────
+  // IMPORTANT: only invoke Rust when the anchor value CHANGED. Otherwise the
+  // resize event fired by an expand would cause us to re-apply "collapsed"
+  // mid-hover and shrink the window under the user's mouse.
+  const loadAnchor = useCallback(async () => {
+    let next: Anchor = "right-center";
+    try {
+      const res = await get<any>("/config");
+      const cfg = res?.config || res || {};
+      next = normalizeAnchor(cfg.favorites_overlay_anchor);
+    } catch {
+      // /config unreachable — keep the default and flag loaded so the UI
+      // doesn't stay blank forever.
+    }
+    setAnchor(next);
+    setAnchorLoaded(true);
+    if (lastAppliedAnchor.current !== next) {
+      lastAppliedAnchor.current = next;
+      void tauriInvoke("apply_favorites_overlay_anchor", { anchor: next, expanded: false });
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAnchor();
+  }, [loadAnchor]);
+
+  // When the Config page saves a new anchor, it invokes
+  // `apply_favorites_overlay_anchor` which resizes THIS window. A native
+  // resize fires → we re-read /config so the UI flips edge.
+  //
+  // Also reset the panel state whenever the window becomes visible again
+  // (tray-reopened). React state survives the hide/show cycle, so a
+  // previously-open panel would otherwise render inside a now-collapsed
+  // window and flash "big → small".
+  useEffect(() => {
+    const onResize = () => { void loadAnchor(); };
+    const onFocus  = () => { void loadAnchor(); reload(); };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        setPanelMounted(false);
+        setPanelOpen(false);
+        setKbIndex(-1);
+        if (collapseTimer.current) { clearTimeout(collapseTimer.current); collapseTimer.current = null; }
+        if (unmountTimer.current)  { clearTimeout(unmountTimer.current);  unmountTimer.current  = null; }
+        void loadAnchor();
+        // Re-fetch favorites: `favorites_overlay_show_all_presets` may have
+        // toggled while the overlay was hidden.
+        reload();
+      }
+    };
+    window.addEventListener("resize", onResize);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [loadAnchor, reload]);
+
+  // ── Reload favorites when mounted ─────────────────────────────────────────
   useEffect(() => { reload(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Register OS-level shortcuts for every favorite with a `favoriteShortcut`.
+  // The Rust side POSTs the door-open request and emits
+  // `favorite-shortcut-triggered` when any registered combo fires anywhere.
+  //
+  // `favorites` is a new array reference every render (derived from qa), so
+  // we derive a JSON signature of only the shortcut-relevant fields and key
+  // the effect on that. Otherwise the effect re-runs on every mouse-hover
+  // render and saturates Tauri's IPC with register/unregister calls — which
+  // was making the whole overlay window freeze / not paint.
+  const shortcutEntries = useMemo(
+    () =>
+      favorites
+        .filter((f) => typeof f.favoriteShortcut === "string" && f.favoriteShortcut.trim().length > 0)
+        .map((f) => ({
+          favoriteId:   Number(f.id),
+          deviceId:     Number(f.deviceId),
+          doorNumber:   Number(f.doorNumber),
+          pulseSeconds: Number(f.pulseSeconds),
+          doorName:     String(f.doorName ?? ""),
+          deviceName:   String(f.deviceName ?? ""),
+          shortcut:     String(f.favoriteShortcut ?? ""),
+        })),
+    [favorites],
+  );
+  const shortcutKey = useMemo(() => JSON.stringify(shortcutEntries), [shortcutEntries]);
+
+  useEffect(() => {
+    if (shortcutEntries.length === 0) {
+      void tauriInvoke("unregister_favorite_shortcuts");
+      return;
+    }
+    void tauriInvoke("register_favorite_shortcuts", { shortcuts: shortcutEntries });
+    return () => { void tauriInvoke("unregister_favorite_shortcuts"); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shortcutKey]);
+
+  // Refs to doOpen/doClose — assigned below — so the shortcut-toast effect
+  // can attach its Tauri listener ONCE on mount without a dependency loop.
+  const doOpenRef  = useRef<() => void>(() => {});
+  const doCloseRef = useRef<() => void>(() => {});
+
+  // ── Immediate beep on shortcut press ─────────────────────────────────────
+  // Fires before the HTTP call so the user gets instant audio confirmation
+  // that the key combo was captured, regardless of network/door outcome.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<{ favoriteId: number; shortcut: string }>(
+          "favorite-shortcut-pressed",
+          () => {
+            try {
+              const ctx = new AudioContext();
+              const osc = ctx.createOscillator();
+              const gain = ctx.createGain();
+              osc.connect(gain);
+              gain.connect(ctx.destination);
+              osc.type = "sine";
+              osc.frequency.value = 880;
+              gain.gain.setValueAtTime(0.25, ctx.currentTime);
+              gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+              osc.start(ctx.currentTime);
+              osc.stop(ctx.currentTime + 0.12);
+              osc.onended = () => ctx.close();
+            } catch { /* AudioContext unavailable */ }
+          },
+        );
+      } catch { /* Non-Tauri environment */ }
+    })();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  // ── Toast on shortcut capture ─────────────────────────────────────────────
+  // Listens for the Rust-emitted event, shows the flash banner, and briefly
+  // expands the overlay (if collapsed) so the toast is actually visible.
+  // After ~2.2 s it auto-collapses again.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let autoCollapseTimer: number | null = null;
+
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<{
+          favoriteId: number;
+          doorName: string;
+          deviceName: string;
+          shortcut: string;
+          ok: boolean;
+          error?: string | null;
+        }>("favorite-shortcut-triggered", (event) => {
+          const p = event.payload;
+          const label = p.doorName?.trim() || p.deviceName || `Favori ${p.favoriteId}`;
+          setFlash({
+            key: `sc-${p.favoriteId}-${Date.now()}`,
+            ok: p.ok,
+            msg: p.ok ? `⌨ ${p.shortcut} → ${label}` : `${label}: ${p.error ?? "erreur"}`,
+          });
+          // Briefly expand so the toast is visible when the user triggered
+          // the shortcut from another app.
+          doOpenRef.current();
+          if (autoCollapseTimer) clearTimeout(autoCollapseTimer);
+          autoCollapseTimer = window.setTimeout(() => {
+            doCloseRef.current();
+          }, 2200);
+        });
+      } catch {
+        // Non-Tauri environment (dev preview in browser) — no events here.
+      }
+    })();
+
+    return () => {
+      if (unlisten) unlisten();
+      if (autoCollapseTimer) clearTimeout(autoCollapseTimer);
+    };
+  }, []);
 
   // ── Auto-clear flash ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -125,7 +358,6 @@ export default function FavoritesOverlayPage() {
     return () => window.clearTimeout(t);
   }, [flash]);
 
-  // ── Respect prefers-reduced-motion ────────────────────────────────────────
   const prefersReducedMotion = useMemo(() => {
     if (typeof window === "undefined") return false;
     return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -138,8 +370,7 @@ export default function FavoritesOverlayPage() {
 
     if (panelOpen) return;
 
-    // Resize window first so the canvas is ready by the time we render
-    void tauriInvoke("expand_favorites_overlay");
+    void tauriInvoke("expand_favorites_overlay", { anchor });
 
     if (!panelMounted) {
       setPanelMounted(true);
@@ -148,23 +379,28 @@ export default function FavoritesOverlayPage() {
         requestAnimationFrame(() => setPanelOpen(true))
       );
     } else {
-      // Mid-collapse: reverse the CSS animation
       setPanelOpen(true);
     }
-  }, [panelMounted, panelOpen]);
+  }, [panelMounted, panelOpen, anchor]);
 
   // ── Close ─────────────────────────────────────────────────────────────────
   const doClose = useCallback(() => {
     if (unmountTimer.current) clearTimeout(unmountTimer.current);
     setPanelOpen(false);
     setKbIndex(-1);
+    // Fire the Rust collapse animation IMMEDIATELY so the window shrink
+    // runs in parallel with the CSS panel slide-out — both finish around
+    // the same time, eliminating the "snap" at the end of the close.
+    void tauriInvoke("collapse_favorites_overlay", { anchor });
     unmountTimer.current = window.setTimeout(() => {
       setPanelMounted(false);
-      void tauriInvoke("collapse_favorites_overlay");
-    }, 270);
-  }, []);
+    }, 280);
+  }, [anchor]);
 
-  // ── Mouse hover ───────────────────────────────────────────────────────────
+  // Keep refs in sync for the shortcut-toast listener registered above.
+  doOpenRef.current  = doOpen;
+  doCloseRef.current = doClose;
+
   const handleMouseEnter = useCallback(() => { doOpen(); }, [doOpen]);
   const scheduleCollapse = useCallback(() => {
     if (collapseTimer.current) clearTimeout(collapseTimer.current);
@@ -212,34 +448,124 @@ export default function FavoritesOverlayPage() {
   }, [panelMounted, favorites, kbIndex, doClose, handleOpen]);
 
   // ── Derived transitions ───────────────────────────────────────────────────
-  const openDur  = prefersReducedMotion ? 0 : 320;
-  const closeDur = prefersReducedMotion ? 0 : 220;
+  // Timings mirror the Rust window animation (~260 ms, ease-out-cubic) so
+  // the panel reaches its final position at the same moment the window
+  // finishes resizing — no residual snap.
+  const openDur  = prefersReducedMotion ? 0 : 260;
+  const closeDur = prefersReducedMotion ? 0 : 260;
 
+  // Panel hidden-state transform: use a fixed pixel offset larger than the
+  // max expanded panel size so the panel stays fully off-screen regardless
+  // of the current (animating) window size. Percentage-based offsets would
+  // drift as the panel's own width changes with the window.
+  const hiddenTransform =
+    edge === "right"  ? "translate3d(360px, 0, 0)"
+    : edge === "left" ? "translate3d(-360px, 0, 0)"
+    : edge === "top"  ? "translate3d(0, -360px, 0)"
+    : /* bottom */      "translate3d(0, 360px, 0)";
+
+  // Match ease-out-cubic on open (same curve as Rust) and a gentle
+  // ease-in-cubic on close so the slide feels symmetric.
   const panelTransitionStyle: React.CSSProperties = {
     transition: panelOpen
-      ? `transform ${openDur}ms cubic-bezier(0.22, 0.9, 0.28, 1), opacity 220ms ease-out`
-      : `transform ${closeDur}ms cubic-bezier(0.4, 0, 1, 1), opacity 160ms ease-in`,
-    transform: panelOpen ? "translateX(0)" : "translateX(calc(100% + 16px))",
+      ? `transform ${openDur}ms cubic-bezier(0.33, 1, 0.68, 1), opacity ${openDur}ms ease-out`
+      : `transform ${closeDur}ms cubic-bezier(0.32, 0, 0.67, 0), opacity ${closeDur}ms ease-in`,
+    transform: panelOpen ? "translate3d(0, 0, 0)" : hiddenTransform,
     opacity:   panelOpen ? 1 : 0,
     willChange: "transform, opacity",
   };
 
-  const handleVisible = !panelMounted;
-  // Handle fills the full window height via `inset-y-0`, so we do NOT need
-  // any Y translation for vertical centring.  Only translateX for the
-  // hide animation.
+  // Handle cross-fades with the panel's open state. The panel's background
+  // is 86% opaque (so the frosted-blur effect works), which means a
+  // fully-opaque handle below would bleed through as a ghost orange strip.
+  // Instead we fade the handle out as `panelOpen` goes true, and back in as
+  // it goes false — so the pill and the panel effectively swap places.
+  // Duration matches the panel slide so neither runs ahead of the other.
   const handleTransitionStyle: React.CSSProperties = {
-    transition: "opacity 180ms ease, transform 220ms cubic-bezier(0.4, 0, 0.2, 1)",
-    opacity:       handleVisible ? 1 : 0,
-    transform:     handleVisible ? "translateX(0)" : "translateX(14px)",
-    pointerEvents: handleVisible ? "auto" : "none",
+    transition: "opacity 220ms ease",
+    opacity: panelOpen ? 0 : 1,
+    transform: "translate3d(0,0,0)",
+    pointerEvents: panelOpen ? "none" : "auto",
   };
+
+  // When the panel opens the mouse leaves the handle region → handleHovered
+  // flips back to false and the hover animations (scale 1.04, chevron shift,
+  // glow, sheen) all spring back to rest at the same time the handle is
+  // fading out. Visually that's a "shake". Freeze the hover state to `false`
+  // the moment the panel is open so the pill fades out perfectly still.
+  const showHoverEffect = handleHovered && !panelOpen;
+
+  // Handle positioning — pill lies along the docked edge.
+  const handleContainerStyle: React.CSSProperties = isVertical
+    ? { width: 36, top: 0, bottom: 0, [edge]: 0 }
+    : { height: 36, left: 0, right: 0, [edge]: 0 };
+
+  // Handle pill inner layout
+  const handleFlexDir = isVertical ? "flex-col" : "flex-row";
+  const handleRadius =
+    edge === "right"  ? "rounded-l-2xl"
+    : edge === "left" ? "rounded-r-2xl"
+    : edge === "top"  ? "rounded-b-2xl"
+    : /* bottom */      "rounded-t-2xl";
+
+  // Hover micro-translation
+  const handleHoverShift =
+    edge === "right"  ? "translate3d(-2px, 0, 0)"
+    : edge === "left" ? "translate3d(2px, 0, 0)"
+    : edge === "top"  ? "translate3d(0, 2px, 0)"
+    : /* bottom */      "translate3d(0, -2px, 0)";
+
+  // Chevron points toward where the panel will appear (opposite of edge).
+  const chevronDir: Edge =
+    edge === "right"  ? "left"
+    : edge === "left" ? "right"
+    : edge === "top"  ? "bottom"
+    : /* bottom */      "top";
+
+  // Chevron hover micro-shift matches handle
+  const chevronHoverShift =
+  
+    edge === "right"  ? "translateX(14px)"
+    : edge === "left" ? "translateX(2px)"
+    : edge === "top"  ? "translateY(2px)"
+    : /* bottom */      "translateY(-2px)";
+
+  // Glow direction — cast away from the handle into the screen
+  const glowShadow =
+    edge === "right"  ? "-4px 0 24px 5px hsl(var(--primary) / 0.5)"
+    : edge === "left" ? "4px 0 24px 5px hsl(var(--primary) / 0.5)"
+    : edge === "top"  ? "0 4px 24px 5px hsl(var(--primary) / 0.5)"
+    : /* bottom */      "0 -4px 24px 5px hsl(var(--primary) / 0.5)";
+
+  // Base gradient direction (from edge face outward)
+  const pillGradient =
+    edge === "right"
+      ? "linear-gradient(168deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
+      : edge === "left"
+        ? "linear-gradient(-168deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
+      : edge === "top"
+        ? "linear-gradient(258deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)"
+        : "linear-gradient(78deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)";
+
+  // Panel border-radius — rounded on the side facing away from the edge.
+  const panelRadius =
+    edge === "right"  ? "20px 0 0 20px"
+    : edge === "left" ? "0 20px 20px 0"
+    : edge === "top"  ? "0 0 20px 20px"
+    : /* bottom */      "20px 20px 0 0";
+
+  // Accent stripe position on the panel (along the docked edge inside)
+  const accentStripeStyle: React.CSSProperties = isVertical
+    ? { height: 3, width: "100%", background:
+        "linear-gradient(90deg, hsl(var(--primary)) 0%, hsl(var(--primary)/0.45) 75%, transparent 100%)",
+        borderRadius: edge === "right" ? "20px 0 0 0" : "0 20px 0 0" }
+    : { width: 3, height: "100%", background:
+        "linear-gradient(180deg, hsl(var(--primary)) 0%, hsl(var(--primary)/0.45) 75%, transparent 100%)",
+        borderRadius: edge === "top" ? "0 0 0 20px" : "0 20px 0 0" };
 
   // ────────────────────────────────────────────────────────────────────────────
   return (
     <>
-      {/* Window-wide transparency enforcement — applied during the first
-          render so the dark body bg never paints. */}
       <style>{`
         html, body, #root {
           background: transparent !important;
@@ -253,137 +579,123 @@ export default function FavoritesOverlayPage() {
 
       <div
         className="h-screen w-screen overflow-hidden bg-transparent"
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
+        onMouseEnter={anchorLoaded ? handleMouseEnter : undefined}
+        onMouseLeave={anchorLoaded ? handleMouseLeave : undefined}
       >
 
+      {/* Gate first paint on the anchor so we never render the handle on
+          the wrong edge before /config replies. The window itself is
+          already sized correctly by Rust at this point. */}
+      {anchorLoaded && <>
+
         {/* ── Collapsed handle ──────────────────────────────────────────────
-            Fills the full window height via `inset-y-0`, so it looks right
-            no matter what Tauri sized the window to.  Uses a classic drawer
-            grab-bar design: star at the top, three dots in the middle,
-            chevron at the bottom.
-            Performance: base gradient + shadow are STATIC. Hover polish is
-            all opacity-fade overlays and transforms — GPU-only. */}
+            `z-0` establishes a stacking context so the `z-10` used on
+            chevrons/dots inside the pill stays CONTAINED to the handle.
+            Without it those inner elements would bleed above the expanded
+            panel — you'd see the orange edge and the arrow tip poking
+            through while the panel is open. */}
         <div
-          className="absolute inset-y-0 right-0 cursor-pointer select-none"
-          style={{ width: 36, ...handleTransitionStyle }}
+          className="absolute cursor-pointer select-none z-0"
+          style={{ ...handleContainerStyle, ...handleTransitionStyle }}
           onMouseEnter={() => setHandleHovered(true)}
           onMouseLeave={() => setHandleHovered(false)}
         >
           {/* Coloured glow */}
           <div
             aria-hidden
-            className="pointer-events-none absolute rounded-l-2xl"
+            className={`pointer-events-none absolute ${handleRadius}`}
             style={{
               inset: 0,
-              opacity: handleHovered ? 1 : 0,
+              opacity: showHoverEffect ? 1 : 0,
               transition: "opacity 220ms ease",
-              boxShadow: "-4px 0 24px 5px hsl(var(--primary) / 0.5)",
+              boxShadow: glowShadow,
               willChange: "opacity",
             }}
           />
 
-          {/* Main pill — fills the window vertically */}
+          {/* Main pill */}
           <div
-            className="relative flex h-full flex-col items-center justify-between rounded-l-2xl px-1 py-2.5"
+            className={`relative flex ${handleFlexDir} items-center justify-between ${handleRadius} ${isVertical ? "h-full w-full px-1 py-2.5" : "h-full w-full px-2.5 py-1"}`}
             style={{
-              width: 36,
-              transform: handleHovered
-                ? "translate3d(-2px, 0, 0) scale(1.04)"
-                : "translate3d(0, 0, 0) scale(1)",
+              transform: showHoverEffect ? `${handleHoverShift} scale(1.04)` : "translate3d(0,0,0) scale(1)",
               transition: "transform 200ms cubic-bezier(0.22, 0.9, 0.28, 1)",
-              background:
-                "linear-gradient(168deg, hsl(var(--primary)) 0%, hsl(var(--primary)) 45%, hsl(var(--primary) / 0.82) 100%)",
+              background: pillGradient,
+              // Inset-only shadows: an outset shadow on a 36px-wide window
+              // renders outside the window bounds and on Windows' DWM shows
+              // up as a faint dark rectangle next to the pill — exactly the
+              // "second background" symptom.
               boxShadow:
-                "-4px 2px 18px rgba(0,0,0,0.46), " +
                 "inset 0 1px 0 rgba(255,255,255,0.26), " +
                 "inset -1px 0 0 rgba(0,0,0,0.1)",
               willChange: "transform",
               backfaceVisibility: "hidden",
             }}
           >
-            {/* Top sheen */}
+            {/* Sheen */}
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-0 rounded-l-2xl"
+              className={`pointer-events-none absolute inset-0 ${handleRadius}`}
               style={{
-                background:
-                  "linear-gradient(180deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0) 55%)",
-                opacity: handleHovered ? 1 : 0,
+                background: isVertical
+                  ? "linear-gradient(180deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0) 55%)"
+                  : "linear-gradient(90deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0) 55%)",
+                opacity: showHoverEffect ? 1 : 0,
                 transition: "opacity 180ms ease",
               }}
             />
 
-            {/* Thin top highlight line */}
-            <div
-              aria-hidden
-              className="absolute left-0 right-0 top-0 h-px rounded-tl-2xl"
-              style={{ background: "rgba(255,255,255,0.32)" }}
-            />
-
-            
-            {/* Chevron */}
+            {/* First chevron */}
             <div
               className="relative z-10"
               style={{
                 transition: "transform 200ms cubic-bezier(0.4, 0, 0.2, 1)",
-                transform: handleHovered ? "translateX(-2px)" : "translateX(0)",
+                transform: showHoverEffect ? chevronHoverShift : "translate3d(0,0,0)",
                 willChange: "transform",
               }}
             >
-              <ChevronLeftIcon className="text-primary-foreground/90" />
+              <ChevronIcon direction={chevronDir} className="text-primary-foreground/90" />
             </div>
-            {/* Middle — three decorative dots (grab-bar style) */}
-            <div className="relative z-10 flex flex-col gap-1">
+
+            {/* Middle grab-bar dots */}
+            <div className={`relative z-10 flex ${isVertical ? "flex-col" : "flex-row"} gap-1`}>
               <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
               <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
               <div className="h-[3px] w-[3px] rounded-full bg-primary-foreground/45" />
             </div>
 
-            {/* Chevron */}
+            {/* Second chevron */}
             <div
               className="relative z-10"
               style={{
                 transition: "transform 200ms cubic-bezier(0.4, 0, 0.2, 1)",
-                transform: handleHovered ? "translateX(-2px)" : "translateX(0)",
+                transform: showHoverEffect ? chevronHoverShift : "translate3d(0,0,0)",
                 willChange: "transform",
               }}
             >
-              <ChevronLeftIcon className="text-primary-foreground/90" />
+              <ChevronIcon direction={chevronDir} className="text-primary-foreground/90" />
             </div>
           </div>
         </div>
 
         {/* ── Expanded panel ────────────────────────────────────────────── */}
         {panelMounted && (
-          <div className="absolute inset-0" style={panelTransitionStyle}>
+          <div className="absolute inset-0 z-10" style={panelTransitionStyle}>
             <div
-              className="flex h-full flex-col overflow-hidden"
+              className="flex h-full w-full flex-col overflow-hidden"
               style={{
-                borderRadius: "20px 0 0 20px",
-                // Frosted glass: translucent + moderate blur.
-                // blur() above ~20px kills framerate on weaker GPUs; 16px is
-                // still convincingly glassy without the jank.
+                borderRadius: panelRadius,
                 background: "hsl(var(--background) / 0.86)",
                 backdropFilter: "blur(16px) saturate(1.3)",
                 WebkitBackdropFilter: "blur(16px) saturate(1.3)",
                 border: "1px solid hsl(var(--border) / 0.5)",
-                borderRight: "none",
                 boxShadow:
                   "-14px 0 48px rgba(0,0,0,0.32), " +
                   "-3px 0 10px rgba(0,0,0,0.12), " +
                   "inset 1px 0 0 hsl(var(--foreground) / 0.04)",
               }}
             >
-              {/* Top accent stripe */}
-              <div
-                className="h-[3px] shrink-0"
-                style={{
-                  background:
-                    "linear-gradient(90deg, hsl(var(--primary)) 0%, hsl(var(--primary)/0.45) 75%, transparent 100%)",
-                  borderRadius: "20px 0 0 0",
-                }}
-              />
+              {/* Top accent */}
+              <div className="shrink-0" style={accentStripeStyle} />
 
               {/* Header */}
               <div className="flex shrink-0 items-center justify-between border-b border-border/40 px-4 py-2.5">
@@ -398,18 +710,59 @@ export default function FavoritesOverlayPage() {
                     Accès rapide
                   </span>
                 </div>
-                <button
-                  type="button"
-                  className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground/60
-                             transition-all duration-150 hover:rotate-90 hover:bg-muted hover:text-foreground
-                             focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
-                  onClick={doClose}
-                  aria-label="Réduire le panneau favoris"
-                >
-                  <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
-                    <path d="M2 2L8 8M8 2L2 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-                  </svg>
-                </button>
+                <div className="flex items-center gap-1">
+                  {/* Manual sync — refetches from the remote server so new
+                      dashboard favorites appear without waiting for auto-sync. */}
+                  <button
+                    type="button"
+                    disabled={syncing}
+                    className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground/60
+                               transition-all duration-150 hover:bg-muted hover:text-foreground
+                               focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50
+                               disabled:opacity-50"
+                    onClick={async () => {
+                      if (syncing) return;
+                      setSyncing(true);
+                      try {
+                        // `forceDeviceRefresh` strips the devicesVersion token
+                        // on the client so the server must re-send full device
+                        // state (including preset favoriteEnabled changes —
+                        // those don't bump the backend's devicesVersion).
+                        await post("/sync/now", {
+                          entityType: "FAVORITE",
+                          forceDeviceRefresh: true,
+                          reason: "user_manual_favorites_refresh",
+                        });
+                        // Give the backend a moment to populate, then reload.
+                        window.setTimeout(() => { reload(); setSyncing(false); }, 2000);
+                      } catch (e) {
+                        setFlash({ key: "sync", ok: false, msg: String(e) });
+                        setSyncing(false);
+                      }
+                    }}
+                    aria-label="Synchroniser les favoris"
+                    title="Synchroniser les favoris depuis le serveur"
+                  >
+                    <svg
+                      width="11" height="11" viewBox="0 0 12 12" fill="none"
+                      className={syncing ? "animate-spin" : ""}
+                    >
+                      <path d="M10.5 6a4.5 4.5 0 1 1-1.32-3.18M10.5 1.5V4.5H7.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    className="flex h-6 w-6 items-center justify-center rounded-full text-muted-foreground/60
+                               transition-all duration-150 hover:rotate-90 hover:bg-muted hover:text-foreground
+                               focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                    onClick={doClose}
+                    aria-label="Réduire le panneau favoris"
+                  >
+                    <svg width="9" height="9" viewBox="0 0 10 10" fill="none">
+                      <path d="M2 2L8 8M8 2L2 8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+                    </svg>
+                  </button>
+                </div>
               </div>
 
               {/* Flash banner */}
@@ -438,29 +791,35 @@ export default function FavoritesOverlayPage() {
                 </div>
               )}
 
-              {/* List */}
-              <div className="flex-1 overflow-y-auto overflow-x-hidden px-2.5 pb-3 pt-2.5 space-y-1">
+              {/* List — single column for vertical panel (right/left anchor);
+                  two-column grid for horizontal panel (top/bottom anchor)
+                  so items use the extra width instead of leaving large
+                  empty bands next to each row. */}
+              <div
+                className={[
+                  "flex-1 overflow-y-auto overflow-x-hidden px-2.5 pb-3 pt-2.5",
+                  isVertical ? "space-y-1" : "grid grid-cols-2 gap-1.5 content-start",
+                ].join(" ")}
+              >
 
-                {/* Skeleton */}
                 {loading && favorites.length === 0 && (
-                  <div className="space-y-1.5 px-0.5">
+                  <div className={isVertical ? "space-y-1.5 px-0.5" : "contents"}>
                     {Array.from({ length: 4 }).map((_, i) => (
                       <div
                         key={i}
                         className="h-[52px] animate-pulse rounded-2xl bg-muted/40"
-                        style={{
-                          opacity: 1 - i * 0.2,
-                          animationDelay: `${i * 80}ms`,
-                        }}
+                        style={{ opacity: 1 - i * 0.2, animationDelay: `${i * 80}ms` }}
                       />
                     ))}
                   </div>
                 )}
 
-                {/* Empty */}
                 {!loading && favorites.length === 0 && (
                   <div
-                    className="flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-muted/20 py-8 px-4 text-center"
+                    className={[
+                      "flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border bg-muted/20 py-8 px-4 text-center",
+                      !isVertical && "col-span-2",
+                    ].filter(Boolean).join(" ")}
                     style={{
                       opacity: panelOpen ? 1 : 0,
                       transform: panelOpen ? "translateY(0)" : "translateY(6px)",
@@ -480,7 +839,6 @@ export default function FavoritesOverlayPage() {
                   </div>
                 )}
 
-                {/* Items — stagger-in on panel open */}
                 {favorites.map((fav, i) => {
                   const key    = String(fav.id);
                   const busy   = busyKey === key;
@@ -489,8 +847,6 @@ export default function FavoritesOverlayPage() {
                   const isErr  = didFlash && !flash?.ok;
                   const isKb   = kbIndex === i;
 
-                  // Stagger: each card appears ~22 ms after the previous,
-                  // capped at 200 ms so long lists don't drag.
                   const delay = panelOpen ? Math.min(i * 22, 200) : 0;
 
                   return (
@@ -514,9 +870,6 @@ export default function FavoritesOverlayPage() {
                         "active:scale-[0.98]",
                       ].join(" ")}
                       style={{
-                        // Stagger entrance (GPU-only: opacity + transform).
-                        // Hover effects on bg/border use Tailwind-provided
-                        // transitions which are separate from this rule.
                         opacity:   panelOpen ? 1 : 0,
                         transform: panelOpen ? "translateY(0)" : "translateY(8px)",
                         transition: [
@@ -529,7 +882,6 @@ export default function FavoritesOverlayPage() {
                         willChange: panelOpen ? "auto" : "opacity, transform",
                       }}
                     >
-                      {/* Slot badge */}
                       <span
                         className={[
                           "flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-[11px] font-bold",
@@ -544,7 +896,6 @@ export default function FavoritesOverlayPage() {
                         {slotBadge(fav.favoriteOrder ?? i)}
                       </span>
 
-                      {/* Label */}
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
                           {favoriteTitle(fav, i)}
@@ -556,7 +907,6 @@ export default function FavoritesOverlayPage() {
                         </div>
                       </div>
 
-                      {/* Trailing icon slot */}
                       <span className="flex h-4 w-4 shrink-0 items-center justify-center">
                         {busy && (
                           <svg className="h-4 w-4 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
@@ -613,6 +963,7 @@ export default function FavoritesOverlayPage() {
             </div>
           </div>
         )}
+      </>}
       </div>
     </>
   );

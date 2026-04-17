@@ -53,6 +53,19 @@ def strip_member_version_tokens(tokens: dict[str, Any] | None) -> dict[str, str]
     return out
 
 
+def strip_device_version_tokens(tokens: dict[str, Any] | None) -> dict[str, str]:
+    """Drop the devicesVersion token so the backend must return full device
+    state on the next getSyncData call. Used by the UI's manual "refresh
+    favorites" action to work around the backend not bumping devicesVersion
+    when a preset's favoriteEnabled flips."""
+    out: dict[str, str] = {}
+    for key, value in (tokens or {}).items():
+        if key == "devicesVersion" or value is None:
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
 def apply_trigger_hint_to_version_tokens(
     tokens: Mapping[str, Any] | None,
     trigger_hint: Mapping[str, Any] | None,
@@ -66,11 +79,37 @@ def apply_trigger_hint_to_version_tokens(
         return None
 
     entity_type = ""
+    force_device_refresh = False
     if isinstance(trigger_hint, Mapping):
         entity_type = str(
             trigger_hint.get("entityType") or trigger_hint.get("entity_type") or ""
         ).strip().upper()
+        force_device_refresh = bool(
+            trigger_hint.get("forceDeviceRefresh")
+            or trigger_hint.get("force_device_refresh")
+        )
 
     if entity_type == "ACTIVE_MEMBERSHIP":
-        return strip_member_version_tokens(normalized)
+        stripped = strip_member_version_tokens(normalized)
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[SYNC-DEBUG] trigger_hint=%s → stripped membersVersion (had=%s now=%s)",
+            dict(trigger_hint) if trigger_hint else None,
+            "membersVersion" in normalized,
+            "membersVersion" in stripped,
+        )
+        return stripped
+    if force_device_refresh or entity_type in ("DEVICE", "DOOR_PRESET", "FAVORITE"):
+        stripped = strip_device_version_tokens(normalized)
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[SYNC-DEBUG] trigger_hint=%s → stripped devicesVersion (had=%s now=%s) "
+            "force=%s entity=%s",
+            dict(trigger_hint) if trigger_hint else None,
+            "devicesVersion" in normalized,
+            "devicesVersion" in stripped,
+            force_device_refresh,
+            entity_type,
+        )
+        return stripped
     return normalized

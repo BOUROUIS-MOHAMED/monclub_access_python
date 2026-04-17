@@ -37,6 +37,7 @@ import {
 import {
   Settings, Save, Lock, Unlock, Loader2, CheckCircle, Download, Info,
   CreditCard, Wifi, Usb, Search, Radio, Music4, Sparkles, Upload, RotateCcw,
+  Star,
 } from "lucide-react";
 import type { DiscoveredDevice } from "@/api/types";
 import { useScanCard } from "@/hooks/useScanCard";
@@ -48,6 +49,128 @@ import {
   uploadFeedbackSound,
   type FeedbackSoundKind,
 } from "@/lib/feedback";
+
+// ── Anchor type for the favorites overlay ─────────────────────────────────────
+// Vertical edges only — top/bottom horizontal anchors were removed from
+// the picker because they never rendered reliably. Backend still accepts
+// all 12 values for forward-compat; a stored top-/bottom- value falls back
+// to right-center in the UI.
+type OverlayAnchor =
+  | "right-top" | "right-center" | "right-bottom"
+  | "left-top"  | "left-center"  | "left-bottom";
+
+const OVERLAY_ANCHORS: OverlayAnchor[] = [
+  "right-top", "right-center", "right-bottom",
+  "left-top", "left-center", "left-bottom",
+];
+
+const OVERLAY_ANCHOR_LABELS: Record<OverlayAnchor, string> = {
+  "right-top": "Droite — haut",
+  "right-center": "Droite — centre",
+  "right-bottom": "Droite — bas",
+  "left-top": "Gauche — haut",
+  "left-center": "Gauche — centre",
+  "left-bottom": "Gauche — bas",
+};
+
+function isOverlayAnchor(v: unknown): v is OverlayAnchor {
+  return typeof v === "string" && (OVERLAY_ANCHORS as string[]).includes(v);
+}
+
+async function applyOverlayAnchor(anchor: OverlayAnchor): Promise<void> {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("apply_favorites_overlay_anchor", { anchor, expanded: false });
+  } catch {
+    // Not running under Tauri, or the overlay window isn't open — harmless.
+  }
+}
+
+/**
+ * 12-position anchor selector. Renders a fake screen with clickable dots
+ * around its border and a live preview of where the collapsed handle would
+ * sit on the real monitor.
+ */
+function OverlayAnchorPicker({
+  value,
+  onChange,
+}: {
+  value: OverlayAnchor;
+  onChange: (next: OverlayAnchor) => void;
+}) {
+  // Each anchor gets absolute coords on a [0..1] × [0..1] grid.
+  const POS: Record<OverlayAnchor, { x: string; y: string; edge: "v" }> = {
+    "right-top":      { x: "100%", y: "18%",  edge: "v" },
+    "right-center":   { x: "100%", y: "50%",  edge: "v" },
+    "right-bottom":   { x: "100%", y: "82%",  edge: "v" },
+    "left-bottom":    { x: "0%",   y: "82%",  edge: "v" },
+    "left-center":    { x: "0%",   y: "50%",  edge: "v" },
+    "left-top":       { x: "0%",   y: "18%",  edge: "v" },
+  };
+
+  return (
+    <div className="flex flex-col items-center gap-3">
+      {/* Fake screen */}
+      <div
+        className="relative w-[320px] h-[200px] rounded-lg border-2 border-border bg-muted/30 shadow-inner"
+        aria-label="Prévisualisation de l'écran"
+      >
+        {/* Monitor bezel highlight */}
+        <div className="absolute inset-0 rounded-md pointer-events-none ring-1 ring-inset ring-border/50" />
+
+        {/* Dots for each anchor */}
+        {OVERLAY_ANCHORS.map((a) => {
+          const p = POS[a];
+          const active = a === value;
+          return (
+            <button
+              key={a}
+              type="button"
+              title={OVERLAY_ANCHOR_LABELS[a]}
+              onClick={() => onChange(a)}
+              className={[
+                "absolute -translate-x-1/2 -translate-y-1/2",
+                "rounded-full focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/60",
+                "transition-all duration-150",
+                active
+                  ? "h-3.5 w-3.5 bg-primary ring-4 ring-primary/25 shadow-[0_0_0_1px_hsl(var(--background))]"
+                  : "h-2.5 w-2.5 bg-muted-foreground/40 hover:bg-primary/80 hover:scale-125",
+              ].join(" ")}
+              style={{ left: p.x, top: p.y }}
+              aria-label={`Ancre ${OVERLAY_ANCHOR_LABELS[a]}`}
+              aria-pressed={active}
+            />
+          );
+        })}
+
+        {/* Handle pill preview at the selected anchor */}
+        {(() => {
+          const edge = value.split("-")[0];
+          let style: React.CSSProperties;
+          if (edge === "right") {
+            style = { right: 0, top: "50%", transform: "translateY(-50%)", width: 6, height: 44, borderRadius: "6px 0 0 6px" };
+            if (value === "right-top")    style = { ...style, top: "18%" };
+            if (value === "right-bottom") style = { ...style, top: "82%" };
+          } else {
+            style = { left: 0, top: "50%", transform: "translateY(-50%)", width: 6, height: 44, borderRadius: "0 6px 6px 0" };
+            if (value === "left-top")    style = { ...style, top: "18%" };
+            if (value === "left-bottom") style = { ...style, top: "82%" };
+          }
+          return (
+            <div
+              aria-hidden
+              className="absolute bg-primary/80 shadow-[0_0_8px_hsl(var(--primary)/0.6)] transition-all duration-200"
+              style={style}
+            />
+          );
+        })()}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Position choisie : <span className="font-semibold text-foreground">{OVERLAY_ANCHOR_LABELS[value]}</span>
+      </p>
+    </div>
+  );
+}
 
 export default function ConfigPage() {
   const { status } = useApp();
@@ -92,6 +215,25 @@ export default function ConfigPage() {
     try {
       const res = await get<any>("/config");
       const nextCfg = res.config || res || {};
+      // Silent migration: top-/bottom- anchors are no longer offered in the
+      // picker. Coerce any legacy value to `right-center` and persist so
+      // the Rust overlay also switches over. Runs once on load per process.
+      const legacy = typeof nextCfg.favorites_overlay_anchor === "string"
+        ? nextCfg.favorites_overlay_anchor
+        : "";
+      if (legacy && !isOverlayAnchor(legacy)) {
+        try {
+          const patched = await patch<any>("/config", { favorites_overlay_anchor: "right-center" });
+          const patchedCfg = patched.config || { ...nextCfg, favorites_overlay_anchor: "right-center" };
+          setCfg(patchedCfg);
+          setServerSettings(res.serverSettings || {});
+          broadcastFeedbackConfig(patchedCfg);
+          void applyOverlayAnchor("right-center");
+          return;
+        } catch {
+          // fall through to normal load if the migration PATCH fails
+        }
+      }
       setCfg(nextCfg);
       setServerSettings(res.serverSettings || {});
       broadcastFeedbackConfig(nextCfg);
@@ -108,6 +250,12 @@ export default function ConfigPage() {
       const nextCfg = res.config || cfg;
       setCfg(nextCfg);
       broadcastFeedbackConfig(nextCfg);
+      // Reposition the floating favorites overlay (if open) to match the
+      // newly-persisted anchor. Silent no-op under web.
+      const nextAnchor = nextCfg.favorites_overlay_anchor;
+      if (isOverlayAnchor(nextAnchor)) {
+        void applyOverlayAnchor(nextAnchor);
+      }
       setSuccess(true);
       setDirty(false);
       setTimeout(() => setSuccess(false), 3000);
@@ -294,6 +442,57 @@ export default function ConfigPage() {
               id="start-on-windows-switch"
               checked={Boolean(cfg.start_on_system_startup ?? false)}
               onCheckedChange={(checked: boolean) => { void handleStartupToggle(checked); }}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Favorites overlay position — always visible */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-sm flex items-center gap-2">
+            <Star className="h-4 w-4" /> Overlay favoris — Position
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+            <div className="space-y-1 max-w-md">
+              <Label>Emplacement du dock flottant</Label>
+              <p className="text-sm text-muted-foreground">
+                Choisissez l&apos;un des 12 points d&apos;ancrage pour le panneau d&apos;accès rapide.
+                Le panneau s&apos;ouvrira dans la direction opposée au bord sélectionné.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                La nouvelle position s&apos;applique après avoir cliqué sur <strong>Enregistrer</strong>.
+              </p>
+            </div>
+            <OverlayAnchorPicker
+              value={
+                isOverlayAnchor(cfg.favorites_overlay_anchor)
+                  ? cfg.favorites_overlay_anchor
+                  : "right-center"
+              }
+              onChange={(next) => update("favorites_overlay_anchor", next)}
+            />
+          </div>
+
+          <Separator />
+
+          <div className="flex items-start justify-between gap-4">
+            <div className="space-y-1 max-w-md">
+              <Label htmlFor="fav-show-all-switch">Afficher tous les presets de portes</Label>
+              <p className="text-sm text-muted-foreground">
+                Quand activé, le panneau liste <strong>tous</strong> les presets synchronisés,
+                pas seulement ceux marqués comme favoris sur le tableau de bord.
+                Les favoris apparaissent en premier.
+              </p>
+            </div>
+            <Switch
+              id="fav-show-all-switch"
+              checked={Boolean(cfg.favorites_overlay_show_all_presets ?? false)}
+              onCheckedChange={(checked: boolean) =>
+                update("favorites_overlay_show_all_presets", checked)
+              }
             />
           </div>
         </CardContent>

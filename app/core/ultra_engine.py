@@ -338,6 +338,19 @@ class UltraDeviceWorker(threading.Thread):
         between polls and executes via its already-connected SDK, avoiding
         the TCP disconnect/reconnect cycle that caused 5s latency.
         """
+        # Drain stale pending commands before adding a new one.
+        # When the device is offline, callers time out and return but their
+        # commands linger in the queue.  Last-write-wins: the most recent
+        # press is what matters; old stale entries should not pile up.
+        while True:
+            try:
+                _, _, stale_ev, stale_box = self._cmd_queue.get_nowait()
+                stale_box["ok"] = False
+                stale_box["error"] = "superseded"
+                stale_ev.set()
+            except queue.Empty:
+                break
+
         result_event = threading.Event()
         result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
         try:

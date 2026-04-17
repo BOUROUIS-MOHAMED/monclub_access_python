@@ -229,6 +229,18 @@ class AppConfig:
     scanner_usb_device_path: str = ""       # Optional: specific HID device path
 
     # -------------------------
+    # Favorites overlay
+    # -------------------------
+    # One of 12 screen anchors: right-{top,center,bottom}, left-{top,center,bottom},
+    # top-{left,center,right}, bottom-{left,center,right}. Drives both the
+    # window's on-screen position and the panel's expansion direction.
+    favorites_overlay_anchor: str = "right-center"
+    # When true, the overlay panel lists every synced door preset (not just
+    # ones marked `favoriteEnabled=true` in the dashboard). Useful for
+    # operators who want quick access to all doors without dashboard edits.
+    favorites_overlay_show_all_presets: bool = False
+
+    # -------------------------
     # Dashboard feedback
     # -------------------------
     push_success_sound_enabled: bool = True
@@ -498,6 +510,23 @@ class AppConfig:
         cfg.scanner_network_port = _clamp_int(getattr(cfg, "scanner_network_port", 4370), 4370, 1, 65535)
         cfg.scanner_network_timeout_ms = _clamp_int(getattr(cfg, "scanner_network_timeout_ms", 5000), 5000, 1000, 30000)
         cfg.scanner_usb_device_path = _safe_str(getattr(cfg, "scanner_usb_device_path", ""), "").strip()
+
+        # favorites overlay anchor — 12 valid values, default right-center
+        _VALID_FAV_ANCHORS = (
+            "right-top", "right-center", "right-bottom",
+            "left-top", "left-center", "left-bottom",
+            "top-left", "top-center", "top-right",
+            "bottom-left", "bottom-center", "bottom-right",
+        )
+        cfg.favorites_overlay_anchor = _safe_str(
+            getattr(cfg, "favorites_overlay_anchor", "right-center"),
+            "right-center",
+        ).strip().lower()
+        if cfg.favorites_overlay_anchor not in _VALID_FAV_ANCHORS:
+            cfg.favorites_overlay_anchor = "right-center"
+        cfg.favorites_overlay_show_all_presets = bool(
+            getattr(cfg, "favorites_overlay_show_all_presets", False)
+        )
 
         # dashboard feedback
         cfg.push_success_sound_enabled = _ensure_bool(getattr(cfg, "push_success_sound_enabled", True), True)

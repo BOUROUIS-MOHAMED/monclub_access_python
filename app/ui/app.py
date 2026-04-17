@@ -843,7 +843,17 @@ class MainApp:
 
     def persist_config(self):
         save_access_app_config(self.cfg)
-        self._sync_startup_registration()
+        # Windows-registry write is expensive and AV-scanned. Skip it unless
+        # the startup flag actually changed since last sync — most config
+        # saves (overlay anchor, sound, tray settings, …) don't touch it.
+        try:
+            current_startup = bool(getattr(self.cfg, "start_on_system_startup", False))
+        except Exception:
+            current_startup = False
+        last_startup = getattr(self, "_last_synced_startup_flag", None)
+        if last_startup != current_startup:
+            self._sync_startup_registration()
+            self._last_synced_startup_flag = current_startup
         self.logger.info("Access config saved to access/config.json.")
 
     def publish_feedback_event(self, event_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
