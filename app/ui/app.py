@@ -130,7 +130,8 @@ def _should_defer_ultra_reconnects(trigger_source: str) -> bool:
 def check_zkemkeeper_registration() -> Dict[str, Any]:
     """
     Returns a diagnostic dict about ZKEMKeeper COM registration.
-    Works without pywin32 by reading registry; optionally tries COM activation if pywin32 exists.
+    Works without pywin32 by reading registry; optionally tries COM activation if
+    pywin32 or comtypes exists.
     """
     result: Dict[str, Any] = {
         "ok": False,
@@ -223,21 +224,22 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
         else:
             result["notes"].append("InprocServer32 not found for CLSID (COM may be broken).")
 
-        # Optional COM activation test (requires pywin32)
+        # Optional COM activation test (works with pywin32 or comtypes)
         try:
-            import win32com.client  # type: ignore
+            from app.core.zkemkeeper_scanner import create_zkemkeeper_com_object
 
             try:
-                obj = win32com.client.Dispatch("zkemkeeper.CZKEM")
+                obj, backend = create_zkemkeeper_com_object()
                 # If Dispatch succeeded, registration is usable from this Python bitness
                 _ = obj is not None
                 result["comCreateOk"] = True
                 result["ok"] = True
+                result["notes"].append(f"COM activation succeeded via {backend}.")
             except Exception as e:
                 result["comCreateOk"] = False
                 result["error"] = f"COM activation failed: {e}"
         except Exception:
-            result["notes"].append("pywin32 not installed; skipped COM activation test.")
+            result["notes"].append("pywin32/comtypes not installed; skipped COM activation test.")
             # If registry is OK, we still consider it "registered" (but not proven callable)
             result["ok"] = bool(result["registryFound"])
 

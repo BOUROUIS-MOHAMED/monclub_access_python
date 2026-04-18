@@ -57,6 +57,8 @@ hiddenimports += safe_collect_submodules("charset_normalizer")
 hiddenimports += safe_collect_submodules("certifi")
 hiddenimports += safe_collect_submodules("PIL")
 hiddenimports += safe_collect_submodules("pystray")
+hiddenimports += safe_collect_submodules("win32com")
+hiddenimports += safe_collect_submodules("comtypes")
 
 hiddenimports += safe_collect_submodules("app")
 hiddenimports += safe_collect_submodules("app.api")

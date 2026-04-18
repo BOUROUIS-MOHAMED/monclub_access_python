@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import time
 from dataclasses import dataclass
 
@@ -8,16 +9,27 @@ class ZkemkeeperError(RuntimeError):
     pass
 
 
+def create_zkemkeeper_com_object() -> tuple[object, str]:
+    try:
+        win32_client = importlib.import_module("win32com.client")
+        return win32_client.Dispatch("zkemkeeper.CZKEM"), "pywin32"
+    except ModuleNotFoundError:
+        pass
+
+    try:
+        comtypes_client = importlib.import_module("comtypes.client")
+        return comtypes_client.CreateObject("zkemkeeper.CZKEM", dynamic=True), "comtypes"
+    except ModuleNotFoundError as e:
+        raise ZkemkeeperError("ZKEMKeeper COM access requires pywin32 or comtypes") from e
+
+
 @dataclass
 class ZkemkeeperScanner:
     _com: object | None = None
 
     def _load_com(self) -> object:
-        try:
-            import win32com.client  # type: ignore
-        except Exception as e:
-            raise ZkemkeeperError("pywin32 is required for ZKEMKeeper COM access") from e
-        return win32com.client.Dispatch("zkemkeeper.CZKEM")
+        com, _backend = create_zkemkeeper_com_object()
+        return com
 
     def connect(self, *, ip: str, port: int, timeout_ms: int) -> None:
         if not ip:

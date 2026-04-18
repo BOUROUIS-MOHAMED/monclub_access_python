@@ -36,6 +36,10 @@ import requests
 _logger = logging.getLogger(__name__)
 
 _SQLITE_TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LEGACY_DASHBOARD_AVATAR_RE = re.compile(
+    r"^/?assets/(?:avatars|images/avatar)/avatar-(\d+)\.(?:png|jpe?g|webp)$",
+    re.IGNORECASE,
+)
 
 from app.api.monclub_api import MonClubApiHttpError
 from app.core.app_const import MONCLUB_BASE_URL
@@ -167,6 +171,9 @@ def _normalize_image_url(raw: str) -> str:
     s = _safe_str(raw, "").strip()
     if not s:
         return ""
+    avatar_match = _LEGACY_DASHBOARD_AVATAR_RE.match(s)
+    if avatar_match:
+        s = f"/assets/images/avatar/avatar-{avatar_match.group(1)}.webp"
     if s.startswith("data:"):
         return s
     if s.startswith("http://") or s.startswith("https://"):

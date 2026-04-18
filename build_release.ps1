@@ -196,6 +196,10 @@ python -m pip install --upgrade pyinstaller
 Write-Host "Sanity import checks..." -ForegroundColor Yellow
 python -c "import requests; print('requests OK', requests.__version__)"
 python -c "import tkinter; print('tkinter OK')"
+python -c "import importlib.util, sys; mods = ['win32com.client', 'comtypes.client']; found = [m for m in mods if importlib.util.find_spec(m) is not None]; print('COM backend modules:', ', '.join(found) if found else 'none'); sys.exit(0 if found else 1)"
+if ($LASTEXITCODE -ne 0) {
+  throw "Neither pywin32 nor comtypes is available in the packaging environment."
+}
 
 if ((-not $SkipTauriBuild) -or (-not (Test-Path $stagedUiExe))) {
   Write-Host "Preparing Tauri shell artifact..." -ForegroundColor Yellow

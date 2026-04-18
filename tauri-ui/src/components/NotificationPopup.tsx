@@ -2,6 +2,7 @@ import { Box, Typography, Chip, Fade } from "@mui/material";
 import PersonIcon from "@mui/icons-material/Person";
 import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import type { PopupEvent } from "../api/types";
+import { buildPopupImageCandidates, toPopupCachedImageUrl } from "@/lib/popupImages";
 
 interface Props {
   popup: PopupEvent | null;
@@ -21,7 +22,7 @@ export default function NotificationPopup({ popup, onDismiss }: Props) {
   const statusLabel = allowed ? "ACCÈS AUTORISÉ" : "ACCÈS REFUSÉ";
 
   const imageUrl = popup.popupShowImage
-    ? (popup.userImage || popup.userProfileImage || popup.imagePath || "")
+    ? toPopupCachedImageUrl(buildPopupImageCandidates(popup)[0] || "")
     : "";
 
   const formatDate = (d: string) => {

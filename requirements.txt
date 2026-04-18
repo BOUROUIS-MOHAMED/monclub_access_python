@@ -6,3 +6,4 @@ winotify
 pyzk>=0.9
 pywinusb>=0.4
 pywin32>=306
+comtypes>=1.4

@@ -1,9 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { openSSE } from "@/api/client";
+import { getApiBaseUrl, openSSE } from "@/api/client";
 import type { PopupEvent } from "@/api/types";
-
-const API_PORT = 8788;
-const API_BASE = `http://127.0.0.1:${API_PORT}/api/v2`;
+import { LOCAL_API_PREFIX } from "@/config/appConst";
+import { buildPopupImageCandidates, toPopupCachedImageUrl } from "@/lib/popupImages";
 
 // ── Timing constants ──────────────────────────────────────────────────────────
 const MIN_SHOW_MS = 2000;   // never interrupt a notification before this
@@ -184,7 +183,7 @@ export default function PopupWindow() {
 
   // Fetch gym name once on mount
   useEffect(() => {
-    fetch(`${API_BASE}/status`)
+    fetch(`${getApiBaseUrl()}${LOCAL_API_PREFIX}/status`)
       .then((r) => r.json())
       .then((d) => {
         const name =
@@ -197,23 +196,13 @@ export default function PopupWindow() {
       .catch(() => {});
   }, []);
 
-  function toCacheUrl(url: string): string {
-    if (url.startsWith("data:")) return url;
-    return `${API_BASE}/image-cache?url=${encodeURIComponent(url)}`;
-  }
-
   function buildImageChain(evt: PopupEvent): string[] {
-    const candidates: string[] = [];
-    const am = (evt.userImage || evt.imagePath || "").trim();
-    const profile = (evt.userProfileImage || "").trim();
-    if (am) candidates.push(am);
-    if (profile && profile !== am) candidates.push(profile);
-    return candidates;
+    return buildPopupImageCandidates(evt);
   }
 
   const handleImageError = useCallback(() => {
     const next = fallbackChainRef.current.shift();
-    setImgSrc(next ? toCacheUrl(next) : null);
+    setImgSrc(next ? toPopupCachedImageUrl(next) : null);
   }, []);
 
   const resolveImage = useCallback((evt: PopupEvent) => {
@@ -222,7 +211,7 @@ export default function PopupWindow() {
     fallbackChainRef.current = chain.slice(1); // remaining fallbacks after the first
     const first = chain[0];
     if (!first) { setImgSrc(null); return; }
-    setImgSrc(toCacheUrl(first));
+    setImgSrc(toPopupCachedImageUrl(first));
   }, []);
 
   // showEvent — transitions to "showing" state with proper timers
