@@ -1071,6 +1071,12 @@ fn parse_favorite_shortcut(raw: &str) -> Option<String> {
             "SHIFT" => shift = true,
             "ALT" | "OPTION" => alt = true,
             "META" | "CMD" | "COMMAND" | "SUPER" | "WIN" => meta = true,
+            // Named keys whose camelCase code names simple title-casing would mangle.
+            "CAPSLOCK"   => key = Some("CapsLock".into()),
+            "NUMLOCK"    => key = Some("NumLock".into()),
+            "SCROLLLOCK" => key = Some("ScrollLock".into()),
+            "PAGEUP"     => key = Some("PageUp".into()),
+            "PAGEDOWN"   => key = Some("PageDown".into()),
             other => {
                 if other.len() == 1 {
                     let c = other.chars().next().unwrap();

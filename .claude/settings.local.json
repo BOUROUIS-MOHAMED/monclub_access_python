@@ -290,7 +290,8 @@
       "Bash(awk '/13:17:30/,0' app.log)",
       "Bash(awk '/13:18:06/{exit} /INFO/')",
       "Bash(awk '/def _sync_one_device/,/^    def [a-zA-Z_]/' app/core/device_sync.py)",
-      "Bash(awk -F: '/_sync_one_device/{start=1} start')"
+      "Bash(awk -F: '/_sync_one_device/{start=1} start')",
+      "Bash(python -m pytest tests/test_batch_progress.py::test_batch_push_emits_intermediate_progress_ticks -v --tb=short)"
     ]
   }
 }
