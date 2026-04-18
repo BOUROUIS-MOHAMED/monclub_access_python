@@ -1,4 +1,4 @@
-import { getApiBaseUrl } from "@/api/client";
+import { getApiBaseUrl, getAuthToken } from "@/api/client";
 import type { PopupEvent } from "@/api/types";
 import { LOCAL_API_PREFIX } from "@/config/appConst";
 
@@ -30,5 +30,9 @@ export function toPopupCachedImageUrl(raw: string): string {
   const normalized = normalizePopupImageSource(raw);
   if (!normalized) return "";
   if (normalized.startsWith("data:")) return normalized;
-  return `${getApiBaseUrl()}${LOCAL_API_PREFIX}/image-cache?url=${encodeURIComponent(normalized)}`;
+  // <img src> cannot send custom headers, so the X-Local-Token is passed as a
+  // ?token= query param — the backend accepts either.
+  const token = getAuthToken();
+  const tokenParam = token ? `&token=${encodeURIComponent(token)}` : "";
+  return `${getApiBaseUrl()}${LOCAL_API_PREFIX}/image-cache?url=${encodeURIComponent(normalized)}${tokenParam}`;
 }
