@@ -474,13 +474,31 @@ class PullSDK:
 
         On chunk failure the method falls back to row-by-row for that chunk so
         a single bad record does not block the rest.
+
+        **Fast-path short-circuit:** if the row-by-row fallback returns a
+        STRUCTURAL error code (rc=-101 field missing, rc=-100 table missing,
+        rc=-102/-103 field layout mismatch) on the very first row, every
+        subsequent row in this AND all remaining chunks will fail the same way
+        — the row payload format itself is wrong for this firmware. We bail out
+        immediately and mark the rest as failed so the caller's domain-level
+        retry (e.g. drop-Name-and-retry) can fire without burning N×50 SDK
+        round-trips on a foregone conclusion.
         """
         if not rows:
             return (0, [])
 
+        # Structural errors — the payload shape is wrong; row-by-row won't help.
+        _FATAL_CODES = ("rc=-100", "rc=-101", "rc=-102", "rc=-103")
+
         ok = 0
         failed: list = []
+        structural_bailout = False
+
         for i in range(0, len(rows), chunk_size):
+            if structural_bailout:
+                failed.extend(rows[i:])
+                break
+
             chunk = rows[i:i + chunk_size]
             data = "\r\n".join(chunk) + "\r\n"
             try:
@@ -492,13 +510,30 @@ class PullSDK:
                     "set_device_data_batch chunk failed (table=%s, rows=%d), falling back to row-by-row",
                     table, len(chunk),
                 )
-                for row in chunk:
+                for j, row in enumerate(chunk):
                     try:
                         self.set_device_data(table=table, data=row + "\r\n", options="")
                         ok += 1
                     except PullSDKError as ex:
                         self.logger.warning("set_device_data_batch row-by-row failed: %s | row=%s", ex, row[:80])
                         failed.append(row)
+                        # Short-circuit on the FIRST row if it's a structural error:
+                        # subsequent rows in the same and later chunks will all fail
+                        # the same way. Let the caller's outer retry take over.
+                        if j == 0 and any(code in str(ex) for code in _FATAL_CODES):
+                            remaining_in_chunk = chunk[j + 1:]
+                            if remaining_in_chunk:
+                                self.logger.warning(
+                                    "set_device_data_batch: structural error on first row "
+                                    "(%s), short-circuiting remaining %d row(s) in chunk and "
+                                    "%d later chunks",
+                                    str(ex).split(" PullLastError")[0],
+                                    len(remaining_in_chunk),
+                                    max(0, (len(rows) - (i + chunk_size))),
+                                )
+                            failed.extend(remaining_in_chunk)
+                            structural_bailout = True
+                            break
         return (ok, failed)
 
     def clear_device_table(self, *, table: str) -> int:

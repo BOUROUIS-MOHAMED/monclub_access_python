@@ -323,6 +323,51 @@ def test_fingerprint_disabled_device_skips_template_table_deletes(tmp_path, monk
         )
 
 
+def test_set_device_data_batch_short_circuits_on_structural_error():
+    """
+    When the row-by-row fallback hits a structural error (rc=-101 'field not
+    supported') on the FIRST row, the SDK must bail out of the rest of the
+    chunk AND every remaining chunk instead of attempting 50 × N pointless
+    row-by-row SDK calls. The domain layer's "retry without Name" takes over
+    from there.
+    """
+    from app.sdk.pullsdk import PullSDK, PullSDKError
+
+    sdk = PullSDK.__new__(PullSDK)
+    sdk.logger = logging.getLogger("test")
+    sdk._handle = 1
+    sdk._dll = MagicMock()
+    sdk.load = lambda: None  # type: ignore
+
+    call_history = []
+
+    def fake_set_device_data(*, table, data, options=""):
+        call_history.append(data)
+        # Simulate firmware that rejects any SetDeviceData with Name field.
+        if "Name=" in data:
+            raise PullSDKError("SetDeviceData FAILED table=user rc=-101 PullLastError=0")
+        return 0
+
+    sdk.set_device_data = fake_set_device_data  # type: ignore
+
+    # 130 rows across 3 chunks of 50. All rows contain Name (firmware-hostile).
+    rows = [f"Pin={i}\tName=U{i}\tCardNo={i}" for i in range(1, 131)]
+    ok, failed = sdk.set_device_data_batch(table="user", rows=rows, chunk_size=50)
+
+    # 0 successes (every row has Name), all 130 in failed list.
+    assert ok == 0
+    assert len(failed) == 130
+
+    # Without the short-circuit this would fire:
+    #   3 chunks × (1 batch + 50 row-by-row) = 153 SDK calls
+    # With the short-circuit we expect:
+    #   chunk-1 batch (1) + chunk-1 row-by-row first row (1) = 2 calls total,
+    # then bail. Allow a small slack in case implementation tweaks it.
+    assert len(call_history) <= 5, (
+        f"Expected short-circuit after ≤5 SDK calls; got {len(call_history)}"
+    )
+
+
 def test_delete_device_data_batch_falls_back_to_per_pin_on_chunk_error():
     """Simulates a chunk error; verifies per-pin fallback is attempted."""
     from app.sdk.pullsdk import PullSDK, PullSDKError

@@ -277,7 +277,10 @@
       "Bash(python -m pytest tests/test_batch_device_push.py -v --tb=short)",
       "Bash(python -m pytest tests/test_batch_device_push.py tests/test_batch_progress.py -v --tb=short)",
       "Bash(python -m pytest tests/test_batch_device_push.py::test_fingerprint_disabled_device_skips_template_table_deletes -v --tb=short)",
-      "Bash(awk '{print substr\\($0, 12, 8\\), substr\\($0, 25, 80\\)}')"
+      "Bash(awk '{print substr\\($0, 12, 8\\), substr\\($0, 25, 80\\)}')",
+      "Bash(awk 'NR>=48522' app.log)",
+      "Bash(awk 'NR==48522' app.log)",
+      "Bash(python -m pytest tests/test_batch_device_push.py tests/test_batch_progress.py --tb=short -q)"
     ]
   }
 }
