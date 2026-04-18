@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import faulthandler
+from pathlib import Path
 
 
 def _ensure_console_streams() -> None:
@@ -19,6 +20,16 @@ def _ensure_console_streams() -> None:
 def main() -> None:
     _ensure_console_streams()
     faulthandler.enable(all_threads=True)
+    try:
+        from shared.dev_dependency_sync import ensure_local_requirements_synced
+
+        ensure_local_requirements_synced(
+            repo_root=Path(__file__).resolve().parents[1],
+            python_executable=Path(sys.executable),
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        raise SystemExit(1) from e
     from access.bootstrap import run_access_app
 
     run_access_app()
@@ -26,4 +37,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

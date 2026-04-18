@@ -234,12 +234,18 @@ class CardScanner:
     # ÄÄ ZKEMKeeper (SCR100) scan loop ÄÄ
     def _zkemkeeper_scan_loop(self, ip: str, port: int, timeout_ms: int) -> None:
         scanner = None
+        com_cleanup = None
         try:
-            from app.core.zkemkeeper_scanner import ZkemkeeperError, ZkemkeeperScanner
+            from app.core.zkemkeeper_scanner import (
+                ZkemkeeperError,
+                ZkemkeeperScanner,
+                initialize_com_apartment,
+            )
 
             if not ip:
                 raise ZkemkeeperError("SCR100 IP address is required")
 
+            com_cleanup = initialize_com_apartment()
             scanner = ZkemkeeperScanner()
             scanner.connect(ip=ip, port=port, timeout_ms=timeout_ms)
 
@@ -266,6 +272,11 @@ class CardScanner:
             if scanner is not None:
                 try:
                     scanner.disconnect()
+                except Exception:
+                    pass
+            if com_cleanup is not None:
+                try:
+                    com_cleanup()
                 except Exception:
                     pass
             with self._lock:

@@ -226,9 +226,14 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
 
         # Optional COM activation test (works with pywin32 or comtypes)
         try:
-            from app.core.zkemkeeper_scanner import create_zkemkeeper_com_object
+            from app.core.zkemkeeper_scanner import (
+                create_zkemkeeper_com_object,
+                initialize_com_apartment,
+            )
 
+            com_cleanup = None
             try:
+                com_cleanup = initialize_com_apartment()
                 obj, backend = create_zkemkeeper_com_object()
                 # If Dispatch succeeded, registration is usable from this Python bitness
                 _ = obj is not None
@@ -238,6 +243,12 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
             except Exception as e:
                 result["comCreateOk"] = False
                 result["error"] = f"COM activation failed: {e}"
+            finally:
+                if com_cleanup is not None:
+                    try:
+                        com_cleanup()
+                    except Exception:
+                        pass
         except Exception:
             result["notes"].append("pywin32/comtypes not installed; skipped COM activation test.")
             # If registry is OK, we still consider it "registered" (but not proven callable)

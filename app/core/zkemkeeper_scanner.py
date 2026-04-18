@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
 import time
 from dataclasses import dataclass
@@ -7,6 +8,29 @@ from dataclasses import dataclass
 
 class ZkemkeeperError(RuntimeError):
     pass
+
+
+def initialize_com_apartment():
+    try:
+        ole32 = ctypes.windll.ole32
+    except Exception as e:
+        raise ZkemkeeperError("COM initialization requires Windows ole32.dll") from e
+
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = ctypes.c_long
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+
+    hr = int(ole32.CoInitialize(None))
+    if hr in (0, 1):
+        def _cleanup() -> None:
+            ole32.CoUninitialize()
+
+        return _cleanup
+    if hr == -2147417850:
+        return lambda: None
+
+    raise ZkemkeeperError(f"COM initialization failed (HRESULT=0x{hr & 0xFFFFFFFF:08X})")
 
 
 def create_zkemkeeper_com_object() -> tuple[object, str]:

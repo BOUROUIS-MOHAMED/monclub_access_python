@@ -1252,7 +1252,8 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
             for sc in specs {
                 let app_c = app.clone();
                 let sc_raw_c = scan_raw.clone();
-                let _ = gs.on_shortcut(sc.as_str(), move |_app, _sc, ev| {
+                eprintln!("[scan-shortcut] trying to register: {:?}", sc);
+                match gs.on_shortcut(sc.as_str(), move |_app, _sc, ev| {
                     if ev.state() != ShortcutState::Pressed { return; }
                     let app = app_c.clone();
                     let sc_raw = sc_raw_c.clone();
@@ -1309,9 +1310,12 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                             "shortcut": sc_raw,
                         }));
                     });
-                });
+                }) {
+                    Ok(_) => eprintln!("[scan-shortcut] OK: {:?}", sc),
+                    Err(e) => eprintln!("[scan-shortcut] FAILED {:?}: {}", sc, e),
+                }
             }
-            eprintln!("[scan-shortcut] registered: {}", scan_raw);
+            eprintln!("[scan-shortcut] registration done for: {}", scan_raw);
         } else {
             eprintln!("[scan-shortcut] could not parse shortcut: {:?}", scan_raw);
         }

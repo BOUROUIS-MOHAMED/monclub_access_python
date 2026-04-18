@@ -56,3 +56,51 @@ def test_validate_16_digit_card():
 
 def test_validate_empty_string():
     assert validate_card_number("") is None
+
+
+def test_zkemkeeper_scan_loop_initializes_and_uninitializes_com(monkeypatch):
+    from app.core import zkemkeeper_scanner as scanner_module
+
+    calls = []
+
+    class FakeZkemkeeperScanner:
+        def connect(self, *, ip: str, port: int, timeout_ms: int) -> None:
+            calls.append(("connect", ip, port, timeout_ms))
+
+        def read_card_once(self, *, poll_sec: float = 10.0) -> str:
+            calls.append(("read", poll_sec))
+            return "8175134"
+
+        def disconnect(self) -> None:
+            calls.append(("disconnect",))
+
+    def fake_initialize_com_apartment():
+        calls.append(("init",))
+
+        def _cleanup() -> None:
+            calls.append(("uninit",))
+
+        return _cleanup
+
+    monkeypatch.setattr(
+        scanner_module,
+        "initialize_com_apartment",
+        fake_initialize_com_apartment,
+        raising=False,
+    )
+    monkeypatch.setattr(scanner_module, "ZkemkeeperScanner", FakeZkemkeeperScanner)
+
+    scanner = CardScanner()
+
+    scanner._zkemkeeper_scan_loop("192.168.0.201", 4370, 5000)
+
+    assert calls == [
+        ("init",),
+        ("connect", "192.168.0.201", 4370, 5000),
+        ("read", 5.0),
+        ("disconnect",),
+        ("uninit",),
+    ]
+    assert scanner.last_result is not None
+    assert scanner.last_result.card_number == "8175134"
+    assert scanner.state == ScannerState.IDLE
