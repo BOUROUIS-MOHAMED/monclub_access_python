@@ -2044,7 +2044,17 @@ class DeviceSyncEngine:
                     pin_to_user[pin] = u
 
                 if user_rows:
-                    ok_u, failed_u = sdk.set_device_data_batch(table="user", rows=user_rows, chunk_size=50)
+                    _total_pins = len(pins_sorted)
+
+                    def _user_progress_cb(ok_so_far: int, _batch_total: int) -> None:
+                        # Map user-phase progress to 0..total: the user push is the
+                        # dominant wall-clock phase, so tracking it drives the bar.
+                        self._set_progress(current=min(_total_pins, ok_so_far))
+
+                    ok_u, failed_u = sdk.set_device_data_batch(
+                        table="user", rows=user_rows, chunk_size=50,
+                        progress_cb=_user_progress_cb,
+                    )
                     pushed_users = ok_u
 
                     if not failed_u and profile.name_supported is None and use_name:
@@ -2066,7 +2076,20 @@ class DeviceSyncEngine:
                             if parts.get("CardNo"):
                                 rp.append(f"CardNo={parts['CardNo']}")
                             retry_rows.append("\t".join(rp))
-                        ok_r, failed_r = sdk.set_device_data_batch(table="user", rows=retry_rows, chunk_size=50)
+                        # Continue advancing the same user-phase progress bar on the
+                        # retry-without-Name path (same pins, different payload).
+                        _retry_total = len(pins_sorted)
+                        _retry_baseline = pushed_users  # already-successful carry-over
+
+                        def _retry_progress_cb(ok_so_far: int, _batch_total: int) -> None:
+                            self._set_progress(
+                                current=min(_retry_total, _retry_baseline + ok_so_far)
+                            )
+
+                        ok_r, failed_r = sdk.set_device_data_batch(
+                            table="user", rows=retry_rows, chunk_size=50,
+                            progress_cb=_retry_progress_cb,
+                        )
                         pushed_users += ok_r
                         if ok_r > 0:
                             # Confirmed: Name field not supported on this firmware
@@ -2157,8 +2180,18 @@ class DeviceSyncEngine:
                     pattern_fn = patterns[profile.authorize_body_index]
                     auth_rows = [pattern_fn(p) for p in remaining_pins if desired.get(p)]
                     if auth_rows:
+                        # Authorize phase runs after user push is at 100%; keep the
+                        # bar pinned at `total` but still emit a heartbeat per chunk
+                        # so the dashboard knows the sync is alive.
+                        _auth_total = len(pins_sorted)
+
+                        def _auth_progress_cb(_ok_so_far: int, _batch_total: int) -> None:
+                            self._set_progress(current=_auth_total)
+
                         ok_a, failed_a = sdk.set_device_data_batch(
-                            table="userauthorize", rows=auth_rows, chunk_size=50)
+                            table="userauthorize", rows=auth_rows, chunk_size=50,
+                            progress_cb=_auth_progress_cb,
+                        )
                         if failed_a:
                             for row in failed_a:
                                 pin = _batch_row_field(row, "Pin")

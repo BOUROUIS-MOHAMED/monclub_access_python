@@ -64,3 +64,40 @@ def test_scan_stream_emits_done(monkeypatch):
     local_access_api_v2._handle_scan_stream(ctx)
     assert ("scan", {"status": "ready"}) in ctx.events
     assert ("scan", {"status": "done", "card": "123456"}) in ctx.events
+
+
+def test_scanner_start_defaults_to_zkemkeeper_when_mode_missing(monkeypatch):
+    class _FakeScanner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def start_scan(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    fake = _FakeScanner()
+    monkeypatch.setattr("app.core.card_scanner.get_scanner", lambda: fake)
+    monkeypatch.setattr(
+        "app.core.config.load_config",
+        lambda: SimpleNamespace(
+            scanner_mode="",
+            scanner_network_ip="192.168.1.201",
+            scanner_network_port=4370,
+            scanner_network_timeout_ms=5000,
+            scanner_usb_device_path="",
+        ),
+    )
+    ctx = _FakeCtx()
+
+    local_access_api_v2._handle_scanner_start(ctx)
+
+    assert ctx.status == 200
+    assert fake.calls == [
+        {
+            "mode": "zkemkeeper",
+            "ip": "192.168.1.201",
+            "port": 4370,
+            "timeout_ms": 5000,
+            "usb_device_path": "",
+        }
+    ]

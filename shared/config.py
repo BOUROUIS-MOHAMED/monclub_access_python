@@ -152,7 +152,7 @@ class AccessConfigSection:
     sync_success_sound_source: str = "default"
     push_success_custom_sound_path: str = ""
     sync_success_custom_sound_path: str = ""
-    scanner_mode: str = "network"
+    scanner_mode: str = "zkemkeeper"
     scanner_network_ip: str = ""
     scanner_network_port: int = 4370
     scanner_network_timeout_ms: int = 5000
@@ -414,7 +414,7 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         sync_success_sound_source=str(getattr(cfg, "sync_success_sound_source", "default") or "default"),
         push_success_custom_sound_path=str(getattr(cfg, "push_success_custom_sound_path", "") or ""),
         sync_success_custom_sound_path=str(getattr(cfg, "sync_success_custom_sound_path", "") or ""),
-        scanner_mode=str(getattr(cfg, "scanner_mode", "network") or "network"),
+        scanner_mode=str(getattr(cfg, "scanner_mode", "zkemkeeper") or "zkemkeeper"),
         scanner_network_ip=str(getattr(cfg, "scanner_network_ip", "") or ""),
         scanner_network_port=int(getattr(cfg, "scanner_network_port", 4370) or 4370),
         scanner_network_timeout_ms=int(getattr(cfg, "scanner_network_timeout_ms", 5000) or 5000),

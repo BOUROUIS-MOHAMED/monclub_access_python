@@ -280,7 +280,15 @@
       "Bash(awk '{print substr\\($0, 12, 8\\), substr\\($0, 25, 80\\)}')",
       "Bash(awk 'NR>=48522' app.log)",
       "Bash(awk 'NR==48522' app.log)",
-      "Bash(python -m pytest tests/test_batch_device_push.py tests/test_batch_progress.py --tb=short -q)"
+      "Bash(python -m pytest tests/test_batch_device_push.py tests/test_batch_progress.py --tb=short -q)",
+      "Bash(awk '/13:16:22/,0' app.log)",
+      "Bash(awk '/13:17:20/,0' app.log)",
+      "Bash(awk '/13:16:00/,0' app.log)",
+      "Bash(awk 'length > 200')",
+      "Bash(awk 'length > 500')",
+      "Bash(awk '/13:17:00/,0' app.log)",
+      "Bash(awk '/13:17:30/,0' app.log)",
+      "Bash(awk '/13:18:06/{exit} /INFO/')"
     ]
   }
 }

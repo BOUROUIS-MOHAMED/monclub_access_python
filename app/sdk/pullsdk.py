@@ -461,7 +461,14 @@ class PullSDK:
             raise PullSDKError(f"SetDeviceData FAILED table={table} rc={rc} PullLastError={err}")
         return rc
 
-    def set_device_data_batch(self, *, table: str, rows: list, chunk_size: int = 50) -> tuple:
+    def set_device_data_batch(
+        self,
+        *,
+        table: str,
+        rows: list,
+        chunk_size: int = 50,
+        progress_cb=None,
+    ) -> tuple:
         """
         Send multiple rows to the device in batched SetDeviceData calls.
 
@@ -534,6 +541,13 @@ class PullSDK:
                             failed.extend(remaining_in_chunk)
                             structural_bailout = True
                             break
+            # Progress tick after every chunk (successful OR fallback) so the
+            # dashboard sees movement during the multi-minute batch phase.
+            if progress_cb is not None:
+                try:
+                    progress_cb(ok, len(rows))
+                except Exception:
+                    pass
         return (ok, failed)
 
     def clear_device_table(self, *, table: str) -> int:

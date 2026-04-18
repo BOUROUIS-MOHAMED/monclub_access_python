@@ -17,3 +17,8 @@ def test_scanner_fields_are_part_of_access_config_fields() -> None:
 def test_scanner_mode_accepts_zkemkeeper() -> None:
     cfg = AppConfig.from_dict({"scanner_mode": "zkemkeeper"})
     assert cfg.scanner_mode == "zkemkeeper"
+
+
+def test_scanner_mode_defaults_to_zkemkeeper_when_missing() -> None:
+    cfg = AppConfig.from_dict({})
+    assert cfg.scanner_mode == "zkemkeeper"

@@ -222,7 +222,7 @@ class AppConfig:
     # -------------------------
     # Card scanner (SCR100 / USB HID)
     # -------------------------
-    scanner_mode: str = "network"           # "network", "usb", or "zkemkeeper"
+    scanner_mode: str = "zkemkeeper"        # "network", "usb", or "zkemkeeper"
     scanner_network_ip: str = ""            # SCR100 IP address
     scanner_network_port: int = 4370        # Always 4370 for ZKTeco
     scanner_network_timeout_ms: int = 5000  # Connection timeout
@@ -503,9 +503,9 @@ class AppConfig:
             cfg.login_email = ""
 
         # scanner
-        cfg.scanner_mode = _safe_str(getattr(cfg, "scanner_mode", "network"), "network").strip().lower()
+        cfg.scanner_mode = _safe_str(getattr(cfg, "scanner_mode", "zkemkeeper"), "zkemkeeper").strip().lower()
         if cfg.scanner_mode not in ("network", "usb", "zkemkeeper"):
-            cfg.scanner_mode = "network"
+            cfg.scanner_mode = "zkemkeeper"
         cfg.scanner_network_ip = _safe_str(getattr(cfg, "scanner_network_ip", ""), "").strip()
         cfg.scanner_network_port = _clamp_int(getattr(cfg, "scanner_network_port", 4370), 4370, 1, 65535)
         cfg.scanner_network_timeout_ms = _clamp_int(getattr(cfg, "scanner_network_timeout_ms", 5000), 5000, 1000, 30000)

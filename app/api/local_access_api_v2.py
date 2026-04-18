@@ -4461,7 +4461,7 @@ def _handle_scanner_start(ctx: _Ctx) -> None:
     from app.core.config import load_config
     body = ctx.body()
     cfg = load_config()
-    mode = _safe_str(body.get("mode"), cfg.scanner_mode) or "network"
+    mode = _safe_str(body.get("mode"), cfg.scanner_mode) or "zkemkeeper"
     ip = _safe_str(body.get("ip"), cfg.scanner_network_ip) or ""
     port = _safe_int(body.get("port"), cfg.scanner_network_port) or 4370
     timeout_ms = _safe_int(body.get("timeout_ms"), cfg.scanner_network_timeout_ms) or 5000
