@@ -8,10 +8,12 @@ class _FakeScanSession:
     def __init__(self) -> None:
         self._events = queue.Queue()
         self.active = False
+        self.last_start_kwargs = None
         self._events.put({"status": "done", "card": "123456"})
 
     def start(self, **_kwargs) -> bool:
         self.active = True
+        self.last_start_kwargs = dict(_kwargs)
         self._events.put({"status": "done", "card": "123456"})
         return True
 
@@ -77,17 +79,16 @@ def test_scanner_start_defaults_to_zkemkeeper_when_mode_missing(monkeypatch):
 
     fake = _FakeScanner()
     monkeypatch.setattr("app.core.card_scanner.get_scanner", lambda: fake)
-    monkeypatch.setattr(
-        "app.core.config.load_config",
-        lambda: SimpleNamespace(
+    ctx = _FakeCtx()
+    ctx.app = SimpleNamespace(
+        cfg=SimpleNamespace(
             scanner_mode="",
             scanner_network_ip="192.168.1.201",
             scanner_network_port=4370,
             scanner_network_timeout_ms=5000,
             scanner_usb_device_path="",
-        ),
+        )
     )
-    ctx = _FakeCtx()
 
     local_access_api_v2._handle_scanner_start(ctx)
 
@@ -96,6 +97,76 @@ def test_scanner_start_defaults_to_zkemkeeper_when_mode_missing(monkeypatch):
         {
             "mode": "zkemkeeper",
             "ip": "192.168.1.201",
+            "port": 4370,
+            "timeout_ms": 5000,
+            "usb_device_path": "",
+        }
+    ]
+
+
+def test_scan_start_uses_runtime_access_config_instead_of_legacy_load_config(monkeypatch):
+    fake = _FakeScanSession()
+    monkeypatch.setattr(local_access_api_v2, "get_scan_session", lambda: fake)
+    monkeypatch.setattr(
+        "app.core.config.load_config",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy load_config should not be used")),
+    )
+    ctx = _FakeCtx()
+    ctx.app = SimpleNamespace(
+        cfg=SimpleNamespace(
+            scanner_mode="zkemkeeper",
+            scanner_network_ip="192.168.0.201",
+            scanner_network_port=4370,
+            scanner_network_timeout_ms=5000,
+            scanner_usb_device_path="",
+        )
+    )
+
+    local_access_api_v2._handle_scan_start(ctx)
+
+    assert ctx.status == 200
+    assert fake.last_start_kwargs == {
+        "mode": "zkemkeeper",
+        "ip": "192.168.0.201",
+        "port": 4370,
+        "timeout_ms": 5000,
+        "usb_device_path": "",
+    }
+
+
+def test_scanner_start_uses_runtime_access_config_instead_of_legacy_load_config(monkeypatch):
+    class _FakeScanner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def start_scan(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    fake = _FakeScanner()
+    monkeypatch.setattr("app.core.card_scanner.get_scanner", lambda: fake)
+    monkeypatch.setattr(
+        "app.core.config.load_config",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy load_config should not be used")),
+    )
+    ctx = _FakeCtx()
+    ctx.app = SimpleNamespace(
+        cfg=SimpleNamespace(
+            scanner_mode="zkemkeeper",
+            scanner_network_ip="192.168.0.201",
+            scanner_network_port=4370,
+            scanner_network_timeout_ms=5000,
+            scanner_usb_device_path="",
+        )
+    )
+
+    local_access_api_v2._handle_scanner_start(ctx)
+
+    assert ctx.status == 200
+    assert fake.calls == [
+        {
+            "mode": "zkemkeeper",
+            "ip": "192.168.0.201",
             "port": 4370,
             "timeout_ms": 5000,
             "usb_device_path": "",

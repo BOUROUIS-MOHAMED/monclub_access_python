@@ -288,7 +288,9 @@
       "Bash(awk 'length > 500')",
       "Bash(awk '/13:17:00/,0' app.log)",
       "Bash(awk '/13:17:30/,0' app.log)",
-      "Bash(awk '/13:18:06/{exit} /INFO/')"
+      "Bash(awk '/13:18:06/{exit} /INFO/')",
+      "Bash(awk '/def _sync_one_device/,/^    def [a-zA-Z_]/' app/core/device_sync.py)",
+      "Bash(awk -F: '/_sync_one_device/{start=1} start')"
     ]
   }
 }

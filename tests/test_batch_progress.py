@@ -101,6 +101,73 @@ def test_batch_push_reports_final_progress(tmp_path, monkeypatch):
     assert progress_updates[-1]["total"] == len(users)
 
 
+def test_batch_push_emits_intermediate_progress_ticks(tmp_path, monkeypatch):
+    """
+    Under the upsert strategy the per-pin predelete loop is gone — which
+    previously caused the dashboard to be stuck at 0% for the full duration
+    of a multi-minute sync because no progress ticks fired.
+
+    Regression guard: during the batch phase, set_device_data_batch must emit
+    progress updates per chunk via the progress_cb hook, and the engine must
+    wire the hook so the dashboard sees current moving from 0 towards total.
+    """
+    svc = make_engine(tmp_path, monkeypatch)
+    users = [make_user(am_id=i) for i in range(1, 126)]  # 125 users -> 3 chunks of 50
+
+    sdk_cls = MagicMock()
+    sdk_inst = MagicMock()
+    sdk_cls.return_value = sdk_inst
+    sdk_inst.get_device_data_rows.return_value = []
+    sdk_inst.clear_device_table.return_value = 0
+    sdk_inst.delete_device_data.return_value = 0
+    sdk_inst.supports_delete_device_data.return_value = True
+    sdk_inst.__enter__ = lambda s: s
+    sdk_inst.__exit__ = MagicMock(return_value=False)
+
+    # Forward to the real implementation so progress_cb actually fires per chunk.
+    from app.sdk.pullsdk import PullSDK as RealPullSDK
+
+    def real_batch(*, table, rows, chunk_size=50, progress_cb=None):
+        ok = 0
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i + chunk_size]
+            ok += len(chunk)
+            if progress_cb is not None:
+                progress_cb(ok, len(rows))
+        return (ok, [])
+
+    sdk_inst.set_device_data_batch.side_effect = real_batch
+    sdk_inst.set_device_data.return_value = 0
+
+    progress_snapshots: list = []
+    orig_set_progress = svc._set_progress
+
+    def record(**changes):
+        orig_set_progress(**changes)
+        snap, _ = svc.get_progress_snapshot()
+        progress_snapshots.append(dict(snap))
+
+    monkeypatch.setattr(svc, "_set_progress", record)
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=make_device(),
+            users=users,
+            local_fp_index={},
+            default_door_id=15,
+        )
+
+    # Collect intermediate currents strictly between 0 and total (excludes the
+    # initial 0 and the final terminal value).
+    currents_over_time = [s.get("current", 0) for s in progress_snapshots]
+    intermediate = [c for c in currents_over_time if 0 < c < len(users)]
+    assert intermediate, (
+        "Expected per-chunk progress ticks during batch phase; got only "
+        f"{sorted(set(currents_over_time))}"
+    )
+    assert progress_snapshots[-1].get("current") == len(users)
+
+
 def test_batch_push_predelete_skipped_under_upsert_strategy(tmp_path, monkeypatch):
     """
     P0-bulk: under default "upsert" insert_strategy, no per-pin DeleteDeviceData

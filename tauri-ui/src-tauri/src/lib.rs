@@ -1319,22 +1319,19 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
 }
 
 /// Fetch scan shortcut from the config API and save it to `CurrentScanShortcut` state.
+///
+/// GET /api/v2/config returns a flat JSON object — the fields are top-level,
+/// not nested under a "config" key.
 fn fetch_scan_shortcut(app: &AppHandle, port: u16) {
-    #[derive(serde::Deserialize)]
-    struct CfgResp {
-        #[serde(default)]
-        config: serde_json::Value,
-    }
     let url = format!("{}/config", api_base(port));
     let sc: Option<String> = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .ok()
         .and_then(|c| c.get(&url).header("X-Local-Token", local_api_token()).send().ok())
-        .and_then(|r| r.json::<CfgResp>().ok())
-        .and_then(|r| {
-            r.config
-                .get("scan_shortcut")
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| {
+            v.get("scan_shortcut")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });

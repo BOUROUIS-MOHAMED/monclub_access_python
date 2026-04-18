@@ -4372,9 +4372,16 @@ def get_scan_session():
     return _get_scan_session()
 
 
+def _get_runtime_access_config(ctx: _Ctx):
+    cfg = getattr(getattr(ctx, "app", None), "cfg", None)
+    if cfg is not None:
+        return cfg
+    from access.config import load_access_app_config
+    return load_access_app_config()
+
+
 def _handle_scan_start(ctx: _Ctx) -> None:
-    from app.core.config import load_config
-    cfg = load_config()
+    cfg = _get_runtime_access_config(ctx)
     body = ctx.body()
     session = get_scan_session()
     started = session.start(
@@ -4416,8 +4423,7 @@ def _handle_scan_quick(ctx: _Ctx) -> None:
     Called by the Tauri global-shortcut handler — the body is optional; missing
     fields fall back to the persisted scanner config.
     """
-    from app.core.config import load_config
-    cfg = load_config()
+    cfg = _get_runtime_access_config(ctx)
     body = ctx.body()
 
     timeout_ms = _safe_int(body.get("timeout_ms"), cfg.scanner_network_timeout_ms) or 5000
@@ -4458,9 +4464,8 @@ def _handle_scan_quick(ctx: _Ctx) -> None:
 
 def _handle_scanner_start(ctx: _Ctx) -> None:
     from app.core.card_scanner import get_scanner
-    from app.core.config import load_config
     body = ctx.body()
-    cfg = load_config()
+    cfg = _get_runtime_access_config(ctx)
     mode = _safe_str(body.get("mode"), cfg.scanner_mode) or "zkemkeeper"
     ip = _safe_str(body.get("ip"), cfg.scanner_network_ip) or ""
     port = _safe_int(body.get("port"), cfg.scanner_network_port) or 4370
