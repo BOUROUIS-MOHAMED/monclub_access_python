@@ -1,12 +1,21 @@
 from __future__ import annotations
 """
-Direct Python port of read-card-from-scr100-zkem.ps1 (the working PS1 script).
-Uses pythoncom for proper COM init (not raw ole32) so pywin32 state stays consistent.
-Pure polling — no COM events, no message pump — exactly like the PS1 script.
+SCR100 card reader via zkemkeeper COM — subprocess-based implementation.
+
+Rationale:
+  The PS1 script (read-card-from-scr100-zkem.ps1) works reliably on this machine.
+  Our direct pywin32 Dispatch path was returning stale "0" from the idle buffer
+  and never the real card UID, almost certainly because of a cross-bitness COM
+  marshaling quirk between 64-bit Python and the 32-bit zkemkeeper.dll surrogate.
+
+  Instead of fighting that, we launch PowerShell as a subprocess and run the
+  same polling logic as the PS1 script.  This guarantees the COM interaction
+  happens in the exact environment the user confirmed works.
 """
 
-import importlib
 import logging
+import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 
@@ -18,176 +27,156 @@ class ZkemkeeperError(RuntimeError):
 
 
 def initialize_com_apartment():
-    """Initialize STA COM apartment for the current (worker) thread.
-
-    Prefers pythoncom.CoInitialize() so pywin32's internal bookkeeping stays in
-    sync with the underlying Windows COM state. Falls back to raw ole32 only if
-    pythoncom is not available.
-    """
-    try:
-        pythoncom = importlib.import_module("pythoncom")
-    except ImportError:
-        pythoncom = None
-
-    if pythoncom is not None:
-        try:
-            pythoncom.CoInitialize()
-        except Exception as e:
-            # COM may already be initialized on this thread — not fatal.
-            logger.debug("[zkemkeeper] pythoncom.CoInitialize: %s", e)
-
-        def _cleanup() -> None:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
-        return _cleanup
-
-    # Last-resort raw Win32 fallback (no pywin32 installed).
-    import ctypes
-    ole32 = ctypes.windll.ole32
-    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
-    ole32.CoInitialize.restype = ctypes.c_long
-    ole32.CoUninitialize.argtypes = []
-    ole32.CoUninitialize.restype = None
-    hr = int(ole32.CoInitialize(None))
-    if hr in (0, 1):
-        def _cleanup() -> None:
-            ole32.CoUninitialize()
-        return _cleanup
-    if hr == -2147417850:
-        return lambda: None
-    raise ZkemkeeperError(f"COM initialization failed (HRESULT=0x{hr & 0xFFFFFFFF:08X})")
+    """No-op: COM is owned by the PowerShell subprocess, not this thread."""
+    return lambda: None
 
 
 def create_zkemkeeper_com_object() -> tuple[object, str]:
-    try:
-        win32_client = importlib.import_module("win32com.client")
-        return win32_client.Dispatch("zkemkeeper.CZKEM"), "pywin32"
-    except ModuleNotFoundError:
-        pass
-    try:
-        comtypes_client = importlib.import_module("comtypes.client")
-        return comtypes_client.CreateObject("zkemkeeper.CZKEM", dynamic=True), "comtypes"
-    except ModuleNotFoundError as e:
-        raise ZkemkeeperError("ZKEMKeeper COM access requires pywin32 or comtypes") from e
+    """Kept for backwards compatibility; not used by the subprocess path."""
+    return None, "powershell"
 
 
-def _extract_card(result) -> tuple[bool, str]:
-    """Unpack a zkemkeeper COM return value → (ok, card_string).
+_PS_SCRIPT_TEMPLATE = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+try {
+    $zk = New-Object -ComObject "zkemkeeper.CZKEM"
+} catch {
+    Write-Output ("ERROR:COM_CREATE:{0}" -f $_.Exception.Message)
+    exit 1
+}
+if (-not $zk.Connect_Net("__IP__", __PORT__)) {
+    Write-Output "ERROR:CONNECT_FAIL"
+    exit 2
+}
+try { [void]$zk.RegEvent(1, 0xFFFFFFFF) } catch {}
+try { [void]$zk.GetRTLog(1) } catch {}
 
-    pywin32 Dispatch returns a tuple (hresult_as_bool, out_str) when the IDispatch
-    method has an [out] parameter. This helper is defensive against other shapes.
-    """
-    if isinstance(result, tuple) and len(result) >= 2:
-        return bool(result[0]), str(result[1] if result[1] is not None else "").strip()
-    if isinstance(result, bool):
-        return result, ""
-    if isinstance(result, int):
-        return bool(result), str(result) if result else ""
-    if isinstance(result, str):
-        return bool(result), result.strip()
-    return False, ""
+$deadline = (Get-Date).AddSeconds(__TIMEOUT__)
+$lastCard = $null
+$seenEmpty = $true
+
+while ((Get-Date) -lt $deadline) {
+    try {
+        $card = ""
+        $ok = $zk.GetHIDEventCardNumAsStr([ref]$card)
+        if (-not $ok -or [string]::IsNullOrWhiteSpace($card)) {
+            $ok = $zk.GetStrCardNumber([ref]$card)
+        }
+        if ($ok -and $card) {
+            $card = $card.Trim()
+            if ($card -and $card.TrimStart("0")) {
+                if ($card -ne $lastCard -or $seenEmpty) {
+                    Write-Output ("CARD:{0}" -f $card)
+                    try { $zk.Disconnect() | Out-Null } catch {}
+                    exit 0
+                }
+                $seenEmpty = $false
+            } else {
+                $seenEmpty = $true
+            }
+        } else {
+            $seenEmpty = $true
+        }
+    } catch {}
+    Start-Sleep -Milliseconds 60
+}
+
+try { $zk.Disconnect() | Out-Null } catch {}
+Write-Output "TIMEOUT"
+exit 3
+"""
 
 
-def _card_is_real(card: str) -> bool:
-    """True only if `card` is a real RFID UID (not the device's idle "0" sentinel)."""
-    if not card:
-        return False
-    return bool(card.lstrip("0"))
+def _find_powershell() -> str:
+    """Prefer 32-bit PowerShell (SysWOW64) because zkemkeeper.dll is x86."""
+    candidates = [
+        r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe",          # 32-bit
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",          # 64-bit fallback
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return "powershell.exe"
 
 
 @dataclass
 class ZkemkeeperScanner:
-    _com: object | None = None
-    _backend: str = field(default="", repr=False)
+    _ip: str = ""
+    _port: int = 4370
+    _backend: str = field(default="powershell", repr=False)
 
     def connect(self, *, ip: str, port: int, timeout_ms: int) -> None:
         if not ip:
             raise ZkemkeeperError("SCR100 IP address is required")
-        self._com, self._backend = create_zkemkeeper_com_object()
-        ok = bool(self._com.Connect_Net(ip, int(port)))
-        if not ok:
-            raise ZkemkeeperError(f"SCR100 connect failed ({ip}:{port})")
-        logger.info("[zkemkeeper] connected via %s to %s:%d", self._backend, ip, port)
-
-        # PS1 does exactly these two (best-effort, errors ignored):
-        try:
-            self._com.RegEvent(1, 0xFFFFFFFF)
-        except Exception as e:
-            logger.debug("[zkemkeeper] RegEvent failed: %s", e)
-        try:
-            self._com.GetRTLog(1)
-        except Exception:
-            pass
-
+        self._ip = ip
+        self._port = int(port)
+        logger.info(
+            "[zkemkeeper] configured for %s:%d (via PowerShell subprocess)",
+            self._ip, self._port,
+        )
         _ = timeout_ms
 
     def disconnect(self) -> None:
-        if self._com is None:
-            return
-        try:
-            self._com.Disconnect()
-        except Exception:
-            pass
-        self._com = None
+        # Each read is a self-contained subprocess; nothing to close here.
+        pass
 
     def read_card_once(self, *, poll_sec: float = 20.0) -> str:
-        """Direct Python port of the PS1 polling loop.
-
-        PS1 works with pure polling: no events, no message pump, no GetRTLog in
-        the loop. The COM server maintains its own TCP reader thread and fills
-        the internal card buffers; the client just reads them every 60 ms with
-        edge-detection on the idle sentinel.
-        """
-        if self._com is None:
+        if not self._ip:
             raise ZkemkeeperError("Not connected")
 
-        logger.info("[zkemkeeper] polling for card (up to %.1fs)...", poll_sec)
+        ps_exe = _find_powershell()
+        script = (
+            _PS_SCRIPT_TEMPLATE
+            .replace("__IP__", self._ip)
+            .replace("__PORT__", str(self._port))
+            .replace("__TIMEOUT__", str(max(1, int(poll_sec))))
+        )
 
-        deadline = time.time() + poll_sec
-        last_card: str | None = None
-        seen_empty = True       # arm first real read
-        poll_no = 0
-        log_every = max(1, int(3.0 / 0.06))
+        logger.info(
+            "[zkemkeeper] %s polling %s:%d for up to %.0fs",
+            os.path.basename(ps_exe), self._ip, self._port, poll_sec,
+        )
 
-        while time.time() < deadline:
-            card = ""
-            source = ""
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
 
-            # 1) GetHIDEventCardNumAsStr (primary on most firmwares)
-            try:
-                result = self._com.GetHIDEventCardNumAsStr()
-                ok, val = _extract_card(result)
-                if ok and val and _card_is_real(val):
-                    card, source = val, "HID"
-            except Exception as e:
-                logger.debug("[zkemkeeper] GetHIDEventCardNumAsStr: %s", e)
+        try:
+            proc = subprocess.run(
+                [
+                    ps_exe,
+                    "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", script,
+                ],
+                capture_output=True, text=True,
+                timeout=poll_sec + 15,
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired:
+            raise ZkemkeeperError("PowerShell subprocess timed out (hung)")
+        except FileNotFoundError:
+            raise ZkemkeeperError(f"PowerShell not found at {ps_exe}")
 
-            # 2) Fall back to GetStrCardNumber (other firmwares)
-            if not card:
-                try:
-                    result = self._com.GetStrCardNumber()
-                    ok, val = _extract_card(result)
-                    if ok and val and _card_is_real(val):
-                        card, source = val, "STR"
-                except Exception as e:
-                    logger.debug("[zkemkeeper] GetStrCardNumber: %s", e)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        logger.info(
+            "[zkemkeeper] PS exit=%d stdout=%r stderr=%r",
+            proc.returncode, stdout[:300], stderr[:200],
+        )
 
-            if card:
-                # Edge detection like PS1: accept if NEW card or after empty tick
-                if card != last_card or seen_empty:
-                    logger.info("[zkemkeeper] CARD via %s: %r (poll #%d)", source, card, poll_no)
-                    return card
-                # Same card, no empty in between — keep polling
-                seen_empty = False
-            else:
-                seen_empty = True
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("CARD:"):
+                card = line[len("CARD:"):].strip()
+                logger.info("[zkemkeeper] CARD DETECTED: %r", card)
+                return card
+            if line.startswith("ERROR:"):
+                raise ZkemkeeperError(line[len("ERROR:"):].strip() or "PowerShell error")
 
-            if poll_no % log_every == 0:
-                logger.debug("[zkemkeeper] poll #%d last=%r empty=%s", poll_no, last_card, seen_empty)
+        if "TIMEOUT" in stdout:
+            raise ZkemkeeperError("No card detected before timeout")
 
-            poll_no += 1
-            time.sleep(0.06)   # same interval as PS1 $PollMs = 60
-
-        raise ZkemkeeperError("No card detected before timeout")
+        raise ZkemkeeperError(
+            f"PowerShell returned no CARD line (exit={proc.returncode}, stdout={stdout[:200]!r})"
+        )

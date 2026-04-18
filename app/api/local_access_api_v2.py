@@ -378,12 +378,14 @@ class _Ctx:
         self.handler.end_headers()
         self.handler.wfile.write(body)
 
-    def send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
+    def send_bytes(self, status: int, payload: bytes, content_type: str, extra_headers: dict | None = None) -> None:
         body = payload or b""
         self.handler.send_response(status)
         _cors_headers(self.handler)
         self.handler.send_header("Content-Type", content_type or "application/octet-stream")
         self.handler.send_header("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            self.handler.send_header(k, v)
         self.handler.end_headers()
         self.handler.wfile.write(body)
 
@@ -448,7 +450,11 @@ def _handle_image_cache(ctx: _Ctx) -> None:
         if os.path.isabs(raw) and os.path.exists(raw) and os.path.isfile(raw):
             with open(raw, "rb") as f:
                 data = f.read()
-            ctx.send_bytes(200, data, _guess_image_mime(raw))
+            etag = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+            ctx.send_bytes(200, data, _guess_image_mime(raw), {
+                "Cache-Control": "public, max-age=86400, immutable",
+                "ETag": f'"{etag}"',
+            })
             return
     except Exception:
         pass
@@ -459,11 +465,13 @@ def _handle_image_cache(ctx: _Ctx) -> None:
         return
 
     target = _image_cache_path(url)
+    _img_etag = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
+    _img_cache_headers = {"Cache-Control": "public, max-age=86400, immutable", "ETag": f'"{_img_etag}"'}
     try:
         if os.path.exists(target) and os.path.isfile(target):
             with open(target, "rb") as f:
                 data = f.read()
-            ctx.send_bytes(200, data, _guess_image_mime(target))
+            ctx.send_bytes(200, data, _guess_image_mime(target), _img_cache_headers)
             return
     except Exception:
         pass
@@ -503,7 +511,7 @@ def _handle_image_cache(ctx: _Ctx) -> None:
                 os.rename(tmp, target)
         except Exception:
             pass
-        ctx.send_bytes(200, data, _guess_image_mime(target))
+        ctx.send_bytes(200, data, _guess_image_mime(target), _img_cache_headers)
     except Exception:
         ctx.send_json(502, {"ok": False, "error": "image fetch failed"})
 
