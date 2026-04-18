@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import logging
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 class ZkemkeeperError(RuntimeError):
@@ -25,7 +28,6 @@ def initialize_com_apartment():
     if hr in (0, 1):
         def _cleanup() -> None:
             ole32.CoUninitialize()
-
         return _cleanup
     if hr == -2147417850:
         return lambda: None
@@ -47,12 +49,11 @@ def create_zkemkeeper_com_object() -> tuple[object, str]:
         raise ZkemkeeperError("ZKEMKeeper COM access requires pywin32 or comtypes") from e
 
 
-def _extract_com_result(result) -> tuple[bool, str]:
-    """Unpack a zkemkeeper COM method result into (ok, card_string).
+def _extract_card(result) -> tuple[bool, str]:
+    """Unpack a zkemkeeper COM return value into (ok, card_string).
 
     pywin32 Dispatch returns [out] params as a tuple: (BOOL, BSTR).
     comtypes dynamic may return just the BSTR directly.
-    Either way we normalise to (bool, str).
     """
     if isinstance(result, tuple) and len(result) >= 2:
         return bool(result[0]), str(result[1] or "").strip()
@@ -65,13 +66,38 @@ def _extract_com_result(result) -> tuple[bool, str]:
     return False, ""
 
 
-def _is_valid_card(card: str) -> bool:
-    """Reject empty, whitespace-only, and the "0" sentinel the device returns when idle."""
+def _card_is_real(card: str) -> bool:
+    """Return True if card looks like a genuine RFID UID.
+
+    The device returns "0" (or all-zeros) when its buffer is empty/idle.
+    Real card UIDs are always at least 2 digits and non-zero.
+    """
     if not card:
         return False
-    # "0" (and strings of only zeros) are the device's default/cleared buffer value.
-    stripped = card.lstrip("0")
-    return bool(stripped)
+    no_zeros = card.lstrip("0")
+    return len(no_zeros) >= 1   # at least one non-zero digit
+
+
+def _read_hid(com) -> str:
+    """Call GetHIDEventCardNumAsStr; return card string or '' on failure."""
+    try:
+        ok, card = _extract_card(com.GetHIDEventCardNumAsStr())
+        if ok and _card_is_real(card):
+            return card
+    except Exception:
+        pass
+    return ""
+
+
+def _read_str(com) -> str:
+    """Call GetStrCardNumber; return card string or '' on failure."""
+    try:
+        ok, card = _extract_card(com.GetStrCardNumber())
+        if ok and _card_is_real(card):
+            return card
+    except Exception:
+        pass
+    return ""
 
 
 @dataclass
@@ -89,12 +115,8 @@ class ZkemkeeperScanner:
         ok = bool(self._com.Connect_Net(ip, int(port)))
         if not ok:
             raise ZkemkeeperError(f"SCR100 connect failed ({ip}:{port})")
-        # Arm real-time event log — same as the PS1 script's RegEvent + GetRTLog.
-        # Without this, GetHIDEventCardNumAsStr returns stale/default values.
-        try:
-            self._com.RegEvent(1, 0xFFFFFFFF)
-        except Exception:
-            pass
+
+        # Flush real-time log so we only see NEW card swipes (mirrors PS1 GetRTLog call).
         try:
             self._com.GetRTLog(1)
         except Exception:
@@ -110,46 +132,48 @@ class ZkemkeeperScanner:
             pass
         self._com = None
 
-    def read_card_once(self, *, poll_sec: float = 10.0) -> str:
-        """Block until a valid card is detected (or timeout).
+    def read_card_once(self, *, poll_sec: float = 20.0) -> str:
+        """Block until a valid RFID card is detected (or timeout).
 
-        Mirrors the PS1 script logic:
-        - Try GetHIDEventCardNumAsStr first.
-        - Fall back to GetStrCardNumber if the first returns nothing useful.
-        - Reject "0" and all-zero strings (device idle/cleared sentinel).
-        - Poll at 60 ms (same as PS1) for snappy detection.
+        Strategy:
+          1. Snapshot the current GetStrCardNumber value immediately after connect.
+             On idle devices this is "0" or the last-read card.
+          2. Poll every 60 ms (same rate as the working PS1 script):
+             a. Try GetHIDEventCardNumAsStr — fires when the device has a swipe event.
+             b. Try GetStrCardNumber — fires when a card is physically on the reader.
+                Accept only if the value CHANGED from the snapshot (edge detection).
+          3. Return the first non-idle, non-zero card seen.
         """
         if self._com is None:
             raise ZkemkeeperError("Not connected")
 
+        # Snapshot idle value for edge detection on GetStrCardNumber.
+        idle_str = _read_str(self._com) or ""
+        logger.debug("[zkemkeeper] idle GetStrCardNumber=%r", idle_str)
+
         deadline = time.time() + poll_sec
+        poll_no  = 0
+
         while time.time() < deadline:
-            card_str = ""
+            # ── GetHIDEventCardNumAsStr (swipe-event based) ──
+            hid_card = _read_hid(self._com)
+            if hid_card:
+                logger.info("[zkemkeeper] HID card: %r (poll #%d)", hid_card, poll_no)
+                return hid_card
 
-            # ── Primary: GetHIDEventCardNumAsStr ──
-            try:
-                ok, card_str = _extract_com_result(
-                    self._com.GetHIDEventCardNumAsStr()
+            # ── GetStrCardNumber (direct read, edge-detected) ──
+            str_card = _read_str(self._com)
+            if str_card and str_card != idle_str:
+                logger.info("[zkemkeeper] STR card: %r (poll #%d)", str_card, poll_no)
+                return str_card
+
+            if poll_no % 50 == 0:   # log every ~3 s
+                logger.debug(
+                    "[zkemkeeper] waiting… poll=%d hid=%r str=%r",
+                    poll_no, hid_card, str_card,
                 )
-                if not (ok and _is_valid_card(card_str)):
-                    card_str = ""
-            except Exception:
-                card_str = ""
 
-            # ── Fallback: GetStrCardNumber ──
-            if not card_str:
-                try:
-                    ok2, card2 = _extract_com_result(
-                        self._com.GetStrCardNumber()
-                    )
-                    if ok2 and _is_valid_card(card2):
-                        card_str = card2
-                except Exception:
-                    pass
-
-            if card_str:
-                return card_str
-
-            time.sleep(0.06)  # 60 ms — same poll rate as the working PS1 script
+            poll_no += 1
+            time.sleep(0.06)   # 60 ms — same as PS1
 
         raise ZkemkeeperError("No card detected before timeout")

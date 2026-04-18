@@ -155,7 +155,7 @@ class AccessConfigSection:
     scanner_mode: str = "zkemkeeper"
     scanner_network_ip: str = ""
     scanner_network_port: int = 4370
-    scanner_network_timeout_ms: int = 5000
+    scanner_network_timeout_ms: int = 20000
     scanner_usb_device_path: str = ""
     scan_shortcut: str = "CTRL_CAPSLOCK"   # Global shortcut to trigger SCR100 card scan
     favorites_overlay_anchor: str = "right-center"
@@ -417,7 +417,7 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         scanner_mode=str(getattr(cfg, "scanner_mode", "zkemkeeper") or "zkemkeeper"),
         scanner_network_ip=str(getattr(cfg, "scanner_network_ip", "") or ""),
         scanner_network_port=int(getattr(cfg, "scanner_network_port", 4370) or 4370),
-        scanner_network_timeout_ms=int(getattr(cfg, "scanner_network_timeout_ms", 5000) or 5000),
+        scanner_network_timeout_ms=int(getattr(cfg, "scanner_network_timeout_ms", 20000) or 20000),
         scanner_usb_device_path=str(getattr(cfg, "scanner_usb_device_path", "") or ""),
         scan_shortcut=str(getattr(cfg, "scan_shortcut", "CTRL_CAPSLOCK") or "CTRL_CAPSLOCK"),
         favorites_overlay_anchor=str(getattr(cfg, "favorites_overlay_anchor", "right-center") or "right-center"),

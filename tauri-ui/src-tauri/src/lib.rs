@@ -546,32 +546,19 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Open a decoration-free, always-on-top RFID-card-style popup showing the
-/// scanned card number.  The window auto-closes after 4 s from the frontend.
+/// Open the scan-result popup in "scanning" state immediately when the shortcut
+/// fires.  The popup listens for the "scan-shortcut-result" Tauri event and
+/// transitions to result/error state on its own — no card param needed here.
 /// 440 × 278 px matches the standard credit-card aspect ratio (1.586 : 1).
-/// If a previous scan-result window is still open, close it first so only one
-/// is ever visible at a time.
-fn show_scan_result_popup(app: &AppHandle, card: &str) {
-    // Close any lingering previous instance before opening a new one.
+/// Destroys any previous instance first so only one is ever visible at a time.
+fn show_scan_result_popup(app: &AppHandle) {
     if let Some(old) = app.get_webview_window(SCAN_RESULT_LABEL) {
         let _ = old.destroy();
     }
-    // Percent-encode the card number for the URL query string.
-    let encoded: String = card
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c.to_string()
-            } else {
-                format!("%{:02X}", c as u32)
-            }
-        })
-        .collect();
-    let url = format!("/scan-result?card={}", encoded);
     match tauri::WebviewWindowBuilder::new(
         app,
         SCAN_RESULT_LABEL,
-        tauri::WebviewUrl::App(url.into()),
+        tauri::WebviewUrl::App("/scan-result".into()),
     )
     .title("MonClub — Carte scannée")
     .inner_size(440.0, 278.0)
@@ -1257,12 +1244,15 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                     if ev.state() != ShortcutState::Pressed { return; }
                     let app = app_c.clone();
                     let sc_raw = sc_raw_c.clone();
-                    // Immediate beep event so the frontend can play a sound.
+                    // Open scanning popup immediately so the operator sees
+                    // "place your card" before the HTTP request finishes.
+                    show_scan_result_popup(&app);
                     let _ = app.emit("scan-shortcut-pressed", serde_json::json!({
                         "shortcut": sc_raw,
                     }));
                     // POST /scan/quick in a background thread — blocks until
-                    // the card is read (or timeout).  On success, open popup.
+                    // the card is read (or timeout).  Popup handles the result
+                    // via the scan-shortcut-result event it listens for.
                     std::thread::spawn(move || {
                         let port = app
                             .state::<ApiPort>()
@@ -1275,7 +1265,7 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                             .post(&url)
                             .header("X-Local-Token", local_api_token())
                             .json(&serde_json::json!({}))
-                            .timeout(std::time::Duration::from_secs(15))
+                            .timeout(std::time::Duration::from_secs(25))
                             .send()
                         {
                             Ok(r) if r.status().is_success() => {
@@ -1297,12 +1287,9 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                             }
                             Err(e) => (false, String::new(), Some(e.to_string())),
                         };
-                        // Show the in-app popup for successful scans.
-                        if ok && !card.is_empty() {
-                            show_scan_result_popup(&app, &card);
-                        }
-                        // Also emit the event so any open overlay/window
-                        // can reflect the result (e.g. the flash toast).
+                        // Popup is already open (scanning state); deliver the result
+                        // via event — it will transition to result/error state and
+                        // auto-close. Also notifies any open overlay with a flash toast.
                         let _ = app.emit("scan-shortcut-result", serde_json::json!({
                             "ok":       ok,
                             "card":     card,
