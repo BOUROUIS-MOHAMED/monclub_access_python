@@ -282,7 +282,8 @@ export default function FavoritesOverlayPage() {
     (async () => {
       try {
         const { listen } = await import("@tauri-apps/api/event");
-        unlisten = await listen<{ favoriteId: number; shortcut: string }>(
+        // Same beep plays for both door shortcuts and the SCR100 scan shortcut.
+        unlisten = await listen<{ favoriteId?: number; shortcut: string }>(
           "favorite-shortcut-pressed",
           () => {
             try {
@@ -345,6 +346,41 @@ export default function FavoritesOverlayPage() {
       }
     })();
 
+    return () => {
+      if (unlisten) unlisten();
+      if (autoCollapseTimer) clearTimeout(autoCollapseTimer);
+    };
+  }, []);
+
+  // ── Toast on SCR100 scan shortcut result ─────────────────────────────────
+  // Python handles the winotify notification; we also show a flash banner in
+  // the overlay so the operator gets visual feedback in the app itself.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let autoCollapseTimer: number | null = null;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<{
+          ok: boolean;
+          card: string;
+          error?: string | null;
+          shortcut: string;
+        }>("scan-shortcut-result", (event) => {
+          const p = event.payload;
+          setFlash({
+            key: `scan-${Date.now()}`,
+            ok: p.ok,
+            msg: p.ok ? `🪪 ${p.card}` : `Scan: ${p.error ?? "erreur"}`,
+          });
+          doOpenRef.current();
+          if (autoCollapseTimer) clearTimeout(autoCollapseTimer);
+          autoCollapseTimer = window.setTimeout(() => {
+            doCloseRef.current();
+          }, 3000);
+        });
+      } catch { /* Non-Tauri environment */ }
+    })();
     return () => {
       if (unlisten) unlisten();
       if (autoCollapseTimer) clearTimeout(autoCollapseTimer);

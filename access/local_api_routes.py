@@ -99,6 +99,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/scanner/discover/status", "_handle_scanner_discover_status"),
     ("POST", "/api/v2/scan/start", "_handle_scan_start"),
     ("GET", "/api/v2/scan/stream", "_handle_scan_stream"),
+    ("POST", "/api/v2/scan/quick", "_handle_scan_quick"),
     ("GET", "/api/v2/logs/recent", "_handle_logs_recent"),
     ("GET", "/api/v2/logs/stream", "_handle_logs_stream_sse"),
     ("POST", "/api/v2/logs/open-dir", "_handle_logs_open_dir"),

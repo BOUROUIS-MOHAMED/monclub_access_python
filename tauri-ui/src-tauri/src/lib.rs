@@ -63,11 +63,16 @@ struct TvBindingsResponse {
 
 struct ApiPort(Mutex<u16>);
 struct KeepBackgroundOnClose(Mutex<bool>);
+/// Persisted raw shortcut string for the scan action (e.g. "CTRL_SHIFT_S").
+/// Saved at startup from the Python config, then re-registered inside
+/// `do_register_shortcuts` so it survives every door-shortcut refresh.
+struct CurrentScanShortcut(Mutex<Option<String>>);
 const ACCESS_PANEL_LABEL: &str = "access-panel";
 const ACCESS_PANEL_WIDTH: f64 = 428.0;
 const ACCESS_PANEL_HEIGHT: f64 = 608.0;
 const ACCESS_PANEL_MARGIN: f64 = 16.0;
 const POPUP_LABEL: &str = "access_popup";
+const SCAN_RESULT_LABEL: &str = "scan-result";
 const FAVORITES_OVERLAY_LABEL: &str = "favorites-overlay";
 
 #[derive(Debug, Clone, Serialize)]
@@ -539,6 +544,50 @@ fn show_popup_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> 
     let _ = win.show();
     let _ = win.set_focus();
     Ok(())
+}
+
+/// Open a decoration-free, always-on-top RFID-card-style popup showing the
+/// scanned card number.  The window auto-closes after 4 s from the frontend.
+/// 440 × 278 px matches the standard credit-card aspect ratio (1.586 : 1).
+/// If a previous scan-result window is still open, close it first so only one
+/// is ever visible at a time.
+fn show_scan_result_popup(app: &AppHandle, card: &str) {
+    // Close any lingering previous instance before opening a new one.
+    if let Some(old) = app.get_webview_window(SCAN_RESULT_LABEL) {
+        let _ = old.destroy();
+    }
+    // Percent-encode the card number for the URL query string.
+    let encoded: String = card
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect();
+    let url = format!("/scan-result?card={}", encoded);
+    match tauri::WebviewWindowBuilder::new(
+        app,
+        SCAN_RESULT_LABEL,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title("MonClub — Carte scannée")
+    .inner_size(440.0, 278.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .center()
+    .skip_taskbar(true)
+    .build()
+    {
+        Ok(win) => {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        Err(e) => eprintln!("[scan-result] failed to open popup: {}", e),
+    }
 }
 
 // ─── Favorites overlay — anchor-aware sizing and positioning ───
@@ -1181,6 +1230,87 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
         }
     }
 
+    // ── Scan shortcut (re-registered after every door-shortcut refresh) ──
+    // Stored in CurrentScanShortcut state; uses the same parser + numpad
+    // variant logic as door shortcuts, but calls POST /api/v2/scan/quick.
+    let scan_raw_opt: Option<String> = app
+        .try_state::<CurrentScanShortcut>()
+        .and_then(|s| s.0.lock().ok().and_then(|g| g.clone()));
+
+    if let Some(scan_raw) = scan_raw_opt {
+        if let Some(spec) = parse_favorite_shortcut(&scan_raw) {
+            let mut specs = vec![spec.clone()];
+            if let Some(np) = numpad_variant(&spec) {
+                specs.push(np);
+            }
+            for sc in specs {
+                let app_c = app.clone();
+                let sc_raw_c = scan_raw.clone();
+                let _ = gs.on_shortcut(sc.as_str(), move |_app, _sc, ev| {
+                    if ev.state() != ShortcutState::Pressed { return; }
+                    let app = app_c.clone();
+                    let sc_raw = sc_raw_c.clone();
+                    // Immediate beep event so the frontend can play a sound.
+                    let _ = app.emit("scan-shortcut-pressed", serde_json::json!({
+                        "shortcut": sc_raw,
+                    }));
+                    // POST /scan/quick in a background thread — blocks until
+                    // the card is read (or timeout).  On success, open popup.
+                    std::thread::spawn(move || {
+                        let port = app
+                            .state::<ApiPort>()
+                            .0
+                            .lock()
+                            .map(|p| *p)
+                            .unwrap_or(8788);
+                        let url = format!("{}/scan/quick", api_base(port));
+                        let (ok, card, err) = match reqwest::blocking::Client::new()
+                            .post(&url)
+                            .header("X-Local-Token", local_api_token())
+                            .json(&serde_json::json!({}))
+                            .timeout(std::time::Duration::from_secs(15))
+                            .send()
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                let body: serde_json::Value = r.json().unwrap_or_default();
+                                let c = body.get("card")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                (true, c, None)
+                            }
+                            Ok(r) => {
+                                let status = r.status().as_u16();
+                                let body: serde_json::Value = r.json().unwrap_or_default();
+                                let msg = body.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("scan failed")
+                                    .to_string();
+                                (false, String::new(), Some(format!("HTTP {}: {}", status, msg)))
+                            }
+                            Err(e) => (false, String::new(), Some(e.to_string())),
+                        };
+                        // Show the in-app popup for successful scans.
+                        if ok && !card.is_empty() {
+                            show_scan_result_popup(&app, &card);
+                        }
+                        // Also emit the event so any open overlay/window
+                        // can reflect the result (e.g. the flash toast).
+                        let _ = app.emit("scan-shortcut-result", serde_json::json!({
+                            "ok":       ok,
+                            "card":     card,
+                            "error":    err,
+                            "shortcut": sc_raw,
+                        }));
+                    });
+                });
+            }
+            eprintln!("[scan-shortcut] registered: {}", scan_raw);
+        } else {
+            eprintln!("[scan-shortcut] could not parse shortcut: {:?}", scan_raw);
+        }
+    }
+
     eprintln!(
         "[fav-shortcuts] done: registered={} skipped={}",
         registered.len(), skipped.len(),
@@ -1188,8 +1318,36 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
     serde_json::json!({ "registered": registered, "skipped": skipped })
 }
 
+/// Fetch scan shortcut from the config API and save it to `CurrentScanShortcut` state.
+fn fetch_scan_shortcut(app: &AppHandle, port: u16) {
+    #[derive(serde::Deserialize)]
+    struct CfgResp {
+        #[serde(default)]
+        config: serde_json::Value,
+    }
+    let url = format!("{}/config", api_base(port));
+    let sc: Option<String> = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()
+        .and_then(|c| c.get(&url).header("X-Local-Token", local_api_token()).send().ok())
+        .and_then(|r| r.json::<CfgResp>().ok())
+        .and_then(|r| {
+            r.config
+                .get("scan_shortcut")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+
+    if let Ok(mut guard) = app.state::<CurrentScanShortcut>().0.lock() {
+        *guard = sc.filter(|s| !s.trim().is_empty());
+        eprintln!("[scan-shortcut] config fetched: {:?}", *guard);
+    }
+}
+
 /// Fetch favorites from the local Python API and register shortcuts.
-/// Returns true on success (API reachable and shortcuts registered).
+/// Also fetches the scan shortcut from the config so it is included in the
+/// registration batch.  Returns true on success (API reachable).
 fn fetch_and_register_shortcuts(app: &AppHandle, port: u16) -> bool {
     let url = format!("{}/sync/cache/favorites", api_base(port));
     let resp: FavoritesApiResponse = match reqwest::blocking::Client::new()
@@ -1203,6 +1361,9 @@ fn fetch_and_register_shortcuts(app: &AppHandle, port: u16) -> bool {
         Some(r) => r,
         None => return false,
     };
+
+    // Also fetch the scan shortcut so do_register_shortcuts includes it.
+    fetch_scan_shortcut(app, port);
 
     let shortcuts: Vec<FavoriteShortcutEntry> = resp.favorites.into_iter()
         .filter_map(|f| {
@@ -1457,6 +1618,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(ApiPort(Mutex::new(initial_api_port)))
         .manage(KeepBackgroundOnClose(Mutex::new(true)))
+        .manage(CurrentScanShortcut(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             set_api_port,
             get_desktop_runtime_context,

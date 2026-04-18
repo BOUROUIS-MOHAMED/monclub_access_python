@@ -4407,6 +4407,55 @@ def _handle_scan_stream(ctx: _Ctx) -> None:
             last_ping = time.time()
 
 
+def _handle_scan_quick(ctx: _Ctx) -> None:
+    """POST /api/v2/scan/quick
+
+    Start an SCR100 scan, block until a card is read (or timeout), then return
+    the result as JSON.  The Tauri layer handles the in-app popup notification.
+
+    Called by the Tauri global-shortcut handler — the body is optional; missing
+    fields fall back to the persisted scanner config.
+    """
+    from app.core.config import load_config
+    cfg = load_config()
+    body = ctx.body()
+
+    timeout_ms = _safe_int(body.get("timeout_ms"), cfg.scanner_network_timeout_ms) or 5000
+
+    session = get_scan_session()
+    started = session.start(
+        mode=_safe_str(body.get("mode"), cfg.scanner_mode) or "zkemkeeper",
+        ip=_safe_str(body.get("ip"), cfg.scanner_network_ip) or "",
+        port=_safe_int(body.get("port"), cfg.scanner_network_port) or 4370,
+        timeout_ms=timeout_ms,
+        usb_device_path=_safe_str(body.get("usb_device_path"), cfg.scanner_usb_device_path) or "",
+    )
+    if not started:
+        ctx.send_json(409, {"ok": False, "error": "Scan session already active"})
+        return
+
+    # Block until done, timeout, or error (add a 2 s buffer beyond the scanner timeout)
+    deadline = time.time() + timeout_ms / 1000 + 2
+    event = None
+    while time.time() < deadline:
+        event = session.wait_event(timeout=1.0)
+        if event:
+            break
+
+    if event and event.get("status") == "done":
+        card = str(event.get("card", ""))
+        ctx.send_json(200, {"ok": True, "card": card})
+
+    elif event and event.get("status") == "timeout":
+        ctx.send_json(408, {"ok": False, "error": "Scan timeout — no card detected"})
+
+    elif event and event.get("status") == "error":
+        ctx.send_json(500, {"ok": False, "error": event.get("message", "Scan error")})
+
+    else:
+        ctx.send_json(408, {"ok": False, "error": "Scan timeout"})
+
+
 def _handle_scanner_start(ctx: _Ctx) -> None:
     from app.core.card_scanner import get_scanner
     from app.core.config import load_config
