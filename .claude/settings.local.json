@@ -291,7 +291,8 @@
       "Bash(awk '/13:18:06/{exit} /INFO/')",
       "Bash(awk '/def _sync_one_device/,/^    def [a-zA-Z_]/' app/core/device_sync.py)",
       "Bash(awk -F: '/_sync_one_device/{start=1} start')",
-      "Bash(python -m pytest tests/test_batch_progress.py::test_batch_push_emits_intermediate_progress_ticks -v --tb=short)"
+      "Bash(python -m pytest tests/test_batch_progress.py::test_batch_push_emits_intermediate_progress_ticks -v --tb=short)",
+      "Bash(python -m pytest tests/test_access_history_user_id.py tests/test_db_anti_fraud_columns.py tests/test_daily_counter.py --tb=short -q)"
     ]
   }
 }

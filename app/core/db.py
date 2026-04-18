@@ -5376,6 +5376,10 @@ class AccessHistoryRow:
     backend_next_retry_at: Optional[str]
     backend_synced_at: Optional[str]
     backend_last_error: Optional[str]
+    # Anti-fraud daily-limit: resolved user_id at insert time (column added via
+    # _ensure_column migration on `access_history`). Defaults to None so old
+    # rows created before the migration still hydrate cleanly.
+    user_id: Optional[int] = None
 
 
 ACCESS_HISTORY_SOURCE_AGENT = "AGENT"

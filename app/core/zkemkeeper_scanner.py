@@ -47,6 +47,33 @@ def create_zkemkeeper_com_object() -> tuple[object, str]:
         raise ZkemkeeperError("ZKEMKeeper COM access requires pywin32 or comtypes") from e
 
 
+def _extract_com_result(result) -> tuple[bool, str]:
+    """Unpack a zkemkeeper COM method result into (ok, card_string).
+
+    pywin32 Dispatch returns [out] params as a tuple: (BOOL, BSTR).
+    comtypes dynamic may return just the BSTR directly.
+    Either way we normalise to (bool, str).
+    """
+    if isinstance(result, tuple) and len(result) >= 2:
+        return bool(result[0]), str(result[1] or "").strip()
+    if isinstance(result, str):
+        return bool(result), result.strip()
+    if isinstance(result, bool):
+        return result, ""
+    if isinstance(result, int):
+        return bool(result), ""
+    return False, ""
+
+
+def _is_valid_card(card: str) -> bool:
+    """Reject empty, whitespace-only, and the "0" sentinel the device returns when idle."""
+    if not card:
+        return False
+    # "0" (and strings of only zeros) are the device's default/cleared buffer value.
+    stripped = card.lstrip("0")
+    return bool(stripped)
+
+
 @dataclass
 class ZkemkeeperScanner:
     _com: object | None = None
@@ -62,6 +89,16 @@ class ZkemkeeperScanner:
         ok = bool(self._com.Connect_Net(ip, int(port)))
         if not ok:
             raise ZkemkeeperError(f"SCR100 connect failed ({ip}:{port})")
+        # Arm real-time event log — same as the PS1 script's RegEvent + GetRTLog.
+        # Without this, GetHIDEventCardNumAsStr returns stale/default values.
+        try:
+            self._com.RegEvent(1, 0xFFFFFFFF)
+        except Exception:
+            pass
+        try:
+            self._com.GetRTLog(1)
+        except Exception:
+            pass
         _ = timeout_ms
 
     def disconnect(self) -> None:
@@ -74,34 +111,45 @@ class ZkemkeeperScanner:
         self._com = None
 
     def read_card_once(self, *, poll_sec: float = 10.0) -> str:
+        """Block until a valid card is detected (or timeout).
+
+        Mirrors the PS1 script logic:
+        - Try GetHIDEventCardNumAsStr first.
+        - Fall back to GetStrCardNumber if the first returns nothing useful.
+        - Reject "0" and all-zero strings (device idle/cleared sentinel).
+        - Poll at 60 ms (same as PS1) for snappy detection.
+        """
         if self._com is None:
             raise ZkemkeeperError("Not connected")
+
         deadline = time.time() + poll_sec
         while time.time() < deadline:
-            card = ""
-            try:
-                result = self._com.GetHIDEventCardNumAsStr()
-                if isinstance(result, tuple) and len(result) >= 2:
-                    ok, card = result[0], result[1]
-                elif isinstance(result, bool):
-                    ok = result
-                    card = ""
-                else:
-                    ok = False
-            except Exception:
-                ok = False
-                card = ""
+            card_str = ""
 
-            card_str = str(card or "").strip()
-            if ok and card_str:
+            # ── Primary: GetHIDEventCardNumAsStr ──
+            try:
+                ok, card_str = _extract_com_result(
+                    self._com.GetHIDEventCardNumAsStr()
+                )
+                if not (ok and _is_valid_card(card_str)):
+                    card_str = ""
+            except Exception:
+                card_str = ""
+
+            # ── Fallback: GetStrCardNumber ──
+            if not card_str:
+                try:
+                    ok2, card2 = _extract_com_result(
+                        self._com.GetStrCardNumber()
+                    )
+                    if ok2 and _is_valid_card(card2):
+                        card_str = card2
+                except Exception:
+                    pass
+
+            if card_str:
                 return card_str
 
-            try:
-                fallback = str(self._com.GetStrCardNumber() or "").strip()
-                if fallback:
-                    return fallback
-            except Exception:
-                pass
+            time.sleep(0.06)  # 60 ms — same poll rate as the working PS1 script
 
-            time.sleep(0.2)
         raise ZkemkeeperError("No card detected before timeout")
