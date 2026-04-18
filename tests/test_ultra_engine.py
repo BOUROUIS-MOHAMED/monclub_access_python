@@ -123,6 +123,7 @@ def _make_worker(
     worker._last_full_sync_error = ""
     worker._full_sync_running = False
     worker._cmd_queue = queue.Queue(maxsize=10)
+    worker._wake_evt = threading.Event()
     worker._sync_pause = threading.Event()
     worker._sync_paused_ack = threading.Event()
     worker._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
@@ -415,6 +416,51 @@ class TestOpenDoorWithRetry:
 
         # range(2) => attempts 0 and 1 only
         assert mock_sdk.open_door.call_count == 2
+
+
+def test_request_door_open_wakes_idle_worker() -> None:
+    stop_event = threading.Event()
+    worker = UltraDeviceWorker(
+        device=_make_device(),
+        settings=_make_settings(
+            empty_sleep_min_ms=2000,
+            empty_sleep_max_ms=2000,
+            empty_backoff_max_ms=2000,
+        ),
+        popup_q=queue.Queue(maxsize=10),
+        history_q=queue.Queue(maxsize=10),
+        stop_event=stop_event,
+    )
+    worker._pre_populate_seen = MagicMock()
+    worker._get_cached_local_state = MagicMock()
+    worker._connected = True
+    worker._sdk = MagicMock()
+    worker._sdk.open_door.return_value = True
+    worker._poll_with_watchdog = MagicMock(return_value=[])
+    worker_wait_started = threading.Event()
+    original_wait_for_work = worker._wait_for_work
+
+    def _observing_wait_for_work(timeout_sec: float) -> None:
+        worker_wait_started.set()
+        original_wait_for_work(timeout_sec)
+
+    worker._wait_for_work = _observing_wait_for_work
+
+    worker.start()
+    try:
+        assert worker_wait_started.wait(timeout=1.0)
+
+        result = worker.request_door_open(door_id=2, pulse_ms=1500, timeout=0.5)
+
+        assert result == {"ok": True, "error": ""}
+        worker._sdk.open_door.assert_called_once_with(
+            door_id=2,
+            pulse_time_ms=1500,
+            timeout_ms=4000,
+        )
+    finally:
+        stop_event.set()
+        worker.join(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------

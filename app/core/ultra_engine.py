@@ -92,6 +92,7 @@ class UltraDeviceWorker(threading.Thread):
         # Command queue: door open requests executed inline between polls
         # (avoids TCP disconnect/reconnect needed by the old pause approach).
         self._cmd_queue: "queue.Queue" = queue.Queue(maxsize=10)
+        self._wake_evt = threading.Event()
         self._member_sync_lock = threading.Lock()
         self._pending_member_syncs: Deque[int] = deque()
         self._pending_member_sync_ids: Set[int] = set()
@@ -165,7 +166,7 @@ class UltraDeviceWorker(threading.Thread):
                 if not self._connected:
                     wait_sec = self._connect_wait_remaining()
                     if wait_sec > 0:
-                        self._stop_evt.wait(min(wait_sec, 1.0))
+                        self._wait_for_work(min(wait_sec, 1.0))
                         continue
                     self._connect()
                     if not self._connected:
@@ -199,7 +200,7 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_full_sync_commands(limit=1)
                 self._drain_commands()
 
-                self._stop_evt.wait(sleep_ms / 1000.0)
+                self._wait_for_work(sleep_ms / 1000.0)
 
             except Exception:
                 logger.exception(f"{self._prefix} unhandled exception in run loop — will retry in 5s")
@@ -219,6 +220,16 @@ class UltraDeviceWorker(threading.Thread):
     def _connect_wait_remaining(self, *, now: float | None = None) -> float:
         current = time.monotonic() if now is None else float(now)
         return max(0.0, float(self._next_connect_at_mono or 0.0) - current)
+
+    def _wait_for_work(self, timeout_sec: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout_sec or 0.0))
+        while not self._stop_evt.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._wake_evt.wait(timeout=min(remaining, 0.05)):
+                self._wake_evt.clear()
+                return
 
     def _record_connect_failure(self, error: str) -> float:
         self._connect_failures = min(int(self._connect_failures or 0) + 1, 8)
@@ -355,6 +366,7 @@ class UltraDeviceWorker(threading.Thread):
         result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
         try:
             self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box))
+            self._wake_evt.set()
         except queue.Full:
             return {"ok": False, "error": "command queue full"}
 
