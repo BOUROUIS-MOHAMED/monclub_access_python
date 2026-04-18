@@ -537,6 +537,66 @@ class PullSDK:
             raise PullSDKError(f"DeleteDeviceData FAILED table={table} rc={rc} PullLastError={err}")
         return rc
 
+    def delete_device_data_batch(
+        self,
+        *,
+        table: str,
+        pins: list,
+        chunk_size: int = 100,
+        condition_field: str = "Pin",
+    ) -> tuple:
+        """
+        Delete multiple rows from a device table in one DeleteDeviceData call.
+
+        Each pin becomes a record ``{condition_field}={pin}`` joined by \\r\\n,
+        and the batch is split into chunks of ``chunk_size``. On chunk failure
+        the method falls back to per-pin deletes so a bad record cannot block
+        the rest of the chunk.
+
+        Returns ``(ok_count, failed_pins)`` — failed_pins is the list of pins
+        that could not be deleted (empty on full success).
+
+        Validated against ZKTeco PullSDK User Guide V2.0: ``Data`` is a record
+        payload, not a SQL filter; multi-row deletes are the documented bulk
+        pattern on C2/C3/InBio firmware.
+        """
+        if not pins:
+            return (0, [])
+
+        self.load()
+        if self._dll is None or not hasattr(self._dll, "DeleteDeviceData"):
+            raise PullSDKError("DeleteDeviceData not available in this plcommpro.dll build.")
+
+        ok = 0
+        failed: list = []
+        pins_list = [str(p) for p in pins]
+        for i in range(0, len(pins_list), chunk_size):
+            chunk = pins_list[i:i + chunk_size]
+            data = "\r\n".join(f"{condition_field}={p}" for p in chunk) + "\r\n"
+            try:
+                self.delete_device_data(table=table, data=data, options="")
+                ok += len(chunk)
+            except PullSDKError as ex:
+                self.logger.warning(
+                    "delete_device_data_batch chunk failed (table=%s, rows=%d): %s — falling back to per-pin",
+                    table, len(chunk), ex,
+                )
+                for pin in chunk:
+                    try:
+                        self.delete_device_data(
+                            table=table,
+                            data=f"{condition_field}={pin}",
+                            options="",
+                        )
+                        ok += 1
+                    except PullSDKError as ex2:
+                        self.logger.warning(
+                            "delete_device_data_batch per-pin fallback failed table=%s %s=%s: %s",
+                            table, condition_field, pin, ex2,
+                        )
+                        failed.append(pin)
+        return (ok, failed)
+
     # -------------------- ControlDevice (Door control) --------------------
 
     def supports_control_device(self) -> bool:

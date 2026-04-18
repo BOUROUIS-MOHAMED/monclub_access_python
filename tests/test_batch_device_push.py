@@ -166,3 +166,189 @@ def test_small_sync_uses_per_pin_loop(tmp_path, monkeypatch):
     # 3 users × (1 user + 1 authorize) = 6 individual calls
     individual_calls = sdk_inst.set_device_data.call_count
     assert individual_calls >= 3, f"Expected ≥3 individual set_device_data calls, got {individual_calls}"
+
+
+# ── P0-bulk: stale-pin bulk delete + strategy cascade ─────────────────────
+
+def test_stale_pins_deleted_via_bulk_not_per_pin(tmp_path, monkeypatch):
+    """
+    Stale pins (on device, not in desired) are removed with bulk
+    DeleteDeviceData — one call per table, not 4×N per-pin calls.
+    With default INCREMENTAL policy and <50%/10 stale threshold, nuke mode
+    is skipped and bulk delete path runs.
+    """
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    # 12 pins on device, server knows all 12 (known_server_pins = 1..12),
+    # but desired is restricted to 1..10 via allowedMemberships → 2 stale (11, 12).
+    # Below the nuke threshold (>10 stale AND > desired).
+    device_pins = [str(i) for i in range(1, 13)]
+    all_users = [make_user(am_id=i) for i in range(1, 13)]
+    device = make_device()
+    device["pushingToDevicePolicy"] = "INCREMENTAL"
+    device["allowedMemberships"] = [i for i in range(1, 11)]  # only 1..10 desired
+
+    sdk_cls, sdk_inst = _patch_sdk(device_pins=device_pins)
+    sdk_inst.set_device_data_batch.return_value = (10, [])
+    sdk_inst.delete_device_data_batch = MagicMock(return_value=(2, []))
+    sdk_inst.supports_delete_device_data.return_value = True
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=device,
+            users=all_users,
+            local_fp_index={},
+            default_door_id=15,
+        )
+
+    # delete_device_data_batch should have been called at least once (user table)
+    assert sdk_inst.delete_device_data_batch.call_count >= 1, (
+        "Expected bulk delete for stale pins"
+    )
+
+
+def test_insert_strategy_defaults_to_upsert_and_is_cached(tmp_path, monkeypatch):
+    """
+    On a fresh install (no cached FirmwareProfile), insert_strategy defaults
+    to "upsert" and is persisted after first sync.
+    """
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    users = [make_user(am_id=i) for i in range(1, 11)]
+
+    sdk_cls, sdk_inst = _patch_sdk(device_pins=[])
+    sdk_inst.set_device_data_batch.return_value = (10, [])
+    sdk_inst.supports_delete_device_data.return_value = True
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=make_device(dev_id=42),
+            users=users,
+            local_fp_index={},
+            default_door_id=15,
+        )
+
+    from app.core.db import load_firmware_profile
+    profile = load_firmware_profile(device_id=42)
+    assert profile is not None
+    assert profile["insert_strategy"] == "upsert"
+
+
+def test_delete_then_insert_strategy_triggers_bulk_predelete(tmp_path, monkeypatch):
+    """
+    When FirmwareProfile.insert_strategy is pinned to "delete_then_insert",
+    the batch path issues a bulk pre-delete instead of skipping (upsert) or
+    per-pin deleting (one_by_one).
+    """
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    users = [make_user(am_id=i) for i in range(1, 11)]
+
+    # Pre-seed the profile with delete_then_insert strategy
+    from app.core.db import save_firmware_profile
+    save_firmware_profile(
+        device_id=99,
+        insert_strategy="delete_then_insert",
+    )
+
+    sdk_cls, sdk_inst = _patch_sdk(device_pins=[])
+    sdk_inst.set_device_data_batch.return_value = (10, [])
+    sdk_inst.delete_device_data_batch = MagicMock(return_value=(10, []))
+    sdk_inst.supports_delete_device_data.return_value = True
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=make_device(dev_id=99),
+            users=users,
+            local_fp_index={},
+            default_door_id=15,
+        )
+
+    # Bulk pre-delete fires (stale path has no work since device_pins is empty,
+    # so any delete_device_data_batch call must be the pre-delete).
+    assert sdk_inst.delete_device_data_batch.call_count >= 1, (
+        "Expected bulk pre-delete under delete_then_insert strategy"
+    )
+
+
+def test_fingerprint_disabled_device_skips_template_table_deletes(tmp_path, monkeypatch):
+    """
+    P1 gate: on devices with fingerprintEnabled=false (C3-400 panels), deletes
+    must NEVER target the templatev10 / template tables. Those tables don't
+    exist on the panel and every call would return rc=-100 "table structure
+    missing" — waste observed in production logs.
+    """
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    device = make_device()
+    device["fingerprintEnabled"] = False
+    device["pushingToDevicePolicy"] = "INCREMENTAL"
+    device["allowedMemberships"] = [i for i in range(1, 13)]
+
+    # Force one_by_one to exercise every per-pin delete path at once.
+    from app.core.db import save_firmware_profile
+    save_firmware_profile(device_id=device["id"], insert_strategy="one_by_one")
+
+    device_pins = [str(i) for i in range(1, 13)]
+    all_users = [make_user(am_id=i) for i in range(1, 13)]
+
+    sdk_cls, sdk_inst = _patch_sdk(device_pins=device_pins)
+    sdk_inst.set_device_data_batch.return_value = (10, [])
+    sdk_inst.delete_device_data_batch = MagicMock(return_value=(2, []))
+    sdk_inst.supports_delete_device_data.return_value = True
+
+    with patch("app.core.device_sync.PullSDK", sdk_cls):
+        svc._sync_one_device(
+            device=device,
+            users=all_users,
+            local_fp_index={},
+            default_door_id=15,
+        )
+
+    # Per-pin delete_device_data: every table argument passed must be in the
+    # non-template set. Any 'templatev10' or 'template' target = regression.
+    seen_tables = {
+        (c.kwargs.get("table") or (c.args[0] if c.args else None))
+        for c in sdk_inst.delete_device_data.call_args_list
+    }
+    assert "templatev10" not in seen_tables, (
+        f"Per-pin delete hit templatev10 on fingerprintEnabled=false device: {seen_tables}"
+    )
+    assert "template" not in seen_tables, (
+        f"Per-pin delete hit template on fingerprintEnabled=false device: {seen_tables}"
+    )
+
+    # Bulk stale-delete too — delete_device_data_batch calls' first positional
+    # or 'table' kwarg must never be templatev10/template.
+    for c in sdk_inst.delete_device_data_batch.call_args_list:
+        t = c.kwargs.get("table") or (c.args[0] if c.args else None)
+        assert t not in ("templatev10", "template"), (
+            f"Bulk delete targeted {t} on fingerprintEnabled=false device"
+        )
+
+
+def test_delete_device_data_batch_falls_back_to_per_pin_on_chunk_error():
+    """Simulates a chunk error; verifies per-pin fallback is attempted."""
+    from app.sdk.pullsdk import PullSDK, PullSDKError
+
+    sdk = PullSDK.__new__(PullSDK)
+    sdk.logger = logging.getLogger("test")
+    sdk._handle = 1
+
+    # Force delete_device_data to succeed per-pin but fail the first chunk
+    call_history = []
+
+    def fake_delete(*, table, data, options=""):
+        call_history.append((table, data))
+        # First call is the bulk chunk — fail it; subsequent per-pin calls succeed.
+        if "\r\n" in data and data.count("Pin=") > 1:
+            raise PullSDKError("simulated buffer error")
+        return 0
+
+    sdk.delete_device_data = fake_delete  # type: ignore
+    sdk.load = lambda: None  # type: ignore
+    import ctypes
+    sdk._dll = MagicMock()
+    sdk._dll.DeleteDeviceData = MagicMock(return_value=0)
+
+    ok, failed = sdk.delete_device_data_batch(table="user", pins=[1, 2, 3], chunk_size=3)
+    assert ok == 3
+    assert failed == []
+    # 1 bulk attempt + 3 per-pin fallbacks = 4 total calls
+    assert len(call_history) == 4

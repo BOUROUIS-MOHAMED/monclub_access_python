@@ -278,6 +278,87 @@ def _sync_users_has_legacy_fingerprint(conn: sqlite3.Connection) -> bool:
     return "fingerprint" in cols
 
 
+def _relax_firmware_profiles_not_null(conn: sqlite3.Connection) -> None:
+    """
+    P0-bulk migration: the original sync_firmware_profiles schema had NOT NULL on
+    template_table / template_body_index / authorize_body_index. On devices that
+    don't expose those (e.g. C3-400 with fingerprintEnabled=false, where template
+    discovery never runs) we now need to cache insert_strategy / delete_strategy
+    independently, so the template columns must be nullable. SQLite can't relax
+    NOT NULL via ALTER — rebuild the table if the old constraints are still in
+    place. Idempotent: no-op once migrated. Robust against very old schemas
+    missing name_supported / insert_strategy / delete_strategy: the SELECT only
+    pulls columns that actually exist.
+    """
+    try:
+        rows = conn.execute("PRAGMA table_info(sync_firmware_profiles)").fetchall()
+    except Exception:
+        return
+    if not rows:
+        return
+
+    existing: dict = {}
+    for r in rows:
+        try:
+            existing[r["name"]] = bool(r["notnull"])
+        except Exception:
+            # Fallback for non-Row cursors
+            existing[r[1]] = bool(r[3])
+
+    must_migrate = any(
+        existing.get(col) is True
+        for col in ("template_table", "template_body_index", "authorize_body_index")
+    )
+    if not must_migrate:
+        return
+
+    # Build the SELECT list from whatever columns actually exist; default missing
+    # ones to NULL so very old DBs migrate cleanly.
+    def _col_or_null(name: str) -> str:
+        return name if name in existing else "NULL"
+
+    select_list = ", ".join(
+        _col_or_null(c)
+        for c in (
+            "device_id",
+            "template_table",
+            "template_body_index",
+            "authorize_body_index",
+            "name_supported",
+            "insert_strategy",
+            "delete_strategy",
+            "updated_at",
+        )
+    )
+
+    conn.execute("DROP TABLE IF EXISTS sync_firmware_profiles__new")
+    conn.execute(
+        """
+        CREATE TABLE sync_firmware_profiles__new (
+            device_id            INTEGER PRIMARY KEY,
+            template_table       TEXT,
+            template_body_index  INTEGER,
+            authorize_body_index INTEGER,
+            name_supported       INTEGER DEFAULT NULL,
+            insert_strategy      TEXT    DEFAULT NULL,
+            delete_strategy      TEXT    DEFAULT NULL,
+            updated_at           TEXT    NOT NULL DEFAULT ''
+        );
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO sync_firmware_profiles__new
+            (device_id, template_table, template_body_index, authorize_body_index,
+             name_supported, insert_strategy, delete_strategy, updated_at)
+        SELECT {select_list}
+        FROM sync_firmware_profiles
+        """
+    )
+    conn.execute("DROP TABLE sync_firmware_profiles")
+    conn.execute("ALTER TABLE sync_firmware_profiles__new RENAME TO sync_firmware_profiles")
+
+
 def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> None:
     """
     Older DBs had a single 'fingerprint' column. We rebuild into the new shape.
@@ -462,6 +543,17 @@ def init_db() -> None:
         # F-027: Track backend upload status for fingerprints
         _ensure_column(conn, "fingerprints", "backend_confirmed", "backend_confirmed INTEGER NOT NULL DEFAULT 0")
 
+        # P0-bulk: strategy cache on firmware profile (bulk upsert / delete cascade)
+        _ensure_column(conn, "sync_firmware_profiles", "insert_strategy", "insert_strategy TEXT")
+        _ensure_column(conn, "sync_firmware_profiles", "delete_strategy", "delete_strategy TEXT")
+        try:
+            _relax_firmware_profiles_not_null(conn)
+        except Exception as _mig_exc:
+            logging.getLogger(__name__).error(
+                "[DB] schema migration _relax_firmware_profiles_not_null failed: %s",
+                _mig_exc,
+            )
+
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
@@ -472,7 +564,10 @@ def init_db() -> None:
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception as _mig_exc:
-            _logger.error("[DB] schema migration _rebuild_sync_users failed: %s", _mig_exc)
+            logging.getLogger(__name__).error(
+                "[DB] schema migration _rebuild_sync_users failed: %s",
+                _mig_exc,
+            )
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
@@ -1080,10 +1175,12 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS sync_firmware_profiles (
                 device_id            INTEGER PRIMARY KEY,
-                template_table       TEXT    NOT NULL,
-                template_body_index  INTEGER NOT NULL,
-                authorize_body_index INTEGER NOT NULL,
+                template_table       TEXT,
+                template_body_index  INTEGER,
+                authorize_body_index INTEGER,
                 name_supported       INTEGER DEFAULT NULL,
+                insert_strategy      TEXT    DEFAULT NULL,
+                delete_strategy      TEXT    DEFAULT NULL,
                 updated_at           TEXT    NOT NULL
             );
             """
@@ -1276,30 +1373,47 @@ def clear_version_tokens() -> None:
 def save_firmware_profile(
     *,
     device_id: int,
-    template_table: str,
-    template_body_index: int,
-    authorize_body_index: int,
+    template_table: str | None = None,
+    template_body_index: int | None = None,
+    authorize_body_index: int | None = None,
     name_supported: bool | None = None,
+    insert_strategy: str | None = None,
+    delete_strategy: str | None = None,
 ) -> None:
     """
     Upsert the firmware profile for a ZKTeco device.
     Keyed by device_id (stable integer) — not IP (DHCP can change IPs).
+
+    Template/authorize columns preserve existing values when None is passed, so
+    callers can save strategy fields without clobbering earlier discoveries.
     """
     name_val = None if name_supported is None else (1 if name_supported else 0)
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO sync_firmware_profiles
-                (device_id, template_table, template_body_index, authorize_body_index, name_supported, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (device_id, template_table, template_body_index, authorize_body_index,
+                 name_supported, insert_strategy, delete_strategy, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
-                template_table       = excluded.template_table,
-                template_body_index  = excluded.template_body_index,
-                authorize_body_index = excluded.authorize_body_index,
-                name_supported       = excluded.name_supported,
+                template_table       = COALESCE(excluded.template_table,       sync_firmware_profiles.template_table),
+                template_body_index  = COALESCE(excluded.template_body_index,  sync_firmware_profiles.template_body_index),
+                authorize_body_index = COALESCE(excluded.authorize_body_index, sync_firmware_profiles.authorize_body_index),
+                name_supported       = COALESCE(excluded.name_supported,       sync_firmware_profiles.name_supported),
+                insert_strategy      = COALESCE(excluded.insert_strategy,      sync_firmware_profiles.insert_strategy),
+                delete_strategy      = COALESCE(excluded.delete_strategy,      sync_firmware_profiles.delete_strategy),
                 updated_at           = excluded.updated_at
             """,
-            (device_id, template_table, template_body_index, authorize_body_index, name_val, now_iso()),
+            (
+                device_id,
+                template_table,
+                template_body_index,
+                authorize_body_index,
+                name_val,
+                insert_strategy,
+                delete_strategy,
+                now_iso(),
+            ),
         )
         conn.commit()
 
@@ -1307,11 +1421,13 @@ def save_firmware_profile(
 def load_firmware_profile(*, device_id: int) -> dict | None:
     """
     Load the cached firmware profile for a device, or None if not cached.
-    Returns dict with keys: template_table, template_body_index, authorize_body_index.
+    Returns dict with keys: template_table, template_body_index, authorize_body_index,
+    name_supported, insert_strategy, delete_strategy.
     """
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT template_table, template_body_index, authorize_body_index, name_supported "
+            "SELECT template_table, template_body_index, authorize_body_index, "
+            "name_supported, insert_strategy, delete_strategy "
             "FROM sync_firmware_profiles WHERE device_id = ?",
             (device_id,),
         ).fetchone()
@@ -1323,6 +1439,8 @@ def load_firmware_profile(*, device_id: int) -> dict | None:
         "template_body_index": row[1],
         "authorize_body_index": row[2],
         "name_supported": None if ns is None else bool(ns),
+        "insert_strategy": row[4],
+        "delete_strategy": row[5],
     }
 
 

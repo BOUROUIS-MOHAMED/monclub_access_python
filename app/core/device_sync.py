@@ -39,11 +39,30 @@ class FirmwareProfile:
         template_table       — "templatev10" or "template"
         template_body_index  — index into the bodies list in _push_templates (0-4)
         authorize_body_index — index into the patterns list in _push_userauthorize (0-3)
+        name_supported       — None=unknown, True=OK, False=rc=-101 on Name field
+        insert_strategy      — None/"upsert" (try bulk upsert first)
+                             — "delete_then_insert" (pre-delete pins, then bulk insert)
+                             — "one_by_one" (per-pin delete+insert)
+        delete_strategy      — None/"bulk" (bulk DeleteDeviceData) | "one_by_one" (per-pin)
     """
     template_table: str | None = None
     template_body_index: int | None = None
     authorize_body_index: int | None = None
-    name_supported: bool | None = None  # None=unknown, True=OK, False=rc=-101 on Name field
+    name_supported: bool | None = None
+    insert_strategy: str | None = None
+    delete_strategy: str | None = None
+
+
+# Strategy constants (P0)
+_INSERT_UPSERT              = "upsert"
+_INSERT_DELETE_THEN_INSERT  = "delete_then_insert"
+_INSERT_ONE_BY_ONE          = "one_by_one"
+_DELETE_BULK                = "bulk"
+_DELETE_ONE_BY_ONE          = "one_by_one"
+
+# Tables affected by a stale-pin removal. Order matters: dependent rows before the user row,
+# so if a table is unavailable (e.g. fingerprintEnabled=false) the user row still gets removed.
+_STALE_DELETE_TABLES = ("templatev10", "template", "userauthorize", "user")
 
 
 # Fallback if a device has no doorIds configured (will be overridden by backend global settings if present)
@@ -328,11 +347,14 @@ class DeviceSyncEngine:
             from app.core.db import load_firmware_profile
             persisted = load_firmware_profile(device_id=device_id)
             if persisted:
+                tt = persisted.get("template_table")
                 self._firmware_profiles[device_id] = FirmwareProfile(
-                    template_table=persisted["template_table"],
-                    template_body_index=persisted["template_body_index"],
-                    authorize_body_index=persisted["authorize_body_index"],
+                    template_table=tt if tt else None,
+                    template_body_index=persisted.get("template_body_index"),
+                    authorize_body_index=persisted.get("authorize_body_index"),
                     name_supported=persisted.get("name_supported"),
+                    insert_strategy=persisted.get("insert_strategy"),
+                    delete_strategy=persisted.get("delete_strategy"),
                 )
             else:
                 self._firmware_profiles[device_id] = FirmwareProfile()
@@ -343,10 +365,12 @@ class DeviceSyncEngine:
         from app.core.db import save_firmware_profile
         save_firmware_profile(
             device_id=device_id,
-            template_table=profile.template_table or "",
-            template_body_index=profile.template_body_index or 0,
-            authorize_body_index=profile.authorize_body_index or 0,
+            template_table=profile.template_table,
+            template_body_index=profile.template_body_index,
+            authorize_body_index=profile.authorize_body_index,
             name_supported=profile.name_supported,
+            insert_strategy=profile.insert_strategy,
+            delete_strategy=profile.delete_strategy,
         )
 
     def _set_progress(self, **changes: Any) -> None:
@@ -576,13 +600,16 @@ class DeviceSyncEngine:
         door_bitmask: int,
         authorize_timezone_id: int,
         templates: List[Dict[str, Any]],
+        fingerprint_enabled: bool = True,
     ) -> bool:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
         auth_err: str | None = None
 
         try:
-            self._delete_pin_unconditional(sdk=sdk, pin=pin)
+            self._delete_pin_unconditional(
+                sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+            )
 
             card_valid = card if (card and card.isdigit()) else ""
             if card and not card_valid:
@@ -614,7 +641,9 @@ class DeviceSyncEngine:
                     device_id,
                     pin,
                 )
-                self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                self._delete_auth_and_templates_best_effort(
+                    sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+                )
                 try:
                     sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
                 except Exception:
@@ -766,7 +795,9 @@ class DeviceSyncEngine:
         desired_user = desired.get(pin)
 
         if not isinstance(desired_user, dict):
-            deleted = self._delete_pin_unconditional(sdk=sdk, pin=pin)
+            deleted = self._delete_pin_unconditional(
+                sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+            )
             delete_device_sync_state(device_id=did, pin=pin)
             try:
                 delete_device_mirror_pin(device_id=did, pin=pin)
@@ -822,6 +853,7 @@ class DeviceSyncEngine:
             door_bitmask=door_bitmask,
             authorize_timezone_id=authorize_timezone_id,
             templates=templates,
+            fingerprint_enabled=fingerprint_enabled,
         )
 
     def _global_defaults(self) -> Dict[str, Any]:
@@ -1323,7 +1355,117 @@ class DeviceSyncEngine:
 
         return ok, failed_fp_errs
 
-    def _delete_pin_if_exists(self, *, sdk: PullSDK, pin: str, device_pins: Set[str]) -> bool:
+    def _bulk_delete_pins(
+        self,
+        *,
+        sdk: PullSDK,
+        pins: list,
+        device_id: int,
+        fingerprint_enabled: bool = True,
+    ) -> tuple:
+        """
+        Delete a list of pins across all relevant ZKTeco tables in bulk.
+
+        Strategy cascade per device (cached in FirmwareProfile.delete_strategy):
+          - None/"bulk" → try delete_device_data_batch (chunk_size=100) per table.
+            On ANY table failing even after per-pin fallback, downgrade cache to
+            "one_by_one" for NEXT sync but still attempt per-pin cleanup NOW.
+          - "one_by_one" → directly issue per-pin DeleteDeviceData calls.
+
+        Template tables are skipped when fingerprint_enabled=False (C3 panels).
+
+        Returns (ok_count, failed_pins) — same shape as sdk.delete_device_data_batch.
+        failed_pins is the union of pins that couldn't be deleted from ANY table
+        after all fallbacks (used by caller to leave sync-state marker intact).
+        """
+        if not pins:
+            return (0, [])
+
+        if not sdk.supports_delete_device_data():
+            self.logger.warning("[DeviceSync] DeleteDeviceData not available — cannot bulk delete")
+            return (0, list(pins))
+
+        profile = self._get_firmware_profile(device_id)
+        strategy = profile.delete_strategy or _DELETE_BULK
+
+        tables: list = []
+        for t in _STALE_DELETE_TABLES:
+            if t in ("templatev10", "template") and not fingerprint_enabled:
+                continue
+            tables.append(t)
+
+        pins_list = [str(p) for p in pins]
+        all_failed: Set[str] = set()
+
+        if strategy == _DELETE_BULK:
+            bulk_downgrade = False
+            for table in tables:
+                try:
+                    ok, failed = sdk.delete_device_data_batch(
+                        table=table, pins=pins_list, chunk_size=100,
+                    )
+                    if failed:
+                        # per-pin fallback was already tried inside delete_device_data_batch
+                        # and still failed for some pins. Only mark "user" table failures
+                        # as truly failed (auxiliary tables may simply have no matching row).
+                        if table == "user":
+                            all_failed.update(str(p) for p in failed)
+                        # If bulk chunk failed but per-pin worked, ok < len(pins_list) is fine.
+                        # If bulk AND per-pin both failed on this table → downgrade cache.
+                        if ok == 0:
+                            bulk_downgrade = True
+                except Exception as ex:
+                    self.logger.warning(
+                        "[DeviceSync] bulk delete failed for table=%s device_id=%s: %s",
+                        table, device_id, ex,
+                    )
+                    bulk_downgrade = True
+                    # Fall back to per-pin delete right now for this table
+                    for pin in pins_list:
+                        try:
+                            sdk.delete_device_data(table=table, data=f"Pin={pin}", options="")
+                        except Exception:
+                            if table == "user":
+                                all_failed.add(str(pin))
+
+            if bulk_downgrade and profile.delete_strategy != _DELETE_ONE_BY_ONE:
+                profile.delete_strategy = _DELETE_ONE_BY_ONE
+                self._save_firmware_profile(profile, device_id)
+                self.logger.info(
+                    "[DeviceSync] Device id=%s: delete_strategy downgraded to one_by_one",
+                    device_id,
+                )
+            elif profile.delete_strategy is None and not bulk_downgrade:
+                profile.delete_strategy = _DELETE_BULK
+                self._save_firmware_profile(profile, device_id)
+        else:
+            # one_by_one path
+            for pin in pins_list:
+                deleted_user = False
+                for table in tables:
+                    try:
+                        sdk.delete_device_data(table=table, data=f"Pin={pin}", options="")
+                        if table == "user":
+                            deleted_user = True
+                    except Exception as ex:
+                        self.logger.debug(
+                            "[DeviceSync] per-pin delete table=%s Pin=%s ignored: %s",
+                            table, pin, ex,
+                        )
+                if not deleted_user:
+                    all_failed.add(str(pin))
+
+        total_ok = len(pins_list) - len(all_failed)
+        return (total_ok, sorted(all_failed))
+
+    def _delete_pin_if_exists(
+        self,
+        *,
+        sdk: PullSDK,
+        pin: str,
+        device_pins: Set[str],
+        fingerprint_enabled: bool = True,
+    ) -> bool:
         if pin not in device_pins:
             return False
 
@@ -1333,15 +1475,19 @@ class DeviceSyncEngine:
 
         cond = f"Pin={pin}"
 
-        try:
-            sdk.delete_device_data(table="templatev10", data=cond, options="")
-        except Exception as ex:
-            self.logger.debug(f"[DeviceSync] Delete templatev10 Pin={pin} ignored: {ex}")
+        # P1: skip fingerprint tables on devices without biometric storage (e.g. C3-400 panels).
+        # Without this gate every delete would issue 2 calls that always return rc=-100
+        # ("table structure missing"), which accounted for ~40% of the delete waste in logs.
+        if fingerprint_enabled:
+            try:
+                sdk.delete_device_data(table="templatev10", data=cond, options="")
+            except Exception as ex:
+                self.logger.debug(f"[DeviceSync] Delete templatev10 Pin={pin} ignored: {ex}")
 
-        try:
-            sdk.delete_device_data(table="template", data=cond, options="")
-        except Exception as ex:
-            self.logger.debug(f"[DeviceSync] Delete template Pin={pin} ignored: {ex}")
+            try:
+                sdk.delete_device_data(table="template", data=cond, options="")
+            except Exception as ex:
+                self.logger.debug(f"[DeviceSync] Delete template Pin={pin} ignored: {ex}")
 
         try:
             sdk.delete_device_data(table="userauthorize", data=cond, options="")
@@ -1355,7 +1501,13 @@ class DeviceSyncEngine:
             return False
         return True
 
-    def _delete_pin_unconditional(self, *, sdk: PullSDK, pin: str) -> bool:
+    def _delete_pin_unconditional(
+        self,
+        *,
+        sdk: PullSDK,
+        pin: str,
+        fingerprint_enabled: bool = True,
+    ) -> bool:
         """
         Delete a pin from ALL tables WITHOUT consulting device_pins first.
         ZKTeco DeleteDeviceData is idempotent — deleting a non-existent record
@@ -1367,12 +1519,13 @@ class DeviceSyncEngine:
         that we confirm the pin is on the device before issuing SDK calls.
         """
         cond = f"Pin={pin}"
-        for table in ("templatev10", "template"):
-            try:
-                sdk.delete_device_data(table=table, data=cond, options="")
-            except Exception as ex:
-                self.logger.debug(
-                    "[DeviceSync] _delete_pin_unconditional %s Pin=%s (non-fatal): %s", table, pin, ex)
+        if fingerprint_enabled:
+            for table in ("templatev10", "template"):
+                try:
+                    sdk.delete_device_data(table=table, data=cond, options="")
+                except Exception as ex:
+                    self.logger.debug(
+                        "[DeviceSync] _delete_pin_unconditional %s Pin=%s (non-fatal): %s", table, pin, ex)
         try:
             sdk.delete_device_data(table="userauthorize", data=cond, options="")
         except Exception as ex:
@@ -1386,19 +1539,26 @@ class DeviceSyncEngine:
                 "[DeviceSync] _delete_pin_unconditional user Pin=%s FAILED: %s", pin, ex)
             return False
 
-    def _delete_auth_and_templates_best_effort(self, *, sdk: PullSDK, pin: str) -> None:
+    def _delete_auth_and_templates_best_effort(
+        self,
+        *,
+        sdk: PullSDK,
+        pin: str,
+        fingerprint_enabled: bool = True,
+    ) -> None:
         if not sdk.supports_delete_device_data():
             return
 
         cond = f"Pin={pin}"
-        try:
-            sdk.delete_device_data(table="templatev10", data=cond, options="")
-        except Exception:
-            pass
-        try:
-            sdk.delete_device_data(table="template", data=cond, options="")
-        except Exception:
-            pass
+        if fingerprint_enabled:
+            try:
+                sdk.delete_device_data(table="templatev10", data=cond, options="")
+            except Exception:
+                pass
+            try:
+                sdk.delete_device_data(table="template", data=cond, options="")
+            except Exception:
+                pass
         try:
             sdk.delete_device_data(table="userauthorize", data=cond, options="")
         except Exception:
@@ -1727,12 +1887,17 @@ class DeviceSyncEngine:
                     dev_id, len(stale_pins), len(desired_pins),
                 )
                 # Template tables are optional (templatev10 vs template depends on firmware).
-                # Best-effort clear — don't abort nuke if these fail.
-                for tbl in ("templatev10", "template"):
-                    try:
-                        sdk.clear_device_table(table=tbl)
-                    except PullSDKError:
-                        self.logger.debug("[DeviceSync] Device id=%s: clear %s skipped (table may not exist)", dev_id, tbl)
+                # P1 gate: skip entirely on devices without biometric storage (C3 panels)
+                # so we don't waste two guaranteed-failing SDK calls per nuke.
+                if fingerprint_enabled:
+                    for tbl in ("templatev10", "template"):
+                        try:
+                            sdk.clear_device_table(table=tbl)
+                        except PullSDKError:
+                            self.logger.debug(
+                                "[DeviceSync] Device id=%s: clear %s skipped (table may not exist)",
+                                dev_id, tbl,
+                            )
                 # Critical tables: userauthorize then user. Abort nuke if these fail.
                 for tbl in ("userauthorize", "user"):
                     try:
@@ -1756,19 +1921,38 @@ class DeviceSyncEngine:
                                     fingerprint_enabled=fingerprint_enabled,
                                 )
 
-            # ── Delete stale pins (skipped when nuke mode cleared everything) ──
+            # ── Delete stale pins in BULK (skipped when nuke mode cleared everything) ──
+            # P0-bulk: collapse 4 × N per-pin DeleteDeviceData calls into 4 bulk calls
+            # (one per table), chunked at 100 pins/call. Falls back to per-pin inside
+            # the SDK on chunk failure.
             deleted = 0
-            for p in stale_pins:
+            if stale_pins:
                 try:
-                    if self._delete_pin_if_exists(sdk=sdk, pin=p, device_pins=device_pins):
-                        deleted += 1
-                    delete_device_sync_state(device_id=did, pin=p)
+                    ok_del, failed_del = self._bulk_delete_pins(
+                        sdk=sdk,
+                        pins=stale_pins,
+                        device_id=int(did) if did is not None else 0,
+                        fingerprint_enabled=fingerprint_enabled,
+                    )
+                    deleted = ok_del
+                    if failed_del:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s: %d stale pin(s) failed to delete: %s",
+                            dev_id, len(failed_del), failed_del[:10],
+                        )
+                except Exception as ex:
+                    self.logger.warning(f"[DeviceSync] Bulk delete of stale pins failed: {ex}")
+                # Clean local mirror/sync-state for every pin that was attempted,
+                # regardless of SDK outcome — keeps local state in sync with desired set.
+                for p in stale_pins:
+                    try:
+                        delete_device_sync_state(device_id=did, pin=p)
+                    except Exception:
+                        pass
                     try:
                         delete_device_mirror_pin(device_id=did, pin=p)
                     except Exception:
                         pass
-                except Exception as ex:
-                    self.logger.warning(f"[DeviceSync] Delete stale Pin={p} failed: {ex}")
 
             pushed_users = 0
             pushed_templates = 0
@@ -1791,24 +1975,51 @@ class DeviceSyncEngine:
             pins_sorted = sorted(pins_to_sync)
 
             if use_batch and pins_sorted:
-                # P0 fix: Unconditional delete-before-insert for each changed pin.
-                # _delete_pin_unconditional does NOT check device_pins first — it
-                # always issues the SDK delete, which is idempotent on all ZKTeco
-                # firmware (deleting a non-existent pin is a no-op, not an error).
-                # This prevents the silent-failure where firmware returns rc=0 on a
-                # duplicate-pin insert (appearing to succeed but keeping the old CardNo).
+                # P0-bulk: strategy-driven pre-delete.
+                #   upsert (default)        — skip pre-delete entirely, trust SetDeviceData upsert.
+                #                             Failed rows fall through to the per-row force-delete retry
+                #                             below (preserves correctness on edge-case firmware).
+                #   delete_then_insert      — ONE bulk delete across the 4 tables (pinned via cache for
+                #                             devices where silent-upsert-failure was observed).
+                #   one_by_one              — legacy per-pin delete loop (ultimate safety net).
+                profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
+                insert_strategy = profile.insert_strategy or _INSERT_UPSERT
+
                 if not nuke_mode:
-                    predelete_progress_cap = max(0, len(pins_sorted) - 1)
-                    predelete_progress_step = max(1, len(pins_sorted) // 100)
-                    for idx, pin in enumerate(pins_sorted, start=1):
-                        self._delete_pin_unconditional(sdk=sdk, pin=pin)
-                        if (
-                            predelete_progress_cap > 0
-                            and (idx == len(pins_sorted) or idx % predelete_progress_step == 0)
-                        ):
-                            # Batch sync can spend a long time deleting/replacing rows
-                            # before the final save-state phase completes.
-                            self._set_progress(current=min(predelete_progress_cap, idx))
+                    if insert_strategy == _INSERT_UPSERT:
+                        # No-op. SetDeviceData below will upsert in place.
+                        pass
+                    elif insert_strategy == _INSERT_DELETE_THEN_INSERT:
+                        # Bulk pre-delete (reuses stale-delete helper: 4 calls total, not 4×N).
+                        try:
+                            self._bulk_delete_pins(
+                                sdk=sdk,
+                                pins=pins_sorted,
+                                device_id=int(did) if did is not None else 0,
+                                fingerprint_enabled=fingerprint_enabled,
+                            )
+                        except Exception as ex:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s: bulk pre-delete failed, falling through to upsert: %s",
+                                dev_id, ex,
+                            )
+                    else:  # _INSERT_ONE_BY_ONE
+                        predelete_progress_cap = max(0, len(pins_sorted) - 1)
+                        predelete_progress_step = max(1, len(pins_sorted) // 100)
+                        for idx, pin in enumerate(pins_sorted, start=1):
+                            self._delete_pin_unconditional(
+                                sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+                            )
+                            if (
+                                predelete_progress_cap > 0
+                                and (idx == len(pins_sorted) or idx % predelete_progress_step == 0)
+                            ):
+                                self._set_progress(current=min(predelete_progress_cap, idx))
+
+                # Record the strategy choice after first successful run (informational; no-op if already cached).
+                if profile.insert_strategy is None:
+                    profile.insert_strategy = _INSERT_UPSERT
+                    self._save_firmware_profile(profile, int(dev_id) if dev_id is not None else 0)
 
                 # Phase A: Batch push user rows
                 # Use cached name_supported flag to skip Name field on firmware that rejects it.
@@ -1872,7 +2083,10 @@ class DeviceSyncEngine:
                                 if not pin:
                                     continue
                                 try:
-                                    self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                                    self._delete_pin_if_exists(
+                                        sdk=sdk, pin=pin, device_pins=device_pins,
+                                        fingerprint_enabled=fingerprint_enabled,
+                                    )
                                     mp = [f"Pin={pin}"]
                                     if card_valid:
                                         mp.append(f"CardNo={card_valid}")
@@ -1896,7 +2110,10 @@ class DeviceSyncEngine:
                             if not pin:
                                 continue
                             try:
-                                self._delete_pin_if_exists(sdk=sdk, pin=pin, device_pins=device_pins)
+                                self._delete_pin_if_exists(
+                                    sdk=sdk, pin=pin, device_pins=device_pins,
+                                    fingerprint_enabled=fingerprint_enabled,
+                                )
                                 mp = [f"Pin={pin}"]
                                 if card_valid:
                                     mp.append(f"CardNo={card_valid}")
@@ -2067,7 +2284,9 @@ class DeviceSyncEngine:
                         # P0 fix: unconditional delete — never rely on device_pins
                         # being accurate (it may be empty/stale if the read failed or
                         # returned no rows). See _delete_pin_unconditional docstring.
-                        self._delete_pin_unconditional(sdk=sdk, pin=pin)
+                        self._delete_pin_unconditional(
+                            sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+                        )
 
                         card_valid = card if (card and card.isdigit()) else ""
                         if card and not card_valid:
@@ -2096,7 +2315,9 @@ class DeviceSyncEngine:
                             self.logger.warning(
                                 "[DeviceSync] Device id=%s Pin=%s SetDeviceData rc=-101 "
                                 "— force-delete + retry without Name", dev_id, pin)
-                            self._delete_auth_and_templates_best_effort(sdk=sdk, pin=pin)
+                            self._delete_auth_and_templates_best_effort(
+                                sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
+                            )
                             try:
                                 sdk.delete_device_data(table="user", data=f"Pin={pin}", options="")
                             except Exception:
