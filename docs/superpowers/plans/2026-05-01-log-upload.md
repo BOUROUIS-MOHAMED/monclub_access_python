@@ -18,7 +18,7 @@
 |------|--------|---------------|
 | `app/core/log_uploader.py` | **Create** | `LogUploadQueue`: marker files, compress, upload, retry |
 | `app/core/logger.py` | **Modify** | Add `on_log_rotated` callback to `HalfDaySizeRotatingFileHandler`; fix `_switch_if_needed` and `_rotate_active_file` |
-| `app/api/monclub_api.py` | **Modify** | Add `log_presign_url` to `ApiEndpoints`; add `upload_log_file` method |
+| `app/api/monclub_api.py` | **Modify** | Add `log_presign_url` to `ApiEndpoints` only (no upload method — queue handles it directly) |
 | `app/core/config.py` | **Modify** | Add `log_presign_url: str = ""` field to `AppConfig` |
 | `app/ui/app.py` | **Modify** | Wire `LogUploadQueue` after `setup_logging` |
 | `tests/test_log_uploader.py` | **Create** | All unit tests for the uploader |
@@ -129,16 +129,18 @@ class TestOnLogRotatedCallback:
         captured = []
         h = _make_handler(tmp_path, callback=captured.append, max_bytes=10)
 
-        import app.core.logger as logger_mod
-        original_rename = Path.rename
+        now = dt.datetime(2026, 5, 1, 9, 0)
+        # First emit seeds the file with data (size was 0, no rotation yet)
+        _emit(h, "a" * 20, now)
 
-        def failing_rename(self, target):
+        # Now the file has content; next emit will trigger _should_rotate.
+        # Apply the monkeypatch AFTER the first write so the file exists.
+        def failing_rename(self_path, target):
             raise OSError("disk full")
 
         monkeypatch.setattr(Path, "rename", failing_rename)
+        _emit(h, "b" * 5, now)   # triggers size rotation → rename fails → no callback
 
-        now = dt.datetime(2026, 5, 1, 9, 0)
-        _emit(h, "a" * 20, now)
         h.close()
         assert captured == []
 ```
@@ -344,6 +346,10 @@ class LogUploadQueue:
         self._get_upload_url = get_upload_url
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # In-memory: maps marker path string → monotonic time of last attempt
+        # Enforces backoff without writing to disk. Reset on restart (intentional:
+        # conservative policy is to retry immediately after restart).
+        self._last_attempt: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -461,20 +467,19 @@ class LogUploadQueue:
             )
             try:
                 marker.unlink(missing_ok=True)
+                self._last_attempt.pop(str(marker), None)
             except OSError:
                 pass
             return
 
         retry_count = self._read_retry_count(marker)
 
-        # Check if enough time has passed since the last attempt.
-        # (In-memory tracking via retry count + loop sleep is sufficient;
-        #  on restart all .pending files are attempted immediately.)
-        # We only skip if this is NOT the first pass (retry_count > 0) and
-        # the backoff hasn't been satisfied by the loop's own 60s interval.
-        # Since the loop sleeps 60s, any attempt 1 (backoff=120s) requires
-        # 2 loop cycles. We track this by storing attempt count and letting
-        # the loop naturally provide the pacing (not perfect, but safe).
+        # Enforce backoff: skip if not enough time has passed since last attempt.
+        now_mono = time.monotonic()
+        required_wait = self._backoff_for(retry_count)
+        last = self._last_attempt.get(str(marker), 0.0)
+        if retry_count > 0 and (now_mono - last) < required_wait:
+            return  # too soon; wait for the next loop cycle
 
         try:
             compressed = self._compress(log_path)
@@ -482,10 +487,12 @@ class LogUploadQueue:
             logger.warning("LogUploadQueue: cannot read %s: %s", log_path.name, e)
             return
 
+        self._last_attempt[str(marker)] = time.monotonic()
         success = self._upload(log_path.name, compressed)
         if success:
             try:
                 marker.unlink(missing_ok=True)
+                self._last_attempt.pop(str(marker), None)
                 Path(str(log_path) + ".uploaded").touch()
             except OSError:
                 pass
@@ -495,7 +502,7 @@ class LogUploadQueue:
             self._write_retry_count(marker, new_count)
             backoff = self._backoff_for(new_count)
             logger.debug(
-                "LogUploadQueue: upload failed for %s (attempt %d), backoff %ds",
+                "LogUploadQueue: upload failed for %s (attempt %d), next retry in %ds",
                 log_path.name, new_count, backoff,
             )
 
@@ -585,6 +592,9 @@ Append to `tests/test_log_uploader.py`:
 
 ```python
 class TestScanOrphans:
+    # Fixtures use past dates (e.g. 2026-04-30) so _active_log_name()
+    # (which returns today's AM/PM filename) never matches them.
+    # This avoids date-sensitive test failures without mocking the clock.
     def _write_log(self, path: Path, content: str = "log") -> None:
         path.write_text(content)
 
@@ -1026,99 +1036,22 @@ git commit -m "feat: skip .log deletion when .pending sibling exists; clean stal
 
 ---
 
-### Task 7: Add `upload_log_file` to `MonClubApi`
+### Task 7: Add `log_presign_url` to `ApiEndpoints`
+
+The `LogUploadQueue` makes HTTP calls directly via `requests` — it does not use `MonClubApi`. Adding `upload_log_file` to `MonClubApi` would create a dead parallel implementation that drifts. Only the URL field is added here so it appears in the endpoints config alongside other URLs.
 
 **Files:**
 - Modify: `app/api/monclub_api.py`
 
-- [ ] **Step 7.1: Add `log_presign_url` to `ApiEndpoints` and `upload_log_file` method**
+- [ ] **Step 7.1: Add `log_presign_url` to `ApiEndpoints`**
 
-In `app/api/monclub_api.py`:
+In `app/api/monclub_api.py`, inside the `ApiEndpoints` dataclass, add:
 
-**In `ApiEndpoints` dataclass**, add:
 ```python
 log_presign_url: str = ""
 ```
 
-**Add method to `MonClubApi`** (after `sync_access_history`):
-
-```python
-def upload_log_file(
-    self,
-    *,
-    token: str,
-    filename: str,
-    compressed: bytes,
-    timeout: int = 120,
-) -> None:
-    """Two-step upload: get presigned R2 URL, then PUT compressed bytes directly.
-
-    Args:
-        token: JWT Bearer token.
-        filename: Original .log filename WITHOUT .gz suffix
-                  (e.g. "app-2026-05-01-am.log"). The backend appends .gz.
-        compressed: gzip-compressed log bytes.
-        timeout: seconds for the PUT to R2 (can be large for slow connections).
-
-    Raises:
-        MonClubApiError: on any failure (presign HTTP error, R2 PUT error, network).
-    """
-    presign_url = (self.endpoints.log_presign_url or "").strip()
-    if not presign_url:
-        raise MonClubApiError("Log presign URL is empty (check Configuration).")
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    # Step 1: request presigned R2 URL from backend
-    self.logger.info("API uploadLogFile presign -> %s filename=%s", presign_url, filename)
-    try:
-        r = self._session.post(
-            presign_url,
-            json={"filename": filename},
-            headers=headers,
-            timeout=20,
-        )
-    except Exception as e:
-        raise MonClubApiError(f"uploadLogFile presign request failed: {e}") from e
-
-    if r.status_code < 200 or r.status_code >= 300:
-        txt = (r.text or "").strip()
-        raise MonClubApiHttpError(
-            f"uploadLogFile presign failed: HTTP {r.status_code} -> {txt[:400]}",
-            status_code=r.status_code,
-            body=txt,
-        )
-
-    try:
-        data = r.json()
-    except Exception as e:
-        raise MonClubApiError(f"uploadLogFile presign returned non-JSON: {e}") from e
-
-    put_url = str(data.get("url") or "").strip()
-    if not put_url:
-        raise MonClubApiError("uploadLogFile presign response missing 'url'.")
-
-    put_headers: dict = dict(data.get("headers") or {})
-    put_headers.setdefault("Content-Type", "application/gzip")
-
-    # Step 2: PUT directly to R2 (backend not involved)
-    self.logger.info("API uploadLogFile PUT -> R2 (%d bytes compressed)", len(compressed))
-    try:
-        put_r = self._session.put(put_url, data=compressed, headers=put_headers, timeout=timeout)
-    except Exception as e:
-        raise MonClubApiError(f"uploadLogFile R2 PUT failed: {e}") from e
-
-    if put_r.status_code < 200 or put_r.status_code >= 300:
-        raise MonClubApiError(
-            f"uploadLogFile R2 PUT HTTP {put_r.status_code} -> {(put_r.text or '')[:200]}"
-        )
-
-    self.logger.info("API uploadLogFile complete: %s", filename)
-```
+Place it after `optional_content_sync_url` for consistency with other optional URL fields.
 
 - [ ] **Step 7.2: Run the full test suite to check for regressions**
 
@@ -1132,7 +1065,7 @@ Expected: no new failures.
 
 ```bash
 git add app/api/monclub_api.py
-git commit -m "feat: add log_presign_url to ApiEndpoints and upload_log_file to MonClubApi"
+git commit -m "feat: add log_presign_url to ApiEndpoints"
 ```
 
 ---
@@ -1184,7 +1117,17 @@ git commit -m "feat: add log_presign_url to AppConfig"
 **Files:**
 - Modify: `app/ui/app.py`
 
-- [ ] **Step 9.1: Add wiring after `setup_logging` call**
+- [ ] **Step 9.1: Add `LOG_DIR` import at the top of `app/ui/app.py`**
+
+`LOG_DIR` is NOT currently imported in `app/ui/app.py`. Add it to the existing `app.core.utils` import block near the top of the file. Find the line that imports from `app.core.utils` (or add a new import):
+
+```python
+from app.core.utils import LOG_DIR
+```
+
+Note: `load_auth_token` is already imported at line 41 via `from access.store import (..., load_auth_token, ...)` — do NOT add a second import of it.
+
+- [ ] **Step 9.2: Add wiring after `setup_logging` call**
 
 In `app/ui/app.py`, locate the line:
 ```python
@@ -1198,11 +1141,11 @@ self.logger = setup_logging(self.cfg.log_level, ui_queue=self.log_queue)
 try:
     from app.core.log_uploader import LogUploadQueue
     from app.core.logger import HalfDaySizeRotatingFileHandler
-    from app.core.db import load_auth_token
+    # load_auth_token already imported from access.store at top of file
 
     self._log_upload_queue = LogUploadQueue(
         log_dir=LOG_DIR,
-        get_token=load_auth_token,
+        get_token=load_auth_token,          # imported from access.store line 41
         get_upload_url=lambda: (self.cfg.log_presign_url or "").strip(),
     )
     # Wire the callback into the rotating file handler
@@ -1218,22 +1161,12 @@ except Exception as _lue:
     self.logger.warning("Log upload queue failed to start: %s", _lue)
 ```
 
-Also ensure `LOG_DIR` is importable at the top of `app/ui/app.py`. Find the existing imports and add:
-```python
-from app.core.utils import LOG_DIR
-```
-(It may already be imported — check first with `grep -n "LOG_DIR" app/ui/app.py`.)
-
-- [ ] **Step 9.2: Verify app starts without error**
+- [ ] **Step 9.3: Verify imports are resolvable**
 
 ```bash
 python -c "
-import sys
-sys.argv = ['test']
-# Dry-check imports only (no tkinter/UI)
 from app.core.log_uploader import LogUploadQueue
 from app.core.logger import HalfDaySizeRotatingFileHandler
-from app.core.db import load_auth_token
 from app.core.utils import LOG_DIR
 print('All imports OK')
 "
@@ -1241,7 +1174,7 @@ print('All imports OK')
 
 Expected: `All imports OK`
 
-- [ ] **Step 9.3: Run full test suite**
+- [ ] **Step 9.4: Run full test suite**
 
 ```bash
 python -m pytest tests/ -x -q 2>&1 | tail -20
@@ -1249,7 +1182,7 @@ python -m pytest tests/ -x -q 2>&1 | tail -20
 
 Expected: no failures.
 
-- [ ] **Step 9.4: Commit**
+- [ ] **Step 9.5: Commit**
 
 ```bash
 git add app/ui/app.py
