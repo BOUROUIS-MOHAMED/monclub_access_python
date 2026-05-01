@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import os
 import re
 import threading
 import time
@@ -128,7 +129,7 @@ class LogUploadQueue:
         tmp = Path(str(marker) + ".tmp")
         try:
             tmp.write_text(str(count), encoding="utf-8")
-            tmp.rename(marker)
+            os.replace(tmp, marker)
         except OSError as e:
             _handler_logger.warning(
                 "LogUploadQueue: failed to write retry count to %s: %s", marker.name, e
