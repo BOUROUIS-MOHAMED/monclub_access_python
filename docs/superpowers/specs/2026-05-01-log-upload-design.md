@@ -20,7 +20,7 @@ After each log rotation, automatically upload the finalized log file (compressed
 
 ### Client side — `app/core/log_uploader.py`
 
-A `LogUploadQueue` class runs as a daemon background thread. It is completely isolated from the turnstile path.
+A `LogUploadQueue` class runs as a background daemon thread. It is completely isolated from the turnstile path.
 
 **Marker file protocol:**
 
@@ -30,98 +30,220 @@ When a log file is finalized (rotated away), a `.pending` marker file is created
 logs/
   app-2026-05-01-am.log           ← active, never touched by uploader
   app-2026-04-30-pm.log           ← rotated, ready to read
-  app-2026-04-30-pm.log.pending   ← signals "upload this file"
+  app-2026-04-30-pm.log.pending   ← signals "upload this file" (content = retry count as ASCII int)
   app-2026-04-29-am.log.uploaded  ← upload confirmed
-  app-2026-04-28-pm.log.failed    ← gave up after max retries
+  app-2026-04-28-pm.log.failed    ← gave up (see retry policy)
 ```
 
 **Marker file states:**
 
 | Marker | Meaning |
 |--------|---------|
-| `.pending` | Rotated, waiting for upload |
-| `.uploaded` | Successfully uploaded |
-| `.failed` | Max retries exceeded, skipped |
+| `.pending` | Rotated, waiting for upload. File content = retry count as plain ASCII integer (e.g. `"0"`, `"3"`). Parse failure treated as `0`. |
+| `.uploaded` | Successfully uploaded. |
+| `.failed` | Permanently skipped (see retry policy). |
 
-No marker = file is either the active log or an orphan from a crash.
+No marker = file is either the active log or an orphan from a crash (handled by startup scan).
 
 ---
 
 ### Hook points in `HalfDaySizeRotatingFileHandler`
 
-Add an `on_log_rotated: Callable[[Path], None] | None` parameter to `__init__`. The handler calls it with the finalized file path in two places:
+Add `on_log_rotated: Callable[[Path], None] | None = None` to `__init__`. The handler calls it with the finalized file path in two places.
 
-1. **`_switch_if_needed`** — when the active file path changes (AM→PM, day boundary). Called with the old path before switching.
-2. **`_rotate_active_file`** — when a file is renamed due to size overflow. Called with the renamed destination path.
+**Invariant:** the callback is ONLY called after the file handle is closed. Both `_set_active_path` and `_rotate_active_file` already call `self.stream.close()` before any rename/path change. The callback must not be called if the underlying filesystem operation (rename) fails.
 
-The callback does one thing: create `{path}.pending`. This is a single atomic filesystem operation — no locks, no DB writes, no latency on the logging thread.
+**1. `_switch_if_needed` (time rotation: AM→PM, day boundary):**
+
+```python
+def _switch_if_needed(self, now: dt.datetime) -> None:
+    path = self._path_for(now)
+    if Path(self.baseFilename) != path:
+        old_path = Path(self.baseFilename)   # capture BEFORE overwriting
+        self._set_active_path(path)          # closes stream, updates self.baseFilename
+        if self.on_log_rotated and old_path.exists():
+            self.on_log_rotated(old_path)
+```
+
+`old_path` must be captured before `_set_active_path` is called, because that method overwrites `self.baseFilename`.
+
+**2. `_rotate_active_file` (size overflow):**
+
+```python
+def _rotate_active_file(self) -> None:
+    source = Path(self.baseFilename)
+    if self.stream:
+        self.stream.flush()
+        self.stream.close()
+        self.stream = None
+    try:
+        if not source.exists() or source.stat().st_size <= 0:
+            return
+        dest = self._next_suffix_path(source)
+        source.rename(dest)                  # rename must succeed first
+        if self.on_log_rotated:
+            self.on_log_rotated(dest)        # called with the RENAMED destination
+    except OSError:
+        return                               # do not call callback on failure
+```
+
+---
+
+### `register_pending(path: Path) -> None`
+
+This is the `on_log_rotated` callback. It creates `{path}.pending` with content `"0"` (initial retry count). Write is atomic: write to `{path}.pending.tmp`, then rename to `{path}.pending`. This prevents a corrupt marker if the process crashes mid-write.
 
 ---
 
 ### `LogUploadQueue` behaviour
 
-**Startup scan (crash recovery):**
+**Constructor signature:**
+```python
+class LogUploadQueue:
+    def __init__(
+        self,
+        log_dir: Path,
+        get_token: Callable[[], str | None],       # lazy: reads token at upload time
+        get_upload_url: Callable[[], str | None],  # lazy: reads config at upload time
+    ) -> None
+```
 
-On `start()`, scans `LOG_DIR` for any `.log` file that:
-- Matches `_LOG_FILE_RE` pattern
-- Is NOT the currently active log file
-- Has no `.uploaded` or `.failed` sibling
+**Bootstrap wiring (in `app/ui/app.py`, `MonClubApp.__init__`, after `setup_logging` at line 321):**
 
-Creates a `.pending` marker for each. This recovers files orphaned by a hard crash.
+```python
+from app.core.db import load_auth_token
+from app.core.log_uploader import LogUploadQueue
 
-**Upload loop (runs every 60 seconds):**
+upload_queue = LogUploadQueue(
+    log_dir=LOG_DIR,
+    get_token=load_auth_token,                    # reads from local SQLite, no import cycle
+    get_upload_url=lambda: self.cfg.log_upload_url,
+)
+# Wire the callback into the file handler
+for h in self.logger.handlers:
+    if isinstance(h, HalfDaySizeRotatingFileHandler):
+        h.on_log_rotated = upload_queue.register_pending
+        break
 
-1. Glob all `*.pending` markers in `LOG_DIR`
-2. For each: read the corresponding `.log` file, gzip-compress in memory, POST to backend
-3. On success: delete `.pending`, create `.uploaded`
-4. On failure: increment retry count (stored as content of the `.pending` file), backoff
-5. After 5 failures: delete `.pending`, create `.failed`, log a warning
+upload_queue.scan_orphans()   # crash recovery: must run before start()
+upload_queue.start()          # launches daemon thread
+```
 
-**Retry backoff:** 1 min → 2 min → 4 min → 8 min → 16 min (tracked via loop sleep, not wall clock)
+`load_auth_token` is already importable from `app.core.db` (used in `monclub_api.py`). `self.cfg.log_upload_url` comes from the config file — added as an optional field, defaults to `""`. When the upload URL is empty or the token is None, the upload attempt is skipped silently and retried next cycle.
 
-**Internet-down behaviour:** upload attempt silently fails, `.pending` stays, retried next cycle. No crash, no exception propagation.
+**Startup scan — `scan_orphans()`:**
 
-**Thread safety:** The uploader only reads files that have been rotated away (the logger no longer writes them). Marker file creation is a single `Path.touch()` call — atomic at the OS level. No shared mutable state between threads.
+Scans `log_dir` for files matching `_LOG_FILE_RE` that are NOT the currently active log file and have no `.uploaded` or `.failed` sibling. For each: calls `register_pending(path)` if `.pending` does not already exist (skips if already registered to avoid resetting retry count).
+
+To identify the currently active file: instantiate a throwaway `dt.datetime.now()` path using the same `_path_for` logic, compare by name. Do not access the handler object from the uploader (avoids coupling).
+
+**Upload loop — runs every 60 seconds:**
+
+1. Glob all `*.pending` markers in `log_dir`
+2. For each marker:
+   a. Read content → parse as int, default `0` on parse failure
+   b. Check if corresponding `.log` file exists. If not: delete the `.pending` marker, log a WARNING (file was deleted before upload, nothing to upload), continue to next
+   c. Read `.log` file bytes
+   d. Gzip-compress in memory (`gzip.compress(data, compresslevel=6)`)
+   e. Call `_upload(log_path, compressed_bytes)` (two-step: presign → PUT)
+   f. On success: delete `.pending`, create `.uploaded` (empty file)
+   g. On failure: increment retry count, write atomically to `.pending`, apply backoff
+
+**Retry policy (no hard cap):**
+
+Retry interval grows with attempt count, capped at 60 minutes:
+
+| Attempt | Wait before next try |
+|---------|---------------------|
+| 0 → 1   | next 60s loop cycle |
+| 1 → 2   | 2 min               |
+| 2 → 3   | 4 min               |
+| 3 → 4   | 8 min               |
+| 4 → 5   | 16 min              |
+| 5+      | 60 min (max)        |
+
+Retry count is stored in the `.pending` file content (plain ASCII integer). At each loop tick, the uploader reads the count and only attempts upload if enough time has passed since the previous attempt. The last-attempt timestamp is tracked in-memory (not on disk) — on process restart, all `.pending` files are retried immediately regardless of count (conservative: prefer re-attempt over permanent skip).
+
+There is NO maximum retry count. Files are retried indefinitely until upload succeeds or the `.log` file is deleted by the 7-day retention cleanup. After the `.log` is gone, the `.pending` is removed with a warning (covered above).
 
 ---
 
 ### Retention conflict fix
 
-`_cleanup_old_logs` currently deletes `.log` files older than 7 days. It must be extended to:
-- Skip any `.log` file that has a `.pending` sibling (upload not yet done)
-- Still delete `.uploaded` and `.failed` marker files older than 30 days (housekeeping)
+`_cleanup_old_logs` must be extended with one guard: before calling `path.unlink()` on a `.log` file, check if `Path(str(path) + ".pending")` exists. If it does, skip deletion for this cycle. This prevents deleting a log before its upload succeeds.
+
+Additionally, clean up stale `.uploaded` and `.failed` marker files older than 30 days (housekeeping — they have no `.log` counterpart):
+
+```python
+for path in self.log_dir.iterdir():
+    if path.suffix in (".uploaded", ".failed") and ...:
+        if log_date < cutoff_30d:
+            path.unlink(missing_ok=True)
+```
 
 ---
 
-### API changes — `app/api/monclub_api.py`
+### Upload flow — two requests (presign + PUT)
 
-**`ApiEndpoints`:** add `log_upload_url: str = ""`
+`ObjectStorageService` only provides presigned URL generation — it has no `putObject(bytes)` method. Therefore the upload uses two HTTP calls:
 
-**`MonClubApi`:** add method:
+**Step 1: Request presigned URL from backend**
+
+```
+POST /api/v1/gym/access/logs/presign
+Authorization: Bearer {token}
+Content-Type: application/json
+
+{"filename": "app-2026-04-30-pm.log"}
+```
+
+Response:
+```json
+{
+  "url": "https://r2.example.com/...",
+  "method": "PUT",
+  "headers": {"Content-Type": "application/gzip"},
+  "expiresAt": "2026-05-01T12:30:00"
+}
+```
+
+`filename` field: original `.log` filename, no `.gz` suffix (e.g. `app-2026-04-30-pm.log`). The backend appends `.gz` when constructing the R2 key.
+
+**Step 2: Upload directly to R2**
+
+```
+PUT {url}
+Content-Type: application/gzip
+{headers from step 1}
+
+[gzip-compressed log bytes]
+```
+
+This is a direct client-to-R2 PUT. The backend is not involved.
+
+**`MonClubApi.upload_log_file` method:**
+
 ```python
 def upload_log_file(
     self,
     *,
     token: str,
-    filename: str,
-    compressed_data: bytes,
+    filename: str,       # original .log name, no .gz suffix
+    compressed: bytes,   # gzip-compressed bytes
     timeout: int = 120,
-) -> None
+) -> None:
+    """Two-step: get presigned URL, then PUT directly to R2."""
 ```
-Posts as `multipart/form-data` with fields `file` (gzip bytes) and `filename`. Raises `MonClubApiError` on failure.
+
+Raises `MonClubApiError` on any failure. The uploader catches this and increments retry count.
 
 ---
 
-### Bootstrap wiring
+### New `ApiEndpoints` field
 
-In `access/bootstrap.py` (or wherever `setup_logging` is called):
-
-1. Create `LogUploadQueue(log_dir=LOG_DIR, ...)`
-2. Pass `on_log_rotated=queue.register_pending` to `setup_logging` / the handler
-3. Call `queue.scan_orphans()` 
-4. Call `queue.start()` (starts daemon thread)
-
-The queue needs access to the auth token and upload URL. It reads them lazily on each upload attempt (so it still works if the token is refreshed mid-session). Injected via callables: `get_token: Callable[[], str | None]` and `get_upload_url: Callable[[], str | None]`.
+```python
+log_presign_url: str = ""   # e.g. https://api.example.com/api/v1/gym/access/logs/presign
+```
 
 ---
 
@@ -129,38 +251,33 @@ The queue needs access to the auth token and upload URL. It reads them lazily on
 
 ### New controller: `AccessLogUploadController.java`
 
-**Route:** `POST /api/v1/gym/access/logs/upload`
+**Route:** `POST /api/v1/gym/access/logs/presign`
 
 **Security:** `/api/v1/gym/**` is already restricted to `Role.GYM + Role.ADMIN` in `SecurityConfiguration`. No changes needed.
 
-**Request:** `multipart/form-data`
-- `file` — gzip-compressed log file (max 60 MB)
-- `filename` — original log filename (e.g. `app-2026-05-01-am.log`)
+**Request body:**
+```json
+{"filename": "app-2026-05-01-am.log"}
+```
 
 **Validation:**
-- `filename` must match regex `^app-\d{4}-\d{2}-\d{2}-(am|pm)(\.\d+)?\.log$` — prevents path traversal
-- File must not be empty
+- `filename` must match `^app-\d{4}-\d{2}-\d{2}-(am|pm)(\.\d+)?\.log$` — prevents path traversal and garbage filenames
+- Empty filename → `400`
 
 **Processing:**
-1. Extract `gymId` from JWT (same pattern used everywhere in the codebase)
-2. Extract year from filename for storage partitioning
-3. Store via `ObjectStorageService.putObject(bucket, key, bytes)` at key: `access-logs/{gymId}/{year}/{filename}.gz`
-4. Return `200 OK` with `{"stored": "access-logs/{gymId}/{year}/{filename}.gz"}`
+1. Extract `gymId` from JWT (same pattern used everywhere via `JwtService`)
+2. Extract year from filename for R2 key partitioning
+3. Build R2 object key: `access-logs/{gymId}/{year}/{filename}.gz`
+4. Call `objectStorageService.createPresignedPut(bucket, key, "application/gzip", FileVisibility.PRIVATE, 30)` (30-minute TTL)
+5. Return `200 OK` with `{url, method, headers, expiresAt}`
 
 **Error responses:**
-- `400` — invalid filename or empty file
-- `413` — file too large (Spring multipart limit)
-- `500` — storage failure (client will retry)
+- `400` — invalid or missing filename
+- `500` — presign generation failure
 
-### Spring config
+### No Spring multipart config changes needed
 
-```yaml
-spring:
-  servlet:
-    multipart:
-      max-file-size: 60MB
-      max-request-size: 65MB
-```
+The presigned approach means the backend never receives the file. No `max-file-size` tuning required.
 
 ---
 
@@ -168,24 +285,29 @@ spring:
 
 ```
 [Logger writes record]
-       │
-       ▼
+         │
+         ▼
 [HalfDaySizeRotatingFileHandler]
-       │ time/size rotation triggers
-       ▼
-[on_log_rotated(path)] ─── creates {path}.pending  (atomic, <1ms)
-       │
-       │   (completely separate thread, 60s loop)
-       ▼
+         │ time/size rotation triggers
+         │ (stream closed, rename done first)
+         ▼
+[on_log_rotated(old_or_dest_path)]
+         │ atomic write: .pending.tmp → .pending (content = "0")
+         │ (<1ms, no locks, no DB)
+         │
+         │  (completely separate daemon thread, 60s loop)
+         ▼
 [LogUploadQueue._upload_loop]
-  reads {path}.log
-  gzip-compresses in memory
-  POST /api/v1/gym/access/logs/upload
-       │
-       ├── 200 OK → delete .pending, create .uploaded
-       └── error  → increment retry counter in .pending
-                    retry later with backoff
-                    → after 5 failures: .failed
+  1. read retry count from .pending
+  2. check .log file exists (if not: delete .pending, warn, skip)
+  3. read .log bytes, gzip-compress in memory
+  4. POST /api/v1/gym/access/logs/presign → get R2 presigned URL
+  5. PUT compressed bytes directly to R2
+         │
+         ├── 200 OK → delete .pending, create .uploaded (empty)
+         └── error  → increment retry count, atomic write to .pending
+                       retry after backoff (max 60 min interval)
+                       indefinite retries until .log file is deleted
 ```
 
 ---
@@ -193,7 +315,7 @@ spring:
 ## What this does NOT touch
 
 - Turnstile read path (`access_verification.py`, `device_worker.py`, `card_scanner.py`)
-- Main application database (`app.db`)
+- Main application database (`app.db`) — only `load_auth_token` reads from it, same as sync loop
 - Any UI thread
 - Any existing sync logic
 
@@ -202,16 +324,18 @@ spring:
 ## Files to create / modify
 
 ### monclub_access_python
+
 | File | Change |
 |------|--------|
-| `app/core/log_uploader.py` | **New** — `LogUploadQueue` |
-| `app/core/logger.py` | Add `on_log_rotated` callback to handler |
-| `app/api/monclub_api.py` | Add `log_upload_url` to `ApiEndpoints`, add `upload_log_file` method |
-| `app/core/utils.py` | No change needed |
-| `access/bootstrap.py` | Wire uploader into startup |
+| `app/core/log_uploader.py` | **New** — `LogUploadQueue` class |
+| `app/core/logger.py` | Add `on_log_rotated` callback; fix `_switch_if_needed` and `_rotate_active_file` to capture old path and call callback correctly |
+| `app/api/monclub_api.py` | Add `log_presign_url` to `ApiEndpoints`; add `upload_log_file` method |
+| `app/core/config.py` | Add `log_upload_url: str = ""` (or `log_presign_url`) to config dataclass |
+| `app/ui/app.py` | Wire `LogUploadQueue` after `setup_logging` call |
 
 ### monclub_backend
+
 | File | Change |
 |------|--------|
-| `Controllers/AccessLogUploadController.java` | **New** |
-| `application.yml` (or `application.properties`) | Add multipart size limits |
+| `Controllers/AccessLogUploadController.java` | **New** — presign endpoint |
+| No `application.yml` change | Presigned approach; no multipart limit needed |
