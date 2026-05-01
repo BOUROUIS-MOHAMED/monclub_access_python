@@ -171,6 +171,11 @@ class AppConfig:
     log_level: str = "DEBUG"
 
     # -------------------------
+    # Log upload
+    # -------------------------
+    log_presign_url: str = ""
+
+    # -------------------------
     # Sync schedule (seconds)
     # -------------------------
     sync_interval_sec: int = 60
