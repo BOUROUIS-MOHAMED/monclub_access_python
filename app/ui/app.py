@@ -84,6 +84,7 @@ from app.core.sync_scope import (
     device_membership_scope_changed,
     strip_member_version_tokens,
 )
+from app.core.utils import LOG_DIR
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
@@ -319,6 +320,28 @@ class MainApp:
             raise
 
         self.logger = setup_logging(self.cfg.log_level, ui_queue=self.log_queue)
+        # --- Log upload queue (marker-file based, daemon thread) ---
+        try:
+            from app.core.log_uploader import LogUploadQueue
+            from app.core.logger import HalfDaySizeRotatingFileHandler
+            # load_auth_token already imported from access.store at top of file
+
+            self._log_upload_queue = LogUploadQueue(
+                log_dir=LOG_DIR,
+                get_token=load_auth_token,
+                get_upload_url=lambda: (self.cfg.log_presign_url or "").strip(),
+            )
+            # Wire the callback into the rotating file handler
+            for _h in self.logger.handlers:
+                if isinstance(_h, HalfDaySizeRotatingFileHandler):
+                    _h.on_log_rotated = self._log_upload_queue.register_pending
+                    break
+            self._log_upload_queue.scan_orphans()
+            self._log_upload_queue.start()
+            self.logger.info("Log upload queue started (presign_url=%s)", bool(self.cfg.log_presign_url))
+        except Exception as _lue:
+            # Never crash startup due to upload system
+            self.logger.warning("Log upload queue failed to start: %s", _lue)
         self.logger.info("App started.")
         self.logger.info(f"Platform: {platform_summary()}")
         self.logger.info("Data root is managed by app.core.utils (ProgramData/LocalAppData).")
@@ -1472,6 +1495,18 @@ class MainApp:
                 self.logger.warning("[SyncHistory] Failed to create sync run row: %s", ex)
             try:
                 api = self._api()
+
+                # --- Proactive token refresh (before sync so we always use a fresh JWT) ---
+                _effective_token = auth.token
+                try:
+                    if api.do_proactive_refresh(email=auth.email):
+                        _reloaded = load_auth_token()
+                        if _reloaded and _reloaded.token:
+                            _effective_token = _reloaded.token
+                            self.logger.info("[SYNC] Access token silently refreshed before sync.")
+                except Exception as _prf_exc:
+                    self.logger.debug("[SYNC] Proactive refresh skipped/failed: %s", _prf_exc)
+
                 previous_cache = load_sync_cache()
                 previous_devices = list(getattr(previous_cache, "devices", []) or []) if previous_cache else []
                 stored_version_tokens = load_version_tokens() or None
@@ -1497,7 +1532,7 @@ class MainApp:
                     version_tokens,
                 )
 
-                data = api.get_sync_data(token=auth.token, version_tokens=version_tokens, timeout=sync_timeout)
+                data = api.get_sync_data(token=_effective_token, version_tokens=version_tokens, timeout=sync_timeout)
 
                 # --- DEBUG: log key response fields ---
                 _users_raw = data.get("users")
@@ -1556,7 +1591,7 @@ class MainApp:
                     try:
                         followup_tokens = strip_member_version_tokens(new_tokens)
                         data = api.get_sync_data(
-                            token=auth.token,
+                            token=_effective_token,
                             version_tokens=followup_tokens or None,
                             timeout=sync_timeout,
                         )
