@@ -96,3 +96,58 @@ class TestOnLogRotatedCallback:
 
         h.close()
         assert captured == []
+
+
+class TestCleanupSkipsPending:
+    def test_does_not_delete_log_with_pending_sibling(self, tmp_path):
+        """_cleanup_old_logs must not delete a .log that has a .pending marker."""
+        import datetime as dt
+        from app.core.logger import HalfDaySizeRotatingFileHandler
+
+        h = HalfDaySizeRotatingFileHandler(tmp_path, retention_days=1)
+
+        # Create an old log file (will be within cleanup window)
+        old_log = tmp_path / "app-2020-01-01-am.log"
+        old_log.write_text("old log")
+        pending = Path(str(old_log) + ".pending")
+        pending.write_text("2")
+
+        # Run cleanup for today's date (cutoff = yesterday → 2020-01-01 is old)
+        today = dt.date.today()
+        h._cleanup_old_logs(today)
+
+        assert old_log.exists(), "log with .pending sibling must NOT be deleted"
+        assert pending.exists()
+        h.close()
+
+    def test_deletes_log_without_pending_sibling(self, tmp_path):
+        """_cleanup_old_logs DOES delete old .log files with no .pending."""
+        import datetime as dt
+        from app.core.logger import HalfDaySizeRotatingFileHandler
+
+        h = HalfDaySizeRotatingFileHandler(tmp_path, retention_days=1)
+
+        old_log = tmp_path / "app-2020-01-01-am.log"
+        old_log.write_text("old log")
+
+        today = dt.date.today()
+        h._cleanup_old_logs(today)
+
+        assert not old_log.exists(), "old log without .pending should be deleted"
+        h.close()
+
+    def test_cleans_up_stale_uploaded_markers(self, tmp_path):
+        """_cleanup_old_logs removes .uploaded markers older than 30 days."""
+        import datetime as dt
+        from app.core.logger import HalfDaySizeRotatingFileHandler
+
+        h = HalfDaySizeRotatingFileHandler(tmp_path, retention_days=1)
+
+        old_uploaded = tmp_path / "app-2020-01-01-am.log.uploaded"
+        old_uploaded.touch()
+
+        today = dt.date.today()
+        h._cleanup_old_logs(today)
+
+        assert not old_uploaded.exists()
+        h.close()

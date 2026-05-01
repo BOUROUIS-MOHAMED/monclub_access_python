@@ -15,6 +15,7 @@ _handler_logger = logging.getLogger(__name__)
 LOG_MAX_BYTES = 50 * 1024 * 1024
 LOG_RETENTION_DAYS = 7
 _LOG_FILE_RE = re.compile(r"^app-(\d{4}-\d{2}-\d{2})-(am|pm)(?:\.(\d+))?\.log$")
+_STALE_MARKER_CUTOFF_DAYS = 30
 
 
 class TkQueueHandler(logging.Handler):
@@ -142,9 +143,26 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
 
     def _cleanup_old_logs(self, today: dt.date) -> None:
         cutoff = today - dt.timedelta(days=self.retention_days - 1)
+        stale_cutoff = today - dt.timedelta(days=_STALE_MARKER_CUTOFF_DAYS)
+
         for path in self.log_dir.iterdir():
             if not path.is_file():
                 continue
+
+            # Clean up stale .uploaded and .failed markers (30-day retention)
+            if path.suffix in (".uploaded", ".failed"):
+                stem = path.stem  # e.g. "app-2020-01-01-am.log"
+                m = _LOG_FILE_RE.match(stem)
+                if m:
+                    try:
+                        log_date = dt.date.fromisoformat(m.group(1))
+                        if log_date < stale_cutoff:
+                            path.unlink(missing_ok=True)
+                    except (ValueError, OSError):
+                        pass
+                continue
+
+            # Only process .log files matched by the pattern
             match = _LOG_FILE_RE.match(path.name)
             if not match:
                 continue
@@ -154,6 +172,11 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
                 continue
             if log_date >= cutoff:
                 continue
+
+            # Skip if a .pending sibling exists (upload not yet done)
+            if Path(str(path) + ".pending").exists():
+                continue
+
             try:
                 path.unlink()
             except OSError:
