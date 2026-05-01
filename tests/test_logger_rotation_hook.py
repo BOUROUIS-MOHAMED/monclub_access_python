@@ -4,9 +4,6 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock
-
-import pytest
 
 from app.core.logger import HalfDaySizeRotatingFileHandler
 
@@ -51,11 +48,11 @@ class TestOnLogRotatedCallback:
         h = _make_handler(tmp_path, callback=captured.append, max_bytes=10)
 
         now = dt.datetime(2026, 5, 1, 9, 0)
-        _emit(h, "a" * 20, now)  # forces size rotation
-        _emit(h, "b", now)
+        _emit(h, "a" * 20, now)  # seeds the file; size was 0 so no rotation yet
+        _emit(h, "b", now)       # triggers size rotation (now current_size > max_bytes)
 
         h.close()
-        assert len(captured) >= 1
+        assert len(captured) == 1  # exactly one size rotation
         # renamed file has .1 suffix
         assert ".1" in captured[0].name
 

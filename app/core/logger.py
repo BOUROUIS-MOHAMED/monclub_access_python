@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 from app.core.utils import LOG_DIR, ensure_dirs
 
+_handler_logger = logging.getLogger(__name__)
 
 LOG_MAX_BYTES = 50 * 1024 * 1024
 LOG_RETENTION_DAYS = 7
@@ -51,6 +52,8 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         self.now_func = now_func or dt.datetime.now
         self._last_cleanup_date: dt.date | None = None
         self.on_log_rotated = on_log_rotated
+        # NOTE: callback is invoked synchronously under the handler lock — must return quickly.
+        # Design: register_pending() does a single atomic file rename (<1 ms); this is safe.
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         now = self.now_func()
@@ -79,8 +82,9 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
             if self.on_log_rotated and old_path.exists():
                 try:
                     self.on_log_rotated(old_path)
-                except Exception:
-                    pass
+                except Exception as _cb_exc:
+                    # Callback errors must not disrupt the logging system.
+                    _handler_logger.debug("on_log_rotated callback raised: %s", _cb_exc)
 
     def _formatted_record_size(self, record: logging.LogRecord) -> int:
         text = self.format(record) + self.terminator
@@ -124,8 +128,9 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
             if self.on_log_rotated:
                 try:
                     self.on_log_rotated(dest)       # called with RENAMED destination
-                except Exception:
-                    pass
+                except Exception as _cb_exc:
+                    # Callback errors must not disrupt the logging system.
+                    _handler_logger.debug("on_log_rotated callback raised: %s", _cb_exc)
         except OSError:
             return                                  # do NOT call callback on failure
 
