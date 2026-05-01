@@ -30,6 +30,7 @@ class ApiEndpoints:
     tv_ad_task_confirm_ready_url: str = ""
     tv_ad_task_submit_proof_url: str = ""
     optional_content_sync_url: str = ""
+    log_presign_url: str = ""
 
 class MonClubApiError(RuntimeError):
     pass
@@ -105,7 +106,21 @@ class MonClubApi:
         self.logger = logger
         self._session = requests.Session()
 
+    def _derive_api_base(self) -> str:
+        """Extract scheme://host/api/v1 prefix from the login URL."""
+        from urllib.parse import urlparse
+        parsed = urlparse(self.endpoints.login_url)
+        parts = [p for p in parsed.path.split("/") if p]
+        prefix = ("/" + "/".join(parts[:2])) if len(parts) >= 2 else ""
+        return f"{parsed.scheme}://{parsed.netloc}{prefix}"
+
     def login(self, *, email: str, password: str, timeout: int = 15) -> str:
+        """Authenticate and return the access token.
+
+        Also persists the refresh token and proactive-refresh deadline to the
+        local database so `do_proactive_refresh()` can rotate the token before
+        the 7-day JWT expires.
+        """
         url = (self.endpoints.login_url or "").strip()
         if not url:
             raise MonClubApiError("Login URL is empty (check Configuration).")
@@ -128,11 +143,106 @@ class MonClubApi:
                 body=txt,
             )
 
-        token = (r.text or "").strip()
-        if not token:
+        # Backend returns {accessToken, refreshToken, expiresAt} or a plain token string.
+        access_token = ""
+        refresh_token = ""
+        expires_at = ""
+        try:
+            data = r.json()
+            if isinstance(data, dict):
+                access_token = str(data.get("accessToken") or data.get("token") or "").strip()
+                refresh_token = str(data.get("refreshToken") or "").strip()
+                expires_at = str(data.get("expiresAt") or "").strip()
+            elif isinstance(data, str):
+                access_token = data.strip()
+        except Exception:
+            access_token = (r.text or "").strip()
+
+        if not access_token:
             raise MonClubApiError("Login response is empty (no token returned).")
 
-        return token
+        # Persist refresh session data so the sync loop can rotate proactively.
+        if refresh_token:
+            try:
+                from shared.auth_state import next_refresh_at_from_expires
+                from app.core.db import save_refresh_session_data
+                next_refresh_at = next_refresh_at_from_expires(expires_at) if expires_at else ""
+                save_refresh_session_data(refresh_token=refresh_token, next_refresh_at=next_refresh_at)
+            except Exception as _exc:
+                self.logger.warning("Failed to persist refresh session data after login: %s", _exc)
+
+        return access_token
+
+    def do_proactive_refresh(self, *, email: str, timeout: int = 15) -> bool:
+        """Silently rotate the refresh token if the proactive-refresh deadline has passed.
+
+        Reads the stored refresh token from the local database, calls
+        ``/public/account/refresh``, and saves the new tokens on success.
+
+        Returns True if the access token was refreshed (callers should reload
+        the auth state from the database), False if no refresh was needed or
+        if the refresh failed non-fatally.
+        """
+        try:
+            from app.core.db import load_refresh_token, load_next_refresh_at, save_auth_token, save_refresh_session_data
+            from shared.auth_state import is_refresh_due, next_refresh_at_from_expires
+
+            next_refresh_at = load_next_refresh_at()
+            if not is_refresh_due(next_refresh_at or ""):
+                return False
+
+            stored_refresh = load_refresh_token()
+            if not stored_refresh:
+                return False
+
+            base = self._derive_api_base()
+            refresh_url = f"{base}/public/account/refresh"
+            self.logger.info("Proactive token refresh -> %s", refresh_url)
+            try:
+                r = self._session.post(
+                    refresh_url,
+                    json={"refreshToken": stored_refresh},
+                    timeout=timeout,
+                )
+            except Exception as e:
+                self.logger.warning("Proactive refresh network error: %s", e)
+                return False
+
+            if r.status_code < 200 or r.status_code >= 300:
+                self.logger.warning("Proactive refresh failed: HTTP %s", r.status_code)
+                return False
+
+            try:
+                data = r.json()
+            except Exception:
+                self.logger.warning("Proactive refresh returned non-JSON body")
+                return False
+
+            if not isinstance(data, dict):
+                return False
+
+            new_access = str(data.get("accessToken") or data.get("token") or "").strip()
+            new_refresh = str(data.get("refreshToken") or "").strip()
+            new_expires_at = str(data.get("expiresAt") or "").strip()
+
+            if not new_access:
+                self.logger.warning("Proactive refresh returned empty access token")
+                return False
+
+            # Persist updated access token.
+            save_auth_token(email=email, token=new_access)
+
+            # Persist updated refresh token + new deadline.
+            if new_refresh:
+                new_next_refresh_at = next_refresh_at_from_expires(new_expires_at) if new_expires_at else ""
+                save_refresh_session_data(refresh_token=new_refresh, next_refresh_at=new_next_refresh_at)
+
+            self.logger.info("Proactive token refresh succeeded.")
+            return True
+
+        except Exception as exc:
+            self.logger.warning("Proactive refresh unexpected error: %s", exc)
+            return False
 
     def get_sync_data(self, *, token: str, version_tokens: dict | None = None, timeout: int = 20) -> Dict[str, Any]:
         url = (self.endpoints.sync_url or "").strip()
