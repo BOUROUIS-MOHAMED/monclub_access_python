@@ -43,12 +43,14 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         retention_days: int = LOG_RETENTION_DAYS,
         encoding: str = "utf-8",
         now_func: Callable[[], dt.datetime] | None = None,
+        on_log_rotated: Callable[[Path], None] | None = None,
     ) -> None:
         self.log_dir = Path(log_dir).resolve()
         self.max_bytes = int(max_bytes)
         self.retention_days = max(1, int(retention_days))
         self.now_func = now_func or dt.datetime.now
         self._last_cleanup_date: dt.date | None = None
+        self.on_log_rotated = on_log_rotated
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         now = self.now_func()
@@ -72,7 +74,13 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
     def _switch_if_needed(self, now: dt.datetime) -> None:
         path = self._path_for(now)
         if Path(self.baseFilename) != path:
-            self._set_active_path(path)
+            old_path = Path(self.baseFilename)      # capture BEFORE overwrite
+            self._set_active_path(path)             # closes stream, updates baseFilename
+            if self.on_log_rotated and old_path.exists():
+                try:
+                    self.on_log_rotated(old_path)
+                except Exception:
+                    pass
 
     def _formatted_record_size(self, record: logging.LogRecord) -> int:
         text = self.format(record) + self.terminator
@@ -111,9 +119,15 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         try:
             if not source.exists() or source.stat().st_size <= 0:
                 return
-            source.rename(self._next_suffix_path(source))
+            dest = self._next_suffix_path(source)
+            source.rename(dest)                     # rename must succeed first
+            if self.on_log_rotated:
+                try:
+                    self.on_log_rotated(dest)       # called with RENAMED destination
+                except Exception:
+                    pass
         except OSError:
-            return
+            return                                  # do NOT call callback on failure
 
     def _cleanup_if_needed(self, today: dt.date) -> None:
         if self._last_cleanup_date == today:
