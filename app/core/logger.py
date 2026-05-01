@@ -55,6 +55,8 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         self.on_log_rotated = on_log_rotated
         # NOTE: callback is invoked synchronously under the handler lock — must return quickly.
         # Design: register_pending() does a single atomic file rename (<1 ms); this is safe.
+        # Windows risk: AV scans may briefly stall file creation. If logging latency spikes
+        # are observed, consider posting to a queue inside the callback instead.
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         now = self.now_func()

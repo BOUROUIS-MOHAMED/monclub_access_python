@@ -63,7 +63,7 @@ class LogUploadQueue:
         tmp = Path(str(marker) + ".tmp")
         try:
             tmp.write_text("0", encoding="utf-8")
-            tmp.rename(marker)
+            os.replace(str(tmp), str(marker))
         except OSError as e:
             _handler_logger.warning(
                 "LogUploadQueue: failed to create .pending for %s: %s", log_path.name, e
@@ -87,6 +87,9 @@ class LogUploadQueue:
                     continue
                 if Path(str(path) + ".uploaded").exists():
                     continue
+                # .failed: reserved for manual operator intervention — drop a .failed file
+                # alongside a .log to permanently skip uploading that file.
+                # (No code creates .failed automatically; the retry loop is indefinite.)
                 if Path(str(path) + ".failed").exists():
                     continue
                 self.register_pending(path)
