@@ -40,6 +40,10 @@ Exports:
 
 When the page unlocks, LocalDbPage silently fetches sync_users and sync_devices in the background. No spinner or button — it is best-effort: if the fetch fails, FK cells degrade gracefully to showing the raw ID.
 
+**FK data loading:**
+- Users: `GET /sync/cache/users` → `res.users` — objects are snake_case (field `full_name`, key field `user_id` as number). Build both `userById` (keyed on `user_id`) and `userByCard` (keyed on `first_card_id` and `second_card_id` — insert one entry per non-null card field). No normalisation on card keys.
+- Devices: `GET /sync/cache/devices` → `res` — objects are camelCase (field `name`, key field `id` as number). Build `deviceById` keyed on `id`.
+
 ```ts
 interface FkLookupContext {
   userById: Map<number, { full_name: string; [k: string]: unknown }>;
@@ -57,7 +61,7 @@ interface FkLookupContext {
 | `card_no`, `cardNo` | `userByCard` | `Full Name` chip, clickable |
 | `device_id`, `deviceId` | `deviceById` | `Device Name (id)` chip, clickable |
 
-Clicking a FK chip opens the detail modal in **FK record mode** showing all fields of the related record.
+Clicking a FK chip opens the detail modal in **FK record mode** showing all fields of the related record. The FK record modal skips sensitive/complex fields: `password`, `fingerprints_json`, `face_id`, `qr_code_payload`, `doorPresets`.
 
 Unresolvable FK-like columns (e.g. `membership_id`) fall through to plain text rendering — no crash, no placeholder noise.
 
@@ -95,7 +99,7 @@ Color map (case-insensitive substring match):
 ### Date columns (detected by name)
 Column name ends with `_at`, `At`, `_time`, `Time`, or is `valid_from` / `valid_to`.
 
-→ Formatted as `06 May 2026, 14:32` using `toLocaleString('fr-FR', ...)`. Full ISO value shown as tooltip on hover.
+→ Formatted using `new Date(v).toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })` — uses the browser/OS locale so output is correct on Windows WebView2. Full ISO value shown as tooltip on hover.
 
 ---
 
@@ -110,6 +114,14 @@ Column name ends with `_at`, `At`, `_time`, `Time`, or is `valid_from` / `valid_
 | > 300 chars, or valid JSON object/array | Truncate at 60 + `…` + small `⤢` icon button, clicking opens detail modal in **long value mode** |
 
 JSON detection: `JSON.parse(v)` — if result is object or array, modal renders pretty-printed JSON in a `<pre>` block with monospace styling.
+
+The `⤢` expand icon button must have `aria-label="Voir la valeur complète"` and a Radix `<Tooltip>` with the same text for discoverability.
+
+**`TooltipProvider` requirement:** `buildSmartColumns` renders Radix `<Tooltip>` inside table cells. A `<TooltipProvider>` must wrap the `<DataTable>` call in LocalDbPage (one per tab). Add it at the tab content level if it is not already present in a layout ancestor.
+
+**Null / empty values:** Null or empty-string values always render as `—` (muted dash), regardless of column type. Numeric `0` is **not** treated as null — it renders as falsy for boolean columns and as `"0"` for text columns.
+
+**`buildSmartColumns` signature clarification:** `keys` is the definitive column order. If `keys` is empty or absent, fall back to `Object.keys(rows[0])`.
 
 ---
 
