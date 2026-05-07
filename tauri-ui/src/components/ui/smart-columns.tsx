@@ -94,10 +94,10 @@ export function isDateCol(key: string): boolean {
 
 // ─── Enum badge color mapper ──────────────────────────────────────────────────
 
-const GREEN_PATTERNS = /success|^ok$|active|enabled|allowed|ready|healthy|succeeded|running/i;
-const RED_PATTERNS = /failed|error|blocked|denied|disabled|terminal/i;
-const AMBER_PATTERNS = /pending|processing|loading|degraded|warning|retryable/i;
-const SLATE_PATTERNS = /idle|info|skipped|unknown/i;
+const GREEN_PATTERNS = /\b(success|ok|active|enabled|allowed|ready|healthy|succeeded|running)\b/i;
+const RED_PATTERNS = /\b(failed|error|blocked|denied|disabled|terminal)\b/i;
+const AMBER_PATTERNS = /\b(pending|processing|loading|degraded|warning|retryable)\b/i;
+const SLATE_PATTERNS = /\b(idle|info|skipped|unknown)\b/i;
 
 export function enumBadgeVariant(
   val: string,
@@ -345,6 +345,7 @@ export function FkChip({
   }
   return (
     <button
+      type="button"
       className="inline-flex items-center gap-1 rounded-full bg-primary/10 border border-primary/20 px-2 py-0.5 text-xs font-medium text-primary hover:bg-primary/20 transition-colors cursor-pointer"
       onClick={() =>
         onExpand(resolved, <FkRecordContent record={record} />)
