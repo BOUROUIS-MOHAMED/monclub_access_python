@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { get, post } from "@/api/client";
-import { type ColumnDef, DataTable } from "@/components/ui/data-table";
+import { DataTable } from "@/components/ui/data-table";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -296,6 +296,9 @@ function SessionBadge({ remaining, onLock }: { remaining: number; onLock: () => 
 
 // ─── main page ────────────────────────────────────────────────────────────────
 
+// Module-scope constant — avoids re-creation on every render
+const SYNC_SKIP = new Set(["fingerprints_json", "face_id", "qr_code_payload"]);
+
 export default function LocalDbPage() {
   // ── lock state ──
   const [unlocked, setUnlocked] = useState(() => readUnlock().ok);
@@ -443,54 +446,32 @@ export default function LocalDbPage() {
     XLSX.writeFile(wb, `${filename}-${new Date().toISOString().split("T")[0]}.xlsx`);
   }, []);
 
-  const syncColumns = useMemo<ColumnDef<any, any>[]>(() => {
-    if (!syncUsers.length) return [];
-    const skipKeys = new Set(["fingerprints_json", "face_id", "qr_code_payload"]);
-    return Object.keys(syncUsers[0])
-      .filter((k) => !skipKeys.has(k))
-      .map((key) => ({
-        accessorKey: key,
-        header: key.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()),
-        cell: ({ row }: any) => {
-          const v = row.original[key];
-          if (v == null || v === "") return <span className="text-muted-foreground">—</span>;
-          const s = String(v);
-          return <span className="text-xs">{s.length > 60 ? s.substring(0, 60) + "…" : s}</span>;
-        },
-      }));
-  }, [syncUsers]);
+  const syncColumns = useMemo(
+    () =>
+      buildSmartColumns(
+        syncUsers.length
+          ? Object.keys(syncUsers[0]).filter((k) => !SYNC_SKIP.has(k))
+          : [],
+        syncUsers,
+        { ...fkCtx, onExpand: handleExpand },
+      ),
+    [syncUsers, fkCtx, handleExpand],
+  );
 
-  const rawColumns = useMemo<ColumnDef<any, any>[]>(() => {
-    return rawCols.map((col) => ({
-      accessorKey: col,
-      header: col,
-      cell: ({ row }: any) => {
-        const v = row.original[col];
-        if (v == null || v === "") return <span className="text-muted-foreground">—</span>;
-        const s = String(v);
-        return <span className="text-xs">{s.length > 80 ? s.substring(0, 80) + "…" : s}</span>;
-      },
-    }));
-  }, [rawCols]);
+  const rawColumns = useMemo(
+    () => buildSmartColumns(rawCols, rawRows, { ...fkCtx, onExpand: handleExpand }),
+    [rawCols, rawRows, fkCtx, handleExpand],
+  );
 
-  const historyColumns = useMemo<ColumnDef<any, any>[]>(() => {
-    if (!historyRows.length) return [];
-    return Object.keys(historyRows[0]).map((key) => ({
-      accessorKey: key,
-      header: key.replace(/([A-Z])/g, " $1").replace(/^./, (s: string) => s.toUpperCase()),
-      cell: ({ row }: any) => {
-        const v = row.original[key];
-        if (v == null || v === "") return <span className="text-muted-foreground">—</span>;
-        if (key === "allowed")
-          return (
-            <Badge variant={v ? "success" : "destructive"} className="text-[10px]">
-              {v ? "Oui" : "Non"}
-            </Badge>
-          );
-        return <span className="text-xs">{String(v)}</span>;
-      },
-    }));
-  }, [historyRows]);
+  const historyColumns = useMemo(
+    () =>
+      buildSmartColumns(
+        historyRows.length ? Object.keys(historyRows[0]) : [],
+        historyRows,
+        { ...fkCtx, onExpand: handleExpand },
+      ),
+    [historyRows, fkCtx, handleExpand],
+  );
 
   const TABLES = [
     "sync_users", "sync_devices", "sync_device_door_presets", "sync_memberships",
@@ -505,6 +486,7 @@ export default function LocalDbPage() {
 
   // ── render content ──
   return (
+    <TooltipProvider>
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -650,6 +632,8 @@ export default function LocalDbPage() {
           )}
         </TabsContent>
       </Tabs>
+      <CellDetailModal state={modalState} onClose={closeModal} />
     </div>
+    </TooltipProvider>
   );
 }
