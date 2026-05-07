@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import React, { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import { get, post } from "@/api/client";
 import { type ColumnDef, DataTable } from "@/components/ui/data-table";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,15 @@ import {
   X,
 } from "lucide-react";
 import * as XLSX from "xlsx";
+import {
+  buildSmartColumns,
+  CellDetailModal,
+  EMPTY_FK_CONTEXT,
+  CLOSED_MODAL,
+  type FkLookupContext,
+  type CellDetailModalState,
+} from "@/components/ui/smart-columns";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // ─── session helpers ──────────────────────────────────────────────────────────
 
@@ -332,6 +341,56 @@ export default function LocalDbPage() {
   const [historyRows, setHistoryRows] = useState<any[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
+
+  // ── FK lookup context (loaded silently on unlock) ──
+  const [fkCtx, setFkCtx] = useState<FkLookupContext>(EMPTY_FK_CONTEXT);
+  const [modalState, setModalState] = useState<CellDetailModalState>(CLOSED_MODAL);
+
+  const handleExpand = useCallback((title: string, content: React.ReactNode) => {
+    setModalState({ open: true, title, content });
+  }, []);
+
+  const closeModal = useCallback(() => setModalState(CLOSED_MODAL), []);
+
+  // Silently load FK lookup data when the page unlocks
+  useEffect(() => {
+    if (!unlocked) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [usersRes, devicesRes] = await Promise.all([
+          get<any>("/sync/cache/users", { limit: "5000" }),
+          get<any>("/sync/cache/devices", { includeDoorPresets: "0" }),
+        ]);
+
+        if (cancelled) return;
+
+        const users: any[] = usersRes?.users ?? [];
+        const devices: any[] = devicesRes?.devices ?? [];
+
+        const userById = new Map<number, Record<string, unknown>>();
+        const userByCard = new Map<string, Record<string, unknown>>();
+        users.forEach((u) => {
+          const id = u.userId ?? u.user_id;
+          if (id != null) userById.set(Number(id), u);
+          const c1 = u.firstCardId ?? u.first_card_id;
+          const c2 = u.secondCardId ?? u.second_card_id;
+          if (c1) userByCard.set(String(c1), u);
+          if (c2) userByCard.set(String(c2), u);
+        });
+
+        const deviceById = new Map<number, Record<string, unknown>>();
+        devices.forEach((d) => {
+          if (d.id != null) deviceById.set(Number(d.id), d);
+        });
+
+        setFkCtx({ userById, userByCard, deviceById, onExpand: handleExpand });
+      } catch {
+        // Best-effort — FK chips degrade to raw values silently
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [unlocked, handleExpand]);
 
   const loadSync = useCallback(async () => {
     setSyncLoading(true);
