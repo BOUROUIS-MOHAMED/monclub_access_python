@@ -354,3 +354,122 @@ export function FkChip({
     </button>
   );
 }
+
+// ─── FK resolver helpers ──────────────────────────────────────────────────────
+
+function resolveFk(
+  col: string,
+  val: unknown,
+  ctx: FkLookupContext,
+): { label: string; record: Record<string, unknown> } | null {
+  if (col === "user_id" || col === "userId") {
+    const u = ctx.userById.get(Number(val));
+    if (!u) return null;
+    const name = (u.fullName ?? u.full_name ?? String(val)) as string;
+    return { label: `${name} (#${val})`, record: u };
+  }
+  if (col === "card_no" || col === "cardNo") {
+    const u = ctx.userByCard.get(String(val));
+    if (!u) return null;
+    const name = (u.fullName ?? u.full_name ?? String(val)) as string;
+    return { label: name, record: u };
+  }
+  if (col === "device_id" || col === "deviceId") {
+    const d = ctx.deviceById.get(Number(val));
+    if (!d) return null;
+    return { label: `${d.name as string} (#${val})`, record: d };
+  }
+  return null;
+}
+
+// ─── Main builder ─────────────────────────────────────────────────────────────
+
+/**
+ * Build smart TanStack column definitions for an arbitrary list of rows.
+ *
+ * @param keys   Definitive column order. Falls back to Object.keys(rows[0]) if empty/absent.
+ * @param rows   Row data (used only for fallback key derivation).
+ * @param ctx    FK lookup maps + expand callback.
+ */
+export function buildSmartColumns(
+  keys: string[] | undefined | null,
+  rows: Record<string, unknown>[],
+  ctx: FkLookupContext,
+): ColumnDef<Record<string, unknown>>[] {
+  const cols =
+    keys && keys.length > 0
+      ? keys
+      : rows.length > 0
+        ? Object.keys(rows[0])
+        : [];
+
+  return cols.map((key): ColumnDef<Record<string, unknown>> => {
+    const header = humanizeKey(key);
+
+    return {
+      accessorKey: key,
+      header,
+      cell: ({ row }) => {
+        const val = row.original[key];
+
+        // 1. FK
+        if (isFkCol(key)) {
+          const resolved = isNullish(val) ? null : resolveFk(key, val, ctx);
+          return (
+            <FkChip
+              rawValue={val}
+              resolved={resolved?.label ?? null}
+              record={resolved?.record ?? null}
+              onExpand={ctx.onExpand}
+            />
+          );
+        }
+
+        // 2. Boolean
+        if (isBoolCol(key)) return <BoolCell value={val} />;
+
+        // 3. Enum/status
+        if (isEnumCol(key)) return <EnumCell value={val} />;
+
+        // 4. Date
+        if (isDateCol(key)) return <DateCell value={val} />;
+
+        // 5. Text (with truncation tiers)
+        return <TextCell value={val} label={header} onExpand={ctx.onExpand} />;
+      },
+    };
+  });
+}
+
+// ─── Lifted detail modal ──────────────────────────────────────────────────────
+
+export interface CellDetailModalState {
+  open: boolean;
+  title: string;
+  content: React.ReactNode;
+}
+
+export const CLOSED_MODAL: CellDetailModalState = {
+  open: false,
+  title: "",
+  content: null,
+};
+
+export function CellDetailModal({
+  state,
+  onClose,
+}: {
+  state: CellDetailModalState;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog open={state.open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="sm:max-w-[600px] max-h-[80vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle className="text-sm font-semibold">{state.title}</DialogTitle>
+        </DialogHeader>
+        <div className="overflow-auto flex-1 pt-1 pb-2">{state.content}</div>
+      </DialogContent>
+    </Dialog>
+  );
+}
