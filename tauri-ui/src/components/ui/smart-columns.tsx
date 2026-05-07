@@ -288,3 +288,69 @@ export function TextCell({
     </span>
   );
 }
+
+// ─── Sensitive field skip list for FK record modal ────────────────────────────
+
+const FK_RECORD_SKIP = new Set([
+  "password", "fingerprints_json", "face_id", "qr_code_payload", "doorPresets",
+]);
+
+// ─── FK record content (rendered inside modal) ────────────────────────────────
+
+export function FkRecordContent({ record }: { record: Record<string, unknown> }) {
+  const entries = Object.entries(record).filter(
+    ([k]) => !FK_RECORD_SKIP.has(k),
+  );
+  return (
+    <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
+      {entries.map(([k, v]) => (
+        <React.Fragment key={k}>
+          <span className="text-muted-foreground font-medium whitespace-nowrap">
+            {humanizeKey(k)}
+          </span>
+          <span className="break-all">
+            {isNullish(v) ? (
+              <span className="text-muted-foreground">—</span>
+            ) : isBoolCol(k) ? (
+              <BoolCell value={v} />
+            ) : isDateCol(k) ? (
+              <DateCell value={v} />
+            ) : (
+              <span className="font-mono text-xs">{String(v)}</span>
+            )}
+          </span>
+        </React.Fragment>
+      ))}
+    </div>
+  );
+}
+
+// ─── FK chip cell ─────────────────────────────────────────────────────────────
+
+export function FkChip({
+  rawValue,
+  resolved,
+  record,
+  onExpand,
+}: {
+  rawValue: unknown;
+  resolved: string | null;
+  record: Record<string, unknown> | null;
+  onExpand: FkLookupContext["onExpand"];
+}) {
+  if (isNullish(rawValue)) return <NullDash />;
+  if (!resolved || !record) {
+    // Unresolved — show raw value
+    return <span className="text-xs font-mono">{String(rawValue)}</span>;
+  }
+  return (
+    <button
+      className="inline-flex items-center gap-1 rounded-full bg-primary/10 border border-primary/20 px-2 py-0.5 text-xs font-medium text-primary hover:bg-primary/20 transition-colors cursor-pointer"
+      onClick={() =>
+        onExpand(resolved, <FkRecordContent record={record} />)
+      }
+    >
+      {resolved}
+    </button>
+  );
+}
