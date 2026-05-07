@@ -108,3 +108,183 @@ export function enumBadgeVariant(
   if (SLATE_PATTERNS.test(val)) return "outline";
   return "secondary";
 }
+
+// ─── Null guard ───────────────────────────────────────────────────────────────
+
+/** Returns true when value should render as an em-dash placeholder */
+function isNullish(v: unknown): boolean {
+  return v === null || v === undefined || v === "";
+}
+
+const NullDash = () => (
+  <span className="text-muted-foreground select-none">—</span>
+);
+
+// ─── Boolean cell ─────────────────────────────────────────────────────────────
+
+export function BoolCell({ value }: { value: unknown }) {
+  if (isNullish(value)) return <NullDash />;
+  const truthy =
+    value === true || value === 1 || value === "true" || value === "1";
+  return (
+    <Badge
+      variant={truthy ? "success" : "destructive"}
+      className="text-[10px] font-mono"
+    >
+      {truthy ? "Oui" : "Non"}
+    </Badge>
+  );
+}
+
+// ─── Enum cell ────────────────────────────────────────────────────────────────
+
+export function EnumCell({ value }: { value: unknown }) {
+  if (isNullish(value)) return <NullDash />;
+  const s = String(value);
+  return (
+    <Badge variant={enumBadgeVariant(s)} className="text-[10px] font-mono">
+      {s}
+    </Badge>
+  );
+}
+
+// ─── Date cell ────────────────────────────────────────────────────────────────
+
+const DATE_FORMAT_OPTS: Intl.DateTimeFormatOptions = {
+  day: "numeric",
+  month: "short",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+};
+
+export function DateCell({ value }: { value: unknown }) {
+  if (isNullish(value)) return <NullDash />;
+  const raw = String(value);
+  let formatted: string;
+  try {
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) throw new Error();
+    formatted = d.toLocaleString(undefined, DATE_FORMAT_OPTS);
+  } catch {
+    return <span className="text-xs">{raw}</span>;
+  }
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="text-xs cursor-default tabular-nums">{formatted}</span>
+      </TooltipTrigger>
+      <TooltipContent>
+        <p className="font-mono text-xs">{raw}</p>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ─── Text cell ────────────────────────────────────────────────────────────────
+
+function tryParseJson(s: string): object | null {
+  if (s.length < 2) return null;
+  const first = s[0];
+  if (first !== "{" && first !== "[") return null;
+  try {
+    const parsed = JSON.parse(s);
+    if (typeof parsed === "object" && parsed !== null) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function TextCell({
+  value,
+  label,
+  onExpand,
+}: {
+  value: unknown;
+  label: string;
+  onExpand: (title: string, content: React.ReactNode) => void;
+}) {
+  if (isNullish(value)) return <NullDash />;
+  const s = String(value);
+
+  // JSON detection — treat as expandable regardless of length
+  const json = tryParseJson(s);
+  if (json !== null) {
+    const pretty = JSON.stringify(json, null, 2);
+    const preview = s.length > 60 ? s.substring(0, 60) + "…" : s;
+    return (
+      <span className="flex items-center gap-1 text-xs font-mono">
+        <span className="text-muted-foreground">{preview}</span>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-4 w-4 shrink-0 opacity-50 hover:opacity-100"
+              aria-label="Voir la valeur complète"
+              onClick={() =>
+                onExpand(
+                  label,
+                  <pre className="text-xs font-mono whitespace-pre-wrap break-all overflow-auto max-h-[60vh]">
+                    {pretty}
+                  </pre>,
+                )
+              }
+            >
+              <Maximize2 className="h-3 w-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Voir la valeur complète</TooltipContent>
+        </Tooltip>
+      </span>
+    );
+  }
+
+  // Short — show as-is
+  if (s.length <= 60) {
+    return <span className="text-xs">{s}</span>;
+  }
+
+  const preview = s.substring(0, 60) + "…";
+
+  // Medium (61–300) — truncate + tooltip
+  if (s.length <= 300) {
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="text-xs cursor-default">{preview}</span>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs whitespace-pre-wrap break-words">
+          {s}
+        </TooltipContent>
+      </Tooltip>
+    );
+  }
+
+  // Long (>300) — truncate + expand button
+  return (
+    <span className="flex items-center gap-1 text-xs">
+      <span>{preview}</span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-4 w-4 shrink-0 opacity-50 hover:opacity-100"
+            aria-label="Voir la valeur complète"
+            onClick={() =>
+              onExpand(
+                label,
+                <p className="text-sm whitespace-pre-wrap break-words">{s}</p>,
+              )
+            }
+          >
+            <Maximize2 className="h-3 w-3" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Voir la valeur complète</TooltipContent>
+      </Tooltip>
+    </span>
+  );
+}
