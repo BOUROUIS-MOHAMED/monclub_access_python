@@ -57,6 +57,13 @@ def _open_sqlite_connection(
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(f"PRAGMA wal_autocheckpoint={int(wal_autocheckpoint)}")
     conn.execute("PRAGMA foreign_keys = ON")
+    # P6: read-side speed-ups for the cache-write hot path. SELECTs inside the
+    # write transaction (e.g. credentials existing-row fetch, members cached-id
+    # fetch) were taking 8–22 s in production. mmap + larger cache lets SQLite
+    # serve those scans from memory instead of repeatedly hitting the file.
+    conn.execute("PRAGMA mmap_size=268435456")   # 256 MB
+    conn.execute("PRAGMA cache_size=-65536")     # 64 MB page cache (negative = KB)
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 
@@ -658,6 +665,10 @@ def init_db() -> None:
         _ensure_column(conn, "sync_access_software_settings", "history_service_enabled", "history_service_enabled INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "agent_sync_backend_refresh_min", "agent_sync_backend_refresh_min INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "default_authorize_door_id", "default_authorize_door_id INTEGER")
+
+        # auth-refresh: opaque rotating refresh token + proactive-refresh deadline (Task 18)
+        _ensure_column(conn, "auth_state", "refresh_token_protected", "refresh_token_protected TEXT")
+        _ensure_column(conn, "auth_state", "next_refresh_at",         "next_refresh_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "sdk_read_initial_bytes", "sdk_read_initial_bytes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "optional_data_sync_delay_minutes", "optional_data_sync_delay_minutes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "created_at", "created_at TEXT")
@@ -2130,9 +2141,55 @@ def save_auth_token(*, email: str, token: str, last_login_at: str | None = None)
         conn.commit()
 
 
+def save_refresh_session_data(*, refresh_token: str, next_refresh_at: str) -> None:
+    """Persist the opaque refresh token (DPAPI-encrypted) and the proactive-refresh deadline.
+
+    Guarantees the auth_state row exists before updating, so callers do not need
+    to ensure save_auth_token() was invoked first (fixes first-login ordering bug).
+    """
+    protected = protect_auth_token(refresh_token) if refresh_token else ""
+    with get_conn() as conn:
+        # Ensure the singleton row exists. All non-id columns are nullable so
+        # INSERT OR IGNORE (id=1) is always valid per the CREATE TABLE schema.
+        conn.execute("INSERT OR IGNORE INTO auth_state (id) VALUES (1)")
+        conn.execute(
+            """
+            UPDATE auth_state
+               SET refresh_token_protected=?,
+                   next_refresh_at=?
+             WHERE id=1
+            """,
+            (protected, next_refresh_at),
+        )
+        conn.commit()
+
+
+def load_refresh_token() -> str | None:
+    """Return the decrypted refresh token, or None if absent or decryption fails."""
+    with get_conn() as conn:
+        r = conn.execute("SELECT refresh_token_protected FROM auth_state WHERE id=1").fetchone()
+        if not r:
+            return None
+        raw = unprotect_auth_token(r["refresh_token_protected"] or "")
+        return raw if raw else None
+
+
+def load_next_refresh_at() -> str | None:
+    """Return the ISO UTC proactive-refresh deadline, or None if not set."""
+    with get_conn() as conn:
+        r = conn.execute("SELECT next_refresh_at FROM auth_state WHERE id=1").fetchone()
+        if not r:
+            return None
+        v = (r["next_refresh_at"] or "").strip()
+        return v if v else None
+
+
 def load_auth_token() -> AuthTokenState | None:
     with get_conn() as conn:
-        r = conn.execute("SELECT email, token_protected, last_login_at FROM auth_state WHERE id=1").fetchone()
+        r = conn.execute(
+            "SELECT email, token_protected, last_login_at, refresh_token_protected, next_refresh_at "
+            "FROM auth_state WHERE id=1"
+        ).fetchone()
         if not r:
             return None
         email = (r["email"] or "").strip()
@@ -2140,7 +2197,15 @@ def load_auth_token() -> AuthTokenState | None:
         last_login_at = r["last_login_at"] or ""
         if not token:
             return None
-        return AuthTokenState(email=email, token=token, last_login_at=last_login_at)
+        refresh_token = unprotect_auth_token(r["refresh_token_protected"] or "") if r["refresh_token_protected"] else ""
+        next_refresh_at = (r["next_refresh_at"] or "").strip()
+        return AuthTokenState(
+            email=email,
+            token=token,
+            last_login_at=last_login_at,
+            refresh_token=refresh_token,
+            next_refresh_at=next_refresh_at,
+        )
 
 
 def clear_auth_token() -> None:
@@ -2816,34 +2881,32 @@ def _sync_gym_access_credentials_rows(
     # Avoid full-row reads (granted_active_membership_ids_json can be huge).
     # We diff using a lightweight field set; JSON changes that don't update
     # these fields will not be detected.
+    #
+    # P6: previously this used a chunked OR-of-AND predicate (200 ORs per chunk,
+    # 8 chunks for 1600 credentials) which the SQLite planner couldn't index
+    # efficiently — a single delta sync was spending ~21 s inside this loop in
+    # production. For the gym's typical 1.5–3 k credentials the table is tiny,
+    # so a single full-table scan filtered down to incoming keys in Python is
+    # an order of magnitude faster (and gets simpler the bigger incoming gets).
     prefer_upsert_all = False
     lite_diff = True
     existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
     if incoming_by_key:
         t_fetch = time.perf_counter()
-        incoming_keys = list(incoming_by_key.keys())
-        chunk_size = 200
-        for i in range(0, len(incoming_keys), chunk_size):
-            chunk = incoming_keys[i:i + chunk_size]
-            predicates = " OR ".join(["(gym_id=? AND account_id=?)"] * len(chunk))
-            params: List[Any] = []
-            for gym_id, account_id in chunk:
-                params.extend([gym_id, account_id])
-            rows = cur.execute(
-                f"""
-                SELECT
-                    id, gym_id, account_id, secret_hex, enabled,
-                    rotated_at, created_at, updated_at
-                FROM sync_gym_access_credentials
-                WHERE {predicates}
-                """,
-                params,
-            ).fetchall()
-            for r in rows:
-                row = dict(r)
-                key = _sync_credential_identity(row)
-                if key is None:
-                    return _replace_sync_credentials(cur, normalized_rows)
+        all_rows = cur.execute(
+            """
+            SELECT
+                id, gym_id, account_id, secret_hex, enabled,
+                rotated_at, created_at, updated_at
+            FROM sync_gym_access_credentials
+            """
+        ).fetchall()
+        for r in all_rows:
+            row = dict(r)
+            key = _sync_credential_identity(row)
+            if key is None:
+                return _replace_sync_credentials(cur, normalized_rows)
+            if key in incoming_by_key:
                 existing_by_key[key] = row
         existing_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
 

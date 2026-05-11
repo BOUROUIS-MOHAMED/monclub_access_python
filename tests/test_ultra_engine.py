@@ -133,6 +133,10 @@ def _make_worker(
     worker._last_connect_error = ""
     worker._last_connect_attempt_at = ""
     worker._last_connect_success_at = ""
+    worker._connect_down_since_mono = 0.0
+    worker._connect_down_since_iso = ""
+    worker._last_down_error_log_mono = 0.0
+    worker._down_error_log_interval_sec = 300.0
 
     return worker
 
@@ -1239,3 +1243,50 @@ class TestDoorIdParsing:
         worker._process_event(_make_event(event_type=0, door_id="not-a-number"))
         rec = worker._history_q.get_nowait()
         assert rec.door_id is None
+
+
+class TestPollWithWatchdogNoThreadLeak:
+    """Regression: when the inner SDK call hangs, _poll_with_watchdog must not
+    orphan a new thread on every call. Each orphan accumulates against the
+    Windows process thread limit and eventually causes the whole app to freeze
+    overnight (every Thread().start() raises RuntimeError)."""
+
+    def test_skips_poll_when_previous_watchdog_thread_still_alive(self):
+        worker = _make_worker()
+        worker._poll_timeout_sec = 0.05
+
+        # Simulate an orphan from a previous call that never finished.
+        hang = threading.Event()
+        prev = threading.Thread(target=hang.wait, daemon=True)
+        prev.start()
+        worker._watchdog_thread = prev
+
+        before = threading.active_count()
+        try:
+            result = worker._poll_with_watchdog()
+        finally:
+            hang.set()
+            prev.join(timeout=2.0)
+
+        after = threading.active_count()
+
+        assert result is None, "must signal failure so caller forces reconnect"
+        # No new thread should have been spawned while the old one was hung.
+        assert after <= before, (
+            f"watchdog leaked a thread (before={before} after={after}); "
+            "fix preserves bounded thread count under SDK hangs"
+        )
+
+    def test_clears_watchdog_reference_after_clean_completion(self):
+        worker = _make_worker()
+        worker._poll_timeout_sec = 1.0
+
+        sdk = MagicMock()
+        sdk.poll_rtlog_once.return_value = []
+        worker._sdk = sdk
+
+        result = worker._poll_with_watchdog()
+
+        assert result == []
+        # Reference cleared so the next cycle is free to spawn a fresh thread.
+        assert getattr(worker, "_watchdog_thread", None) is None

@@ -30,9 +30,27 @@ def main() -> None:
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         raise SystemExit(1) from e
+
+    from shared.single_instance import (
+        SingleInstanceAlreadyRunning,
+        acquire_single_instance_guard,
+    )
+
+    try:
+        guard = acquire_single_instance_guard(component_id="access")
+    except SingleInstanceAlreadyRunning:
+        print("MonClub Access is already running — exiting this instance.", file=sys.stderr)
+        raise SystemExit(0)
+
     from access.bootstrap import run_access_app
 
-    run_access_app()
+    try:
+        run_access_app()
+    finally:
+        try:
+            guard.release()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

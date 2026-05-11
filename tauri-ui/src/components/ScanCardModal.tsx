@@ -45,6 +45,12 @@ export default function ScanCardModal({ open, onClose }: Props) {
   const isScanning = status.state === "scanning";
   const hasResult = status.lastResult !== null;
   const hasError = status.state === "error";
+  const sourceLabel =
+    status.lastResult?.source === "zkemkeeper"
+      ? "SCR100 (ZKEMKeeper)"
+      : status.lastResult?.source === "network"
+        ? "SCR100 (réseau)"
+        : "USB";
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!v) handleClose(); }}>
@@ -100,8 +106,7 @@ export default function ScanCardModal({ open, onClose }: Props) {
                 </Button>
               </div>
               <p className="text-xs text-muted-foreground">
-                Source:{" "}
-                {status.lastResult!.source === "network" ? "SCR100 (réseau)" : "USB"}
+                Source: {sourceLabel}
               </p>
             </>
           )}

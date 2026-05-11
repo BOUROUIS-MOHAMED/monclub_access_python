@@ -279,3 +279,71 @@ class TestUpload:
             result = q._upload("app-2026-05-01-am.log", b"data")
 
         assert result is True
+
+    def test_cloudinary_post_multipart_success(self, tmp_path):
+        """POST_MULTIPART method uses multipart POST with formFields, not a raw PUT."""
+        state = self._make_token_state("mytoken")
+        q = _make_queue(tmp_path, get_token=lambda: state)
+
+        compressed = b"\x1f\x8b\x08cloudinary-data"
+
+        presign_resp = MagicMock()
+        presign_resp.status_code = 200
+        presign_resp.json.return_value = {
+            "url": "https://api.cloudinary.com/v1_1/mycloudname/auto/upload",
+            "method": "POST_MULTIPART",
+            "headers": {},
+            "formFields": {
+                "api_key": "123",
+                "timestamp": "9999",
+                "signature": "abc",
+                "public_id": "access-logs/42/2026/app-2026-05-01-am.log.gz",
+                "type": "authenticated",
+            },
+        }
+
+        upload_resp = MagicMock()
+        upload_resp.status_code = 200
+
+        with patch("requests.post", side_effect=[presign_resp, upload_resp]) as mock_post, \
+             patch("requests.put") as mock_put:
+            result = q._upload("app-2026-05-01-am.log", compressed)
+
+        assert result is True
+        # PUT must never be called for Cloudinary uploads
+        mock_put.assert_not_called()
+        # Second POST is the actual Cloudinary upload
+        assert mock_post.call_count == 2
+        cloudinary_call = mock_post.call_args_list[1]
+        # Multipart file field must be present
+        assert "files" in cloudinary_call.kwargs
+        assert "file" in cloudinary_call.kwargs["files"]
+        # The gzip bytes must be in the file tuple
+        assert compressed in cloudinary_call.kwargs["files"]["file"]
+        # Form fields must carry the signed params
+        assert cloudinary_call.kwargs["data"]["api_key"] == "123"
+
+    def test_cloudinary_post_multipart_http_error(self, tmp_path):
+        """POST_MULTIPART upload failing returns False."""
+        state = self._make_token_state()
+        q = _make_queue(tmp_path, get_token=lambda: state)
+
+        presign_resp = MagicMock()
+        presign_resp.status_code = 200
+        presign_resp.json.return_value = {
+            "url": "https://api.cloudinary.com/v1_1/x/auto/upload",
+            "method": "POST_MULTIPART",
+            "headers": {},
+            "formFields": {"api_key": "k", "timestamp": "1", "signature": "s",
+                           "public_id": "access-logs/1/2026/f.log.gz", "type": "authenticated"},
+        }
+
+        upload_resp = MagicMock()
+        upload_resp.status_code = 400
+
+        with patch("requests.post", side_effect=[presign_resp, upload_resp]), \
+             patch("requests.put") as mock_put:
+            result = q._upload("app-2026-05-01-am.log", b"data")
+
+        assert result is False
+        mock_put.assert_not_called()

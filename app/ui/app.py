@@ -89,6 +89,34 @@ from app.core.utils import LOG_DIR
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
 
+def _read_runtime_version_string() -> str:
+    """Best-effort: read MonClub Access version from update.json / version.json.
+
+    Used by the boot/shutdown banner so an incident log clearly shows which
+    build is running. Falls back to "unknown" on any failure.
+    """
+    try:
+        from shared.runtime_support import runtime_base_dir
+
+        for filename, key in (("version.json", None), ("update.json", "access")):
+            try:
+                path = runtime_base_dir() / filename
+                if not path.exists():
+                    continue
+                import json as _json
+                data = _json.loads(path.read_text(encoding="utf-8-sig"))
+                payload = data if key is None else (data.get(key) or {})
+                version = str(payload.get("version") or "").strip()
+                if version:
+                    codename = str(payload.get("codename") or "").strip()
+                    return f"{version} ({codename})" if codename else version
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _parse_dt_any(s: str) -> datetime | None:
     if not s:
         return None
@@ -342,7 +370,19 @@ class MainApp:
         except Exception as _lue:
             # Never crash startup due to upload system
             self.logger.warning("Log upload queue failed to start: %s", _lue)
-        self.logger.info("App started.")
+        self._boot_version = _read_runtime_version_string()
+        # NOTE: _started_from_windows_startup is set later in __init__ from sys.argv;
+        # read the same source directly here so the banner doesn't depend on init order.
+        _boot_startup_arg = WINDOWS_STARTUP_ARG in sys.argv[1:]
+        self.logger.info(
+            "App started. pid=%s version=%s frozen=%s startup_arg=%s exe=%s args=%r",
+            os.getpid(),
+            self._boot_version,
+            bool(getattr(sys, "frozen", False)),
+            _boot_startup_arg,
+            sys.executable,
+            sys.argv,
+        )
         self.logger.info(f"Platform: {platform_summary()}")
         self.logger.info("Data root is managed by app.core.utils (ProgramData/LocalAppData).")
         try:
@@ -848,6 +888,14 @@ class MainApp:
 
     def quit_app(self):
         # H-003: All stop calls have bounded timeouts to prevent hanging on exit.
+        try:
+            self.logger.info(
+                "App shutting down. pid=%s version=%s",
+                os.getpid(),
+                getattr(self, "_boot_version", "unknown"),
+            )
+        except Exception:
+            pass
         try:
             self._kill_tauri_ui()
         except Exception:
@@ -1869,6 +1917,18 @@ class MainApp:
                         if ultra_devices:
                             self._ultra_engine.start(ultra_devices)
                             ultra_engine_restarted = True
+                    elif refresh.get("devices"):
+                        # Same device IDs, but the dashboard pushed updates to one
+                        # or more device records (allowedMemberships, doorIds,
+                        # pushingToDevicePolicy, …). Refresh worker snapshots in
+                        # place so members in newly-allowed memberships get pushed
+                        # instead of filtered out and pin-deleted.
+                        try:
+                            self._ultra_engine.refresh_devices(ultra_devices)
+                        except Exception as _refresh_exc:
+                            self.logger.warning(
+                                "[ULTRA] refresh_devices error: %s", _refresh_exc
+                            )
 
                 # Stop ULTRA engine if no ULTRA devices remain (switched away from ULTRA)
                 if ultra_count == 0 and self._ultra_engine.running:

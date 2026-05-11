@@ -112,16 +112,37 @@ class UltraDeviceWorker(threading.Thread):
         self._cached_state_ts: float = 0.0
         self._CACHE_TTL_SEC: float = 60.0  # sync data only changes on sync cycles (~60s)
         self._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
-        self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 15.0))
+        self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 120.0))
         self._connect_failures = 0
         self._next_connect_at_mono = 0.0
         self._last_connect_error = ""
         self._last_connect_attempt_at = ""
         self._last_connect_success_at = ""
+        # Sustained-outage tracking: when set, the worker has been disconnected
+        # since this monotonic timestamp. Used to (a) surface a "down for N min"
+        # status to the UI and (b) suppress log spam — we keep one ERROR per
+        # ~5 minutes plus DEBUG details, instead of one ERROR per retry.
+        self._connect_down_since_mono: float = 0.0
+        self._connect_down_since_iso: str = ""
+        self._last_down_error_log_mono: float = 0.0
+        self._down_error_log_interval_sec: float = 300.0
 
     def reset_fast_patch_caches(self) -> None:
         self._cached_state = None
         self._cached_state_ts = 0.0
+
+    def update_device(self, device: Dict[str, Any], settings: Dict[str, Any]) -> None:
+        """Swap in a refreshed device dict and settings.
+
+        Called when the dashboard updates the GymDevice (e.g. allowedMemberships,
+        pushingToDevicePolicy, doorIds). The reference assignment is atomic in
+        CPython, and downstream consumers re-read self._device on each request,
+        so no lock is required. Refreshing in place avoids restarting the worker,
+        which would tear down the RTLog observer and force a reconnect.
+        """
+        self._device = device
+        self._settings = settings
+        self._device_name = str(device.get("name", ""))
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -232,23 +253,53 @@ class UltraDeviceWorker(threading.Thread):
                 return
 
     def _record_connect_failure(self, error: str) -> float:
-        self._connect_failures = min(int(self._connect_failures or 0) + 1, 8)
+        self._connect_failures = min(int(self._connect_failures or 0) + 1, 32)
         delay = min(
             self._connect_retry_base_sec * (2 ** max(self._connect_failures - 1, 0)),
             self._connect_retry_max_sec,
         )
-        self._next_connect_at_mono = time.monotonic() + float(delay)
+        now_mono = time.monotonic()
+        self._next_connect_at_mono = now_mono + float(delay)
         self._last_connect_error = str(error or "connect failed")
         self._last_connect_attempt_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if self._connect_down_since_mono == 0.0:
+            self._connect_down_since_mono = now_mono
+            self._connect_down_since_iso = self._last_connect_attempt_at
         return float(delay)
 
     def _record_connect_success(self) -> None:
         self._connect_failures = 0
         self._next_connect_at_mono = 0.0
         self._last_connect_error = ""
+        self._connect_down_since_mono = 0.0
+        self._connect_down_since_iso = ""
+        self._last_down_error_log_mono = 0.0
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self._last_connect_attempt_at = now_iso
         self._last_connect_success_at = now_iso
+
+    def _should_log_connect_error_now(self) -> bool:
+        """During a sustained outage, throttle ERROR logs to once per interval.
+
+        First 3 failures always log ERROR. After that we emit one ERROR every
+        ``_down_error_log_interval_sec`` (default 5 min) so the log file does
+        not get flooded with the same line every retry.
+        """
+        if self._connect_failures <= 3:
+            return True
+        now_mono = time.monotonic()
+        if self._last_down_error_log_mono == 0.0:
+            self._last_down_error_log_mono = now_mono
+            return True
+        if now_mono - self._last_down_error_log_mono >= self._down_error_log_interval_sec:
+            self._last_down_error_log_mono = now_mono
+            return True
+        return False
+
+    def _down_for_seconds(self) -> float:
+        if self._connect_down_since_mono == 0.0:
+            return 0.0
+        return max(0.0, time.monotonic() - self._connect_down_since_mono)
 
     def defer_reconnect(self, delay_sec: float, *, reason: str = "deferred") -> bool:
         if self._connected:
@@ -266,7 +317,9 @@ class UltraDeviceWorker(threading.Thread):
         ip = self._device.get("ipAddress") or self._device.get("ip_address", "")
         port = self._device.get("portNumber") or self._device.get("port_number") or self._device.get("devicePort") or 4370
         self._last_connect_attempt_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        logger.info(
+        attempt_level = logging.INFO if self._connect_failures <= 3 else logging.DEBUG
+        logger.log(
+            attempt_level,
             "%s connect attempt: name=%r ip=%s port=%s failures=%s",
             self._prefix,
             self._device_name,
@@ -278,25 +331,51 @@ class UltraDeviceWorker(threading.Thread):
             self._sdk = PullSDKDevice(device_payload=self._device, logger=logger)
             ok = self._sdk.connect()
             if ok:
+                was_down_for = self._down_for_seconds()
                 self._connected = True
                 self._record_connect_success()
-                logger.info(f"{self._prefix} connected OK: name={self._device_name!r} ip={ip} port={port}")
+                if was_down_for >= 60.0:
+                    logger.warning(
+                        "%s connected OK after %.0fs downtime: name=%r ip=%s port=%s",
+                        self._prefix, was_down_for, self._device_name, ip, port,
+                    )
+                else:
+                    logger.info(
+                        "%s connected OK: name=%r ip=%s port=%s",
+                        self._prefix, self._device_name, ip, port,
+                    )
             else:
                 self._connected = False
                 self._sdk = None
                 delay = self._record_connect_failure("connect returned False")
-                logger.error(
-                    f"{self._prefix} connect returned False: "
-                    f"name={self._device_name!r} ip={ip} port={port} "
-                    f"next_retry_in={delay:.1f}s"
-                )
+                if self._should_log_connect_error_now():
+                    logger.error(
+                        "%s connect returned False: name=%r ip=%s port=%s "
+                        "next_retry_in=%.1fs down_for=%.0fs failures=%s",
+                        self._prefix, self._device_name, ip, port,
+                        delay, self._down_for_seconds(), self._connect_failures,
+                    )
+                else:
+                    logger.debug(
+                        "%s connect returned False (suppressed): "
+                        "next_retry_in=%.1fs down_for=%.0fs failures=%s",
+                        self._prefix, delay, self._down_for_seconds(), self._connect_failures,
+                    )
         except Exception as e:
             delay = self._record_connect_failure(str(e))
-            logger.error(
-                f"{self._prefix} connect FAILED: "
-                f"name={self._device_name!r} ip={ip} port={port} error={e} "
-                f"next_retry_in={delay:.1f}s"
-            )
+            if self._should_log_connect_error_now():
+                logger.error(
+                    "%s connect FAILED: name=%r ip=%s port=%s error=%s "
+                    "next_retry_in=%.1fs down_for=%.0fs failures=%s",
+                    self._prefix, self._device_name, ip, port, e,
+                    delay, self._down_for_seconds(), self._connect_failures,
+                )
+            else:
+                logger.debug(
+                    "%s connect FAILED (suppressed): error=%s "
+                    "next_retry_in=%.1fs down_for=%.0fs failures=%s",
+                    self._prefix, e, delay, self._down_for_seconds(), self._connect_failures,
+                )
             self._connected = False
             self._sdk = None
 
@@ -512,7 +591,7 @@ class UltraDeviceWorker(threading.Thread):
                 started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
                 self._mark_full_sync_started(reason=reason, engine=engine, started_at=started_iso)
                 self._notify_full_sync_started(reason=reason)
-                engine.run_one_device_on_connected_sdk(
+                sync_ok = engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
                     device=device_copy,
@@ -520,18 +599,23 @@ class UltraDeviceWorker(threading.Thread):
                     changed_ids=None,
                 )
                 duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
+                # P9: surface the underlying sync error (e.g. PullSDKError on
+                # the user table) instead of silently treating it as success.
+                sync_error = "" if sync_ok else (
+                    getattr(engine, "_last_single_device_error", "") or "device sync failed"
+                )
                 self._mark_full_sync_finished(
                     reason=reason,
-                    ok=True,
+                    ok=sync_ok,
                     duration_ms=duration_ms,
-                    error="",
+                    error=sync_error,
                 )
                 self._notify_full_sync_finished(
                     reason=reason,
-                    ok=True,
-                    fingerprint_hash=fingerprint_hash,
+                    ok=sync_ok,
+                    fingerprint_hash=fingerprint_hash if sync_ok else None,
                     duration_ms=duration_ms,
-                    error="",
+                    error=sync_error,
                 )
             except Exception as exc:
                 logger.warning(
@@ -620,6 +704,18 @@ class UltraDeviceWorker(threading.Thread):
 
     def _poll_with_watchdog(self) -> Optional[List[Dict[str, Any]]]:
         """Poll RTLog with thread-based watchdog. Returns events or None on timeout."""
+        # If the previous watchdog thread is still alive, the inner SDK call is
+        # hung. Spawning a new one would orphan the previous — that's a thread
+        # leak. Skip this cycle and force the caller to reconnect; the SDK
+        # disconnect should unblock the orphan thread.
+        prev_t: Optional[threading.Thread] = getattr(self, "_watchdog_thread", None)
+        if prev_t is not None and prev_t.is_alive():
+            logger.error(
+                f"{self._prefix} poll_rtlog WATCHDOG STILL HUNG from previous cycle — "
+                f"skipping poll, forcing reconnect"
+            )
+            return None
+
         result: List[Optional[List[Dict[str, Any]]]] = [None]
         error: List[Optional[Exception]] = [None]
 
@@ -630,7 +726,8 @@ class UltraDeviceWorker(threading.Thread):
             except Exception as e:
                 error[0] = e
 
-        t = threading.Thread(target=_poll, daemon=True)
+        t = threading.Thread(target=_poll, daemon=True, name=f"UltraPoll-{self._device_id}")
+        self._watchdog_thread = t
         t0 = time.monotonic()
         t.start()
         t.join(timeout=self._poll_timeout_sec)
@@ -645,7 +742,11 @@ class UltraDeviceWorker(threading.Thread):
                 f"{self._prefix} poll_rtlog WATCHDOG TIMEOUT "
                 f"(>{self._poll_timeout_sec}s elapsed={elapsed_ms:.0f}ms) — forcing reconnect"
             )
+            # Leave _watchdog_thread set; next call will detect it's still alive
+            # and skip rather than orphan another thread.
             return None
+        # Thread finished — clear the reference so the next cycle can spawn fresh.
+        self._watchdog_thread = None
         if error[0]:
             logger.error(
                 f"{self._prefix} poll_rtlog ERROR: {error[0]} "
@@ -1294,6 +1395,8 @@ class UltraDeviceWorker(threading.Thread):
             "poll_ema_ms": round(self._poll_ema_ms, 1),
             "connect_failures": int(self._connect_failures or 0),
             "connect_retry_wait_ms": round(self._connect_wait_remaining() * 1000.0, 1),
+            "connect_down_since": self._connect_down_since_iso,
+            "connect_down_for_sec": round(self._down_for_seconds(), 1),
             "last_connect_error": self._last_connect_error,
             "last_connect_attempt_at": self._last_connect_attempt_at,
             "last_connect_success_at": self._last_connect_success_at,
@@ -1387,6 +1490,15 @@ class UltraSyncScheduler:
         """F-015: Clear in-memory hash for a device to force re-push on next cycle."""
         self._last_hash.pop(device_id, None)
         self._logger.info("[UltraSyncScheduler] force_resync: cleared hash for device_id=%s", device_id)
+
+    def update_devices(self, devices: List[Dict[str, Any]]) -> None:
+        """Replace the scheduler's device list with the latest payload.
+
+        Used together with UltraEngine.refresh_devices() so the scheduler's
+        loops (interval computation, _sync_all iteration) see the same data
+        the workers see.
+        """
+        self._devices = list(devices)
 
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
@@ -1910,6 +2022,65 @@ class UltraEngine:
             name="UltraWatchdog",
         )
         self._watchdog_thread.start()
+
+    def refresh_devices(self, devices: List[Dict[str, Any]]) -> int:
+        """Refresh each running ULTRA worker's device snapshot in place.
+
+        Workers cache the device dict at construction (self._device), which is
+        used to filter members against allowedMemberships at push time. When
+        the dashboard edits a device (adds memberships, changes doorIds, etc.)
+        a sync brings the new payload into local SQLite — but the in-memory
+        worker snapshots stay stale, so newly-allowed members get filtered out
+        and pin-deleted instead of pushed. Call this after every sync that
+        returned a refreshed devices section.
+
+        Returns the number of workers refreshed.
+        """
+        if not self._running:
+            return 0
+
+        from app.core.settings_reader import normalize_device_settings
+
+        def _adm(d):
+            return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
+
+        ultra_devices = [d for d in (devices or []) if _adm(d) == "ULTRA"]
+
+        refreshed = 0
+        for d in ultra_devices:
+            try:
+                device_id = int(d.get("id", 0))
+            except (TypeError, ValueError):
+                continue
+            if device_id <= 0:
+                continue
+            worker = self._workers.get(device_id)
+            if worker is None:
+                continue
+            try:
+                settings = normalize_device_settings(d)
+                d["_settings"] = settings
+                worker.update_device(d, settings)
+                refreshed += 1
+            except Exception as exc:
+                self._logger.warning(
+                    "[ULTRA:%s] refresh_devices failed: %s", device_id, exc
+                )
+
+        if refreshed > 0:
+            self._logger.info(
+                "[ULTRA] refreshed %d worker device snapshot(s) in place", refreshed
+            )
+
+        if self._sync_scheduler is not None:
+            try:
+                self._sync_scheduler.update_devices(ultra_devices)
+            except Exception as exc:
+                self._logger.warning(
+                    "[ULTRA] sync_scheduler.update_devices failed: %s", exc
+                )
+
+        return refreshed
 
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.

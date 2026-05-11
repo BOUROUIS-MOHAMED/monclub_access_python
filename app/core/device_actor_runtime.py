@@ -67,6 +67,25 @@ class DeviceActor:
                 except Exception as exc:
                     with self._state_lock:
                         self._last_error = str(exc)
+                    if message.kind in {"FULL_SYNC_START", "TARGETED_SYNC_START", "SYNC_NEXT_CHUNK"}:
+                        self._finish_current_sync(force_notify=True)
+
+    def _finish_current_sync(self, *, force_notify: bool = False) -> None:
+        should_notify = bool(force_notify)
+        with self._state_lock:
+            if self._current_sync_session is not None or self._current_sync_kind is not None:
+                should_notify = True
+            self._current_sync_session = None
+            self._current_sync_kind = None
+        if not should_notify:
+            return
+        callback = getattr(self.adapter, "on_sync_finished", None)
+        if not callable(callback):
+            return
+        try:
+            callback(device_id=self.device_id)
+        except TypeError:
+            callback(self.device_id)
 
     def _handle_message(self, message: ActorMessage) -> None:
         if message.kind == "OPEN_DOOR":
@@ -86,6 +105,8 @@ class DeviceActor:
                 self._current_sync_kind = "FULL_SYNC"
             if session and session.has_pending_work():
                 self.enqueue(ActorMessage.sync_next_chunk(device_id=self.device_id))
+            else:
+                self._finish_current_sync()
             return
 
         if message.kind == "TARGETED_SYNC_START":
@@ -101,6 +122,8 @@ class DeviceActor:
                 self._current_sync_kind = "TARGETED_SYNC"
             if session and session.has_pending_work():
                 self.enqueue(ActorMessage.sync_next_chunk(device_id=self.device_id))
+            else:
+                self._finish_current_sync()
             return
 
         if message.kind == "SYNC_NEXT_CHUNK":
@@ -111,4 +134,6 @@ class DeviceActor:
             self.adapter.run_sync_chunk(session)
             if session.has_pending_work():
                 self.enqueue(ActorMessage.sync_next_chunk(device_id=self.device_id))
+            else:
+                self._finish_current_sync()
             return

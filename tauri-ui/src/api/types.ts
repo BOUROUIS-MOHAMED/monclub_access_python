@@ -1586,7 +1586,7 @@ export interface ScannerStatus {
   lastResult: {
     cardNumber: string;
     timestamp: number;
-    source: "network" | "usb";
+    source: "network" | "usb" | "zkemkeeper";
   } | null;
 }
 

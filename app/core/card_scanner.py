@@ -34,7 +34,7 @@ class ScannerState(str, Enum):
 class ScanResult:
     card_number: str
     timestamp: float = 0.0
-    source: str = ""  # "network" or "usb"
+    source: str = ""  # "network", "usb", or "zkemkeeper"
 
     def __post_init__(self) -> None:
         if not self.timestamp:
@@ -249,10 +249,16 @@ class CardScanner:
             scanner = ZkemkeeperScanner()
             scanner.connect(ip=ip, port=port, timeout_ms=timeout_ms)
 
-            with self._lock:
-                self._state = ScannerState.SCANNING
+            def _mark_ready() -> None:
+                with self._lock:
+                    if self._state == ScannerState.CONNECTING and not self._stop_event.is_set():
+                        self._state = ScannerState.SCANNING
 
-            card = scanner.read_card_once(poll_sec=max(1, timeout_ms / 1000))
+            card = scanner.read_card_once(
+                poll_sec=max(1, timeout_ms / 1000),
+                on_ready=_mark_ready,
+                stop_event=self._stop_event,
+            )
             card = validate_card_number(card)
             if card:
                 result = ScanResult(card_number=card, source="zkemkeeper")

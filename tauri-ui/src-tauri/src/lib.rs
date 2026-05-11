@@ -1597,11 +1597,48 @@ fn setup_tray(
     }
 }
 
+// ─── Single-instance guard (per-role) ───
+
+#[cfg(target_os = "windows")]
+fn acquire_single_instance_lock(role: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::iter::once;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mutex_name = format!("Local\\MonClubUI.{}", role);
+    let wide: Vec<u16> = OsStr::new(&mutex_name).encode_wide().chain(once(0)).collect();
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, wide.as_ptr());
+        if handle.is_null() {
+            return true;
+        }
+        let last_err = GetLastError();
+        if last_err == ERROR_ALREADY_EXISTS {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn acquire_single_instance_lock(_role: &str) -> bool {
+    true
+}
+
 // ─── Main entry point ───
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let role = desktop_role();
+    if !acquire_single_instance_lock(&role) {
+        eprintln!(
+            "MonClub UI ({}) is already running — exiting this duplicate instance.",
+            role
+        );
+        return;
+    }
     let initial_api_port = desktop_api_port(&role);
     let start_hidden = should_start_hidden();
     let setup_role = role.clone();

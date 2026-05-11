@@ -22,7 +22,8 @@ _BACKOFF_SECONDS = [0, 120, 240, 480, 960, 3600]
 class LogUploadQueue:
     """
     Background daemon that uploads finalized log files to the backend via
-    presigned R2 URLs. Uses marker files for state — no SQLite, no DB.
+    presigned upload credentials (Cloudinary POST_MULTIPART or R2 PUT).
+    Uses marker files for state — no SQLite, no DB.
 
     Files are never touched by this class while the logger is actively writing to them.
 
@@ -214,7 +215,14 @@ class LogUploadQueue:
         return gzip.compress(data, compresslevel=6)
 
     def _upload(self, filename: str, compressed: bytes) -> bool:
-        """Two-step upload: get presigned URL, then PUT directly to R2."""
+        """Two-step upload: get presigned credentials, then upload directly to storage.
+
+        Supports two upload methods returned by the backend:
+          - POST_MULTIPART  — Cloudinary (default). Sends multipart/form-data with
+                              the signed formFields + the gzip file.
+          - PUT             — Cloudflare R2 / S3-compatible. Sends raw bytes with
+                              the provided headers.
+        """
         token_state = self._get_token()
         if token_state is None:
             _handler_logger.debug("LogUploadQueue: no auth token, skipping upload")
@@ -233,7 +241,7 @@ class LogUploadQueue:
         try:
             import requests
 
-            # Step 1: request presigned URL
+            # Step 1: request upload credentials from the backend
             resp = requests.post(
                 presign_url,
                 json={"filename": filename},
@@ -248,16 +256,37 @@ class LogUploadQueue:
                 return False
 
             data = resp.json()
-            put_url = data["url"]
-            put_headers = dict(data.get("headers") or {})
-            put_headers.setdefault("Content-Type", "application/gzip")
+            upload_url = data["url"]
+            method = data.get("method", "PUT").upper()
+            form_fields = dict(data.get("formFields") or {})
+            extra_headers = dict(data.get("headers") or {})
 
-            # Step 2: PUT directly to R2
-            put_resp = requests.put(put_url, data=compressed, headers=put_headers, timeout=120)
-            if put_resp.status_code < 200 or put_resp.status_code >= 300:
+            # Step 2: upload directly to storage
+            if method == "POST_MULTIPART":
+                # Cloudinary: multipart/form-data POST with signed fields + file
+                files = {
+                    "file": (filename + ".gz", compressed, "application/gzip"),
+                }
+                upload_resp = requests.post(
+                    upload_url,
+                    files=files,
+                    data=form_fields,
+                    timeout=120,
+                )
+            else:
+                # R2 / S3-compatible: raw PUT with Content-Type header
+                extra_headers.setdefault("Content-Type", "application/gzip")
+                upload_resp = requests.put(
+                    upload_url,
+                    data=compressed,
+                    headers=extra_headers,
+                    timeout=120,
+                )
+
+            if upload_resp.status_code < 200 or upload_resp.status_code >= 300:
                 _handler_logger.warning(
-                    "LogUploadQueue: R2 PUT failed HTTP %d for %s",
-                    put_resp.status_code, filename,
+                    "LogUploadQueue: storage upload failed HTTP %d for %s (method=%s)",
+                    upload_resp.status_code, filename, method,
                 )
                 return False
 

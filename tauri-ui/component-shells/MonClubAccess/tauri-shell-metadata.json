@@ -1,8 +1,8 @@
-﻿{
-    "component":  "access",
-    "displayName":  "MonClub Access",
-    "productArtifact":  "MonClubAccess",
-    "sourceExe":  "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\src-tauri\\target\\release\\monclub-access-ui.exe",
-    "stagedExe":  "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\component-shells\\MonClubAccess\\monclub-access-ui.exe",
-    "builtAtUtc":  "2026-04-13T17:05:50.7074413Z"
+{
+    "component": "access",
+    "displayName": "MonClub Access",
+    "productArtifact": "MonClubAccess",
+    "sourceExe": "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\src-tauri\\target\\release\\monclub-access-ui.exe",
+    "stagedExe": "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\component-shells\\MonClubAccess\\monclub-access-ui.exe",
+    "builtAtUtc": "2026-05-11T11:45:22.070858Z"
 }

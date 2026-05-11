@@ -1,6 +1,6 @@
 {
   "productName": "MonClub Access",
-  "version": "1.1.8",
+  "version": "1.2.0",
   "identifier": "com.monclub.access",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -20,7 +20,9 @@
         "decorations": true
       }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": null
+    }
   },
   "bundle": {
     "active": true,
@@ -34,4 +36,3 @@
     ]
   }
 }
-

@@ -296,3 +296,51 @@ def test_agent_events_sse_delivers_ultra_popup_when_agent_engine_is_absent() -> 
 
     popup_events = [data for event, data in ctx.events if event == "popup"]
     assert popup_events == [popup_payload]
+
+
+class _IdleUltraEngine:
+    """Ultra engine that's running but never produces popups (idle gym)."""
+
+    def __init__(self) -> None:
+        self.running = True
+
+    def get_latest_popup_event_seq(self) -> int:
+        return 0
+
+    def get_popup_events_since(self, seq: int, limit: int = 10) -> list[tuple[int, dict[str, object]]]:
+        return []
+
+
+def test_agent_events_sse_emits_heartbeat_during_idle_and_exits_on_dead_client() -> None:
+    """Regression for overnight UI freeze: when no popups/status changes occur,
+    the handler must still ping periodically to detect a dead client.
+
+    Without the ping the handler loops forever in time.sleep(0.25), the native
+    EventSource reconnects after its idle timeout, and one thread leaks per
+    reconnect — eventually exhausting the process thread budget."""
+
+    ctx = _FakePopupStreamCtx(_PopupStreamApp(_IdleUltraEngine()))
+    sent: list[tuple[str, object]] = []
+
+    def _fake_send(event: str, data: object) -> bool:
+        sent.append((event, data))
+        # Simulate a dead client: any heartbeat ping fails immediately.
+        # Non-ping events (e.g. the initial "status") succeed so the loop runs.
+        return event != "ping"
+
+    ctx.send_sse_event = _fake_send  # type: ignore[assignment]
+
+    # Virtual clock: each time.time() call advances 1s. After ~15 iterations
+    # the heartbeat threshold trips and the handler emits a ping.
+    clock = [1000.0]
+
+    def _fake_time() -> float:
+        clock[0] += 1.0
+        return clock[0]
+
+    with patch.object(local_access_api_v2.time, "sleep", lambda _s: None), \
+         patch.object(local_access_api_v2.time, "time", _fake_time):
+        local_access_api_v2._handle_agent_events_sse(ctx)
+
+    assert any(event == "ping" for event, _ in sent), \
+        "idle agent_events SSE must emit a heartbeat to detect dead clients"

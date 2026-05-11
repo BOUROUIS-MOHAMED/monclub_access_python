@@ -1,10 +1,10 @@
 {
   "access": {
-    "version": "1.1.8",
-    "codename": "Cake"
+    "version": "1.2.0",
+    "codename": "Orange"
   },
   "tv": {
-    "version": "1.1.7",
-    "codename": "Cake"
+    "version": "1.2.0",
+    "codename": "Orange"
   }
 }

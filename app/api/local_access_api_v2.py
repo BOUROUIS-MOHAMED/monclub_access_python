@@ -21,6 +21,7 @@ import mimetypes
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -672,6 +673,34 @@ _status_payload_building: tuple[int, threading.Event] | None = None
 _STATUS_PAYLOAD_TTL = 1.0  # seconds
 
 
+# Thread-count canary: warns early if a future leak starts accumulating
+# threads, so we don't have to wait for the process to freeze to notice.
+_thread_canary_lock = threading.Lock()
+_thread_canary_last_warn_at = 0.0
+
+
+def _check_thread_count_canary() -> None:
+    global _thread_canary_last_warn_at
+    try:
+        n = threading.active_count()
+    except Exception:
+        return
+    if n < 200:
+        return
+    now = time.time()
+    with _thread_canary_lock:
+        if now - _thread_canary_last_warn_at < 300.0:
+            return
+        _thread_canary_last_warn_at = now
+    level = logging.CRITICAL if n >= 500 else logging.WARNING
+    _logger.log(
+        level,
+        "[ThreadCanary] threading.active_count()=%d — investigate SSE handlers / "
+        "watchdog threads before the process exhausts its thread budget",
+        n,
+    )
+
+
 def _build_status_payload(app: Any) -> Dict[str, Any]:
     global _status_payload_cache, _status_payload_building
     now = time.monotonic()
@@ -713,6 +742,8 @@ def _build_status_payload(app: Any) -> Dict[str, Any]:
                 _status_payload_building = None
         if build_evt is not None:
             build_evt.set()
+
+    _check_thread_count_canary()
 
     with _status_payload_lock:
         _status_payload_cache = (time.monotonic() + _STATUS_PAYLOAD_TTL, app_id, result)
@@ -3538,6 +3569,24 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
     if ultra_eng and ultra_eng.running:
         worker = ultra_eng._workers.get(did)
         if worker:
+            # P7: short-circuit if we already know the device is unreachable.
+            # Without this, every "Open door" click during an outage waits the
+            # full 2 s command-queue timeout before returning 500. Production
+            # logs showed 2.5 s p50 and 14.6 s peak for door-open during the
+            # Door 2 outage — the UI looked frozen for every click.
+            down_for = float(getattr(worker, "_down_for_seconds", lambda: 0.0)())
+            if down_for > 0 and not getattr(worker, "_connected", False):
+                _logger.info(
+                    "[LocalAPI] door_open short-circuit: device_id=%s offline_for=%.0fs",
+                    did, down_for,
+                )
+                ctx.send_json(503, {
+                    "ok": False,
+                    "error": "device unreachable",
+                    "downForSec": round(down_for, 1),
+                    "lastConnectError": str(getattr(worker, "_last_connect_error", "")),
+                })
+                return
             _logger.info(
                 "[LocalAPI] ULTRA door open via command queue: device_id=%s door=%s pulse_sec=%s",
                 did, door, pulse_sec,
@@ -3548,6 +3597,15 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
             if ok:
                 _logger.info("[LocalAPI] ULTRA door open OK: device_id=%s door=%s", did, door)
                 ctx.send_json(200, {"ok": True, "rc": 0, "source": "ultra"})
+            elif err == "timeout":
+                # Worker took the command but didn't ack in time — likely
+                # mid-reconnect. Tell the UI it's unreachable, not a server
+                # crash, so it can render an "offline" state instead of a 500.
+                _logger.warning(
+                    "[LocalAPI] ULTRA door open timed out: device_id=%s door=%s",
+                    did, door,
+                )
+                ctx.send_json(503, {"ok": False, "error": "device unreachable (command timed out)"})
             else:
                 _logger.warning("[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s", did, door, err)
                 ctx.send_json(500, {"ok": False, "error": err or "door open failed"})
@@ -3556,7 +3614,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
     # Fallback: direct PullSDK connect (DEVICE-mode or unmanaged devices)
     sdk, err = _connect_device(ctx, did)
     if err:
-        ctx.send_json(500, {"ok": False, "error": err})
+        ctx.send_json(503, {"ok": False, "error": err})
         return
     try:
         rc = sdk.door_pulse_open(door=door, seconds=pulse_sec)
@@ -3876,7 +3934,18 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
         type(eng).__name__ if eng else None,
         bool(eng and eng.is_running()),
     )
+
+    # Enable OS-level TCP keepalive so a half-open connection (peer crashed,
+    # router NAT timed out) is detected without depending on the next write.
+    try:
+        sock = ctx.handler.request
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
     ctx.send_sse_start()
+    handler_start_mono = time.monotonic()
+    MAX_LIFETIME_SEC = 1800.0  # 30 min — bound resource usage; client reconnects
 
     # send initial status
     ultra_eng = getattr(ctx.app, "_ultra_engine", None)
@@ -3906,19 +3975,35 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
             last_ultra_popup_seq = 0
 
     last_snap: Dict[int, Dict[str, Any]] = {}
+    # Heartbeat: without periodic writes the handler can't detect a dead client
+    # during idle periods (no popups, no status changes). The native EventSource
+    # silently reconnects every ~7-30s, leaving this thread orphaned and leaking
+    # one thread per reconnect — eventually exhausting the process.
+    last_ping = time.time()
+    PING_INTERVAL_SEC = 15.0
     while True:
         try:
             time.sleep(0.25)
+
+            if time.monotonic() - handler_start_mono >= MAX_LIFETIME_SEC:
+                _logger.info(
+                    "[SSE/agent_events] closing after max lifetime (%ds), client will reconnect: %s:%s",
+                    int(MAX_LIFETIME_SEC), client_addr[0], client_addr[1],
+                )
+                return
 
             eng = getattr(ctx.app, "_agent_engine", None)
             ultra_eng = getattr(ctx.app, "_ultra_engine", None)
             agent_running = bool(eng and eng.is_running())
             ultra_running = bool(ultra_eng and ultra_eng.running)
 
+            wrote_event = False
+
             if not agent_running and not ultra_running:
                 alive = ctx.send_sse_event("status", {"running": False})
                 if not alive:
                     return
+                last_ping = time.time()
                 time.sleep(1.0)
                 continue
 
@@ -3931,6 +4016,7 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                         if not alive:
                             return
                         last_snap = snap
+                        wrote_event = True
                 except Exception:
                     pass
 
@@ -3957,6 +4043,7 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                         )
                         return
                     last_popup_seq = popup_seq
+                    wrote_event = True
 
             if ultra_running:
                 try:
@@ -3979,6 +4066,19 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                         )
                         return
                     last_ultra_popup_seq = popup_seq
+                    wrote_event = True
+
+            now = time.time()
+            if wrote_event:
+                last_ping = now
+            elif now - last_ping >= PING_INTERVAL_SEC:
+                last_ping = now
+                if not ctx.send_sse_event("ping", {"t": int(now)}):
+                    _logger.info(
+                        "[SSE/agent_events] client disconnected (ping failed): %s:%s",
+                        client_addr[0], client_addr[1],
+                    )
+                    return
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as _pipe_exc:
             _logger.info(

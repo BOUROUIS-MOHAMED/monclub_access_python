@@ -74,4 +74,4 @@ def test_targeted_sync_builds_session_once_and_runs_chunks():
 
     assert adapter.calls[0] == ("TARGETED_SYNC", (11, 13))
     assert adapter.calls[1][0] == "SYNC"
-    assert actor.get_status()["current_sync_kind"] == "TARGETED_SYNC"
+    assert actor.get_status()["current_sync_kind"] is None

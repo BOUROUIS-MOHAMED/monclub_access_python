@@ -231,8 +231,12 @@ class _DeviceSyncActorAdapter:
             default_door_id=int(session.default_door_id),
             changed_ids=None if session.changed_ids is None else set(session.changed_ids),
             sync_run_id=session.sync_run_id,
+            report_progress=False,
         )
         return True
+
+    def on_sync_finished(self, *, device_id: int) -> None:
+        self._engine._finish_actor_dispatch_progress(device_id=int(device_id))
 
     def _build_session(self, *, changed_ids: Set[int] | None) -> _OneShotDeviceSyncSession:
         context = self._engine._get_actor_dispatch_context()
@@ -297,6 +301,10 @@ class DeviceSyncEngine:
         self._actor_registry = DeviceActorRegistry(
             adapter_factory=self._build_actor_adapter,
         )
+        # P9: captured by _run_single_device_sync on exception so the ULTRA
+        # worker (or any other caller) can surface it as last_full_sync_error
+        # instead of silently treating a failed sync as successful.
+        self._last_single_device_error: str = ""
 
     def _build_actor_adapter(self, device: Dict[str, Any]) -> "_DeviceSyncActorAdapter":
         return _DeviceSyncActorAdapter(engine=self, device=device)
@@ -384,6 +392,60 @@ class DeviceSyncEngine:
                 self._progress_seq += 1
                 self._progress_cond.notify_all()
 
+    def _begin_actor_dispatch_progress(self, *, dispatched: int) -> None:
+        dispatched = int(dispatched or 0)
+        if dispatched <= 0:
+            return
+        with self._progress_cond:
+            current = int(self._sync_progress.get("current") or 0)
+            total = int(self._sync_progress.get("total") or 0)
+            running = bool(self._sync_progress.get("running"))
+            reset = (not running) or total <= current
+            next_current = 0 if reset else current
+            next_total = dispatched if reset else total + dispatched
+
+            changed = False
+            for key, value in {
+                "running": True,
+                "deviceName": "",
+                "deviceId": None,
+                "current": next_current,
+                "total": next_total,
+            }.items():
+                if self._sync_progress.get(key) != value:
+                    self._sync_progress[key] = value
+                    changed = True
+            if changed:
+                self._progress_seq += 1
+                self._progress_cond.notify_all()
+
+    def _finish_actor_dispatch_progress(self, *, device_id: int) -> None:
+        with self._progress_cond:
+            total = int(self._sync_progress.get("total") or 0)
+            current = int(self._sync_progress.get("current") or 0)
+            if total <= 0 or current >= total:
+                return
+
+            next_current = min(total, current + 1)
+            changes = {
+                "current": next_current,
+            }
+            if next_current >= total:
+                changes.update({
+                    "running": False,
+                    "deviceName": "",
+                    "deviceId": None,
+                })
+
+            changed = False
+            for key, value in changes.items():
+                if self._sync_progress.get(key) != value:
+                    self._sync_progress[key] = value
+                    changed = True
+            if changed:
+                self._progress_seq += 1
+                self._progress_cond.notify_all()
+
     def get_progress_snapshot(self) -> tuple[Dict[str, Any], int]:
         with self._progress_cond:
             return dict(self._sync_progress), self._progress_seq
@@ -397,6 +459,7 @@ class DeviceSyncEngine:
     def stop_workers(self) -> None:
         """Stop all per-device worker threads. Call on logout / shutdown."""
         self._actor_registry.stop_all()
+        self._set_progress(running=False, deviceName="", deviceId=None, current=0, total=0)
 
     def run_blocking(
         self,
@@ -549,8 +612,17 @@ class DeviceSyncEngine:
                 **sync_kwargs,
             )
             self._set_progress(current=1)
+            self._last_single_device_error = ""
             return True
         except Exception as e:
+            # P9: capture the error so the ULTRA worker can surface it via
+            # last_full_sync_error. Previously the exception was logged here
+            # and swallowed; the ULTRA worker then reported the sync as
+            # successful because it only inspected the absence of an exception
+            # *at its own call site*. Production logs showed PullSDKError
+            # (table=user rc=-2) silently failing user-table refresh while
+            # the UI's full-sync status showed green.
+            self._last_single_device_error = str(e) or e.__class__.__name__
             self.logger.exception(f"[DeviceSync] Single-device sync failed: {e}")
             return False
         finally:
@@ -1674,6 +1746,7 @@ class DeviceSyncEngine:
         changed_ids: set | None = None,
         sync_run_id: int | None = None,
         sdk: PullSDK | None = None,
+        report_progress: bool = True,
     ) -> None:
         dev_id = device.get("id")
         dev_name = device.get("name") or ""
@@ -1686,6 +1759,10 @@ class DeviceSyncEngine:
         pins_sorted: List[str] = []
         pin_outcomes: Dict[str, Dict[str, Any]] = {}
         batch_error: str | None = None
+
+        def _maybe_set_progress(**changes: Any) -> None:
+            if report_progress:
+                self._set_progress(**changes)
 
         door_ids, door_bitmask, authorize_timezone_id, fingerprint_enabled = self._resolve_push_context(
             device=device,
@@ -1961,7 +2038,7 @@ class DeviceSyncEngine:
             failed_synced = 0
 
             # Expose live progress for the frontend banner.
-            self._set_progress(
+            _maybe_set_progress(
                 deviceName=dev_name or "",
                 deviceId=did,
                 current=0,
@@ -2014,7 +2091,7 @@ class DeviceSyncEngine:
                                 predelete_progress_cap > 0
                                 and (idx == len(pins_sorted) or idx % predelete_progress_step == 0)
                             ):
-                                self._set_progress(current=min(predelete_progress_cap, idx))
+                                _maybe_set_progress(current=min(predelete_progress_cap, idx))
 
                 # Record the strategy choice after first successful run (informational; no-op if already cached).
                 if profile.insert_strategy is None:
@@ -2049,7 +2126,7 @@ class DeviceSyncEngine:
                     def _user_progress_cb(ok_so_far: int, _batch_total: int) -> None:
                         # Map user-phase progress to 0..total: the user push is the
                         # dominant wall-clock phase, so tracking it drives the bar.
-                        self._set_progress(current=min(_total_pins, ok_so_far))
+                        _maybe_set_progress(current=min(_total_pins, ok_so_far))
 
                     ok_u, failed_u = sdk.set_device_data_batch(
                         table="user", rows=user_rows, chunk_size=50,
@@ -2082,7 +2159,7 @@ class DeviceSyncEngine:
                         _retry_baseline = pushed_users  # already-successful carry-over
 
                         def _retry_progress_cb(ok_so_far: int, _batch_total: int) -> None:
-                            self._set_progress(
+                            _maybe_set_progress(
                                 current=min(_retry_total, _retry_baseline + ok_so_far)
                             )
 
@@ -2186,7 +2263,7 @@ class DeviceSyncEngine:
                         _auth_total = len(pins_sorted)
 
                         def _auth_progress_cb(_ok_so_far: int, _batch_total: int) -> None:
-                            self._set_progress(current=_auth_total)
+                            _maybe_set_progress(current=_auth_total)
 
                         ok_a, failed_a = sdk.set_device_data_batch(
                             table="userauthorize", rows=auth_rows, chunk_size=50,
@@ -2290,7 +2367,7 @@ class DeviceSyncEngine:
                             "[DeviceSync] Device id=%s save_device_sync_state_batch failed "
                             "(%d rows): %s", dev_id, len(_batch_state_rows), _batch_err
                         )
-                self._set_progress(current=ok_synced)
+                _maybe_set_progress(current=ok_synced)
                 self.logger.info(
                     "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
                     dev_id, pushed_users, len(pins_sorted), pushed_templates,
@@ -2442,11 +2519,11 @@ class DeviceSyncEngine:
                                 )
                             except Exception:
                                 pass
-                        self._set_progress(current=ok_synced + failed_synced)
+                        _maybe_set_progress(current=ok_synced + failed_synced)
 
                     except Exception as ex:
                         failed_synced += 1
-                        self._set_progress(current=ok_synced + failed_synced)
+                        _maybe_set_progress(current=ok_synced + failed_synced)
                         save_device_sync_state(
                             device_id=did, pin=pin,
                             desired_hash=None, ok=False, error=str(ex),
@@ -2655,7 +2732,9 @@ class DeviceSyncEngine:
             }
         )
         if normalized_changed_ids is not None and not normalized_changed_ids:
-            self._set_progress(running=False, current=0, total=0)
+            progress, _ = self.get_progress_snapshot()
+            if not progress.get("running"):
+                self._set_progress(running=False, deviceName="", deviceId=None, current=0, total=0)
             self.logger.info("[DeviceSync] delta sync no-op: changed_ids empty -> skip actor dispatch")
             return
 
@@ -2707,7 +2786,7 @@ class DeviceSyncEngine:
                 device_ids=device_ids,
                 member_ids=set(normalized_changed_ids),
             )
-        self._set_progress(running=True, current=0, total=dispatched)
+        self._begin_actor_dispatch_progress(dispatched=dispatched)
         self.logger.info(
             "[DeviceSync] dispatched actor sync to %d device workers (changed_ids=%s)",
             dispatched,

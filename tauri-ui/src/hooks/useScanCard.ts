@@ -12,38 +12,54 @@ export function useScanCard() {
   const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveredDevice[]>([]);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const startScan = useCallback(async (overrides?: { mode?: string; ip?: string }) => {
-    try {
-      await post("/scanner/start", overrides || {});
-      // Poll status until idle/error
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await get<{ ok: boolean; scanner: ScannerStatus }>("/scanner/status");
-          setStatus(res.scanner);
-          if (res.scanner.state === "idle" || res.scanner.state === "error") {
-            if (pollRef.current) clearInterval(pollRef.current);
-          }
-        } catch {
-          // ignore poll errors
-        }
-      }, 300);
-    } catch (e) {
-      setStatus((s) => ({ ...s, state: "error", error: String(e) }));
-    }
-  }, []);
-
-  const stopScan = useCallback(async () => {
+  const stopPolling = useCallback(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
       pollRef.current = null;
     }
+  }, []);
+
+  const fetchScannerStatus = useCallback(async () => {
+    const res = await get<{ ok: boolean; scanner: ScannerStatus }>("/scanner/status");
+    setStatus(res.scanner);
+    if (res.scanner.state === "idle" || res.scanner.state === "error") {
+      stopPolling();
+    }
+    return res.scanner;
+  }, [stopPolling]);
+
+  const startScan = useCallback(async (overrides?: { mode?: string; ip?: string }) => {
+    stopPolling();
+    setStatus({
+      state: "connecting",
+      error: "",
+      lastResult: null,
+    });
+    try {
+      await post("/scanner/start", overrides || {});
+      const initialStatus = await fetchScannerStatus().catch(() => null);
+      if (!initialStatus || (initialStatus.state !== "idle" && initialStatus.state !== "error")) {
+        pollRef.current = setInterval(() => {
+          void fetchScannerStatus().catch(() => {
+            // ignore poll errors
+          });
+        }, 150);
+      }
+    } catch (e) {
+      stopPolling();
+      setStatus((s) => ({ ...s, state: "error", error: String(e) }));
+    }
+  }, [fetchScannerStatus, stopPolling]);
+
+  const stopScan = useCallback(async () => {
+    stopPolling();
     try {
       await post("/scanner/stop");
     } catch {
       // ignore
     }
     setStatus({ state: "idle", error: "", lastResult: null });
-  }, []);
+  }, [stopPolling]);
 
   const startDiscover = useCallback(async () => {
     setDiscovering(true);
@@ -71,9 +87,9 @@ export function useScanCard() {
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+      stopPolling();
     };
-  }, []);
+  }, [stopPolling]);
 
   return { status, startScan, stopScan, startDiscover, discovering, discoveredDevices };
 }

@@ -1,4 +1,5 @@
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -43,11 +44,9 @@ def test_sync_all_devices_routes_full_reconcile_to_actor_registry(monkeypatch):
         enqueue_targeted_sync=MagicMock(return_value=0),
         stop_all=MagicMock(),
     )
-    progress_calls = []
 
     monkeypatch.setattr(engine, "_actor_registry", fake_registry)
     monkeypatch.setattr("app.core.device_sync.list_fingerprints", lambda: [])
-    monkeypatch.setattr(engine, "_set_progress", lambda **kwargs: progress_calls.append(kwargs))
 
     engine._sync_all_devices(
         cache=SimpleNamespace(
@@ -61,7 +60,10 @@ def test_sync_all_devices_routes_full_reconcile_to_actor_registry(monkeypatch):
     fake_registry.update_devices.assert_called_once()
     fake_registry.enqueue_full_reconcile.assert_called_once_with(device_ids={7, 8})
     fake_registry.enqueue_targeted_sync.assert_not_called()
-    assert progress_calls[-1]["total"] == 2
+    progress, _ = engine.get_progress_snapshot()
+    assert progress["running"] is True
+    assert progress["current"] == 0
+    assert progress["total"] == 2
 
 
 def test_sync_all_devices_skips_actor_dispatch_for_empty_delta(monkeypatch):
@@ -121,3 +123,44 @@ def test_sync_all_devices_skips_global_fingerprint_scan_when_no_device_uses_fing
     )
 
     assert fingerprint_calls["count"] == 0
+
+
+def test_actor_dispatch_marks_progress_complete_after_workers_finish(monkeypatch):
+    from app.core.device_sync import DeviceSyncEngine
+
+    engine = DeviceSyncEngine(cfg=MagicMock(), logger=logging.getLogger("test"))
+
+    monkeypatch.setattr("app.core.device_sync.list_fingerprints", lambda: [])
+    monkeypatch.setattr(
+        engine,
+        "_sync_one_device",
+        lambda **kwargs: time.sleep(0.01),
+    )
+
+    try:
+        engine._sync_all_devices(
+            cache=SimpleNamespace(
+                users=[make_user(1), make_user(2)],
+                devices=[make_device(7), make_device(8)],
+            ),
+            changed_ids=None,
+            sync_run_id=777,
+        )
+
+        deadline = time.time() + 1.0
+        progress = {}
+        while time.time() < deadline:
+            progress, _ = engine.get_progress_snapshot()
+            if (
+                progress.get("running") is False
+                and progress.get("current") == 2
+                and progress.get("total") == 2
+            ):
+                break
+            time.sleep(0.01)
+
+        assert progress["running"] is False
+        assert progress["current"] == 2
+        assert progress["total"] == 2
+    finally:
+        engine.stop_workers()

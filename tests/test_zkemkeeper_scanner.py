@@ -1,67 +1,110 @@
-import types
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+import threading
 
 import pytest
 
-from app.core import zkemkeeper_scanner as scanner_module
 from app.core.zkemkeeper_scanner import ZkemkeeperError, ZkemkeeperScanner
 
 
-def test_read_card_once_prefers_hid_event() -> None:
-    com = SimpleNamespace(
-        GetHIDEventCardNumAsStr=MagicMock(return_value=(True, "8175134")),
-        GetStrCardNumber=MagicMock(return_value="999"),
-    )
-    scanner = ZkemkeeperScanner(_com=com)
-    assert scanner.read_card_once(poll_sec=0.05) == "8175134"
+class _FakeStream:
+    def __init__(self, lines: list[str], on_eof) -> None:
+        self._lines = list(lines)
+        self._index = 0
+        self._closed = False
+        self._on_eof = on_eof
+
+    def readline(self) -> str:
+        if self._index < len(self._lines):
+            line = self._lines[self._index]
+            self._index += 1
+            return line
+
+        if not self._closed:
+            self._closed = True
+            self._on_eof()
+        return ""
 
 
-def test_read_card_once_falls_back_to_getstrcardnumber() -> None:
-    com = SimpleNamespace(
-        GetHIDEventCardNumAsStr=MagicMock(return_value=(False, "")),
-        GetStrCardNumber=MagicMock(return_value="445566"),
-    )
-    scanner = ZkemkeeperScanner(_com=com)
-    assert scanner.read_card_once(poll_sec=0.05) == "445566"
+class _FakePopen:
+    def __init__(self, stdout_lines: list[str], stderr_lines: list[str], returncode: int) -> None:
+        self._returncode = returncode
+        self.returncode = None
+        self._open_streams = 2
+        self.terminated = False
+        self.killed = False
+        self.stdout = _FakeStream(stdout_lines, self._mark_stream_closed)
+        self.stderr = _FakeStream(stderr_lines, self._mark_stream_closed)
+
+    def _mark_stream_closed(self) -> None:
+        self._open_streams -= 1
+        if self._open_streams <= 0 and self.returncode is None:
+            self.returncode = self._returncode
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise TimeoutError("process still running")
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
 
 
-def test_read_card_once_times_out() -> None:
-    com = SimpleNamespace(
-        GetHIDEventCardNumAsStr=MagicMock(return_value=(False, "")),
-        GetStrCardNumber=MagicMock(return_value=""),
-    )
-    scanner = ZkemkeeperScanner(_com=com)
+def test_read_card_once_waits_for_ready_before_returning_card(monkeypatch) -> None:
+    fake_proc = _FakePopen(["READY\n", "CARD:8175134\n"], [], 0)
+
+    monkeypatch.setattr("app.core.zkemkeeper_scanner._find_powershell", lambda: "powershell.exe")
+    monkeypatch.setattr("app.core.zkemkeeper_scanner.subprocess.Popen", lambda *args, **kwargs: fake_proc)
+
+    scanner = ZkemkeeperScanner()
+    scanner.connect(ip="192.168.0.201", port=4370, timeout_ms=5000)
+    ready_calls = []
+
+    assert scanner.read_card_once(poll_sec=5.0, on_ready=lambda: ready_calls.append("ready")) == "8175134"
+    assert ready_calls == ["ready"]
+
+
+def test_read_card_once_returns_empty_when_stop_requested(monkeypatch) -> None:
+    fake_proc = _FakePopen([], [], 0)
+
+    monkeypatch.setattr("app.core.zkemkeeper_scanner._find_powershell", lambda: "powershell.exe")
+    monkeypatch.setattr("app.core.zkemkeeper_scanner.subprocess.Popen", lambda *args, **kwargs: fake_proc)
+
+    scanner = ZkemkeeperScanner()
+    scanner.connect(ip="192.168.0.201", port=4370, timeout_ms=5000)
+    stop_event = threading.Event()
+    stop_event.set()
+
+    assert scanner.read_card_once(poll_sec=5.0, stop_event=stop_event) == ""
+
+
+def test_read_card_once_times_out_when_powershell_reports_timeout(monkeypatch) -> None:
+    fake_proc = _FakePopen(["READY\n", "TIMEOUT\n"], [], 3)
+
+    monkeypatch.setattr("app.core.zkemkeeper_scanner._find_powershell", lambda: "powershell.exe")
+    monkeypatch.setattr("app.core.zkemkeeper_scanner.subprocess.Popen", lambda *args, **kwargs: fake_proc)
+
+    scanner = ZkemkeeperScanner()
+    scanner.connect(ip="192.168.0.201", port=4370, timeout_ms=5000)
+
     with pytest.raises(ZkemkeeperError, match="No card detected"):
-        scanner.read_card_once(poll_sec=0.02)
+        scanner.read_card_once(poll_sec=5.0)
 
 
-def test_load_com_falls_back_to_comtypes_when_pywin32_missing(monkeypatch) -> None:
-    fake_com = object()
+def test_read_card_once_raises_connect_fail(monkeypatch) -> None:
+    fake_proc = _FakePopen(["ERROR:CONNECT_FAIL\n"], [], 2)
 
-    def fake_import_module(name: str):
-        if name == "win32com.client":
-            raise ModuleNotFoundError("No module named 'win32com'")
-        if name == "comtypes.client":
-            return types.SimpleNamespace(
-                CreateObject=MagicMock(return_value=fake_com)
-            )
-        raise AssertionError(f"unexpected import: {name}")
-
-    monkeypatch.setattr(scanner_module.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr("app.core.zkemkeeper_scanner._find_powershell", lambda: "powershell.exe")
+    monkeypatch.setattr("app.core.zkemkeeper_scanner.subprocess.Popen", lambda *args, **kwargs: fake_proc)
 
     scanner = ZkemkeeperScanner()
+    scanner.connect(ip="192.168.0.201", port=4370, timeout_ms=5000)
 
-    assert scanner._load_com() is fake_com
-
-
-def test_load_com_reports_both_missing_dependencies(monkeypatch) -> None:
-    def fake_import_module(name: str):
-        raise ModuleNotFoundError(f"No module named '{name}'")
-
-    monkeypatch.setattr(scanner_module.importlib, "import_module", fake_import_module)
-
-    scanner = ZkemkeeperScanner()
-
-    with pytest.raises(ZkemkeeperError, match="pywin32 or comtypes"):
-        scanner._load_com()
+    with pytest.raises(ZkemkeeperError, match="Cannot connect to SCR100"):
+        scanner.read_card_once(poll_sec=5.0)

@@ -22,6 +22,34 @@ def _is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
 from shared.runtime_support import runtime_base_dir
 
 
+def _orphan_image_for_role(role: str) -> str:
+    return "monclub-tv-ui.exe" if str(role or "").strip().lower() == "tv" else "monclub-access-ui.exe"
+
+
+def _kill_orphan_role_processes(role: str, logger) -> None:
+    """Best-effort: taskkill any leftover UI shell processes for *role*.
+
+    These can accumulate when a prior Python process crashed before its own
+    `_kill_tauri_ui` ran — leaving the Tauri shell (and its tray icon) alive
+    forever. Run this before we spawn our own shell so we don't end up with
+    duplicate tray icons on Windows.
+    """
+    if os.name != "nt":
+        return
+    image = _orphan_image_for_role(role)
+    try:
+        result = subprocess.run(
+            ["taskkill", "/F", "/T", "/IM", image],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            logger.info("[Tauri:%s] Cleaned up orphan UI processes: %s", role, image)
+    except Exception as exc:
+        logger.debug("[Tauri:%s] Orphan cleanup skipped: %s", role, exc)
+
+
 def launch_tauri_ui(
     *,
     role: str,
@@ -37,6 +65,7 @@ def launch_tauri_ui(
         return existing_process
 
     normalized_role = str(role or "access").strip().lower() or "access"
+    _kill_orphan_role_processes(normalized_role, logger)
 
     runtime_base = runtime_base_dir()
     bundled_candidates = []

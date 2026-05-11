@@ -25,12 +25,33 @@ function useApi<T>(fetcher: () => Promise<T>, deps: unknown[] = []) {
 }
 
 // ── Unified status polling (GET /api/v2/status) ──
+// P10: stop polling after 5 consecutive 401s. Production logs showed an orphan
+// Tauri shell hammering /status every 15 s for 1 h+ with a stale X-Local-Token,
+// generating 249 useless 401 lines. After the cap we go quiet until the user
+// retriggers (window focus, manual reload).
+const AUTH_FAILURE_LIMIT = 5;
+
 export function useStatus(pollMs = 5000) {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const authFailures = useRef(0);
+  const stoppedRef = useRef(false);
   const load = useCallback(async () => {
-    try { setStatus(await get<StatusResponse>("/status")); setError(null); }
-    catch (e) { setError(e instanceof ApiError ? e.message : String(e)); }
+    if (stoppedRef.current) return;
+    try {
+      setStatus(await get<StatusResponse>("/status"));
+      setError(null);
+      authFailures.current = 0;
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+      if (e instanceof ApiError && e.status === 401) {
+        authFailures.current += 1;
+        if (authFailures.current >= AUTH_FAILURE_LIMIT) {
+          stoppedRef.current = true;
+          console.warn(`[useStatus] stopping polling after ${AUTH_FAILURE_LIMIT} consecutive 401s — stale token`);
+        }
+      }
+    }
   }, []);
   useEffect(() => { load(); const id = setInterval(load, pollMs); return () => clearInterval(id); }, [load, pollMs]);
   return { status, error, reload: load };
@@ -80,14 +101,28 @@ export function useSyncTrigger() {
 export function useAgentStatus(pollMs = 3000) {
   const [status, setStatus] = useState<AgentStatusResponse | null>(null);
   const [devices, setDevices] = useState<AgentDeviceSnap>({});
+  const authFailures = useRef(0);
+  const stoppedRef = useRef(false);
   const load = useCallback(async () => {
+    if (stoppedRef.current) return;
     try {
       const [s, d] = await Promise.all([
         get<AgentStatusResponse>("/agent/status"),
         get<{ devices: AgentDeviceSnap }>("/agent/devices"),
       ]);
       setStatus(s); setDevices(d.devices);
-    } catch { /* silent poll fail */ }
+      authFailures.current = 0;
+    } catch (e) {
+      // P10: stop after 5 consecutive 401s to prevent log floods from stale-
+      // token UI clients (see useStatus comment).
+      if (e instanceof ApiError && e.status === 401) {
+        authFailures.current += 1;
+        if (authFailures.current >= AUTH_FAILURE_LIMIT) {
+          stoppedRef.current = true;
+          console.warn(`[useAgentStatus] stopping polling after ${AUTH_FAILURE_LIMIT} consecutive 401s — stale token`);
+        }
+      }
+    }
   }, []);
   useEffect(() => { load(); const id = setInterval(load, pollMs); return () => clearInterval(id); }, [load, pollMs]);
   return { status, devices, reload: load };

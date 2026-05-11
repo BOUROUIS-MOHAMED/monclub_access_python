@@ -70,8 +70,13 @@ export function useTrayIntegration(apiPort: number = 8788): {
     // Set port + initial menu refresh
     refreshTray();
 
-    // Refresh tray menu periodically (every 30s) to pick up new devices/presets
-    const interval = setInterval(refreshTray, 30_000);
+    // P8: refresh tray menu periodically to pick up new devices/presets.
+    // Was 30 s, which generated 4320 HTTP hits per 12 h log just for the
+    // tray menu (1 device list + 2 preset fetches per cycle, × 2 hooks if a
+    // duplicate shell was running). Devices and presets rarely change at
+    // runtime — 5 min is plenty, and explicit user actions (Sync Now,
+    // device add/remove) already call refreshTray() inline.
+    const interval = setInterval(refreshTray, 5 * 60_000);
 
     // Listen for tray-quit-request event from Rust
     (async () => {

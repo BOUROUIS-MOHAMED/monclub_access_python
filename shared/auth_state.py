@@ -11,6 +11,9 @@ class AuthTokenState:
     email: str
     token: str
     last_login_at: str
+    # Refresh-token extension (two-token auth, Task 18)
+    refresh_token: str = ""     # raw opaque refresh token (not stored here encrypted; db layer handles that)
+    next_refresh_at: str = ""   # ISO UTC deadline: app proactively refreshes when past this
 
 
 def protect_auth_token(plain: str) -> str:
@@ -124,4 +127,43 @@ def unprotect_auth_token(stored: str) -> str:
         return ""
 
 
-__all__ = ["AuthTokenState", "protect_auth_token", "unprotect_auth_token"]
+def next_refresh_at_from_expires(expires_at_iso: str, *, lead_days: int = 3) -> str:
+    """Compute the proactive-refresh deadline as an ISO UTC string.
+
+    Returns empty string on any parse error so callers can treat it as
+    "no deadline" without crashing.
+    """
+    if not expires_at_iso:
+        return ""
+    try:
+        from datetime import datetime, timezone, timedelta
+        exp = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
+        due = exp.astimezone(timezone.utc) - timedelta(days=lead_days)
+        return due.isoformat()
+    except Exception:
+        return ""
+
+
+def is_refresh_due(next_refresh_at: str) -> bool:
+    """Return True if the proactive-refresh deadline has passed.
+
+    An empty or unparseable deadline is treated as *not due* to be safe
+    (callers fall back to the 401 safety-net path).
+    """
+    if not next_refresh_at:
+        return False
+    try:
+        from datetime import datetime, timezone
+        due = datetime.fromisoformat(next_refresh_at.replace("Z", "+00:00")).astimezone(timezone.utc)
+        return datetime.now(timezone.utc) >= due
+    except Exception:
+        return False
+
+
+__all__ = [
+    "AuthTokenState",
+    "protect_auth_token",
+    "unprotect_auth_token",
+    "next_refresh_at_from_expires",
+    "is_refresh_due",
+]

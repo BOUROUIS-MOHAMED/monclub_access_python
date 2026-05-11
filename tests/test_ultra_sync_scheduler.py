@@ -397,3 +397,123 @@ def test_ultra_worker_drains_full_sync_commands_using_live_connection(monkeypatc
     assert full_sync_calls == [
         ("raw-sdk", "device_refresh", [{"activeMembershipId": 11}]),
     ]
+
+
+def test_ultra_device_worker_update_device_swaps_dict_in_place():
+    """update_device must replace the cached device, settings, and name so that
+    a delta-sync triggered after the dashboard adds a membership to
+    allowedMemberships does NOT filter the new member out and pin-delete them."""
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(
+        _device={"id": 5, "name": "Door 1", "allowedMemberships": [1, 2]},
+        _settings={"ultra_sync_interval_minutes": 15},
+        _device_name="Door 1",
+    )
+
+    new_device = {
+        "id": 5,
+        "name": "Door 1 Renamed",
+        "allowedMemberships": [1, 2, 265],
+    }
+    new_settings = {"ultra_sync_interval_minutes": 30}
+
+    ultra_module.UltraDeviceWorker.update_device(worker, new_device, new_settings)
+
+    assert worker._device is new_device
+    assert worker._device["allowedMemberships"] == [1, 2, 265]
+    assert worker._settings is new_settings
+    assert worker._device_name == "Door 1 Renamed"
+
+
+def test_ultra_sync_scheduler_update_devices_replaces_list():
+    import app.core.ultra_engine as ultra_module
+
+    scheduler = ultra_module.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    scheduler._devices = [{"id": 5, "allowedMemberships": [1]}]
+
+    new_devices = [
+        {"id": 5, "allowedMemberships": [1, 265]},
+        {"id": 6, "allowedMemberships": [1, 265]},
+    ]
+    scheduler.update_devices(new_devices)
+
+    assert scheduler._devices == new_devices
+    # Defensive copy: mutating the caller's list must not affect the scheduler.
+    new_devices.append({"id": 99})
+    assert len(scheduler._devices) == 2
+
+
+def test_ultra_engine_refresh_devices_updates_workers_in_place(monkeypatch):
+    """When the dashboard adds a membership to a device, refresh_devices must
+    push the new device dict into each running ULTRA worker so subsequent
+    delta-sync calls see the fresh allowedMemberships list."""
+    import app.core.ultra_engine as ultra_module
+
+    worker_a = MagicMock()
+    worker_b = MagicMock()
+    scheduler = SimpleNamespace(update_devices=MagicMock())
+
+    engine = SimpleNamespace(
+        _running=True,
+        _workers={5: worker_a, 6: worker_b},
+        _sync_scheduler=scheduler,
+        _logger=MagicMock(),
+    )
+
+    monkeypatch.setattr(
+        "app.core.settings_reader.normalize_device_settings",
+        lambda d: {"ultra_sync_interval_minutes": 15, "_normalized_for": d.get("id")},
+    )
+
+    devices = [
+        {"id": 5, "name": "Door 1", "accessDataMode": "ULTRA",
+         "allowedMemberships": [1, 2, 265]},
+        {"id": 6, "name": "Door 2", "accessDataMode": "ULTRA",
+         "allowedMemberships": [1, 2, 265]},
+        {"id": 9, "name": "Agent door", "accessDataMode": "AGENT"},  # filtered out
+        {"id": 99, "name": "Stray", "accessDataMode": "ULTRA"},      # no worker
+    ]
+
+    refreshed = ultra_module.UltraEngine.refresh_devices(engine, devices)
+
+    assert refreshed == 2
+    worker_a.update_device.assert_called_once()
+    worker_b.update_device.assert_called_once()
+
+    a_args = worker_a.update_device.call_args
+    assert a_args.args[0]["id"] == 5
+    assert a_args.args[0]["allowedMemberships"] == [1, 2, 265]
+    assert a_args.args[1]["_normalized_for"] == 5
+
+    b_args = worker_b.update_device.call_args
+    assert b_args.args[0]["id"] == 6
+
+    # Scheduler is updated with ULTRA-only devices (AGENT and unmanaged ULTRA
+    # are still passed through — only the engine's workers gate what gets
+    # update_device-ed).
+    scheduler.update_devices.assert_called_once()
+    sched_devices = scheduler.update_devices.call_args.args[0]
+    sched_ids = sorted(d["id"] for d in sched_devices)
+    assert sched_ids == [5, 6, 99]  # 9 (AGENT) is filtered out
+
+
+def test_ultra_engine_refresh_devices_skips_when_not_running():
+    import app.core.ultra_engine as ultra_module
+
+    worker = MagicMock()
+    scheduler = SimpleNamespace(update_devices=MagicMock())
+    engine = SimpleNamespace(
+        _running=False,
+        _workers={5: worker},
+        _sync_scheduler=scheduler,
+        _logger=MagicMock(),
+    )
+
+    refreshed = ultra_module.UltraEngine.refresh_devices(
+        engine, [{"id": 5, "accessDataMode": "ULTRA"}]
+    )
+
+    assert refreshed == 0
+    worker.update_device.assert_not_called()
+    scheduler.update_devices.assert_not_called()
