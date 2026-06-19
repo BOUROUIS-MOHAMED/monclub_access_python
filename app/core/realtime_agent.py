@@ -9,7 +9,6 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from app.core.db import (
@@ -24,14 +23,17 @@ from app.core.db import (
 )
 from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
+from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
-    verify_totp,
+    verify_totp_resilient,
     verify_card,
     load_local_state,
+    parse_event_time_to_epoch as _shared_parse_event_time_to_epoch,
 )
+from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 
 
 # ===================== constants =====================
@@ -83,51 +85,10 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
-def _parse_event_time_to_epoch(s: str, tz_offset_sec: int = 0) -> Optional[float]:
-    """
-    Best-effort parsing of RTLog eventTime into epoch seconds.
-    Supports:
-      - unix seconds or milliseconds
-      - ISO 8601 (with Z or offset)
-      - 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS'
-    """
-    raw = (s or "").strip()
-    if not raw:
-        return None
-
-    # numeric epoch (seconds/ms)
-    if raw.isdigit():
-        try:
-            v = int(raw)
-            if v > 10_000_000_000:  # ms
-                return float(v) / 1000.0
-            if v > 1_000_000_000:  # sec
-                return float(v)
-        except Exception:
-            pass
-
-    # ISO with Z
-    try:
-        iso = raw.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        pass
-
-    # common fallback formats
-    # Device timestamps are local time, not UTC.
-    # tz_offset_sec = device UTC offset in seconds (e.g., +10800 for UTC+3).
-    # Subtracting gives approximate UTC epoch for cursor comparison.
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.strptime(raw, fmt)
-            return dt.timestamp() - tz_offset_sec
-        except Exception:
-            continue
-
-    return None
+# Canonical implementation now lives in app.core.access_verification so the
+# AGENT and ULTRA engines parse device timestamps identically. Kept as a thin
+# module-level alias to avoid churning the many call sites below.
+_parse_event_time_to_epoch = _shared_parse_event_time_to_epoch
 
 
 def _boolish(v: Any, default: bool = False) -> bool:
@@ -847,6 +808,10 @@ class DeviceWorker(threading.Thread):
                         if self._is_old_by_cursor(event_id=event_id, event_time_str=event_time_str):
                             continue
 
+                        event_epoch = _parse_event_time_to_epoch(
+                            event_time_str, tz_offset_sec=self._device_tz_offset_sec
+                        )
+
                         ev = AccessEvent(
                             event_id=event_id,
                             device_id=self.device_id,
@@ -857,6 +822,7 @@ class DeviceWorker(threading.Thread):
                             raw=r if isinstance(r, dict) else {"raw": _safe_str(r)},
                             poll_ms=float(poll_ms),
                             queued_at=_now_ms(),
+                            event_epoch=event_epoch,
                         )
 
                         self.logger.debug(
@@ -878,9 +844,8 @@ class DeviceWorker(threading.Thread):
 
                         self._last_event_id = event_id
                         self._last_event_at_str = event_time_str or self._last_event_at_str
-                        ep = _parse_event_time_to_epoch(event_time_str, tz_offset_sec=self._device_tz_offset_sec)
-                        if ep is not None:
-                            self._last_event_epoch = ep
+                        if event_epoch is not None:
+                            self._last_event_epoch = event_epoch
                         self._state_dirty = True
                         self._events_since_flush += 1
                         if self._events_since_flush >= 10:
@@ -1035,8 +1000,8 @@ class DecisionService(threading.Thread):
     def _verify_card(self, *, scanned: str, settings: Dict[str, Any], users_by_card: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
         return verify_card(scanned=scanned, settings=settings, users_by_card=users_by_card)
 
-    def _verify_totp(self, *, scanned: str, settings: Dict[str, Any], creds_payload: List[Dict[str, Any]], users_by_am: Dict[int, Dict[str, Any]], users_by_card: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-        return verify_totp(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card)
+    def _verify_totp(self, *, scanned: str, settings: Dict[str, Any], creds_payload: List[Dict[str, Any]], users_by_am: Dict[int, Dict[str, Any]], users_by_card: Dict[str, List[Dict[str, Any]]], scan_epoch: Optional[float] = None) -> Dict[str, Any]:
+        return verify_totp_resilient(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card, scan_epoch=scan_epoch)
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -1092,12 +1057,17 @@ class DecisionService(threading.Thread):
                 load_ms = _now_ms() - t_load
 
                 t_verify = _now_ms()
+                # Validate against the moment the device read the code (scan time)
+                # rather than now, so decision-queue / poll latency can't expire a
+                # still-valid code. Falls back to wall-clock if the scan time is
+                # missing or implausible (broken device clock).
                 vr = self._verify_totp(
                     scanned=ev.card_no,
                     settings=settings,
                     creds_payload=creds_payload,
                     users_by_am=users_by_am,
                     users_by_card=users_by_card,
+                    scan_epoch=ev.event_epoch,
                 )
                 verify_ms = _now_ms() - t_verify
 
@@ -1349,6 +1319,21 @@ class DecisionService(threading.Thread):
             if not self.notify_gate.allow(key=dedupe_key):
                 continue
 
+            # Pre-warm the popup image cache so the popup window doesn't
+            # wait on a synchronous backend fetch when the <img> tag mounts.
+            # Same shared pool used by ULTRA.
+            if allowed and bool(settings.get("popup_show_image", True)):
+                try:
+                    if user_image:
+                        _prefetch_popup_image(user_image)
+                    if user_profile_image and user_profile_image != user_image:
+                        _prefetch_popup_image(user_profile_image)
+                except Exception:
+                    self.logger.debug(
+                        "[RT][device=%s] popup image prefetch failed (non-fatal)",
+                        ev.device_id, exc_info=True,
+                    )
+
             req = NotificationRequest(
                 event_id=ev.event_id,
                 title=title,
@@ -1492,8 +1477,10 @@ class NotificationService(threading.Thread):
                 except Exception:
                     pass
                 n.show()
+                _tel.event("TOAST_SHOW", title=str(r.title)[:30], has_icon=bool(icon_path))
             except Exception as e:
                 self.logger.debug(f"[RT][notify failed] {e}")
+                _tel.warn("TOAST_FAILED", err=type(e).__name__)
 
 
 # ===================== History service =====================

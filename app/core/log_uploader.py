@@ -18,6 +18,13 @@ _LOG_FILE_RE = re.compile(r"^app-(\d{4}-\d{2}-\d{2})-(am|pm)(?:\.(\d+))?\.log$")
 # Retry backoff intervals (seconds) indexed by attempt count; last value is the cap.
 _BACKOFF_SECONDS = [0, 120, 240, 480, 960, 3600]
 
+# After this many failed attempts, give up on a file. It moves from .pending to
+# .failed so the cleanup sweep can remove it eventually. Without this, a single
+# unreadable file or an auth misconfiguration could keep the .pending marker
+# alive forever and prevent the disk-cleanup loop from purging the log
+# (logger._cleanup_old_logs skips files with a .pending sibling).
+MAX_RETRY_COUNT = 20
+
 
 class LogUploadQueue:
     """
@@ -42,11 +49,21 @@ class LogUploadQueue:
         self._get_token = get_token
         self._get_upload_url = get_upload_url
         self._stop = threading.Event()
+        # Wake event lets external callers (the /logs/flush endpoint, the
+        # sync-request poller) interrupt the 60 s upload-loop sleep so a
+        # freshly-rotated file goes out within seconds instead of up to a
+        # minute later.
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         # In-memory: maps marker path string → monotonic time of last attempt.
         # Enforces backoff without writing to disk. Reset on restart (intentional:
         # conservative policy is to retry immediately after restart).
         self._last_attempt: dict[str, float] = {}
+        # Optional zero-arg callable wired in by the app (see app/ui/app.py)
+        # that triggers the rotating file handler's _rotate_active_file under
+        # its own lock. We don't import the handler here — keep this module
+        # decoupled from app.core.logger.
+        self._rotate_fn: Callable[[], None] | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -111,6 +128,62 @@ class LogUploadQueue:
     def stop(self) -> None:
         """Signal the background thread to stop (used in tests)."""
         self._stop.set()
+        self._wake.set()
+
+    def set_rotate_fn(self, fn: Callable[[], None] | None) -> None:
+        """Inject a callable that force-rotates the currently active half-day log.
+
+        The app wires this to ``HalfDaySizeRotatingFileHandler._rotate_active_file``
+        (called under the handler's logging lock). ``flush_now()`` invokes it so
+        the in-flight log file becomes a finalized sibling that ``register_pending``
+        / ``scan_orphans`` will queue for upload.
+        """
+        self._rotate_fn = fn
+
+    def wake(self) -> None:
+        """Interrupt the upload loop's sleep so it processes pending markers now."""
+        self._wake.set()
+
+    def flush_now(self) -> dict:
+        """Force-rotate the currently active log and kick the upload loop.
+
+        Returns a small dict the local API surfaces back to the dashboard:
+            {
+              "rotated":      True/False — whether the rotate callback ran,
+              "activeBefore": "app-2026-05-11-am.log",
+              "pendingNow":   ["app-2026-05-11-am.1.log", ...]  # filenames
+            }
+
+        Idempotent: calling twice in a row just re-scans orphans the second time.
+        Cheap: rotate + scan + wake completes in single-digit milliseconds.
+        """
+        active_before = self._active_log_name()
+        rotated = False
+        if self._rotate_fn is not None:
+            try:
+                self._rotate_fn()
+                rotated = True
+            except Exception as exc:
+                _handler_logger.warning("LogUploadQueue: flush rotate failed: %s", exc)
+        # In case rotation didn't fire (e.g. file was already empty) we still
+        # sweep — there may be other orphans from a previous boot.
+        try:
+            self.scan_orphans()
+        except Exception:
+            pass
+        self._wake.set()
+        try:
+            pending_now = sorted(
+                p.name[: -len(".pending")]
+                for p in self.log_dir.glob("*.pending")
+            )
+        except OSError:
+            pending_now = []
+        return {
+            "rotated":      rotated,
+            "activeBefore": active_before,
+            "pendingNow":   pending_now,
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -149,7 +222,11 @@ class LogUploadQueue:
         """Main loop: scan for .pending markers and process them."""
         while not self._stop.is_set():
             self._process_pending_files()
-            self._stop.wait(timeout=60)
+            # Wait up to 60 s OR until something pokes the wake event
+            # (flush_now, sync-request poller, stop). Clear afterwards so
+            # only NEW pokes wake us next cycle.
+            self._wake.wait(timeout=60)
+            self._wake.clear()
 
     def _process_pending_files(self) -> None:
         try:
@@ -160,6 +237,25 @@ class LogUploadQueue:
             if self._stop.is_set():
                 break
             self._handle_marker(marker)
+
+    def _is_ready(self) -> bool:
+        """True only when we can actually attempt an upload (auth token + upload
+        URL both present).
+
+        When not ready — logged out, or the presign URL isn't configured yet —
+        we must NOT treat the marker as a failed attempt. Counting it would burn
+        the file's retry budget and, after MAX_RETRY_COUNT, permanently mark a
+        perfectly good log .failed (then cleanup purges it unsent). That is the
+        bug that lost logs when log_presign_url defaulted to "" — uploads were
+        never even attempted, yet files marched to .failed.
+        """
+        token_state = self._get_token()
+        token = token_state.token if hasattr(token_state, "token") else token_state
+        if not token:
+            return False
+        if not (self._get_upload_url() or "").strip():
+            return False
+        return True
 
     def _handle_marker(self, marker: Path) -> None:
         log_path = Path(str(marker)[: -len(".pending")])
@@ -174,6 +270,15 @@ class LogUploadQueue:
                 self._last_attempt.pop(str(marker), None)
             except OSError:
                 pass
+            return
+
+        # Not ready (no token / no upload URL): defer WITHOUT counting a retry,
+        # so a config gap or logged-out window can't push good logs to .failed.
+        if not self._is_ready():
+            _handler_logger.debug(
+                "LogUploadQueue: deferring %s — not ready (missing auth token or upload URL)",
+                log_path.name,
+            )
             return
 
         retry_count = self._read_retry_count(marker)
@@ -203,11 +308,25 @@ class LogUploadQueue:
             _handler_logger.info("LogUploadQueue: uploaded %s", log_path.name)
         else:
             new_count = retry_count + 1
+            if new_count >= MAX_RETRY_COUNT:
+                # Give up: convert .pending → .failed so cleanup can purge the
+                # log eventually and we stop wasting bandwidth on a doomed file.
+                try:
+                    marker.unlink(missing_ok=True)
+                    Path(str(log_path) + ".failed").touch()
+                    self._last_attempt.pop(str(marker), None)
+                except OSError:
+                    pass
+                _handler_logger.error(
+                    "LogUploadQueue: giving up on %s after %d attempts — marked .failed",
+                    log_path.name, new_count,
+                )
+                return
             self._write_retry_count(marker, new_count)
             backoff = self._backoff_for(new_count)
             _handler_logger.debug(
-                "LogUploadQueue: upload failed for %s (attempt %d), next retry in %ds",
-                log_path.name, new_count, backoff,
+                "LogUploadQueue: upload failed for %s (attempt %d/%d), next retry in %ds",
+                log_path.name, new_count, MAX_RETRY_COUNT, backoff,
             )
 
     def _compress(self, log_path: Path) -> bytes:
@@ -284,9 +403,17 @@ class LogUploadQueue:
                 )
 
             if upload_resp.status_code < 200 or upload_resp.status_code >= 300:
+                # The presign URL has a TTL (R2: 30 min, Cloudinary: signed
+                # params). If the local upload step happens long after the
+                # presign (e.g. flaky network kept us in backoff for an hour),
+                # the storage side returns 401/403/`SignatureDoesNotMatch`.
+                # Surface that explicitly so we know to re-presign rather than
+                # blaming the local network.
+                presign_expired = upload_resp.status_code in (401, 403)
+                hint = " (presign URL likely expired — will re-presign on retry)" if presign_expired else ""
                 _handler_logger.warning(
-                    "LogUploadQueue: storage upload failed HTTP %d for %s (method=%s)",
-                    upload_resp.status_code, filename, method,
+                    "LogUploadQueue: storage upload failed HTTP %d for %s (method=%s)%s",
+                    upload_resp.status_code, filename, method, hint,
                 )
                 return False
 

@@ -23,6 +23,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("PATCH", "/api/v2/config", "_handle_config_patch"),
     ("POST", "/api/v2/config/restart-local-api", "_handle_config_restart_api"),
     ("GET", "/api/v2/image-cache", "_handle_image_cache"),
+    ("POST", "/api/v2/logs/flush", "_handle_logs_flush"),
     ("GET", "/api/v2/feedback/events", "_handle_feedback_events_sse"),
     ("GET", "/api/v2/feedback/sounds/device-push", "_handle_feedback_sound_device_push_get"),
     ("POST", "/api/v2/feedback/sounds/device-push", "_handle_feedback_sound_device_push_post"),

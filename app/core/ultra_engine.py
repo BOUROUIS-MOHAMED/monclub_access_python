@@ -9,11 +9,44 @@ from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Set
 
 from app.core.access_types import HistoryRecord, NotificationRequest
-from app.core.access_verification import load_local_state, verify_totp
+from app.core.access_verification import (
+    EVENT_TIME_SANITY_BOUND_SEC as _EVENT_TIME_SANITY_BOUND_SEC,
+    load_local_state,
+    parse_event_time_to_epoch,
+    verify_totp_resilient,
+)
 from app.core.db import get_recent_access_history, insert_access_history, load_sync_cache
+from app.core.popup_image_cache import prefetch as _prefetch_popup_image
+from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
 
 logger = logging.getLogger("zkapp")
+
+
+# Fix #1 / #2a — clock-skew handling for TOTP rescue.
+# An RTLog event carries the device's own timestamp for when the scan happened.
+# We validate TOTP against that instant (not wall-clock-at-processing) so the
+# poll/sync pipeline latency can't expire a still-valid code. The sanity bound
+# beyond which a scan time is treated as a broken device clock lives in
+# access_verification (_EVENT_TIME_SANITY_BOUND_SEC, imported above).
+#
+# When an event is older than this at processing time (pipeline latency + any
+# PC/device clock skew), emit a throttled warning: at this magnitude the tight
+# default TOTP window (±1 step / 32 s) will start rejecting valid codes.
+_CLOCK_SKEW_WARN_SEC = 20.0
+_CLOCK_SKEW_WARN_INTERVAL_SEC = 120.0
+
+# Card/QR re-scan cooldown has TWO distinct jobs that used to be conflated:
+#   1. DEBOUNCE — the C3 controller fires several RTLog events per single scan
+#      (one per door). We must suppress those for a few seconds so the relay
+#      isn't re-pulsed. This is ALWAYS needed, even with anti-fraud off, and is
+#      short (a member can't physically re-enter within it).
+#   2. ANTI-PASSBACK — block re-use of the same card/QR for anti_fraude_duration
+#      seconds. This applies ONLY when anti-fraud is enabled for that scan kind.
+# The old code used a single frozen value (anti_fraude_duration, computed once at
+# init), so disabling anti-fraud still blocked re-entry for the stale 30s. This
+# debounce floor is the cooldown when anti-fraud is off.
+_ULTRA_CARD_DEBOUNCE_SEC = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -63,16 +96,38 @@ class UltraDeviceWorker(threading.Thread):
         self._door_cmd_failures = 0
         self._poll_ema_ms = 0.0
         self._prefix = f"[ULTRA:{self._device_id}]"
-        # Card-level cooldown: prevents duplicate door opens when the C3
-        # controller fires multiple events for the same card/QR scan.
-        # Uses anti_fraude_duration from dashboard (seconds) when available,
-        # falls back to replay_block_window_seconds (default 10s).
+        # Stable worker id used by telemetry heartbeat/state tracking.
+        self._tel_wid = f"ULTRA:{self._device_id}"
+
+        # Device timezone offset (seconds) for converting the device-local RTLog
+        # eventTime into a UTC epoch comparable to time.time(). Parity with the
+        # AGENT engine; defaults to 0 when the backend omits it (device shares
+        # the PC's timezone, which is the common single-site case).
+        try:
+            self._device_tz_offset_sec: int = int(
+                device.get("timezoneOffsetSeconds")
+                or device.get("timezone_offset_seconds")
+                or 0
+            )
+        except (TypeError, ValueError):
+            self._device_tz_offset_sec = 0
+
+        # Clock-skew / pipeline-latency telemetry (fix #2a): age of each RTLog
+        # event at the moment we process it (pc_now - eventTime). A persistently
+        # large value silently breaks TOTP validation, so we surface it.
+        self._last_event_age_sec: float = 0.0
+        self._max_event_age_sec: float = 0.0
+        self._clock_skew_warns: int = 0
+        self._last_skew_warn_mono: float = 0.0
+
+        # Device-clock discipline (fix #2b) throttle + last measured device↔PC skew.
+        self._last_clock_check_mono: float = 0.0
+        self._device_pc_skew_sec: Optional[float] = None
+        # Card/QR re-scan cooldown state. The effective cooldown is computed
+        # PER EVENT from current settings (see _effective_card_cooldown_sec) so a
+        # dashboard change (e.g. disabling anti-fraud) takes effect immediately
+        # instead of being frozen at the value seen when the worker started.
         self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
-        _af_duration = settings.get("anti_fraude_duration")
-        if _af_duration is not None and int(_af_duration) > 0:
-            self._card_cooldown_sec = float(_af_duration)
-        else:
-            self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 10))
 
         # Adaptive sleep settings (same as AGENT mode)
         self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
@@ -84,6 +139,19 @@ class UltraDeviceWorker(threading.Thread):
         self._empty_sleep_ms = float(self._empty_min)
         # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
         self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
+
+        # Hot-window connect-per-cycle policy. After this many consecutive
+        # empty polls we close the TCP socket and reopen on the next active
+        # cycle. Matches the C2-400 / C3-200 firmware behaviour where idle
+        # sockets are dropped silently and the next poll then has to eat the
+        # reconnect cost while events queue on the device. Closing
+        # proactively turns that into a deterministic cycle:
+        #     connect -> drain commands -> poll -> process -> (maybe) disconnect
+        # 0 disables holding entirely (pure connect-per-poll).
+        self._hot_window_empty_polls = int(
+            settings.get("ultra_hot_window_empty_polls", 20)
+        )
+        self._empty_polls_since_event = 0
 
         # Sync-pause handshake: set by UltraSyncScheduler before it connects to the device
         self._sync_pause = threading.Event()      # set = paused for sync
@@ -143,6 +211,14 @@ class UltraDeviceWorker(threading.Thread):
         self._device = device
         self._settings = settings
         self._device_name = str(device.get("name", ""))
+        # Hot-window tunable can change from the dashboard without restarting
+        # the worker — read it back on every device refresh.
+        try:
+            self._hot_window_empty_polls = int(
+                settings.get("ultra_hot_window_empty_polls", self._hot_window_empty_polls)
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -170,11 +246,14 @@ class UltraDeviceWorker(threading.Thread):
                             f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
                         )
                         self._disconnect()
+                    _tel.set_state(self._tel_wid, "sync_handoff_paused")
+                    _tel.event("SYNC_HANDOFF_PAUSE_ACK", worker=self._tel_wid)
                     self._sync_paused_ack.set()
                     while self._sync_pause.is_set() and not self._stop_evt.is_set():
                         self._stop_evt.wait(0.5)
                     self._sync_paused_ack.clear()
                     logger.info(f"{self._prefix} sync pause ended — will reconnect")
+                    _tel.event("SYNC_HANDOFF_RESUME", worker=self._tel_wid)
                     # Pre-warm cache after sync invalidated it (resume_from_sync sets _cached_state=None).
                     # Without this, the first event after resume blocks 5+ seconds loading from SQLite.
                     try:
@@ -187,16 +266,20 @@ class UltraDeviceWorker(threading.Thread):
                 if not self._connected:
                     wait_sec = self._connect_wait_remaining()
                     if wait_sec > 0:
+                        _tel.set_state(self._tel_wid, "waiting", "connect backoff")
                         self._wait_for_work(min(wait_sec, 1.0))
                         continue
+                    _tel.set_state(self._tel_wid, "reconnecting")
                     self._connect()
                     if not self._connected:
                         continue
 
                 # Drain queued door-open commands (uses the already-connected SDK)
+                _tel.set_state(self._tel_wid, "draining_cmds")
                 self._drain_commands()
 
                 # Poll RTLog with watchdog
+                _tel.set_state(self._tel_wid, "polling")
                 events = self._poll_with_watchdog()
                 if events is None:
                     # Watchdog timeout or error -> reconnect
@@ -205,10 +288,13 @@ class UltraDeviceWorker(threading.Thread):
 
                 if events:
                     self._empty_sleep_ms = float(self._empty_min)
+                    self._empty_polls_since_event = 0
+                    _tel.set_state(self._tel_wid, "processing", f"{len(events)} evt")
                     for evt in events:
                         self._process_event(evt)
                     sleep_ms = self._busy_min
                 else:
+                    self._empty_polls_since_event += 1
                     self._empty_sleep_ms = min(
                         self._empty_sleep_ms * self._backoff,
                         self._backoff_cap,
@@ -221,10 +307,38 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_full_sync_commands(limit=1)
                 self._drain_commands()
 
+                # Hot-window connect-per-cycle policy. Hold the TCP socket
+                # during a burst of activity (cheap, avoids per-event TCP
+                # handshake) but close it after the configured streak of
+                # empty polls so flaky C2-400 / C3-200 firmware can't drop
+                # the socket mid-poll and lose events. 0 disables holding.
+                if (
+                    self._hot_window_empty_polls > 0
+                    and self._connected
+                    and self._empty_polls_since_event >= self._hot_window_empty_polls
+                ):
+                    logger.debug(
+                        "%s hot-window closed after %d empty polls — disconnecting",
+                        self._prefix,
+                        self._empty_polls_since_event,
+                    )
+                    self._disconnect()
+                    self._empty_polls_since_event = 0
+                elif self._hot_window_empty_polls <= 0:
+                    # Pure connect-per-cycle: always close after each poll.
+                    self._disconnect()
+                    self._empty_polls_since_event = 0
+
+                _tel.set_state(self._tel_wid, "idle", f"sleep {sleep_ms:.0f}ms")
                 self._wait_for_work(sleep_ms / 1000.0)
 
-            except Exception:
+            except Exception as _loop_exc:
                 logger.exception(f"{self._prefix} unhandled exception in run loop — will retry in 5s")
+                _tel.snapshot_event(
+                    "RUN_LOOP_EXCEPTION",
+                    worker=self._tel_wid,
+                    err=type(_loop_exc).__name__,
+                )
                 try:
                     self._disconnect()
                 except Exception:
@@ -334,6 +448,9 @@ class UltraDeviceWorker(threading.Thread):
                 was_down_for = self._down_for_seconds()
                 self._connected = True
                 self._record_connect_success()
+                # Check device vs PC clock (read-only log always; correct only
+                # when opted in). Throttled internally; safe between polls.
+                self._maybe_discipline_device_clock()
                 if was_down_for >= 60.0:
                     logger.warning(
                         "%s connected OK after %.0fs downtime: name=%r ip=%s port=%s",
@@ -522,18 +639,34 @@ class UltraDeviceWorker(threading.Thread):
                 from app.core.device_sync import DeviceSyncEngine
 
                 engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
-                engine.sync_member_on_connected_sdk(
-                    sdk=raw_sdk,
-                    device=self._device,
-                    member_id=member_id,
-                    source="ultra_targeted_member_sync",
-                )
+                # Member sync runs INLINE on this worker thread over the single
+                # device connection — it blocks RTLog polling + door commands
+                # for its whole duration (a Type-1 freeze contributor). Track it.
+                _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
+                _ms_t0 = time.monotonic()
+                try:
+                    engine.sync_member_on_connected_sdk(
+                        sdk=raw_sdk,
+                        device=self._device,
+                        member_id=member_id,
+                        source="ultra_targeted_member_sync",
+                    )
+                finally:
+                    _tel.event(
+                        "MEMBER_SYNC_DONE", worker=self._tel_wid, member_id=member_id,
+                        dur_ms=round((time.monotonic() - _ms_t0) * 1000),
+                        pending=len(self._pending_member_syncs),
+                    )
             except Exception as exc:
                 logger.warning(
                     "%s targeted member sync failed: member_id=%s err=%s",
                     self._prefix,
                     member_id,
                     exc,
+                )
+                _tel.warn(
+                    "MEMBER_SYNC_FAILED", worker=self._tel_wid,
+                    member_id=member_id, err=type(exc).__name__,
                 )
             drained += 1
         return drained
@@ -591,6 +724,15 @@ class UltraDeviceWorker(threading.Thread):
                 started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
                 self._mark_full_sync_started(reason=reason, engine=engine, started_at=started_iso)
                 self._notify_full_sync_started(reason=reason)
+                # Full sync runs INLINE on this worker over the single device
+                # connection: RTLog polling + door commands are blocked for the
+                # entire push. This is the primary Type-1 freeze. The heartbeat
+                # will raise WORKER_STALL if it runs long.
+                _tel.set_state(self._tel_wid, "full_sync", f"reason={reason}")
+                _tel.event(
+                    "FULL_SYNC_START", worker=self._tel_wid, reason=reason,
+                    users=len(getattr(filtered_cache, "users", []) or []),
+                )
                 sync_ok = engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
@@ -599,6 +741,10 @@ class UltraDeviceWorker(threading.Thread):
                     changed_ids=None,
                 )
                 duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
+                _tel.event(
+                    "FULL_SYNC_DONE", worker=self._tel_wid, reason=reason,
+                    ok=sync_ok, dur_ms=round(duration_ms),
+                )
                 # P9: surface the underlying sync error (e.g. PullSDKError on
                 # the user table) instead of silently treating it as success.
                 sync_error = "" if sync_ok else (
@@ -714,6 +860,7 @@ class UltraDeviceWorker(threading.Thread):
                 f"{self._prefix} poll_rtlog WATCHDOG STILL HUNG from previous cycle — "
                 f"skipping poll, forcing reconnect"
             )
+            _tel.warn("POLL_WATCHDOG_STILL_HUNG", worker=f"ULTRA:{self._device_id}")
             return None
 
         result: List[Optional[List[Dict[str, Any]]]] = [None]
@@ -729,7 +876,21 @@ class UltraDeviceWorker(threading.Thread):
         t = threading.Thread(target=_poll, daemon=True, name=f"UltraPoll-{self._device_id}")
         self._watchdog_thread = t
         t0 = time.monotonic()
-        t.start()
+        try:
+            t.start()
+        except RuntimeError as exc:
+            # Type-2 failure mode: the process can no longer create OS threads
+            # ("can't start new thread"). This is where the daily full lockup
+            # surfaces. Capture the exact process resource snapshot (Python
+            # thread count, private/working-set bytes, OS handles) so the cause
+            # is measured, not inferred — then propagate unchanged.
+            self._watchdog_thread = None
+            _tel.thread_spawn_failure(
+                "ultra._poll_with_watchdog",
+                worker=f"ULTRA:{self._device_id}",
+                err=str(exc),
+            )
+            raise
         t.join(timeout=self._poll_timeout_sec)
         elapsed_ms = (time.monotonic() - t0) * 1000
 
@@ -741,6 +902,12 @@ class UltraDeviceWorker(threading.Thread):
             logger.error(
                 f"{self._prefix} poll_rtlog WATCHDOG TIMEOUT "
                 f"(>{self._poll_timeout_sec}s elapsed={elapsed_ms:.0f}ms) — forcing reconnect"
+            )
+            _tel.warn(
+                "POLL_WATCHDOG_TIMEOUT",
+                worker=f"ULTRA:{self._device_id}",
+                elapsed_ms=round(elapsed_ms),
+                timeout_s=self._poll_timeout_sec,
             )
             # Leave _watchdog_thread set; next call will detect it's still alive
             # and skip rather than orphan another thread.
@@ -754,6 +921,7 @@ class UltraDeviceWorker(threading.Thread):
             )
             return None
         events = result[0] or []
+        _tel.note_poll(f"ULTRA:{self._device_id}", events=len(events))
         if events:
             logger.debug(f"{self._prefix} poll_rtlog OK: {len(events)} event(s) in {elapsed_ms:.0f}ms")
         return events
@@ -780,6 +948,35 @@ class UltraDeviceWorker(threading.Thread):
         self._seen.append(event_id)
         return False
 
+    def _effective_card_cooldown_sec(self, card_no: str) -> float:
+        """Re-scan cooldown for this card/QR, from CURRENT settings.
+
+        Short debounce by default; the longer anti_fraude_duration only when
+        anti-fraud is enabled for this scan kind (QR vs RFID). Read live each
+        event so a dashboard toggle (disable anti-fraud) takes effect at once.
+        """
+        s = self._settings or {}
+        # Pure format check (independent of the totp enable flags) so we consult
+        # the correct anti-fraud toggle for a QR/TOTP code vs an RFID card.
+        prefix = str(s.get("totp_prefix", "9") or "9")
+        try:
+            digits = int(s.get("totp_digits", 6) or 6)
+        except (TypeError, ValueError):
+            digits = 6
+        is_qr = (
+            len(card_no) == len(prefix) + digits
+            and card_no.startswith(prefix)
+            and card_no[len(prefix):].isdigit()
+        )
+        af_on = bool(s.get("anti_fraude_qr_code") if is_qr else s.get("anti_fraude_card"))
+        try:
+            af_dur = int(s.get("anti_fraude_duration") or 0)
+        except (TypeError, ValueError):
+            af_dur = 0
+        if af_on and af_dur > 0:
+            return max(float(_ULTRA_CARD_DEBOUNCE_SEC), float(af_dur))
+        return float(_ULTRA_CARD_DEBOUNCE_SEC)
+
     # ------------------------------------------------------------------ #
     # Event classification (core ULTRA logic)
     # ------------------------------------------------------------------ #
@@ -788,13 +985,6 @@ class UltraDeviceWorker(threading.Thread):
         """Classify RTLog event and route to appropriate handler."""
         if not hasattr(self, "_card_cooldown") or not isinstance(self._card_cooldown, dict):
             self._card_cooldown = {}
-        if not hasattr(self, "_card_cooldown_sec"):
-            settings = getattr(self, "_settings", {}) or {}
-            anti_fraude_duration = settings.get("anti_fraude_duration")
-            if anti_fraude_duration is not None and int(anti_fraude_duration) > 0:
-                self._card_cooldown_sec = float(anti_fraude_duration)
-            else:
-                self._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 0))
 
         card_no = str(evt.get("cardNo", "") or "").strip()
         event_type_raw = evt.get("eventType", "")
@@ -811,22 +1001,26 @@ class UltraDeviceWorker(threading.Thread):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
 
-        # Card-level cooldown: the C3-400 fires separate events per door for a
-        # single card/QR scan. Without this, the turnstile re-opens after the
-        # user has already passed through.
+        # Card/QR re-scan cooldown. Computed per-event from CURRENT settings:
+        #   - anti-fraud OFF  -> short debounce only (member can re-enter in ~3s)
+        #   - anti-fraud ON   -> anti_fraude_duration (anti-passback)
+        # The C3 fires several events per single scan; the debounce floor stops
+        # the relay re-pulsing without blocking a deliberate re-entry.
         if card_no:
+            cooldown = self._effective_card_cooldown_sec(card_no)
             now_mono = time.monotonic()
             last_seen = self._card_cooldown.get(card_no, 0.0)
-            if (now_mono - last_seen) < self._card_cooldown_sec:
+            if (now_mono - last_seen) < cooldown:
                 logger.debug(
                     f"{self._prefix} SKIP card cooldown: card={card_no!r} "
-                    f"elapsed={now_mono - last_seen:.1f}s < {self._card_cooldown_sec}s"
+                    f"elapsed={now_mono - last_seen:.1f}s < {cooldown}s"
                 )
                 return
             self._card_cooldown[card_no] = now_mono
-            # Prune old entries to avoid unbounded growth
+            # Prune old entries to avoid unbounded growth. Anything older than the
+            # max possible cooldown window is safe to evict.
             if len(self._card_cooldown) > 2000:
-                cutoff = now_mono - self._card_cooldown_sec * 2
+                cutoff = now_mono - 600.0
                 self._card_cooldown = {k: v for k, v in self._card_cooldown.items() if v > cutoff}
 
         self._events_processed += 1
@@ -855,12 +1049,100 @@ class UltraDeviceWorker(threading.Thread):
             except (ValueError, TypeError):
                 pass
 
+        # Convert the device's scan timestamp to a UTC epoch and record how stale
+        # the event is at processing time (pipeline latency + clock skew). This
+        # feeds both the TOTP rescue clock (fix #1) and skew telemetry (fix #2a).
+        scan_epoch = parse_event_time_to_epoch(event_time, self._device_tz_offset_sec)
+        self._record_event_age(scan_epoch)
+
         if is_allow:
             self._handle_allow(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         elif self._is_totp_format(card_no):
-            self._handle_totp_rescue(card_no, event_time, event_id, door_id, raw_row)
+            self._handle_totp_rescue(card_no, event_time, event_id, door_id, raw_row, scan_epoch)
         else:
             self._handle_deny(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
+
+    def _record_event_age(self, scan_epoch: Optional[float]) -> None:
+        """Track event age at processing (fix #2a) and warn (throttled) when the
+        pipeline latency + clock skew grows large enough to threaten TOTP."""
+        if scan_epoch is None:
+            return
+        age = time.time() - float(scan_epoch)
+        # Ignore obviously bogus (future or absurdly old) timestamps for stats.
+        if age < -_EVENT_TIME_SANITY_BOUND_SEC or age > _EVENT_TIME_SANITY_BOUND_SEC:
+            return
+        self._last_event_age_sec = age
+        if age > self._max_event_age_sec:
+            self._max_event_age_sec = age
+        if age >= _CLOCK_SKEW_WARN_SEC:
+            now_mono = time.monotonic()
+            if (now_mono - self._last_skew_warn_mono) >= _CLOCK_SKEW_WARN_INTERVAL_SEC:
+                self._last_skew_warn_mono = now_mono
+                self._clock_skew_warns += 1
+                logger.warning(
+                    "%s CLOCK_SKEW/LATENCY: RTLog events are ~%.0fs old at processing "
+                    "(latency + PC/device clock skew). The TOTP window is "
+                    "drift=%s step / max_past_age=%ss — beyond ~45s of skew, valid QR "
+                    "codes are rejected as DENY_NO_MATCH. Check the PC clock (NTP) and "
+                    "the device clock.",
+                    self._prefix, age,
+                    self._settings.get("totp_drift_steps", 1),
+                    self._settings.get("totp_max_past_age_seconds", 32),
+                )
+
+    def _maybe_discipline_device_clock(self) -> None:
+        """Compare the device RTC to the PC clock (fix #2b).
+
+        Always logs the device↔PC skew (read-only, the most precise clock-skew
+        signal we can get). Corrects the device clock toward the PC clock ONLY
+        when ``ultra_discipline_device_clock`` is enabled AND drift exceeds the
+        threshold. Throttled to once/hour. The correction is only safe when the
+        PC itself is NTP-synced — otherwise it would push a wrong time onto the
+        device, so it is opt-in.
+        """
+        now_mono = time.monotonic()
+        if (now_mono - self._last_clock_check_mono) < 3600.0:
+            return
+        self._last_clock_check_mono = now_mono
+
+        sdk = self._sdk
+        if sdk is None:
+            return
+        try:
+            dev_epoch = sdk.get_device_time()
+        except Exception:
+            dev_epoch = None
+        if dev_epoch is None:
+            return
+
+        pc_now = time.time()
+        skew = pc_now - float(dev_epoch)  # >0 => device clock is behind the PC
+        self._device_pc_skew_sec = skew
+
+        threshold = float(self._settings.get("ultra_device_clock_max_drift_sec", 10))
+        if abs(skew) <= threshold:
+            logger.info("%s device clock OK: device↔PC skew=%.1fs", self._prefix, skew)
+            return
+
+        if not bool(self._settings.get("ultra_discipline_device_clock", False)):
+            logger.warning(
+                "%s DEVICE CLOCK SKEW=%.1fs (>%.0fs) — TOTP codes may be rejected. "
+                "Auto-correct is OFF (ultra_discipline_device_clock). Sync the PC "
+                "clock (NTP) and the device clock, or enable auto-correct once the "
+                "PC clock is trusted.",
+                self._prefix, skew, threshold,
+            )
+            return
+
+        logger.warning(
+            "%s correcting device clock: skew=%.1fs (>%.0fs) -> setting device to PC time",
+            self._prefix, skew, threshold,
+        )
+        try:
+            if sdk.set_device_time(pc_now):
+                self._device_pc_skew_sec = 0.0
+        except Exception as e:
+            logger.warning("%s device clock correction failed: %s", self._prefix, e)
 
     def _is_totp_format(self, code: str) -> bool:
         """Check if scanned code matches TOTP format: prefix + N digits."""
@@ -985,17 +1267,26 @@ class UltraDeviceWorker(threading.Thread):
     def _handle_totp_rescue(
         self, code: str, event_time: str, event_id: str,
         door_id: Optional[int], raw_row: Dict[str, Any],
+        scan_epoch: Optional[float] = None,
     ):
-        """Device denied a TOTP code. Verify locally, open door if valid."""
+        """Device denied a TOTP code. Verify locally, open door if valid.
+
+        ``scan_epoch`` is the UTC epoch of the moment the device read the code
+        (from the RTLog eventTime). verify_totp_resilient accepts the code if it
+        is valid against either the scan time (removes RTLog poll/sync latency
+        from the window) or the wall clock (covers a skewed device clock), so
+        neither a processing delay nor a single bad clock alone can reject it.
+        """
         creds, users_by_am, users_by_card = self._get_cached_local_state()
 
         t0 = time.monotonic()
-        result = verify_totp(
+        result = verify_totp_resilient(
             scanned=code,
             settings=self._settings,
             creds_payload=creds,
             users_by_am=users_by_am,
             users_by_card=users_by_card,
+            scan_epoch=scan_epoch,
         )
         decision_ms = (time.monotonic() - t0) * 1000
 
@@ -1212,6 +1503,26 @@ class UltraDeviceWorker(threading.Thread):
         if not popup_enabled:
             return
 
+        # Kick the image fetch onto a background pool the moment we know we'll
+        # display this card. By the time the popup window mounts the <img>
+        # tag (5-50ms later for SSE delivery, 50-200ms for browser layout),
+        # the bytes are usually already on disk and the local API answers
+        # from the cache. Without this, the popup waits on a synchronous
+        # backend fetch — slow on Tunisian 4G — and shows the no-image
+        # placeholder for 1-3s before the image finally loads.
+        if bool(self._settings.get("popup_show_image", True)):
+            try:
+                if user_image:
+                    _prefetch_popup_image(user_image)
+                if user_profile_image and user_profile_image != user_image:
+                    _prefetch_popup_image(user_profile_image)
+            except Exception:
+                logger.debug(
+                    "%s popup image prefetch failed (non-fatal)",
+                    self._prefix,
+                    exc_info=True,
+                )
+
         # User-facing message for error states
         message = ""
         if reason == "DOOR_CMD_FAILED":
@@ -1247,10 +1558,18 @@ class UltraDeviceWorker(threading.Thread):
                 f"{self._prefix} popup enqueued: allowed={allowed} reason={reason} "
                 f"user={user_full_name!r} scan_mode={scan_mode} event_id={event_id}"
             )
+            _tel.event(
+                "POPUP_ENQUEUE", worker=self._tel_wid, allowed=allowed, reason=reason,
+                scan_mode=scan_mode, qsize=self._popup_q.qsize(), event_id=event_id,
+            )
         except queue.Full:
             logger.warning(
                 f"{self._prefix} popup queue FULL — dropping notification "
                 f"(allowed={allowed} user={user_full_name!r} event_id={event_id})"
+            )
+            _tel.warn(
+                "POPUP_QUEUE_FULL", worker=self._tel_wid, allowed=allowed,
+                reason=reason, event_id=event_id,
             )
 
     def _enqueue_history(
@@ -1343,25 +1662,43 @@ class UltraDeviceWorker(threading.Thread):
                 if not getattr(self, "_cache_bg_loading", False):
                     self._cache_bg_loading = True
                     def _bg_load():
+                        _bg_t0 = time.monotonic()
                         try:
                             result = load_local_state()
                             if result and isinstance(result, (tuple, list)) and len(result) >= 3:
                                 self._cached_state = result
                                 self._cached_state_ts = time.monotonic()
                                 creds, uam, ucard = result
+                                _dur = round((time.monotonic() - _bg_t0) * 1000)
                                 logger.debug(
                                     f"{self._prefix} bg cache refresh done: "
                                     f"creds={len(creds)} users_by_am={len(uam)} users_by_card={len(ucard)}"
                                 )
+                                _tel.event(
+                                    "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
+                                    dur_ms=_dur, creds=len(creds),
+                                )
                         except Exception as e:
                             logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
+                            _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
                         finally:
                             self._cache_bg_loading = False
-                    threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
+                    try:
+                        threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
+                    except RuntimeError as _exc:
+                        # Second thread-spawn site that surfaces Type-2 exhaustion.
+                        _tel.thread_spawn_failure(
+                            "ultra._bg_cache_load", worker=self._tel_wid, err=str(_exc),
+                        )
+                        raise
                 return self._cached_state
             else:
-                # No data at all — must load synchronously (first time only)
+                # No data at all — must load synchronously (first time only).
+                # This BLOCKS the worker thread (3-5s SQLite load) and so the
+                # single device connection — a Type-1 freeze contributor.
                 logger.debug(f"{self._prefix} refreshing local state cache from DB (sync, first load)")
+                _tel.set_state(self._tel_wid, "cache_load", "sync")
+                _cl_t0 = time.monotonic()
                 result = load_local_state()
                 if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
                     logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
@@ -1373,6 +1710,10 @@ class UltraDeviceWorker(threading.Thread):
                 logger.debug(
                     f"{self._prefix} local state cache refreshed: "
                     f"creds={len(creds)} users_by_am={len(users_by_am)} users_by_card={len(users_by_card)}"
+                )
+                _tel.event(
+                    "CACHE_SYNC_LOAD_DONE", worker=self._tel_wid,
+                    dur_ms=round((time.monotonic() - _cl_t0) * 1000), creds=len(creds),
                 )
         return self._cached_state
 
@@ -1393,6 +1734,16 @@ class UltraDeviceWorker(threading.Thread):
             "totp_failures": self._totp_failures,
             "door_cmd_failures": self._door_cmd_failures,
             "poll_ema_ms": round(self._poll_ema_ms, 1),
+            # Clock-skew / latency telemetry (fix #2a): how stale RTLog events are
+            # at processing. Large values mean TOTP codes are validated late and
+            # will start failing as DENY_NO_MATCH. Watch this to catch clock drift.
+            "event_age_sec": round(self._last_event_age_sec, 1),
+            "event_age_max_sec": round(self._max_event_age_sec, 1),
+            "clock_skew_warns": int(self._clock_skew_warns),
+            "device_pc_skew_sec": (
+                round(self._device_pc_skew_sec, 1)
+                if self._device_pc_skew_sec is not None else None
+            ),
             "connect_failures": int(self._connect_failures or 0),
             "connect_retry_wait_ms": round(self._connect_wait_remaining() * 1000.0, 1),
             "connect_down_since": self._connect_down_since_iso,
@@ -1595,7 +1946,7 @@ class UltraSyncScheduler:
             min_interval = 15 * 60  # default 15 min
             for d in self._devices:
                 settings = d.get("_settings", {})
-                interval = int(settings.get("ultra_sync_interval_minutes", 15)) * 60
+                interval = int(settings.get("ultra_sync_interval_minutes", 30)) * 60
                 min_interval = min(min_interval, interval)
 
             woke_for_sync = self._wake_sync.wait(min_interval)
@@ -1696,7 +2047,7 @@ class UltraSyncScheduler:
                 else:
                     did_sync = self._sync_device(d, changed_ids=changed_ids)
                 interval = int(
-                    d.get("_settings", {}).get("ultra_sync_interval_minutes", 15)
+                    d.get("_settings", {}).get("ultra_sync_interval_minutes", 30)
                 ) * 60
                 next_t = time.time() + interval
                 self._next_sync_at[device_id] = time.strftime(
@@ -1903,6 +2254,13 @@ class UltraEngine:
                     self._popup_events_seq += 1
                     self._popup_events_replay.append((self._popup_events_seq, payload))
                 drained += 1
+        if drained:
+            # A large drain here = the popup backlog that built up while the
+            # worker was blocked, now flushed to the SSE replay buffer.
+            _tel.event(
+                "POPUP_CAPTURE", worker=self._tel_wid, drained=drained,
+                latest_seq=self._popup_events_seq, qsize=self._popup_q.qsize(),
+            )
         return drained
 
     def get_latest_popup_event_seq(self) -> int:
@@ -2165,7 +2523,7 @@ class UltraEngine:
             snap["last_sync_at"] = ss.get("last_sync_at", "")
             snap["next_sync_at"] = ss.get("next_sync_at", "")
             snap["sync_interval_minutes"] = int(
-                worker._settings.get("ultra_sync_interval_minutes", 15)
+                worker._settings.get("ultra_sync_interval_minutes", 30)
             )
             devices[str(device_id)] = snap
 

@@ -44,6 +44,7 @@ _LEGACY_DASHBOARD_AVATAR_RE = re.compile(
 
 from app.api.monclub_api import MonClubApiHttpError
 from app.core.app_const import MONCLUB_BASE_URL
+from app.core import telemetry as _tel
 
 # TV boundary — imported through the phase 1 TV facade so new code does not
 # depend on the legacy implementation module directly.
@@ -158,50 +159,26 @@ def _qs_first(qs: Dict[str, List[str]], *names: str, default: str = "") -> str:
     return default
 
 
+# Image cache helpers delegate to app.core.popup_image_cache so that the
+# engine-side prefetch (right after a popup notification is enqueued) and the
+# Tauri-side <img> fetch share the same cache files and normalization rules.
+from app.core import popup_image_cache as _popup_image_cache
+
+
 def _image_cache_dir() -> str:
-    try:
-        from access.storage import current_access_runtime_db_path
-        access_db_path = str(current_access_runtime_db_path())
-        base_dir = os.path.dirname(access_db_path) if access_db_path else os.getcwd()
-    except Exception:
-        base_dir = os.getcwd()
-    return os.path.join(base_dir, "cache", "images")
+    return _popup_image_cache.cache_dir()
 
 
 def _normalize_image_url(raw: str) -> str:
-    s = _safe_str(raw, "").strip()
-    if not s:
-        return ""
-    avatar_match = _LEGACY_DASHBOARD_AVATAR_RE.match(s)
-    if avatar_match:
-        s = f"/assets/images/avatar/avatar-{avatar_match.group(1)}.webp"
-    if s.startswith("data:"):
-        return s
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-    if s.startswith("//"):
-        return f"https:{s}"
-    if s.startswith("/"):
-        return urljoin(MONCLUB_BASE_URL.rstrip("/") + "/", s.lstrip("/"))
-    return urljoin(MONCLUB_BASE_URL.rstrip("/") + "/", s)
+    return _popup_image_cache.normalize_url(_safe_str(raw, "").strip())
 
 
 def _image_cache_path(url: str) -> str:
-    cache_dir = _image_cache_dir()
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-    except Exception:
-        pass
-    h = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
-    ext = os.path.splitext(urlparse(url).path or "")[1].lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".ico", ".webp"):
-        ext = ".png"
-    return os.path.join(cache_dir, f"{h}{ext}")
+    return _popup_image_cache.cache_path(url)
 
 
 def _guess_image_mime(path: str) -> str:
-    m, _ = mimetypes.guess_type(path)
-    return m or "image/png"
+    return _popup_image_cache.guess_mime(path)
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
@@ -428,6 +405,31 @@ def _handle_health(ctx: _Ctx) -> None:
     ctx.send_json(200, info)
 
 
+def _handle_logs_flush(ctx: _Ctx) -> None:
+    """POST /api/v2/logs/flush — force-rotate the current half-day log and queue upload.
+
+    This is the dashboard "Sync logs now" button's fast path. The dashboard
+    (running in a browser at https://monclubwigo.tn) tries to call this
+    directly on http://127.0.0.1:8788/api/v2/logs/flush. When that fails
+    (CORS, ECONNREFUSED, dashboard opened from a different machine) the
+    dashboard falls back to creating an AccessLogSyncRequest on the backend
+    which the desktop's LogSyncRequestPoller picks up on its next 10-min tick.
+
+    Auth-exempt (see _AUTH_EXEMPT) because the dashboard can't carry the
+    session token. Loopback-only listener is the security boundary.
+    """
+    q = getattr(ctx.app, "_log_upload_queue", None)
+    if q is None:
+        ctx.send_json(503, {"ok": False, "error": "log upload queue not initialized"})
+        return
+    try:
+        result = q.flush_now()
+    except Exception as exc:
+        ctx.send_json(500, {"ok": False, "error": str(exc)})
+        return
+    ctx.send_json(200, {"ok": True, **(result or {})})
+
+
 def _handle_platform(ctx: _Ctx) -> None:
     from shared.platform import platform_summary
     from app.core.utils import is_frozen, DATA_ROOT
@@ -440,21 +442,57 @@ def _handle_platform(ctx: _Ctx) -> None:
     })
 
 
+def _image_cache_size_limits(app: Any) -> Tuple[int, int]:
+    """Resolve current (max_bytes, max_files) for popup-image cache pruning.
+
+    Reads from the cached global settings the AGENT engine already loads; the
+    same settings drive the legacy ImageCache so both surfaces stay aligned.
+    """
+    try:
+        eng = getattr(app, "_agent_engine", None)
+        if eng is not None and hasattr(eng, "get_global_settings"):
+            g = eng.get_global_settings() or {}
+            return (
+                int(g.get("image_cache_max_bytes") or 50 * 1024 * 1024),
+                int(g.get("image_cache_max_files") or 5000),
+            )
+    except Exception:
+        pass
+    try:
+        from app.core.settings_reader import get_backend_global_settings
+        g = get_backend_global_settings() or {}
+        return (
+            int(g.get("image_cache_max_bytes") or 50 * 1024 * 1024),
+            int(g.get("image_cache_max_files") or 5000),
+        )
+    except Exception:
+        return 50 * 1024 * 1024, 5000
+
+
 def _handle_image_cache(ctx: _Ctx) -> None:
     raw = _safe_str(ctx.q("url", default=""), "").strip()
     if not raw:
         ctx.send_json(400, {"ok": False, "error": "missing url"})
         return
 
-    # Allow direct local file path (desktop debug)
+    # Local-file passthrough (desktop debug). Honour If-None-Match so the
+    # browser's view can short-circuit on reload.
     try:
         if os.path.isabs(raw) and os.path.exists(raw) and os.path.isfile(raw):
+            etag = _popup_image_cache.etag_for(raw)
+            quoted = f'"{etag}"'
+            if ctx.handler.headers.get("If-None-Match", "") == quoted:
+                ctx.handler.send_response(304)
+                _cors_headers(ctx.handler)
+                ctx.handler.send_header("ETag", quoted)
+                ctx.handler.send_header("Cache-Control", "public, max-age=86400, immutable")
+                ctx.handler.end_headers()
+                return
             with open(raw, "rb") as f:
                 data = f.read()
-            etag = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
             ctx.send_bytes(200, data, _guess_image_mime(raw), {
                 "Cache-Control": "public, max-age=86400, immutable",
-                "ETag": f'"{etag}"',
+                "ETag": quoted,
             })
             return
     except Exception:
@@ -465,56 +503,48 @@ def _handle_image_cache(ctx: _Ctx) -> None:
         ctx.send_json(400, {"ok": False, "error": "unsupported image url"})
         return
 
+    etag = _popup_image_cache.etag_for(url)
+    quoted_etag = f'"{etag}"'
+    cache_headers = {
+        "Cache-Control": "public, max-age=86400, immutable",
+        "ETag": quoted_etag,
+    }
+
+    # Browser already has this exact body (matched by URL hash). Skip the
+    # disk read and the network entirely. This is the big win when 3 members
+    # in a row enter — the popup window re-requests the same avatar URLs and
+    # the local API now answers with 304 instead of re-reading bytes.
+    if ctx.handler.headers.get("If-None-Match", "") == quoted_etag:
+        ctx.handler.send_response(304)
+        _cors_headers(ctx.handler)
+        ctx.handler.send_header("ETag", quoted_etag)
+        ctx.handler.send_header("Cache-Control", "public, max-age=86400, immutable")
+        ctx.handler.end_headers()
+        return
+
     target = _image_cache_path(url)
-    _img_etag = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
-    _img_cache_headers = {"Cache-Control": "public, max-age=86400, immutable", "ETag": f'"{_img_etag}"'}
+    cached = _popup_image_cache.read_cached(url)
+    if cached is not None:
+        data, _ = cached
+        ctx.send_bytes(200, data, _guess_image_mime(target), cache_headers)
+        return
+
+    fetched = _popup_image_cache.fetch_and_cache(url)
+    if fetched is None:
+        ctx.send_json(502, {"ok": False, "error": "image fetch failed"})
+        return
+    data, _ = fetched
+
+    # Opportunistic prune (throttled to once/minute internally) so the disk
+    # cache doesn't grow unbounded during a busy day. Cheap on a hit because
+    # the throttle short-circuits without touching disk.
     try:
-        if os.path.exists(target) and os.path.isfile(target):
-            with open(target, "rb") as f:
-                data = f.read()
-            ctx.send_bytes(200, data, _guess_image_mime(target), _img_cache_headers)
-            return
+        max_bytes, max_files = _image_cache_size_limits(ctx.app)
+        _popup_image_cache.maybe_prune(max_bytes, max_files)
     except Exception:
         pass
 
-    # Fetch from backend with auth if available.
-    try:
-        from access.store import load_auth_token
-        auth = load_auth_token()
-        token = _safe_str(getattr(auth, "token", None), "").strip()
-    except Exception:
-        token = ""
-
-    headers = {"User-Agent": "MonClubAccess/1.0", "Accept": "*/*"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    try:
-        r = requests.get(url, headers=headers, timeout=2)
-        if r.status_code < 200 or r.status_code >= 300:
-            ctx.send_json(404, {"ok": False, "error": f"image fetch failed (HTTP {r.status_code})"})
-            return
-        data = r.content or b""
-        if not data:
-            ctx.send_json(404, {"ok": False, "error": "image empty"})
-            return
-        if len(data) > 5 * 1024 * 1024:
-            ctx.send_json(413, {"ok": False, "error": "image too large"})
-            return
-        try:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            tmp = target + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            try:
-                os.replace(tmp, target)
-            except Exception:
-                os.rename(tmp, target)
-        except Exception:
-            pass
-        ctx.send_bytes(200, data, _guess_image_mime(target), _img_cache_headers)
-    except Exception:
-        ctx.send_json(502, {"ok": False, "error": "image fetch failed"})
+    ctx.send_bytes(200, data, _guess_image_mime(target), cache_headers)
 
 
 # ==================== 1.5) UNIFIED STATUS ====================
@@ -822,6 +852,28 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "avgDecisionMs": round(eng.get_avg_decision_ms(), 2) if agent_running else 0.0,
     }
 
+    # Surface popup config so the TV popup window can size its lane grid
+    # without a second round-trip. Falls back to safe defaults when no
+    # backend settings have been synced yet.
+    popup: Dict[str, Any] = {"lanes": 3, "durationSec": 3, "enabled": True}
+    try:
+        g_for_popup: Dict[str, Any] = {}
+        if eng is not None and hasattr(eng, "get_global_settings"):
+            try:
+                g_for_popup = eng.get_global_settings() or {}
+            except Exception:
+                g_for_popup = {}
+        if not g_for_popup:
+            from app.core.settings_reader import get_backend_global_settings as _g
+            g_for_popup = _g() or {}
+        popup = {
+            "lanes": int(g_for_popup.get("popup_lanes") or 3),
+            "durationSec": int(g_for_popup.get("popup_duration_sec") or 3),
+            "enabled": bool(g_for_popup.get("popup_enabled", True)),
+        }
+    except Exception:
+        pass
+
     ultra_eng = getattr(app, "_ultra_engine", None)
     ultra_running = bool(ultra_eng and ultra_eng.running)
     ultra: Dict[str, Any] = {"running": ultra_running, "devices": {}}
@@ -858,6 +910,7 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         "agent": agent,
         "ultra": ultra,
         "updates": updates,
+        "popup": popup,
     }
 
 
@@ -1663,10 +1716,17 @@ def _handle_sync_fast_patch_bundle(ctx: _Ctx) -> None:
 
 
 def _handle_sync_hard_reset(ctx: _Ctx) -> None:
-    """Clear all device sync hashes so the next sync re-pushes every user, then trigger sync."""
+    """Hard reset: re-pull every member from the backend AND re-push every user to devices.
+
+    Clears device sync hashes (so the next sync re-pushes all users) and the
+    member version tokens (so the next getSyncData runs in FULL mode instead of
+    returning a no-op delta). Without clearing the version tokens, a hard reset
+    that follows a cache wipe leaves sync_users stuck at a handful of members."""
     try:
-        from app.core.db import clear_all_device_sync_hashes
+        from app.core.db import clear_all_device_sync_hashes, clear_version_tokens
         cleared = clear_all_device_sync_hashes()
+        # Force a full member/credential/device re-pull from the backend.
+        clear_version_tokens()
 
         # Also clear ULTRA scheduler in-memory hashes for all devices
         ultra_eng = getattr(ctx.app, "_ultra_engine", None)
@@ -3538,6 +3598,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
     _last = _door_open_last.get(did, 0.0)
     if (_now - _last) < _DOOR_OPEN_COOLDOWN_SEC:
         ctx.send_json(429, {"ok": False, "error": "Door open rate limited (1s cooldown)"})
+        _tel.event("DOOR_OPEN", device_id=did, result="429_cooldown")
         return
     _door_open_last[did] = _now
 
@@ -3591,12 +3652,15 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 "[LocalAPI] ULTRA door open via command queue: device_id=%s door=%s pulse_sec=%s",
                 did, door, pulse_sec,
             )
+            _door_t0 = time.monotonic()
             result = worker.request_door_open(door_id=door, pulse_ms=pulse_sec * 1000, timeout=2.0)
             ok = bool(result.get("ok", False))
             err = result.get("error", "")
+            _door_ms = round((time.monotonic() - _door_t0) * 1000)
             if ok:
                 _logger.info("[LocalAPI] ULTRA door open OK: device_id=%s door=%s", did, door)
                 ctx.send_json(200, {"ok": True, "rc": 0, "source": "ultra"})
+                _tel.event("DOOR_OPEN", device_id=did, door=door, result="200_ok", wait_ms=_door_ms)
             elif err == "timeout":
                 # Worker took the command but didn't ack in time — likely
                 # mid-reconnect. Tell the UI it's unreachable, not a server
@@ -3606,9 +3670,13 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                     did, door,
                 )
                 ctx.send_json(503, {"ok": False, "error": "device unreachable (command timed out)"})
+                # 503 = the worker thread was blocked (Type-1 freeze) and didn't
+                # drain the command within 2s. This is the user-facing symptom.
+                _tel.warn("DOOR_OPEN", device_id=did, door=door, result="503_timeout", wait_ms=_door_ms)
             else:
                 _logger.warning("[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s", did, door, err)
                 ctx.send_json(500, {"ok": False, "error": err or "door open failed"})
+                _tel.warn("DOOR_OPEN", device_id=did, door=door, result="500_failed", err=str(err)[:40], wait_ms=_door_ms)
             return
 
     # Fallback: direct PullSDK connect (DEVICE-mode or unmanaged devices)
@@ -3974,6 +4042,18 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
         except Exception:
             last_ultra_popup_seq = 0
 
+    # Checkpoint: with replayLast=0 the popup wall shows only live scans. A
+    # non-zero replay_last here means a client asked to re-show old events on
+    # connect — the usual cause of "ancient user shown on open". Log it so this
+    # class of bug is visible from the gym logs.
+    if replay_last > 0:
+        _logger.info(
+            "[SSE/agent_events] replayLast=%d on connect from %s:%s "
+            "(agent_start_seq=%d ultra_start_seq=%d) — will resend old popups",
+            replay_last, client_addr[0], client_addr[1],
+            last_popup_seq, last_ultra_popup_seq,
+        )
+
     last_snap: Dict[int, Dict[str, Any]] = {}
     # Heartbeat: without periodic writes the handler can't detect a dead client
     # during idle periods (no popups, no status changes). The native EventSource
@@ -3981,9 +4061,16 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
     # one thread per reconnect — eventually exhausting the process.
     last_ping = time.time()
     PING_INTERVAL_SEC = 15.0
+    # Tick fast enough that even a 3-card burst lands within one frame.
+    # 100ms keeps perceived latency under a single video frame at 60fps while
+    # still bounding wakeups to ~10/sec per SSE client.
+    POPUP_TICK_SEC = 0.1
+    # Batch size sized so a full turnstile queue drains in one tick.
+    POPUP_BATCH_LIMIT = 50
+
     while True:
         try:
-            time.sleep(0.25)
+            time.sleep(POPUP_TICK_SEC)
 
             if time.monotonic() - handler_start_mono >= MAX_LIFETIME_SEC:
                 _logger.info(
@@ -4020,21 +4107,18 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                 except Exception:
                     pass
 
-            # Fan out popup events to every SSE subscriber instead of letting
-            # subscribers race on the same queue item.
+            # Pull what's available since last seq and stream every event.
+            # Each event still goes out as its own SSE "popup" message so the
+            # frontend gets the natural input rate; the multi-lane popup will
+            # apply them in a single React state update.
             if agent_running:
                 try:
-                    popup_events = eng.get_popup_events_since(last_popup_seq, limit=10)
+                    popup_events = eng.get_popup_events_since(
+                        last_popup_seq, limit=POPUP_BATCH_LIMIT,
+                    )
                 except Exception:
                     popup_events = []
                 for popup_seq, payload in popup_events:
-                    _logger.debug(
-                        "[SSE/agent_events] sending AGENT popup seq=%s allowed=%s user=%r client=%s:%s",
-                        popup_seq,
-                        payload.get("allowed"),
-                        payload.get("userFullName"),
-                        client_addr[0], client_addr[1],
-                    )
                     alive = ctx.send_sse_event("popup", payload)
                     if not alive:
                         _logger.info(
@@ -4047,23 +4131,26 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
 
             if ultra_running:
                 try:
-                    ultra_popup_events = ultra_eng.get_popup_events_since(last_ultra_popup_seq, limit=10)
+                    ultra_popup_events = ultra_eng.get_popup_events_since(
+                        last_ultra_popup_seq, limit=POPUP_BATCH_LIMIT,
+                    )
                 except Exception:
                     ultra_popup_events = []
-                for popup_seq, payload in ultra_popup_events:
-                    _logger.debug(
-                        "[SSE/agent_events] sending ULTRA popup seq=%s allowed=%s user=%r client=%s:%s",
-                        popup_seq,
-                        payload.get("allowed"),
-                        payload.get("userFullName"),
-                        client_addr[0], client_addr[1],
+                if ultra_popup_events:
+                    # Delivery side of the popup pipeline. A large batch here is
+                    # the backlog flushing to the popup window after a freeze.
+                    _tel.event(
+                        "POPUP_SSE_DELIVER", count=len(ultra_popup_events),
+                        client=f"{client_addr[0]}:{client_addr[1]}",
                     )
+                for popup_seq, payload in ultra_popup_events:
                     alive = ctx.send_sse_event("popup", payload)
                     if not alive:
                         _logger.info(
                             "[SSE/agent_events] client disconnected (ULTRA popup): %s:%s",
                             client_addr[0], client_addr[1],
                         )
+                        _tel.warn("POPUP_SSE_CLIENT_LOST", client=f"{client_addr[0]}:{client_addr[1]}")
                         return
                     last_ultra_popup_seq = popup_seq
                     wrote_event = True
@@ -5669,6 +5756,13 @@ class LocalApiServerV2:
                         "_handle_sync_now", "_handle_sync_fast_patch_bundle",
                         "_handle_enroll_start", "_handle_enroll_retry_push",
                         "_handle_scan_start", "_handle_scan_stream",
+                        # /logs/flush is the "Sync logs now" button on the dashboard.
+                        # Dashboard runs in a browser at https://monclubwigo.tn and
+                        # has no way to obtain the session-local X-Local-Token. The
+                        # endpoint is harmless (force-rotates + queues a log file)
+                        # and the local API only listens on 127.0.0.1, so loopback
+                        # is already the security boundary.
+                        "_handle_logs_flush",
                     }
                     fn_name = getattr(handler_fn, "__name__", "")
                     if fn_name not in _AUTH_EXEMPT:
@@ -5753,6 +5847,14 @@ class LocalApiServerV2:
             self.app.logger.info(
                 "%s started on http://%s:%s", self.server_name, self.host, self.port
             )
+        except Exception:
+            pass
+
+        # Start the telemetry heartbeat so process resource snapshots + worker
+        # state are logged even before/independently of any device worker.
+        try:
+            _tel.start()
+            _tel.snapshot_event("LOCAL_API_STARTED", host=self.host, port=self.port)
         except Exception:
             pass
 

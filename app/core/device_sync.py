@@ -26,6 +26,7 @@ from app.core.db import (
     update_push_batch,
 )
 from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
+from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDK, PullSDKError
 
 
@@ -608,11 +609,24 @@ class DeviceSyncEngine:
             }
             if sdk is not None:
                 sync_kwargs["sdk"] = sdk
+            # Push to device runs over the single device TCP connection. When it
+            # is invoked on the live ULTRA worker (sdk is not None) it blocks
+            # RTLog polling for its full duration — trace start/duration/result.
+            _push_t0 = time.monotonic()
+            _tel.event(
+                "PUSH_DEVICE_START", device_id=dev_id, source=source,
+                users=len(users), changed=(len(changed_ids) if changed_ids else 0),
+                mode=("connected_sdk" if sdk is not None else "own_conn"),
+            )
             self._sync_one_device(
                 **sync_kwargs,
             )
             self._set_progress(current=1)
             self._last_single_device_error = ""
+            _tel.event(
+                "PUSH_DEVICE_DONE", device_id=dev_id, source=source,
+                dur_ms=round((time.monotonic() - _push_t0) * 1000), users=len(users),
+            )
             return True
         except Exception as e:
             # P9: capture the error so the ULTRA worker can surface it via
@@ -624,6 +638,7 @@ class DeviceSyncEngine:
             # the UI's full-sync status showed green.
             self._last_single_device_error = str(e) or e.__class__.__name__
             self.logger.exception(f"[DeviceSync] Single-device sync failed: {e}")
+            _tel.warn("PUSH_DEVICE_FAILED", source=source, err=type(e).__name__)
             return False
         finally:
             self._set_progress(

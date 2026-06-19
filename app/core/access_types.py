@@ -16,6 +16,10 @@ class AccessEvent:
     raw: Dict[str, Any]
     poll_ms: float
     queued_at: float = 0.0  # perf_counter ms when event was put in queue
+    # UTC epoch of the moment the device read the scan (parsed from event_time).
+    # Used to validate TOTP against scan time instead of processing time so
+    # queue/poll latency can't expire a still-valid code. None when unparseable.
+    event_epoch: Optional[float] = None
 
 
 @dataclass

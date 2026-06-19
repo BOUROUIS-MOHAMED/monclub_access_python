@@ -10,6 +10,7 @@ import hmac
 import logging
 import struct
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.core.db import (
@@ -18,6 +19,96 @@ from app.core.db import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ===================== event-time parsing =====================
+
+def parse_event_time_to_epoch(s: str, tz_offset_sec: int = 0) -> Optional[float]:
+    """
+    Best-effort parsing of an RTLog eventTime string into epoch seconds.
+
+    Supports:
+      - unix seconds or milliseconds
+      - ISO 8601 (with Z or numeric offset)
+      - 'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DDTHH:MM:SS' (device local time)
+
+    ``tz_offset_sec`` is the device's UTC offset in seconds (e.g. +3600 for
+    UTC+1). For the local-time formats it is subtracted so the result is an
+    approximate UTC epoch comparable to ``time.time()``.
+
+    Returns None when the string can't be parsed.
+
+    NOTE: kept identical to realtime_agent's historical helper so the AGENT and
+    ULTRA engines parse device timestamps the same way; that module now imports
+    this implementation.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        return None
+
+    # numeric epoch (seconds/ms)
+    if raw.isdigit():
+        try:
+            v = int(raw)
+            if v > 10_000_000_000:  # ms
+                return float(v) / 1000.0
+            if v > 1_000_000_000:  # sec
+                return float(v)
+        except Exception:
+            pass
+
+    # ISO 8601 — ONLY when an explicit timezone is present (Z or numeric offset).
+    # A naive 'YYYY-MM-DD HH:MM:SS' string is ALSO accepted by fromisoformat, but
+    # ZKTeco devices emit *local* wall-clock time, not UTC. Treating such a naive
+    # string as UTC would shift every scan by the site's UTC offset (e.g. +3600s
+    # in UTC+1) and make TOTP validation fail. So only trust this branch when the
+    # parsed value is tz-aware; otherwise fall through to the local-time branch.
+    try:
+        iso = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is not None:
+            return dt.timestamp()
+    except Exception:
+        pass
+
+    # common fallback formats (device local time). dt.timestamp() on a naive
+    # datetime interprets it in the host's local timezone; tz_offset_sec corrects
+    # for any device/host timezone mismatch (0 when they share a timezone).
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            return dt.timestamp() - tz_offset_sec
+        except Exception:
+            continue
+
+    return None
+
+
+# Beyond this distance from the PC wall clock, a scan timestamp is treated as a
+# misconfigured device clock (not mere skew) and ignored in favour of time.time().
+EVENT_TIME_SANITY_BOUND_SEC = 3600.0  # 1 hour
+
+
+def resolve_totp_clock(
+    scan_epoch: Optional[float],
+    *,
+    sanity_bound_sec: float = EVENT_TIME_SANITY_BOUND_SEC,
+    now: Optional[float] = None,
+) -> Optional[float]:
+    """Decide which clock to validate a TOTP code against.
+
+    Returns ``scan_epoch`` (the instant the device read the code) when it is
+    present and within ``sanity_bound_sec`` of the PC wall clock — this removes
+    RTLog pipeline latency from the TOTP window. Returns None (caller falls back
+    to ``time.time()``) when the scan time is missing or implausibly far off,
+    which indicates a broken device clock rather than ordinary skew.
+    """
+    if scan_epoch is None:
+        return None
+    ref = now if now is not None else time.time()
+    if abs(ref - float(scan_epoch)) <= sanity_bound_sec:
+        return float(scan_epoch)
+    return None
 
 
 # ===================== helpers (private, used in _safe_int / _safe_str) =====================
@@ -173,7 +264,18 @@ def verify_totp(
     creds_payload: List[Dict[str, Any]],
     users_by_am: Dict[int, Dict[str, Any]],
     users_by_card: Dict[str, List[Dict[str, Any]]],
+    now_unix: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Validate a scanned QR/TOTP string.
+
+    ``now_unix`` overrides the validation clock. Callers SHOULD pass the moment
+    the code was actually scanned (parsed from the RTLog eventTime) rather than
+    letting it default to ``time.time()`` at processing time: the RTLog pipeline
+    can deliver an event tens of seconds after the scan (poll backoff, sync
+    pauses, reconnect), and validating against wall-clock-at-processing pushes a
+    still-valid code past ``totp_max_past_age_seconds`` and rejects it as
+    DENY_EXPIRED / DENY_NO_MATCH. Falls back to ``time.time()`` when None.
+    """
     t0 = time.perf_counter()
 
     totp_enabled = bool(settings.get("totp_enabled", True))
@@ -225,7 +327,9 @@ def verify_totp(
     # QR TOTP format => use LAST 'digits'
     code = raw[-digits:]
 
-    now = int(time.time())
+    # Validate against the moment the code was scanned (now_unix, from the RTLog
+    # eventTime) when the caller provides it; otherwise fall back to wall-clock.
+    now = int(now_unix if now_unix is not None else time.time())
     cur = _totp_counter(now, period)
     allowed_ctrs = list(range(cur - int(drift), cur + int(drift) + 1))
 
@@ -376,6 +480,57 @@ def verify_totp(
         "tookMs": (time.perf_counter() - t0) * 1000.0,
         "user": None,
     }
+
+
+def verify_totp_resilient(
+    *,
+    scanned: str,
+    settings: Dict[str, Any],
+    creds_payload: List[Dict[str, Any]],
+    users_by_am: Dict[int, Dict[str, Any]],
+    users_by_card: Dict[str, List[Dict[str, Any]]],
+    scan_epoch: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Validate a QR/TOTP code resiliently against unreliable clocks.
+
+    Accepts the code if it is valid under EITHER reference:
+      1. the scan time (``scan_epoch`` from the RTLog eventTime) — removes RTLog
+         pipeline latency (poll backoff, sync pauses) from the window, and
+      2. the local wall clock (``time.time()``) — the historical behaviour, which
+         still works when the *device* clock is the skewed one.
+
+    This avoids having to guess which clock is trustworthy: a field gym can have
+    a bad PC clock, a bad turnstile RTC, or both, and they drift independently.
+    Trying both means neither a processing delay nor a single skewed clock alone
+    can reject an otherwise-valid code. The result carries ``clockUsed`` =
+    ``"scan"`` | ``"wall"`` for diagnostics.
+
+    The common ALLOW case costs a single verification; the second pass only runs
+    when the first denies (i.e. the already-failing path).
+    """
+    now_unix = resolve_totp_clock(scan_epoch)
+
+    primary = verify_totp(
+        scanned=scanned, settings=settings, creds_payload=creds_payload,
+        users_by_am=users_by_am, users_by_card=users_by_card, now_unix=now_unix,
+    )
+    primary_clock = "scan" if now_unix is not None else "wall"
+    if primary.get("allowed") or now_unix is None:
+        primary["clockUsed"] = primary_clock
+        return primary
+
+    # Scan-time validation denied — retry against the wall clock so a skewed
+    # device clock can't reject a code the PC clock would accept.
+    fallback = verify_totp(
+        scanned=scanned, settings=settings, creds_payload=creds_payload,
+        users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
+    )
+    if fallback.get("allowed"):
+        fallback["clockUsed"] = "wall"
+        return fallback
+
+    primary["clockUsed"] = primary_clock
+    return primary
 
 
 # ===================== local state loading =====================

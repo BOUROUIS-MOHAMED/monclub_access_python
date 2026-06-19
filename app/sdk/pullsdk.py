@@ -778,6 +778,30 @@ class PullSDK:
         return rc
 
 
+# --------------------------------------------------------------------------
+# ZKTeco "DateTime" device-param codec.
+# The PullSDK encodes the device RTC as a single integer:
+#   enc = ((Y-2000)*12*31 + (M-1)*31 + (D-1))*86400 + h*3600 + m*60 + s
+# --------------------------------------------------------------------------
+
+def zk_datetime_encode(y: int, mo: int, d: int, h: int, mi: int, s: int) -> int:
+    return (
+        ((int(y) - 2000) * 12 * 31 + (int(mo) - 1) * 31 + (int(d) - 1)) * 86400
+        + int(h) * 3600 + int(mi) * 60 + int(s)
+    )
+
+
+def zk_datetime_decode(val: int) -> Tuple[int, int, int, int, int, int]:
+    t = int(val)
+    s = t % 60; t //= 60
+    mi = t % 60; t //= 60
+    h = t % 24; t //= 24
+    d = t % 31 + 1; t //= 31
+    mo = t % 12 + 1; t //= 12
+    y = t + 2000
+    return (y, mo, d, h, mi, s)
+
+
 class PullSDKDevice:
     """
     High-level per-device wrapper used by realtime_agent.py.
@@ -786,6 +810,7 @@ class PullSDKDevice:
       - ensure_connected / disconnect
       - poll_rtlog_once (normalized event rows)
       - open_door
+      - get_device_time / set_device_time (RTC discipline)
     """
 
     def __init__(self, device_payload: Dict[str, Any], logger=None):
@@ -934,6 +959,60 @@ class PullSDKDevice:
                     )
                 except Exception:
                     pass
+                return False
+
+    def get_device_time(self) -> Optional[float]:
+        """Read the device RTC and return it as a unix epoch.
+
+        The device stores wall-clock time with no timezone; we interpret it in
+        the PC's local timezone (consistent with how RTLog eventTime strings are
+        parsed) so the result is directly comparable to ``time.time()``.
+        Returns None when the param is unsupported or the read/parse fails.
+        """
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return None
+            try:
+                assert self._sdk is not None
+                if not self._sdk.supports_get_device_param():
+                    return None
+                raw = self._sdk.get_device_param(items="DateTime")
+            except Exception as e:
+                self.logger.debug(f"[PullSDKDevice][{self.device_id}] get_device_time read failed: {e}")
+                return None
+        try:
+            val_str = raw.split("=", 1)[1].strip() if "=" in raw else raw.strip()
+            y, mo, d, h, mi, s = zk_datetime_decode(int(val_str))
+            return time.mktime((y, mo, d, h, mi, s, 0, 0, -1))
+        except Exception as e:
+            self.logger.debug(f"[PullSDKDevice][{self.device_id}] get_device_time parse failed raw={raw!r}: {e}")
+            return None
+
+    def set_device_time(self, epoch: float) -> bool:
+        """Set the device RTC to ``epoch`` (interpreted in the PC's local tz).
+
+        Caller is responsible for deciding *whether* to correct (drift threshold,
+        opt-in gate). Only correct toward a trusted clock — pushing a wrong PC
+        clock onto the device would also break TOTP, just consistently.
+        """
+        lt = time.localtime(float(epoch))
+        encoded = zk_datetime_encode(lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec)
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return False
+            try:
+                assert self._sdk is not None
+                if not self._sdk.supports_set_device_param():
+                    return False
+                self._sdk.set_device_param(items=f"DateTime={encoded}")
+                self.logger.info(
+                    "[PullSDKDevice][%s] set_device_time OK -> %04d-%02d-%02d %02d:%02d:%02d (enc=%d)",
+                    self.device_id, lt.tm_year, lt.tm_mon, lt.tm_mday,
+                    lt.tm_hour, lt.tm_min, lt.tm_sec, encoded,
+                )
+                return True
+            except Exception as e:
+                self.logger.warning(f"[PullSDKDevice][{self.device_id}] set_device_time FAILED: {e}")
                 return False
 
     def get_table_count(self, *, table: str, filter_expr: str = "", options: str = "") -> int:

@@ -173,9 +173,13 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         "totp_validation": _boolish(raw.get("totpValidation", raw.get("totp_validation")), True),
 
         "image_cache_enabled": _boolish(raw.get("imageCacheEnabled"), True),
-        "image_cache_timeout_sec": _clamp_int(raw.get("imageCacheTimeoutSec"), 2, 0, 60),
-        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 5 * 1024 * 1024, 1024, 200 * 1024 * 1024),
-        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 1000, 1, 50000),
+        # 8s default — slow Tunisian links routinely exceeded the old 2s and
+        # turned popup avatars into blanks. Clamp top stays generous.
+        "image_cache_timeout_sec": _clamp_int(raw.get("imageCacheTimeoutSec"), 8, 1, 60),
+        # 50MB default keeps a full season roster of avatars warm. Cap raised
+        # so a backend override can grow further if the gym wants it.
+        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 50 * 1024 * 1024, 1024, 500 * 1024 * 1024),
+        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 5000, 1, 50000),
 
         "event_queue_max": _clamp_int(raw.get("eventQueueMax"), 5000, 100, 200000),
         "notification_queue_max": _clamp_int(raw.get("notificationQueueMax"), 5000, 100, 200000),
@@ -206,6 +210,9 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         # global popup defaults (per-device override exists)
         "popup_enabled": _boolish(raw.get("popupEnabled"), True),
         "popup_duration_sec": _clamp_int(raw.get("popupDurationSec"), 3, 1, 60),
+        # Number of simultaneous member cards the TV popup can display.
+        # Default 3 matches the "3 turnstiles firing at once" case in the gym.
+        "popup_lanes": _clamp_int(raw.get("popupLanes"), 3, 1, 5),
     }
 
 
@@ -270,9 +277,17 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
 
     totp_digits = _clamp_int(dev.get("totpDigits"), 7, 4, 10)
     totp_period_seconds = _clamp_int(dev.get("totpPeriodSeconds"), 30, 10, 120)
-    totp_drift_steps = _clamp_int(dev.get("totpDriftSteps"), 1, 0, 10)
-    totp_max_past_age_seconds = _clamp_int(dev.get("totpMaxPastAgeSeconds"), 32, 1, 600)
-    totp_max_future_skew_seconds = _clamp_int(dev.get("totpMaxFutureSkewSeconds"), 3, 0, 120)
+    # Default validation window widened from the original (1 step / 32s / 3s).
+    # Field gym PCs and turnstile RTCs are frequently NOT NTP-synced and drift
+    # tens of seconds apart; the old window rejected valid QR codes as
+    # DENY_NO_MATCH the moment combined skew + pipeline latency passed ~45s
+    # (real incident). These defaults only apply when the backend omits a value
+    # (the dashboard normally sends explicit ones); they absorb ~75s of skew
+    # while keeping the QR replay window short. Engines also now validate at the
+    # scan timestamp, so this is purely a safety margin for clock skew.
+    totp_drift_steps = _clamp_int(dev.get("totpDriftSteps"), 2, 0, 10)
+    totp_max_past_age_seconds = _clamp_int(dev.get("totpMaxPastAgeSeconds"), 75, 1, 600)
+    totp_max_future_skew_seconds = _clamp_int(dev.get("totpMaxFutureSkewSeconds"), 15, 0, 120)
 
     rfid_min_digits = _clamp_int(dev.get("rfidMinDigits"), 1, 1, 16)
     rfid_max_digits = _clamp_int(dev.get("rfidMaxDigits"), 16, 1, 16)
@@ -374,9 +389,40 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "cmd_ema_alpha": 0.2,
 
         # ULTRA mode fields
-        "ultra_sync_interval_minutes": int(dev.get("ultraSyncIntervalMinutes") or 15),
+        # Periodic full-reconciliation interval. The full sync runs inline on the
+        # worker's single SDK socket and blocks RTLog polling for its duration
+        # (~15-25s on a 1700-user device), during which new scans buffer on the
+        # device and the door opens late. Raised 15->30 to halve these timer-driven
+        # blackouts; real-time member changes still propagate via the fast targeted
+        # member-sync path (change_detector), so data freshness is unaffected.
+        # (Scan-time TOTP validation already ensures buffered codes stay valid.)
+        "ultra_sync_interval_minutes": int(dev.get("ultraSyncIntervalMinutes") or 30),
         "ultra_totp_rescue_enabled": bool(dev.get("ultraTotpRescueEnabled", True)),
         "ultra_rtlog_enabled": bool(dev.get("ultraRtlogEnabled", True)),
+        # Device RTC discipline (fix #2b). When enabled, the ULTRA worker nudges
+        # the turnstile clock toward the PC clock when they drift apart by more
+        # than ultra_device_clock_max_drift_sec. Default OFF: only safe once the
+        # PC clock itself is NTP-synced — otherwise we'd push a wrong time onto
+        # the device. The read-only device↔PC skew check/log runs regardless.
+        "ultra_discipline_device_clock": _boolish(dev.get("ultraDisciplineDeviceClock"), False),
+        "ultra_device_clock_max_drift_sec": _clamp_int(dev.get("ultraDeviceClockMaxDriftSec"), 10, 2, 600),
+        # Connect-per-cycle hot window: how many consecutive empty polls the
+        # worker holds the TCP connection before disconnecting. C2-400 /
+        # C3-200 firmware drops idle sockets unpredictably, so we close
+        # proactively after a burst window. 0 disables the hot window entirely
+        # (pure connect-per-poll).
+        #
+        # Raised 3 -> 20: with 3 (~1.5s grace) the socket dropped between scans,
+        # so a re-entry/next member arrived to a disconnected worker and ate a
+        # 0.6-2.2s reconnect before its scan was even polled — the cause of the
+        # variable 2s/5-10s door-open latency. 20 holds the connection ~5-7s
+        # after activity so back-to-back scans hit a live socket and open fast.
+        # If the firmware silently drops the held socket the next poll just
+        # reconnects (self-healing); no events are lost. Backend can override
+        # per-device via ultraHotWindowEmptyPolls.
+        "ultra_hot_window_empty_polls": _clamp_int(
+            dev.get("ultraHotWindowEmptyPolls"), 20, 0, 50
+        ),
 
         # Per-door presets (from dashboard doorPresets config).
         # List of dicts: [{"doorNumber": 1, "pulseSeconds": 3, "doorName": "..."}, ...]

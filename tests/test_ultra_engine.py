@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-from app.core.ultra_engine import UltraDeviceWorker
+from app.core.ultra_engine import UltraDeviceWorker, _ULTRA_CARD_DEBOUNCE_SEC
 from app.core.access_types import HistoryRecord, NotificationRequest
 
 
@@ -95,7 +95,6 @@ def _make_worker(
     worker._poll_ema_ms = 0.0
     worker._prefix = f"[ULTRA:{worker._device_id}]"
     worker._card_cooldown = {}
-    worker._card_cooldown_sec = float(settings.get("replay_block_window_seconds", 0))
 
     worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
     worker._busy_max = int(settings.get("busy_sleep_max_ms", 50))
@@ -137,6 +136,22 @@ def _make_worker(
     worker._connect_down_since_iso = ""
     worker._last_down_error_log_mono = 0.0
     worker._down_error_log_interval_sec = 300.0
+
+    # Clock / skew handling (fix #1 / #2a / #2b)
+    try:
+        worker._device_tz_offset_sec = int(
+            device.get("timezoneOffsetSeconds")
+            or device.get("timezone_offset_seconds")
+            or 0
+        )
+    except (TypeError, ValueError):
+        worker._device_tz_offset_sec = 0
+    worker._last_event_age_sec = 0.0
+    worker._max_event_age_sec = 0.0
+    worker._clock_skew_warns = 0
+    worker._last_skew_warn_mono = 0.0
+    worker._last_clock_check_mono = 0.0
+    worker._device_pc_skew_sec = None
 
     return worker
 
@@ -633,11 +648,12 @@ class TestProcessEventDeny:
     def test_non_zero_event_type_is_deny(self, mock_lls, mock_iah):
         """Any non-zero numeric event type that's not TOTP format → DENY."""
         worker = _make_worker()
-        for etype in [1, 2, 255, -1]:
+        for idx, etype in enumerate([1, 2, 255, -1]):
             worker._popup_q = queue.Queue(maxsize=100)
             eid = f"evt-deny-{etype}"
             worker._seen = deque(maxlen=10_000)  # reset dedup
-            worker._process_event(_make_event(event_type=etype, event_id=eid))
+            # Distinct card per scan so the re-scan debounce doesn't collapse them.
+            worker._process_event(_make_event(event_type=etype, event_id=eid, card_no=f"30000{idx}"))
             req = worker._popup_q.get_nowait()
             assert req.allowed is False
 
@@ -688,7 +704,7 @@ class TestProcessEventDedup:
         worker = _make_worker()
 
         for i in range(5):
-            worker._process_event(_make_event(event_id=f"unique-{i}", event_type=0))
+            worker._process_event(_make_event(event_id=f"unique-{i}", event_type=0, card_no=f"60000{i}"))
 
         assert worker._events_processed == 5
         assert worker._popup_q.qsize() == 5
@@ -721,7 +737,7 @@ class TestTotpRescueFlow:
         )
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.verify_totp")
+    @patch("app.core.ultra_engine.verify_totp_resilient")
     def test_valid_totp_opens_door_and_allows(self, mock_verify, mock_iah):
         """Valid TOTP + door opens → allowed=True in notification and history."""
         mock_verify.return_value = {
@@ -762,7 +778,7 @@ class TestTotpRescueFlow:
         assert worker._totp_failures == 0
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.verify_totp")
+    @patch("app.core.ultra_engine.verify_totp_resilient")
     def test_invalid_totp_does_not_open_door(self, mock_verify, mock_iah):
         """Invalid TOTP → door never opened, denied notification."""
         mock_verify.return_value = {
@@ -790,7 +806,7 @@ class TestTotpRescueFlow:
         assert worker._totp_rescues == 0
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.verify_totp")
+    @patch("app.core.ultra_engine.verify_totp_resilient")
     def test_valid_totp_door_open_fails_returns_deny(self, mock_verify, mock_iah):
         """Valid TOTP but door open fails → allowed=False, reason=DOOR_CMD_FAILED."""
         mock_verify.return_value = {
@@ -824,7 +840,7 @@ class TestTotpRescueFlow:
         assert worker._totp_rescues == 0
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
-    @patch("app.core.ultra_engine.verify_totp")
+    @patch("app.core.ultra_engine.verify_totp_resilient")
     def test_totp_event_increments_events_processed(self, mock_verify, mock_iah):
         mock_verify.return_value = {"allowed": False, "reason": "DENY_NO_MATCH", "user": None}
 
@@ -1078,7 +1094,7 @@ class TestGetSnapshot:
         worker._cached_state_ts = time.monotonic()
 
         for i in range(3):
-            worker._process_event(_make_event(event_id=f"snap-{i}", event_type=0))
+            worker._process_event(_make_event(event_id=f"snap-{i}", event_type=0, card_no=f"50000{i}"))
 
         snap = worker.get_snapshot()
         assert snap["events_processed"] == 3
@@ -1290,3 +1306,75 @@ class TestPollWithWatchdogNoThreadLeak:
         assert result == []
         # Reference cleared so the next cycle is free to spawn a fresh thread.
         assert getattr(worker, "_watchdog_thread", None) is None
+
+
+# ---------------------------------------------------------------------------
+# TestCardCooldown — re-scan cooldown: debounce (always) vs anti-passback (only
+# when anti-fraud enabled). Regression for the "wait 30-40s to re-enter even
+# with anti-fraud disabled" production bug (frozen _card_cooldown_sec).
+# ---------------------------------------------------------------------------
+
+class TestCardCooldown:
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_antifraud_off_uses_short_debounce(self, mock_lls, mock_iah):
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=False, anti_fraude_qr_code=False, anti_fraude_duration=0))
+        assert worker._effective_card_cooldown_sec("4894671") == _ULTRA_CARD_DEBOUNCE_SEC
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_antifraud_off_blocks_rapid_duplicate_only(self, mock_lls, mock_iah):
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=False, anti_fraude_qr_code=False, anti_fraude_duration=0))
+        worker._cached_state = _EMPTY_LOCAL_STATE
+        worker._cached_state_ts = time.monotonic()
+        card = "4894671"
+        worker._process_event(_make_event(event_id="c1", event_type=0, card_no=card))
+        assert worker._events_processed == 1
+        # same card within the debounce -> skipped (prevents C3 double-open)
+        worker._process_event(_make_event(event_id="c2", event_type=0, card_no=card))
+        assert worker._events_processed == 1
+        # debounce elapsed -> re-entry allowed (this was 30-40s before the fix)
+        worker._card_cooldown[card] = time.monotonic() - (_ULTRA_CARD_DEBOUNCE_SEC + 1.0)
+        worker._process_event(_make_event(event_id="c3", event_type=0, card_no=card))
+        assert worker._events_processed == 2
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_antifraud_on_blocks_for_duration(self, mock_lls, mock_iah):
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=True, anti_fraude_duration=30))
+        worker._cached_state = _EMPTY_LOCAL_STATE
+        worker._cached_state_ts = time.monotonic()
+        card = "4894671"
+        assert worker._effective_card_cooldown_sec(card) == 30.0
+        worker._process_event(_make_event(event_id="a1", event_type=0, card_no=card))
+        assert worker._events_processed == 1
+        worker._card_cooldown[card] = time.monotonic() - 10.0   # < 30 -> blocked
+        worker._process_event(_make_event(event_id="a2", event_type=0, card_no=card))
+        assert worker._events_processed == 1
+        worker._card_cooldown[card] = time.monotonic() - 31.0   # > 30 -> allowed
+        worker._process_event(_make_event(event_id="a3", event_type=0, card_no=card))
+        assert worker._events_processed == 2
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_cooldown_tracks_live_settings_not_frozen(self, mock_lls, mock_iah):
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=True, anti_fraude_duration=30))
+        card = "4894671"
+        assert worker._effective_card_cooldown_sec(card) == 30.0
+        # operator disables anti-fraud -> takes effect immediately (not frozen)
+        worker.update_device(worker._device, _make_settings(
+            anti_fraude_card=False, anti_fraude_qr_code=False, anti_fraude_duration=0))
+        assert worker._effective_card_cooldown_sec(card) == _ULTRA_CARD_DEBOUNCE_SEC
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_qr_uses_qr_antifraud_flag_not_card(self, mock_lls, mock_iah):
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=False, anti_fraude_qr_code=True, anti_fraude_duration=25,
+            totp_prefix="9", totp_digits=6))
+        assert worker._effective_card_cooldown_sec("9123456") == 25.0          # QR/TOTP
+        assert worker._effective_card_cooldown_sec("4894671") == _ULTRA_CARD_DEBOUNCE_SEC  # RFID

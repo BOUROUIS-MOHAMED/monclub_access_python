@@ -163,6 +163,41 @@ class TestHandleMarker:
         assert marker.exists()
         assert marker.read_text().strip() == "3"
 
+    def test_not_ready_no_url_does_not_count_retry(self, tmp_path):
+        """No upload URL configured must NOT burn the retry budget (regression:
+        log_presign_url defaulted to '' and marched good logs to .failed)."""
+        log = tmp_path / "app-2026-04-28-am.log"
+        log.write_text("data")
+        marker = Path(str(log) + ".pending")
+        marker.write_text("2")
+
+        upload_calls = []
+        q = _make_queue(tmp_path, get_url=lambda: "")
+        q._upload = lambda name, data: upload_calls.append(name) or False
+
+        q._handle_marker(marker)
+
+        assert marker.exists()
+        assert marker.read_text().strip() == "2"   # unchanged — no retry counted
+        assert upload_calls == []                   # upload never attempted
+
+    def test_not_ready_no_token_does_not_count_retry(self, tmp_path):
+        """Logged out (no token) must NOT burn the retry budget either."""
+        log = tmp_path / "app-2026-04-28-am.log"
+        log.write_text("data")
+        marker = Path(str(log) + ".pending")
+        marker.write_text("5")
+
+        upload_calls = []
+        q = _make_queue(tmp_path, get_token=lambda: None)
+        q._upload = lambda name, data: upload_calls.append(name) or False
+
+        q._handle_marker(marker)
+
+        assert marker.exists()
+        assert marker.read_text().strip() == "5"
+        assert upload_calls == []
+
     def test_compressed_data_is_valid_gzip(self, tmp_path):
         """Data passed to _upload is valid gzip content."""
         log = tmp_path / "app-2026-04-28-am.log"
