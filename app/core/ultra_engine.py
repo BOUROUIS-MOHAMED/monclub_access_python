@@ -186,6 +186,9 @@ class UltraDeviceWorker(threading.Thread):
         self._last_connect_error = ""
         self._last_connect_attempt_at = ""
         self._last_connect_success_at = ""
+        # Monotonic time of the current successful connection (0 = not connected).
+        # Used by persistent-connection mode for the slow safety refresh.
+        self._connected_since_mono = 0.0
         # Sustained-outage tracking: when set, the worker has been disconnected
         # since this monotonic timestamp. Used to (a) surface a "down for N min"
         # status to the UI and (b) suppress log spam — we keep one ERROR per
@@ -307,12 +310,44 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_full_sync_commands(limit=1)
                 self._drain_commands()
 
-                # Hot-window connect-per-cycle policy. Hold the TCP socket
-                # during a burst of activity (cheap, avoids per-event TCP
-                # handshake) but close it after the configured streak of
-                # empty polls so flaky C2-400 / C3-200 firmware can't drop
-                # the socket mid-poll and lose events. 0 disables holding.
-                if (
+                # Connection policy.
+                #
+                # The C3-200's plcommpro.dll leaks ~1 OS handle + ~280KB on
+                # EVERY Connect/Disconnect cycle (measured in prod: the process
+                # handle count tracks the connect count at ~1.0 per connect, and
+                # private bytes climb ~175MB/h). The old hot-window closed the
+                # socket after a streak of empty polls — ~680 reconnects/hour —
+                # which exhausts the 32-bit address space in ~a day and produces
+                # the "can't start new thread" full lockup.
+                #
+                # Persistent mode (default ON) holds the socket and only
+                # reconnects (a) reactively when a poll actually fails — handled
+                # above: `events is None` -> `_disconnect()` -> reconnect next
+                # cycle — and (b) on a slow safety refresh, guarding against
+                # firmware that might silently drop a long-idle socket. Prod logs
+                # showed only ~4 real poll failures in 26h vs 13,465 proactive
+                # disconnects, so holding is safe and removes ~99.7% of the leak.
+                if bool(self._settings.get("ultra_persistent_connection", True)):
+                    refresh_sec = float(
+                        self._settings.get("ultra_connection_refresh_sec", 1800.0)
+                    )
+                    if (
+                        refresh_sec > 0
+                        and self._connected
+                        and self._connected_since_mono > 0.0
+                        and (time.monotonic() - self._connected_since_mono) >= refresh_sec
+                    ):
+                        _age = time.monotonic() - self._connected_since_mono
+                        logger.info(
+                            "%s persistent connection: safety refresh after %.0fs",
+                            self._prefix, _age,
+                        )
+                        _tel.event("CONN_REFRESH", worker=self._tel_wid, age_s=round(_age))
+                        self._disconnect()
+                        self._empty_polls_since_event = 0
+                    # else: HOLD the connection (no idle disconnect). This is the
+                    # change that eliminates the reconnect-driven leak.
+                elif (
                     self._hot_window_empty_polls > 0
                     and self._connected
                     and self._empty_polls_since_event >= self._hot_window_empty_polls
@@ -447,6 +482,7 @@ class UltraDeviceWorker(threading.Thread):
             if ok:
                 was_down_for = self._down_for_seconds()
                 self._connected = True
+                self._connected_since_mono = time.monotonic()
                 self._record_connect_success()
                 # Check device vs PC clock (read-only log always; correct only
                 # when opted in). Throttled internally; safe between polls.
@@ -506,6 +542,7 @@ class UltraDeviceWorker(threading.Thread):
                 logger.debug(f"{self._prefix} disconnect error (non-fatal): {_disc_exc}")
         self._sdk = None
         self._connected = False
+        self._connected_since_mono = 0.0
 
     def pause_for_sync(self, timeout: float = 20.0) -> bool:
         """Ask worker to disconnect and wait until it confirms.

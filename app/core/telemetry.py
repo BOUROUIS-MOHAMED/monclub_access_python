@@ -28,14 +28,33 @@ the rest of the app) as ``key=value`` pairs so they are trivial to grep.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("zkapp.telemetry")
+
+# Memory-leak diagnostics. tracemalloc names the exact Python source lines that
+# hold the most memory; comparing its total to the process private bytes also
+# tells us whether a leak is Python-side (tracemalloc grows) or native/C/DLL
+# (tracemalloc flat while private_mb climbs). Enabled by default for the leak
+# hunt; set MONCLUB_MEMPROFILE=0 to disable. depth=1 keeps the overhead small.
+_tracemalloc_on = False
+try:
+    if os.environ.get("MONCLUB_MEMPROFILE", "1") != "0":
+        import tracemalloc as _tracemalloc
+        _tracemalloc.start(1)
+        _tracemalloc_on = True
+    else:
+        _tracemalloc = None
+except Exception:
+    _tracemalloc = None
+    _tracemalloc_on = False
 
 # --------------------------------------------------------------------------- #
 # Process resource snapshot (threads / memory / handles)
@@ -199,6 +218,63 @@ def thread_spawn_failure(where: str, **fields: Any) -> None:
         pass
 
 
+def mem_diagnostics(top: int = 15) -> None:
+    """Name the residual memory leak's source — don't guess it.
+
+    Emits up to two lines (runs on the heartbeat thread, never blocks the worker):
+      MEM_DIAG  — live Python object count + top object types by count + the
+                  process private/rss bytes. A type whose count climbs across
+                  successive samples is the leaking Python structure.
+      MEM_TRACE — (tracemalloc on) total Python-tracked bytes + the top source
+                  lines by retained size. KEY DISCRIMINATOR: if py_tracked_mb
+                  stays flat while MEM_DIAG private_mb climbs, the leak is
+                  NATIVE (e.g. plcommpro.dll per-call), not Python — so the fix
+                  is to cut call volume, not chase Python code.
+    """
+    private_mb = None
+    try:
+        snap = proc_snapshot()
+        private_mb = snap.get("private_mb")
+        # NOTE: gc.get_objects() only returns GC-TRACKED containers — CPython
+        # leaves dicts/tuples of atomic values, and all bytes/str/int, untracked.
+        # So this census is a SUPPLEMENTARY hint only; MEM_TRACE below (tracemalloc)
+        # is the authoritative source — it tracks every allocation.
+        from collections import Counter
+        objs = gc.get_objects()
+        n = len(objs)
+        cnt: "Counter[str]" = Counter()
+        for o in objs:
+            cnt[type(o).__name__] += 1
+        del objs
+        top_types = ";".join(f"{name}={c}" for name, c in cnt.most_common(top))
+        logger.info(
+            "[T] MEM_DIAG tracked_objects=%d private_mb=%s rss_mb=%s gc=%s top=%s",
+            n, private_mb, snap.get("rss_mb"), gc.get_count(), top_types,
+        )
+    except Exception:
+        pass
+    if not _tracemalloc_on or _tracemalloc is None:
+        return
+    try:
+        cur, peak = _tracemalloc.get_traced_memory()
+        py_mb = cur / 1048576.0
+        stats = _tracemalloc.take_snapshot().statistics("lineno")[:10]
+        lines = []
+        for s in stats:
+            fr = s.traceback[0]
+            fname = fr.filename.replace("\\", "/").split("/")[-1]
+            lines.append(f"{fname}:{fr.lineno}={s.size // 1024}KB/{s.count}")
+        # KEY DISCRIMINATOR on one line: if py_tracked_mb stays flat across
+        # samples while private_mb climbs, the residual leak is NATIVE (the
+        # plcommpro.dll per-call leak), not Python.
+        logger.info(
+            "[T] MEM_TRACE py_tracked_mb=%.1f private_mb=%s peak_mb=%.1f top=%s",
+            py_mb, private_mb, peak / 1048576.0, " | ".join(lines),
+        )
+    except Exception:
+        pass
+
+
 @contextmanager
 def span(name: str, **fields: Any):
     """Timed, exception-safe span. Logs start, then end with duration_ms.
@@ -260,6 +336,8 @@ _hb_routine_every = 3  # routine WORKER_HB cadence = interval * this (≈30s)
 # A non-idle state held longer than this is reported as a STALL (the freeze).
 _hb_stall_warn_sec = 25.0
 _proc_log_every_sec = 60.0
+# Object/line-level memory census cadence (heavier than PROC_HB, so less often).
+_mem_diag_every_sec = 300.0
 # States that are normal to sit in for a while (don't warn on these).
 _idle_states = {"idle", "init", "stopped", "waiting"}
 
@@ -329,9 +407,11 @@ def _ensure_heartbeat() -> None:
 
 def _heartbeat_loop() -> None:
     last_proc_log = 0.0
+    last_mem_diag = 0.0
     tick = 0
     try:
         snapshot_event("HEARTBEAT_START")
+        event("MEMPROFILE", tracemalloc=_tracemalloc_on)
     except Exception:
         pass
     while not _hb_stop.is_set():
@@ -364,6 +444,10 @@ def _heartbeat_loop() -> None:
             if now - last_proc_log >= _proc_log_every_sec:
                 last_proc_log = now
                 snapshot_event("PROC_HB")
+            # Periodic memory census to pinpoint the residual leak's source.
+            if now - last_mem_diag >= _mem_diag_every_sec:
+                last_mem_diag = now
+                mem_diagnostics()
         except Exception:
             # Heartbeat must survive anything.
             try:
