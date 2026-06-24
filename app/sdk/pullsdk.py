@@ -832,6 +832,11 @@ class PullSDKDevice:
         self._connected = False
         self._event_seq: int = 0
         self._sdk_lock = threading.Lock()  # F-007: serialize concurrent SDK calls
+        # Cache of the DoorNDrivetime we last pushed per door (cleared on reconnect).
+        # The pulse time is constant, so re-setting it on EVERY open_door is a wasted
+        # SDK round-trip (~225ms on the C3-200, half of the door-open latency). Set it
+        # once per connection instead — the controller retains it.
+        self._door_drivetime_set: Dict[int, int] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -875,6 +880,9 @@ class PullSDKDevice:
             )
             self._sdk = _pending_sdk
             self._connected = True
+            # Fresh connection: the controller's stored drive-time is unknown, so the
+            # next open_door must re-push it once.
+            self._door_drivetime_set.clear()
             self.logger.info(
                 "[PullSDKDevice][%s] connected OK: name=%r ip=%s port=%s",
                 self.device_id, self.name, self.ip, self.port,
@@ -934,11 +942,14 @@ class PullSDKDevice:
                 seconds = int(max(1, min(60, math.ceil(int(pulse_time_ms) / 1000.0))))
 
                 # Many C3-200 firmware versions ignore ControlDevice param3 and use the
-                # device's stored DoorNDriveTime instead. Set it explicitly before firing
-                # the relay so the configured pulse time is always respected.
-                if self._sdk.supports_set_device_param():
+                # device's stored DoorNDriveTime instead. Set it explicitly so the
+                # configured pulse time is respected — but only ONCE per connection (or
+                # when it changes), since it's a ~225ms round-trip and the controller
+                # retains the value. This halves the open_door latency on repeat opens.
+                if self._sdk.supports_set_device_param() and self._door_drivetime_set.get(door_id) != seconds:
                     try:
                         self._sdk.set_device_param(items=f"Door{door_id}Drivertime={seconds}")
+                        self._door_drivetime_set[door_id] = seconds
                     except Exception as _sp_err:
                         self.logger.debug(
                             "[PullSDKDevice][%s] SetDeviceParam Door%sDriveTime=%s ignored: %s",

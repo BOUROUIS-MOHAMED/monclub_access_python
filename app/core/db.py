@@ -911,6 +911,8 @@ def init_db() -> None:
 
                 optional_data_sync_delay_minutes INTEGER,
 
+                manual_sync_mode INTEGER,
+
                 created_at TEXT,
                 updated_at TEXT
             );
@@ -946,6 +948,7 @@ def init_db() -> None:
         _ensure_column(conn, "auth_state", "next_refresh_at",         "next_refresh_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "sdk_read_initial_bytes", "sdk_read_initial_bytes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "optional_data_sync_delay_minutes", "optional_data_sync_delay_minutes INTEGER")
+        _ensure_column(conn, "sync_access_software_settings", "manual_sync_mode", "manual_sync_mode INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "created_at", "created_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "updated_at", "updated_at TEXT")
 
@@ -2928,6 +2931,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
                         optional_data_sync_delay_minutes,
 
+                        manual_sync_mode,
+
                         created_at,
                         updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2964,6 +2969,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
 
                         optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
+
+                        manual_sync_mode=excluded.manual_sync_mode,
 
                         created_at=excluded.created_at,
                         updated_at=excluded.updated_at
@@ -3002,6 +3009,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         _to_int_or_none(s.get("sdkReadInitialBytes", 1048576)),
 
                         _to_int_or_none(s.get("optionalDataSyncDelayMinutes", 60)),
+
+                        _bool_to_i(s.get("manualSyncMode", s.get("manual_sync_mode", False)), default=0),
 
                         _safe_str(s.get("createdAt"), ""),
                         _safe_str(s.get("updatedAt"), updated_at) or updated_at,
@@ -3373,8 +3382,9 @@ def _upsert_sync_access_software_settings_row(
             agent_sync_backend_refresh_min,
             default_authorize_door_id, sdk_read_initial_bytes,
             optional_data_sync_delay_minutes,
+            manual_sync_mode,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             gym_id=excluded.gym_id,
             access_server_host=excluded.access_server_host,
@@ -3400,6 +3410,7 @@ def _upsert_sync_access_software_settings_row(
             default_authorize_door_id=excluded.default_authorize_door_id,
             sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
             optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
+            manual_sync_mode=excluded.manual_sync_mode,
             created_at=excluded.created_at,
             updated_at=excluded.updated_at
         """,
@@ -3429,6 +3440,7 @@ def _upsert_sync_access_software_settings_row(
             _to_int_or_none(settings.get("defaultAuthorizeDoorId", 15)),
             _to_int_or_none(settings.get("sdkReadInitialBytes", 1048576)),
             _to_int_or_none(settings.get("optionalDataSyncDelayMinutes", 60)),
+            _bool_to_i(settings.get("manualSyncMode", settings.get("manual_sync_mode", False)), default=0),
             _safe_str(settings.get("createdAt"), ""),
             _safe_str(settings.get("updatedAt"), updated_at) or updated_at,
         ),
@@ -4368,6 +4380,7 @@ def _coerce_sync_access_software_settings_row_to_payload(
         "defaultAuthorizeDoorId": d.get("default_authorize_door_id"),
         "sdkReadInitialBytes": d.get("sdk_read_initial_bytes"),
         "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
+        "manualSyncMode": bool(int(d.get("manual_sync_mode") or 0)),
         "createdAt": d.get("created_at"),
         "updatedAt": d.get("updated_at"),
     }
@@ -4394,6 +4407,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
                 default_authorize_door_id,
                 sdk_read_initial_bytes,
                 optional_data_sync_delay_minutes,
+                manual_sync_mode,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1
@@ -4728,6 +4742,7 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
                 default_authorize_door_id,
                 sdk_read_initial_bytes,
                 optional_data_sync_delay_minutes,
+                manual_sync_mode,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1

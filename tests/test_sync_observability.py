@@ -433,6 +433,42 @@ def test_local_api_server_suppresses_connection_abort_tracebacks(monkeypatch):
     server.app.logger.info.assert_called_once()
 
 
+# --- Manual sync mode gate: is_explicit_user_sync ----------------------------------------
+# Drives whether a device push is allowed while a gym is in manual sync mode. Explicit pushes
+# (dashboard "Sync data" button, HARD_RESET) must pass; every automatic trigger must not.
+
+def _ctx(source, run_type="TRIGGERED", hint=None):
+    from app.core.sync_observability import SyncTriggerContext
+
+    return SyncTriggerContext(run_type=run_type, trigger_source=source, trigger_hint=hint)
+
+
+@pytest.mark.parametrize(
+    "context, expected",
+    [
+        # explicit user/maintenance pushes -> allowed
+        (_ctx("SYNC_NOW_API", hint={"reason": "user-sync"}), True),
+        (_ctx("SYNC_NOW_API", hint={"reason": "daily-auto-sync"}), True),
+        (_ctx("SYNC_NOW_API", run_type="HARD_RESET", hint={"hardReset": True}), True),
+        (_ctx("SYNC_NOW_API", hint={"hardReset": True}), True),
+        # automatic triggers -> suppressed
+        (_ctx("TIMER", run_type="PERIODIC"), False),
+        (_ctx("CHANGE_DETECTOR"), False),
+        (_ctx("STARTUP", run_type="PERIODIC"), False),
+        (_ctx("FAST_PATCH_BUNDLE", hint={"reason": "fast_patch_bundle"}), False),
+        # SYNC_NOW_API without the marker = the dashboard per-edit auto-dispatch / AUTH_LOGIN
+        (_ctx("SYNC_NOW_API", hint={"entityType": "ACTIVE_MEMBERSHIP", "operation": "UPDATE"}), False),
+        (_ctx("SYNC_NOW_API", hint={"reason": "AUTH_LOGIN"}), False),
+        (_ctx("SYNC_NOW_API", hint=None), False),
+        (None, False),
+    ],
+)
+def test_is_explicit_user_sync(context, expected):
+    from app.core.sync_observability import is_explicit_user_sync
+
+    assert is_explicit_user_sync(context) is expected
+
+
 def test_local_api_server_delegates_unexpected_errors(monkeypatch):
     from app.api import local_access_api_v2 as api_module
 

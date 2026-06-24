@@ -290,6 +290,63 @@ class MonClubApi:
 
         return data
 
+    def ack_pending_sync(self, *, token: str, timeout: int = 10) -> bool:
+        """Reset the backend per-gym unsynced-change counter to 0 after a manual sync.
+
+        Called by the on-site app only when manual sync mode is on and the user pressed
+        "Sync data" (so the dashboard badge returns to 0). Best-effort: returns False
+        instead of raising so a failure here never breaks the sync loop.
+
+        The URL is derived from the known sync endpoint so we reuse the same host + the
+        shared /manager/gym/access/v1/ path family (no extra endpoint wiring needed).
+        """
+        base = (self.endpoints.sync_url or "").strip()
+        marker = "/manager/gym/access/v1/"
+        idx = base.find(marker)
+        if idx < 0:
+            self.logger.debug("[API] ack_pending_sync: cannot derive URL from sync_url=%r", base)
+            return False
+        url = base[: idx + len(marker)] + "pending-sync/ack"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        try:
+            r = self._session.post(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            self.logger.debug("[API] ack_pending_sync request failed: %s", e)
+            return False
+        if r.status_code < 200 or r.status_code >= 300:
+            self.logger.debug("[API] ack_pending_sync HTTP %s -> %s", r.status_code, (r.text or "")[:200])
+            return False
+        return True
+
+    def report_daily_sync(self, *, token: str, ok: bool, error: str | None = None, timeout: int = 10) -> bool:
+        """Report the outcome of the scheduled daily 22:00 auto-sync to the backend so the
+        dashboard can show a "daily sync failed" notification. Best-effort (returns False on
+        failure, never raises). URL derived from the sync endpoint's path family."""
+        base = (self.endpoints.sync_url or "").strip()
+        marker = "/manager/gym/access/v1/"
+        idx = base.find(marker)
+        if idx < 0:
+            self.logger.debug("[API] report_daily_sync: cannot derive URL from sync_url=%r", base)
+            return False
+        url = base[: idx + len(marker)] + "daily-sync/report"
+        payload = {"ok": bool(ok), "error": (str(error)[:250] if error else None)}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        try:
+            r = self._session.post(url, json=payload, headers=headers, timeout=timeout)
+        except Exception as e:
+            self.logger.debug("[API] report_daily_sync request failed: %s", e)
+            return False
+        if r.status_code < 200 or r.status_code >= 300:
+            self.logger.debug("[API] report_daily_sync HTTP %s -> %s", r.status_code, (r.text or "")[:200])
+            return False
+        return True
+
     def validate_statistics_password(self, *, token: str, password: str, timeout: int = 15) -> bool:
         """Validate the gym statistics/admin-agent password against the backend.
 

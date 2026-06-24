@@ -209,8 +209,11 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         "image_cache_timeout_sec": _clamp_int(raw.get("imageCacheTimeoutSec"), 8, 1, 60),
         # 50MB default keeps a full season roster of avatars warm. Cap raised
         # so a backend override can grow further if the gym wants it.
-        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 50 * 1024 * 1024, 1024, 500 * 1024 * 1024),
-        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 5000, 1, 50000),
+        # Sized to hold ALL members' avatars + face captures (≈1800 members × 2
+        # images) so a once-seen image is never evicted (was 50MB → the cache
+        # filled in 1-2h and members went black again on their next scan).
+        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 256 * 1024 * 1024, 1024, 1024 * 1024 * 1024),
+        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 8000, 1, 50000),
 
         "event_queue_max": _clamp_int(raw.get("eventQueueMax"), 5000, 100, 200000),
         "notification_queue_max": _clamp_int(raw.get("notificationQueueMax"), 5000, 100, 200000),
@@ -228,6 +231,11 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         "history_service_enabled": _boolish(raw.get("historyServiceEnabled"), True),
 
         "agent_sync_backend_refresh_min": _clamp_int(raw.get("agentSyncBackendRefreshMin"), 30, 1, 1440),
+
+        # When True, dashboard edits do NOT auto-push to the turnstiles. Auto sync ticks
+        # (timer / change-detector) still pull+cache but skip the device push; only an explicit
+        # push — the "Sync data" button ({"reason":"user-sync"}) or a HARD_RESET — reconciles.
+        "manual_sync_mode": _boolish(raw.get("manualSyncMode", raw.get("manual_sync_mode")), False),
 
         "optional_data_sync_delay_minutes": _clamp_int(raw.get("optionalDataSyncDelayMinutes"), 60, 60, 1440),
 
@@ -296,7 +304,7 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         empty_max = empty_min
 
     empty_factor = _clamp_float(dev.get("emptyBackoffFactor"), 1.35, 1.0, 3.0)
-    empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 500, 0, 120000)
+    empty_backoff_max = _clamp_int(dev.get("emptyBackoffMaxMs"), 300, 0, 120000)
 
     # TOTP/RFID
     totp_enabled = _boolish(dev.get("totpEnabled"), True)

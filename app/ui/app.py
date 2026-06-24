@@ -77,6 +77,7 @@ from app.core.log_sync_request_poller import LogSyncRequestPoller
 from app.core.sync_observability import (
     SyncTriggerContext,
     build_sync_response_summary,
+    is_explicit_user_sync,
     resolve_sync_context,
     serialize_trigger_hint,
 )
@@ -513,6 +514,13 @@ class MainApp:
         self._last_device_sync_at: Optional[str] = None
         self._last_device_sync_ok: bool = True
         self._last_device_sync_error: Optional[str] = None
+        # Scheduled daily 22:00 auto-sync — outcome of the latest run (reported to backend).
+        self._last_daily_sync_at: Optional[str] = None
+        self._last_daily_sync_ok: Optional[bool] = None
+        self._last_daily_sync_error: Optional[str] = None
+        self._daily_sync_after_id: Optional[int] = None
+        self._daily_sync_last_run_date: Optional[str] = None  # local YYYY-MM-DD of last fired run
+        self._daily_sync_hour: int = 22  # 22:00 local
         self._feedback_event_seq: int = 0
         self._feedback_events: List[Dict[str, Any]] = []
         self._feedback_events_cond = threading.Condition()
@@ -1015,6 +1023,7 @@ class MainApp:
     def show_app(self):
         self._active_view = "app"
         self._start_change_detector()
+        self._start_daily_sync_scheduler()
 
     def show_login(self):
         try:
@@ -1091,6 +1100,45 @@ class MainApp:
                 self.logger.warning("[LogSyncPoller] Failed to start: %s", poll_exc)
         except Exception as exc:
             self.logger.warning("[ChangeDetector] Failed to start: %s", exc)
+
+    def _start_daily_sync_scheduler(self) -> None:
+        """Start the once-per-day 22:00-local auto-sync watchdog (idempotent).
+
+        Uses a lightweight ~1-minute self-rescheduling check rather than a single 24h timer, so it
+        survives clock drift / sleep and still fires if the PC was off at exactly 22:00 but came
+        back a few minutes later. The fired sync is a FORCED full reconcile (reason=daily-auto-sync)
+        that pushes even in manual sync mode; its outcome is reported to the backend so the
+        dashboard can show a "daily sync failed" notification.
+        """
+        if self._daily_sync_after_id is not None:
+            return  # already armed
+        self._daily_sync_check()
+
+    def _daily_sync_check(self) -> None:
+        try:
+            from datetime import datetime
+
+            now = datetime.now()  # local time (gym PC clock)
+            today = now.date().isoformat()
+            if now.hour >= self._daily_sync_hour and self._daily_sync_last_run_date != today:
+                self._daily_sync_last_run_date = today
+                self.logger.info(
+                    "[DailySync] Firing scheduled daily auto-sync (>= %02d:00 local)",
+                    self._daily_sync_hour,
+                )
+                self.request_sync_now(
+                    trigger_source="SYNC_NOW_API",
+                    run_type="TRIGGERED",
+                    trigger_hint={"reason": "daily-auto-sync"},
+                )
+        except Exception:
+            self.logger.warning("[DailySync] check failed", exc_info=True)
+        finally:
+            # Re-arm the check ~every minute.
+            try:
+                self._daily_sync_after_id = self.after(60 * 1000, self._daily_sync_check)
+            except Exception:
+                self._daily_sync_after_id = None
 
     def force_login(self):
         clear_auth_token()
@@ -1214,6 +1262,19 @@ class MainApp:
             self.logger.warning("[FastPatch] failed to reset ULTRA caches", exc_info=True)
 
     def apply_fast_patch_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
+        # Manual sync mode: ignore immediate fast-patch bundles entirely. In this mode the
+        # dashboard records pending changes instead of pushing; the admin flushes them with the
+        # "Sync data" button (a full pull + reconcile). Applying a bundle here would push to the
+        # turnstiles, defeating manual mode. An updated dashboard never sends bundles while manual
+        # sync is on — this is defense-in-depth against a stale/old client.
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+            if bool((get_backend_global_settings() or {}).get("manual_sync_mode", False)):
+                self.logger.info("[FastPatch] Ignored: manual sync mode")
+                return {"ok": True, "skipped": "manual_sync_mode"}
+        except Exception:
+            pass
+
         from app.core.db import (
             apply_fast_patch_bundle,
             invalidate_sync_cache,
@@ -1579,6 +1640,31 @@ class MainApp:
             }
             _delta_changed_ids = None  # set when backend returns membersDeltaMode=True
 
+            # --- Manual sync mode gate ------------------------------------------------
+            # When the gym enabled manual sync, AUTOMATIC ticks (periodic TIMER / CHANGE_DETECTOR
+            # / STARTUP / AUTH_LOGIN, and the dashboard's per-edit auto-dispatch) must NOT push to
+            # the turnstiles — edits accumulate as "unsynced" until the admin acts. Only EXPLICIT
+            # pushes are allowed through in manual mode:
+            #   • the dashboard "Sync data" button — POST /api/v2/sync/now with the marker body
+            #     {"reason": "user-sync"} (see callSync). The marker survives request_sync_now's
+            #     preserve-pending path (so a genuine click always registers) and distinguishes
+            #     the click from the per-edit auto-dispatch (triggerLocalAccessSync), which carries
+            #     entity hints WITHOUT the marker and stays suppressed even vs an un-updated dashboard.
+            #   • a HARD_RESET — the local maintenance endpoint that deliberately clears all sync
+            #     hashes/tokens and force-pushes the full roster; it must not be neutered by manual mode.
+            try:
+                from app.core.settings_reader import get_backend_global_settings
+                _manual_sync_mode = bool((get_backend_global_settings() or {}).get("manual_sync_mode", False))
+            except Exception:
+                _manual_sync_mode = False
+            _is_user_initiated_sync = is_explicit_user_sync(trigger_context)
+            # Push to devices only on auto-sync gyms, or when the user explicitly forced a sync.
+            _should_push = (not _manual_sync_mode) or _is_user_initiated_sync
+            _is_daily_sync = (
+                isinstance(trigger_context.trigger_hint, dict)
+                and str(trigger_context.trigger_hint.get("reason") or "").strip().lower() == "daily-auto-sync"
+            )
+
             try:
                 from app.core.db import insert_sync_run
 
@@ -1649,6 +1735,13 @@ class MainApp:
                         "[SYNC-DEBUG] forcing member refresh due to trigger_hint=%s",
                         trigger_context.trigger_hint,
                     )
+                # Manual-mode "Sync data" button: force a FULL member refresh so the local
+                # cache captures edits made right before the click — auto ticks may have
+                # advanced the member version tokens without pushing. Device/credential/settings
+                # deltas still flow via their own tokens. The full device reconcile happens below.
+                if _manual_sync_mode and _is_user_initiated_sync:
+                    version_tokens = strip_all_member_version_tokens(version_tokens) or None
+
                 # First sync (no tokens) transfers full payload - allow more time.
                 # Delta syncs (tokens present) are small and fast - keep tight timeout.
                 sync_timeout = 60 if version_tokens else 60
@@ -1784,6 +1877,12 @@ class MainApp:
                     if _shadow_ms >= 250:
                         self.logger.info("[SYNC-DEBUG] shadow diff/write took %dms", _shadow_ms)
 
+                # Manual-mode button sync: ignore narrow delta hints and reconcile the FULL
+                # roster against on-device state, so every change accumulated while unsynced
+                # is pushed (the device engine still only writes pins that actually differ).
+                if _manual_sync_mode and _is_user_initiated_sync:
+                    _delta_changed_ids = None
+
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they
                 # are recognised on the next request (membersVersion, not currentMembersVersion).
@@ -1807,7 +1906,7 @@ class MainApp:
                     refresh["members"], refresh["devices"], refresh["credentials"], refresh["settings"],
                     new_tokens,
                 )
-                if refresh.get("members") and not refresh.get("devices"):
+                if _should_push and refresh.get("members") and not refresh.get("devices"):
                     self._request_running_ultra_sync(
                         refresh=refresh,
                         changed_ids=_delta_changed_ids,
@@ -1830,7 +1929,23 @@ class MainApp:
 
             # Device sync (DEVICE-mode devices only)
             try:
-                if bool(getattr(self.cfg, "device_sync_enabled", True)):
+                if not _should_push:
+                    # Manual sync mode + automatic trigger: do NOT touch the turnstiles. The
+                    # local cache was still refreshed above, but device_sync_state is left
+                    # untouched so the accumulated diff survives until the user presses
+                    # "Sync data" (which reconciles the full pending delta).
+                    self.logger.info(
+                        "[DeviceSync] Skipped: manual sync mode (auto trigger=%s)",
+                        trigger_context.trigger_source,
+                    )
+                    if sync_response_summary is not None:
+                        sync_response_summary["devicePush"] = {
+                            "enabled": True,
+                            "started": False,
+                            "devicesDispatched": 0,
+                            "skippedReason": "MANUAL_SYNC_MODE",
+                        }
+                elif bool(getattr(self.cfg, "device_sync_enabled", True)):
                     reasons = self._restriction_reasons()
                     if reasons:
                         self.logger.warning("[DeviceSync] Skipped: restricted: " + " | ".join(reasons[:3]))
@@ -1920,6 +2035,36 @@ class MainApp:
                         "skippedReason": "ERROR",
                     }
                 self.logger.exception(f"[DeviceSync] Unexpected error: {ex}")
+
+            # Manual-mode "Sync data" button finished: the latest roster was pulled and the
+            # full device/ULTRA reconcile was dispatched — clear the backend pending counter so
+            # the dashboard badge returns to 0. Best-effort; never break the sync loop.
+            if _manual_sync_mode and _is_user_initiated_sync and sync_online:
+                try:
+                    self._api().ack_pending_sync(token=_effective_token)
+                    self.logger.info("[ManualSync] pending-sync acked after manual reconcile")
+                except Exception as _ack_exc:
+                    self.logger.warning("[ManualSync] pending-sync ack failed: %s", _ack_exc)
+
+            # Scheduled daily 22:00 auto-sync: report the outcome so the dashboard can show a
+            # "daily sync failed" notification. ok = pulled from backend AND the device push
+            # dispatched without error on this run.
+            if _is_daily_sync:
+                _daily_ok = bool(sync_online) and (device_sync_issue is None)
+                self._last_daily_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self._last_daily_sync_ok = _daily_ok
+                self._last_daily_sync_error = (
+                    None if _daily_ok else (sync_error_message or device_sync_issue or "daily sync failed")
+                )
+                try:
+                    self._api().report_daily_sync(
+                        token=auth.token,
+                        ok=_daily_ok,
+                        error=self._last_daily_sync_error,
+                    )
+                    self.logger.info("[DailySync] reported result ok=%s", _daily_ok)
+                except Exception as _ds_exc:
+                    self.logger.warning("[DailySync] report failed: %s", _ds_exc)
 
             try:
                 self._device_attendance_engine.run_blocking(
@@ -2018,7 +2163,7 @@ class MainApp:
             except Exception as ex:
                 self.logger.exception(f"[ULTRA] Unexpected error in sync_tick: {ex}")
 
-            if refresh.get("devices") and not ultra_engine_restarted:
+            if _should_push and refresh.get("devices") and not ultra_engine_restarted:
                 self._request_running_ultra_sync(
                     refresh=refresh,
                     changed_ids=None,

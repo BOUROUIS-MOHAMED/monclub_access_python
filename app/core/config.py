@@ -351,7 +351,7 @@ class AppConfig:
                 "empty_sleep_min_ms": 200,
                 "empty_sleep_max_ms": 500,
                 "empty_backoff_factor": 1.35,
-                "empty_backoff_max_ms": 2000,
+                "empty_backoff_max_ms": 300,  # cap idle RTLog-poll wait → sub-second QR latency
                 "platform": "",
                 "timeout_ms": int(self.device_timeout_ms),
                 "rtlog_table": "rtlog",

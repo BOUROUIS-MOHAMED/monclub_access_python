@@ -175,7 +175,12 @@ class UltraDeviceWorker(threading.Thread):
         self._empty_min = int(settings.get("empty_sleep_min_ms", 200))
         self._empty_max = int(settings.get("empty_sleep_max_ms", 500))
         self._backoff = float(settings.get("empty_backoff_factor", 1.35))
-        self._backoff_cap = int(settings.get("empty_backoff_max_ms", 2000))
+        # Idle RTLog poll cap. This is the WORST-CASE latency from "member scans the
+        # QR" to "MonClub sees it": the scan sits in the controller's RTLog until the
+        # next poll. The old 2000ms cap made an idle-period scan wait up to ~2s (the
+        # gym owner measured 1.8-2.3s). 300ms keeps it sub-second; the held persistent
+        # connection makes frequent GetRTLog cheap.
+        self._backoff_cap = int(settings.get("empty_backoff_max_ms", 300))
         self._empty_sleep_ms = float(self._empty_min)
         # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
         self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
@@ -292,6 +297,10 @@ class UltraDeviceWorker(threading.Thread):
         try:
             self._get_cached_local_state()
             logger.info(f"{self._prefix} local state cache pre-warmed")
+            # Kick the bg refresh once at startup so member images start
+            # downloading immediately (warms the popup-image cache before the
+            # first scanners arrive — fixes black-on-first-scan).
+            self._trigger_bg_cache_refresh()
         except Exception as e:
             logger.warning(f"{self._prefix} cache pre-warm failed: {e} (will retry on first event)")
 
@@ -1806,16 +1815,50 @@ class UltraDeviceWorker(threading.Thread):
     # ------------------------------------------------------------------ #
 
     def _trigger_bg_cache_refresh(self) -> None:
-        """Reload local state on a background thread (never blocks the worker).
+        """Signal the persistent refresh thread to reload local state (non-blocking).
 
-        Updates BOTH this worker's cache and the process-wide shared snapshot on
-        success. Idempotent: a refresh already in flight is not duplicated.
+        The refresh runs on ONE long-lived thread (not a fresh thread per call), so
+        its SQLite connection's page cache stays warm across refreshes — measured
+        ~1.5s warm vs ~6.4s cold-per-thread on the gym PC. Reusing the thread also
+        REDUCES thread churn (safer for the 32-bit thread ceiling). The worker is
+        never blocked: it just sets an event.
         """
-        if getattr(self, "_cache_bg_loading", False):
-            return
-        self._cache_bg_loading = True
+        evt = getattr(self, "_refresh_evt", None)
+        if evt is None:
+            evt = threading.Event()
+            self._refresh_evt = evt
+            self._refresh_thread_lock = threading.Lock()
+            self._refresh_thread = None
+        self._ensure_refresh_thread()
+        evt.set()
 
-        def _bg_load():
+    def _ensure_refresh_thread(self) -> None:
+        with self._refresh_thread_lock:
+            t = getattr(self, "_refresh_thread", None)
+            if t is not None and t.is_alive():
+                return
+            try:
+                t = threading.Thread(
+                    target=self._refresh_loop, daemon=True,
+                    name=f"cache-refresh-{self._device_id}",
+                )
+                self._refresh_thread = t
+                t.start()
+            except RuntimeError as _exc:
+                self._refresh_thread = None
+                _tel.thread_spawn_failure(
+                    "ultra._ensure_refresh_thread", worker=self._tel_wid, err=str(_exc),
+                )
+
+    def _refresh_loop(self) -> None:
+        """Persistent local-state refresh worker. One per device; reused so its
+        DB connection cache stays warm. Exits when the worker stops."""
+        while not self._stop_evt.is_set():
+            if not self._refresh_evt.wait(timeout=5.0):
+                continue
+            self._refresh_evt.clear()
+            if self._stop_evt.is_set():
+                break
             _bg_t0 = time.monotonic()
             try:
                 _gen_at_load = get_local_state_generation()
@@ -1830,22 +1873,43 @@ class UltraDeviceWorker(threading.Thread):
                         "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
                         dur_ms=round((time.monotonic() - _bg_t0) * 1000), creds=len(creds),
                     )
+                    # Warm the popup-image cache for ALL members NOW (on this bg
+                    # thread), so a member's avatar is already downloaded before
+                    # they scan — fixes "image black on first scan" (the on-scan
+                    # prefetch lost the race against the 3s popup + ~3s fetch).
+                    self._prefetch_member_images(uam)
             except Exception as e:
                 logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
                 _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
-            finally:
-                self._cache_bg_loading = False
 
+    def _prefetch_member_images(self, users_by_am) -> None:
+        """Submit ALL members' avatar/face images to the popup-image prefetch pool
+        so they are downloaded and cached BEFORE the member scans. prefetch() is
+        idempotent (skips already-cached files via a cheap stat), so re-running is
+        safe. Throttled to once / 5 min to avoid re-iterating the full roster on
+        every refresh. Runs on the bg refresh thread — never blocks the worker.
+        """
         try:
-            threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
-        except RuntimeError as _exc:
-            # Thread-spawn exhaustion (Type-2). Reset the flag so a later attempt
-            # can retry, then surface the snapshot.
-            self._cache_bg_loading = False
-            _tel.thread_spawn_failure(
-                "ultra._bg_cache_load", worker=self._tel_wid, err=str(_exc),
-            )
-            raise
+            now = time.monotonic()
+            if (now - getattr(self, "_last_img_prefetch_mono", 0.0)) < 300.0:
+                return
+            self._last_img_prefetch_mono = now
+            submitted = 0
+            for u in (users_by_am or {}).values():
+                if not isinstance(u, dict):
+                    continue
+                for key in ("userProfileImage", "image"):
+                    img = u.get(key)
+                    if img:
+                        try:
+                            _prefetch_popup_image(str(img))
+                            submitted += 1
+                        except Exception:
+                            pass
+            if submitted:
+                _tel.event("MEMBER_IMG_PREFETCH", worker=self._tel_wid, submitted=submitted)
+        except Exception:
+            pass
 
     def _get_cached_local_state(self):
         """Return (creds, users_by_am, users_by_card) without ever blocking the
@@ -2134,10 +2198,24 @@ class UltraSyncScheduler:
             self._pending_reason = "manual"
             return changed_ids, device_ids, reason
 
+    @staticmethod
+    def _manual_sync_mode() -> bool:
+        """True when the gym enabled manual sync. In that mode the ULTRA scheduler must NOT
+        auto-push to devices (startup / periodic timer). Explicit syncs still flow through
+        request_sync_now (gated by the app layer's _should_push) and are honored."""
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+            return bool((get_backend_global_settings() or {}).get("manual_sync_mode", False))
+        except Exception:
+            return False
+
     def _run(self):
         """Sync loop: push data to each ULTRA device on its configured interval."""
-        # Immediate first sync
-        self._sync_all(reason="startup")
+        # Immediate first sync — suppressed in manual sync mode. The worker still connects and
+        # observes RTLog; the device keeps its last-synced credentials until an explicit sync
+        # (the "Sync data" button / daily 22:00 / hard reset) routed via request_sync_now.
+        if not self._manual_sync_mode():
+            self._sync_all(reason="startup")
 
         while not self._stop.is_set():
             # Find the shortest interval among all ULTRA devices
@@ -2158,7 +2236,9 @@ class UltraSyncScheduler:
                 changed_ids, device_ids, reason = pending
                 self._sync_all(changed_ids=changed_ids, device_ids=device_ids, reason=reason)
                 continue
-            self._sync_all(reason="timer")
+            # Periodic timer push — suppressed in manual sync mode (auto-push off).
+            if not self._manual_sync_mode():
+                self._sync_all(reason="timer")
 
     def _check_worker_health(self):
         """Deprecated: worker restarts are handled exclusively by the watchdog thread.

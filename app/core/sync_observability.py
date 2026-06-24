@@ -24,6 +24,33 @@ def resolve_sync_context(
     return SyncTriggerContext(run_type="PERIODIC", trigger_source="TIMER"), False
 
 
+def is_explicit_user_sync(context: SyncTriggerContext | None) -> bool:
+    """True when a sync was explicitly forced by a person, as opposed to an automatic trigger.
+
+    Explicit (push allowed even in manual sync mode):
+      • the dashboard "Sync data" button   → SYNC_NOW_API + trigger_hint {"reason": "user-sync"}
+      • the scheduled daily 22:00 auto-sync → SYNC_NOW_API + trigger_hint {"reason": "daily-auto-sync"}
+      • a HARD_RESET maintenance action     → SYNC_NOW_API + run_type HARD_RESET / hint hardReset
+
+    Automatic (suppressed in manual sync mode):
+      • TIMER / STARTUP (periodic), CHANGE_DETECTOR, AUTH_LOGIN, FAST_PATCH_BUNDLE, and the
+        dashboard's per-edit auto-dispatch (SYNC_NOW_API carrying an entity hint, no marker).
+    """
+    if context is None:
+        return False
+    source = str(getattr(context, "trigger_source", "") or "").strip().upper()
+    if source != "SYNC_NOW_API":
+        return False
+    run_type = str(getattr(context, "run_type", "") or "").strip().upper()
+    hint = context.trigger_hint if isinstance(getattr(context, "trigger_hint", None), dict) else {}
+    reason = str(hint.get("reason") or "").strip().lower()
+    return (
+        reason in ("user-sync", "daily-auto-sync")
+        or run_type == "HARD_RESET"
+        or bool(hint.get("hardReset"))
+    )
+
+
 def serialize_trigger_hint(trigger_hint: Mapping[str, Any] | None) -> str | None:
     if not trigger_hint:
         return None

@@ -453,8 +453,8 @@ def _image_cache_size_limits(app: Any) -> Tuple[int, int]:
         if eng is not None and hasattr(eng, "get_global_settings"):
             g = eng.get_global_settings() or {}
             return (
-                int(g.get("image_cache_max_bytes") or 50 * 1024 * 1024),
-                int(g.get("image_cache_max_files") or 5000),
+                int(g.get("image_cache_max_bytes") or 256 * 1024 * 1024),
+                int(g.get("image_cache_max_files") or 8000),
             )
     except Exception:
         pass
@@ -462,11 +462,11 @@ def _image_cache_size_limits(app: Any) -> Tuple[int, int]:
         from app.core.settings_reader import get_backend_global_settings
         g = get_backend_global_settings() or {}
         return (
-            int(g.get("image_cache_max_bytes") or 50 * 1024 * 1024),
-            int(g.get("image_cache_max_files") or 5000),
+            int(g.get("image_cache_max_bytes") or 256 * 1024 * 1024),
+            int(g.get("image_cache_max_files") or 8000),
         )
     except Exception:
-        return 50 * 1024 * 1024, 5000
+        return 256 * 1024 * 1024, 8000
 
 
 def _handle_image_cache(ctx: _Ctx) -> None:
