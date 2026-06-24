@@ -10,8 +10,10 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+import app.core.ultra_engine as _ue
 from app.core.ultra_engine import UltraDeviceWorker, _ULTRA_CARD_DEBOUNCE_SEC
 from app.core.access_types import HistoryRecord, NotificationRequest
+from app.core.db import get_local_state_generation
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,7 @@ def _make_worker(
     worker._door_cmd_failures = 0
     worker._poll_ema_ms = 0.0
     worker._prefix = f"[ULTRA:{worker._device_id}]"
+    worker._tel_wid = f"ULTRA:{worker._device_id}"
     worker._card_cooldown = {}
 
     worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
@@ -107,6 +110,11 @@ def _make_worker(
 
     worker._cached_state = None
     worker._cached_state_ts = 0.0
+    # Match the live generation so a worker whose _cached_state is set directly by
+    # a test is not seen as "stale" (which would trigger a bg refresh). Reset the
+    # process-wide shared snapshot too, so it can't leak between tests.
+    worker._cached_state_gen = get_local_state_generation()
+    _ue._set_shared_local_state(None, -1)
     worker._CACHE_TTL_SEC = 5.0
     worker._member_sync_lock = threading.Lock()
     worker._pending_member_syncs = deque()

@@ -159,6 +159,7 @@ def read_cached(url: str) -> Optional[Tuple[bytes, str]]:
     return None
 
 
+@_tel.timed("IMG_FETCH_DUR", slow_ms=0, warn_ms=3000)
 def fetch_and_cache(
     url: str,
     *,
@@ -216,6 +217,7 @@ def fetch_and_cache(
         return None
 
 
+@_tel.timed("IMG_PREFETCH_SUBMIT", slow_ms=20)
 def prefetch(raw_url: str) -> None:
     """Best-effort background prefetch of a popup image.
 

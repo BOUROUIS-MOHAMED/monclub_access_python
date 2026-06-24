@@ -15,7 +15,12 @@ from app.core.access_verification import (
     parse_event_time_to_epoch,
     verify_totp_resilient,
 )
-from app.core.db import get_recent_access_history, insert_access_history, load_sync_cache
+from app.core.db import (
+    get_recent_access_history,
+    insert_access_history,
+    load_sync_cache,
+    get_local_state_generation,
+)
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
@@ -52,6 +57,41 @@ _ULTRA_CARD_DEBOUNCE_SEC = 3.0
 # ---------------------------------------------------------------------------
 # UltraDeviceWorker
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Process-wide "last good" local-state cache (creds, users_by_am, users_by_card).
+#
+# load_local_state() was measured at 78s on the gym PC (DB_READ_list_sync_users
+# cold-reads 1798 rows). When a worker's own cache is empty (startup, recreation,
+# or post-invalidation) the old code loaded it SYNCHRONOUSLY on the worker thread
+# — freezing RTLog polling + door commands for the whole load (the user's "QR
+# stuck ~3 min" symptom). Sharing the last successfully-loaded state across all
+# workers means only the VERY FIRST load in the process ever blocks (at startup);
+# every later cold cache adopts this shared snapshot instantly and refreshes in
+# the background. The snapshot is treated as read-only (verify_totp only reads
+# it), so sharing one object across workers is safe.
+# ---------------------------------------------------------------------------
+_SHARED_LOCAL_STATE_LOCK = threading.Lock()
+_SHARED_LOCAL_STATE: Dict[str, Any] = {"value": None, "gen": -1}
+
+
+def _get_shared_local_state():
+    """Return (value, generation) of the process-wide last-good snapshot."""
+    try:
+        with _SHARED_LOCAL_STATE_LOCK:
+            return _SHARED_LOCAL_STATE["value"], _SHARED_LOCAL_STATE["gen"]
+    except Exception:
+        return None, -1
+
+
+def _set_shared_local_state(value, gen) -> None:
+    try:
+        with _SHARED_LOCAL_STATE_LOCK:
+            _SHARED_LOCAL_STATE["value"] = value
+            _SHARED_LOCAL_STATE["gen"] = int(gen)
+    except Exception:
+        pass
+
 
 class UltraDeviceWorker(threading.Thread):
     """Per-device thread: polls RTLog, classifies events, TOTP rescue."""
@@ -175,10 +215,15 @@ class UltraDeviceWorker(threading.Thread):
         self._last_full_sync_error = ""
         self._full_sync_running = False
 
-        # Local state cache (avoid per-event DB reads)
+        # Local state cache (avoid per-event DB reads).
+        # Reloads are gated by a generation counter (bumped only when a sync
+        # actually changes members/credentials), so the TTL is just a slow safety
+        # net — NOT a "re-read the 1798-row table every 60s" timer (that full read
+        # measured 23-102s on the gym PC and was hammering the DB continuously).
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
-        self._CACHE_TTL_SEC: float = 60.0  # sync data only changes on sync cycles (~60s)
+        self._cached_state_gen: int = -1
+        self._CACHE_TTL_SEC: float = 300.0  # safety net only; real refresh is generation-driven
         self._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
         self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 120.0))
         self._connect_failures = 0
@@ -199,6 +244,16 @@ class UltraDeviceWorker(threading.Thread):
         self._down_error_log_interval_sec: float = 300.0
 
     def reset_fast_patch_caches(self) -> None:
+        # A fast-patch changed member data the local cache reads. Advance the
+        # generation so workers reload exactly once, and clear this worker's cache.
+        # Nulling _cached_state is now safe (no longer a freeze): the cleared cache
+        # takes the non-blocking "adopt the process-wide shared snapshot + refresh
+        # in background" path, not the old synchronous 90s load.
+        try:
+            from app.core.db import bump_local_state_generation
+            bump_local_state_generation()
+        except Exception:
+            pass
         self._cached_state = None
         self._cached_state_ts = 0.0
 
@@ -242,6 +297,7 @@ class UltraDeviceWorker(threading.Thread):
 
         while not self._stop_evt.is_set():
             try:
+                _iter_t0 = time.monotonic()
                 # Yield the TCP connection to UltraSyncScheduler when requested
                 if self._sync_pause.is_set():
                     if self._connected:
@@ -364,6 +420,10 @@ class UltraDeviceWorker(threading.Thread):
                     self._disconnect()
                     self._empty_polls_since_event = 0
 
+                _iter_ms = (time.monotonic() - _iter_t0) * 1000
+                if _iter_ms > 2000:
+                    _tel.warn("LOOP_ITER_SLOW", worker=self._tel_wid, dur_ms=round(_iter_ms))
+
                 _tel.set_state(self._tel_wid, "idle", f"sleep {sleep_ms:.0f}ms")
                 self._wait_for_work(sleep_ms / 1000.0)
 
@@ -461,6 +521,7 @@ class UltraDeviceWorker(threading.Thread):
         self._last_connect_error = f"deferred: {str(reason or 'deferred')}"
         return True
 
+    @_tel.timed("CONN_CONNECT", slow_ms=0, warn_ms=3000)
     def _connect(self):
         """Connect to device via PullSDK."""
         ip = self._device.get("ipAddress") or self._device.get("ip_address", "")
@@ -532,6 +593,7 @@ class UltraDeviceWorker(threading.Thread):
             self._connected = False
             self._sdk = None
 
+    @_tel.timed("CONN_DISCONNECT", slow_ms=200)
     def _disconnect(self):
         if self._connected or self._sdk:
             logger.debug(f"{self._prefix} disconnect: was_connected={self._connected}")
@@ -626,6 +688,7 @@ class UltraDeviceWorker(threading.Thread):
             }
         return True
 
+    @_tel.timed("DOOR_DRAIN", slow_ms=500)
     def _drain_commands(self):
         """Execute pending door-open commands using the current SDK connection."""
         while not self._cmd_queue.empty():
@@ -653,6 +716,28 @@ class UltraDeviceWorker(threading.Thread):
             finally:
                 result_event.set()
 
+    def _sync_yield_to_doors(self) -> None:
+        """Service queued door-open commands BETWEEN device-sync push chunks.
+
+        A full/member sync runs inline on this worker over the single device
+        connection (a Type-1 freeze: the door is starved for the whole push).
+        DeviceSyncEngine calls this hook between SetDeviceData chunks — the
+        connection is idle between chunks, so issuing a ControlDevice open here
+        is safe and serialized on this thread — so a member scanning mid-sync is
+        let in within ~one chunk instead of waiting for the entire push.
+        Gated by ``ultra_sync_yield_to_doors`` (default ON) so it can be disabled
+        from the backend if a device misbehaves with interleaved commands.
+        """
+        if not bool(self._settings.get("ultra_sync_yield_to_doors", True)):
+            return
+        try:
+            pending = self._cmd_queue.qsize()
+            if pending:
+                self._drain_commands()
+                _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid, opened=pending)
+        except Exception:
+            pass
+
     def _drain_member_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
@@ -679,6 +764,8 @@ class UltraDeviceWorker(threading.Thread):
                 # Member sync runs INLINE on this worker thread over the single
                 # device connection — it blocks RTLog polling + door commands
                 # for its whole duration (a Type-1 freeze contributor). Track it.
+                # Let it open doors queued mid-sync between push chunks.
+                engine._door_yield_cb = self._sync_yield_to_doors
                 _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
                 _ms_t0 = time.monotonic()
                 try:
@@ -757,6 +844,10 @@ class UltraDeviceWorker(threading.Thread):
                 filtered_cache_attrs["devices"] = [device_copy]
                 filtered_cache = SimpleNamespace(**filtered_cache_attrs)
                 engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
+                # Full sync runs INLINE on this worker (see comment below). Let it
+                # open doors queued mid-push between SetDeviceData chunks so the
+                # turnstile stays responsive during the push.
+                engine._door_yield_cb = self._sync_yield_to_doors
                 started_at = time.time()
                 started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
                 self._mark_full_sync_started(reason=reason, engine=engine, started_at=started_iso)
@@ -1020,6 +1111,7 @@ class UltraDeviceWorker(threading.Thread):
 
     def _process_event(self, evt: Dict[str, Any]):
         """Classify RTLog event and route to appropriate handler."""
+        t0 = time.monotonic()
         if not hasattr(self, "_card_cooldown") or not isinstance(self._card_cooldown, dict):
             self._card_cooldown = {}
 
@@ -1099,6 +1191,9 @@ class UltraDeviceWorker(threading.Thread):
         else:
             self._handle_deny(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
 
+        if (time.monotonic() - t0) * 1000 >= 250:
+            _tel.warn("EVENT_PROCESS_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
+
     def _record_event_age(self, scan_epoch: Optional[float]) -> None:
         """Track event age at processing (fix #2a) and warn (throttled) when the
         pipeline latency + clock skew grows large enough to threaten TOTP."""
@@ -1145,10 +1240,16 @@ class UltraDeviceWorker(threading.Thread):
         sdk = self._sdk
         if sdk is None:
             return
+        # get_device_time() is an SDK round-trip on the worker's connect path with
+        # no timeout; time it and surface a slow read (throttled to once/hour).
+        _gdt_t0 = time.monotonic()
         try:
             dev_epoch = sdk.get_device_time()
         except Exception:
             dev_epoch = None
+        _gdt_ms = (time.monotonic() - _gdt_t0) * 1000.0
+        if _gdt_ms >= 1000.0:
+            _tel.warn("DEV_CLOCK_READ_SLOW", worker=self._tel_wid, dur_ms=round(_gdt_ms))
         if dev_epoch is None:
             return
 
@@ -1216,6 +1317,7 @@ class UltraDeviceWorker(threading.Thread):
         door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
     ):
         """Device already opened door. Enrich with user data for popup/history."""
+        t0 = time.monotonic()
         creds, users_by_am, users_by_card = self._get_cached_local_state()
 
         # Simple dict lookup -- no validation (device already decided)
@@ -1296,6 +1398,9 @@ class UltraDeviceWorker(threading.Thread):
             door_id=door_id,
             raw=raw_row,
         )
+
+        if (time.monotonic() - t0) * 1000 >= 250:
+            _tel.warn("ALLOW_HANDLE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
 
     # ------------------------------------------------------------------ #
     # TOTP Rescue handler (active: verify + open door)
@@ -1487,6 +1592,7 @@ class UltraDeviceWorker(threading.Thread):
         door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
     ):
         """Device denied a non-TOTP code. Log and notify."""
+        t0 = time.monotonic()
         logger.info(
             f"{self._prefix} rtlog DENY: card={card_no!r} reason=DEVICE_DENIED "
             f"event_type={event_type!r} door={door_id} event_id={event_id}"
@@ -1515,6 +1621,9 @@ class UltraDeviceWorker(threading.Thread):
             raw=raw_row,
         )
 
+        if (time.monotonic() - t0) * 1000 >= 250:
+            _tel.warn("DENY_HANDLE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
+
     # ------------------------------------------------------------------ #
     # Notification and history helpers
     # ------------------------------------------------------------------ #
@@ -1536,6 +1645,7 @@ class UltraDeviceWorker(threading.Thread):
         user_image_status: str = "",
         user_profile_image: str = "",
     ):
+        t0 = time.monotonic()
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
             return
@@ -1609,6 +1719,9 @@ class UltraDeviceWorker(threading.Thread):
                 reason=reason, event_id=event_id,
             )
 
+        if (time.monotonic() - t0) * 1000 >= 100:
+            _tel.warn("NOTIF_ENQUEUE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
+
     def _enqueue_history(
         self,
         *,
@@ -1631,7 +1744,12 @@ class UltraDeviceWorker(threading.Thread):
         """
         poll_ms = self._poll_ema_ms
 
-        # Use the existing insert_access_history which does INSERT OR IGNORE
+        # Use the existing insert_access_history which does INSERT OR IGNORE.
+        # This is a synchronous DB write on the worker thread (per event). It is
+        # normally sub-ms, but can spike under WAL/DbWriter contention (e.g. while
+        # a sync floods the writer) and stall the loop between scans — so time it
+        # and surface only the slow spikes (no per-event log spam).
+        _hist_t0 = time.monotonic()
         try:
             rowcount = insert_access_history(
                 event_id=event_id,
@@ -1654,6 +1772,10 @@ class UltraDeviceWorker(threading.Thread):
         except Exception as e:
             logger.error(f"{self._prefix} history DB insert failed: {e}")
             inserted = False  # treat as duplicate to avoid bypass of dedup gate
+        finally:
+            _hist_ms = (time.monotonic() - _hist_t0) * 1000.0
+            if _hist_ms >= 250.0:
+                _tel.warn("HIST_INSERT_SLOW", worker=self._tel_wid, dur_ms=round(_hist_ms))
 
         if not inserted:
             return  # duplicate, already processed
@@ -1683,75 +1805,114 @@ class UltraDeviceWorker(threading.Thread):
     # Local state caching (avoid per-event DB reads)
     # ------------------------------------------------------------------ #
 
-    def _get_cached_local_state(self):
-        """Return (creds, users_by_am, users_by_card) with TTL-based cache.
+    def _trigger_bg_cache_refresh(self) -> None:
+        """Reload local state on a background thread (never blocks the worker).
 
-        If stale data exists, returns it immediately and reloads in the
-        background so the caller (TOTP verification + door command) is never
-        blocked by the 3-5 second load_local_state() SQLite query.
+        Updates BOTH this worker's cache and the process-wide shared snapshot on
+        success. Idempotent: a refresh already in flight is not duplicated.
+        """
+        if getattr(self, "_cache_bg_loading", False):
+            return
+        self._cache_bg_loading = True
+
+        def _bg_load():
+            _bg_t0 = time.monotonic()
+            try:
+                _gen_at_load = get_local_state_generation()
+                result = load_local_state()
+                if result and isinstance(result, (tuple, list)) and len(result) >= 3:
+                    self._cached_state = result
+                    self._cached_state_ts = time.monotonic()
+                    self._cached_state_gen = _gen_at_load
+                    _set_shared_local_state(result, _gen_at_load)
+                    creds, uam, ucard = result
+                    _tel.event(
+                        "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
+                        dur_ms=round((time.monotonic() - _bg_t0) * 1000), creds=len(creds),
+                    )
+            except Exception as e:
+                logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
+                _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
+            finally:
+                self._cache_bg_loading = False
+
+        try:
+            threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
+        except RuntimeError as _exc:
+            # Thread-spawn exhaustion (Type-2). Reset the flag so a later attempt
+            # can retry, then surface the snapshot.
+            self._cache_bg_loading = False
+            _tel.thread_spawn_failure(
+                "ultra._bg_cache_load", worker=self._tel_wid, err=str(_exc),
+            )
+            raise
+
+    def _get_cached_local_state(self):
+        """Return (creds, users_by_am, users_by_card) without ever blocking the
+        worker on the slow load_local_state() (78s on the gym PC).
+
+        Order of preference: fresh per-worker cache → stale per-worker cache (+bg
+        refresh) → process-wide last-good snapshot (+bg refresh) → ONE synchronous
+        load (first-ever load in the process only, at startup).
         """
         now = time.monotonic()
-        needs_refresh = self._cached_state is None or (now - self._cached_state_ts) > self._CACHE_TTL_SEC
+        try:
+            current_gen = get_local_state_generation()
+        except Exception:
+            current_gen = self._cached_state_gen
+        # Reload only when: no data, the data actually changed (generation moved),
+        # or the long TTL safety net elapsed. This stops the every-~60s full re-read
+        # of the 1798-row users table when nothing changed.
+        gen_changed = self._cached_state_gen != current_gen
+        needs_refresh = (
+            self._cached_state is None
+            or gen_changed
+            or (now - self._cached_state_ts) > self._CACHE_TTL_SEC
+        )
 
-        if needs_refresh:
-            if self._cached_state is not None:
-                # Stale data exists — return immediately, reload in background
-                if not getattr(self, "_cache_bg_loading", False):
-                    self._cache_bg_loading = True
-                    def _bg_load():
-                        _bg_t0 = time.monotonic()
-                        try:
-                            result = load_local_state()
-                            if result and isinstance(result, (tuple, list)) and len(result) >= 3:
-                                self._cached_state = result
-                                self._cached_state_ts = time.monotonic()
-                                creds, uam, ucard = result
-                                _dur = round((time.monotonic() - _bg_t0) * 1000)
-                                logger.debug(
-                                    f"{self._prefix} bg cache refresh done: "
-                                    f"creds={len(creds)} users_by_am={len(uam)} users_by_card={len(ucard)}"
-                                )
-                                _tel.event(
-                                    "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
-                                    dur_ms=_dur, creds=len(creds),
-                                )
-                        except Exception as e:
-                            logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
-                            _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
-                        finally:
-                            self._cache_bg_loading = False
-                    try:
-                        threading.Thread(target=_bg_load, daemon=True, name=f"cache-{self._device_id}").start()
-                    except RuntimeError as _exc:
-                        # Second thread-spawn site that surfaces Type-2 exhaustion.
-                        _tel.thread_spawn_failure(
-                            "ultra._bg_cache_load", worker=self._tel_wid, err=str(_exc),
-                        )
-                        raise
-                return self._cached_state
-            else:
-                # No data at all — must load synchronously (first time only).
-                # This BLOCKS the worker thread (3-5s SQLite load) and so the
-                # single device connection — a Type-1 freeze contributor.
-                logger.debug(f"{self._prefix} refreshing local state cache from DB (sync, first load)")
-                _tel.set_state(self._tel_wid, "cache_load", "sync")
-                _cl_t0 = time.monotonic()
-                result = load_local_state()
-                if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
-                    logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
-                    self._cached_state = ({}, {}, {})
-                else:
-                    self._cached_state = result
-                self._cached_state_ts = now
-                creds, users_by_am, users_by_card = self._cached_state
-                logger.debug(
-                    f"{self._prefix} local state cache refreshed: "
-                    f"creds={len(creds)} users_by_am={len(users_by_am)} users_by_card={len(users_by_card)}"
-                )
-                _tel.event(
-                    "CACHE_SYNC_LOAD_DONE", worker=self._tel_wid,
-                    dur_ms=round((time.monotonic() - _cl_t0) * 1000), creds=len(creds),
-                )
+        if not needs_refresh:
+            return self._cached_state
+
+        # Stale-but-usable per-worker data: serve it, refresh in the background.
+        if self._cached_state is not None:
+            self._trigger_bg_cache_refresh()
+            return self._cached_state
+
+        # No per-worker data. Adopt the process-wide last-good snapshot so we do
+        # NOT freeze the worker for the full synchronous load. Refresh in the bg
+        # only if the snapshot is itself behind the current generation.
+        shared_value, shared_gen = _get_shared_local_state()
+        if shared_value is not None and isinstance(shared_value, (tuple, list)) and len(shared_value) >= 3:
+            self._cached_state = shared_value
+            self._cached_state_ts = now
+            self._cached_state_gen = shared_gen
+            try:
+                _tel.event("CACHE_ADOPTED_SHARED", worker=self._tel_wid, creds=len(shared_value[0]))
+            except Exception:
+                pass
+            if shared_gen != current_gen:
+                self._trigger_bg_cache_refresh()
+            return self._cached_state
+
+        # First-ever load in the whole process — block ONCE (startup only).
+        logger.debug(f"{self._prefix} refreshing local state cache from DB (sync, first load)")
+        _tel.set_state(self._tel_wid, "cache_load", "sync")
+        _cl_t0 = time.monotonic()
+        _gen_at_load = current_gen
+        result = load_local_state()
+        if result is None or not isinstance(result, (tuple, list)) or len(result) < 3:
+            logger.warning(f"{self._prefix} load_local_state() returned invalid data: {type(result)}")
+            self._cached_state = ({}, {}, {})
+        else:
+            self._cached_state = result
+            _set_shared_local_state(result, _gen_at_load)
+        self._cached_state_ts = now
+        self._cached_state_gen = _gen_at_load
+        creds, users_by_am, users_by_card = self._cached_state
+        _tel.event(
+            "CACHE_SYNC_LOAD_DONE", worker=self._tel_wid,
+            dur_ms=round((time.monotonic() - _cl_t0) * 1000), creds=len(creds),
+        )
         return self._cached_state
 
     # ------------------------------------------------------------------ #
@@ -2230,6 +2391,12 @@ class UltraEngine:
     def __init__(self, cfg: Any, logger_inst: logging.Logger):
         self._cfg = cfg
         self._logger = logger_inst
+        # Telemetry id for the orchestrator (distinct from the per-device
+        # "ULTRA:<id>" workers). Without this, the POPUP_CAPTURE event in the
+        # popup-drain path (which fires exactly when a freeze-induced backlog is
+        # flushed, i.e. drained>0) raised AttributeError: '_tel_wid' and crashed
+        # the drain — a latent bug surfaced by the audit instrumentation.
+        self._tel_wid = "ULTRA:engine"
         self._workers: Dict[int, UltraDeviceWorker] = {}
         self._sync_scheduler: Optional[UltraSyncScheduler] = None
         self._stop_event = threading.Event()

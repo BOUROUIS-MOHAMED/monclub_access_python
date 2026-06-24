@@ -185,6 +185,7 @@ class ImageCache:
         ext = self._ext_from_url(url)
         return os.path.join(self.cache_dir, f"{h}{ext}")
 
+    @_tel.timed("IMG_DOWNLOAD", slow_ms=0, warn_ms=2000)
     def _download(self, url: str, target_path: str) -> bool:
         tmp = target_path + ".tmp"
         try:
@@ -221,6 +222,7 @@ class ImageCache:
                 pass
             return False
 
+    @_tel.timed("IMG_PRUNE", slow_ms=50, warn_ms=2000)
     def _maybe_prune(self) -> None:
         if self.max_files <= 0:
             return
@@ -248,6 +250,7 @@ class ImageCache:
         except Exception:
             return
 
+    @_tel.timed("IMG_RESOLVE", slow_ms=50, warn_ms=2500)
     def resolve(self, url_or_path: str) -> str:
         s = (url_or_path or "").strip()
         if not s:
@@ -629,6 +632,7 @@ class DeviceWorker(threading.Thread):
         except Exception:
             pass
 
+    @_tel.timed("DOOR_OPEN_CMD", slow_ms=0, warn_ms=2000)
     def open_door(self, *, door_id: int, pulse_time_ms: int, timeout_ms: int = 4000) -> CommandResult:
         t0 = _now_ms()
         try:
@@ -973,6 +977,7 @@ class DecisionService(threading.Thread):
             self._users_by_active_membership_id = {}
             self._users_by_card = {}
 
+    @_tel.timed("CACHE_LOAD_LOCAL_STATE", slow_ms=50, warn_ms=1000)
     def _load_local_state(
         self,
     ) -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
@@ -1141,23 +1146,24 @@ class DecisionService(threading.Thread):
             _history_claimed = 0
             if bool(settings.get("save_history", True)):
                 try:
-                    _history_claimed = insert_access_history(
-                        event_id=ev.event_id,
-                        device_id=ev.device_id,
-                        door_id=int(door_id) if door_id is not None else None,
-                        card_no=ev.card_no,
-                        event_time=ev.event_time,
-                        event_type=ev.event_type,
-                        allowed=allowed,
-                        reason=reason,
-                        poll_ms=float(ev.poll_ms),
-                        decision_ms=float(decision_ms),
-                        cmd_ms=0.0,
-                        cmd_ok=None,
-                        cmd_error=None,
-                        raw=dict(ev.raw),
-                        user_id=_resolved_user_id,
-                    )
+                    with _tel.span("HISTORY_CLAIM_WRITE", device_id=int(ev.device_id), allowed=bool(allowed)):
+                        _history_claimed = insert_access_history(
+                            event_id=ev.event_id,
+                            device_id=ev.device_id,
+                            door_id=int(door_id) if door_id is not None else None,
+                            card_no=ev.card_no,
+                            event_time=ev.event_time,
+                            event_type=ev.event_type,
+                            allowed=allowed,
+                            reason=reason,
+                            poll_ms=float(ev.poll_ms),
+                            decision_ms=float(decision_ms),
+                            cmd_ms=0.0,
+                            cmd_ok=None,
+                            cmd_error=None,
+                            raw=dict(ev.raw),
+                            user_id=_resolved_user_id,
+                        )
                 except Exception as ex:
                     _history_claimed = 0
                     self.logger.exception(
@@ -1455,29 +1461,30 @@ class NotificationService(threading.Thread):
                 except Exception:
                     pass
 
-                icon_path = ""
-                if r.image_path:
-                    # F-024: Try to get from cache without downloading (non-blocking)
-                    icon_path = self._img_cache.get_cached(r.image_path)
-                    if not icon_path:
-                        # Not in cache — show notification without image, download in background
-                        def _bg_download(url):
-                            try:
-                                self._img_cache.resolve(url)
-                            except Exception:
-                                pass
-                        # L-002: Submit to bounded thread pool instead of spawning unbounded threads
-                        self._img_executor.submit(_bg_download, r.image_path)
+                with _tel.span("NOTIF_DELIVER", device_id=int(r.device_id), allowed=bool(r.allowed)):
+                    icon_path = ""
+                    if r.image_path:
+                        # F-024: Try to get from cache without downloading (non-blocking)
+                        icon_path = self._img_cache.get_cached(r.image_path)
+                        if not icon_path:
+                            # Not in cache — show notification without image, download in background
+                            def _bg_download(url):
+                                try:
+                                    self._img_cache.resolve(url)
+                                except Exception:
+                                    pass
+                            # L-002: Submit to bounded thread pool instead of spawning unbounded threads
+                            self._img_executor.submit(_bg_download, r.image_path)
 
-                # respect per-device popupShowImage only for popups; Windows toast can still show icon
-                n = Notification(app_id="MonClub Access", title=r.title, msg=r.message, icon=icon_path or "")
-                try:
-                    if audio:
-                        n.set_audio(audio.Default, loop=False)
-                except Exception:
-                    pass
-                n.show()
-                _tel.event("TOAST_SHOW", title=str(r.title)[:30], has_icon=bool(icon_path))
+                    # respect per-device popupShowImage only for popups; Windows toast can still show icon
+                    n = Notification(app_id="MonClub Access", title=r.title, msg=r.message, icon=icon_path or "")
+                    try:
+                        if audio:
+                            n.set_audio(audio.Default, loop=False)
+                    except Exception:
+                        pass
+                    n.show()
+                    _tel.event("TOAST_SHOW", title=str(r.title)[:30], has_icon=bool(icon_path))
             except Exception as e:
                 self.logger.debug(f"[RT][notify failed] {e}")
                 _tel.warn("TOAST_FAILED", err=type(e).__name__)
@@ -1505,22 +1512,23 @@ class HistoryService(threading.Thread):
                 continue
 
             try:
-                insert_access_history(
-                    event_id=r.event_id,
-                    device_id=r.device_id,
-                    door_id=r.door_id,
-                    card_no=r.card_no,
-                    event_time=r.event_time,
-                    event_type=r.event_type,
-                    allowed=r.allowed,
-                    reason=r.reason,
-                    poll_ms=r.poll_ms,
-                    decision_ms=r.decision_ms,
-                    cmd_ms=r.cmd_ms,
-                    cmd_ok=r.cmd_ok,
-                    cmd_error=r.cmd_error,
-                    raw=r.raw,
-                )
+                with _tel.span("HISTORY_RECORD", device_id=int(r.device_id), allowed=bool(r.allowed)):
+                    insert_access_history(
+                        event_id=r.event_id,
+                        device_id=r.device_id,
+                        door_id=r.door_id,
+                        card_no=r.card_no,
+                        event_time=r.event_time,
+                        event_type=r.event_type,
+                        allowed=r.allowed,
+                        reason=r.reason,
+                        poll_ms=r.poll_ms,
+                        decision_ms=r.decision_ms,
+                        cmd_ms=r.cmd_ms,
+                        cmd_ok=r.cmd_ok,
+                        cmd_error=r.cmd_error,
+                        raw=r.raw,
+                    )
             except Exception as e:
                 self.logger.warning(f"[RT][history write failed] {e}")
 
@@ -1602,6 +1610,7 @@ class AgentRealtimeEngine:
     # ---------- settings providers (SQLite cached) ----------
 
 
+    @_tel.timed("CACHE_LOAD_DEVICES", slow_ms=50, warn_ms=1000)
     def _load_devices_cached(self) -> List[Dict[str, Any]]:
         """
         Primary: normalized table -> list_sync_devices_payload() (GymDeviceDto-shaped dicts).
@@ -1644,6 +1653,7 @@ class AgentRealtimeEngine:
             self._devices_cache_at = now_s
         return [dict(x) for x in devs]
 
+    @_tel.timed("CACHE_LOAD_GLOBAL_SETTINGS", slow_ms=50, warn_ms=1000)
     def get_global_settings(self) -> Dict[str, Any]:
         """
         Returns normalized global settings (snake_case) from GymAccessSoftwareSettingsDto.
@@ -1723,6 +1733,7 @@ class AgentRealtimeEngine:
         with self._popup_events_lock:
             self._popup_events_replay = deque(self._popup_events_replay, maxlen=size)
 
+    @_tel.timed("POPUP_CAPTURE", slow_ms=100, warn_ms=1000)
     def capture_popup_events(self, limit: int = 50) -> int:
         drained = 0
         target = max(1, _safe_int(limit, 50))
@@ -1983,6 +1994,7 @@ class AgentRealtimeEngine:
 
     # ---------- device orchestration (per-device mode) ----------
 
+    @_tel.timed("REFRESH_DEVICES", slow_ms=0, warn_ms=3000)
     def refresh_devices(self) -> None:
         """
         Build workers ONLY for devices where:

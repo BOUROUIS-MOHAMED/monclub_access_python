@@ -19,7 +19,38 @@ circular imports.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from typing import Any, Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# In-memory cache for get_backend_global_settings().
+#
+# Measured in production (gym PC, 2026-06-22): this helper was called 229 times
+# in 27 minutes and EACH call hit SQLite (load_sync_access_software_settings or
+# the giant payload_json fallback) costing ~1s on that machine — ~226s of pure
+# waste that also contends with the worker's reads/writes. Global settings change
+# rarely (only on a settings sync), so a short TTL cache is safe and removes the
+# repeated DB hits. invalidate_global_settings_cache() is called after a settings
+# refresh so a real change applies immediately.
+# ---------------------------------------------------------------------------
+_GLOBAL_SETTINGS_CACHE: Dict[str, Any] = {"value": None, "ts": 0.0}
+_GLOBAL_SETTINGS_LOCK = threading.Lock()
+_GLOBAL_SETTINGS_TTL_SEC = 30.0
+
+
+def invalidate_global_settings_cache() -> None:
+    """Drop the cached global settings so the next read reloads from DB.
+
+    Call after a settings sync so a dashboard change applies without waiting for
+    the TTL. Never raises.
+    """
+    try:
+        with _GLOBAL_SETTINGS_LOCK:
+            _GLOBAL_SETTINGS_CACHE["value"] = None
+            _GLOBAL_SETTINGS_CACHE["ts"] = 0.0
+    except Exception:
+        pass
 
 
 # --------------- generic helpers (local to avoid circular imports) ---------------
@@ -433,11 +464,36 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
 # --------------- Convenience: full reads (normalized tables first) ---------------
 
 def get_backend_global_settings() -> Dict[str, Any]:
-    """
-    One-call helper:
+    """One-call helper, with a short in-memory TTL cache (see top of module).
+
     - Primary: read from normalized table sync_access_software_settings (via db.py)
     - Fallback: read from sync_cache.payload_json (older DB / before first sync)
+
+    Returns a shallow COPY of the cached dict so callers may freely mutate their
+    result without corrupting the shared cache.
     """
+    now = time.monotonic()
+    try:
+        with _GLOBAL_SETTINGS_LOCK:
+            cached = _GLOBAL_SETTINGS_CACHE["value"]
+            if cached is not None and (now - float(_GLOBAL_SETTINGS_CACHE["ts"])) < _GLOBAL_SETTINGS_TTL_SEC:
+                return dict(cached)
+    except Exception:
+        pass
+
+    result = _load_backend_global_settings_uncached()
+
+    try:
+        with _GLOBAL_SETTINGS_LOCK:
+            _GLOBAL_SETTINGS_CACHE["value"] = result
+            _GLOBAL_SETTINGS_CACHE["ts"] = time.monotonic()
+    except Exception:
+        pass
+    return dict(result)
+
+
+def _load_backend_global_settings_uncached() -> Dict[str, Any]:
+    """Uncached DB read + normalize (the original get_backend_global_settings body)."""
     raw: Dict[str, Any] = {}
     try:
         from app.core.db import load_sync_access_software_settings

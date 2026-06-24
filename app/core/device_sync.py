@@ -14,11 +14,13 @@ from app.core.db import (
     list_sync_users_by_active_membership_ids,
     list_device_sync_hashes,
     list_device_sync_hashes_and_status,
+    get_device_sync_hash_for_pin,
     save_device_sync_state,
     save_device_sync_state_batch,
     delete_device_sync_state,
     prune_device_sync_state,
     upsert_device_mirror_pin,
+    upsert_device_mirror_batch,
     delete_device_mirror_pin,
     insert_push_batch,
     insert_push_pin,
@@ -275,6 +277,13 @@ class DeviceSyncEngine:
         self.cfg = cfg
         self.logger = logger
         self._feedback_callback = feedback_callback
+        # Optional hook the ULTRA worker sets so this engine can service queued
+        # door-open commands BETWEEN device-push chunks. A full/member sync runs
+        # inline on the worker over the single device TCP connection; without this
+        # a door-open queued mid-push waits for the whole push (seconds→minutes)
+        # and the member is stuck at the turnstile. Called between SetDeviceData
+        # chunks, when the connection is idle — safe and serialized on the worker.
+        self._door_yield_cb: "Callable[[], None] | None" = None
         self._run_lock = threading.Lock()
         self._running = False
         self._progress_cond = threading.Condition()
@@ -531,6 +540,18 @@ class DeviceSyncEngine:
             sync_run_id=sync_run_id,
             sdk=sdk,
         )
+
+    def _maybe_yield_doors(self) -> None:
+        """Service the worker's queued door-opens (if a hook is set) between
+        device-push chunks, so a member scanning mid-sync is let in within ~one
+        chunk instead of waiting for the entire inline push. Never raises."""
+        cb = self._door_yield_cb
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            pass
 
     def _run_single_device_sync(
         self,
@@ -842,6 +863,7 @@ class DeviceSyncEngine:
             )
             return False
 
+    @_tel.timed("MEMBER_SYNC_DEVICE", slow_ms=0, warn_ms=3000)
     def sync_member_on_connected_sdk(
         self,
         *,
@@ -918,7 +940,9 @@ class DeviceSyncEngine:
             authorize_timezone_id=authorize_timezone_id,
         )
 
-        prev_hash, prev_ok = list_device_sync_hashes_and_status(device_id=did).get(pin, ("", True))
+        # Targeted: fetch ONLY this pin's stored hash (PK lookup ~ms) instead of
+        # reading the whole device_sync_state table (~1798 rows, 11-20s on the gym PC).
+        prev_hash, prev_ok = get_device_sync_hash_for_pin(device_id=did, pin=pin)
         if prev_hash == desired_hash and prev_ok:
             self.logger.info(
                 "[DeviceSync] targeted member sync skip: device_id=%s device_name=%r pin=%s unchanged source=%s",
@@ -1119,6 +1143,7 @@ class DeviceSyncEngine:
             "anti_fraude_daily_pass_limit": _to_int(g("anti_fraude_daily_pass_limit",  "antiFraudeDailyPassLimit",   default=0),  default=0)  or 0,
         }
 
+    @_tel.timed("SYNC_FILTER_USERS", slow_ms=100)
     def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
@@ -1799,7 +1824,16 @@ class DeviceSyncEngine:
         # P1: resolve effective push policy for this device
         policy = self._resolve_push_policy(device)
 
-        desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
+        # Audit profile for the whole-device sync: accumulates the UNTIMED phases
+        # (filter / prev_state / connect / predelete / userauthorize) and emits ONE
+        # FULL_SYNC_DEVICE summary line. Phases already wrapped by their own spans
+        # (SYNC_READBACK / SYNC_HASH_DESIRED / SYNC_PHASE_C_TEMPLATES / SYNC_PHASE_D_MIRROR)
+        # are NOT re-timed here to avoid duplication. Named _fsp (not p) because p is
+        # reused as a loop variable below.
+        _fsp = _tel.profile("FULL_SYNC_DEVICE", device_id=dev_id)
+
+        with _fsp.step("filter"):
+            desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
         desired_pins = set(desired.keys())
 
         known_server_pins: Set[str] = set()
@@ -1808,7 +1842,8 @@ class DeviceSyncEngine:
             if p and p.isdigit():
                 known_server_pins.add(p)
 
-        prev_state = list_device_sync_hashes_and_status(device_id=did)
+        with _fsp.step("prev_state"):
+            prev_state = list_device_sync_hashes_and_status(device_id=did)
         # Also keep a simple hash dict for backward compat with prune logic
         prev_hashes = {p: h for p, (h, _ok) in prev_state.items()}
         deletion_only_delta = changed_ids is not None and len(changed_ids) == 0
@@ -1817,24 +1852,38 @@ class DeviceSyncEngine:
         desired_hashes: Dict[str, str] = {}
         templates_for_sync: Dict[str, List[Dict[str, Any]]] = {}
 
-        for pin, u in desired.items():
-            templates = self._collect_templates_for_pin(
-                user=u, pin=pin, local_fp_index=local_fp_index,
-                fingerprint_enabled=fingerprint_enabled,
-            )
-            dh = self._compute_desired_hash(
-                pin=pin,
-                user=u,
-                door_bitmask=door_bitmask,
-                templates=templates,
-                authorize_timezone_id=authorize_timezone_id,
-            )
-            desired_hashes[pin] = dh
-            prev_hash, prev_ok = prev_state.get(pin, ("", True))
-            # Sync if: hash changed OR previous attempt failed
-            if prev_hash != dh or not prev_ok:
-                pins_to_sync.add(pin)
-                templates_for_sync[pin] = templates
+        # NOTE: this desired-hash loop runs over the FULL desired roster on EVERY
+        # sync, even when only one member changed (changed_ids prunes pins_to_sync
+        # AFTER, at line ~1868, but the hashing itself is unconditional). It is the
+        # CPU half of the steady-state freeze — measure it so a 1-member change
+        # that stalls minutes names its own cost instead of leaving us to infer it.
+        with _tel.span("SYNC_HASH_DESIRED", device_id=dev_id, n=len(desired)):
+            _hash_i = 0
+            for pin, u in desired.items():
+                templates = self._collect_templates_for_pin(
+                    user=u, pin=pin, local_fp_index=local_fp_index,
+                    fingerprint_enabled=fingerprint_enabled,
+                )
+                dh = self._compute_desired_hash(
+                    pin=pin,
+                    user=u,
+                    door_bitmask=door_bitmask,
+                    templates=templates,
+                    authorize_timezone_id=authorize_timezone_id,
+                )
+                desired_hashes[pin] = dh
+                prev_hash, prev_ok = prev_state.get(pin, ("", True))
+                # Sync if: hash changed OR previous attempt failed
+                if prev_hash != dh or not prev_ok:
+                    pins_to_sync.add(pin)
+                    templates_for_sync[pin] = templates
+                # This loop hashes the WHOLE roster even for a 1-member change and
+                # no SDK call is in flight here, so periodically let the worker open
+                # any door queued mid-reconcile (keeps the turnstile alive during the
+                # CPU phase, not just the push phase).
+                _hash_i += 1
+                if (_hash_i & 0x7F) == 0:  # every 128 users
+                    self._maybe_yield_doors()
 
         # Delta hint: when the backend reported only a subset of users changed,
         # prune pins_to_sync to those users + any with a failed/missing prev sync.
@@ -1888,24 +1937,30 @@ class DeviceSyncEngine:
                     port,
                     connect_timeout_ms,
                 )
-                sdk.connect(
-                    ip=ip,
-                    port=int(port),
-                    timeout_ms=connect_timeout_ms,
-                    password=str(pwd),
-                )
+                with _fsp.step("connect"):
+                    sdk.connect(
+                        ip=ip,
+                        port=int(port),
+                        timeout_ms=connect_timeout_ms,
+                        password=str(pwd),
+                    )
                 connect_ms = (_time.time() - t_connect) * 1000
                 self.logger.info(
                     "[DeviceSync] Device id=%s name=%r connected OK: connect_ms=%.0f", dev_id, dev_name, connect_ms
                 )
 
-            rows = sdk.get_device_data_rows(
-                table="user",
-                fields="Pin",
-                filter_expr="",
-                options="",
-                initial_size=self._sdk_read_initial_bytes(),  # ✅ backend-driven knob
-            )
+            # UNCONDITIONAL device read-back of ALL pins, every sync (network round
+            # trip over the single connection that also polls RTLog / opens doors).
+            # Independent of changed_ids — the network half of the steady-state
+            # freeze. Time it so the 1-member-change stall is attributable.
+            with _tel.span("SYNC_READBACK", device_id=dev_id):
+                rows = sdk.get_device_data_rows(
+                    table="user",
+                    fields="Pin",
+                    filter_expr="",
+                    options="",
+                    initial_size=self._sdk_read_initial_bytes(),  # ✅ backend-driven knob
+                )
             device_pins: Set[str] = set()
             for r in rows:
                 p = _pin_str(r.get("Pin") or r.get("pin") or "")
@@ -2018,33 +2073,34 @@ class DeviceSyncEngine:
             # (one per table), chunked at 100 pins/call. Falls back to per-pin inside
             # the SDK on chunk failure.
             deleted = 0
-            if stale_pins:
-                try:
-                    ok_del, failed_del = self._bulk_delete_pins(
-                        sdk=sdk,
-                        pins=stale_pins,
-                        device_id=int(did) if did is not None else 0,
-                        fingerprint_enabled=fingerprint_enabled,
-                    )
-                    deleted = ok_del
-                    if failed_del:
-                        self.logger.warning(
-                            "[DeviceSync] Device id=%s: %d stale pin(s) failed to delete: %s",
-                            dev_id, len(failed_del), failed_del[:10],
+            with _fsp.step("predelete"):
+                if stale_pins:
+                    try:
+                        ok_del, failed_del = self._bulk_delete_pins(
+                            sdk=sdk,
+                            pins=stale_pins,
+                            device_id=int(did) if did is not None else 0,
+                            fingerprint_enabled=fingerprint_enabled,
                         )
-                except Exception as ex:
-                    self.logger.warning(f"[DeviceSync] Bulk delete of stale pins failed: {ex}")
-                # Clean local mirror/sync-state for every pin that was attempted,
-                # regardless of SDK outcome — keeps local state in sync with desired set.
-                for p in stale_pins:
-                    try:
-                        delete_device_sync_state(device_id=did, pin=p)
-                    except Exception:
-                        pass
-                    try:
-                        delete_device_mirror_pin(device_id=did, pin=p)
-                    except Exception:
-                        pass
+                        deleted = ok_del
+                        if failed_del:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s: %d stale pin(s) failed to delete: %s",
+                                dev_id, len(failed_del), failed_del[:10],
+                            )
+                    except Exception as ex:
+                        self.logger.warning(f"[DeviceSync] Bulk delete of stale pins failed: {ex}")
+                    # Clean local mirror/sync-state for every pin that was attempted,
+                    # regardless of SDK outcome — keeps local state in sync with desired set.
+                    for p in stale_pins:
+                        try:
+                            delete_device_sync_state(device_id=did, pin=p)
+                        except Exception:
+                            pass
+                        try:
+                            delete_device_mirror_pin(device_id=did, pin=p)
+                        except Exception:
+                            pass
 
             pushed_users = 0
             pushed_templates = 0
@@ -2142,6 +2198,8 @@ class DeviceSyncEngine:
                         # Map user-phase progress to 0..total: the user push is the
                         # dominant wall-clock phase, so tracking it drives the bar.
                         _maybe_set_progress(current=min(_total_pins, ok_so_far))
+                        # Let the worker open any door queued mid-push (door-not-open fix).
+                        self._maybe_yield_doors()
 
                     ok_u, failed_u = sdk.set_device_data_batch(
                         table="user", rows=user_rows, chunk_size=50,
@@ -2177,6 +2235,7 @@ class DeviceSyncEngine:
                             _maybe_set_progress(
                                 current=min(_retry_total, _retry_baseline + ok_so_far)
                             )
+                            self._maybe_yield_doors()
 
                         ok_r, failed_r = sdk.set_device_data_batch(
                             table="user", rows=retry_rows, chunk_size=50,
@@ -2247,141 +2306,155 @@ class DeviceSyncEngine:
 
                 # Phase B: Batch push authorize rows
                 # Discover firmware profile if not cached (push 1 pin individually first)
-                profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
-                if profile.authorize_body_index is None and pins_sorted:
-                    # No cached pattern — discover by pushing first user individually
-                    first_pin = pins_sorted[0]
-                    self._push_userauthorize(
-                        sdk, pin=first_pin, door_bitmask=door_bitmask,
-                        authorize_timezone_id=int(authorize_timezone_id),
-                        device_id=int(dev_id) if dev_id is not None else 0,
-                    )
+                with _fsp.step("userauthorize"):
                     profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
-                    remaining_pins = pins_sorted[1:]
-                else:
-                    remaining_pins = pins_sorted
-
-                if profile.authorize_body_index is not None and remaining_pins:
-                    tz = int(authorize_timezone_id)
-                    patterns = [
-                        lambda p: f"Pin={p}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}",
-                        lambda p: f"Pin={p}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}",
-                        lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZoneID={tz}",
-                        lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZone={tz}",
-                    ]
-                    pattern_fn = patterns[profile.authorize_body_index]
-                    auth_rows = [pattern_fn(p) for p in remaining_pins if desired.get(p)]
-                    if auth_rows:
-                        # Authorize phase runs after user push is at 100%; keep the
-                        # bar pinned at `total` but still emit a heartbeat per chunk
-                        # so the dashboard knows the sync is alive.
-                        _auth_total = len(pins_sorted)
-
-                        def _auth_progress_cb(_ok_so_far: int, _batch_total: int) -> None:
-                            _maybe_set_progress(current=_auth_total)
-
-                        ok_a, failed_a = sdk.set_device_data_batch(
-                            table="userauthorize", rows=auth_rows, chunk_size=50,
-                            progress_cb=_auth_progress_cb,
+                    if profile.authorize_body_index is None and pins_sorted:
+                        # No cached pattern — discover by pushing first user individually
+                        first_pin = pins_sorted[0]
+                        self._push_userauthorize(
+                            sdk, pin=first_pin, door_bitmask=door_bitmask,
+                            authorize_timezone_id=int(authorize_timezone_id),
+                            device_id=int(dev_id) if dev_id is not None else 0,
                         )
-                        if failed_a:
-                            for row in failed_a:
-                                pin = _batch_row_field(row, "Pin")
-                                if not pin:
-                                    continue
+                        profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
+                        remaining_pins = pins_sorted[1:]
+                    else:
+                        remaining_pins = pins_sorted
+
+                    if profile.authorize_body_index is not None and remaining_pins:
+                        tz = int(authorize_timezone_id)
+                        patterns = [
+                            lambda p: f"Pin={p}\tAuthorizeTimezoneId={tz}\tAuthorizeDoorId={door_bitmask}",
+                            lambda p: f"Pin={p}\tAuthorizeDoorId={door_bitmask}\tAuthorizeTimezoneId={tz}",
+                            lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZoneID={tz}",
+                            lambda p: f"Pin={p}\tDoorID={door_bitmask}\tTimeZone={tz}",
+                        ]
+                        pattern_fn = patterns[profile.authorize_body_index]
+                        auth_rows = [pattern_fn(p) for p in remaining_pins if desired.get(p)]
+                        if auth_rows:
+                            # Authorize phase runs after user push is at 100%; keep the
+                            # bar pinned at `total` but still emit a heartbeat per chunk
+                            # so the dashboard knows the sync is alive.
+                            _auth_total = len(pins_sorted)
+
+                            def _auth_progress_cb(_ok_so_far: int, _batch_total: int) -> None:
+                                _maybe_set_progress(current=_auth_total)
+                                self._maybe_yield_doors()
+
+                            ok_a, failed_a = sdk.set_device_data_batch(
+                                table="userauthorize", rows=auth_rows, chunk_size=50,
+                                progress_cb=_auth_progress_cb,
+                            )
+                            if failed_a:
+                                for row in failed_a:
+                                    pin = _batch_row_field(row, "Pin")
+                                    if not pin:
+                                        continue
+                                    pin_outcomes[pin] = {
+                                        "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                        "status": "FAILED",
+                                        "error_message": "authorize batch failed",
+                                        "duration_ms": 0,
+                                    }
+                                self.logger.warning(
+                                    "[DeviceSync] Device id=%s: %d authorize rows failed in batch", dev_id, len(failed_a))
+                    elif remaining_pins:
+                        # No cached pattern available — fall back to per-pin authorize
+                        for pin in remaining_pins:
+                            try:
+                                self._push_userauthorize(
+                                    sdk, pin=pin, door_bitmask=door_bitmask,
+                                    authorize_timezone_id=int(authorize_timezone_id),
+                                    device_id=int(dev_id) if dev_id is not None else 0,
+                                )
+                            except Exception as ex:
                                 pin_outcomes[pin] = {
                                     "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                     "status": "FAILED",
-                                    "error_message": "authorize batch failed",
+                                    "error_message": str(ex),
                                     "duration_ms": 0,
                                 }
-                            self.logger.warning(
-                                "[DeviceSync] Device id=%s: %d authorize rows failed in batch", dev_id, len(failed_a))
-                elif remaining_pins:
-                    # No cached pattern available — fall back to per-pin authorize
-                    for pin in remaining_pins:
-                        try:
-                            self._push_userauthorize(
-                                sdk, pin=pin, door_bitmask=door_bitmask,
-                                authorize_timezone_id=int(authorize_timezone_id),
-                                device_id=int(dev_id) if dev_id is not None else 0,
-                            )
-                        except Exception as ex:
-                            pin_outcomes[pin] = {
-                                "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
-                                "status": "FAILED",
-                                "error_message": str(ex),
-                                "duration_ms": 0,
-                            }
-                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
+                                self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
 
                 # Phase C: Push templates individually (binary data — too large to batch)
-                for pin in pins_sorted:
-                    templates = templates_for_sync.get(pin) or []
-                    if templates:
-                        try:
-                            ok_count, errs = self._push_templates(
-                                sdk, pin=pin, templates=templates,
-                                device_id=int(dev_id) if dev_id is not None else 0)
-                            pushed_templates += ok_count
-                            if errs:
+                with _tel.span("SYNC_PHASE_C_TEMPLATES", device_id=dev_id, pins=len(pins_sorted)):
+                    for pin in pins_sorted:
+                        templates = templates_for_sync.get(pin) or []
+                        if templates:
+                            try:
+                                ok_count, errs = self._push_templates(
+                                    sdk, pin=pin, templates=templates,
+                                    device_id=int(dev_id) if dev_id is not None else 0)
+                                pushed_templates += ok_count
+                                if errs:
+                                    warn_templates_users += 1
+                                    self.logger.warning(
+                                        f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
+                                        f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
+                            except Exception as ex:
                                 warn_templates_users += 1
-                                self.logger.warning(
-                                    f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
-                                    f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
-                        except Exception as ex:
-                            warn_templates_users += 1
-                            self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
+                                self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
 
                 # Phase D: Save device sync state + write-through mirror for all pushed pins.
-                # Build all state rows first (pure Python), then flush to DB in ONE batch
-                # transaction instead of one DbWriter round-trip per pin (N pins × ~2ms =
-                # ~2.5s serialised queue wait for a 1277-member club with 2 devices).
-                _batch_state_rows: list[tuple[str, str | None, bool, str | None]] = []
-                for pin in pins_sorted:
-                    u = desired.get(pin)
-                    if u:
-                        _u_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
-                        _u_card = _pin_str(u.get("firstCardId") or "")
-                        _u_fps = len(templates_for_sync.get(pin) or [])
-                        pin_error = pin_outcomes.get(pin, {}).get("error_message")
-                        pin_ok = not pin_error
-                        _batch_state_rows.append((
-                            pin,
-                            desired_hashes.get(pin) or "",
-                            pin_ok,
-                            None if pin_ok else str(pin_error),
-                        ))
-                        pin_outcomes[pin] = {
-                            "full_name": _u_name,
-                            "status": "SUCCESS" if pin_ok else "FAILED",
-                            "error_message": None if pin_ok else str(pin_error),
-                            "duration_ms": 0,
-                        }
-                        if pin_ok:
-                            ok_synced += 1
-                        else:
-                            failed_synced += 1
-                        # P7: update device content mirror (write-through)
+                # Build all state + mirror rows first (pure Python), then flush each to DB in
+                # ONE batch transaction instead of one DbWriter round-trip per pin. The mirror
+                # write previously called upsert_device_mirror_pin() — which opens its own
+                # connection and commit()s PER pin — inside this loop. Over a full roster
+                # (1784 pins × 2 devices on a fresh install) that was thousands of individual
+                # fsync commits contending on the SQLite write lock: measured in prod as a
+                # ~23 min worker-thread freeze AFTER the device push had already finished, with
+                # BOTH turnstiles unable to poll RTLog or open doors the whole time. Now batched
+                # into a single executemany transaction (like save_device_sync_state_batch),
+                # and wrapped in a span so the cost is measured on the next cold start.
+                with _tel.span("SYNC_PHASE_D_MIRROR", device_id=dev_id, pins=len(pins_sorted)):
+                    _batch_state_rows: list[tuple[str, str | None, bool, str | None]] = []
+                    _batch_mirror_rows: list[tuple] = []
+                    for pin in pins_sorted:
+                        u = desired.get(pin)
+                        if u:
+                            _u_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
+                            _u_card = _pin_str(u.get("firstCardId") or "")
+                            _u_fps = len(templates_for_sync.get(pin) or [])
+                            pin_error = pin_outcomes.get(pin, {}).get("error_message")
+                            pin_ok = not pin_error
+                            _batch_state_rows.append((
+                                pin,
+                                desired_hashes.get(pin) or "",
+                                pin_ok,
+                                None if pin_ok else str(pin_error),
+                            ))
+                            pin_outcomes[pin] = {
+                                "full_name": _u_name,
+                                "status": "SUCCESS" if pin_ok else "FAILED",
+                                "error_message": None if pin_ok else str(pin_error),
+                                "duration_ms": 0,
+                            }
+                            if pin_ok:
+                                ok_synced += 1
+                            else:
+                                failed_synced += 1
+                            # P7: device content mirror (write-through) — collected, batched below.
+                            _batch_mirror_rows.append((
+                                pin, _u_name, _u_card or None, door_bitmask,
+                                int(authorize_timezone_id), _u_fps, pin_ok,
+                            ))
+                    # One DbWriter transaction each for state + mirror (replaces N round-trips).
+                    if _batch_state_rows:
                         try:
-                            upsert_device_mirror_pin(
-                                device_id=did, pin=pin,
-                                full_name=_u_name, card_no=_u_card or None,
-                                door_bitmask=door_bitmask,
-                                authorize_tz_id=int(authorize_timezone_id),
-                                fp_count=_u_fps, push_ok=pin_ok,
+                            save_device_sync_state_batch(device_id=did, rows=_batch_state_rows)
+                        except Exception as _batch_err:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s save_device_sync_state_batch failed "
+                                "(%d rows): %s", dev_id, len(_batch_state_rows), _batch_err
                             )
-                        except Exception:
-                            pass
-                # Single DbWriter transaction for all N pins (replaces N round-trips).
-                if _batch_state_rows:
-                    try:
-                        save_device_sync_state_batch(device_id=did, rows=_batch_state_rows)
-                    except Exception as _batch_err:
-                        self.logger.warning(
-                            "[DeviceSync] Device id=%s save_device_sync_state_batch failed "
-                            "(%d rows): %s", dev_id, len(_batch_state_rows), _batch_err
-                        )
+                    if _batch_mirror_rows:
+                        try:
+                            upsert_device_mirror_batch(device_id=did, rows=_batch_mirror_rows)
+                        except Exception as _mirror_err:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s upsert_device_mirror_batch failed "
+                                "(%d rows): %s", dev_id, len(_batch_mirror_rows), _mirror_err
+                            )
                 _maybe_set_progress(current=ok_synced)
                 self.logger.info(
                     "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
@@ -2664,6 +2737,11 @@ class DeviceSyncEngine:
                     duration_ms=duration_ms,
                     error_message=batch_error,
                 )
+                # One FULL_SYNC_DEVICE summary line for the whole device sync, emitted
+                # on every outcome (success/partial/failed) so the audit trail always
+                # has the per-phase breakdown. desired_pins/pins_to_sync are assigned
+                # before the try, so they are always in scope in this finally block.
+                _fsp.done(desired=len(desired_pins), to_sync=len(pins_to_sync))
                 if batch_status == "SUCCESS":
                     self._emit_feedback_event(
                         "device_push_success",

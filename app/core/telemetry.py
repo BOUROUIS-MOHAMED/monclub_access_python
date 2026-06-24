@@ -28,6 +28,7 @@ the rest of the app) as ``key=value`` pairs so they are trivial to grep.
 """
 from __future__ import annotations
 
+import functools
 import gc
 import logging
 import os
@@ -35,7 +36,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("zkapp.telemetry")
 
@@ -43,10 +44,12 @@ logger = logging.getLogger("zkapp.telemetry")
 # hold the most memory; comparing its total to the process private bytes also
 # tells us whether a leak is Python-side (tracemalloc grows) or native/C/DLL
 # (tracemalloc flat while private_mb climbs). Enabled by default for the leak
-# hunt; set MONCLUB_MEMPROFILE=0 to disable. depth=1 keeps the overhead small.
+# hunt. Now DEFAULT OFF: it found the auth_state leak, and tracemalloc itself
+# costs memory (it stores a trace per live allocation) — wasteful on the 4GB gym
+# PC. Set MONCLUB_MEMPROFILE=1 to re-enable for a future hunt. depth=1 keeps it small.
 _tracemalloc_on = False
 try:
-    if os.environ.get("MONCLUB_MEMPROFILE", "1") != "0":
+    if os.environ.get("MONCLUB_MEMPROFILE", "0") != "0":
         import tracemalloc as _tracemalloc
         _tracemalloc.start(1)
         _tracemalloc_on = True
@@ -118,6 +121,28 @@ if _proc_backend == "minimal" and os.name == "nt":
             wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)
         ]
         _GetProcessHandleCount.restype = wintypes.BOOL
+
+        # SYSTEM-WIDE memory — the key signal on a low-RAM box (the gym PC has 4GB).
+        # When physical RAM runs out, Windows pages to the SSD, the disk thrashes
+        # with swap I/O, and every DB read/write queues behind it. mem_load% near
+        # 100 and avail_mb near 0 during a freeze proves swapping, not a slow disk.
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        _GlobalMemoryStatusEx = _kernel32.GlobalMemoryStatusEx
+        _GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+        _GlobalMemoryStatusEx.restype = wintypes.BOOL
+
         _ctypes_ready = True
         _proc_backend = "ctypes"
     except Exception:
@@ -149,6 +174,13 @@ def proc_snapshot() -> Dict[str, Any]:
                 priv = getattr(mi, "vms", 0)
             snap["private_mb"] = round((priv or 0) / 1048576.0, 1)
             try:
+                vm = _psutil.virtual_memory()
+                snap["sys_mem_load"] = int(round(vm.percent))
+                snap["sys_avail_mb"] = round(vm.available / 1048576.0, 1)
+                snap["sys_total_mb"] = round(vm.total / 1048576.0, 1)
+            except Exception:
+                pass
+            try:
                 snap["handles"] = _psutil_proc.num_handles()  # Windows only
             except Exception:
                 pass
@@ -162,6 +194,16 @@ def proc_snapshot() -> Dict[str, Any]:
             hc = wintypes.DWORD(0)
             if _GetProcessHandleCount(h, ctypes.byref(hc)):
                 snap["handles"] = int(hc.value)
+            try:
+                ms = _MEMORYSTATUSEX()
+                ms.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+                if _GlobalMemoryStatusEx(ctypes.byref(ms)):
+                    snap["sys_mem_load"] = int(ms.dwMemoryLoad)            # % physical RAM in use
+                    snap["sys_avail_mb"] = round(ms.ullAvailPhys / 1048576.0, 1)
+                    snap["sys_total_mb"] = round(ms.ullTotalPhys / 1048576.0, 1)
+                    snap["sys_avail_pagefile_mb"] = round(ms.ullAvailPageFile / 1048576.0, 1)
+            except Exception:
+                pass
     except Exception:
         pass
     return snap
@@ -305,6 +347,110 @@ def span(name: str, **fields: Any):
             logger.info("[T] %s.end dur_ms=%.0f %s", name, dur, _fmt(fields))
         except Exception:
             pass
+
+
+def timed(name: Optional[str] = None, *, slow_ms: float = 0.0,
+          warn_ms: float = 0.0, **static_fields: Any) -> Callable:
+    """Decorator that times a function and emits one ``[T] <name> dur_ms=…`` line.
+
+    SAFE BY CONSTRUCTION: the wrapped function's own exceptions propagate
+    unchanged; only the timing/logging is wrapped in try/except. The decorator
+    references NO inner locals of the function, so it cannot raise a NameError
+    the way an inline ``event(...)`` with a mistyped field would. This is the
+    primary building block for the audit log — apply it to any I/O-bound or
+    potentially-slow function (DB read/write, cache load, sync phase, network).
+
+    Args:
+        name:    event name; defaults to the function's qualified name.
+        slow_ms: only emit when duration >= this (0 = always emit). Use a small
+                 threshold on high-frequency functions to cap log volume while
+                 still catching every spike.
+        warn_ms: emit at WARNING level (not INFO) when duration >= this — the
+                 audit's "this took too long" signal. 0 disables.
+        **static_fields: constant key=value pairs appended to every line.
+    """
+    suffix = (" " + _fmt(static_fields)) if static_fields else ""
+
+    def deco(fn: Callable) -> Callable:
+        nm = name or getattr(fn, "__qualname__", getattr(fn, "__name__", "fn"))
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            t0 = time.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    dur = (time.monotonic() - t0) * 1000.0
+                    if dur >= slow_ms:
+                        if warn_ms and dur >= warn_ms:
+                            logger.warning("[T] %s dur_ms=%.0f SLOW%s", nm, dur, suffix)
+                        else:
+                            logger.info("[T] %s dur_ms=%.0f%s", nm, dur, suffix)
+                except Exception:
+                    pass
+        return wrapper
+    return deco
+
+
+class _Profile:
+    """Accumulate named sub-step durations, then emit ONE summary line.
+
+    Use when a function has many internal phases and you want the full
+    breakdown without one log line per phase. Never raises.
+
+        p = telemetry.profile("FULL_SYNC", device_id=5)
+        with p.step("readback"): rows = sdk.get(...)
+        with p.step("hash"):     hashes = compute(...)
+        p.done(pins=len(rows))   # -> [T] FULL_SYNC readback_ms=… hash_ms=… total_ms=… pins=…
+    """
+    __slots__ = ("name", "fields", "_t0", "_steps")
+
+    def __init__(self, name: str, **fields: Any) -> None:
+        self.name = name
+        self.fields = dict(fields)
+        self._t0 = time.monotonic()
+        self._steps: Dict[str, float] = {}
+
+    @contextmanager
+    def step(self, key: str):
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            try:
+                self._steps[key] = self._steps.get(key, 0.0) + (time.monotonic() - t0) * 1000.0
+            except Exception:
+                pass
+
+    def mark(self, key: str, dur_ms: float) -> None:
+        try:
+            self._steps[key] = self._steps.get(key, 0.0) + float(dur_ms)
+        except Exception:
+            pass
+
+    def done(self, **extra: Any) -> None:
+        try:
+            total = (time.monotonic() - self._t0) * 1000.0
+            merged: Dict[str, Any] = dict(self.fields)
+            for k, v in self._steps.items():
+                merged[f"{k}_ms"] = round(v)
+            merged.update(extra)
+            merged["total_ms"] = round(total)
+            logger.info("[T] %s %s", self.name, _fmt(merged))
+        except Exception:
+            pass
+
+
+def profile(name: str, **fields: Any) -> _Profile:
+    """Create a multi-step profile (see :class:`_Profile`). Never raises."""
+    try:
+        return _Profile(name, **fields)
+    except Exception:
+        # Return a dummy that no-ops if construction somehow fails.
+        p = _Profile.__new__(_Profile)
+        p.name, p.fields, p._t0, p._steps = name, {}, time.monotonic(), {}
+        return p
 
 
 # --------------------------------------------------------------------------- #

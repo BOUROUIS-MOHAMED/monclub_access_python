@@ -28,19 +28,19 @@ def _emit(h: HalfDaySizeRotatingFileHandler, msg: str, when: dt.datetime) -> Non
 
 class TestOnLogRotatedCallback:
     def test_callback_receives_old_path_on_time_rotation(self, tmp_path):
-        """Switching from AM to PM must call the callback with the AM log path."""
+        """Crossing a window boundary must call the callback with the closed log path."""
         captured = []
         h = _make_handler(tmp_path, callback=captured.append)
 
-        am = dt.datetime(2026, 5, 1, 9, 0)
-        _emit(h, "hello am", am)
+        first = dt.datetime(2026, 5, 1, 9, 0)
+        _emit(h, "hello first", first)
 
-        pm = dt.datetime(2026, 5, 1, 13, 0)
-        _emit(h, "hello pm", pm)  # triggers time rotation
+        second = dt.datetime(2026, 5, 1, 13, 0)
+        _emit(h, "hello second", second)  # triggers time rotation
 
         h.close()
         assert len(captured) == 1
-        assert captured[0].name == "app-2026-05-01-am.log"
+        assert captured[0].name == "app-2026-05-01-from-09-to-10.log"
 
     def test_callback_receives_dest_path_on_size_rotation(self, tmp_path):
         """Exceeding max_bytes must call the callback with the renamed file path."""

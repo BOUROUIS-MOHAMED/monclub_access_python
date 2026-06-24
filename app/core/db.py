@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import pathlib
 import queue
 import sqlite3
 import threading
@@ -15,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from access.storage import current_access_runtime_db_path
+from app.core import telemetry as _tel
 from app.core.utils import ensure_dirs, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -31,6 +34,157 @@ _db_writer_queue: "queue.Queue[_DbWriteJob | None] | None" = None
 _db_writer_db_path: str | None = None
 _db_writer_local = threading.local()
 
+# ---------------------------------------------------------------------------
+# Per-thread WARM read connection (mitigation for a pathologically slow disk /
+# antivirus on the deployment PC). Measured: the gym's 2MB DB answers
+# `SELECT * FROM sync_users` in 8ms on healthy hardware but 0.8-80s on the gym PC
+# — the OS file cache isn't serving it (a fresh connection-per-op closes its
+# cache each time, and/or AV re-scans the file on every open). A persistent
+# per-thread connection with a small private page cache holds the ENTIRE 2MB DB
+# warm in RAM, so reads come from memory instead of the slow disk, and the file
+# is opened far less often (fewer AV scans). mmap is disabled so this is safe on
+# 32-bit. Disable with MONCLUB_DB_REUSE_CONN=0. Nested get_conn() calls on the
+# same thread get a FRESH connection (preserves separate-transaction semantics).
+# ---------------------------------------------------------------------------
+_conn_local = threading.local()
+_REUSE_CONN_ENABLED = os.environ.get("MONCLUB_DB_REUSE_CONN", "1") != "0"
+
+# ---------------------------------------------------------------------------
+# Local-state generation counter. Bumped whenever a sync actually changes the
+# members/credentials that load_local_state() reads. The ULTRA workers cache the
+# generation they loaded at and only reload when it advances — so the 1798-row
+# user table (78s to read on the gym PC) is re-read ONCE per real change instead
+# of every TTL tick (the gym log showed a full reload every ~1-2 min, each
+# 23-102s, hammering the DB continuously). Cheap, thread-safe, never raises.
+# ---------------------------------------------------------------------------
+_local_state_gen_lock = threading.Lock()
+_local_state_gen = [0]
+
+
+def bump_local_state_generation() -> None:
+    """Signal that members/credentials changed; ULTRA caches will reload once."""
+    try:
+        with _local_state_gen_lock:
+            _local_state_gen[0] += 1
+    except Exception:
+        pass
+
+
+def get_local_state_generation() -> int:
+    """Current local-state generation (see bump_local_state_generation)."""
+    try:
+        with _local_state_gen_lock:
+            return _local_state_gen[0]
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# WAL maintenance. The gym PC showed reads degrading within a session
+# (DB_READ list 32s -> 81s) — the classic WAL-bloat spiral: long-running reads
+# hold old snapshots, so auto-checkpoint can't advance, the WAL grows, and every
+# read scans a bigger wal-index. We (a) log the WAL size so it's visible, (b)
+# run a NON-BLOCKING passive checkpoint when the writer is idle, and (c) do one
+# blocking TRUNCATE at startup (no readers yet) to reset a WAL inherited huge
+# from a previous session.
+# ---------------------------------------------------------------------------
+_WAL_CHECKPOINT_INTERVAL_SEC = 30.0
+_WAL_LOG_MIN_BYTES = 8 * 1024 * 1024  # only log when the WAL is non-trivial (>8MB)
+
+
+def _wal_size_bytes(db_path) -> int:
+    try:
+        p = str(db_path) + "-wal"
+        return os.path.getsize(p) if os.path.exists(p) else 0
+    except Exception:
+        return 0
+
+
+def checkpoint_wal_truncate() -> None:
+    """One-shot blocking TRUNCATE checkpoint — call at startup BEFORE the device
+    workers begin reading, to reset a WAL inherited large from a prior run. Never
+    raises. (Do not call while long reads are active: it can block on them.)
+    """
+    try:
+        db_path = _resolve_db_path()
+        before = _wal_size_bytes(db_path)
+        with get_conn() as conn:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        after = _wal_size_bytes(db_path)
+        busy = int(row[0]) if row else -1
+        _tel.event(
+            "WAL_CHECKPOINT_STARTUP", busy=busy,
+            wal_before_mb=round(before / 1048576.0, 1),
+            wal_after_mb=round(after / 1048576.0, 1),
+        )
+    except Exception as exc:
+        try:
+            _tel.warn("WAL_CHECKPOINT_FAILED", where="startup", err=type(exc).__name__)
+        except Exception:
+            pass
+
+
+def disk_selftest(*, mb: int = 4) -> None:
+    """Measure RAW disk throughput at the DB folder + a raw read of access.db,
+    independent of SQLite.
+
+    Proven on a dev box the gym's actual 2MB DB answers `SELECT * FROM sync_users`
+    in ~8ms, yet the gym PC takes 0.8-80s — so the bottleneck is that PC's storage
+    or an antivirus scanning the DB file on every open, NOT SQLite/the data. This
+    self-test makes that visible on the gym PC itself: write+fsync an incompressible
+    file to the SAME folder (same drive + same AV path) and read the real access.db
+    raw. Healthy: tens-hundreds of MB/s. A dying disk / AV-scanned path: <1 MB/s.
+    Logs DISK_SELFTEST. Never raises.
+    """
+    try:
+        db_path = pathlib.Path(_resolve_db_path())
+        folder = db_path.parent
+        payload = os.urandom(int(mb) * 1024 * 1024)  # incompressible: defeats FS compression
+        test = folder / ("._disk_selftest_%d.tmp" % os.getpid())
+
+        t0 = time.monotonic()
+        with open(test, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())          # force a real physical write (not OS cache)
+        w_ms = (time.monotonic() - t0) * 1000.0
+
+        t1 = time.monotonic()
+        with open(test, "rb") as fh:       # fresh open → also pays the AV on-open scan
+            fh.read()
+        r_ms = (time.monotonic() - t1) * 1000.0
+
+        try:
+            os.remove(test)
+        except Exception:
+            pass
+
+        # Raw read of the ACTUAL access.db file (the file AV scans on every open).
+        dbsz = 0
+        db_read_ms = -1.0
+        try:
+            dbsz = os.path.getsize(db_path)
+            t2 = time.monotonic()
+            with open(db_path, "rb") as fh:
+                fh.read()
+            db_read_ms = (time.monotonic() - t2) * 1000.0
+        except Exception:
+            pass
+
+        w_mbps = round(mb / (w_ms / 1000.0), 2) if w_ms > 0 else 0
+        r_mbps = round(mb / (r_ms / 1000.0), 2) if r_ms > 0 else 0
+        _tel.event(
+            "DISK_SELFTEST", mb=mb,
+            write_ms=round(w_ms), write_mbps=w_mbps,
+            read_ms=round(r_ms), read_mbps=r_mbps,
+            db_bytes=dbsz, db_raw_read_ms=round(db_read_ms),
+        )
+    except Exception as exc:
+        try:
+            _tel.warn("DISK_SELFTEST_FAILED", err=type(exc).__name__)
+        except Exception:
+            pass
+
 
 def _resolve_db_path():
     if _DB_PATH is not None:
@@ -45,6 +199,7 @@ def _resolve_db_path():
     return db_path
 
 
+@_tel.timed("DB_CONN_OPEN", slow_ms=50)
 def _open_sqlite_connection(
     db_path,
     *,
@@ -65,6 +220,44 @@ def _open_sqlite_connection(
     conn.execute("PRAGMA cache_size=-65536")     # 64 MB page cache (negative = KB)
     conn.execute("PRAGMA temp_store=MEMORY")
     return conn
+
+
+@_tel.timed("DB_CONN_OPEN_WARM", slow_ms=50)
+def _open_read_connection(db_path, *, timeout: float = 30.0) -> sqlite3.Connection:
+    """Connection for the per-thread WARM read cache (see _conn_local).
+
+    Differs from _open_sqlite_connection: mmap is DISABLED (no per-connection
+    address-space reservation → safe to keep many alive on 32-bit) and the page
+    cache is sized to hold the whole 2MB DB in RAM. Reused across calls so the
+    cache stays warm and the file is opened rarely.
+    """
+    conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA mmap_size=0")          # 32-bit safe: no address-space reservation
+    conn.execute("PRAGMA cache_size=-4096")     # 4 MB private cache holds the whole 2MB DB warm
+    return conn
+
+
+def _close_thread_local_conn() -> None:
+    """Close + drop this thread's warm connection (test teardown / path change)."""
+    try:
+        c = getattr(_conn_local, "conn", None)
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            _conn_local.conn = None
+            _conn_local.path = None
+            _conn_local.in_use = False
+        except Exception:
+            pass
 
 
 @dataclass
@@ -112,6 +305,9 @@ def _shutdown_db_writer_for_tests() -> None:
         work_q.put(None)
     if thread is not None and thread.is_alive():
         thread.join(timeout=2.0)
+    # Drop this thread's warm read connection too — tests swap _DB_PATH between
+    # cases, and a reused connection would still point at the previous temp DB.
+    _close_thread_local_conn()
 
 
 def _ensure_db_writer() -> "queue.Queue[_DbWriteJob | None]":
@@ -146,6 +342,7 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
     conn = _open_sqlite_connection(db_path)
     _db_writer_local.connection = conn
     _db_writer_local.ident = threading.get_ident()
+    _last_ckpt = time.monotonic()
     try:
         while True:
             job = work_q.get()
@@ -193,8 +390,38 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
                     or float(profile.get("queue_wait_ms") or 0.0) >= _log_threshold
                 ):
                     logger.info("[DB-WRITE] %s profile=%s", job.label, profile)
+                    _tel.warn(
+                        "DB_WRITE_SLOW",
+                        label=job.label,
+                        total_ms=profile.get("total_ms"),
+                        queue_wait_ms=profile.get("queue_wait_ms"),
+                        transaction_ms=profile.get("transaction_ms"),
+                        commit_ms=profile.get("commit_ms"),
+                    )
                 job.profile = profile
                 job.done.set()
+
+            # When the write queue drains, run a NON-BLOCKING passive checkpoint
+            # so the WAL is reclaimed in idle gaps (it never waits on readers, so
+            # it can't stall writes). Logs the WAL size when it's grown large —
+            # that's the signal that long reads are blocking reclamation (the
+            # death-spiral) vs a genuinely slow disk.
+            _now = time.monotonic()
+            if work_q.empty() and (_now - _last_ckpt) >= _WAL_CHECKPOINT_INTERVAL_SEC:
+                _last_ckpt = _now
+                try:
+                    _wal_before = _wal_size_bytes(db_path)
+                    _ck = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if _wal_before >= _WAL_LOG_MIN_BYTES:
+                        _tel.event(
+                            "WAL_CHECKPOINT", mode="PASSIVE",
+                            busy=(int(_ck[0]) if _ck else -1),
+                            wal_mb=round(_wal_before / 1048576.0, 1),
+                            checkpointed=(int(_ck[2]) if _ck and len(_ck) > 2 else None),
+                            log_frames=(int(_ck[1]) if _ck and len(_ck) > 1 else None),
+                        )
+                except Exception:
+                    pass
     finally:
         try:
             conn.close()
@@ -249,14 +476,62 @@ def _profile_write_step(profile: Dict[str, Any], key: str) -> Iterator[None]:
 # -----------------------------
 @contextmanager
 def get_conn() -> Iterator[sqlite3.Connection]:
-    conn = _open_sqlite_connection(_resolve_db_path())
+    db_path = str(_resolve_db_path())
+
+    # Fast path / safety valve: fresh connection-per-call (original behaviour).
+    if not _REUSE_CONN_ENABLED:
+        conn = _open_sqlite_connection(db_path)
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
+
+    # A warm connection already checked out on THIS thread → nested get_conn().
+    # Hand back a FRESH connection so the inner block has its own independent
+    # transaction (exactly like the original behaviour); never reuse mid-flight.
+    if getattr(_conn_local, "in_use", False):
+        conn = _open_sqlite_connection(db_path)
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
+
+    # Reuse (or lazily create) this thread's warm read connection.
+    conn = getattr(_conn_local, "conn", None)
+    if conn is None or getattr(_conn_local, "path", None) != db_path:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        conn = _open_read_connection(db_path)
+        _conn_local.conn = conn
+        _conn_local.path = db_path
+
+    _conn_local.in_use = True
     try:
         yield conn
+    except Exception:
+        # The connection may be in a bad state (e.g. mid-transaction error) —
+        # discard it so the next call gets a clean one.
+        _close_thread_local_conn()
+        raise
     finally:
+        _conn_local.in_use = False
+        # Leave no open transaction behind for the next reuse. If rollback fails
+        # the connection is suspect → discard it.
         try:
-            conn.close()
+            conn.rollback()
         except Exception:
-            pass
+            _close_thread_local_conn()
 
 
 # -----------------------------
@@ -1337,6 +1612,15 @@ def init_db() -> None:
         import logging
         logging.getLogger("db").error(f"[DB] Failed to reset stale processing locks on startup: {_e}")
 
+    # Reset a WAL inherited large from a prior session BEFORE the device workers
+    # start their long reads (which would otherwise block the truncate). Cheap and
+    # safe here; a no-op when the WAL is already small.
+    checkpoint_wal_truncate()
+
+    # Measure the actual storage speed at the DB folder, so the gym PC proves
+    # (or rules out) the "slow disk / antivirus" root cause on its own hardware.
+    disk_selftest()
+
 
 # -----------------------------
 # Delta sync: version tokens
@@ -1502,6 +1786,74 @@ def upsert_device_mirror_pin(
         conn.commit()
 
 
+def upsert_device_mirror_batch(
+    *,
+    device_id: int,
+    rows: "Iterable[tuple[str, str | None, str | None, int | None, int | None, int, bool]]",
+) -> int:
+    """Batch write-through of the device content mirror for many pins in ONE
+    DbWriter transaction.
+
+    Each row is ``(pin, full_name, card_no, door_bitmask, authorize_tz_id,
+    fp_count, push_ok)``. The single-pin :func:`upsert_device_mirror_pin` opens
+    its own connection and ``commit()s`` once PER pin; calling it in a loop over a
+    full roster (e.g. 1784 pins × 2 devices on a fresh install) is thousands of
+    separate fsync commits contending on the SQLite write lock — measured in prod
+    as a ~23 min worker-thread freeze (both turnstiles dead) AFTER the device push
+    itself had already finished. This collapses them into a single
+    ``executemany`` transaction on the shared DB writer (the same pattern as
+    :func:`save_device_sync_state_batch`), bounding the cost and freeing the
+    worker to keep polling RTLog / opening doors.
+
+    Returns the number of rows written.
+    """
+    did = int(device_id)
+    pushed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    params_list: list[tuple] = []
+    for pin, full_name, card_no, door_bitmask, authorize_tz_id, fp_count, push_ok in (rows or []):
+        p = str(pin or "").strip()
+        if not p:
+            continue
+        params_list.append((
+            did,
+            p,
+            full_name,
+            card_no,
+            door_bitmask,
+            authorize_tz_id,
+            int(fp_count or 0),
+            pushed_at,
+            1 if bool(push_ok) else 0,
+        ))
+
+    if not params_list:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            """
+            INSERT INTO device_content_mirror
+                (device_id, pin, full_name, card_no, door_bitmask, authorize_tz_id,
+                 fp_count, pushed_at, push_ok)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, pin) DO UPDATE SET
+                full_name       = excluded.full_name,
+                card_no         = excluded.card_no,
+                door_bitmask    = excluded.door_bitmask,
+                authorize_tz_id = excluded.authorize_tz_id,
+                fp_count        = excluded.fp_count,
+                pushed_at       = excluded.pushed_at,
+                push_ok         = excluded.push_ok
+            """,
+            params_list,
+        )
+        profile["rows"] = len(params_list)
+        return len(params_list)
+
+    return int(_run_db_write_sync("upsert_device_mirror_batch", _write))
+
+
 def delete_device_mirror_pin(*, device_id: int, pin: str) -> None:
     """Remove a pin from the content mirror (called when pin is deleted from device)."""
     with get_conn() as conn:
@@ -1512,6 +1864,7 @@ def delete_device_mirror_pin(*, device_id: int, pin: str) -> None:
         conn.commit()
 
 
+@_tel.timed("DB_READ_list_device_mirror", slow_ms=50, warn_ms=1000)
 def list_device_mirror(*, device_id: int) -> List[Dict[str, Any]]:
     """Return all mirror rows for a device (used by API + drift detection)."""
     with get_conn() as conn:
@@ -1533,6 +1886,7 @@ def clear_device_mirror(*, device_id: int) -> None:
 # P6: Member shadow
 # -----------------------------
 
+@_tel.timed("SHADOW_DIFF", slow_ms=100, warn_ms=2000)
 def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
     """
     Upsert the local shadow copy of backend member state.
@@ -2448,6 +2802,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
     )
 
 
+@_tel.timed("CACHE_SAVE_FULL", slow_ms=100, warn_ms=2000)
 def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     """
     Persist ActiveMemberResponse payload and normalized tables.
@@ -3594,6 +3949,19 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
         return {"credentials": creds_summary}
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}
+    # A settings refresh changes the global settings; drop the settings_reader
+    # in-memory cache so the new values apply immediately (not after its TTL).
+    if refresh.get("settings", True):
+        try:
+            from app.core.settings_reader import invalidate_global_settings_cache
+            invalidate_global_settings_cache()
+        except Exception:
+            pass
+    # If members/credentials changed, advance the local-state generation so the
+    # ULTRA workers reload their (creds, users) cache once — instead of re-reading
+    # the 1798-row table on every TTL tick.
+    if refresh.get("members") or refresh.get("credentials"):
+        bump_local_state_generation()
     _creds_summary = result.get("credentials")
     if _creds_summary:
         _logger.info(
@@ -3610,6 +3978,14 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
         # even when the actual transaction is fast (total_ms < threshold).
         if queue_wait >= 100.0 or total >= 100.0:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta profile=%s", profile)
+        _tel.event(
+            "CACHE_SAVE_DELTA",
+            credentials_upsert_ms=profile.get("credentials_upsert_ms"),
+            members_ms=profile.get("members_ms"),
+            transaction_ms=profile.get("transaction_ms"),
+            total_ms=profile.get("total_ms"),
+            queue_wait_ms=profile.get("queue_wait_ms"),
+        )
 
 
 def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
@@ -4263,6 +4639,7 @@ def invalidate_sync_cache(*, clear_cached: bool = False) -> None:
         _sync_cache_entry = (0.0, None if clear_cached else cached)
 
 
+@_tel.timed("DB_READ_load_sync_cache", slow_ms=50, warn_ms=1000)
 def load_sync_cache() -> "SyncCacheState | None":
     global _sync_cache_entry, _sync_cache_loading
     now = time.monotonic()
@@ -4562,6 +4939,7 @@ def load_sync_device_mode_summary() -> Dict[str, int]:
     return summary
 
 
+@_tel.timed("DB_READ_list_sync_users_page", slow_ms=50, warn_ms=1000)
 def list_sync_users_page(*, limit: int = 0, offset: int = 0) -> tuple[List[Dict[str, Any]], int]:
     """Paged direct query for UI endpoints that should not hydrate the full sync cache."""
     normalized_limit = max(0, int(limit or 0))
@@ -4576,9 +4954,14 @@ def list_sync_users_page(*, limit: int = 0, offset: int = 0) -> tuple[List[Dict[
         elif normalized_offset > 0:
             sql += " LIMIT -1 OFFSET ?"
             params.append(normalized_offset)
+        _t_sel = time.monotonic()
         rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+        _sel_ms = (time.monotonic() - _t_sel) * 1000.0
 
+    _t_co = time.monotonic()
     users = [_coerce_user_row_to_payload(r) for r in rows]
+    _co_ms = (time.monotonic() - _t_co) * 1000.0
+    _t_proj = time.monotonic()
     include_projected_offline = normalized_offset == 0 and (normalized_limit <= 0 or normalized_limit >= total)
     if include_projected_offline:
         try:
@@ -4587,15 +4970,29 @@ def list_sync_users_page(*, limit: int = 0, offset: int = 0) -> tuple[List[Dict[
             total += len(projected)
         except Exception:
             pass
+    _proj_ms = (time.monotonic() - _t_proj) * 1000.0
+    # Split the 78s gym read into SELECT (disk I/O — a warm/reused connection would
+    # help) vs coerce (per-row CPU parse — connection reuse would NOT help) vs the
+    # offline-projection query, so the right next optimization is evidence-driven.
+    if (_sel_ms + _co_ms + _proj_ms) >= 1000.0:
+        try:
+            _tel.event(
+                "DB_READ_users_split", rows=len(rows),
+                select_ms=round(_sel_ms), coerce_ms=round(_co_ms), projected_ms=round(_proj_ms),
+            )
+        except Exception:
+            pass
     return users, total
 
 
+@_tel.timed("DB_READ_list_sync_users", slow_ms=50, warn_ms=1000)
 def list_sync_users() -> List[Dict[str, Any]]:
     """Direct query — avoids loading memberships/devices/infra via load_sync_cache() hot path."""
     users, _total = list_sync_users_page(limit=0, offset=0)
     return users
 
 
+@_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
 def list_sync_users_by_active_membership_ids(
     active_membership_ids: List[int] | set[int] | tuple[int, ...],
 ) -> List[Dict[str, Any]]:
@@ -4760,6 +5157,7 @@ def get_sync_access_software_settings_payload() -> Optional[Dict[str, Any]]:
     return load_sync_access_software_settings()
 
 
+@_tel.timed("DB_READ_list_sync_gym_access_credentials", slow_ms=50, warn_ms=1000)
 def list_sync_gym_access_credentials() -> List[Dict[str, Any]]:
     """Direct query — avoids full load_sync_cache() on the hot verification path."""
     with get_conn() as conn:
@@ -4784,6 +5182,7 @@ def list_device_sync_hashes(*, device_id: int) -> Dict[str, str]:
         return out
 
 
+@_tel.timed("DB_READ_list_device_sync_hashes_and_status", slow_ms=50, warn_ms=1000)
 def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
     """Return {pin: (desired_hash, last_ok)} so callers can detect pins that need retry."""
     did = int(device_id)
@@ -4800,6 +5199,30 @@ def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
             if p:
                 out[p] = (h, ok)
         return out
+
+
+@_tel.timed("DB_READ_device_sync_hash_for_pin", slow_ms=200, warn_ms=2000)
+def get_device_sync_hash_for_pin(*, device_id: int, pin: str) -> tuple:
+    """Return (desired_hash, last_ok) for ONE (device, pin) via an indexed lookup.
+
+    A targeted member sync only needs the single pin's stored hash, but used to
+    call list_device_sync_hashes_and_status() which reads the WHOLE device table
+    (~1798 rows) — measured at 11-20s on the gym PC just to fetch one row. This
+    PK-indexed point query is ~ms. Returns ("", True) when the pin is unknown
+    (same default the full-table caller used).
+    """
+    did = int(device_id)
+    p = str(pin or "").strip()
+    if not p:
+        return ("", True)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT desired_hash, last_ok FROM device_sync_state WHERE device_id=? AND pin=?",
+            (did, p),
+        ).fetchone()
+    if row is None:
+        return ("", True)
+    return (str(row["desired_hash"] or ""), bool(int(row["last_ok"] or 0)))
 
 
 def list_device_sync_pins(*, device_id: int) -> List[str]:
@@ -5730,6 +6153,7 @@ def prune_offline_creation_queue(*, retention_days: int = 30) -> int:
         return int(cur.rowcount or 0)
 
 
+@_tel.timed("DB_READ_get_recent_access_history", slow_ms=50, warn_ms=1000)
 def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
     lim = int(limit)
     if lim < 1:

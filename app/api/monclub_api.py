@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 import requests
 
+from app.core import telemetry as _tel
+
 
 @dataclass
 class ApiEndpoints:
@@ -114,6 +116,7 @@ class MonClubApi:
         prefix = ("/" + "/".join(parts[:2])) if len(parts) >= 2 else ""
         return f"{parsed.scheme}://{parsed.netloc}{prefix}"
 
+    @_tel.timed("API_LOGIN", slow_ms=0, warn_ms=3000)
     def login(self, *, email: str, password: str, timeout: int = 15) -> str:
         """Authenticate and return the access token.
 
@@ -173,6 +176,7 @@ class MonClubApi:
 
         return access_token
 
+    @_tel.timed("API_TOKEN_REFRESH", slow_ms=0, warn_ms=3000)
     def do_proactive_refresh(self, *, email: str, timeout: int = 15) -> bool:
         """Silently rotate the refresh token if the proactive-refresh deadline has passed.
 
@@ -244,6 +248,7 @@ class MonClubApi:
             self.logger.warning("Proactive refresh unexpected error: %s", exc)
             return False
 
+    @_tel.timed("API_GETSYNCDATA", slow_ms=0, warn_ms=3000)
     def get_sync_data(self, *, token: str, version_tokens: dict | None = None, timeout: int = 20) -> Dict[str, Any]:
         url = (self.endpoints.sync_url or "").strip()
         if not url:
@@ -351,6 +356,7 @@ class MonClubApi:
 
 
 
+    @_tel.timed("API_LATEST_RELEASE", slow_ms=0, warn_ms=3000)
     def get_latest_software_release(
         self,
         *,

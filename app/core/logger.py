@@ -14,8 +14,51 @@ _handler_logger = logging.getLogger(__name__)
 
 LOG_MAX_BYTES = 50 * 1024 * 1024
 LOG_RETENTION_DAYS = 7
-_LOG_FILE_RE = re.compile(r"^app-(\d{4}-\d{2}-\d{2})-(am|pm)(?:\.(\d+))?\.log$")
+# Matches both the legacy half-day names (app-DATE-am/pm.log) and the current
+# hourly-window names (app-DATE-from-HH-to-HH.log), plus an optional size suffix
+# (.1, .2, ...). The legacy alternation is kept so files written before the
+# windowed-logging rollout still get cleaned up and uploaded. Group 1 = date.
+_LOG_FILE_RE = re.compile(
+    r"^app-(\d{4}-\d{2}-\d{2})-(?:am|pm|from-\d{2}-to-\d{2})(?:\.(\d+))?\.log$"
+)
 _STALE_MARKER_CUTOFF_DAYS = 30
+
+# Upload windows: the day is split into these contiguous ranges so each finalized
+# log is pushed to the backend at the end of its window, instead of only twice a
+# day (the old am/pm split at 00:00 and 12:00). Each entry is a window START hour;
+# a window ends at the next start, and the last window ends at 24. Crossing a
+# boundary finalizes the previous file (triggering its upload) and opens the next.
+# Edit this tuple to change the cadence — values must be strictly increasing and
+# within 0..23, and must start at 0 so every hour maps to a window.
+_WINDOW_START_HOURS = (0, 3, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                       18, 19, 20, 21, 22, 23)
+
+
+def window_bounds_for_hour(hour: int) -> tuple[int, int]:
+    """Return the (start, end) hour bounds of the upload window holding ``hour``.
+
+    ``end`` is exclusive and is 24 for the final window of the day. Examples:
+    ``8 -> (8, 9)``, ``4 -> (3, 6)``, ``23 -> (23, 24)``, ``0 -> (0, 3)``.
+    """
+    start, end = _WINDOW_START_HOURS[0], 24
+    for i, boundary in enumerate(_WINDOW_START_HOURS):
+        if boundary > hour:
+            break
+        start = boundary
+        end = _WINDOW_START_HOURS[i + 1] if i + 1 < len(_WINDOW_START_HOURS) else 24
+    return start, end
+
+
+def window_label_for(when: dt.datetime) -> str:
+    """Filename window label for ``when``, e.g. ``from-08-to-09`` at 08:xx."""
+    start, end = window_bounds_for_hour(when.hour)
+    return f"from-{start:02d}-to-{end:02d}"
+
+
+def active_log_name_for(when: dt.datetime) -> str:
+    """Filename of the active (un-rotated) log at ``when``, e.g.
+    ``app-2026-06-22-from-08-to-09.log``."""
+    return f"app-{when.date().isoformat()}-{window_label_for(when)}.log"
 
 
 class TkQueueHandler(logging.Handler):
@@ -35,7 +78,13 @@ class TkQueueHandler(logging.Handler):
 
 
 class HalfDaySizeRotatingFileHandler(logging.FileHandler):
-    """Write dated AM/PM logs and rotate each half-day file by size."""
+    """Write dated per-window logs and rotate each window's file by size.
+
+    The day is split into the ranges defined by ``_WINDOW_START_HOURS`` (see
+    ``active_log_name_for``). Each finalized file is handed to ``on_log_rotated``
+    so it can be uploaded shortly after its window closes. (Name kept for
+    historical reasons — it used to split the day only into AM/PM halves.)
+    """
 
     def __init__(
         self,
@@ -63,12 +112,8 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
         self._cleanup_if_needed(now.date())
         super().__init__(str(self._path_for(now)), mode="a", encoding=encoding, delay=True)
 
-    @staticmethod
-    def _period_for(when: dt.datetime) -> str:
-        return "am" if when.hour < 12 else "pm"
-
     def _path_for(self, when: dt.datetime) -> Path:
-        return self.log_dir / f"app-{when.date().isoformat()}-{self._period_for(when)}.log"
+        return self.log_dir / active_log_name_for(when)
 
     def _set_active_path(self, path: Path) -> None:
         if self.stream:
@@ -153,7 +198,7 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
 
             # Clean up stale .uploaded and .failed markers (30-day retention)
             if path.suffix in (".uploaded", ".failed"):
-                stem = path.stem  # e.g. "app-2020-01-01-am.log"
+                stem = path.stem  # e.g. "app-2020-01-01-from-08-to-09.log"
                 m = _LOG_FILE_RE.match(stem)
                 if m:
                     try:

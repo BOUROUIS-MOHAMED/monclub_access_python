@@ -17,6 +17,7 @@ from app.core.db import (
     list_sync_users,
     list_sync_gym_access_credentials,
 )
+from app.core import telemetry as _tel
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,7 @@ def verify_card(
     }
 
 
+@_tel.timed("TOTP_VERIFY", slow_ms=50)
 def verify_totp(
     *,
     scanned: str,
@@ -482,6 +484,7 @@ def verify_totp(
     }
 
 
+@_tel.timed("TOTP_VERIFY_RESILIENT", slow_ms=50)
 def verify_totp_resilient(
     *,
     scanned: str,
@@ -562,53 +565,60 @@ def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]],
             if k in obj:
                 add_card(idx, obj.get(k), u)
 
-    try:
-        creds = list_sync_gym_access_credentials()
-    except Exception:
-        creds = []
+    p = _tel.profile("CACHE_LOAD_LOCAL_STATE")
 
-    try:
-        users = list_sync_users()
-    except Exception:
-        users = []
+    with p.step("creds"):
+        try:
+            creds = list_sync_gym_access_credentials()
+        except Exception:
+            creds = []
+
+    with p.step("users"):
+        try:
+            users = list_sync_users()
+        except Exception:
+            users = []
 
     idx_by_am: Dict[int, Dict[str, Any]] = {}
     idx_by_card: Dict[str, List[Dict[str, Any]]] = {}
 
-    for u in users:
-        if not isinstance(u, dict):
-            continue
+    with p.step("index"):
+        for u in users:
+            if not isinstance(u, dict):
+                continue
 
-        am_id = u.get("activeMembershipId")
-        try:
-            if am_id is not None:
-                s = str(am_id).strip()
-                if s:
-                    idx_by_am[int(s)] = u
-            else:
-                # Fallback: index by userId for users without activeMembershipId.
-                # device_sync uses userId as the device Pin when activeMembershipId
-                # is null, so the same key must be in this lookup index.
-                user_id = u.get("userId")
-                if user_id is not None:
-                    s = str(user_id).strip()
-                    if s.isdigit():
-                        uid_int = int(s)
-                        # Only add if no activeMembershipId user already owns this key
-                        if uid_int not in idx_by_am:
-                            idx_by_am[uid_int] = u
-        except Exception:
-            pass
+            am_id = u.get("activeMembershipId")
+            try:
+                if am_id is not None:
+                    s = str(am_id).strip()
+                    if s:
+                        idx_by_am[int(s)] = u
+                else:
+                    # Fallback: index by userId for users without activeMembershipId.
+                    # device_sync uses userId as the device Pin when activeMembershipId
+                    # is null, so the same key must be in this lookup index.
+                    user_id = u.get("userId")
+                    if user_id is not None:
+                        s = str(user_id).strip()
+                        if s.isdigit():
+                            uid_int = int(s)
+                            # Only add if no activeMembershipId user already owns this key
+                            if uid_int not in idx_by_am:
+                                idx_by_am[uid_int] = u
+            except Exception:
+                pass
 
-        add_cards_from_obj(idx_by_card, u, u)
+            add_cards_from_obj(idx_by_card, u, u)
 
-        for nested_key in ("activeMembership", "activeMembershipModel", "activeMembershipDto"):
-            nested = u.get(nested_key)
-            add_cards_from_obj(idx_by_card, nested, u)
+            for nested_key in ("activeMembership", "activeMembershipModel", "activeMembershipDto"):
+                nested = u.get(nested_key)
+                add_cards_from_obj(idx_by_card, nested, u)
 
-        cards = u.get("cards")
-        if isinstance(cards, list):
-            for c in cards:
-                add_card(idx_by_card, c, u)
+            cards = u.get("cards")
+            if isinstance(cards, list):
+                for c in cards:
+                    add_card(idx_by_card, c, u)
+
+    p.done(creds=len(creds), users=len(users))
 
     return list(creds), dict(idx_by_am), dict(idx_by_card)

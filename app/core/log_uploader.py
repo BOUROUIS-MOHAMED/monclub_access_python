@@ -12,8 +12,11 @@ from typing import Callable
 
 _handler_logger = logging.getLogger(__name__)
 
-# Must match the same pattern as HalfDaySizeRotatingFileHandler
-_LOG_FILE_RE = re.compile(r"^app-(\d{4}-\d{2}-\d{2})-(am|pm)(?:\.(\d+))?\.log$")
+# Must match the same pattern as HalfDaySizeRotatingFileHandler (logger._LOG_FILE_RE).
+# Accepts legacy am/pm names and current hourly-window (from-HH-to-HH) names.
+_LOG_FILE_RE = re.compile(
+    r"^app-(\d{4}-\d{2}-\d{2})-(?:am|pm|from-\d{2}-to-\d{2})(?:\.(\d+))?\.log$"
+)
 
 # Retry backoff intervals (seconds) indexed by attempt count; last value is the cap.
 _BACKOFF_SECONDS = [0, 120, 240, 480, 960, 3600]
@@ -150,8 +153,8 @@ class LogUploadQueue:
         Returns a small dict the local API surfaces back to the dashboard:
             {
               "rotated":      True/False — whether the rotate callback ran,
-              "activeBefore": "app-2026-05-11-am.log",
-              "pendingNow":   ["app-2026-05-11-am.1.log", ...]  # filenames
+              "activeBefore": "app-2026-05-11-from-08-to-09.log",
+              "pendingNow":   ["app-2026-05-11-from-08-to-09.1.log", ...]  # filenames
             }
 
         Idempotent: calling twice in a row just re-scans orphans the second time.
@@ -190,11 +193,14 @@ class LogUploadQueue:
     # ------------------------------------------------------------------
 
     def _active_log_name(self) -> str:
-        """Return the filename of the currently active log (not yet rotated)."""
+        """Return the filename of the currently active log (not yet rotated).
+
+        Derived from the logger's window scheme so the two never drift — if they
+        did, scan_orphans could queue the live file for upload mid-write.
+        """
         import datetime as dt
-        now = dt.datetime.now()
-        period = "am" if now.hour < 12 else "pm"
-        return f"app-{now.date().isoformat()}-{period}.log"
+        from app.core.logger import active_log_name_for
+        return active_log_name_for(dt.datetime.now())
 
     def _read_retry_count(self, marker: Path) -> int:
         try:

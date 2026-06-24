@@ -16,54 +16,76 @@ class AuthTokenState:
     next_refresh_at: str = ""   # ISO UTC deadline: app proactively refreshes when past this
 
 
+# ---------------------------------------------------------------------------
+# DPAPI (Windows) setup — done ONCE at import, NOT per call.
+#
+# The previous code defined a ctypes.Structure subclass (DATA_BLOB), loaded the
+# crypt32/kernel32 WinDLLs, and set .argtypes on EVERY call to protect/unprotect.
+# Each new DATA_BLOB class seeds ctypes' internal type caches (POINTER(DATA_BLOB),
+# c_byte*N, …) which are never freed → ~110 bytes leaked per call. These helpers
+# are on the auth hot path (hundreds of thousands of calls), so the process grew
+# ~37 MB/h and eventually hit the 32-bit address ceiling → "can't start new thread"
+# (the Type-2 daily lockup). Defining everything once removes the leak entirely.
+# ---------------------------------------------------------------------------
+_DPAPI_READY = False
+try:
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    class _DATA_BLOB(_ctypes.Structure):
+        _fields_ = [("cbData", _wintypes.DWORD), ("pbData", _ctypes.POINTER(_ctypes.c_byte))]
+
+    _crypt32 = _ctypes.WinDLL("crypt32.dll")
+    _kernel32 = _ctypes.WinDLL("kernel32.dll")
+
+    _crypt32.CryptProtectData.argtypes = [
+        _ctypes.POINTER(_DATA_BLOB), _wintypes.LPCWSTR, _ctypes.POINTER(_DATA_BLOB),
+        _wintypes.LPVOID, _wintypes.LPVOID, _wintypes.DWORD, _ctypes.POINTER(_DATA_BLOB),
+    ]
+    _crypt32.CryptProtectData.restype = _wintypes.BOOL
+    _crypt32.CryptUnprotectData.argtypes = [
+        _ctypes.POINTER(_DATA_BLOB), _ctypes.POINTER(_wintypes.LPWSTR), _ctypes.POINTER(_DATA_BLOB),
+        _wintypes.LPVOID, _wintypes.LPVOID, _wintypes.DWORD, _ctypes.POINTER(_DATA_BLOB),
+    ]
+    _crypt32.CryptUnprotectData.restype = _wintypes.BOOL
+    _DPAPI_READY = True
+except Exception:
+    _DPAPI_READY = False
+
+
+def _bytes_to_blob(b: bytes):
+    buf = (_ctypes.c_byte * len(b))(*b)
+    return _DATA_BLOB(len(b), _ctypes.cast(buf, _ctypes.POINTER(_ctypes.c_byte)))
+
+
+def _blob_to_bytes(blob) -> bytes:
+    cb = int(blob.cbData)
+    if cb <= 0:
+        return b""
+    data = _ctypes.string_at(blob.pbData, cb)
+    _kernel32.LocalFree(blob.pbData)
+    return data
+
+
 def protect_auth_token(plain: str) -> str:
     """
     Best-effort encryption for auth tokens on Windows using DPAPI.
     Falls back to a raw prefix if DPAPI is unavailable.
     """
+    if not _DPAPI_READY:
+        import logging as _log
+        _log.getLogger(__name__).error("DPAPI unavailable — refusing to store plaintext token")
+        return ""
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        crypt32 = ctypes.WinDLL("crypt32.dll")
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-
-        class DATA_BLOB(ctypes.Structure):
-            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
-
-        def _bytes_to_blob(b: bytes) -> DATA_BLOB:
-            buf = (ctypes.c_byte * len(b))(*b)
-            return DATA_BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
-
-        def _blob_to_bytes(blob: DATA_BLOB) -> bytes:
-            cb = int(blob.cbData)
-            if cb <= 0:
-                return b""
-            data = ctypes.string_at(blob.pbData, cb)
-            kernel32.LocalFree(blob.pbData)
-            return data
-
-        crypt32.CryptProtectData.argtypes = [
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPCWSTR,
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPVOID,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(DATA_BLOB),
-        ]
-        crypt32.CryptProtectData.restype = wintypes.BOOL
-
-        plain_bytes = plain.encode("utf-8")
-        in_blob = _bytes_to_blob(plain_bytes)
-        out_blob = DATA_BLOB()
-
-        ok = crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
+        in_blob = _bytes_to_blob(plain.encode("utf-8"))
+        out_blob = _DATA_BLOB()
+        ok = _crypt32.CryptProtectData(
+            _ctypes.byref(in_blob), None, None, None, None, 0, _ctypes.byref(out_blob)
+        )
         if not ok:
             import logging as _log
             _log.getLogger(__name__).error("DPAPI CryptProtectData failed — refusing to store plaintext token")
             return ""
-
         enc = _blob_to_bytes(out_blob)
         return "dpapi:" + base64.b64encode(enc).decode("ascii")
     except Exception as _exc:
@@ -79,48 +101,17 @@ def unprotect_auth_token(stored: str) -> str:
         return stored[len("raw:") :]
     if not stored.startswith("dpapi:"):
         return stored
-
+    if not _DPAPI_READY:
+        return ""
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        crypt32 = ctypes.WinDLL("crypt32.dll")
-        kernel32 = ctypes.WinDLL("kernel32.dll")
-
-        class DATA_BLOB(ctypes.Structure):
-            _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
-
-        def _bytes_to_blob_alloc(b: bytes) -> DATA_BLOB:
-            buf = (ctypes.c_byte * len(b))(*b)
-            return DATA_BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_byte)))
-
-        def _blob_to_bytes(blob: DATA_BLOB) -> bytes:
-            cb = int(blob.cbData)
-            if cb <= 0:
-                return b""
-            data = ctypes.string_at(blob.pbData, cb)
-            kernel32.LocalFree(blob.pbData)
-            return data
-
-        crypt32.CryptUnprotectData.argtypes = [
-            ctypes.POINTER(DATA_BLOB),
-            ctypes.POINTER(wintypes.LPWSTR),
-            ctypes.POINTER(DATA_BLOB),
-            wintypes.LPVOID,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(DATA_BLOB),
-        ]
-        crypt32.CryptUnprotectData.restype = wintypes.BOOL
-
         enc = base64.b64decode(stored[len("dpapi:") :].encode("ascii"))
-        in_blob = _bytes_to_blob_alloc(enc)
-        out_blob = DATA_BLOB()
-
-        ok = crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None, 0, ctypes.byref(out_blob))
+        in_blob = _bytes_to_blob(enc)
+        out_blob = _DATA_BLOB()
+        ok = _crypt32.CryptUnprotectData(
+            _ctypes.byref(in_blob), None, None, None, None, 0, _ctypes.byref(out_blob)
+        )
         if not ok:
             return ""
-
         dec = _blob_to_bytes(out_blob)
         return dec.decode("utf-8", errors="replace")
     except Exception:
