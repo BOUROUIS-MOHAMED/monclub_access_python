@@ -11,9 +11,12 @@ from typing import Any, Deque, Dict, List, Optional, Set
 from app.core.access_types import HistoryRecord, NotificationRequest
 from app.core.access_verification import (
     EVENT_TIME_SANITY_BOUND_SEC as _EVENT_TIME_SANITY_BOUND_SEC,
+    build_totp_index,
     load_local_state,
     parse_event_time_to_epoch,
     verify_totp_resilient,
+    _totp_counter,
+    _totp_params,
 )
 from app.core.db import (
     get_recent_access_history,
@@ -93,6 +96,33 @@ def _set_shared_local_state(value, gen) -> None:
         pass
 
 
+# Process-wide precomputed TOTP index ({code -> hits}). Built off the hot path
+# (bg refresh thread) and shared by both device workers since they verify against
+# the same credentials. Tagged with the local-state generation it was built from
+# so a worker only uses it when it matches the creds it is verifying against —
+# that gen check is what prevents a stale index from allowing a removed member.
+_SHARED_TOTP_INDEX_LOCK = threading.Lock()
+_SHARED_TOTP_INDEX: Dict[str, Any] = {"value": None, "gen": -1}
+
+
+def _get_shared_totp_index():
+    """Return (index_struct, generation) of the process-wide TOTP index."""
+    try:
+        with _SHARED_TOTP_INDEX_LOCK:
+            return _SHARED_TOTP_INDEX["value"], _SHARED_TOTP_INDEX["gen"]
+    except Exception:
+        return None, -1
+
+
+def _set_shared_totp_index(value, gen) -> None:
+    try:
+        with _SHARED_TOTP_INDEX_LOCK:
+            _SHARED_TOTP_INDEX["value"] = value
+            _SHARED_TOTP_INDEX["gen"] = int(gen)
+    except Exception:
+        pass
+
+
 class UltraDeviceWorker(threading.Thread):
     """Per-device thread: polls RTLog, classifies events, TOTP rescue."""
 
@@ -161,7 +191,10 @@ class UltraDeviceWorker(threading.Thread):
         self._last_skew_warn_mono: float = 0.0
 
         # Device-clock discipline (fix #2b) throttle + last measured device↔PC skew.
-        self._last_clock_check_mono: float = 0.0
+        # -inf (not 0.0): time.monotonic() has an arbitrary epoch, so a 0.0 seed
+        # would throttle away the very first check on a freshly-booted PC (when
+        # monotonic() is still < 3600). The startup clock-correction must run.
+        self._last_clock_check_mono: float = float("-inf")
         self._device_pc_skew_sec: Optional[float] = None
         # Card/QR re-scan cooldown state. The effective cooldown is computed
         # PER EVENT from current settings (see _effective_card_cooldown_sec) so a
@@ -374,6 +407,15 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_member_sync_commands(limit=1)
                 self._drain_full_sync_commands(limit=1)
                 self._drain_commands()
+
+                # Re-align the device RTC to the PC clock periodically. The call
+                # self-throttles to once/hour and is a no-op below the drift
+                # threshold; with the persistent connection the connect-path check
+                # runs only once at startup, so this keeps a slowly-drifting
+                # C3-200 clock corrected over a long run (prod RTCs were 38-74s
+                # behind, which breaks scan-time TOTP and mass-DENYs valid codes).
+                if self._connected:
+                    self._maybe_discipline_device_clock()
 
                 # Connection policy.
                 #
@@ -1430,6 +1472,14 @@ class UltraDeviceWorker(threading.Thread):
         """
         creds, users_by_am, users_by_card = self._get_cached_local_state()
 
+        # Use the precomputed O(1) index ONLY when it was built from the exact
+        # same credential generation we are about to verify against. Mismatch =>
+        # pass None and verify_totp_resilient runs the full loop over `creds`.
+        # This gen-gate is what stops a stale index from allowing a removed
+        # member (or silently missing a just-added one).
+        _idx, _idx_gen = _get_shared_totp_index()
+        totp_index = _idx if (_idx is not None and _idx_gen == self._cached_state_gen) else None
+
         t0 = time.monotonic()
         result = verify_totp_resilient(
             scanned=code,
@@ -1438,6 +1488,7 @@ class UltraDeviceWorker(threading.Thread):
             users_by_am=users_by_am,
             users_by_card=users_by_card,
             scan_epoch=scan_epoch,
+            totp_index=totp_index,
         )
         decision_ms = (time.monotonic() - t0) * 1000
 
@@ -1854,33 +1905,40 @@ class UltraDeviceWorker(threading.Thread):
         """Persistent local-state refresh worker. One per device; reused so its
         DB connection cache stays warm. Exits when the worker stops."""
         while not self._stop_evt.is_set():
-            if not self._refresh_evt.wait(timeout=5.0):
-                continue
-            self._refresh_evt.clear()
+            triggered = self._refresh_evt.wait(timeout=5.0)
             if self._stop_evt.is_set():
                 break
-            _bg_t0 = time.monotonic()
+            if triggered:
+                self._refresh_evt.clear()
+                _bg_t0 = time.monotonic()
+                try:
+                    _gen_at_load = get_local_state_generation()
+                    result = load_local_state()
+                    if result and isinstance(result, (tuple, list)) and len(result) >= 3:
+                        self._cached_state = result
+                        self._cached_state_ts = time.monotonic()
+                        self._cached_state_gen = _gen_at_load
+                        _set_shared_local_state(result, _gen_at_load)
+                        creds, uam, ucard = result
+                        _tel.event(
+                            "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
+                            dur_ms=round((time.monotonic() - _bg_t0) * 1000), creds=len(creds),
+                        )
+                        # Warm the popup-image cache for ALL members NOW (on this bg
+                        # thread), so a member's avatar is already downloaded before
+                        # they scan — fixes "image black on first scan" (the on-scan
+                        # prefetch lost the race against the 3s popup + ~3s fetch).
+                        self._prefetch_member_images(uam)
+                except Exception as e:
+                    logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
+                    _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
+            # Every tick (≤5s), reload or not: keep the precomputed TOTP index
+            # covering the current counter window so QR verification stays O(1)
+            # across period rolls. Always built here (bg thread), never on a scan.
             try:
-                _gen_at_load = get_local_state_generation()
-                result = load_local_state()
-                if result and isinstance(result, (tuple, list)) and len(result) >= 3:
-                    self._cached_state = result
-                    self._cached_state_ts = time.monotonic()
-                    self._cached_state_gen = _gen_at_load
-                    _set_shared_local_state(result, _gen_at_load)
-                    creds, uam, ucard = result
-                    _tel.event(
-                        "CACHE_BG_REFRESH_DONE", worker=self._tel_wid,
-                        dur_ms=round((time.monotonic() - _bg_t0) * 1000), creds=len(creds),
-                    )
-                    # Warm the popup-image cache for ALL members NOW (on this bg
-                    # thread), so a member's avatar is already downloaded before
-                    # they scan — fixes "image black on first scan" (the on-scan
-                    # prefetch lost the race against the 3s popup + ~3s fetch).
-                    self._prefetch_member_images(uam)
-            except Exception as e:
-                logger.warning(f"{self._prefix} bg cache refresh failed: {e}")
-                _tel.warn("CACHE_BG_REFRESH_FAILED", worker=self._tel_wid, err=type(e).__name__)
+                self._maybe_rebuild_totp_index()
+            except Exception:
+                pass
 
     def _prefetch_member_images(self, users_by_am) -> None:
         """Submit ALL members' avatar/face images to the popup-image prefetch pool
@@ -1910,6 +1968,52 @@ class UltraDeviceWorker(threading.Thread):
                 _tel.event("MEMBER_IMG_PREFETCH", worker=self._tel_wid, submitted=submitted)
         except Exception:
             pass
+
+    def _maybe_rebuild_totp_index(self) -> None:
+        """Keep the process-wide {code -> hits} TOTP index covering the current
+        counter window so QR verification is O(1) instead of HMAC-ing every
+        credential (~350ms on the gym roster).
+
+        Rebuilds only when the creds changed (generation moved) or the index no
+        longer covers / matches the current window+params — the SAME conditions
+        verify_totp uses to accept it. A miss is harmless: verify_totp falls back
+        to the full loop, so this is a pure latency optimization. Tagged with the
+        local-state generation so a worker never verifies against a stale index.
+        Runs on the bg refresh thread; never blocks a scan.
+        """
+        try:
+            if not bool(self._settings.get("totp_enabled", True)):
+                return
+            if not bool(self._settings.get("ultra_totp_index_enabled", True)):
+                return
+            state = self._cached_state
+            if not state or not isinstance(state, (tuple, list)) or len(state) < 1:
+                return
+            creds = state[0]
+            gen = self._cached_state_gen
+            now = time.time()
+            period, drift, digits, prefix = _totp_params(self._settings)
+            cur = _totp_counter(int(now), period)
+            needed = set(range(cur - drift, cur + drift + 1))
+            cur_struct, cur_gen = _get_shared_totp_index()
+            if (
+                isinstance(cur_struct, dict)
+                and cur_gen == gen
+                and cur_struct.get("params") == (period, drift, digits, prefix)
+                and needed.issubset(cur_struct.get("counters") or set())
+            ):
+                return  # still fresh — covers the current window
+            _t0 = time.monotonic()
+            struct = build_totp_index(creds, self._settings, now, margin=1)
+            _set_shared_totp_index(struct, gen)
+            _tel.event(
+                "TOTP_INDEX_BUILD", worker=self._tel_wid,
+                dur_ms=round((time.monotonic() - _t0) * 1000),
+                creds=struct.get("credCount", 0), codes=len(struct.get("index") or {}),
+                gen=gen,
+            )
+        except Exception as e:
+            _tel.warn("TOTP_INDEX_BUILD_FAILED", worker=self._tel_wid, err=type(e).__name__)
 
     def _get_cached_local_state(self):
         """Return (creds, users_by_am, users_by_card) without ever blocking the

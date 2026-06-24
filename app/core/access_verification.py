@@ -259,6 +259,138 @@ def verify_card(
 
 
 @_tel.timed("TOTP_VERIFY", slow_ms=50)
+def _iter_eligible_totp_creds(creds_payload: List[Dict[str, Any]]):
+    """Yield ``(cred_id, account_id, secret_bytes, grants)`` for every
+    TOTP-eligible credential, applying the EXACT filters the verify loop uses.
+
+    Shared by :func:`verify_totp`'s scan loop and :func:`build_totp_index` so the
+    precomputed index can never contain a credential the loop would skip (or
+    vice-versa) — that equivalence is what makes the index a safe pure-speed
+    optimization rather than a second, divergent code path.
+    """
+    for c in creds_payload:
+        if not isinstance(c, dict):
+            continue
+        if not bool(c.get("enabled", False)):
+            continue
+        cred_id = c.get("id")
+        account_id = c.get("accountId")
+        secret_hex = (c.get("secretHex") or "").strip()
+        grants = c.get("grantedActiveMembershipIds") or []
+        if cred_id in (None, "", 0) or account_id in (None, "", 0):
+            continue
+        if not secret_hex or (not _totp_is_hex(secret_hex)):
+            continue
+        if not isinstance(grants, list) or not grants:
+            continue
+        try:
+            secret = _totp_hex_to_bytes(secret_hex)
+        except Exception:
+            continue
+        yield cred_id, account_id, secret, grants
+
+
+def _totp_params(settings: Dict[str, Any]):
+    """Resolve (period, drift, digits, prefix) exactly as verify_totp does."""
+    period = _safe_int(settings.get("totp_period_seconds", 30))
+    drift = _safe_int(settings.get("totp_drift_steps", 1))
+    digits = _safe_int(settings.get("totp_digits", 7))
+    if digits < 4:
+        digits = 4
+    if digits > 10:
+        digits = 10
+    prefix = _safe_str(settings.get("totp_prefix", "9"), "9").strip()
+    if (len(prefix) != 1) or (not prefix.isdigit()):
+        prefix = "9"
+    return period, drift, digits, prefix
+
+
+def build_totp_index(
+    creds_payload: List[Dict[str, Any]],
+    settings: Dict[str, Any],
+    now_unix: Optional[float] = None,
+    margin: int = 1,
+) -> Dict[str, Any]:
+    """Precompute ``{code -> [hit, ...]}`` for the counter window around ``now``.
+
+    Built off the hot path (the ULTRA bg refresh thread). A scan then resolves
+    its owning credential with an O(1) dict lookup instead of HMAC-ing every
+    credential, turning ``verify_totp``'s ~350ms cred loop into ~microseconds.
+
+    ``margin`` widens the counter window by ±N steps beyond the drift band so an
+    index built a few seconds before the period rolls still covers the next
+    scan's window; when it does NOT cover a scan's window (or the params differ),
+    ``verify_totp`` transparently falls back to the full loop, so correctness
+    never depends on the index being fresh.
+    """
+    period, drift, digits, prefix = _totp_params(settings)
+    now = int(now_unix if now_unix is not None else time.time())
+    cur = _totp_counter(now, period)
+    lo = cur - int(drift) - int(max(0, margin))
+    hi = cur + int(drift) + int(max(0, margin))
+    counters = list(range(lo, hi + 1))
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    n_creds = 0
+    for cred_id, account_id, secret, grants in _iter_eligible_totp_creds(creds_payload):
+        n_creds += 1
+        for ctr in counters:
+            try:
+                code = _totp_hotp(secret, ctr, digits)
+            except Exception:
+                continue
+            index.setdefault(code, []).append(
+                {
+                    "credId": str(cred_id),
+                    "accountId": str(account_id),
+                    "counter": int(ctr),
+                    "grants": list(grants),
+                }
+            )
+    return {
+        "index": index,
+        "counters": set(counters),
+        "params": (period, drift, digits, prefix),
+        "built_unix": float(now),
+        "credCount": n_creds,
+    }
+
+
+def _hits_from_index(
+    index: Dict[str, List[Dict[str, Any]]],
+    code: str,
+    allowed_ctrs: List[int],
+) -> List[Dict[str, Any]]:
+    """Reconstruct the SAME ``hits`` list the cred loop would build, from the
+    precomputed index: one entry per credential (lowest matching counter, which
+    is what the ascending-counter loop picks), restricted to ``allowed_ctrs``,
+    short-circuiting at the first 2 distinct creds (collision) like the loop.
+    """
+    raw = index.get(code)
+    if not raw:
+        return []
+    allowed_set = {int(x) for x in allowed_ctrs}
+    hits: List[Dict[str, Any]] = []
+    seen: set = set()
+    for h in raw:
+        if int(h["counter"]) not in allowed_set:
+            continue
+        cid = h["credId"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        hits.append(
+            {
+                "credId": h["credId"],
+                "accountId": h["accountId"],
+                "counter": int(h["counter"]),
+                "grants": list(h["grants"]),
+            }
+        )
+        if len(seen) > 1:
+            break  # 2 distinct creds is enough to force DENY_COLLISION downstream
+    return hits
+
+
 def verify_totp(
     *,
     scanned: str,
@@ -267,6 +399,7 @@ def verify_totp(
     users_by_am: Dict[int, Dict[str, Any]],
     users_by_card: Dict[str, List[Dict[str, Any]]],
     now_unix: Optional[float] = None,
+    totp_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate a scanned QR/TOTP string.
 
@@ -335,58 +468,54 @@ def verify_totp(
     cur = _totp_counter(now, period)
     allowed_ctrs = list(range(cur - int(drift), cur + int(drift) + 1))
 
-    # TOTP diagnostic: count eligible credentials
-    _eligible_creds = sum(
-        1 for c in creds_payload if isinstance(c, dict) and c.get("enabled")
-        and (c.get("secretHex") or "").strip() and _totp_is_hex((c.get("secretHex") or "").strip())
-    )
-    logger.debug(
-        "verify_totp: code_len=%d prefix=%r digits=%d eligible_creds=%d "
-        "now=%d counter=%d drift=%d period=%d",
-        len(raw), prefix, digits, _eligible_creds, now, cur, drift, period,
-    )
-
-    hits: List[Dict[str, Any]] = []
-    for c in creds_payload:
-        if not isinstance(c, dict):
-            continue
-        if not bool(c.get("enabled", False)):
-            continue
-
-        cred_id = c.get("id")
-        account_id = c.get("accountId")
-        secret_hex = (c.get("secretHex") or "").strip()
-        grants = c.get("grantedActiveMembershipIds") or []
-
-        if cred_id in (None, "", 0) or account_id in (None, "", 0):
-            continue
-        if not secret_hex or (not _totp_is_hex(secret_hex)):
-            continue
-        if not isinstance(grants, list) or not grants:
-            continue
-
+    # Resolve the matching credential(s). FAST PATH: a precomputed index keyed by
+    # code (built off the hot path on the bg refresh thread) turns this from an
+    # HMAC over every credential into an O(1) dict lookup. The index is consulted
+    # ONLY when it was built with the same TOTP params AND fully covers this
+    # scan's counter window; otherwise we fall through to the exact same loop, so
+    # the decision is byte-for-byte identical whether or not the index is present.
+    hits: Optional[List[Dict[str, Any]]] = None
+    used_index = False
+    if isinstance(totp_index, dict):
         try:
-            secret = _totp_hex_to_bytes(secret_hex)
+            if (
+                totp_index.get("params") == (period, drift, digits, prefix)
+                and set(allowed_ctrs).issubset(totp_index.get("counters") or set())
+            ):
+                hits = _hits_from_index(totp_index.get("index") or {}, code, allowed_ctrs)
+                used_index = True
         except Exception:
-            continue
+            hits = None
+            used_index = False
 
-        for ctr in allowed_ctrs:
-            try:
-                if _totp_hotp(secret, ctr, digits) == code:
-                    hits.append(
-                        {
-                            "credId": str(cred_id),
-                            "accountId": str(account_id),
-                            "counter": int(ctr),
-                            "grants": list(grants),
-                        }
-                    )
-                    break  # F-022: one match per credential is sufficient; skip remaining counters
-            except Exception:
-                continue
-        # F-022: if we already have a collision (2+ distinct cred IDs), we can short-circuit
-        if len(set(h["credId"] for h in hits)) > 1:
-            break
+    if hits is None:
+        hits = []
+        for cred_id, account_id, secret, grants in _iter_eligible_totp_creds(creds_payload):
+            for ctr in allowed_ctrs:
+                try:
+                    if _totp_hotp(secret, ctr, digits) == code:
+                        hits.append(
+                            {
+                                "credId": str(cred_id),
+                                "accountId": str(account_id),
+                                "counter": int(ctr),
+                                "grants": list(grants),
+                            }
+                        )
+                        break  # F-022: one match per credential is sufficient
+                except Exception:
+                    continue
+            # F-022: a collision (2+ distinct cred IDs) is enough to short-circuit
+            if len(set(h["credId"] for h in hits)) > 1:
+                break
+
+    if logger.isEnabledFor(logging.DEBUG):
+        _eligible_creds = sum(1 for _ in _iter_eligible_totp_creds(creds_payload))
+        logger.debug(
+            "verify_totp: code_len=%d prefix=%r digits=%d eligible_creds=%d "
+            "now=%d counter=%d drift=%d period=%d indexed=%s",
+            len(raw), prefix, digits, _eligible_creds, now, cur, drift, period, used_index,
+        )
 
     if hits:
         uniq_creds = sorted(set(h["credId"] for h in hits))
@@ -493,6 +622,7 @@ def verify_totp_resilient(
     users_by_am: Dict[int, Dict[str, Any]],
     users_by_card: Dict[str, List[Dict[str, Any]]],
     scan_epoch: Optional[float] = None,
+    totp_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Validate a QR/TOTP code resiliently against unreliable clocks.
 
@@ -516,6 +646,7 @@ def verify_totp_resilient(
     primary = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=now_unix,
+        totp_index=totp_index,
     )
     primary_clock = "scan" if now_unix is not None else "wall"
     if primary.get("allowed") or now_unix is None:
@@ -527,6 +658,7 @@ def verify_totp_resilient(
     fallback = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
+        totp_index=totp_index,
     )
     if fallback.get("allowed"):
         fallback["clockUsed"] = "wall"

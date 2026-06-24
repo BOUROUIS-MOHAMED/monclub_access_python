@@ -1,6 +1,6 @@
 [package]
 name = "monclub-access-ui"
-version = "1.4.10"
+version = "1.4.11"
 description = "MonClub Access Tauri UI"
 authors = ["MonClub"]
 edition = "2021"

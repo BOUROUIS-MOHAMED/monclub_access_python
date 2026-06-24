@@ -438,12 +438,23 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "ultra_sync_interval_minutes": int(dev.get("ultraSyncIntervalMinutes") or 30),
         "ultra_totp_rescue_enabled": bool(dev.get("ultraTotpRescueEnabled", True)),
         "ultra_rtlog_enabled": bool(dev.get("ultraRtlogEnabled", True)),
+        # Precompute a {code -> credential} index off the hot path so QR/TOTP
+        # verification is O(1) instead of HMAC-ing every credential (~350ms on a
+        # ~1800-member roster). Pure speed: a stale/missing index transparently
+        # falls back to the full verify loop, so the decision is unchanged. ON by
+        # default; backend can disable per-device with ultraTotpIndexEnabled=false.
+        "ultra_totp_index_enabled": _boolish(dev.get("ultraTotpIndexEnabled"), True),
         # Device RTC discipline (fix #2b). When enabled, the ULTRA worker nudges
         # the turnstile clock toward the PC clock when they drift apart by more
-        # than ultra_device_clock_max_drift_sec. Default OFF: only safe once the
-        # PC clock itself is NTP-synced — otherwise we'd push a wrong time onto
-        # the device. The read-only device↔PC skew check/log runs regardless.
-        "ultra_discipline_device_clock": _boolish(dev.get("ultraDisciplineDeviceClock"), False),
+        # than ultra_device_clock_max_drift_sec. Default ON: prod evidence showed
+        # C3-200 RTCs drifting 38-74s behind the PC, which makes scan-time TOTP
+        # verification always fail (forcing the slow 2-pass fallback ~+400ms) and
+        # causes ~50% DENY_NO_MATCH whenever processing lags even slightly. The
+        # resilient verifier already trusts the PC clock for its wall-clock pass,
+        # so aligning the device to the (NTP-synced) PC can only help; a backend
+        # value of false still disables it per-device. The read-only device↔PC
+        # skew check/log runs regardless.
+        "ultra_discipline_device_clock": _boolish(dev.get("ultraDisciplineDeviceClock"), True),
         "ultra_device_clock_max_drift_sec": _clamp_int(dev.get("ultraDeviceClockMaxDriftSec"), 10, 2, 600),
         # Connect-per-cycle hot window: how many consecutive empty polls the
         # worker holds the TCP connection before disconnecting. C2-400 /

@@ -115,6 +115,7 @@ def _make_worker(
     # process-wide shared snapshot too, so it can't leak between tests.
     worker._cached_state_gen = get_local_state_generation()
     _ue._set_shared_local_state(None, -1)
+    _ue._set_shared_totp_index(None, -1)
     worker._CACHE_TTL_SEC = 5.0
     worker._member_sync_lock = threading.Lock()
     worker._pending_member_syncs = deque()
@@ -1386,3 +1387,171 @@ class TestCardCooldown:
             totp_prefix="9", totp_digits=6))
         assert worker._effective_card_cooldown_sec("9123456") == 25.0          # QR/TOTP
         assert worker._effective_card_cooldown_sec("4894671") == _ULTRA_CARD_DEBOUNCE_SEC  # RFID
+
+
+# ---------------------------------------------------------------------------
+# Device RTC discipline (fix #2b) — default-ON + first-call-runs regression.
+# Prod evidence (2026-06-24): two C3-200 turnstiles ran 38-74s behind the PC,
+# which makes scan-time TOTP always fail (slow 2-pass verify) and mass-DENYs
+# valid codes (~50% DENY_NO_MATCH). Auto-correct must be ON by default and the
+# startup check must not be throttled away on a freshly-booted PC.
+# ---------------------------------------------------------------------------
+from app.core.settings_reader import normalize_device_settings as _norm_dev
+
+
+def test_discipline_device_clock_defaults_on():
+    assert _norm_dev({})["ultra_discipline_device_clock"] is True
+    # Admin can still disable it per-device from the backend.
+    assert _norm_dev({"ultraDisciplineDeviceClock": False})["ultra_discipline_device_clock"] is False
+    assert _norm_dev({"ultraDisciplineDeviceClock": True})["ultra_discipline_device_clock"] is True
+
+
+def _clock_worker(flag: bool, drift_threshold: int = 10):
+    settings = _make_settings()
+    settings["ultra_discipline_device_clock"] = flag
+    settings["ultra_device_clock_max_drift_sec"] = drift_threshold
+    worker = _make_worker(settings=settings)
+    # Mimic the real __init__ seed so the first check always runs.
+    worker._last_clock_check_mono = float("-inf")
+    return worker
+
+
+def test_discipline_corrects_when_skew_exceeds_threshold():
+    worker = _clock_worker(flag=True)
+    mock_sdk = MagicMock()
+    mock_sdk.get_device_time.return_value = time.time() - 74.0  # 74s behind PC
+    mock_sdk.set_device_time.return_value = True
+    worker._sdk = mock_sdk
+
+    worker._maybe_discipline_device_clock()
+
+    mock_sdk.get_device_time.assert_called_once()
+    mock_sdk.set_device_time.assert_called_once()
+    set_arg = mock_sdk.set_device_time.call_args[0][0]
+    assert abs(set_arg - time.time()) < 5.0            # corrected toward PC now
+    assert worker._device_pc_skew_sec == 0.0
+
+
+def test_discipline_warns_only_when_flag_off():
+    worker = _clock_worker(flag=False)
+    mock_sdk = MagicMock()
+    mock_sdk.get_device_time.return_value = time.time() - 74.0
+    worker._sdk = mock_sdk
+
+    worker._maybe_discipline_device_clock()
+
+    mock_sdk.get_device_time.assert_called_once()      # still reads/logs the skew
+    mock_sdk.set_device_time.assert_not_called()       # but does NOT push a correction
+
+
+def test_discipline_noop_within_threshold():
+    worker = _clock_worker(flag=True)
+    mock_sdk = MagicMock()
+    mock_sdk.get_device_time.return_value = time.time() - 2.0  # within 10s
+    worker._sdk = mock_sdk
+
+    worker._maybe_discipline_device_clock()
+    mock_sdk.set_device_time.assert_not_called()
+
+
+def test_discipline_throttled_when_recently_checked():
+    worker = _clock_worker(flag=True)
+    worker._last_clock_check_mono = time.monotonic()   # just checked
+    mock_sdk = MagicMock()
+    worker._sdk = mock_sdk
+
+    worker._maybe_discipline_device_clock()
+    mock_sdk.get_device_time.assert_not_called()       # no SDK round-trip while throttled
+
+
+def test_discipline_first_call_runs_despite_small_monotonic():
+    # Regression for the 0.0-seed bug: on a fresh boot time.monotonic() can be
+    # < 3600, which with a 0.0 seed would throttle away the startup correction.
+    # The -inf seed (real __init__) guarantees the first check runs.
+    worker = _clock_worker(flag=True)
+    assert worker._last_clock_check_mono == float("-inf")
+    mock_sdk = MagicMock()
+    mock_sdk.get_device_time.return_value = time.time() - 50.0
+    mock_sdk.set_device_time.return_value = True
+    worker._sdk = mock_sdk
+
+    worker._maybe_discipline_device_clock()
+    mock_sdk.get_device_time.assert_called_once()      # ran, not throttled
+
+
+# ---------------------------------------------------------------------------
+# Precomputed TOTP index wiring (O(1) QR verify). The index itself is proven
+# equivalent to the loop in test_totp_index.py; these cover the worker plumbing.
+# ---------------------------------------------------------------------------
+_TEST_SECRET_HEX = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+
+
+def _index_cred(cred_id=7, account_id=8, am=55):
+    return {
+        "id": cred_id, "accountId": account_id, "enabled": True,
+        "secretHex": _TEST_SECRET_HEX, "grantedActiveMembershipIds": [am],
+    }
+
+
+def test_maybe_rebuild_totp_index_builds_and_tags_generation():
+    import time as _t
+    from app.core import access_verification as av
+    settings = _make_settings(totp_digits=7)
+    settings["ultra_totp_index_enabled"] = True
+    worker = _make_worker(settings=settings)
+    worker._cached_state = ([_index_cred()], {55: {"fullName": "X", "activeMembershipId": 55}}, {})
+    worker._cached_state_gen = 123
+    _ue._set_shared_totp_index(None, -1)
+
+    worker._maybe_rebuild_totp_index()
+
+    struct, gen = _ue._get_shared_totp_index()
+    assert isinstance(struct, dict) and gen == 123
+    period, drift, digits, prefix = av._totp_params(settings)
+    ctr = av._totp_counter(int(_t.time()), period)
+    code = av._totp_hotp(av._totp_hex_to_bytes(_TEST_SECRET_HEX), ctr, digits)
+    assert code in struct["index"]
+
+
+def test_totp_index_disabled_setting_skips_build():
+    settings = _make_settings()
+    settings["ultra_totp_index_enabled"] = False
+    worker = _make_worker(settings=settings)
+    worker._cached_state = ([_index_cred()], {}, {})
+    worker._cached_state_gen = 5
+    _ue._set_shared_totp_index(None, -1)
+
+    worker._maybe_rebuild_totp_index()
+    struct, _ = _ue._get_shared_totp_index()
+    assert struct is None  # disabled -> never built
+
+
+def test_totp_index_fresh_is_not_rebuilt():
+    settings = _make_settings()
+    worker = _make_worker(settings=settings)
+    worker._cached_state = ([_index_cred()], {}, {})
+    worker._cached_state_gen = 5
+    _ue._set_shared_totp_index(None, -1)
+
+    worker._maybe_rebuild_totp_index()
+    s1, _ = _ue._get_shared_totp_index()
+    worker._maybe_rebuild_totp_index()
+    s2, _ = _ue._get_shared_totp_index()
+    assert s1 is s2  # still covers the window/gen -> short-circuits, same object
+
+
+def test_totp_index_rebuilds_on_generation_change():
+    settings = _make_settings()
+    worker = _make_worker(settings=settings)
+    worker._cached_state = ([_index_cred()], {}, {})
+    worker._cached_state_gen = 5
+    _ue._set_shared_totp_index(None, -1)
+    worker._maybe_rebuild_totp_index()
+    s1, g1 = _ue._get_shared_totp_index()
+    assert g1 == 5
+
+    # Creds changed -> generation moves -> index must rebuild and re-tag.
+    worker._cached_state_gen = 6
+    worker._maybe_rebuild_totp_index()
+    s2, g2 = _ue._get_shared_totp_index()
+    assert g2 == 6 and s2 is not s1

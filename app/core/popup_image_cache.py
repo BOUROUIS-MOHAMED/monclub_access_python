@@ -60,6 +60,72 @@ _pool: Optional[ThreadPoolExecutor] = None
 _inflight_lock = threading.Lock()
 _inflight: Set[str] = set()
 
+# Negative cache for failed fetches. Without this a permanently-broken image URL
+# (e.g. a backend row whose Cloudinary asset 404s) is NEVER written to disk, so
+# prefetch()'s os.path.isfile() skip-guard never trips and the SAME doomed URL is
+# re-fetched every 5-min prefetch cycle on BOTH workers, AND every popup serve
+# miss pays a fresh 200-850ms doomed round-trip before falling back. We remember
+# failures with a TTL: a hard 404/410 is broken for a long time; a transient
+# (timeout / 5xx / connection error) gets only a short backoff so flaky 4G still
+# recovers quickly.
+_neg_lock = threading.Lock()
+_neg_cache: dict[str, float] = {}  # normalized_url -> monotonic expiry
+_NEG_TTL_HARD_SEC = 6 * 3600.0     # 404 / 410 — almost certainly a broken asset
+_NEG_TTL_TRANSIENT_SEC = 120.0     # timeout / 5xx / conn error — retry soon
+_NEG_MAX_ENTRIES = 4000
+
+
+def _neg_mark(url: str, hard: bool) -> None:
+    """Record a failed fetch so it is skipped until the TTL elapses."""
+    if not url:
+        return
+    ttl = _NEG_TTL_HARD_SEC if hard else _NEG_TTL_TRANSIENT_SEC
+    now = time.monotonic()
+    with _neg_lock:
+        _neg_cache[url] = now + ttl
+        # Bound growth: when oversized, drop everything already expired.
+        if len(_neg_cache) > _NEG_MAX_ENTRIES:
+            for k in [k for k, exp in _neg_cache.items() if exp <= now]:
+                _neg_cache.pop(k, None)
+
+
+def _neg_clear(url: str) -> None:
+    """Forget a prior failure (call on a later success)."""
+    if not url:
+        return
+    with _neg_lock:
+        _neg_cache.pop(url, None)
+
+
+def is_known_bad(url: str) -> bool:
+    """True if ``url`` recently failed and its negative-cache TTL has not elapsed.
+
+    ``url`` must already be normalized (the value :func:`normalize_url` returns).
+    Callers use this to skip a doomed network fetch and fall back to the popup
+    placeholder instantly instead of waiting on it.
+    """
+    if not url:
+        return False
+    now = time.monotonic()
+    with _neg_lock:
+        exp = _neg_cache.get(url)
+        if exp is None:
+            return False
+        if exp <= now:
+            _neg_cache.pop(url, None)
+            return False
+        return True
+
+
+# Memoized cache directory. cache_dir() used to run get_desktop_path_layout()
+# AND os.makedirs(exist_ok=True) on EVERY call — and the serve path calls it
+# twice per request (via cache_path() in _image_cache_path and again inside
+# read_cached). Those pure-Python + syscall costs are negligible idle but become
+# real on the hot serve path when the process is GIL/scheduler-contended during
+# an entry burst. Resolve + create once, then reuse the string.
+_cache_dir_lock = threading.Lock()
+_cache_dir_cached: Optional[str] = None
+
 
 def _get_pool() -> ThreadPoolExecutor:
     global _pool
@@ -72,19 +138,33 @@ def _get_pool() -> ThreadPoolExecutor:
 
 
 def cache_dir() -> str:
-    """Resolve the on-disk cache directory under the Access data dir."""
-    try:
-        from access.storage import current_access_runtime_db_path
-        db_path = str(current_access_runtime_db_path())
-        base_dir = os.path.dirname(db_path) if db_path else os.getcwd()
-    except Exception:
-        base_dir = os.getcwd()
-    path = os.path.join(base_dir, "cache", "images")
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError:
-        pass
-    return path
+    """Resolve (and memoize) the on-disk cache directory under the Access data dir.
+
+    Resolved + created ONCE; later calls return the cached string without the
+    get_desktop_path_layout() walk or an os.makedirs syscall, keeping the hot
+    serve path (which calls this twice per request) cheap under GIL/scheduler
+    contention. Writes still go through _atomic_write which re-ensures the dir.
+    """
+    global _cache_dir_cached
+    cached = _cache_dir_cached
+    if cached is not None:
+        return cached
+    with _cache_dir_lock:
+        if _cache_dir_cached is not None:
+            return _cache_dir_cached
+        try:
+            from access.storage import current_access_runtime_db_path
+            db_path = str(current_access_runtime_db_path())
+            base_dir = os.path.dirname(db_path) if db_path else os.getcwd()
+        except Exception:
+            base_dir = os.getcwd()
+        path = os.path.join(base_dir, "cache", "images")
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            pass
+        _cache_dir_cached = path
+        return path
 
 
 def normalize_url(raw: str) -> str:
@@ -188,16 +268,22 @@ def fetch_and_cache(
                 "[popup-image] fetch failed url=%s status=%s", url, r.status_code
             )
             _tel.warn("IMG_FETCH_HTTP", status=r.status_code, dur_ms=_dur)
+            # 404/410 = broken asset (long TTL); other non-2xx (e.g. 5xx, 429)
+            # is likely transient (short backoff so a recovered backend retries).
+            _neg_mark(url, hard=r.status_code in (404, 410))
             return None
         data = r.content or b""
         if not data:
             _tel.warn("IMG_FETCH_EMPTY", dur_ms=_dur)
+            _neg_mark(url, hard=False)
             return None
         if len(data) > _MAX_IMAGE_BYTES:
             _logger.warning(
                 "[popup-image] image too large url=%s bytes=%d", url, len(data)
             )
             _tel.warn("IMG_FETCH_TOO_LARGE", bytes=len(data), dur_ms=_dur)
+            # Oversized won't shrink on retry — treat as broken (long TTL).
+            _neg_mark(url, hard=True)
             return None
         try:
             _atomic_write(target, data)
@@ -205,6 +291,7 @@ def fetch_and_cache(
             _logger.warning("[popup-image] write failed target=%s: %s", target, exc)
             _tel.warn("IMG_FETCH_WRITE_FAIL", bytes=len(data), dur_ms=_dur)
             return data, target
+        _neg_clear(url)  # recovered — forget any prior failure
         _tel.event("IMG_FETCH_OK", bytes=len(data), dur_ms=_dur)
         return data, target
     except Exception as exc:
@@ -214,6 +301,7 @@ def fetch_and_cache(
             "IMG_FETCH_ERROR", err=type(exc).__name__,
             dur_ms=round((time.monotonic() - _t0) * 1000),
         )
+        _neg_mark(url, hard=False)
         return None
 
 
@@ -235,6 +323,11 @@ def prefetch(raw_url: str) -> None:
         if os.path.isfile(target):
             return
     except OSError:
+        return
+
+    # Skip URLs that recently failed — without this the ~8 permanently-broken
+    # (404) roster images are re-fetched every prefetch cycle on every worker.
+    if is_known_bad(url):
         return
 
     with _inflight_lock:
@@ -338,6 +431,7 @@ __all__ = [
     "etag_for",
     "fetch_and_cache",
     "guess_mime",
+    "is_known_bad",
     "maybe_prune",
     "normalize_url",
     "prefetch",

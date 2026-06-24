@@ -523,10 +523,30 @@ def _handle_image_cache(ctx: _Ctx) -> None:
         return
 
     target = _image_cache_path(url)
+    _read_t0 = time.monotonic()
     cached = _popup_image_cache.read_cached(url)
+    _read_ms = (time.monotonic() - _read_t0) * 1000.0
     if cached is not None:
         data, _ = cached
+        _send_t0 = time.monotonic()
         ctx.send_bytes(200, data, _guess_image_mime(target), cache_headers)
+        _send_ms = (time.monotonic() - _send_t0) * 1000.0
+        # Split telemetry: on a slow cache HIT, attribute the cost to the file
+        # read (read_ms — large => GIL/scheduler/disk contention, since the cache
+        # dir is AV-excluded) vs the socket write (send_ms). thr exposes the
+        # concurrent thread count so a serve slowdown can be tied to entry bursts.
+        if (_read_ms + _send_ms) >= 150.0:
+            _tel.warn(
+                "IMG_SERVE_SLOW", read_ms=round(_read_ms), send_ms=round(_send_ms),
+                kb=round(len(data) / 1024), thr=threading.active_count(),
+            )
+        return
+
+    # Known-broken URL (recent 404/410): skip the doomed 200-850ms Cloudinary
+    # round-trip on the popup serve thread and let the popup fall back to its
+    # placeholder immediately instead of staying black for the fetch's duration.
+    if _popup_image_cache.is_known_bad(url):
+        ctx.send_json(404, {"ok": False, "error": "image unavailable (known bad)"})
         return
 
     fetched = _popup_image_cache.fetch_and_cache(url)
@@ -5720,6 +5740,15 @@ class LocalApiServerV2:
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            # Send the (header-segment, body-segment) response pair immediately
+            # instead of letting Nagle hold the body waiting for the header ACK
+            # while the WebView delays its ACK (~200ms on Windows loopback).
+            # StreamRequestHandler.setup() turns this into setsockopt(TCP_NODELAY).
+            # Low-risk hygiene: trims the small body-write tail. NOTE: the dominant
+            # serve cost is the pre-send read phase under GIL/scheduler contention,
+            # not the socket — see IMG_SERVE_SLOW telemetry; this is not that fix.
+            disable_nagle_algorithm = True
+
             def _dispatch(self, method: str) -> None:
                 import time as _dispatch_time
                 _t0 = _dispatch_time.monotonic()
