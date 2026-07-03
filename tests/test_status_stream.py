@@ -271,6 +271,12 @@ class _FakePopupStreamCtx:
     def q_int(self, *names: str, default: int = 0) -> int:
         return self._replay_last
 
+    def q(self, *names: str, default: str = "") -> str:
+        # Query-param reader used by the SSE handler for the popup-vs-dashboard
+        # client tag (?client=popup). The tag is telemetry-only, so the default
+        # is fine for these tests.
+        return default
+
     def send_sse_start(self) -> None:
         return None
 

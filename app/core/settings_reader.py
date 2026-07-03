@@ -207,13 +207,16 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         # 8s default — slow Tunisian links routinely exceeded the old 2s and
         # turned popup avatars into blanks. Clamp top stays generous.
         "image_cache_timeout_sec": _clamp_int(raw.get("imageCacheTimeoutSec"), 8, 1, 60),
-        # 50MB default keeps a full season roster of avatars warm. Cap raised
-        # so a backend override can grow further if the gym wants it.
         # Sized to hold ALL members' avatars + face captures (≈1800 members × 2
         # images) so a once-seen image is never evicted (was 50MB → the cache
         # filled in 1-2h and members went black again on their next scan).
-        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 256 * 1024 * 1024, 1024, 1024 * 1024 * 1024),
-        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 8000, 1, 50000),
+        # FLOOR raised to the default (256MB / 8000): a too-small backend value
+        # (prod gym 58 had 5MB / 1000 for ~1800 members) makes the LRU evict
+        # constantly → popup images go black / re-fetch every scan. The cache only
+        # grows to actual usage, so a high floor is harmless for small gyms; the
+        # backend can still RAISE it above the floor (up to 1GB / 50000).
+        "image_cache_max_bytes": _clamp_int(raw.get("imageCacheMaxBytes"), 256 * 1024 * 1024, 256 * 1024 * 1024, 1024 * 1024 * 1024),
+        "image_cache_max_files": _clamp_int(raw.get("imageCacheMaxFiles"), 8000, 8000, 50000),
 
         "event_queue_max": _clamp_int(raw.get("eventQueueMax"), 5000, 100, 200000),
         "notification_queue_max": _clamp_int(raw.get("notificationQueueMax"), 5000, 100, 200000),
@@ -236,6 +239,14 @@ def normalize_global_settings(raw: Dict[str, Any]) -> Dict[str, Any]:
         # (timer / change-detector) still pull+cache but skip the device push; only an explicit
         # push — the "Sync data" button ({"reason":"user-sync"}) or a HARD_RESET — reconciles.
         "manual_sync_mode": _boolish(raw.get("manualSyncMode", raw.get("manual_sync_mode")), False),
+
+        # When True, a full/member device sync interleaves RTLog polling + scan
+        # processing between push chunks (see UltraDeviceWorker._sync_yield_to_rtlog)
+        # so a long inline sync doesn't freeze the popup or block PC-verified
+        # QR/TOTP entries. DEFAULT OFF — enabled per-gym from the dashboard once
+        # validated on real hardware (interleaved reads on the single SDK
+        # connection are cooperative, not parallel).
+        "ultra_sync_yield_to_rtlog": _boolish(raw.get("ultraSyncYieldToRtlog", raw.get("ultra_sync_yield_to_rtlog")), False),
 
         "optional_data_sync_delay_minutes": _clamp_int(raw.get("optionalDataSyncDelayMinutes"), 60, 60, 1440),
 
@@ -444,6 +455,14 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         # falls back to the full verify loop, so the decision is unchanged. ON by
         # default; backend can disable per-device with ultraTotpIndexEnabled=false.
         "ultra_totp_index_enabled": _boolish(dev.get("ultraTotpIndexEnabled"), True),
+        # PC-side staff rescue for denied RFID cards: when the device denies a
+        # card (e.g. its punch-interval re-entry block fires), if the card is a
+        # VALID member whose plan is STAFF the PC re-opens the door so staff skip
+        # the re-entry delay. Non-staff denied cards always stay denied. Safe to
+        # leave ON: with no STAFF plans the staff set is empty and nothing is ever
+        # rescued (no behaviour change). Backend can disable with
+        # ultraRfidStaffRescueEnabled=false.
+        "ultra_rfid_staff_rescue_enabled": _boolish(dev.get("ultraRfidStaffRescueEnabled"), True),
         # Device RTC discipline (fix #2b). When enabled, the ULTRA worker nudges
         # the turnstile clock toward the PC clock when they drift apart by more
         # than ultra_device_clock_max_drift_sec. Default ON: prod evidence showed

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MÉRIDIEN — Preview (Claude Design)</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #070809; overflow: hidden; }
+    #frame { position: fixed; inset: 0; width: 100vw; height: 100vh; border: 0; display: block; }
+
+    .cp {
+      position: fixed; top: 12px; right: 12px; z-index: 100000; width: 250px;
+      background: rgba(10,10,12,0.92); backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
+      color: #e5e7eb; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    }
+    .cp-head { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid rgba(255,255,255,0.08); }
+    .cp-title { font-weight:700; }
+    .cp-sub { font-size:11px; color:#71717a; margin-top:2px; }
+    .cp-body { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+    .cp-label { font-size:11px; text-transform:uppercase; letter-spacing:0.12em; color:#8b8b94; }
+    .cp-row { display:flex; gap:6px; }
+    .cp-btn { flex:1 1 auto; padding:9px 10px; border-radius:9px; border:1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.05); color:#e4e4e7; cursor:pointer; font-size:13px; font-weight:600; transition:all .12s; }
+    .cp-btn:hover { background: rgba(255,255,255,0.12); }
+    .cp-btn:active { transform: translateY(1px); }
+    .cp-btn.accent { background:#10b981; border-color:#10b981; color:#042c22; }
+    .cp-hint { font-size:10.5px; color:#6b6b73; line-height:1.5; }
+    .cp-min { position: fixed; top:12px; right:12px; z-index:100000; padding:8px 12px; border-radius:10px; cursor:pointer;
+      background: rgba(10,10,12,0.92); border:1px solid rgba(255,255,255,0.12); color:#e5e7eb; font:600 13px system-ui; backdrop-filter: blur(10px); }
+  </style>
+</head>
+<body>
+  <iframe id="frame" src="meridien-original.html" tabindex="0"></iframe>
+
+  <button id="reopen" class="cp-min" style="display:none">☰ Contrôles</button>
+  <div class="cp" id="panel">
+    <div class="cp-head">
+      <div>
+        <div class="cp-title">MÉRIDIEN</div>
+        <div class="cp-sub">Aperçu · Claude Design</div>
+      </div>
+      <button class="cp-btn" style="flex:0 0 auto" id="hide">✕</button>
+    </div>
+    <div class="cp-body">
+      <div class="cp-label">Naviguer les états</div>
+      <div class="cp-row">
+        <button class="cp-btn" id="prev">◀ Précédent</button>
+        <button class="cp-btn" id="next">Suivant ▶</button>
+      </div>
+      <button class="cp-btn" id="veille">🌙 Veille (espace)</button>
+      <div class="cp-hint">
+        Ces boutons pilotent la démo intégrée du design (mêmes touches ← → et Espace).
+        Vous pouvez aussi cliquer dans l'aperçu et utiliser le clavier directement.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    var frame = document.getElementById('frame');
+
+    // Dispatch a key into the iframe's own document/window (same-origin), using
+    // the iframe realm's KeyboardEvent so the design's handlers see a native event.
+    function sendKey(key, code, kc) {
+      try {
+        var w = frame.contentWindow, d = frame.contentDocument;
+        if (!w || !d) return;
+        var K = w.KeyboardEvent || window.KeyboardEvent;
+        ['keydown', 'keyup'].forEach(function (type) {
+          var ev = new K(type, { key: key, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true });
+          var target = d.activeElement || d.body || d;
+          target.dispatchEvent(ev);
+          d.dispatchEvent(ev);
+          w.dispatchEvent(ev);
+        });
+        try { w.focus(); } catch (e) {}
+      } catch (e) { console.warn('sendKey failed', e); }
+    }
+
+    document.getElementById('prev').onclick   = function () { sendKey('ArrowLeft', 'ArrowLeft', 37); };
+    document.getElementById('next').onclick   = function () { sendKey('ArrowRight', 'ArrowRight', 39); };
+    document.getElementById('veille').onclick = function () { sendKey(' ', 'Space', 32); };
+
+    // collapse / expand the panel
+    var panel = document.getElementById('panel'), reopen = document.getElementById('reopen');
+    document.getElementById('hide').onclick = function () { panel.style.display = 'none'; reopen.style.display = 'block'; };
+    reopen.onclick = function () { panel.style.display = 'block'; reopen.style.display = 'none'; };
+
+    // give the iframe focus once it has loaded so keyboard works immediately
+    frame.addEventListener('load', function () { setTimeout(function () { try { frame.contentWindow.focus(); } catch (e) {} }, 500); });
+  </script>
+</body>
+</html>

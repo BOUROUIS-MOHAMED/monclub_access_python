@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MonClub Access — Popup Preview (PopupWindow.tsx)</title>
+
+  <!--
+    ──────────────────────────────────────────────────────────────────────────
+    STANDALONE DESIGN PREVIEW of tauri-ui/src/pages/PopupWindow.tsx
+    ──────────────────────────────────────────────────────────────────────────
+    This is a self-contained mirror of the production entry-display popup.
+    Open it directly in any browser (double-click) — no build step, no backend,
+    no Tauri. It strips out the live plumbing (SSE / Tauri IPC / localStorage /
+    /status fetch / image-cache token) and feeds the *exact same* visual
+    components (LaneCard + IdleScreen) mock data, with a control panel to flip
+    through every state.
+
+    HOW TO ROUND-TRIP A DESIGN CHANGE BACK INTO THE APP
+    ---------------------------------------------------
+    The two functions marked  // ▼▼▼ SOURCE-MIRROR ... ▼▼▼  below
+    (paletteFor, isTodayBirthday, IdleScreen, LaneCard, globalKeyframes) are
+    copied verbatim from PopupWindow.tsx, minus TypeScript type annotations.
+    Tweak them here, preview live, then copy the changed parts back into
+    tauri-ui/src/pages/PopupWindow.tsx. The JSX/markup is identical, so it is a
+    near copy-paste — only re-add the TS types (e.g. layout: "hero"|"split2"|...).
+
+    Everything below the "PREVIEW HARNESS" banner is preview-only scaffolding
+    (mock data + controls) and must NOT be ported back.
+    ──────────────────────────────────────────────────────────────────────────
+  -->
+
+  <!-- React 18 (UMD) + Babel for in-browser JSX. The markup is identical under
+       React 18/19 for this purely-visual component, so 18 is used for a no-build
+       standalone file. -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Tailwind Play CDN — provides the same utility classes the app uses (h-screen,
+       flex, rounded-full, tracking-[0.2em], …). The "production" console warning
+       it prints is expected and harmless for a preview tool. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+    #root { height: 100vh; width: 100vw; }
+
+    /* ── Control panel chrome (preview-only) ─────────────────────────────── */
+    .cp {
+      position: fixed; top: 12px; right: 12px; z-index: 100000;
+      width: 320px; max-height: calc(100vh - 24px); overflow-y: auto;
+      background: rgba(10,10,12,0.92); backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.10); border-radius: 14px;
+      color: #e5e7eb; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    }
+    .cp-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.08);
+      position: sticky; top: 0; background: rgba(10,10,12,0.96);
+    }
+    .cp-title { font-weight: 700; letter-spacing: 0.02em; }
+    .cp-sub { font-size: 11px; color: #71717a; margin-top: 2px; }
+    .cp-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 14px; }
+    .cp-group { display: flex; flex-direction: column; gap: 7px; }
+    .cp-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: #8b8b94; }
+    .cp-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .cp-btn {
+      flex: 1 1 auto; min-width: 0; padding: 7px 9px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04);
+      color: #d4d4d8; cursor: pointer; font-size: 12px; font-weight: 600;
+      white-space: nowrap; transition: all .12s ease;
+    }
+    .cp-btn:hover { background: rgba(255,255,255,0.10); }
+    .cp-btn.active { background: #10b981; border-color: #10b981; color: #042c22; }
+    .cp-btn.wide { flex-basis: 100%; }
+    .cp-field { display: flex; flex-direction: column; gap: 4px; }
+    .cp-field > span { font-size: 11px; color: #a1a1aa; }
+    .cp-input {
+      width: 100%; box-sizing: border-box; padding: 6px 8px; border-radius: 7px;
+      border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.4);
+      color: #f4f4f5; font-size: 12px;
+    }
+    .cp-toggle {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 7px 9px; border-radius: 8px; background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.10);
+    }
+    .cp-min {
+      position: fixed; top: 12px; right: 12px; z-index: 100000;
+      padding: 8px 12px; border-radius: 10px; cursor: pointer;
+      background: rgba(10,10,12,0.92); border: 1px solid rgba(255,255,255,0.12);
+      color: #e5e7eb; font: 600 13px system-ui; backdrop-filter: blur(10px);
+    }
+    .cp-hint { font-size: 10.5px; color: #6b6b73; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- JSX source. Kept as text/plain so Babel's auto-transform skips it; the
+       bootstrap at the bottom compiles it with the CLASSIC React runtime
+       (React.createElement) — the automatic runtime emits bare `import`
+       statements that can't run in a non-module <script>. -->
+  <script type="text/plain" id="app-src">
+  const { useState, useEffect, useRef, useMemo } = React;
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     ▼▼▼ SOURCE-MIRROR — copied verbatim from PopupWindow.tsx (TS types removed).
+     Edit these to change the design, then port back to the .tsx file. ▼▼▼
+     ════════════════════════════════════════════════════════════════════════ */
+
+  const MIN_DURATION_MS = 2500;
+  const FADE_OUT_MS = 350;
+  const CONFETTI_COLORS = ["#facc15", "#f472b6", "#a78bfa", "#34d399", "#fb923c", "#60a5fa"];
+
+  function isTodayBirthday(birthday) {
+    if (!birthday) return false;
+    try {
+      const t = new Date();
+      const mm = String(t.getMonth() + 1).padStart(2, "0");
+      const dd = String(t.getDate()).padStart(2, "0");
+      const parts = birthday.slice(0, 10).split("-");
+      if (parts.length < 3) return false;
+      return `${parts[1]}-${parts[2]}` === `${mm}-${dd}`;
+    } catch {
+      return false;
+    }
+  }
+
+  function paletteFor(allowed, birthday) {
+    if (birthday) {
+      return {
+        accent: "#f59e0b",
+        glow: "250,159,21",
+        status: "Joyeux Anniversaire !",
+        icon: "🎂",
+        bgFrom: "#451a03",
+      };
+    }
+    if (allowed) {
+      return {
+        accent: "#10b981",
+        glow: "16,185,129",
+        status: "Accès Autorisé",
+        icon: "✓",
+        bgFrom: "#022c22",
+      };
+    }
+    return {
+      accent: "#ef4444",
+      glow: "239,68,68",
+      status: "Accès Refusé",
+      icon: "✕",
+      bgFrom: "#450a0a",
+    };
+  }
+
+  // ── Idle screen ───────────────────────────────────────────────────────────
+  function IdleScreen({ gymName }) {
+    const name = gymName || "MonClub Access";
+    return (
+      <div
+        className="h-screen w-screen flex flex-col items-center justify-center select-none relative overflow-hidden"
+        style={{ background: "#080808" }}
+      >
+        <div
+          className="absolute pointer-events-none"
+          style={{
+            width: "70vw",
+            height: "70vw",
+            borderRadius: "50%",
+            background: "radial-gradient(circle, rgba(16,185,129,0.07) 0%, transparent 70%)",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+          }}
+        />
+        <div
+          style={{
+            width: "clamp(3rem, 8vw, 6rem)",
+            height: 2,
+            background: "linear-gradient(90deg, transparent, #10b981, transparent)",
+            marginBottom: "clamp(1.5rem, 4vh, 3rem)",
+          }}
+        />
+        <h1
+          className="font-black uppercase text-center"
+          style={{
+            margin: 0,
+            letterSpacing: "0.18em",
+            lineHeight: 1.1,
+            fontSize: "clamp(3rem, 7vw, 6.5rem)",
+            background: "linear-gradient(160deg, #ffffff 40%, #a1a1aa 100%)",
+            WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+          }}
+        >
+          {name}
+        </h1>
+        <div
+          style={{
+            width: "clamp(3rem, 8vw, 6rem)",
+            height: 2,
+            background: "linear-gradient(90deg, transparent, #10b981, transparent)",
+            marginTop: "clamp(1.5rem, 4vh, 3rem)",
+            marginBottom: "clamp(1rem, 3vh, 2rem)",
+          }}
+        />
+        <p
+          className="font-medium uppercase text-center"
+          style={{
+            margin: 0,
+            letterSpacing: "0.45em",
+            fontSize: "clamp(0.7rem, 1.2vw, 0.95rem)",
+            color: "#52525b",
+          }}
+        >
+          powered by&nbsp;
+          <span style={{ color: "#10b981", fontWeight: 700 }}>monclub</span>
+        </p>
+      </div>
+    );
+  }
+
+  // ── Single card (hero or split) ───────────────────────────────────────────
+  function LaneCard({ lane, layout, onImageError }) {
+    const n = lane.event;
+    const birthday = n.allowed && isTodayBirthday(n.userBirthday);
+    const p = paletteFor(n.allowed, birthday);
+    const initial = (n.userFullName || "?")[0].toUpperCase();
+    const durationMs = Math.max(MIN_DURATION_MS, n.popupDurationSec * 1000);
+    const remainingRatio = Math.max(0, Math.min(1, (lane.expiresAt - Date.now()) / durationMs));
+    const sizing = layout === "hero" ? "hero" : layout === "split2" ? "split2" : "split3";
+
+    // Font scaling per layout — the TV is far away, so we keep names huge in
+    // hero and just barely shrink in 3-up to keep them readable.
+    const nameFontSize =
+      sizing === "hero"
+        ? "clamp(2.8rem, 5.5vw, 5rem)"
+        : sizing === "split2"
+        ? "clamp(2.2rem, 3.6vw, 3.6rem)"
+        : "clamp(1.6rem, 2.4vw, 2.6rem)";
+
+    const statusFontSize =
+      sizing === "hero"
+        ? "1.25rem"
+        : sizing === "split2"
+        ? "1rem"
+        : "0.85rem";
+
+    const heroLayout = sizing === "hero";
+
+    return (
+      <div
+        className="relative h-full w-full overflow-hidden"
+        style={{
+          background: "#050505",
+          opacity: lane.fadingOut ? 0 : 1,
+          transition: `opacity ${FADE_OUT_MS}ms ease`,
+          animation: lane.fadingOut ? undefined : "laneEnter 320ms cubic-bezier(0.16,1,0.3,1) both",
+        }}
+      >
+        {/* Birthday confetti */}
+        {birthday && (
+          <div className="absolute inset-0 pointer-events-none overflow-hidden z-30">
+            {[...Array(18)].map((_, i) => (
+              <div
+                key={i}
+                style={{
+                  position: "absolute",
+                  width: i % 3 === 0 ? 12 : 8,
+                  height: i % 3 === 0 ? 20 : 8,
+                  borderRadius: i % 2 === 0 ? "50%" : 3,
+                  background: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+                  left: `${(i * 5.4) % 100}%`,
+                  top: -24,
+                  animation: `confettiFall ${1.6 + (i % 5) * 0.28}s ease-in ${i * 0.07}s forwards`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+
+        <div
+          className={heroLayout ? "flex h-full" : "flex flex-col h-full"}
+          style={{ overflow: "hidden" }}
+        >
+          {/* Photo block */}
+          <div
+            className="relative flex-shrink-0"
+            style={
+              heroLayout
+                ? { width: "44%", height: "100%" }
+                : { width: "100%", height: "52%" }
+            }
+          >
+            {lane.imgUrl ? (
+              <img
+                key={lane.imgUrl}
+                src={lane.imgUrl}
+                alt=""
+                className="absolute inset-0 w-full h-full object-cover object-top"
+                onError={() => onImageError(lane.laneId)}
+              />
+            ) : (
+              <div
+                className="absolute inset-0 flex items-center justify-center"
+                style={{
+                  background: `linear-gradient(160deg, ${p.bgFrom}, #050505)`,
+                }}
+              >
+                <span
+                  className="font-black leading-none select-none"
+                  style={{
+                    fontSize: heroLayout ? "38vw" : "22vw",
+                    color: p.accent,
+                    opacity: 0.12,
+                  }}
+                >
+                  {initial}
+                </span>
+              </div>
+            )}
+            {/* fade-to-info gradient */}
+            <div
+              className="absolute inset-0"
+              style={{
+                background: heroLayout
+                  ? "linear-gradient(to right, transparent 55%, #050505 100%)"
+                  : "linear-gradient(to bottom, transparent 60%, #050505 100%)",
+              }}
+            />
+            {/* accent edge */}
+            <div
+              className="absolute"
+              style={
+                heroLayout
+                  ? { top: 0, bottom: 0, right: 0, width: 4, background: p.accent, opacity: 0.6 }
+                  : { left: 0, right: 0, bottom: 0, height: 4, background: p.accent, opacity: 0.6 }
+              }
+            />
+          </div>
+
+          {/* Info block */}
+          <div
+            className="flex-1 flex flex-col relative overflow-hidden"
+            style={{
+              background: "#050505",
+              padding: heroLayout ? "5vh 4vw" : "1.5vh 1.5vw",
+              justifyContent: heroLayout ? "center" : "flex-start",
+            }}
+          >
+            {/* glow */}
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                right: "-10vw",
+                top: "50%",
+                transform: "translateY(-50%)",
+                width: "60vw",
+                height: "60vw",
+                borderRadius: "50%",
+                background: `radial-gradient(circle, rgba(${p.glow},0.18) 0%, transparent 70%)`,
+              }}
+            />
+
+            {/* status badge */}
+            <div className="flex items-center gap-3 relative" style={{ marginBottom: heroLayout ? "1.5rem" : "0.5rem" }}>
+              <span style={{ color: p.accent, fontWeight: 900, fontSize: statusFontSize }}>
+                {p.icon}
+              </span>
+              <span
+                className="font-black uppercase"
+                style={{
+                  color: p.accent,
+                  letterSpacing: "0.22em",
+                  fontSize: statusFontSize,
+                }}
+              >
+                {p.status}
+              </span>
+              {n.scanMode && !birthday && (
+                <span className="text-zinc-600 font-normal lowercase" style={{ fontSize: "0.7em" }}>
+                  · {n.scanMode}
+                </span>
+              )}
+            </div>
+
+            {/* name */}
+            <h1
+              className="font-black text-white relative z-10 leading-none"
+              style={{
+                fontSize: nameFontSize,
+                letterSpacing: "-0.02em",
+                wordBreak: "break-word",
+                marginBottom: heroLayout ? "1rem" : "0.4rem",
+                maxHeight: heroLayout ? undefined : "26%",
+                overflow: "hidden",
+              }}
+            >
+              {n.userFullName || "Inconnu"}
+            </h1>
+
+            {/* membership: STAFF/KIDS type badge in front of the membership name (falls back to id) */}
+            {(n.userMembershipTitle || n.userMembershipId != null) && (
+              <div
+                className="inline-flex items-center gap-2"
+                style={{ marginBottom: heroLayout ? "2rem" : "0.5rem" }}
+              >
+                {n.userMembersType === "STAFF" && (
+                  <span
+                    className="inline-flex items-center rounded-full font-black uppercase"
+                    style={{
+                      background: "rgba(245,158,11,0.16)",
+                      border: "1px solid rgba(245,158,11,0.45)",
+                      color: "#f59e0b",
+                      padding: heroLayout ? "0.4rem 0.9rem" : "0.18rem 0.55rem",
+                      fontSize: heroLayout ? "0.95rem" : "0.72rem",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Staff
+                  </span>
+                )}
+                {n.userMembersType === "KIDS" && (
+                  <span
+                    className="inline-flex items-center rounded-full font-black uppercase"
+                    style={{
+                      background: "rgba(56,189,248,0.16)",
+                      border: "1px solid rgba(56,189,248,0.45)",
+                      color: "#38bdf8",
+                      padding: heroLayout ? "0.4rem 0.9rem" : "0.18rem 0.55rem",
+                      fontSize: heroLayout ? "0.95rem" : "0.72rem",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Kids
+                  </span>
+                )}
+                <span
+                  className="inline-flex items-center gap-2 rounded-full font-bold"
+                  style={{
+                    background: `rgba(${p.glow},0.12)`,
+                    border: `1px solid rgba(${p.glow},0.3)`,
+                    color: p.accent,
+                    padding: heroLayout ? "0.4rem 1rem" : "0.18rem 0.6rem",
+                    fontSize: heroLayout ? "1.05rem" : "0.8rem",
+                  }}
+                >
+                  {n.userMembershipTitle || `# ${n.userMembershipId}`}
+                </span>
+              </div>
+            )}
+
+            {/* image flags (only in hero — saves vertical space in splits) */}
+            {heroLayout && (n.imageSource === "PROFILE_BORROWED" || n.userImageStatus === "REQUIRED_CHANGE") && (
+              <div className="flex flex-wrap gap-2 mb-4">
+                {n.imageSource === "PROFILE_BORROWED" && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium"
+                        style={{ background: "rgba(255,255,255,0.08)", color: "#a1a1aa" }}>
+                    👤 Profile photo — no gym image set
+                  </span>
+                )}
+                {n.userImageStatus === "REQUIRED_CHANGE" && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium"
+                        style={{ background: "rgba(251,146,60,0.15)", color: "#fb923c", border: "1px solid rgba(251,146,60,0.3)" }}>
+                    ⚠ Image change required
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* validity row (hero only — too cramped in 3-up) */}
+            {heroLayout && (n.userValidFrom || n.userValidTo) && (
+              <div className="grid grid-cols-2 gap-x-10 gap-y-4 mb-6 relative z-10">
+                {n.userValidFrom && (
+                  <div>
+                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500 mb-1">Début</p>
+                    <p className="text-2xl font-bold text-zinc-100">{n.userValidFrom.slice(0, 10)}</p>
+                  </div>
+                )}
+                {n.userValidTo && (
+                  <div>
+                    <p className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500 mb-1">Fin</p>
+                    <p className="text-2xl font-bold text-zinc-100">{n.userValidTo.slice(0, 10)}</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* deny reason (replaces validity row for denied entries) */}
+            {!n.allowed && n.reason && (
+              <div style={{ marginBottom: heroLayout ? "1.5rem" : "0.3rem" }}>
+                <p className="text-xs font-bold uppercase tracking-[0.2em] text-zinc-500 mb-1">Raison</p>
+                <p
+                  className="font-bold text-zinc-100 leading-tight"
+                  style={{ fontSize: heroLayout ? "1.4rem" : "0.95rem" }}
+                >
+                  {n.reason}
+                </p>
+              </div>
+            )}
+
+            {/* birthday banner */}
+            {birthday && heroLayout && (
+              <div
+                className="rounded-2xl mb-4"
+                style={{
+                  padding: "1rem 1.5rem",
+                  background: "linear-gradient(135deg, rgba(120,53,15,0.6), rgba(88,28,135,0.6))",
+                  border: "1px solid rgba(250,204,21,0.25)",
+                }}
+              >
+                <p
+                  className="font-extrabold text-xl text-center"
+                  style={{
+                    background: "linear-gradient(90deg, #fde68a, #f9a8d4, #c4b5fd)",
+                    WebkitBackgroundClip: "text",
+                    WebkitTextFillColor: "transparent",
+                  }}
+                >
+                  🎉 Joyeux anniversaire ! 🎉
+                </p>
+              </div>
+            )}
+
+            {/* device footer */}
+            {n.deviceName && (
+              <div className="flex items-center gap-2 mt-auto">
+                <div
+                  className="rounded-full flex-shrink-0"
+                  style={{ width: 8, height: 8, background: p.accent, opacity: 0.5 }}
+                />
+                <span
+                  className="text-zinc-600 truncate"
+                  style={{ fontSize: heroLayout ? "1rem" : "0.75rem" }}
+                >
+                  {n.deviceName}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* progress bar — drains over the lane's lifetime */}
+        <div
+          className="absolute bottom-0 left-0 right-0"
+          style={{ height: 4, background: "rgba(255,255,255,0.06)" }}
+        >
+          <div
+            style={{
+              height: "100%",
+              width: `${remainingRatio * 100}%`,
+              background: p.accent,
+              opacity: 0.7,
+              transition: "width 100ms linear",
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // ── Keyframes shared across the window ────────────────────────────────────
+  const globalKeyframes = `
+    @keyframes laneEnter {
+      0%   { opacity: 0; transform: translateY(8px) scale(0.98); }
+      100% { opacity: 1; transform: translateY(0)    scale(1);    }
+    }
+    @keyframes confettiFall {
+      0%   { transform: translateY(0px)   rotate(0deg);    opacity: 0.9; }
+      100% { transform: translateY(105vh) rotate(540deg);  opacity: 0;   }
+    }
+  `;
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     ▲▲▲ END SOURCE-MIRROR. Do NOT port anything below this line. ▲▲▲
+     ──────────────────────────────────────────────────────────────────────────
+     PREVIEW HARNESS — mock data + control panel (preview-only scaffolding)
+     ════════════════════════════════════════════════════════════════════════ */
+
+  // today's mm-dd so the "birthday" scenario actually triggers isTodayBirthday()
+  const _t = new Date();
+  const TODAY_BD = `1991-${String(_t.getMonth() + 1).padStart(2, "0")}-${String(_t.getDate()).padStart(2, "0")}`;
+
+  // Realistic portrait placeholders (different faces). If offline, <img> onError
+  // falls back to the initial-letter avatar — exactly like the real popup.
+  const PHOTO = (n) => `https://i.pravatar.cc/800?img=${n}`;
+
+  // A small pool of mock members per scenario. Index 0 is overridable from the
+  // "Lane 1 fields" editor in the control panel.
+  const POOL = {
+    granted: [
+      { userFullName: "Yasmine Khelifi", photo: PHOTO(5),  userMembershipTitle: "Premium",  userMembershipId: 1042, userMembersType: "NORMAL", userValidFrom: "2026-01-12", userValidTo: "2026-12-31", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Mehdi Brahimi",   photo: PHOTO(12), userMembershipTitle: "Illimité", userMembershipId: 2231, userMembersType: "NORMAL", userValidFrom: "2026-03-01", userValidTo: "2027-02-28", deviceName: "Tourniquet Entrée", scanMode: "QR" },
+      { userFullName: "Sofia Bouazizi",  photo: PHOTO(45), userMembershipTitle: "Étudiant", userMembershipId: 3310, userMembersType: "NORMAL", userValidFrom: "2026-02-15", userValidTo: "2026-08-15", deviceName: "Tourniquet Sortie",  scanMode: "FP" },
+    ],
+    staff: [
+      { userFullName: "Karim Haddad",    photo: PHOTO(15), userMembershipTitle: "Coach",      userMembershipId: 9001, userMembersType: "STAFF", userValidFrom: "2025-09-01", userValidTo: "2027-09-01", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Nadia Trabelsi",  photo: PHOTO(32), userMembershipTitle: "Réception",  userMembershipId: 9002, userMembersType: "STAFF", userValidFrom: "2025-06-01", userValidTo: "2027-06-01", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Omar Saidi",      photo: PHOTO(51), userMembershipTitle: "Manager",    userMembershipId: 9003, userMembersType: "STAFF", userValidFrom: "2025-01-01", userValidTo: "2028-01-01", deviceName: "Tourniquet Sortie",  scanMode: "FP" },
+    ],
+    kids: [
+      { userFullName: "Lina Gharbi",     photo: PHOTO(20), userMembershipTitle: "Kids Club",  userMembershipId: 4101, userMembersType: "KIDS", userValidFrom: "2026-01-10", userValidTo: "2026-07-10", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Adam Cherif",     photo: PHOTO(13), userMembershipTitle: "Kids Club",  userMembershipId: 4102, userMembersType: "KIDS", userValidFrom: "2026-02-01", userValidTo: "2026-08-01", deviceName: "Tourniquet Entrée", scanMode: "QR" },
+      { userFullName: "Maya Jelassi",    photo: PHOTO(9),  userMembershipTitle: "Kids Club",  userMembershipId: 4103, userMembersType: "KIDS", userValidFrom: "2026-03-05", userValidTo: "2026-09-05", deviceName: "Tourniquet Sortie",  scanMode: "FP" },
+    ],
+    birthday: [
+      { userFullName: "Yasmine Khelifi", photo: PHOTO(5),  userMembershipTitle: "Premium",  userMembershipId: 1042, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2026-01-12", userValidTo: "2026-12-31", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Mehdi Brahimi",   photo: PHOTO(12), userMembershipTitle: "Illimité", userMembershipId: 2231, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2026-03-01", userValidTo: "2027-02-28", deviceName: "Tourniquet Entrée", scanMode: "QR" },
+      { userFullName: "Sofia Bouazizi",  photo: PHOTO(45), userMembershipTitle: "Étudiant", userMembershipId: 3310, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2026-02-15", userValidTo: "2026-08-15", deviceName: "Tourniquet Sortie",  scanMode: "FP" },
+    ],
+    denied: [
+      { userFullName: "Hichem Ferjani",  photo: PHOTO(60), userMembershipTitle: "Premium",  userMembershipId: 1199, userMembersType: "NORMAL", allowed: false, reason: "Abonnement expiré",     userValidFrom: "2025-01-01", userValidTo: "2025-12-31", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Rania Mansour",   photo: PHOTO(47), userMembershipTitle: "Illimité", userMembershipId: 1288, userMembersType: "NORMAL", allowed: false, reason: "Hors plage horaire",    userValidFrom: "2026-01-01", userValidTo: "2026-12-31", deviceName: "Tourniquet Entrée", scanMode: "QR" },
+      { userFullName: "Bilel Ayari",     photo: PHOTO(68), userMembershipTitle: "Étudiant", userMembershipId: 1377, userMembersType: "NORMAL", allowed: false, reason: "Carte non reconnue",    userValidFrom: "2026-01-01", userValidTo: "2026-12-31", deviceName: "Tourniquet Sortie",  scanMode: "RFID" },
+    ],
+    mixed: [
+      { userFullName: "Yasmine Khelifi", photo: PHOTO(5),  userMembershipTitle: "Premium",  userMembershipId: 1042, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2026-01-12", userValidTo: "2026-12-31", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Karim Haddad",    photo: PHOTO(15), userMembershipTitle: "Coach",    userMembershipId: 9001, userMembersType: "STAFF", userValidFrom: "2025-09-01", userValidTo: "2027-09-01", deviceName: "Tourniquet Entrée", scanMode: "RFID" },
+      { userFullName: "Lina Gharbi",     photo: PHOTO(20), userMembershipTitle: "Kids Club", userMembershipId: 4101, userMembersType: "KIDS", userValidFrom: "2026-01-10", userValidTo: "2026-07-10", deviceName: "Tourniquet Sortie", scanMode: "QR" },
+    ],
+  };
+
+  const SCENARIOS = [
+    { key: "granted",  label: "Autorisé" },
+    { key: "staff",    label: "Staff" },
+    { key: "kids",     label: "Kids" },
+    { key: "birthday", label: "Anniv. 🎂" },
+    { key: "denied",   label: "Refusé" },
+    { key: "mixed",    label: "Mixte" },
+  ];
+
+  const DEFAULT_DURATION_SEC = 5;
+
+  function buildEvent(member, { showPhotos, imageFlags }) {
+    const ev = {
+      eventId: "preview-" + (member.userMembershipId || member.userFullName),
+      title: "Acces",
+      message: "",
+      imagePath: "",
+      popupShowImage: !!showPhotos,
+      userFullName: member.userFullName || "",
+      userImage: "",
+      userValidFrom: member.userValidFrom || "",
+      userValidTo: member.userValidTo || "",
+      userMembershipId: member.userMembershipId ?? null,
+      userMembershipTitle: member.userMembershipTitle,
+      userMembersType: member.userMembersType,
+      userPhone: "",
+      deviceId: 1,
+      deviceName: member.deviceName || "",
+      allowed: member.allowed !== false,
+      reason: member.reason || "",
+      scanMode: member.scanMode || "",
+      popupDurationSec: DEFAULT_DURATION_SEC,
+      userBirthday: member.userBirthday,
+      imageSource: imageFlags === "borrowed" ? "PROFILE_BORROWED" : undefined,
+      userImageStatus: imageFlags === "change" ? "REQUIRED_CHANGE" : undefined,
+      // preview-only: resolved <img> src (real app routes through /image-cache)
+      __photo: showPhotos ? member.photo : null,
+    };
+    return ev;
+  }
+
+  function PreviewApp() {
+    const [panelOpen, setPanelOpen] = useState(true);
+    const [view, setView] = useState("popup");        // 'popup' | 'idle'
+    const [laneCount, setLaneCount] = useState(1);     // 1 | 2 | 3
+    const [scenario, setScenario] = useState("granted");
+    const [showPhotos, setShowPhotos] = useState(true);
+    const [imageFlags, setImageFlags] = useState("none"); // 'none' | 'borrowed' | 'change'
+    const [animate, setAnimate] = useState(false);
+    const [replayNonce, setReplayNonce] = useState(0);
+    const [imgErrored, setImgErrored] = useState({}); // laneId -> true
+    const [gymName, setGymName] = useState("FitZone Tunis");
+
+    // Lane-1 editable overrides
+    const [c1, setC1] = useState({
+      userFullName: "", deviceName: "", userMembershipTitle: "",
+      scanMode: "", reason: "", userValidFrom: "", userValidTo: "",
+    });
+
+    const cycleStartRef = useRef(Date.now());
+    const [, forceTick] = useState(0);
+
+    // animation loop (drains progress bar + replays entry/confetti)
+    useEffect(() => {
+      if (!animate) return;
+      cycleStartRef.current = Date.now();
+      const durMs = Math.max(MIN_DURATION_MS, DEFAULT_DURATION_SEC * 1000);
+      const id = setInterval(() => {
+        if (Date.now() - cycleStartRef.current > durMs + 700) {
+          cycleStartRef.current = Date.now();
+          setReplayNonce((x) => x + 1);
+        }
+        forceTick((x) => x + 1);
+      }, 100);
+      return () => clearInterval(id);
+    }, [animate]);
+
+    const members = useMemo(() => {
+      const pool = POOL[scenario] || POOL.granted;
+      const picked = pool.slice(0, laneCount).map((m) => ({ ...m }));
+      // apply lane-1 overrides (only non-empty fields)
+      if (picked[0]) {
+        const o = picked[0];
+        if (c1.userFullName) o.userFullName = c1.userFullName;
+        if (c1.deviceName) o.deviceName = c1.deviceName;
+        if (c1.userMembershipTitle) o.userMembershipTitle = c1.userMembershipTitle;
+        if (c1.scanMode) o.scanMode = c1.scanMode;
+        if (c1.reason) o.reason = c1.reason;
+        if (c1.userValidFrom) o.userValidFrom = c1.userValidFrom;
+        if (c1.userValidTo) o.userValidTo = c1.userValidTo;
+      }
+      return picked;
+    }, [scenario, laneCount, c1]);
+
+    const layoutMode = laneCount <= 1 ? "hero" : laneCount === 2 ? "split2" : "split3";
+
+    const handleImageError = (laneId) =>
+      setImgErrored((prev) => ({ ...prev, [laneId]: true }));
+
+    // build ActiveLane[] for the cards
+    const now = Date.now();
+    const lanes = members.map((m, i) => {
+      const ev = buildEvent(m, { showPhotos, imageFlags });
+      const durMs = Math.max(MIN_DURATION_MS, ev.popupDurationSec * 1000);
+      const arrivedAt = animate ? cycleStartRef.current : now;
+      // static (paused): show ~72% so the drain bar reads as a fresh scan
+      const expiresAt = animate ? cycleStartRef.current + durMs : now + durMs * 0.72;
+      const laneId = `lane-${i}-${replayNonce}`;
+      const imgUrl = imgErrored[laneId] ? null : ev.__photo;
+      return { laneId, event: ev, arrivedAt, expiresAt, fadingOut: false, imgUrl, imgFallbacks: [] };
+    });
+
+    const seg = (val, cur, set, label) => (
+      <button className={"cp-btn" + (val === cur ? " active" : "")} onClick={() => set(val)}>{label}</button>
+    );
+
+    return (
+      <React.Fragment>
+        {/* ── The popup itself (full viewport, faithful to the TV) ── */}
+        {view === "idle" ? (
+          <IdleScreen gymName={gymName} />
+        ) : (
+          <div className="h-screen w-screen flex overflow-hidden select-none" style={{ background: "#000" }}>
+            {lanes.map((lane) => (
+              <div
+                key={lane.laneId}
+                className="h-full"
+                style={{ flex: "1 1 0", minWidth: 0, borderRight: "1px solid rgba(255,255,255,0.05)" }}
+              >
+                <LaneCard lane={lane} layout={layoutMode} onImageError={handleImageError} />
+              </div>
+            ))}
+          </div>
+        )}
+        <style>{globalKeyframes}</style>
+
+        {/* ── Control panel (preview-only) ── */}
+        {!panelOpen && (
+          <button className="cp-min" onClick={() => setPanelOpen(true)}>☰ Contrôles</button>
+        )}
+        {panelOpen && (
+          <div className="cp">
+            <div className="cp-head">
+              <div>
+                <div className="cp-title">Popup Preview</div>
+                <div className="cp-sub">PopupWindow.tsx · aperçu design</div>
+              </div>
+              <button className="cp-btn" style={{ flex: "0 0 auto" }} onClick={() => setPanelOpen(false)}>✕</button>
+            </div>
+            <div className="cp-body">
+              <div className="cp-group">
+                <div className="cp-label">Vue</div>
+                <div className="cp-row">
+                  {seg("popup", view, setView, "Popup")}
+                  {seg("idle", view, setView, "Écran de veille")}
+                </div>
+              </div>
+
+              <div className="cp-group">
+                <div className="cp-label">Voies (lanes)</div>
+                <div className="cp-row">
+                  {seg(1, laneCount, setLaneCount, "1 · héro")}
+                  {seg(2, laneCount, setLaneCount, "2")}
+                  {seg(3, laneCount, setLaneCount, "3")}
+                </div>
+              </div>
+
+              <div className="cp-group">
+                <div className="cp-label">Scénario</div>
+                <div className="cp-row">
+                  {SCENARIOS.map((s) => (
+                    <button key={s.key}
+                      className={"cp-btn" + (scenario === s.key ? " active" : "")}
+                      style={{ flexBasis: "31%" }}
+                      onClick={() => setScenario(s.key)}>{s.label}</button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="cp-group">
+                <div className="cp-label">Photos membres</div>
+                <div className="cp-row">
+                  {seg(true, showPhotos, setShowPhotos, "Avec photo")}
+                  {seg(false, showPhotos, setShowPhotos, "Initiale")}
+                </div>
+              </div>
+
+              <div className="cp-group">
+                <div className="cp-label">Badges image (héro)</div>
+                <div className="cp-row">
+                  {seg("none", imageFlags, setImageFlags, "Aucun")}
+                  {seg("borrowed", imageFlags, setImageFlags, "Profil emprunté")}
+                  {seg("change", imageFlags, setImageFlags, "Maj requise")}
+                </div>
+              </div>
+
+              <div className="cp-group">
+                <div className="cp-label">Animation</div>
+                <div className="cp-row">
+                  {seg(true, animate, setAnimate, "▶ Lecture")}
+                  {seg(false, animate, setAnimate, "⏸ Pause")}
+                  <button className="cp-btn wide" onClick={() => setReplayNonce((x) => x + 1)}>↻ Rejouer l'entrée</button>
+                </div>
+              </div>
+
+              {view === "idle" && (
+                <div className="cp-group">
+                  <div className="cp-label">Écran de veille</div>
+                  <label className="cp-field">
+                    <span>Nom de la salle</span>
+                    <input className="cp-input" value={gymName} onChange={(e) => setGymName(e.target.value)} />
+                  </label>
+                </div>
+              )}
+
+              {view === "popup" && (
+                <div className="cp-group">
+                  <div className="cp-label">Voie 1 — champs (override)</div>
+                  <label className="cp-field"><span>Nom complet</span>
+                    <input className="cp-input" placeholder="(défaut du scénario)" value={c1.userFullName}
+                      onChange={(e) => setC1({ ...c1, userFullName: e.target.value })} /></label>
+                  <label className="cp-field"><span>Abonnement</span>
+                    <input className="cp-input" placeholder="(défaut)" value={c1.userMembershipTitle}
+                      onChange={(e) => setC1({ ...c1, userMembershipTitle: e.target.value })} /></label>
+                  <label className="cp-field"><span>Appareil</span>
+                    <input className="cp-input" placeholder="(défaut)" value={c1.deviceName}
+                      onChange={(e) => setC1({ ...c1, deviceName: e.target.value })} /></label>
+                  <label className="cp-field"><span>Mode de scan</span>
+                    <input className="cp-input" placeholder="RFID / QR / FP" value={c1.scanMode}
+                      onChange={(e) => setC1({ ...c1, scanMode: e.target.value })} /></label>
+                  <label className="cp-field"><span>Raison (refus)</span>
+                    <input className="cp-input" placeholder="(scénario Refusé)" value={c1.reason}
+                      onChange={(e) => setC1({ ...c1, reason: e.target.value })} /></label>
+                  <div className="cp-row">
+                    <label className="cp-field" style={{ flex: 1 }}><span>Valide du</span>
+                      <input className="cp-input" placeholder="2026-01-01" value={c1.userValidFrom}
+                        onChange={(e) => setC1({ ...c1, userValidFrom: e.target.value })} /></label>
+                    <label className="cp-field" style={{ flex: 1 }}><span>au</span>
+                      <input className="cp-input" placeholder="2026-12-31" value={c1.userValidTo}
+                        onChange={(e) => setC1({ ...c1, userValidTo: e.target.value })} /></label>
+                  </div>
+                </div>
+              )}
+
+              <div className="cp-hint">
+                Aperçu fidèle au plein écran TV (unités vw/vh réelles). Le bloc
+                « SOURCE-MIRROR » dans ce fichier est copié de PopupWindow.tsx —
+                modifiez-le, prévisualisez, puis recopiez vers le .tsx.
+              </div>
+            </div>
+          </div>
+        )}
+      </React.Fragment>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<PreviewApp />);
+  </script>
+
+  <!-- Bootstrap: compile the JSX above with the classic React runtime and run it. -->
+  <script>
+    (function () {
+      function run() {
+        try {
+          var src = document.getElementById("app-src").textContent;
+          var out = Babel.transform(src, {
+            presets: [["react", { runtime: "classic" }]],
+          });
+          (0, eval)(out.code);
+        } catch (err) {
+          document.getElementById("root").innerHTML =
+            '<pre style="color:#f87171;padding:24px;font:13px monospace;white-space:pre-wrap">' +
+            "Preview build error:\n\n" + String(err && err.stack ? err.stack : err) +
+            "</pre>";
+          console.error("[popup-preview] build error", err);
+        }
+      }
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", run);
+      } else {
+        run();
+      }
+    })();
+  </script>
+</body>
+</html>

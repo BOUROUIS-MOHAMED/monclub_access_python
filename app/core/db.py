@@ -62,7 +62,14 @@ _local_state_gen = [0]
 
 
 def bump_local_state_generation() -> None:
-    """Signal that members/credentials changed; ULTRA caches will reload once."""
+    """Signal that members/credentials changed; ULTRA caches will reload once.
+
+    INVARIANT: MONOTONIC — only ever increments, never resets/decrements. The
+    ULTRA TOTP-index gen-gate accepts a shared index whose gen is >= the worker's
+    (a newer index = fewer creds = stricter on revocation). If this counter were
+    ever reset, an older/less-revoked index could be mistaken for "newer" and
+    reused — a door-security regression. Keep it strictly increasing.
+    """
     try:
         with _local_state_gen_lock:
             _local_state_gen[0] += 1
@@ -866,10 +873,13 @@ def init_db() -> None:
                 title TEXT,
                 description TEXT,
                 price TEXT,
-                duration_in_days INTEGER
+                duration_in_days INTEGER,
+                members_type TEXT
             );
             """
         )
+        # Added later: membership member-type category (NORMAL | KIDS | STAFF).
+        _ensure_column(conn, "sync_memberships", "members_type", "members_type TEXT")
 
         # -----------------------------
         # GymAccessSoftwareSettingsDto (single row)
@@ -912,6 +922,7 @@ def init_db() -> None:
                 optional_data_sync_delay_minutes INTEGER,
 
                 manual_sync_mode INTEGER,
+                ultra_sync_yield_to_rtlog INTEGER,
 
                 created_at TEXT,
                 updated_at TEXT
@@ -949,6 +960,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_access_software_settings", "sdk_read_initial_bytes", "sdk_read_initial_bytes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "optional_data_sync_delay_minutes", "optional_data_sync_delay_minutes INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "manual_sync_mode", "manual_sync_mode INTEGER")
+        _ensure_column(conn, "sync_access_software_settings", "ultra_sync_yield_to_rtlog", "ultra_sync_yield_to_rtlog INTEGER")
         _ensure_column(conn, "sync_access_software_settings", "created_at", "created_at TEXT")
         _ensure_column(conn, "sync_access_software_settings", "updated_at", "updated_at TEXT")
 
@@ -1235,6 +1247,10 @@ def init_db() -> None:
         # sync_users (JOIN is ambiguous for cards that get reassigned and
         # undefined for QR credentials which have no card_no).
         _ensure_column(conn, "access_history", "user_id", "user_id INTEGER")
+        # Membership resolved at verify time, persisted so the uploader can send a
+        # valid activeMembership for QR/TOTP rows (which have no device pin/card to
+        # re-resolve). Without it the backend silently drops those rows.
+        _ensure_column(conn, "access_history", "active_membership_id", "active_membership_id INTEGER")
         conn.execute("UPDATE access_history SET history_source='AGENT' WHERE history_source IS NULL OR history_source=''")
         conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
         conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
@@ -1355,10 +1371,100 @@ def init_db() -> None:
         _ensure_column(conn, "offline_creation_queue", "created_at", "created_at TEXT")
         _ensure_column(conn, "offline_creation_queue", "updated_at", "updated_at TEXT")
 
+        # Server identifiers learned from the backend create response once a queued row
+        # succeeds/reconciles. They are REQUIRED to push deferred sub-resources (fingerprint
+        # templates, member photo) against the real activeMembershipId after reconcile —
+        # the synthetic negative ids used for offline turnstile projection must never be sent
+        # to the backend.
+        _ensure_column(conn, "offline_creation_queue", "server_active_membership_id", "server_active_membership_id INTEGER")
+        _ensure_column(conn, "offline_creation_queue", "server_user_id", "server_user_id INTEGER")
+        _ensure_column(conn, "offline_creation_queue", "server_account_id", "server_account_id INTEGER")
+        _ensure_column(conn, "offline_creation_queue", "server_account_username_id", "server_account_username_id TEXT")
+        _ensure_column(conn, "offline_creation_queue", "server_result_json", "server_result_json TEXT")
+
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_offline_creation_client_request_id ON offline_creation_queue(client_request_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_active_retry ON offline_creation_queue(state, try_to_create, next_retry_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_processing_lock ON offline_creation_queue(state, processing_lock_expires_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_creation_history_state ON offline_creation_queue(state, updated_at);")
+
+        # -----------------------------
+        # offline sub-resource queue (access-only): deferred fingerprint templates
+        # and member photos captured against an offline-created member that can only
+        # be pushed once the parent creation reconciles and its real activeMembershipId
+        # is known (server_active_membership_id on offline_creation_queue).
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offline_subresource_queue (
+                id TEXT PRIMARY KEY,
+                creation_local_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                last_attempt_at TEXT,
+                next_retry_at TEXT,
+                server_ref TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_subres_creation ON offline_subresource_queue(creation_local_id, state);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_subres_due ON offline_subresource_queue(state, next_retry_at);")
+
+        # -----------------------------
+        # offline mutation queue (access-only): edit / renew / freeze / balance /
+        # delete / taxes on ALREADY-SYNCED members. Mirrors offline_creation_queue but
+        # targets a REAL server id (never a synthetic negative projection id), carries an
+        # @Version for optimistic-lock conflict detection, a per-target FIFO dependency,
+        # and a `money` flag that drives stricter drain/retry policy. client_request_id is
+        # the idempotency key sent as X-Idempotency-Key on every attempt/retry.
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offline_mutation_queue (
+                local_id TEXT PRIMARY KEY,
+                client_request_id TEXT NOT NULL,
+                op_kind TEXT NOT NULL,
+                target_kind TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                expected_version INTEGER,
+                payload_json TEXT NOT NULL,
+                payload_hash TEXT,
+                money INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'pending',
+                try_to_apply INTEGER NOT NULL DEFAULT 1,
+                depends_on_local_id TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                failure_type TEXT,
+                failure_code TEXT,
+                last_http_status INTEGER,
+                last_error_message TEXT,
+                failed_reason TEXT,
+                last_attempt_at TEXT,
+                next_retry_at TEXT,
+                processing_started_at TEXT,
+                processing_lock_token TEXT,
+                processing_lock_expires_at TEXT,
+                succeeded_at TEXT,
+                reconciled_at TEXT,
+                cancelled_at TEXT,
+                archived_at TEXT,
+                conflict_at TEXT,
+                server_result_json TEXT,
+                server_new_version INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_offline_mutation_client_request_id ON offline_mutation_queue(client_request_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_mutation_due ON offline_mutation_queue(state, try_to_apply, next_retry_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_mutation_target ON offline_mutation_queue(target_kind, target_id, state);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_mutation_lock ON offline_mutation_queue(state, processing_lock_expires_at);")
 
         # -----------------------------
         # optional content sync state (single row — version markers)
@@ -1614,6 +1720,16 @@ def init_db() -> None:
     except Exception as _e:
         import logging
         logging.getLogger("db").error(f"[DB] Failed to reset stale processing locks on startup: {_e}")
+
+    # Same recovery for the lifecycle-mutation queue.
+    try:
+        nm = reset_stale_offline_mutation_locks()
+        if nm > 0:
+            import logging
+            logging.getLogger("db").warning(f"[DB] Reset {nm} stale processing lock(s) in offline_mutation_queue on startup.")
+    except Exception as _e:
+        import logging
+        logging.getLogger("db").error(f"[DB] Failed to reset stale mutation locks on startup: {_e}")
 
     # Reset a WAL inherited large from a prior session BEFORE the device workers
     # start their long reads (which would otherwise block the truncate). Cheap and
@@ -2932,10 +3048,11 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         optional_data_sync_delay_minutes,
 
                         manual_sync_mode,
+                        ultra_sync_yield_to_rtlog,
 
                         created_at,
                         updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         gym_id=excluded.gym_id,
                         access_server_host=excluded.access_server_host,
@@ -2971,6 +3088,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
 
                         manual_sync_mode=excluded.manual_sync_mode,
+                        ultra_sync_yield_to_rtlog=excluded.ultra_sync_yield_to_rtlog,
 
                         created_at=excluded.created_at,
                         updated_at=excluded.updated_at
@@ -3011,6 +3129,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                         _to_int_or_none(s.get("optionalDataSyncDelayMinutes", 60)),
 
                         _bool_to_i(s.get("manualSyncMode", s.get("manual_sync_mode", False)), default=0),
+                        _bool_to_i(s.get("ultraSyncYieldToRtlog", s.get("ultra_sync_yield_to_rtlog", False)), default=0),
 
                         _safe_str(s.get("createdAt"), ""),
                         _safe_str(s.get("updatedAt"), updated_at) or updated_at,
@@ -3076,8 +3195,8 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                 continue
             cur.execute(
                 """
-                INSERT INTO sync_memberships (id, title, description, price, duration_in_days)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     m.get("id"),
@@ -3085,6 +3204,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     m.get("description"),
                     m.get("price"),
                     m.get("durationInDays"),
+                    m.get("membersType"),
                 ),
             )
 
@@ -3383,8 +3503,9 @@ def _upsert_sync_access_software_settings_row(
             default_authorize_door_id, sdk_read_initial_bytes,
             optional_data_sync_delay_minutes,
             manual_sync_mode,
+            ultra_sync_yield_to_rtlog,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             gym_id=excluded.gym_id,
             access_server_host=excluded.access_server_host,
@@ -3411,6 +3532,7 @@ def _upsert_sync_access_software_settings_row(
             sdk_read_initial_bytes=excluded.sdk_read_initial_bytes,
             optional_data_sync_delay_minutes=excluded.optional_data_sync_delay_minutes,
             manual_sync_mode=excluded.manual_sync_mode,
+            ultra_sync_yield_to_rtlog=excluded.ultra_sync_yield_to_rtlog,
             created_at=excluded.created_at,
             updated_at=excluded.updated_at
         """,
@@ -3441,6 +3563,7 @@ def _upsert_sync_access_software_settings_row(
             _to_int_or_none(settings.get("sdkReadInitialBytes", 1048576)),
             _to_int_or_none(settings.get("optionalDataSyncDelayMinutes", 60)),
             _bool_to_i(settings.get("manualSyncMode", settings.get("manual_sync_mode", False)), default=0),
+            _bool_to_i(settings.get("ultraSyncYieldToRtlog", settings.get("ultra_sync_yield_to_rtlog", False)), default=0),
             _safe_str(settings.get("createdAt"), ""),
             _safe_str(settings.get("updatedAt"), updated_at) or updated_at,
         ),
@@ -3500,13 +3623,14 @@ def _replace_sync_memberships(cur: sqlite3.Cursor, memberships: List[Dict[str, A
         if not isinstance(membership, dict):
             continue
         cur.execute(
-            "INSERT INTO sync_memberships (id, title, description, price, duration_in_days) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sync_memberships (id, title, description, price, duration_in_days, members_type) VALUES (?, ?, ?, ?, ?, ?)",
             (
                 membership.get("id"),
                 membership.get("title"),
                 membership.get("description"),
                 membership.get("price"),
                 membership.get("durationInDays"),
+                membership.get("membersType"),
             ),
         )
 
@@ -4381,6 +4505,7 @@ def _coerce_sync_access_software_settings_row_to_payload(
         "sdkReadInitialBytes": d.get("sdk_read_initial_bytes"),
         "optionalDataSyncDelayMinutes": d.get("optional_data_sync_delay_minutes"),
         "manualSyncMode": bool(int(d.get("manual_sync_mode") or 0)),
+        "ultraSyncYieldToRtlog": bool(int(d.get("ultra_sync_yield_to_rtlog") or 0)),
         "createdAt": d.get("created_at"),
         "updatedAt": d.get("updated_at"),
     }
@@ -4408,6 +4533,7 @@ def load_sync_access_software_settings() -> Optional[Dict[str, Any]]:
                 sdk_read_initial_bytes,
                 optional_data_sync_delay_minutes,
                 manual_sync_mode,
+                ultra_sync_yield_to_rtlog,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1
@@ -4743,6 +4869,7 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
                 sdk_read_initial_bytes,
                 optional_data_sync_delay_minutes,
                 manual_sync_mode,
+                ultra_sync_yield_to_rtlog,
                 created_at, updated_at
             FROM sync_access_software_settings
             WHERE id=1
@@ -5007,6 +5134,153 @@ def list_sync_users() -> List[Dict[str, Any]]:
     return users
 
 
+def _active_mutations_by_target() -> Dict[int, List[Dict[str, Any]]]:
+    """Active/conflict lifecycle mutations grouped by the real activeMembershipId they
+    target — used to overlay pending-sync badges onto the roster."""
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT local_id, op_kind, target_id, state, money
+                FROM offline_mutation_queue
+                WHERE target_kind='active_membership'
+                  AND state IN ('pending','processing','failed_retryable','blocked_auth','conflict')
+                """
+            ).fetchall()
+    except Exception:
+        return out
+    for r in rows:
+        d = dict(r)
+        tid = _to_int_or_none(d.get("target_id"))
+        if tid is None:
+            continue
+        out.setdefault(int(tid), []).append({
+            "localId": d.get("local_id"),
+            "opKind": d.get("op_kind"),
+            "state": d.get("state"),
+            "money": bool(int(d.get("money") or 0)),
+        })
+    return out
+
+
+def _membership_title_index() -> Dict[str, str]:
+    """Maps a membership id (as string) to its display title, tolerant of the
+    varied column/key names the sync cache may carry across backend versions."""
+    idx: Dict[str, str] = {}
+    try:
+        for m in list_sync_memberships():
+            if not isinstance(m, dict):
+                continue
+            mid = None
+            for k in ("remote_id", "id", "membershipId", "membership_id"):
+                if m.get(k) is not None:
+                    mid = m.get(k)
+                    break
+            title = None
+            for k in ("title", "name", "membershipTitle", "membership_title"):
+                v = m.get(k)
+                if v:
+                    title = str(v)
+                    break
+            if mid is not None and title:
+                idx[str(mid)] = title
+    except Exception:
+        pass
+    return idx
+
+
+def list_members_roster(
+    *,
+    q: str = "",
+    status: str = "all",
+    limit: int = 25,
+    offset: int = 0,
+    sort_by: str = "name",
+    sort_dir: str = "asc",
+) -> tuple[List[Dict[str, Any]], int, Dict[str, int]]:
+    """Local-first member roster for the Access UI. Reads the local sync cache
+    (which already merges projected offline-pending members via list_sync_users)
+    so it works fully offline; enriches each row with a derived status
+    (active | expired | pending) and the membership title, then applies free-text
+    search, status filtering, sorting and pagination in memory. Returns
+    (page_rows, filtered_total, status_counts)."""
+    users = list_sync_users()
+    title_idx = _membership_title_index()
+    muts_by_target = _active_mutations_by_target()
+    today = datetime.now().date()
+
+    enriched: List[Dict[str, Any]] = []
+    counts = {"all": 0, "active": 0, "expired": 0, "pending": 0}
+    for u in users:
+        row = dict(u)
+        pending = bool(u.get("offlinePending"))
+        if pending:
+            st = "pending"
+        else:
+            vt = _parse_iso_date(u.get("validTo"))
+            if vt is None:
+                st = "expired"
+            else:
+                st = "active" if vt.date() >= today else "expired"
+        row["status"] = st
+        mid = u.get("membershipId")
+        row["membershipTitle"] = title_idx.get(str(mid), "") if mid is not None else ""
+        # Overlay any queued lifecycle mutation for this (real) member so the roster shows
+        # a pending-sync / pending-delete / conflict badge before reconcile.
+        amid = _to_int_or_none(u.get("activeMembershipId"))
+        if amid is not None and amid > 0 and amid in muts_by_target:
+            ms = muts_by_target[amid]
+            row["pendingMutations"] = ms
+            row["pendingDelete"] = any(m.get("opKind") == "delete" for m in ms)
+            row["hasConflict"] = any(m.get("state") == "conflict" for m in ms)
+        enriched.append(row)
+        counts["all"] += 1
+        counts[st] = counts.get(st, 0) + 1
+
+    s = (status or "all").strip().lower()
+    if s in ("active", "expired", "pending"):
+        enriched = [r for r in enriched if r.get("status") == s]
+
+    ql = (q or "").strip().lower()
+    if ql:
+        search_keys = (
+            "fullName", "email", "phone", "accountUsernameId",
+            "firstCardId", "secondCardId", "membershipTitle",
+        )
+
+        def _match(r: Dict[str, Any]) -> bool:
+            for k in search_keys:
+                v = r.get(k)
+                if v and ql in str(v).lower():
+                    return True
+            return False
+
+        enriched = [r for r in enriched if _match(r)]
+
+    filtered_total = len(enriched)
+
+    sb = (sort_by or "name").strip()
+    reverse = (sort_dir or "asc").strip().lower() == "desc"
+
+    def _sort_key(r: Dict[str, Any]):
+        if sb == "validTo":
+            d = _parse_iso_date(r.get("validTo"))
+            return (d is None, d or datetime.min)
+        if sb == "membership":
+            return (False, (r.get("membershipTitle") or "").lower())
+        if sb == "status":
+            return (False, (r.get("status") or ""))
+        return (False, (r.get("fullName") or "").lower())
+
+    enriched.sort(key=_sort_key, reverse=reverse)
+
+    lim = max(1, int(limit or 25))
+    off = max(0, int(offset or 0))
+    page_rows = enriched[off:off + lim]
+    return page_rows, filtered_total, counts
+
+
 @_tel.timed("DB_READ_list_sync_users_by_active_membership_ids", slow_ms=50, warn_ms=1000)
 def list_sync_users_by_active_membership_ids(
     active_membership_ids: List[int] | set[int] | tuple[int, ...],
@@ -5033,6 +5307,151 @@ def list_sync_users_by_active_membership_ids(
 def list_sync_memberships() -> List[Dict[str, Any]]:
     with get_conn() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
+
+
+def get_sync_membership_brief(membership_id: Any) -> Dict[str, Any]:
+    """Title + members_type for a membership plan id, used to render the scan popup badge.
+
+    Returns {} when the id is missing/unknown. members_type defaults to NORMAL when null.
+    """
+    if membership_id in (None, ""):
+        return {}
+    try:
+        mid = int(str(membership_id).strip())
+    except Exception:
+        return {}
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT title, members_type FROM sync_memberships WHERE id = ? LIMIT 1",
+            (mid,),
+        ).fetchone()
+    if row is None:
+        return {}
+    return {
+        "title": row["title"],
+        "membersType": (row["members_type"] or "NORMAL"),
+    }
+
+
+_MBRIEF_LOCK = threading.Lock()
+_MBRIEF_CACHE: Dict[str, Any] = {"index": {}, "gen": -2, "at": 0.0}
+
+
+def get_membership_brief_index() -> "Dict[int, Dict[str, str]]":
+    """Cached {plan_id: {'title','membersType'}} for scan-popup badges.
+
+    Replaces the per-scan get_sync_membership_brief() SQLite read that ran on the
+    live ULTRA worker loop (NOTIF_ENQUEUE_SLOW up to ~1.1s per granted scan on the
+    antivirus-slow gym PC). Built once from list_sync_memberships() and reused.
+
+    Guarded by BOTH the local-state generation AND a 60s TTL: bump_local_state_
+    generation() fires only on members/credentials refresh, NOT on a plan-only
+    title/type edit, so the TTL is required to eventually pick those up. Same model
+    as get_staff_membership_ids(). Purely cosmetic (badge text) — never gates a
+    door decision — so a <=60s-stale label is harmless.
+    """
+    try:
+        gen = get_local_state_generation()
+    except Exception:
+        gen = -1
+    now = time.monotonic()
+    with _MBRIEF_LOCK:
+        c = _MBRIEF_CACHE
+        if c["gen"] == gen and (now - c["at"]) < 60.0:
+            return c["index"]
+    index: Dict[int, Dict[str, str]] = {}
+    try:
+        for m in list_sync_memberships():
+            try:
+                mid = int(m["id"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+            index[mid] = {
+                "title": str(m.get("title") or ""),
+                "membersType": str(m.get("members_type") or "NORMAL"),
+            }
+    except Exception as exc:
+        _tel.warn("MBRIEF_INDEX_QUERY_FAILED", err=type(exc).__name__)
+    with _MBRIEF_LOCK:
+        _MBRIEF_CACHE.update({"index": index, "gen": gen, "at": now})
+    return index
+
+
+def get_membership_brief_index_cached() -> "Dict[int, Dict[str, str]]":
+    """Non-blocking peek at the membership-brief cache — NEVER hits SQLite.
+
+    For the live ULTRA worker hot path (popup badge): returns the last-built index
+    (or {} if never warmed). The full get_membership_brief_index() (which may do
+    the AV-slow list_sync_memberships() reload) is called only on the bg refresh
+    thread, so a scan never pays the reload. Worst case (cold start, before the
+    first bg warm): a briefly-blank badge — never a wrong access decision.
+    """
+    with _MBRIEF_LOCK:
+        return _MBRIEF_CACHE["index"]
+
+
+_STAFF_IDS_LOCK = threading.Lock()
+_STAFF_IDS_CACHE: Dict[str, Any] = {"ids": frozenset(), "gen": -2, "at": 0.0}
+
+
+def get_staff_membership_ids() -> "frozenset[int]":
+    """Cached set of membership-PLAN ids whose members_type is STAFF.
+
+    Lets the access engines exempt staff from the QR/TOTP re-entry cooldown with
+    an in-memory set check instead of a per-scan DB read. Refreshed when the
+    local-state generation moves OR after 60s (covers plan edits that don't bump
+    the generation, since it tracks users/credentials not membership plans).
+    """
+    try:
+        gen = get_local_state_generation()
+    except Exception:
+        gen = -1
+    now = time.monotonic()
+    with _STAFF_IDS_LOCK:
+        c = _STAFF_IDS_CACHE
+        if c["gen"] == gen and (now - c["at"]) < 60.0:
+            return c["ids"]
+    ids: set = set()
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id FROM sync_memberships "
+                "WHERE UPPER(COALESCE(members_type, 'NORMAL')) = 'STAFF'"
+            ).fetchall()
+        for r in rows:
+            try:
+                ids.add(int(r["id"]))
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
+    except Exception as exc:
+        # Distinct signal so a swallowed DB error is NOT mistaken for "no staff
+        # plans" (both otherwise yield an empty set). Diagnoses the staff-rescue
+        # blind spot: n=0 with no error => backend membersType not deployed / no
+        # staff plans; an error event => the query itself failed.
+        _tel.warn("STAFF_IDS_QUERY_FAILED", err=type(exc).__name__)
+    frozen = frozenset(ids)
+    with _STAFF_IDS_LOCK:
+        _STAFF_IDS_CACHE.update({"ids": frozen, "gen": gen, "at": now})
+    # Fires only on an actual DB reload (generation moved or 60s TTL), so it is
+    # cheap. On the gym: n=0 => STAFF plans not reaching the desktop (deploy the
+    # backend membersType serialization); n>0 => staff set is populated and any
+    # remaining block is elsewhere (plan-id mismatch / routing). See RFID rescue.
+    _tel.event("STAFF_IDS_REFRESH", n=len(frozen), gen=gen)
+    return frozen
+
+
+def get_staff_membership_ids_cached() -> "frozenset[int]":
+    """Non-blocking peek at the staff-ids cache — NEVER hits SQLite.
+
+    For the live ULTRA worker hot path (TOTP/RFID staff-exemption check): returns
+    the last-loaded set (or frozenset() if never warmed). The reloading
+    get_staff_membership_ids() (which may do the AV-slow SELECT — it was the ~1.1s
+    STAFF_IDS_REFRESH on the door-open path) is called only on the bg refresh
+    thread. Worst case (cold start, before the first bg warm): a staff member pays
+    the re-entry delay ONCE (fail-safe = more restrictive) — never a wrong allow.
+    """
+    with _STAFF_IDS_LOCK:
+        return _STAFF_IDS_CACHE["ids"]
 
 
 def list_sync_devices(*, include_door_presets: bool = True) -> List[Dict[str, Any]]:
@@ -5881,6 +6300,9 @@ class AccessHistoryRow:
     # _ensure_column migration on `access_history`). Defaults to None so old
     # rows created before the migration still hydrate cleanly.
     user_id: Optional[int] = None
+    # Membership resolved at verify time (QR/TOTP has no device pin/card to re-resolve
+    # on upload). Persisted so the uploader can send a valid activeMembership.
+    active_membership_id: Optional[int] = None
 
 
 ACCESS_HISTORY_SOURCE_AGENT = "AGENT"
@@ -5957,6 +6379,7 @@ def _build_access_history_insert_params(
     history_source: str | None,
     backend_sync_state: str | None,
     user_id: int | None = None,
+    active_membership_id: int | None = None,
 ) -> tuple[Any, ...]:
     return (
         now_iso(),
@@ -5977,6 +6400,7 @@ def _build_access_history_insert_params(
         normalize_access_history_source(history_source),
         normalize_access_history_sync_state(backend_sync_state),
         int(user_id) if user_id is not None else None,
+        int(active_membership_id) if active_membership_id is not None else None,
     )
 
 
@@ -5999,6 +6423,7 @@ def insert_access_history(
     history_source: str | None = None,
     backend_sync_state: str | None = None,
     user_id: int | None = None,
+    active_membership_id: int | None = None,
 ) -> int:
     """
     Insert an access history row using INSERT OR IGNORE (UNIQUE on event_id).
@@ -6027,8 +6452,9 @@ def insert_access_history(
                     raw_json,
                     history_source,
                     backend_sync_state,
-                    user_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_id,
+                    active_membership_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _build_access_history_insert_params(
                     event_id=event_id,
@@ -6048,6 +6474,7 @@ def insert_access_history(
                     history_source=history_source,
                     backend_sync_state=backend_sync_state,
                     user_id=user_id,
+                    active_membership_id=active_membership_id,
                 ),
             )
             conn.commit()
@@ -6083,6 +6510,7 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 history_source=row.get("history_source", row.get("historySource")),
                 backend_sync_state=row.get("backend_sync_state", row.get("backendSyncState")),
                 user_id=row.get("user_id", row.get("userId")),
+                active_membership_id=row.get("active_membership_id", row.get("activeMembershipId")),
             )
         )
     if not batch:
@@ -6099,8 +6527,9 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
                 raw_json,
                 history_source,
                 backend_sync_state,
-                user_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_id,
+                active_membership_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             batch,
         )
@@ -6966,6 +7395,36 @@ def claim_offline_creation_for_processing(local_id: str, *, lock_ttl_sec: int = 
     return row
 
 
+def _extract_server_ids(result: Dict[str, Any] | None) -> tuple[int | None, int | None, int | None, str | None]:
+    """Pull the real server identifiers out of the backend create response
+    (MembershipCreationResponseDto): activeMembershipId, userId, mainAccountId,
+    accountUsernameId. Returns (None, None, None, None) defensively when the response
+    body is empty or malformed (the backend may return an empty body on some replays)."""
+    r = result if isinstance(result, dict) else {}
+
+    def _int(*keys: str) -> int | None:
+        for k in keys:
+            v = r.get(k)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    am_id = _int("activeMembershipId", "active_membership_id")
+    user_id = _int("userId", "user_id")
+    account_id = _int("mainAccountId", "main_account_id", "accountId", "account_id")
+    account_username = None
+    for k in ("accountUsernameId", "account_username_id"):
+        v = r.get(k)
+        if v is not None and str(v).strip():
+            account_username = str(v).strip()
+            break
+    return am_id, user_id, account_id, account_username
+
+
 def mark_offline_creation_success(
     local_id: str,
     *,
@@ -6978,6 +7437,13 @@ def mark_offline_creation_success(
 
     now = _utc_now_iso()
     state = "reconciled" if bool(reconciled) else "succeeded"
+    am_id, user_id, account_id, account_username = _extract_server_ids(result)
+    result_json = None
+    if isinstance(result, dict) and result:
+        try:
+            result_json = json.dumps(result, ensure_ascii=False)[:4000]
+        except Exception:
+            result_json = None
     with get_conn() as conn:
         conn.execute(
             """
@@ -6994,12 +7460,18 @@ def mark_offline_creation_success(
                 processing_started_at=NULL,
                 processing_lock_token=NULL,
                 processing_lock_expires_at=NULL,
+                server_active_membership_id=COALESCE(?, server_active_membership_id),
+                server_user_id=COALESCE(?, server_user_id),
+                server_account_id=COALESCE(?, server_account_id),
+                server_account_username_id=COALESCE(?, server_account_username_id),
+                server_result_json=COALESCE(?, server_result_json),
                 succeeded_at=CASE WHEN ?='succeeded' THEN ? ELSE succeeded_at END,
                 reconciled_at=CASE WHEN ?='reconciled' THEN ? ELSE reconciled_at END,
                 updated_at=?
             WHERE local_id=?
             """,
-            (state, state, now, state, now, now, lid),
+            (state, am_id, user_id, account_id, account_username, result_json,
+             state, now, state, now, now, lid),
         )
         conn.commit()
     return get_offline_creation(lid)
@@ -7078,6 +7550,605 @@ def mark_offline_creation_failure(
         )
         conn.commit()
     return get_offline_creation(lid)
+
+
+# ---------------------------------------------------------------------------
+# offline sub-resource queue helpers (deferred fingerprint / photo push)
+# ---------------------------------------------------------------------------
+_OFFLINE_SUBRESOURCE_KINDS = ("fingerprint", "photo")
+_OFFLINE_SUBRESOURCE_ACTIVE_STATES = ("pending", "failed_retryable")
+_OFFLINE_SUBRESOURCE_FINAL_STATES = ("done", "cancelled", "failed_terminal")
+
+
+def _subresource_row_to_dict(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row)
+    raw = d.get("payload_json")
+    payload: Dict[str, Any] = {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict):
+                payload = j
+        except Exception:
+            payload = {}
+    d["payload"] = payload
+    d["attempt_count"] = int(d.get("attempt_count") or 0)
+    return d
+
+
+def insert_offline_subresource(
+    *, creation_local_id: str, kind: str, payload: Dict[str, Any], sub_id: str | None = None
+) -> Dict[str, Any]:
+    cid = _norm_text(creation_local_id)
+    if not cid:
+        raise ValueError("creation_local_id is required")
+    k = _norm_text_l(kind)
+    if k not in _OFFLINE_SUBRESOURCE_KINDS:
+        raise ValueError(f"unsupported sub-resource kind: {kind!r}")
+    sid = str(sub_id or uuid.uuid4())
+    payload_obj = payload if isinstance(payload, dict) else {}
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO offline_subresource_queue (
+                id, creation_local_id, kind, payload_json, state,
+                attempt_count, last_error, last_attempt_at, next_retry_at,
+                server_ref, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, ?, ?)
+            """,
+            (sid, cid, k, json.dumps(payload_obj, ensure_ascii=False), now, now),
+        )
+        conn.commit()
+    return get_offline_subresource(sid)  # type: ignore[return-value]
+
+
+def get_offline_subresource(sub_id: str) -> Dict[str, Any] | None:
+    sid = _norm_text(sub_id)
+    if not sid:
+        return None
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM offline_subresource_queue WHERE id=? LIMIT 1", (sid,)).fetchone()
+        return _subresource_row_to_dict(r) if r else None
+
+
+def list_offline_subresources_for(creation_local_id: str, *, states: List[str] | None = None) -> List[Dict[str, Any]]:
+    cid = _norm_text(creation_local_id)
+    if not cid:
+        return []
+    sql = "SELECT * FROM offline_subresource_queue WHERE creation_local_id=?"
+    params: List[Any] = [cid]
+    if states:
+        ph = ",".join("?" for _ in states)
+        sql += f" AND state IN ({ph})"
+        params.extend([_norm_text_l(s) for s in states])
+    sql += " ORDER BY created_at ASC"
+    with get_conn() as conn:
+        return [_subresource_row_to_dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def list_due_offline_subresources(*, limit: int = 100) -> List[Dict[str, Any]]:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM offline_subresource_queue
+            WHERE state IN ('pending','failed_retryable')
+              AND (next_retry_at IS NULL OR next_retry_at <= ?)
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (now, max(1, int(limit or 100))),
+        ).fetchall()
+    return [_subresource_row_to_dict(r) for r in rows]
+
+
+def mark_offline_subresource_done(sub_id: str, *, server_ref: str | None = None) -> Dict[str, Any] | None:
+    sid = _norm_text(sub_id)
+    if not sid:
+        return None
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_subresource_queue
+            SET state='done', last_error=NULL, next_retry_at=NULL,
+                server_ref=COALESCE(?, server_ref), updated_at=?
+            WHERE id=?
+            """,
+            (_norm_text(server_ref) or None, now, sid),
+        )
+        conn.commit()
+    return get_offline_subresource(sid)
+
+
+def mark_offline_subresource_failed(
+    sub_id: str, *, message: str, retry_delay_min: int = 15, max_attempts: int = 8
+) -> Dict[str, Any] | None:
+    sid = _norm_text(sub_id)
+    if not sid:
+        return None
+    row = get_offline_subresource(sid)
+    if not row:
+        return None
+    attempts = int(row.get("attempt_count") or 0) + 1
+    terminal = attempts >= max(1, int(max_attempts or 8))
+    state = "failed_terminal" if terminal else "failed_retryable"
+    nr = None if terminal else _next_retry_iso(int(retry_delay_min or 15))
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_subresource_queue
+            SET state=?, attempt_count=?, last_error=?, last_attempt_at=?, next_retry_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (state, attempts, _norm_text(message)[:1000] or None, now, nr, now, sid),
+        )
+        conn.commit()
+    return get_offline_subresource(sid)
+
+
+def cancel_offline_subresources_for(creation_local_id: str) -> int:
+    """Cancel still-pending sub-resources when their parent creation row is
+    cancelled or terminally failed (the member will never reconcile)."""
+    cid = _norm_text(creation_local_id)
+    if not cid:
+        return 0
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE offline_subresource_queue
+            SET state='cancelled', updated_at=?
+            WHERE creation_local_id=? AND state IN ('pending','failed_retryable')
+            """,
+            (now, cid),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# offline mutation queue helpers (lifecycle edits on already-synced members)
+# ---------------------------------------------------------------------------
+_OFFLINE_MUTATION_KINDS = (
+    "edit", "renew", "freeze_create", "freeze_cancel", "balance_adjust",
+    "pay_rest", "pay_tolerance",
+    "tax_assign", "tax_mark_paid", "tax_toggle", "tax_cancel", "delete",
+)
+_OFFLINE_MUTATION_TARGET_KINDS = ("active_membership", "active_membership_tax", "active_membership_freeze")
+_OFFLINE_MUTATION_ACTIVE_STATES = ("pending", "processing", "failed_retryable", "blocked_auth")
+_OFFLINE_MUTATION_FINAL_STATES = ("succeeded", "reconciled", "cancelled", "failed_terminal", "archived")
+_MONEY_OP_KINDS = ("renew", "balance_adjust", "pay_rest", "pay_tolerance", "tax_mark_paid")
+
+
+def _mutation_row_to_dict(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(row)
+    raw = d.get("payload_json")
+    payload: Dict[str, Any] = {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            j = json.loads(raw)
+            if isinstance(j, dict):
+                payload = j
+        except Exception:
+            payload = {}
+    d["payload"] = payload
+    d["money"] = bool(int(d.get("money") or 0))
+    d["try_to_apply"] = bool(int(d.get("try_to_apply") or 0))
+    d["attempt_count"] = int(d.get("attempt_count") or 0)
+    d["failure_count"] = int(d.get("failure_count") or 0)
+    return d
+
+
+def count_offline_mutation_active() -> int:
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT COUNT(*) AS c FROM offline_mutation_queue WHERE state IN ('pending','processing','failed_retryable','blocked_auth','conflict')"
+        ).fetchone()
+        return int((r["c"] if r else 0) or 0)
+
+
+def get_offline_mutation(local_id: str) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM offline_mutation_queue WHERE local_id=? LIMIT 1", (lid,)).fetchone()
+        return _mutation_row_to_dict(r) if r else None
+
+
+def insert_offline_mutation(
+    *,
+    op_kind: str,
+    target_kind: str,
+    target_id: int,
+    payload: Dict[str, Any],
+    money: bool | None = None,
+    expected_version: int | None = None,
+    depends_on_local_id: str | None = None,
+    client_request_id: str | None = None,
+    local_id: str | None = None,
+) -> Dict[str, Any]:
+    if count_offline_mutation_active() >= _OFFLINE_QUEUE_MAX_PENDING:
+        raise RuntimeError(f"Offline mutation queue is full (max={_OFFLINE_QUEUE_MAX_PENDING}).")
+    ok = _norm_text_l(op_kind)
+    if ok not in _OFFLINE_MUTATION_KINDS:
+        raise ValueError(f"unsupported op_kind: {op_kind!r}")
+    tk = _norm_text_l(target_kind)
+    if tk not in _OFFLINE_MUTATION_TARGET_KINDS:
+        raise ValueError(f"unsupported target_kind: {target_kind!r}")
+    try:
+        tid = int(target_id)
+    except (TypeError, ValueError):
+        raise ValueError("target_id must be an integer")
+    if tid <= 0:
+        # invariant: NEVER queue a mutation against a synthetic-negative projected id.
+        raise ValueError("target_id must be a real positive server id (got non-positive)")
+
+    money_v = 1 if (money if money is not None else (ok in _MONEY_OP_KINDS)) else 0
+    lid = str(local_id or uuid.uuid4())
+    rid = str(client_request_id or uuid.uuid4())
+    payload_obj = payload if isinstance(payload, dict) else {}
+    payload_json = json.dumps(payload_obj, ensure_ascii=False)
+    payload_hash = _hash_payload(payload_obj)
+    ev = int(expected_version) if expected_version is not None else None
+    dep = _norm_text(depends_on_local_id) or None
+    now = _utc_now_iso()
+
+    with get_conn() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO offline_mutation_queue (
+                    local_id, client_request_id, op_kind, target_kind, target_id,
+                    expected_version, payload_json, payload_hash, money, state,
+                    try_to_apply, depends_on_local_id, attempt_count, failure_count,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, 0, 0, ?, ?)
+                """,
+                (lid, rid, ok, tk, tid, ev, payload_json, payload_hash, money_v, dep, now, now),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            ex = conn.execute(
+                "SELECT local_id FROM offline_mutation_queue WHERE client_request_id=? LIMIT 1", (rid,)
+            ).fetchone()
+            if ex:
+                existing = get_offline_mutation(str(ex["local_id"]))  # type: ignore[index]
+                if existing:
+                    return existing
+            raise
+
+    row = get_offline_mutation(lid)
+    if not row:
+        raise RuntimeError("Failed to insert offline mutation row")
+    return row
+
+
+def list_offline_mutations(
+    *,
+    states: List[str] | None = None,
+    target_kind: str | None = None,
+    target_id: int | None = None,
+    include_archived: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM offline_mutation_queue"
+    clauses: List[str] = []
+    params: List[Any] = []
+    if states:
+        ph = ",".join("?" for _ in states)
+        clauses.append(f"state IN ({ph})")
+        params.extend([_norm_text_l(s) for s in states])
+    elif not include_archived:
+        clauses.append("state != 'archived'")
+    if target_kind:
+        clauses.append("target_kind=?")
+        params.append(_norm_text_l(target_kind))
+    if target_id is not None:
+        clauses.append("target_id=?")
+        params.append(int(target_id))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at ASC LIMIT ? OFFSET ?"
+    params.extend([max(1, int(limit or 200)), max(0, int(offset or 0))])
+    with get_conn() as conn:
+        return [_mutation_row_to_dict(r) for r in conn.execute(sql, tuple(params)).fetchall()]
+
+
+def count_offline_mutations(*, states: List[str] | None = None, include_archived: bool = False) -> int:
+    sql = "SELECT COUNT(*) AS c FROM offline_mutation_queue"
+    clauses: List[str] = []
+    params: List[Any] = []
+    if states:
+        ph = ",".join("?" for _ in states)
+        clauses.append(f"state IN ({ph})")
+        params.extend([_norm_text_l(s) for s in states])
+    elif not include_archived:
+        clauses.append("state != 'archived'")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    with get_conn() as conn:
+        r = conn.execute(sql, tuple(params)).fetchone()
+        return int((r["c"] if r else 0) or 0)
+
+
+def list_offline_mutations_due_for_retry(*, now_iso_value: str | None = None, limit: int = 100) -> List[Dict[str, Any]]:
+    """Due rows, gated by the per-target FIFO: a row is only due when its
+    depends_on dependency has succeeded/reconciled (or no longer exists). This makes
+    the queue a per-member ordered chain while staying parallel across members."""
+    now_v = _norm_text(now_iso_value) or _utc_now_iso()
+    lim = max(1, min(int(limit or 100), 500))
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.* FROM offline_mutation_queue m
+            WHERE m.try_to_apply = 1
+              AND m.state IN ('pending','failed_retryable','blocked_auth')
+              AND (m.next_retry_at IS NULL OR m.next_retry_at='' OR m.next_retry_at <= ?)
+              AND (m.processing_lock_expires_at IS NULL OR m.processing_lock_expires_at='' OR m.processing_lock_expires_at <= ?)
+              AND (
+                m.depends_on_local_id IS NULL OR m.depends_on_local_id=''
+                OR EXISTS (SELECT 1 FROM offline_mutation_queue d
+                           WHERE d.local_id = m.depends_on_local_id AND d.state IN ('succeeded','reconciled'))
+                OR NOT EXISTS (SELECT 1 FROM offline_mutation_queue d2
+                               WHERE d2.local_id = m.depends_on_local_id)
+              )
+            ORDER BY COALESCE(m.next_retry_at,''), m.created_at
+            LIMIT ?
+            """,
+            (now_v, now_v, lim),
+        ).fetchall()
+        return [_mutation_row_to_dict(r) for r in rows]
+
+
+def claim_offline_mutation_for_processing(local_id: str, *, lock_ttl_sec: int = 300, force: bool = False) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    expires = (datetime.utcnow() + timedelta(seconds=max(30, int(lock_ttl_sec or 300)))).replace(microsecond=0).isoformat() + "Z"
+    token = str(uuid.uuid4())
+    where = "local_id=? AND (processing_lock_expires_at IS NULL OR processing_lock_expires_at='' OR processing_lock_expires_at<=?)"
+    args: List[Any] = [lid, now]
+    if not force:
+        where += " AND try_to_apply=1 AND state IN ('pending','failed_retryable','blocked_auth')"
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE offline_mutation_queue
+            SET state='processing',
+                attempt_count = COALESCE(attempt_count, 0) + 1,
+                last_attempt_at=?, processing_started_at=?,
+                processing_lock_token=?, processing_lock_expires_at=?, updated_at=?
+            WHERE {where}
+            """,
+            (now, now, token, expires, now, *args),
+        )
+        conn.commit()
+        if int(cur.rowcount or 0) <= 0:
+            return None
+    row = get_offline_mutation(lid)
+    if row:
+        row["processing_lock_token"] = token
+    return row
+
+
+def _extract_new_version(result: Dict[str, Any] | None) -> int | None:
+    r = result if isinstance(result, dict) else {}
+    for k in ("server_new_version", "newVersion", "version"):
+        v = r.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                continue
+    # the backend may return the fresh entity nested under common keys
+    for nest in ("activeMembership", "entity", "data", "result"):
+        sub = r.get(nest)
+        if isinstance(sub, dict) and sub.get("version") is not None:
+            try:
+                return int(sub.get("version"))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def mark_offline_mutation_success(
+    local_id: str, *, reconciled: bool, result: Dict[str, Any] | None = None
+) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    state = "reconciled" if bool(reconciled) else "succeeded"
+    new_version = _extract_new_version(result)
+    result_json = None
+    if isinstance(result, dict) and result:
+        try:
+            result_json = json.dumps(result, ensure_ascii=False)[:4000]
+        except Exception:
+            result_json = None
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_mutation_queue
+            SET state=?, try_to_apply=0,
+                failure_type=NULL, failure_code=NULL, last_http_status=NULL,
+                last_error_message=NULL, failed_reason=NULL, next_retry_at=NULL,
+                processing_started_at=NULL, processing_lock_token=NULL, processing_lock_expires_at=NULL,
+                server_result_json=COALESCE(?, server_result_json),
+                server_new_version=COALESCE(?, server_new_version),
+                succeeded_at=CASE WHEN ?='succeeded' THEN ? ELSE succeeded_at END,
+                reconciled_at=CASE WHEN ?='reconciled' THEN ? ELSE reconciled_at END,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (state, result_json, new_version, state, now, state, now, now, lid),
+        )
+        # Version chaining: bump the next queued op on the same target so a chain of
+        # offline edits doesn't self-conflict on a stale version.
+        if new_version is not None:
+            conn.execute(
+                """
+                UPDATE offline_mutation_queue
+                SET expected_version=?, updated_at=?
+                WHERE depends_on_local_id=? AND state IN ('pending','failed_retryable','blocked_auth')
+                """,
+                (new_version, now, lid),
+            )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def mark_offline_mutation_failure(
+    local_id: str, *, failure_type: str, failure_code: str | None, http_status: int | None,
+    message: str, retry_delay_min: int | None = None, max_countable_failures: int = 5,
+) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    row = get_offline_mutation(lid)
+    if not row:
+        return None
+    ft = _norm_text_l(failure_type) or "server"
+    countable = _failure_is_countable(ft)
+    new_count = int(row.get("failure_count") or 0) + (1 if countable else 0)
+    next_state = "failed_retryable"
+    next_try = True
+    if ft == "auth":
+        next_state = "blocked_auth"
+    elif countable and new_count >= max(1, int(max_countable_failures or 5)):
+        next_state = "failed_terminal"
+        next_try = False
+    delay = int(retry_delay_min) if retry_delay_min is not None else _failure_retry_delay_minutes(ft)
+    nr = None if next_state == "failed_terminal" else _next_retry_iso(delay)
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_mutation_queue
+            SET state=?, try_to_apply=?, failure_count=?, failure_type=?, failure_code=?,
+                last_http_status=?, last_error_message=?, failed_reason=?, next_retry_at=?,
+                processing_started_at=NULL, processing_lock_token=NULL, processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (
+                next_state, 1 if next_try else 0, new_count, ft,
+                _norm_text(failure_code)[:200] or None,
+                int(http_status) if http_status is not None else None,
+                _norm_text(message)[:1000] or None, _norm_text(message)[:1000] or None,
+                nr, now, lid,
+            ),
+        )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def mark_offline_mutation_conflict(
+    local_id: str, *, http_status: int | None = 409, message: str = "", server_state: Dict[str, Any] | None = None
+) -> Dict[str, Any] | None:
+    """Stale-version / business 409: the target moved under us. NOT auto-retried —
+    it waits for an operator decision (re-base or abort). The fresh server state from
+    the 409 body is stored so the UI can show a diff."""
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    server_json = None
+    if isinstance(server_state, dict) and server_state:
+        try:
+            server_json = json.dumps(server_state, ensure_ascii=False)[:4000]
+        except Exception:
+            server_json = None
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_mutation_queue
+            SET state='conflict', try_to_apply=0, next_retry_at=NULL,
+                failure_type='conflict', failure_code='STALE_VERSION',
+                last_http_status=?, last_error_message=?, conflict_at=?,
+                server_result_json=COALESCE(?, server_result_json),
+                processing_started_at=NULL, processing_lock_token=NULL, processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=?
+            """,
+            (
+                int(http_status) if http_status is not None else 409,
+                _norm_text(message)[:1000] or None, now, server_json, now, lid,
+            ),
+        )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def cancel_offline_mutation(local_id: str, *, reason: str | None = None) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE offline_mutation_queue
+            SET state='cancelled', try_to_apply=0, next_retry_at=NULL,
+                last_error_message=COALESCE(?, last_error_message), cancelled_at=?,
+                processing_started_at=NULL, processing_lock_token=NULL, processing_lock_expires_at=NULL,
+                updated_at=?
+            WHERE local_id=? AND state NOT IN ('archived')
+            """,
+            (_norm_text(reason)[:1000] or None, now, now, lid),
+        )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def archive_offline_mutation(local_id: str) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE offline_mutation_queue SET state='archived', archived_at=?, updated_at=? WHERE local_id=?",
+            (now, now, lid),
+        )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def set_offline_mutation_try(local_id: str, *, enabled: bool) -> Dict[str, Any] | None:
+    lid = _norm_text(local_id)
+    if not lid:
+        return None
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE offline_mutation_queue SET try_to_apply=?, updated_at=? WHERE local_id=? AND state IN ('pending','failed_retryable','blocked_auth')",
+            (1 if enabled else 0, now, lid),
+        )
+        conn.commit()
+    return get_offline_mutation(lid)
+
+
+def reset_stale_offline_mutation_locks() -> int:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE offline_mutation_queue
+            SET state='pending', processing_started_at=NULL, processing_lock_token=NULL, processing_lock_expires_at=NULL, updated_at=?
+            WHERE state='processing'
+              AND (processing_lock_expires_at IS NULL OR processing_lock_expires_at='' OR processing_lock_expires_at<=?)
+            """,
+            (now, now),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
 
 
 def classify_failure(*, http_status: int | None, message: str | None) -> Dict[str, Any]:

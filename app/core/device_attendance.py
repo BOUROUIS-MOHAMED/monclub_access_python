@@ -152,6 +152,11 @@ def _normalize_card_token(value: Any) -> str:
 
 
 def _credential_type_from_raw(lowered: Dict[str, Any]) -> str:
+    # QR/TOTP entries are software-verified by the access app (the device sees only a
+    # rotating token, no verifytype), so they carry an explicit scanMode tag instead.
+    scan_mode = _safe_str(_pick_ci(lowered, "scanmode", "scan_mode"), "").upper()
+    if "QR" in scan_mode or "TOTP" in scan_mode:
+        return "QR_CODE"
     verify = _safe_str(
         _pick_ci(lowered, "verifytype", "verified", "verifymode", "verify_mode", "credentialtype", "type"),
         "",
@@ -714,6 +719,21 @@ class DeviceAttendanceMaintenanceEngine:
             item["userFullName"] = _safe_str(user.get("fullName") or user.get("full_name"), "")
             item["userPhone"] = _safe_str(user.get("phone"), "")
             item["userEmail"] = _safe_str(user.get("email"), "")
+
+        # Fallback for rows the uploader cannot re-resolve from pin/card — notably
+        # QR/TOTP, whose card_no is a rotating token absent from users_by_card. The
+        # realtime agent already resolved the member at verify time and persisted it on
+        # the row; use it so the backend (which keys solely on activeMembership) does
+        # not silently drop the entry.
+        if item.get("activeMembership") is None:
+            am_fallback = _safe_int(getattr(row, "active_membership_id", None), 0)
+            if am_fallback > 0:
+                item["activeMembership"] = am_fallback
+                item["activeMembershipId"] = am_fallback
+        if not item.get("userId"):
+            uid_fallback = _safe_int(getattr(row, "user_id", None), 0)
+            if uid_fallback > 0:
+                item["userId"] = uid_fallback
 
         return item
 

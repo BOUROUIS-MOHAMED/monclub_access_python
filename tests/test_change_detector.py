@@ -106,6 +106,31 @@ class TestChangeDetectorAuth:
         # Should have triggered sync after re-login
         mock_app.after.assert_called_once()
 
+    def test_401_failed_refresh_does_not_disable_autosync(self, mock_app, mock_logger):
+        """Regression: a failed token refresh on 401 must NOT permanently stop the
+        poller (the old behaviour called self.stop(), so a single transient blip froze
+        turnstile data until an app restart). It must back off and stay alive instead."""
+        svc = ChangeDetectorService(
+            app=mock_app,
+            backend_base_url="http://test.local",
+            get_token_fn=lambda: "test-jwt-token",
+            re_login_fn=lambda: None,  # refresh failed (transient error or dead session)
+            gym_id=42,
+            poll_interval=0.05,
+            cfg=MagicMock(),
+            logger=mock_logger,
+        )
+        svc._last_known_version = _DT1
+
+        with patch("app.core.change_detector._requests") as mock_requests:
+            mock_requests.RequestException = Exception
+            mock_requests.get.return_value = MagicMock(status_code=401)
+            svc._poll_once()  # must not raise
+
+        assert not svc._stop_event.is_set()        # auto-sync NOT disabled
+        assert svc._consecutive_failures >= 1      # backed off for a later retry
+        mock_app.after.assert_not_called()         # no sync triggered on auth failure
+
     def test_network_error_logs_warning_and_does_not_crash(self, mock_app, mock_logger):
         svc = make_service(mock_app, mock_logger)
 

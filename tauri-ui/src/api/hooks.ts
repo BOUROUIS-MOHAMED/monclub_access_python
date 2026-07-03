@@ -188,6 +188,13 @@ export function usePullSdk() {
       tableName: string,
       params?: Record<string, string>,
     ) => get<DeviceTableResponse>(`/devices/${deviceId}/table/${tableName}`, params),
+    // ── Control panel (re-entry block + clock) ──
+    getSettings: (deviceId: number) => get<any>(`/devices/${deviceId}/settings`),
+    setReentry: (deviceId: number, enabled: boolean, seconds: number) =>
+      post<any>(`/devices/${deviceId}/reentry`, { enabled, seconds }),
+    getClock: (deviceId: number) => get<any>(`/devices/${deviceId}/clock`),
+    syncClock: (deviceId: number) =>
+      post<any>(`/devices/${deviceId}/clock/sync`, { confirm: true }),
   };
 }
 

@@ -35,6 +35,9 @@ class NotificationRequest:
     user_valid_from: str = ""
     user_valid_to: str = ""
     user_membership_id: Optional[int] = None
+    # Membership plan name + category (NORMAL | KIDS | STAFF) shown in the scan popup.
+    user_membership_title: str = ""
+    user_members_type: str = ""
     user_phone: str = ""
     device_id: int = 0
     device_name: str = ""

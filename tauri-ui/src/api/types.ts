@@ -1063,6 +1063,10 @@ export interface PopupEvent {
   userValidFrom: string;
   userValidTo: string;
   userMembershipId: number | null;
+  /** Membership plan name (title) of the scanning member, if known. */
+  userMembershipTitle?: string;
+  /** Membership category: "NORMAL" | "KIDS" | "STAFF" (badge in the popup). */
+  userMembersType?: string;
   userPhone: string;
   deviceId: number;
   deviceName: string;

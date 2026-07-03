@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "popup-preview-static",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8099", "--directory", "tauri-ui"],
+      "port": 8099
+    },
+    {
+      "name": "tauri-ui-dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "tauri-ui", "run", "dev", "--", "--port", "5174", "--strictPort"],
+      "port": 5174
+    }
+  ]
+}

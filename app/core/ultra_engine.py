@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from types import SimpleNamespace
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
 from app.core.access_types import HistoryRecord, NotificationRequest
 from app.core.access_verification import (
@@ -14,6 +14,7 @@ from app.core.access_verification import (
     build_totp_index,
     load_local_state,
     parse_event_time_to_epoch,
+    verify_card,
     verify_totp_resilient,
     _totp_counter,
     _totp_params,
@@ -23,6 +24,10 @@ from app.core.db import (
     insert_access_history,
     load_sync_cache,
     get_local_state_generation,
+    get_membership_brief_index,
+    get_membership_brief_index_cached,
+    get_staff_membership_ids,
+    get_staff_membership_ids_cached,
 )
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
@@ -55,6 +60,20 @@ _CLOCK_SKEW_WARN_INTERVAL_SEC = 120.0
 # init), so disabling anti-fraud still blocked re-entry for the stale 30s. This
 # debounce floor is the cooldown when anti-fraud is off.
 _ULTRA_CARD_DEBOUNCE_SEC = 3.0
+
+# How long a staff member's just-rescued TOTP code stays exempt from the
+# re-entry block. Only needs to span the same code's re-scan window (the code
+# rotates ~every 30s; a fresh code's first scan is never blocked anyway), so a
+# couple of TOTP periods is plenty. The DEBOUNCE floor still applies to staff.
+_ULTRA_STAFF_CODE_TTL_SEC = 120.0
+
+# Minimum spacing between RTLog poll+process passes interleaved into a long
+# device sync (the ``ultra_sync_yield_to_rtlog`` feature). The yield hook fires
+# at every push chunk and every 128 hashed users; this throttle keeps it to at
+# most ~1 poll/sec so a 1,800-user push neither hammers the single SDK
+# connection nor re-reads settings on every chunk, while still observing scans
+# (and letting PC-verified QR/TOTP members through) within ~a second.
+_ULTRA_SYNC_RTLOG_YIELD_MIN_INTERVAL_SEC = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +134,23 @@ def _get_shared_totp_index():
 
 
 def _set_shared_totp_index(value, gen) -> None:
+    """Publish the process-wide TOTP index. MONOTONIC: never lower the stored
+    generation — a lagging worker (older gen) must not overwrite a newer index
+    published by the other worker (that would re-open the gen-thrash and could
+    briefly expose an older, less-revoked index). Same-gen updates ARE allowed so
+    the counter window can be refreshed as it rolls."""
     try:
+        g = int(gen)
         with _SHARED_TOTP_INDEX_LOCK:
-            _SHARED_TOTP_INDEX["value"] = value
-            _SHARED_TOTP_INDEX["gen"] = int(gen)
+            # Always allow a clear (value=None) or the first publish; otherwise
+            # only publish a real index whose gen is >= the stored one (monotonic).
+            if (
+                value is None
+                or _SHARED_TOTP_INDEX["value"] is None
+                or g >= int(_SHARED_TOTP_INDEX["gen"])
+            ):
+                _SHARED_TOTP_INDEX["value"] = value
+                _SHARED_TOTP_INDEX["gen"] = g
     except Exception:
         pass
 
@@ -142,6 +174,14 @@ class UltraDeviceWorker(threading.Thread):
         self._settings = settings
         self._popup_q = popup_q
         self._history_q = history_q
+        # Off-loop history writer: the per-event DB insert (INSERT OR IGNORE) used
+        # to run synchronously on the live worker loop and, when a sync flooded the
+        # DbWriter, stalled scans/door-opens/popups for seconds per event
+        # (HIST_INSERT_SLOW) — the recurring ~30-min "freeze". The insert now runs
+        # on a dedicated writer thread fed by this bounded queue; the worker only
+        # enqueues (O(1)). Bounded so a stuck DbWriter can't grow it without limit.
+        self._history_write_q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=5000)
+        self._history_writer_thread: Optional[threading.Thread] = None
         self._stop_evt = stop_event
         self._cfg = cfg
         self._on_full_sync_started = on_full_sync_started
@@ -165,6 +205,9 @@ class UltraDeviceWorker(threading.Thread):
         self._totp_failures = 0
         self._door_cmd_failures = 0
         self._poll_ema_ms = 0.0
+        # Throttle clock for the RTLog-yield-during-sync hook (see
+        # _sync_yield_to_rtlog). monotonic seconds of the last yield poll.
+        self._last_sync_rtlog_yield_mono = 0.0
         self._prefix = f"[ULTRA:{self._device_id}]"
         # Stable worker id used by telemetry heartbeat/state tracking.
         self._tel_wid = f"ULTRA:{self._device_id}"
@@ -201,6 +244,10 @@ class UltraDeviceWorker(threading.Thread):
         # dashboard change (e.g. disabling anti-fraud) takes effect immediately
         # instead of being frozen at the value seen when the worker started.
         self._card_cooldown: Dict[str, float] = {}  # card_no -> monotonic timestamp
+        # TOTP codes of staff members, exempt from the re-entry block (kept only
+        # for the debounce floor). code -> monotonic expiry. Populated after a
+        # staff TOTP rescue (see _handle_totp_rescue / _effective_card_cooldown_sec).
+        self._staff_codes: Dict[str, float] = {}
 
         # Adaptive sleep settings (same as AGENT mode)
         self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
@@ -238,6 +285,13 @@ class UltraDeviceWorker(threading.Thread):
         # Command queue: door open requests executed inline between polls
         # (avoids TCP disconnect/reconnect needed by the old pause approach).
         self._cmd_queue: "queue.Queue" = queue.Queue(maxsize=10)
+        # Separate queue for generic, operator-initiated SDK calls (read/write a
+        # device parameter, sync the clock) from the DevicesPage control panel.
+        # Kept distinct from _cmd_queue so the latency-critical door-open path is
+        # untouched. Drained on the worker thread so these calls reuse the single
+        # held SDK socket — NEVER opening a 2nd Connect (handle-leak/daily-lockup,
+        # see project_pullsdk_connect_leak).
+        self._sdk_cmd_queue: "queue.Queue" = queue.Queue(maxsize=8)
         self._wake_evt = threading.Event()
         self._member_sync_lock = threading.Lock()
         self._pending_member_syncs: Deque[int] = deque()
@@ -324,6 +378,10 @@ class UltraDeviceWorker(threading.Thread):
         """Main loop: connect -> poll RTLog -> classify -> repeat."""
         logger.info(f"{self._prefix} started")
         self._pre_populate_seen()
+        # Start the off-loop history writer so per-event DB inserts never block the
+        # live loop (see _enqueue_history). Started before the poll loop so it is
+        # already draining when the first event arrives.
+        self._ensure_history_writer()
 
         # Pre-warm the local state cache eagerly so the first scan doesn't
         # block for 30+ seconds loading 1,275 users from SQLite.
@@ -407,6 +465,8 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_member_sync_commands(limit=1)
                 self._drain_full_sync_commands(limit=1)
                 self._drain_commands()
+                # Operator SDK calls (control panel): read/write a param, sync clock.
+                self._drain_sdk_commands()
 
                 # Re-align the device RTC to the PC clock periodically. The call
                 # self-throttles to once/hour and is a no-op below the drift
@@ -492,6 +552,12 @@ class UltraDeviceWorker(threading.Thread):
                 self._stop_evt.wait(5.0)
 
         self._disconnect()
+        # Best-effort: persist any history rows still queued so a clean shutdown
+        # does not lose the last few audit events (the writer thread has stopped).
+        try:
+            self._flush_history_writes()
+        except Exception:
+            pass
         logger.info(f"{self._prefix} stopped")
 
     # ------------------------------------------------------------------ #
@@ -719,6 +785,38 @@ class UltraDeviceWorker(threading.Thread):
         result_event.wait(timeout=timeout)
         return result_box
 
+    def request_run_sdk(
+        self,
+        fn: "Callable[[Any], Any]",
+        *,
+        label: str = "sdk_op",
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Run ``fn(sdk)`` on the worker thread using the held SDK connection.
+
+        For operator-initiated device reads/writes from the control panel
+        (GetDeviceParam/SetDeviceParam/clock). Called from the HTTP handler
+        thread; the worker drains _sdk_cmd_queue between polls and executes on
+        its single connection — so the panel NEVER opens a second Connect.
+        Returns {"ok", "result", "error"}. ``error`` carries the full SDK error
+        string (e.g. PullSDKError with rc + PullLastError) for the UI popup.
+        """
+        result_event = threading.Event()
+        result_box: Dict[str, Any] = {"ok": False, "result": None, "error": "timeout", "label": label}
+        # Deadline so a command the caller has already abandoned (timed out) is
+        # NOT executed when the worker drains it later — critical for WRITES: a
+        # SetDeviceParam that lingered through a device outage must not silently
+        # apply on reconnect. Reads are harmless, but the rule is uniform.
+        deadline = time.monotonic() + float(timeout)
+        try:
+            self._sdk_cmd_queue.put_nowait((fn, label, result_event, result_box, deadline))
+            self._wake_evt.set()
+        except queue.Full:
+            return {"ok": False, "result": None, "error": "device busy (command queue full)", "label": label}
+
+        result_event.wait(timeout=timeout)
+        return result_box
+
     def request_member_sync(self, member_id: int) -> bool:
         normalized_member_id = int(member_id)
         with self._member_sync_lock:
@@ -767,6 +865,53 @@ class UltraDeviceWorker(threading.Thread):
             finally:
                 result_event.set()
 
+    def _drain_sdk_commands(self):
+        """Execute pending operator SDK calls on the held connection.
+
+        Drained between polls, like _drain_commands. Each command is independent
+        (no last-write-wins): a read and a write are distinct, so we run each and
+        return its own result. Bounded by the single-event-per-call timeout on
+        the caller side. Never opens a second connection.
+        """
+        while not self._sdk_cmd_queue.empty():
+            try:
+                fn, label, result_event, result_box, deadline = self._sdk_cmd_queue.get_nowait()
+            except queue.Empty:
+                break
+            # Skip (do NOT execute) a command the caller already gave up on — a
+            # late write must never land. The caller has already returned its
+            # timeout box; setting the event here is harmless.
+            if deadline is not None and time.monotonic() > float(deadline):
+                result_box["ok"] = False
+                result_box["error"] = "expired (not executed)"
+                _tel.event("SDK_CMD", worker=self._tel_wid, op=label, ok=False, expired=True)
+                result_event.set()
+                continue
+            _t0 = time.monotonic()
+            try:
+                if self._sdk is None or not self._connected:
+                    result_box["ok"] = False
+                    result_box["error"] = "device not connected"
+                else:
+                    result_box["result"] = fn(self._sdk)
+                    result_box["ok"] = True
+                    result_box["error"] = ""
+            except Exception as e:
+                result_box["ok"] = False
+                # Full SDK error string (PullSDKError carries rc + PullLastError)
+                # so the control panel can show it in the error popup.
+                result_box["error"] = str(e)
+            finally:
+                _dur = round((time.monotonic() - _t0) * 1000)
+                _tel.event(
+                    "SDK_CMD", worker=self._tel_wid, op=label,
+                    ok=result_box.get("ok"), dur_ms=_dur,
+                )
+                logger.info(
+                    f"{self._prefix} SDK_CMD op={label} ok={result_box.get('ok')} dur_ms={_dur}"
+                )
+                result_event.set()
+
     def _sync_yield_to_doors(self) -> None:
         """Service queued door-open commands BETWEEN device-sync push chunks.
 
@@ -787,6 +932,68 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_commands()
                 _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid, opened=pending)
         except Exception:
+            pass
+
+    def _sync_yield_to_rtlog(self) -> None:
+        """Poll + process RTLog scans BETWEEN device-sync push chunks.
+
+        A full/member sync runs INLINE on this worker over the single device
+        connection, so for the entire push RTLog polling is otherwise starved
+        (the primary Type-1 freeze: new scans aren't observed → the popup
+        freezes, and PC-verified QR/TOTP members can't get in until the sync
+        ends; only device-autonomous RFID still opens). ``_sync_yield_to_doors``
+        already drains *queued* door commands between chunks but never polls
+        RTLog, so member *scans* are still invisible during a sync.
+
+        DeviceSyncEngine calls this hook between SetDeviceData chunks (and every
+        128 hashed users): the connection is idle at those points and everything
+        runs on this one thread, so a quick poll + _process_event here is
+        serialized and safe — exactly the same safety model as the interleaved
+        door opens. It lets a member scanning mid-sync be seen (and PC-verified
+        ones let in) within ~one second instead of waiting for the whole push.
+
+        Safety invariants:
+          * Gated by the gym-level ``ultra_sync_yield_to_rtlog`` flag (dashboard
+            /account → MonClub Access tab), DEFAULT OFF, read live (TTL-cached)
+            so it can be enabled per-gym once validated on real hardware without
+            a desktop redeploy or restart.
+          * Throttled to ~1 poll/sec so a 1,800-user push doesn't hammer the SDK.
+          * A failed poll here NEVER disconnects — tearing down the connection
+            mid-push would corrupt the in-flight SetDeviceData. On poll
+            error/timeout it just skips; the run loop reconnects after the sync.
+          * _process_event dedups via _is_seen (check-and-set), so the run loop's
+            post-sync poll won't re-process anything handled here.
+        """
+        try:
+            now = time.monotonic()
+            # Throttle FIRST (cheap) and advance the clock regardless of the
+            # enabled state, so neither the SDK poll nor the settings read runs
+            # more than ~once/sec during a long push. getattr-default so any
+            # construction path (incl. tests) is safe before the first poll.
+            last = getattr(self, "_last_sync_rtlog_yield_mono", 0.0)
+            if (now - last) < _ULTRA_SYNC_RTLOG_YIELD_MIN_INTERVAL_SEC:
+                return
+            self._last_sync_rtlog_yield_mono = now
+
+            # Gym-level toggle (sibling of manual_sync_mode). Read via the
+            # TTL-cached backend-global-settings helper, not self._settings
+            # (which is per-device). Default OFF.
+            from app.core.settings_reader import get_backend_global_settings
+            if not bool((get_backend_global_settings() or {}).get("ultra_sync_yield_to_rtlog", False)):
+                return
+
+            if self._sdk is None or not self._connected:
+                return
+
+            events = self._poll_with_watchdog()
+            if not events:
+                # None (poll timeout/error) or [] — do NOT disconnect mid-sync.
+                return
+            _tel.event("SYNC_RTLOG_YIELD", worker=self._tel_wid, events=len(events))
+            for evt in events:
+                self._process_event(evt)
+        except Exception:
+            # Best-effort: a yield poll must never abort the in-flight push.
             pass
 
     def _drain_member_sync_commands(self, limit: int = 1) -> int:
@@ -815,8 +1022,10 @@ class UltraDeviceWorker(threading.Thread):
                 # Member sync runs INLINE on this worker thread over the single
                 # device connection — it blocks RTLog polling + door commands
                 # for its whole duration (a Type-1 freeze contributor). Track it.
-                # Let it open doors queued mid-sync between push chunks.
+                # Let it open doors queued mid-sync between push chunks, and
+                # (when enabled) poll+process RTLog scans so the popup stays live.
                 engine._door_yield_cb = self._sync_yield_to_doors
+                engine._rtlog_yield_cb = self._sync_yield_to_rtlog
                 _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
                 _ms_t0 = time.monotonic()
                 try:
@@ -897,8 +1106,11 @@ class UltraDeviceWorker(threading.Thread):
                 engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
                 # Full sync runs INLINE on this worker (see comment below). Let it
                 # open doors queued mid-push between SetDeviceData chunks so the
-                # turnstile stays responsive during the push.
+                # turnstile stays responsive during the push, and (when enabled)
+                # poll+process RTLog scans so the popup keeps updating and
+                # PC-verified QR/TOTP members get in during the push.
                 engine._door_yield_cb = self._sync_yield_to_doors
+                engine._rtlog_yield_cb = self._sync_yield_to_rtlog
                 started_at = time.time()
                 started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
                 self._mark_full_sync_started(reason=reason, engine=engine, started_at=started_iso)
@@ -1134,6 +1346,16 @@ class UltraDeviceWorker(threading.Thread):
         anti-fraud is enabled for this scan kind (QR vs RFID). Read live each
         event so a dashboard toggle (disable anti-fraud) takes effect at once.
         """
+        # Staff exemption (TOTP): a staff member's just-rescued code is exempt
+        # from the long re-entry block — only the short debounce floor applies,
+        # so staff re-enter freely while the C3 multi-event burst is still
+        # deduped. RFID can't be exempted (the controller opens it itself).
+        sc = getattr(self, "_staff_codes", None)
+        if sc:
+            exp = sc.get(card_no)
+            if exp is not None and exp > time.monotonic():
+                return float(_ULTRA_CARD_DEBOUNCE_SEC)
+
         s = self._settings or {}
         # Pure format check (independent of the totp enable flags) so we consult
         # the correct anti-fraud toggle for a QR/TOTP code vs an RFID card.
@@ -1155,6 +1377,31 @@ class UltraDeviceWorker(threading.Thread):
         if af_on and af_dur > 0:
             return max(float(_ULTRA_CARD_DEBOUNCE_SEC), float(af_dur))
         return float(_ULTRA_CARD_DEBOUNCE_SEC)
+
+    def _is_staff_rfid_card(self, card_no: str) -> bool:
+        """True if ``card_no`` is an RFID card belonging to a STAFF member.
+
+        Lets a staff card's device-blocked re-entry slip past the software
+        re-scan cooldown so it reaches the rescue path (TOTP is handled
+        separately via _staff_codes). Cheap: cached local state (dict lookup) +
+        the cached staff-plan-id set. Never raises."""
+        try:
+            if self._is_totp_format(card_no):
+                return False
+            if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
+                return False
+            _creds, _uam, users_by_card = self._get_cached_local_state()
+            hits = users_by_card.get(card_no) or []
+            staff_ids = get_staff_membership_ids_cached()
+            for u in (hits if isinstance(hits, list) else [hits]):
+                if not isinstance(u, dict):
+                    continue
+                pid = u.get("membershipId")
+                if pid is not None and int(pid) in staff_ids:
+                    return True
+        except Exception:
+            return False
+        return False
 
     # ------------------------------------------------------------------ #
     # Event classification (core ULTRA logic)
@@ -1190,12 +1437,27 @@ class UltraDeviceWorker(threading.Thread):
             cooldown = self._effective_card_cooldown_sec(card_no)
             now_mono = time.monotonic()
             last_seen = self._card_cooldown.get(card_no, 0.0)
-            if (now_mono - last_seen) < cooldown:
-                logger.debug(
-                    f"{self._prefix} SKIP card cooldown: card={card_no!r} "
-                    f"elapsed={now_mono - last_seen:.1f}s < {cooldown}s"
-                )
-                return
+            elapsed = now_mono - last_seen
+            if elapsed < cooldown:
+                # A re-scan inside the cooldown window — normally skip. EXCEPTION:
+                # a valid STAFF RFID card must reach the rescue path (the device
+                # blocked its re-entry; the PC re-opens for staff). Only the
+                # debounce floor still applies, so the C3's multi-event burst is
+                # still deduped. (TOTP staff use _staff_codes in the cooldown calc.)
+                if (
+                    elapsed >= float(_ULTRA_CARD_DEBOUNCE_SEC)
+                    and self._is_staff_rfid_card(card_no)
+                ):
+                    logger.debug(
+                        f"{self._prefix} staff RFID re-entry past debounce — "
+                        f"allow through to rescue: card={card_no!r} elapsed={elapsed:.1f}s"
+                    )
+                else:
+                    logger.debug(
+                        f"{self._prefix} SKIP card cooldown: card={card_no!r} "
+                        f"elapsed={elapsed:.1f}s < {cooldown}s"
+                    )
+                    return
             self._card_cooldown[card_no] = now_mono
             # Prune old entries to avoid unbounded growth. Anything older than the
             # max possible cooldown window is safe to evict.
@@ -1235,12 +1497,55 @@ class UltraDeviceWorker(threading.Thread):
         scan_epoch = parse_event_time_to_epoch(event_time, self._device_tz_offset_sec)
         self._record_event_age(scan_epoch)
 
+        # ── Re-entry / punch-interval (DoorNIntertime) diagnostics ──
+        # Only meaningful when the re-entry block (Door{N}Intertime=N) is enabled on
+        # the device. Tracks the last ACCEPTED card per door; on an EVENT=20 ("Too
+        # Short Punch Interval") rejection it emits REENTRY_BLOCK correlating the
+        # rejected card to what last happened on that door, to answer definitively:
+        #   same_card=True                       -> genuine per-CARD re-entry (OK)
+        #   same_card=False & last_accept<block  -> a DIFFERENT card just entered on
+        #                                           this door => DoorNIntertime is a
+        #                                           per-DOOR lockout (the reported
+        #                                           "random first-scan rejected" bug)
+        #   last_open_delta<block                -> a PC open (QR/TOTP/staff) started
+        #                                           the device's interval
+        # Telemetry only — no behaviour change.
+        try:
+            if door_id is not None:
+                _re_now = time.monotonic()
+                if not hasattr(self, "_reentry_last_accept"):
+                    self._reentry_last_accept = {}
+                if not hasattr(self, "_reentry_last_open_mono"):
+                    self._reentry_last_open_mono = {}
+                if is_allow:
+                    self._reentry_last_accept[door_id] = (card_no, _re_now)
+                elif event_type_int == 20:
+                    _la_card, _la_mono = self._reentry_last_accept.get(door_id, ("", 0.0))
+                    _lo_mono = self._reentry_last_open_mono.get(door_id, 0.0)
+                    def _mask(c: str) -> str:
+                        return (c[:2] + "*" * max(0, len(c) - 4) + c[-2:]) if c and len(c) > 4 else (c or "")
+                    _tel.event(
+                        "REENTRY_BLOCK", worker=self._tel_wid, door=door_id,
+                        rejected_card=_mask(card_no),
+                        last_accept_card=_mask(_la_card),
+                        same_card=bool(_la_card and _la_card == card_no),
+                        last_accept_delta_s=(round(_re_now - _la_mono, 1) if _la_mono else -1),
+                        last_open_delta_s=(round(_re_now - _lo_mono, 1) if _lo_mono else -1),
+                        event_id=event_id,
+                    )
+        except Exception:
+            pass
+
         if is_allow:
             self._handle_allow(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         elif self._is_totp_format(card_no):
             self._handle_totp_rescue(card_no, event_time, event_id, door_id, raw_row, scan_epoch)
         else:
-            self._handle_deny(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
+            # Denied, non-TOTP = a denied RFID card. If it is a VALID STAFF
+            # member the PC re-opens (staff skip the device re-entry interval);
+            # every other denied card stays denied (the device's decision —
+            # including the punch-interval block — stands).
+            self._handle_rfid_rescue(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
 
         if (time.monotonic() - t0) * 1000 >= 250:
             _tel.warn("EVENT_PROCESS_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
@@ -1432,6 +1737,7 @@ class UltraDeviceWorker(threading.Thread):
             user_full_name=user_name,
             user_image=user_image,
             user_membership_id=user_membership_id,
+            user_membership_plan_id=(user.get("membershipId") if isinstance(user, dict) else None),
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
@@ -1473,12 +1779,18 @@ class UltraDeviceWorker(threading.Thread):
         creds, users_by_am, users_by_card = self._get_cached_local_state()
 
         # Use the precomputed O(1) index ONLY when it was built from the exact
-        # same credential generation we are about to verify against. Mismatch =>
-        # pass None and verify_totp_resilient runs the full loop over `creds`.
-        # This gen-gate is what stops a stale index from allowing a removed
-        # member (or silently missing a just-added one).
+        # Use the shared index if it was built from a credential generation that
+        # is AT LEAST AS FRESH as ours (>=, not ==). A newer index is a SUBSET of
+        # eligible creds (revocations already applied via the same
+        # _iter_eligible_totp_creds filter), so verifying against it is STRICTER on
+        # revocation, never looser — a removed member is absent from a newer index
+        # and cannot match. Using >= (instead of ==) stops the two workers, which
+        # sit at different _cached_state_gen, from perpetually rejecting each
+        # other's shared index (the ~700 builds/hr gen-thrash). SAFETY RESTS ON
+        # bump_local_state_generation() being MONOTONIC (db.py) — never reset/
+        # decrement it, or a stale index could be accepted as "newer".
         _idx, _idx_gen = _get_shared_totp_index()
-        totp_index = _idx if (_idx is not None and _idx_gen == self._cached_state_gen) else None
+        totp_index = _idx if (_idx is not None and _idx_gen >= self._cached_state_gen) else None
 
         t0 = time.monotonic()
         result = verify_totp_resilient(
@@ -1533,6 +1845,22 @@ class UltraDeviceWorker(threading.Thread):
         )
 
         if allowed:
+            # Staff exemption: mark this code so a re-scan only pays the debounce
+            # floor, not the re-entry delay. Resolved from the member's plan id
+            # (cached set, no per-scan DB read). RFID is opened by the device
+            # itself, so it can't be exempted this way — TOTP only.
+            try:
+                plan_id = user.get("membershipId") if isinstance(user, dict) else None
+                if plan_id is not None and int(plan_id) in get_staff_membership_ids_cached():
+                    now_m = time.monotonic()
+                    self._staff_codes[code] = now_m + _ULTRA_STAFF_CODE_TTL_SEC
+                    if len(self._staff_codes) > 500:
+                        self._staff_codes = {k: v for k, v in self._staff_codes.items() if v > now_m}
+                    logger.debug(
+                        f"{self._prefix} staff re-entry exemption: plan={plan_id} code={masked_code}"
+                    )
+            except Exception:
+                pass
             # Open door
             logger.info(
                 f"{self._prefix} TOTP_RESCUE opening door: door_id={door_id} "
@@ -1573,6 +1901,7 @@ class UltraDeviceWorker(threading.Thread):
             user_full_name=user_name,
             user_image=user_image,
             user_membership_id=user_membership_id,
+            user_membership_plan_id=(user.get("membershipId") if isinstance(user, dict) else None),
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
@@ -1580,6 +1909,33 @@ class UltraDeviceWorker(threading.Thread):
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
         )
+        # Persist the resolved member + tag the raw with scanMode so the backend
+        # uploader can (a) classify this as QR_CODE and (b) re-resolve the member.
+        # A TOTP row's card_no is a rotating token (absent from users_by_card, no
+        # PIN), so without the persisted user_id/active_membership_id the backend
+        # drops the row from member-filtered door-history and, without the scanMode
+        # tag, labels it CARD. Mirrors the AGENT path (realtime_agent.py).
+        _resolved_user_id: Optional[int] = None
+        _resolved_am_id: Optional[int] = None
+        try:
+            if isinstance(user, dict) and user.get("userId") not in (None, ""):
+                _resolved_user_id = int(str(user.get("userId")).strip())
+        except (ValueError, TypeError):
+            _resolved_user_id = None
+        try:
+            _am_src = result.get("activeMembershipId")
+            if _am_src in (None, "") and isinstance(user, dict):
+                _am_src = user.get("activeMembershipId")
+            if _am_src not in (None, ""):
+                _resolved_am_id = int(str(_am_src).strip())
+        except (ValueError, TypeError):
+            _resolved_am_id = None
+        _hist_raw = (
+            {**dict(raw_row), "scanMode": "QR_TOTP"}
+            if isinstance(raw_row, dict)
+            else {"scanMode": "QR_TOTP"}
+        )
+
         self._enqueue_history(
             event_id=event_id,
             allowed=allowed,
@@ -1588,11 +1944,13 @@ class UltraDeviceWorker(threading.Thread):
             card_no=code,
             event_time=event_time,
             door_id=door_id,
-            raw=raw_row,
+            raw=_hist_raw,
             decision_ms=decision_ms,
             cmd_ms=cmd_ms,
             cmd_ok=cmd_ok,
             cmd_error=cmd_error,
+            user_id=_resolved_user_id,
+            active_membership_id=_resolved_am_id,
         )
 
     def _open_door_with_retry(self, *, door_id: Optional[int] = None) -> bool:
@@ -1629,6 +1987,15 @@ class UltraDeviceWorker(threading.Thread):
                 ok = self._sdk.open_door(door_id=resolved_door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
                 if ok:
                     logger.debug(f"{self._prefix} open_door succeeded on attempt {attempt + 1}")
+                    # Stamp this PC-initiated open so a later EVENT=20 rejection can
+                    # be attributed to it (the device may start DoorNIntertime on
+                    # ANY open, incl. a PC/QR/TOTP/staff open — see REENTRY_BLOCK).
+                    try:
+                        if not hasattr(self, "_reentry_last_open_mono"):
+                            self._reentry_last_open_mono = {}
+                        self._reentry_last_open_mono[resolved_door_id] = time.monotonic()
+                    except Exception:
+                        pass
                     return True
                 else:
                     logger.warning(
@@ -1646,6 +2013,116 @@ class UltraDeviceWorker(threading.Thread):
     # ------------------------------------------------------------------ #
     # DENY handler (passive observation)
     # ------------------------------------------------------------------ #
+
+    def _handle_rfid_rescue(
+        self, card_no: str, event_time: str, event_id: str,
+        door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
+    ):
+        """PC-side STAFF rescue for a denied RFID card.
+
+        The device denied this card (unknown, or — the common case — its
+        punch-interval re-entry block fired). If the card is a VALID member whose
+        plan is STAFF, the PC re-opens the door so staff skip the re-entry delay.
+        Every other denied card falls through to _handle_deny, so the device's
+        decision (including the interval block) stands for non-staff.
+
+        SECURITY: opens ONLY when verify_card validates the card (RFID enabled,
+        format/length, exactly one active-member match) AND the member's plan is
+        in the cached STAFF set. Never opens a non-staff, unknown, or invalid card.
+        Runs on the worker thread; opens via the held SDK socket (no 2nd Connect).
+        """
+        if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
+            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
+            return
+
+        t0 = time.monotonic()
+        _creds, _uam, users_by_card = self._get_cached_local_state()
+        vr = verify_card(scanned=card_no, settings=self._settings, users_by_card=users_by_card)
+        user = vr.get("user") if vr.get("allowed") else None
+        plan_id = user.get("membershipId") if isinstance(user, dict) else None
+        is_staff = False
+        staff_n = -1
+        try:
+            staff_ids = get_staff_membership_ids_cached()
+            staff_n = len(staff_ids)
+            is_staff = plan_id is not None and int(plan_id) in staff_ids
+        except Exception:
+            is_staff = False
+
+        # Observability for the staff blind spot (rare — only on RFID deny events):
+        # valid=is the card a recognised active member, staff_n=size of the STAFF
+        # plan set (0 => backend membersType not deployed), staff=matched. Lets the
+        # next gym test tell "backend not deployed" (staff_n=0) from "plan mismatch"
+        # (staff_n>0, valid=1, staff=0) from "unknown card" (valid=0).
+        _tel.event(
+            "RFID_RESCUE_EVAL", worker=self._tel_wid, valid=bool(vr.get("allowed")),
+            staff=is_staff, staff_n=staff_n, plan=plan_id, event_id=event_id,
+        )
+
+        if not (vr.get("allowed") and is_staff):
+            # Not a valid staff card — respect the device's deny.
+            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
+            return
+
+        masked = card_no[0] + "*" * (len(card_no) - 2) + card_no[-1] if len(card_no) > 2 else card_no
+        user_name = str(user.get("fullName", user.get("full_name", user.get("name", ""))) or "")
+        logger.info(
+            f"{self._prefix} RFID_STAFF_RESCUE opening: card={masked} user={user_name!r} "
+            f"plan={plan_id} door={door_id} event_id={event_id}"
+        )
+        t_cmd = time.monotonic()
+        door_opened = self._open_door_with_retry(door_id=door_id)
+        cmd_ms = (time.monotonic() - t_cmd) * 1000
+        _tel.event(
+            "RFID_STAFF_RESCUE", worker=self._tel_wid, ok=door_opened,
+            plan=plan_id, cmd_ms=round(cmd_ms), event_id=event_id,
+        )
+
+        # Enrich popup/history from the member (mirror _handle_allow).
+        user_image = str(user.get("image", "") or "")
+        user_profile_image = str(user.get("userProfileImage", "") or "")
+        image_source = str(user.get("imageSource", "") or "")
+        user_image_status = str(user.get("userImageStatus", "") or "")
+        user_phone = str(user.get("phone", "") or "")
+        user_valid_from = str(user.get("validFrom", user.get("valid_from", "")) or "")
+        user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
+        user_membership_id: Optional[int] = None
+        raw_am_id = user.get("activeMembershipId")
+        if raw_am_id is not None:
+            try:
+                user_membership_id = int(str(raw_am_id).strip())
+            except (ValueError, TypeError):
+                pass
+
+        reason = "ALLOW_STAFF_RFID" if door_opened else "DOOR_CMD_FAILED"
+        self._enqueue_notification(
+            event_id=event_id,
+            allowed=door_opened,
+            reason=reason,
+            scan_mode="RFID_CARD",
+            user_full_name=user_name,
+            user_image=user_image,
+            user_membership_id=user_membership_id,
+            user_membership_plan_id=plan_id,
+            user_phone=user_phone,
+            user_valid_from=user_valid_from,
+            user_valid_to=user_valid_to,
+            image_source=image_source,
+            user_image_status=user_image_status,
+            user_profile_image=user_profile_image,
+        )
+        self._enqueue_history(
+            event_id=event_id,
+            allowed=door_opened,
+            reason=reason,
+            event_type=event_type,
+            card_no=card_no,
+            event_time=event_time,
+            door_id=door_id,
+            raw=raw_row,
+        )
+        if (time.monotonic() - t0) * 1000 >= 250:
+            _tel.warn("RFID_RESCUE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
 
     def _handle_deny(
         self, card_no: str, event_time: str, event_id: str,
@@ -1704,11 +2181,25 @@ class UltraDeviceWorker(threading.Thread):
         image_source: str = "",
         user_image_status: str = "",
         user_profile_image: str = "",
+        user_membership_plan_id: Optional[int] = None,
     ):
         t0 = time.monotonic()
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
             return
+
+        # Resolve membership plan name + type for the scan-popup badge (best-effort).
+        user_membership_title = ""
+        user_members_type = ""
+        if user_membership_plan_id is not None:
+            try:
+                # Cached badge lookup (no per-scan DB read on the live loop; was
+                # NOTIF_ENQUEUE_SLOW up to ~1.1s/scan on the AV-slow gym PC).
+                brief = get_membership_brief_index_cached().get(int(user_membership_plan_id), {})
+                user_membership_title = str(brief.get("title") or "")
+                user_members_type = str(brief.get("membersType") or "")
+            except Exception:
+                pass
 
         # Kick the image fetch onto a background pool the moment we know we'll
         # display this card. By the time the popup window mounts the <img>
@@ -1747,6 +2238,8 @@ class UltraDeviceWorker(threading.Thread):
                 user_valid_from=user_valid_from,
                 user_valid_to=user_valid_to,
                 user_membership_id=user_membership_id,
+                user_membership_title=user_membership_title,
+                user_members_type=user_members_type,
                 user_phone=user_phone,
                 device_id=self._device_id,
                 device_name=self._device_name,
@@ -1797,36 +2290,156 @@ class UltraDeviceWorker(threading.Thread):
         cmd_ms: float = 0.0,
         cmd_ok: Optional[bool] = None,
         cmd_error: str = "",
+        user_id: Optional[int] = None,
+        active_membership_id: Optional[int] = None,
     ):
-        """Insert history via insert_access_history() (DB-level dedup with INSERT OR IGNORE).
+        """Hand the access event to the OFF-LOOP history writer (non-blocking).
 
-        Only enqueues to the history queue for backend sync if insert succeeds (rowcount=1).
+        The DB insert (insert_access_history, INSERT OR IGNORE) and the
+        backend-sync enqueue now run on a dedicated writer thread, NOT the live
+        worker loop. A sync flooding the DbWriter previously stalled the loop for
+        seconds per event (HIST_INSERT_SLOW), delaying scans / door-opens / popups
+        — the recurring ~30-min "freeze". Enqueueing is O(1); on overflow the
+        OLDEST queued record is dropped so the worker never blocks (history is a
+        best-effort audit record, and the device's own log retains the event).
         """
-        poll_ms = self._poll_ema_ms
+        item = {
+            "event_id": event_id,
+            "door_id": door_id,
+            "card_no": card_no,
+            "event_time": event_time,
+            "event_type": event_type,
+            "allowed": allowed,
+            "reason": reason,
+            "poll_ms": self._poll_ema_ms,
+            "decision_ms": decision_ms,
+            "cmd_ms": cmd_ms,
+            "cmd_ok": cmd_ok,
+            "cmd_error": cmd_error,
+            "raw": raw or {},
+            "user_id": user_id,
+            "active_membership_id": active_membership_id,
+        }
+        t = getattr(self, "_history_writer_thread", None)
+        if t is None or not t.is_alive():
+            # No live off-loop writer: persist inline. In production the writer is
+            # started in run() before the poll loop, so this branch covers unit
+            # tests (which drive _process_event directly) and the rare case of a
+            # writer that has died — in both, recording the audit row matters more
+            # than the (test-only / degraded) inline cost. The hot path in
+            # production always takes the async branch below and never blocks.
+            self._write_history_item(item)
+            return
+        wq = self._get_history_write_q()
+        try:
+            wq.put_nowait(item)
+        except queue.Full:
+            # Writer is behind (DbWriter flooded by a sync). Drop the OLDEST so the
+            # worker never blocks; better to lose one audit row than to freeze.
+            try:
+                wq.get_nowait()
+                wq.put_nowait(item)
+            except (queue.Empty, queue.Full):
+                pass
+            _tel.warn("HIST_WRITE_Q_FULL", worker=self._tel_wid)
 
-        # Use the existing insert_access_history which does INSERT OR IGNORE.
-        # This is a synchronous DB write on the worker thread (per event). It is
-        # normally sub-ms, but can spike under WAL/DbWriter contention (e.g. while
-        # a sync floods the writer) and stall the loop between scans — so time it
-        # and surface only the slow spikes (no per-event log spam).
+    def _get_history_write_q(self) -> "queue.Queue":
+        """Return the history write queue, lazily creating it.
+
+        Lazy-init keeps test harnesses that build the worker via __new__ (bypassing
+        __init__) working without extra setup.
+        """
+        wq = getattr(self, "_history_write_q", None)
+        if wq is None:
+            wq = queue.Queue(maxsize=5000)
+            self._history_write_q = wq
+        return wq
+
+    def _ensure_history_writer(self) -> None:
+        """Start the dedicated history-writer thread (idempotent).
+
+        Called from run() at worker start so the writer drains events that the loop
+        enqueues. Daemon thread; exits when _stop_evt is set.
+        """
+        t = getattr(self, "_history_writer_thread", None)
+        if t is not None and t.is_alive():
+            return
+        try:
+            t = threading.Thread(
+                target=self._history_writer_loop,
+                name=f"hist-writer-{self._device_id}",
+                daemon=True,
+            )
+            t.start()
+            self._history_writer_thread = t
+        except Exception as e:
+            self._history_writer_thread = None
+            _tel.warn("HIST_WRITER_SPAWN_FAIL", worker=self._tel_wid, err=type(e).__name__)
+
+    def _history_writer_loop(self) -> None:
+        """Dedicated thread: run the synchronous history DB insert + backend-sync
+        enqueue OFF the live worker loop, so DbWriter contention (e.g. while a sync
+        floods the writer) never stalls scans / door-opens."""
+        wq = self._get_history_write_q()
+        while not self._stop_evt.is_set():
+            try:
+                item = wq.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if not item:
+                continue
+            try:
+                self._write_history_item(item)
+            except Exception as e:
+                logger.error(f"{self._prefix} history writer error: {e}")
+
+    def _flush_history_writes(self) -> None:
+        """Drain and persist all currently-queued history items synchronously.
+
+        Used by tests (no writer thread) and as a best-effort flush on shutdown so
+        queued audit rows are not lost. Safe to run alongside the writer thread:
+        each item is consumed once by whichever side grabs it.
+        """
+        wq = self._get_history_write_q()
+        while True:
+            try:
+                item = wq.get_nowait()
+            except queue.Empty:
+                return
+            if not item:
+                continue
+            try:
+                self._write_history_item(item)
+            except Exception as e:
+                logger.error(f"{self._prefix} history flush error: {e}")
+
+    def _write_history_item(self, item: Dict[str, Any]) -> None:
+        """Persist one history item (DB insert + backend-sync enqueue).
+
+        Runs on the writer thread (or the synchronous flush), never the live loop.
+        Insert uses INSERT OR IGNORE for DB-level dedup; only rowcount==1 (a genuine
+        new row) is forwarded to the backend-sync queue.
+        """
         _hist_t0 = time.monotonic()
         try:
             rowcount = insert_access_history(
-                event_id=event_id,
+                event_id=item["event_id"],
                 device_id=self._device_id,
-                door_id=door_id,
-                card_no=card_no,
-                event_time=event_time,
-                event_type=event_type,
-                allowed=allowed,
-                reason=reason,
-                poll_ms=poll_ms,
-                decision_ms=decision_ms,
-                cmd_ms=cmd_ms,
-                cmd_ok=cmd_ok,
-                cmd_error=cmd_error,
-                raw=raw or {},
+                door_id=item["door_id"],
+                card_no=item["card_no"],
+                event_time=item["event_time"],
+                event_type=item["event_type"],
+                allowed=item["allowed"],
+                reason=item["reason"],
+                poll_ms=item["poll_ms"],
+                decision_ms=item["decision_ms"],
+                cmd_ms=item["cmd_ms"],
+                cmd_ok=item["cmd_ok"],
+                cmd_error=item["cmd_error"],
+                raw=item["raw"],
                 history_source="ULTRA",
+                user_id=item["user_id"],
+                active_membership_id=item["active_membership_id"],
             )
             inserted = rowcount == 1
         except Exception as e:
@@ -1835,6 +2448,8 @@ class UltraDeviceWorker(threading.Thread):
         finally:
             _hist_ms = (time.monotonic() - _hist_t0) * 1000.0
             if _hist_ms >= 250.0:
+                # Now OFF the live loop — this still surfaces DbWriter contention
+                # for diagnostics, but no longer blocks scans/door-opens.
                 _tel.warn("HIST_INSERT_SLOW", worker=self._tel_wid, dur_ms=round(_hist_ms))
 
         if not inserted:
@@ -1842,20 +2457,20 @@ class UltraDeviceWorker(threading.Thread):
 
         try:
             rec = HistoryRecord(
-                event_id=event_id,
+                event_id=item["event_id"],
                 device_id=self._device_id,
-                door_id=door_id,
-                card_no=card_no,
-                event_time=event_time,
-                event_type=event_type,
-                allowed=allowed,
-                reason=reason,
-                poll_ms=poll_ms,
-                decision_ms=decision_ms,
-                cmd_ms=cmd_ms,
-                cmd_ok=cmd_ok is True,
-                cmd_error=cmd_error,
-                raw=raw or {},
+                door_id=item["door_id"],
+                card_no=item["card_no"],
+                event_time=item["event_time"],
+                event_type=item["event_type"],
+                allowed=item["allowed"],
+                reason=item["reason"],
+                poll_ms=item["poll_ms"],
+                decision_ms=item["decision_ms"],
+                cmd_ms=item["cmd_ms"],
+                cmd_ok=item["cmd_ok"] is True,
+                cmd_error=item["cmd_error"],
+                raw=item["raw"],
             )
             self._history_q.put_nowait(rec)
         except queue.Full:
@@ -1939,6 +2554,17 @@ class UltraDeviceWorker(threading.Thread):
                 self._maybe_rebuild_totp_index()
             except Exception:
                 pass
+            # Every tick (≤5s): pre-warm the staff-ids + membership-brief caches
+            # HERE on the bg thread (warm connection) so their 60s-TTL/gen DB
+            # reload never fires INLINE on a scan's door/popup path. The hot path
+            # reads the *_cached() peeks (no SQLite). This is what removed the
+            # ~1.1s STAFF_IDS_REFRESH stall on the TOTP door-open path and the
+            # NOTIF_ENQUEUE_SLOW badge stall.
+            try:
+                get_staff_membership_ids()
+                get_membership_brief_index()
+            except Exception:
+                pass
 
     def _prefetch_member_images(self, users_by_am) -> None:
         """Submit ALL members' avatar/face images to the popup-image prefetch pool
@@ -1998,12 +2624,22 @@ class UltraDeviceWorker(threading.Thread):
             cur_struct, cur_gen = _get_shared_totp_index()
             if (
                 isinstance(cur_struct, dict)
-                and cur_gen == gen
+                # >= (not ==): accept a shared index at least as fresh as our creds.
+                # This is what stops the two workers (at different _cached_state_gen)
+                # from perpetually restamping each other's index — the ~700 builds/hr
+                # gen-thrash. A newer index is a subset of eligible creds (stricter
+                # on revocation), so it is safe to reuse. Rests on the generation
+                # being MONOTONIC (db.bump_local_state_generation only increments).
+                and cur_gen >= gen
                 and cur_struct.get("params") == (period, drift, digits, prefix)
                 and needed.issubset(cur_struct.get("counters") or set())
             ):
                 return  # still fresh — covers the current window
             _t0 = time.monotonic()
+            # margin=1 (small window). The rebuild frequency is now bounded by the
+            # counter window rolling (~every couple of periods), NOT by the gen-
+            # thrash (fixed above via the >= gate + monotonic _set_shared_totp_index),
+            # so only ONE worker rebuilds per roll and the other reuses it.
             struct = build_totp_index(creds, self._settings, now, margin=1)
             _set_shared_totp_index(struct, gen)
             _tel.event(
@@ -2151,6 +2787,7 @@ class UltraSyncScheduler:
         self._thread: Optional[threading.Thread] = None
         self._devices: List[Dict[str, Any]] = []
         self._last_hash: Dict[int, str] = {}  # device_id -> payload hash
+        self._last_fp_detail: Dict[Any, Dict[str, Any]] = {}  # device_id -> fingerprint breakdown (diagnostic)
         self._last_sync_at: Dict[int, str] = {}
         self._next_sync_at: Dict[int, str] = {}
         self._workers: Dict[int, "UltraDeviceWorker"] = {}
@@ -2206,7 +2843,86 @@ class UltraSyncScheduler:
     def force_resync(self, device_id: int):
         """F-015: Clear in-memory hash for a device to force re-push on next cycle."""
         self._last_hash.pop(device_id, None)
+        self._last_fp_detail.pop(device_id, None)
         self._logger.info("[UltraSyncScheduler] force_resync: cleared hash for device_id=%s", device_id)
+
+    def _log_fingerprint_delta(
+        self,
+        device_id: Any,
+        prev_detail: Dict[str, Any] | None,
+        cur_detail: Dict[str, Any] | None,
+        *,
+        reason: str = "timer",
+    ) -> None:
+        """Diagnostic: a changed device-sync fingerprint forces a full ~10s blocking
+        live-worker read (RTLog polling + door commands stall → popups freeze then
+        burst). Often the change is spurious — the read finds to_sync=0. This logs
+        WHICH users/fields flipped the fingerprint so it can be paired with the
+        FULL_SYNC_DEVICE to_sync=N line to confirm a spurious flip and stabilise it.
+        Best-effort: never raises, never affects sync behaviour."""
+        try:
+            if not isinstance(cur_detail, dict):
+                return
+            if not isinstance(prev_detail, dict) or not prev_detail.get("users"):
+                self._logger.info(
+                    "[ULTRA:%s] FP_DELTA reason=%s no_prev_detail=1 (first observed fingerprint)",
+                    device_id, reason,
+                )
+                return
+            prev_users = prev_detail.get("users") or {}
+            cur_users = cur_detail.get("users") or {}
+            prev_pins = set(prev_users.keys())
+            cur_pins = set(cur_users.keys())
+            added = sorted(cur_pins - prev_pins)
+            removed = sorted(prev_pins - cur_pins)
+            field_counts: Dict[str, int] = {}
+            changed: List[Any] = []
+            for pin in (cur_pins & prev_pins):
+                pf = prev_users.get(pin) or {}
+                cf = cur_users.get(pin) or {}
+                if pf.get("h") == cf.get("h"):
+                    continue
+                diff_fields = [k for k in ("name", "card", "doors", "tz", "tplh") if pf.get(k) != cf.get(k)]
+                changed.append((pin, diff_fields, pf, cf))
+                for k in diff_fields:
+                    field_counts[k] = field_counts.get(k, 0) + 1
+            header_changed = prev_detail.get("header") != cur_detail.get("header")
+            self._logger.info(
+                "[ULTRA:%s] FP_DELTA reason=%s header_changed=%s users_added=%d users_removed=%d "
+                "users_changed=%d field_change_counts=%s",
+                device_id, reason, header_changed, len(added), len(removed), len(changed), field_counts,
+            )
+            try:
+                _tel.event(
+                    "FP_DELTA", device_id=device_id, reason=reason,
+                    header_changed=header_changed, added=len(added),
+                    removed=len(removed), changed=len(changed), fields=field_counts,
+                )
+            except Exception:
+                pass
+            if header_changed:
+                # Device-level inputs (allowedMemberships/doorIds/doorBitmask/
+                # authorizeTimezoneId/policy/fingerprintEnabled) flipped the fingerprint;
+                # log both so the specific culprit is identifiable, not just "True".
+                self._logger.info(
+                    "[ULTRA:%s] FP_DELTA_HEADER prev=%r cur=%r",
+                    device_id, prev_detail.get("header"), cur_detail.get("header"),
+                )
+            for pin, diff_fields, pf, cf in changed[:8]:
+                sample = {k: {"prev": pf.get(k), "cur": cf.get(k)} for k in diff_fields}
+                self._logger.info(
+                    "[ULTRA:%s] FP_DELTA_USER pin=%s fields=%s %s", device_id, pin, diff_fields, sample,
+                )
+            if added:
+                self._logger.info(
+                    "[ULTRA:%s] FP_DELTA_ADDED count=%d sample=%s", device_id, len(added), added[:8],
+                )
+            if removed:
+                self._logger.info(
+                    "[ULTRA:%s] FP_DELTA_REMOVED count=%d sample=%s", device_id, len(removed), removed[:8],
+                )
+        except Exception as exc:
+            self._logger.warning("[ULTRA:%s] FP_DELTA logging failed: %s", device_id, exc)
 
     def update_devices(self, devices: List[Dict[str, Any]]) -> None:
         """Replace the scheduler's device list with the latest payload.
@@ -2216,6 +2932,11 @@ class UltraSyncScheduler:
         the workers see.
         """
         self._devices = list(devices)
+        # Drop the (comparatively large) diagnostic fingerprint snapshots for any
+        # device no longer in the list so removed devices don't leak their breakdown.
+        live_ids = {d.get("id") for d in self._devices}
+        for _stale in [k for k in self._last_fp_detail if k not in live_ids]:
+            self._last_fp_detail.pop(_stale, None)
 
     def start(self, devices: List[Dict[str, Any]]):
         self._devices = devices
@@ -2397,9 +3118,11 @@ class UltraSyncScheduler:
                     else:
                         users = getattr(cache, "users", []) or []
                         engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+                        cur_detail: Dict[str, Any] = {}
                         current_hash, desired_users = engine.build_device_sync_fingerprint(
                             device=d,
                             users=list(users),
+                            detail_out=cur_detail,
                         )
                         if self._last_hash.get(device_id) == current_hash:
                             self._logger.info(
@@ -2408,8 +3131,21 @@ class UltraSyncScheduler:
                                 desired_users,
                                 current_hash[:12],
                             )
+                            # Fingerprint matches the device's last-synced state, so this
+                            # breakdown IS the synced baseline — refresh it for the next diff.
+                            self._last_fp_detail[device_id] = cur_detail
                             did_sync = False
                         else:
+                            # Telemetry: log which user/field flipped the fingerprint so a
+                            # spurious flip (paired with FULL_SYNC_DEVICE to_sync=0) is
+                            # identifiable — that's the unnecessary live-worker freeze.
+                            # NOTE: diff against the last-SYNCED baseline and do NOT overwrite
+                            # it here — if this sync fails, the retry must still show the real
+                            # delta (not an empty one). It's refreshed on the next unchanged cycle.
+                            self._log_fingerprint_delta(
+                                device_id, self._last_fp_detail.get(device_id), cur_detail,
+                                reason=str(reason or "manual"),
+                            )
                             routed = bool(
                                 worker.request_full_sync(
                                     reason=reason,
@@ -2474,9 +3210,11 @@ class UltraSyncScheduler:
 
         users = getattr(cache, "users", []) or []
         engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+        cur_detail: Dict[str, Any] = {}
         current_hash, desired_users = engine.build_device_sync_fingerprint(
             device=device,
             users=list(users),
+            detail_out=cur_detail,
         )
 
         if self._last_hash.get(device_id) == current_hash:
@@ -2484,8 +3222,14 @@ class UltraSyncScheduler:
                 "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
                 device_id, desired_users, current_hash[:12],
             )
+            self._last_fp_detail[device_id] = cur_detail
             return False
 
+        # Diff against the last-SYNCED baseline; refresh _last_fp_detail only AFTER a
+        # successful push (below), so a failed push leaves the real delta visible on retry.
+        self._log_fingerprint_delta(
+            device_id, self._last_fp_detail.get(device_id), cur_detail, reason="ultra_sync",
+        )
         self._logger.info(
             "[ULTRA:%s] sync push started: desired_users=%d prev_hash=%s new_hash=%s",
             device_id, desired_users,
@@ -2528,6 +3272,7 @@ class UltraSyncScheduler:
                 self._logger.warning("[ULTRA:%s] sync push failed or was skipped", device_id)
                 return False
             self._last_hash[device_id] = current_hash
+            self._last_fp_detail[device_id] = cur_detail  # baseline now matches synced state
             self._logger.info("[ULTRA:%s] sync push complete", device_id)
             return True
         finally:

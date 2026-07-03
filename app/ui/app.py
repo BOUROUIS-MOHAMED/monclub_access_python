@@ -5,6 +5,7 @@ local API server, sync engines, and Tauri UI launcher.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import queue
@@ -49,6 +50,28 @@ from access.store import (
     set_offline_creation_try_to_create,
     update_offline_creation_payload,
 )
+from app.core.db import (
+    cancel_offline_subresources_for,
+    insert_offline_subresource,
+    list_due_offline_subresources,
+    list_offline_subresources_for,
+    mark_offline_subresource_done,
+    mark_offline_subresource_failed,
+)
+from app.core.db import (
+    archive_offline_mutation,
+    cancel_offline_mutation,
+    claim_offline_mutation_for_processing,
+    get_offline_mutation,
+    insert_offline_mutation,
+    list_offline_mutations,
+    list_offline_mutations_due_for_retry,
+    mark_offline_mutation_conflict,
+    mark_offline_mutation_failure,
+    mark_offline_mutation_success,
+    set_offline_mutation_try,
+    _MONEY_OP_KINDS,
+)
 from access.settings import get_backend_global_settings
 from shared.log_buffer import LogBuffer
 from shared.logging import setup_logging
@@ -71,7 +94,7 @@ from access.runtime import (
 )
 from app.core.ultra_engine import UltraEngine
 from access.api import LocalAccessApiServerV2
-from shared.api.monclub_api import MonClubApi, MonClubApiHttpError
+from shared.api.monclub_api import MonClubApi, MonClubApiConflictError, MonClubApiHttpError
 from app.core.change_detector import ChangeDetectorService
 from app.core.log_sync_request_poller import LogSyncRequestPoller
 from app.core.sync_observability import (
@@ -507,6 +530,13 @@ class MainApp:
         self._offline_retry_interval_sec = 3600
         self._last_offline_retry_epoch = 0.0
         self._last_sync_online = False
+        # Lifecycle-mutation queue (edit/renew/freeze/balance/delete/taxes on synced members).
+        self._offline_mutation_lock = threading.Lock()
+        self._last_mutation_retry_epoch = 0.0
+        # HARD GATE: offline MONEY mutations (renew/balance/pay/markPaid) stay queued but are
+        # NOT attempted until the backend idempotency layer is deployed — else a retry
+        # double-charges. Flip to True only after that backend change ships.
+        self._offline_money_mutations_enabled = False
         # H-005: Real sync telemetry for /status endpoint
         self._last_sync_at: Optional[str] = None
         self._last_sync_ok: bool = False
@@ -1062,6 +1092,29 @@ class MainApp:
             pass
         self._active_view = "restricted"
 
+    def _reactive_token_refresh(self) -> Optional[str]:
+        """Reactively rotate the access token using the stored refresh token after a 401.
+
+        Used by the ChangeDetector (and any background poller) when the backend
+        rejects the current JWT. Forces a refresh regardless of the proactive
+        deadline and returns the new access token, or None when the session is
+        truly gone or the refresh failed transiently (the caller should back off
+        and retry, not hard-stop). Never raises.
+        """
+        try:
+            auth = load_auth_token()
+            if not auth or not auth.email:
+                return None
+            api = self._api()
+            if api.do_proactive_refresh(email=auth.email, force=True):
+                reloaded = load_auth_token()
+                if reloaded and reloaded.token:
+                    return reloaded.token
+            return None
+        except Exception as exc:
+            self.logger.debug("[Auth] reactive token refresh failed: %s", exc)
+            return None
+
     def _start_change_detector(self) -> None:
         """Lazily create and start ChangeDetectorService once logged in."""
         if self._change_detector is not None and self._change_detector._thread and self._change_detector._thread.is_alive():
@@ -1078,7 +1131,7 @@ class MainApp:
                 app=self,
                 backend_base_url=MONCLUB_BASE_URL,
                 get_token_fn=lambda: (load_auth_token().token if load_auth_token() else ""),
-                re_login_fn=lambda: None,
+                re_login_fn=self._reactive_token_refresh,
                 gym_id=int(gym_id),
                 logger=self.logger,
             )
@@ -1471,6 +1524,13 @@ class MainApp:
         if bool(attempt.get("ok")):
             reconciled = bool(attempt.get("state") == "reconciled" or attempt.get("alreadyExists"))
             row = mark_offline_creation_success(local_id, reconciled=reconciled, result=attempt.get("result") if isinstance(attempt.get("result"), dict) else None)
+            # Now that the real activeMembershipId is known, push any deferred
+            # sub-resources (fingerprint templates, photo) captured while offline.
+            if row and row.get("server_active_membership_id"):
+                try:
+                    self.process_due_offline_subresources(limit=200)
+                except Exception as ex:
+                    self.logger.warning("[OfflineSubresource] post-reconcile push failed for %s: %s", local_id, ex)
             return {"ok": True, "row": row, "state": "reconciled" if reconciled else "succeeded", "source": source}
         row = mark_offline_creation_failure(
             local_id,
@@ -1534,6 +1594,429 @@ class MainApp:
                                  summary.get("processed"), summary.get("succeeded"), summary.get("reconciled"), summary.get("failed"), run_source)
         except Exception as ex:
             self.logger.exception("[OfflineCreation] retry run failed: %s", ex)
+        # Drain deferred sub-resources (fingerprint/photo) whose parent member has
+        # since reconciled and now carries a real activeMembershipId.
+        try:
+            sub_summary = self.process_due_offline_subresources(limit=200)
+            if sub_summary.get("ok") and int(sub_summary.get("pushed") or 0) > 0:
+                self.logger.info("[OfflineSubresource] pushed=%s processed=%s source=%s",
+                                 sub_summary.get("pushed"), sub_summary.get("processed"), run_source)
+        except Exception as ex:
+            self.logger.exception("[OfflineSubresource] drain failed: %s", ex)
+        # Drain queued lifecycle mutations (edit/delete/freeze/tax; money ops stay gated).
+        try:
+            mut_summary = self.process_due_offline_mutations(source=run_source, limit=100)
+            if mut_summary.get("ok") and int(mut_summary.get("processed") or 0) > 0:
+                self.logger.info(
+                    "[OfflineMutation] processed=%s succeeded=%s reconciled=%s conflicts=%s failed=%s gated=%s source=%s",
+                    mut_summary.get("processed"), mut_summary.get("succeeded"), mut_summary.get("reconciled"),
+                    mut_summary.get("conflicts"), mut_summary.get("failed"), mut_summary.get("gated"), run_source,
+                )
+        except Exception as ex:
+            self.logger.exception("[OfflineMutation] drain failed: %s", ex)
+
+    def _push_offline_subresource(self, sub: Dict[str, Any], *, creation: Dict[str, Any], token: str) -> bool:
+        """Push one deferred sub-resource against the now-known real activeMembershipId."""
+        sid = str(sub.get("id") or "")
+        kind = str(sub.get("kind") or "").strip().lower()
+        payload = sub.get("payload") if isinstance(sub.get("payload"), dict) else {}
+        try:
+            am_id = int(creation.get("server_active_membership_id"))
+        except Exception:
+            return False
+        if am_id <= 0:
+            return False
+        try:
+            if kind == "fingerprint":
+                body = {
+                    "activeMembershipId": am_id,
+                    "fingerId": int(payload.get("finger_id") or payload.get("fingerId") or 0),
+                    "templateVersion": int(payload.get("tpl_ver") or payload.get("templateVersion") or 0),
+                    "templateEncoding": str(payload.get("enc_backend") or payload.get("templateEncoding") or ""),
+                    "templateData": str(payload.get("tpl_text") or payload.get("templateData") or ""),
+                    "label": str(payload.get("label") or "access"),
+                    "enabled": True,
+                }
+                resp = self._api().create_user_fingerprint(token=token, payload=body)
+                server_ref = str((resp or {}).get("id") or "") or None
+                mark_offline_subresource_done(sid, server_ref=server_ref)
+                self.logger.info("[OfflineSubresource] fingerprint pushed local=%s am=%s finger=%s",
+                                 sub.get("creation_local_id"), am_id, body.get("fingerId"))
+                return True
+            if kind == "photo":
+                ref = self._push_member_photo(active_membership_id=am_id, payload=payload, token=token)
+                mark_offline_subresource_done(sid, server_ref=ref or None)
+                self.logger.info("[OfflineSubresource] photo pushed local=%s am=%s fileId=%s",
+                                 sub.get("creation_local_id"), am_id, ref)
+                return True
+            mark_offline_subresource_failed(sid, message=f"sub-resource kind '{kind}' not yet supported", max_attempts=1)
+            return False
+        except MonClubApiHttpError as e:
+            mark_offline_subresource_failed(sid, message=f"HTTP {getattr(e, 'status_code', '?')}: {e}")
+            self.logger.warning("[OfflineSubresource] push failed local=%s kind=%s: %s",
+                                sub.get("creation_local_id"), kind, e)
+            return False
+        except Exception as e:
+            mark_offline_subresource_failed(sid, message=str(e))
+            self.logger.warning("[OfflineSubresource] push error local=%s kind=%s: %s",
+                                sub.get("creation_local_id"), kind, e)
+            return False
+
+    def process_due_offline_subresources(self, *, limit: int = 200) -> Dict[str, Any]:
+        token = self._auth_token_value()
+        if not token:
+            return {"ok": False, "error": "no-auth", "processed": 0, "pushed": 0, "skipped": 0}
+        due = list_due_offline_subresources(limit=limit)
+        processed = 0
+        pushed = 0
+        skipped = 0
+        for sub in due:
+            cid = str(sub.get("creation_local_id") or "").strip()
+            creation = get_offline_creation(cid) if cid else None
+            if not creation:
+                mark_offline_subresource_failed(str(sub.get("id") or ""), message="parent creation row missing", max_attempts=1)
+                continue
+            state = str(creation.get("state") or "")
+            if state in ("cancelled", "failed_terminal", "archived"):
+                cancel_offline_subresources_for(cid)
+                continue
+            if not creation.get("server_active_membership_id"):
+                skipped += 1  # parent not reconciled yet — leave pending, no attempt consumed
+                continue
+            processed += 1
+            if self._push_offline_subresource(sub, creation=creation, token=token):
+                pushed += 1
+        return {"ok": True, "processed": processed, "pushed": pushed, "skipped": skipped}
+
+    # ----------------------- member photo (managed media) -----------------------
+    def _offline_media_dir(self) -> str:
+        from access.storage import current_access_runtime_db_path
+        base = os.path.dirname(str(current_access_runtime_db_path()))
+        d = os.path.join(base, "offline_media")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _photo_ext_for(content_type: str, file_name: str) -> str:
+        ct = (content_type or "").lower()
+        if "png" in ct:
+            return ".png"
+        if "webp" in ct:
+            return ".webp"
+        fn = (file_name or "").lower()
+        for e in (".png", ".webp"):
+            if fn.endswith(e):
+                return e
+        return ".jpg"
+
+    def _upload_member_photo_bytes(self, *, active_membership_id: int, data: bytes, content_type: str, file_name: str, token: str) -> str:
+        """Run the 3-step managed-media flow (createUploadSession → PUT bytes → finalize)
+        and return the resulting StoredFile id. finalize links the file to the membership."""
+        api = self._api()
+        sess = api.media_create_upload_session(
+            token=token, file_name=file_name, content_type=content_type,
+            size_bytes=len(data), active_membership_id=int(active_membership_id),
+        )
+        api.media_put_object(
+            upload_url=sess.get("uploadUrl"), upload_method=sess.get("uploadMethod"),
+            upload_headers=sess.get("uploadHeaders"), upload_fields=sess.get("uploadFields"),
+            data=data, content_type=content_type, file_name=file_name,
+        )
+        fin = api.media_finalize_upload(
+            token=token, session_id=int(sess.get("sessionId")), active_membership_id=int(active_membership_id),
+        )
+        return str(fin.get("fileId") or "")
+
+    def _push_member_photo(self, *, active_membership_id: int, payload: Dict[str, Any], token: str) -> str:
+        path = str(payload.get("file_path") or "")
+        if not path or not os.path.exists(path):
+            raise RuntimeError(f"pending photo file is missing: {path or '(none)'}")
+        with open(path, "rb") as f:
+            data = f.read()
+        ref = self._upload_member_photo_bytes(
+            active_membership_id=int(active_membership_id), data=data,
+            content_type=str(payload.get("content_type") or "image/jpeg"),
+            file_name=str(payload.get("file_name") or "member.jpg"), token=token,
+        )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return ref
+
+    def upload_member_photo_now(self, *, active_membership_id: int, image_base64: str, content_type: str = "image/jpeg", file_name: str = "member.jpg") -> Dict[str, Any]:
+        """Attach a photo to an ALREADY-SYNCED member immediately (online)."""
+        token = self._auth_token_value()
+        if not token:
+            return {"ok": False, "error": "Not logged in."}
+        try:
+            data = base64.b64decode(image_base64 or "", validate=False)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid image data: {e}"}
+        if not data:
+            return {"ok": False, "error": "empty image"}
+        try:
+            ref = self._upload_member_photo_bytes(
+                active_membership_id=int(active_membership_id), data=data,
+                content_type=content_type or "image/jpeg", file_name=file_name or "member.jpg", token=token,
+            )
+            return {"ok": True, "fileId": ref}
+        except MonClubApiHttpError as e:
+            return {"ok": False, "error": str(e), "status": getattr(e, "status_code", None)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def store_member_photo_pending(self, *, creation_local_id: str, image_base64: str, content_type: str = "image/jpeg", file_name: str = "member.jpg") -> Dict[str, Any]:
+        """Store a photo for an OFFLINE-PENDING member on disk + enqueue a deferred
+        upload that fires once the member reconciles and its real id is known."""
+        creation = get_offline_creation(str(creation_local_id))
+        if not creation:
+            return {"ok": False, "error": "Unknown offline member (creation row not found)."}
+        state = str(creation.get("state") or "")
+        if state in ("cancelled", "failed_terminal", "archived"):
+            return {"ok": False, "error": f"This offline member is {state}; cannot attach a photo."}
+        try:
+            data = base64.b64decode(image_base64 or "", validate=False)
+        except Exception as e:
+            return {"ok": False, "error": f"invalid image data: {e}"}
+        if not data:
+            return {"ok": False, "error": "empty image"}
+        ext = self._photo_ext_for(content_type, file_name)
+        path = os.path.join(self._offline_media_dir(), f"{uuid.uuid4().hex}{ext}")
+        try:
+            with open(path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            return {"ok": False, "error": f"failed to store photo locally: {e}"}
+        try:
+            insert_offline_subresource(
+                creation_local_id=str(creation_local_id), kind="photo",
+                payload={"file_path": path, "content_type": content_type or "image/jpeg", "file_name": file_name or "member.jpg"},
+            )
+        except Exception as e:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return {"ok": False, "error": str(e)}
+        # If the member already reconciled (race), push now instead of waiting for the drain.
+        if creation.get("server_active_membership_id"):
+            try:
+                self.process_due_offline_subresources(limit=50)
+            except Exception:
+                pass
+        return {"ok": True, "deferred": True}
+
+    # ======================= Offline lifecycle mutations =======================
+    def attempt_offline_mutation(
+        self, *, op_kind: str, target_kind: str, target_id: int, payload: Dict[str, Any],
+        money: bool | None = None, expected_version: int | None = None, client_request_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Online-first attempt of a single lifecycle mutation. Returns a result dict the
+        caller maps to the queue state. A 409 is surfaced distinctly (conflict) so a money
+        clobber is never silently retried."""
+        token = self._auth_token_value()
+        if not token:
+            return {
+                "ok": False, "failureType": "auth", "failureCode": "AUTH_REQUIRED",
+                "lastHttpStatus": 401, "error": "Authentication required. Please re-login.",
+            }
+        rid = str(client_request_id or __import__("uuid").uuid4())
+        try:
+            api = self._api()
+            resp = api.apply_lifecycle_mutation(
+                op_kind=op_kind, target_id=int(target_id), payload=dict(payload or {}),
+                token=token, idempotency_key=rid, expected_version=expected_version,
+            )
+            if not isinstance(resp, dict):
+                resp = {"raw": resp}
+            already = bool(resp.get("alreadyExists") or resp.get("idempotentReplay"))
+            return {
+                "ok": True, "clientRequestId": rid,
+                "state": "reconciled" if already else "succeeded", "result": resp,
+            }
+        except MonClubApiConflictError as e:
+            return {
+                "ok": False, "conflict": True, "lastHttpStatus": 409,
+                "error": str(e), "serverState": getattr(e, "server_state", None),
+            }
+        except MonClubApiHttpError as e:
+            c = classify_failure(http_status=getattr(e, "status_code", None), message=str(e))
+            return {
+                "ok": False, "failureType": c.get("failure_type"), "failureCode": c.get("failure_code"),
+                "lastHttpStatus": getattr(e, "status_code", None), "error": str(e),
+            }
+        except Exception as e:
+            c = classify_failure(http_status=None, message=str(e))
+            return {
+                "ok": False, "failureType": c.get("failure_type"), "failureCode": c.get("failure_code"),
+                "lastHttpStatus": None, "error": str(e),
+            }
+
+    def process_offline_mutation_row(self, local_id: str, *, source: str = "manual", force: bool = False) -> Dict[str, Any]:
+        row0 = get_offline_mutation(local_id)
+        if not row0:
+            return {"ok": False, "error": "not-found", "localId": local_id}
+        if bool(row0.get("money")) and not self._offline_money_mutations_enabled:
+            # Stay pending until the backend idempotency layer is deployed.
+            return {"ok": False, "error": "money-gated", "localId": local_id, "state": row0.get("state")}
+
+        claimed = claim_offline_mutation_for_processing(local_id, force=bool(force))
+        if not claimed:
+            return {"ok": False, "error": "not-claimable", "localId": local_id}
+
+        attempt = self.attempt_offline_mutation(
+            op_kind=str(claimed.get("op_kind")), target_kind=str(claimed.get("target_kind")),
+            target_id=int(claimed.get("target_id")),
+            payload=claimed.get("payload") if isinstance(claimed.get("payload"), dict) else {},
+            money=bool(claimed.get("money")), expected_version=claimed.get("expected_version"),
+            client_request_id=str(claimed.get("client_request_id") or "") or None,
+        )
+        if bool(attempt.get("ok")):
+            reconciled = bool(attempt.get("state") == "reconciled")
+            row = mark_offline_mutation_success(
+                local_id, reconciled=reconciled,
+                result=attempt.get("result") if isinstance(attempt.get("result"), dict) else None,
+            )
+            return {"ok": True, "row": row, "state": (row or {}).get("state"), "source": source}
+        if bool(attempt.get("conflict")):
+            row = mark_offline_mutation_conflict(
+                local_id, http_status=409, message=str(attempt.get("error") or "conflict"),
+                server_state=attempt.get("serverState") if isinstance(attempt.get("serverState"), dict) else None,
+            )
+            return {"ok": False, "row": row, "state": "conflict", "source": source, "error": attempt.get("error")}
+
+        # Money rows get a lower failure ceiling so a stuck money mutation surfaces fast.
+        max_fail = 3 if bool(claimed.get("money")) else 5
+        row = mark_offline_mutation_failure(
+            local_id, failure_type=str(attempt.get("failureType") or "server"),
+            failure_code=str(attempt.get("failureCode") or "UNKNOWN"),
+            http_status=attempt.get("lastHttpStatus"), message=str(attempt.get("error") or "Mutation failed"),
+            max_countable_failures=max_fail,
+        )
+        return {"ok": False, "row": row, "state": (row or {}).get("state"), "source": source, "error": attempt.get("error")}
+
+    def process_due_offline_mutations(self, *, source: str = "hourly", limit: int = 50) -> Dict[str, Any]:
+        if not self._offline_mutation_lock.acquire(blocking=False):
+            return {"ok": False, "error": "already-running", "processed": 0}
+        try:
+            due = list_offline_mutations_due_for_retry(limit=limit)
+            processed = succeeded = reconciled = failed = conflicts = gated = 0
+            for r in due:
+                lid = str(r.get("local_id") or "").strip()
+                if not lid:
+                    continue
+                if bool(r.get("money")) and not self._offline_money_mutations_enabled:
+                    gated += 1
+                    continue
+                res = self.process_offline_mutation_row(lid, source=source, force=False)
+                processed += 1
+                st = str(res.get("state") or "")
+                if bool(res.get("ok")):
+                    if st == "reconciled":
+                        reconciled += 1
+                    else:
+                        succeeded += 1
+                elif st == "conflict":
+                    conflicts += 1
+                else:
+                    failed += 1
+            self._last_mutation_retry_epoch = time.time()
+            return {
+                "ok": True, "processed": processed, "succeeded": succeeded, "reconciled": reconciled,
+                "conflicts": conflicts, "failed": failed, "gated": gated, "source": source,
+            }
+        finally:
+            self._offline_mutation_lock.release()
+
+    def submit_offline_mutation(
+        self, *, op_kind: str, target_kind: str, target_id: int, payload: Dict[str, Any],
+        money: bool | None = None, expected_version: int | None = None, depends_on_local_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Entry point for a lifecycle action. Online-first: tries the backend immediately;
+        on a transport/offline/5xx/auth failure (recommendation=save_later) it queues a
+        pending row that the drain retries with the SAME idempotency key. A 409 conflict and
+        a 400/422 validation error are surfaced to the operator (never silently queued — a
+        money clobber must be an explicit decision). Money ops while the gate is off are
+        queued straight to pending WITHOUT a live attempt (the backend isn't idempotency-safe
+        yet)."""
+        kind = (op_kind or "").strip().lower()
+        if int(target_id) <= 0:
+            return {"ok": False, "error": "invalid target id (must be a real synced member)"}
+        is_money = bool(money) if money is not None else (kind in _MONEY_OP_KINDS)
+        rid = str(__import__("uuid").uuid4())
+
+        def _enqueue(failure: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            try:
+                row = insert_offline_mutation(
+                    op_kind=kind, target_kind=target_kind, target_id=int(target_id), payload=payload,
+                    money=is_money, expected_version=expected_version, depends_on_local_id=depends_on_local_id,
+                    client_request_id=rid,
+                )
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            ft = str((failure or {}).get("failureType") or "").strip().lower()
+            if ft:
+                upd = mark_offline_mutation_failure(
+                    row["local_id"], failure_type=ft,
+                    failure_code=str((failure or {}).get("failureCode") or "UNKNOWN"),
+                    http_status=(failure or {}).get("lastHttpStatus"),
+                    message=str((failure or {}).get("error") or "Mutation failed"),
+                    max_countable_failures=3 if is_money else 5,
+                )
+                if upd:
+                    row = upd
+            return {"ok": False, "queued": True, "gated": bool((failure or {}).get("gated")),
+                    "localId": row["local_id"], "state": row.get("state")}
+
+        if is_money and not self._offline_money_mutations_enabled:
+            return _enqueue({"gated": True})
+
+        attempt = self.attempt_offline_mutation(
+            op_kind=kind, target_kind=target_kind, target_id=int(target_id), payload=payload,
+            money=is_money, expected_version=expected_version, client_request_id=rid,
+        )
+        if bool(attempt.get("ok")):
+            return {"ok": True, "state": attempt.get("state"), "result": attempt.get("result")}
+        if bool(attempt.get("conflict")):
+            return {"ok": False, "conflict": True, "lastHttpStatus": 409,
+                    "error": attempt.get("error"), "serverState": attempt.get("serverState")}
+        c = classify_failure(http_status=attempt.get("lastHttpStatus"), message=str(attempt.get("error") or ""))
+        if c.get("recommendation") == "save_later":
+            return _enqueue({
+                "failureType": c.get("failure_type"), "failureCode": c.get("failure_code"),
+                "lastHttpStatus": attempt.get("lastHttpStatus"), "error": attempt.get("error"),
+            })
+        # validation / modify-required: surface to operator, do not queue a doomed retry.
+        return {"ok": False, "needsFix": True, "lastHttpStatus": attempt.get("lastHttpStatus"),
+                "failureType": c.get("failure_type"), "error": attempt.get("error")}
+
+    def resolve_offline_mutation_conflict(
+        self, local_id: str, *, action: str, new_payload: Dict[str, Any] | None = None, new_expected_version: int | None = None,
+    ) -> Dict[str, Any]:
+        """Operator decision on a conflicted row: 'abort' cancels it; 'rebase' archives it
+        and enqueues a fresh row (new idempotency key) carrying the re-derived absolute
+        snapshot on top of the current server version."""
+        row = get_offline_mutation(local_id)
+        if not row:
+            return {"ok": False, "error": "not-found"}
+        if str(row.get("state")) != "conflict":
+            return {"ok": False, "error": "row is not in conflict"}
+        act = (action or "").strip().lower()
+        if act == "abort":
+            cancel_offline_mutation(local_id, reason="operator aborted after conflict")
+            return {"ok": True, "action": "abort"}
+        if act == "rebase":
+            new = insert_offline_mutation(
+                op_kind=str(row.get("op_kind")), target_kind=str(row.get("target_kind")),
+                target_id=int(row.get("target_id")),
+                payload=new_payload if isinstance(new_payload, dict) else (row.get("payload") or {}),
+                money=bool(row.get("money")), expected_version=new_expected_version,
+            )
+            archive_offline_mutation(local_id)
+            return {"ok": True, "action": "rebase", "localId": new["local_id"]}
+        return {"ok": False, "error": "unknown action (use abort|rebase)"}
+
     # ======================= Sync timer =======================
     def request_sync_now(
         self,
@@ -2606,6 +3089,35 @@ class MainApp:
                 "tpl_ver": tpl_ver,
                 "enc_backend": enc_backend,
             })
+
+            # Offline-pending member: the real activeMembershipId does not exist yet
+            # (the resolved id is a synthetic negative projection id). Persist the
+            # template durably against the parent creation row so it is pushed
+            # automatically once that member reconciles with the backend.
+            pending_local_id = ""
+            if isinstance(user_obj, dict):
+                pending_local_id = str(user_obj.get("offlinePendingLocalId") or "").strip()
+            is_pending_member = bool(pending_local_id) or (isinstance(active_membership_id, int) and active_membership_id < 0)
+            if is_pending_member:
+                if not pending_local_id:
+                    fail("This member was created offline but its pending record is missing; cannot defer the fingerprint.")
+                    return
+                insert_offline_subresource(
+                    creation_local_id=pending_local_id,
+                    kind="fingerprint",
+                    payload={
+                        "finger_id": int(finger_id),
+                        "tpl_text": tpl_text,
+                        "tpl_ver": int(tpl_ver),
+                        "enc_backend": enc_backend,
+                        "label": "access",
+                    },
+                )
+                _enroll_clear_tpl()  # nothing to retry-push; it's deferred durably
+                self.logger.info("[OfflineSubresource] fingerprint deferred for pending member local=%s finger=%s",
+                                 pending_local_id, finger_id)
+                success("Fingerprint captured. It will be saved to the member automatically once they sync to the server.")
+                return
 
             _enroll_set_phase({"phase": "push"})
             step("Saving to backend...")

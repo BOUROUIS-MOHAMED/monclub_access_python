@@ -20,6 +20,7 @@ from app.core.db import (
     load_agent_rtlog_state,
     save_agent_rtlog_state,
     access_history_exists,
+    get_sync_membership_brief,
 )
 from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
@@ -361,6 +362,8 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "userValidFrom": req.user_valid_from,
         "userValidTo": req.user_valid_to,
         "userMembershipId": req.user_membership_id,
+        "userMembershipTitle": req.user_membership_title,
+        "userMembersType": req.user_members_type,
         "userPhone": req.user_phone,
         "deviceId": req.device_id,
         "deviceName": req.device_name,
@@ -1140,6 +1143,18 @@ class DecisionService(threading.Thread):
             except Exception:
                 _resolved_user_id = None
 
+            # Membership resolved at verify time. QR/TOTP rows carry no device pin/card
+            # for the uploader to re-resolve, so persist it now; otherwise the backend
+            # drops them for having a null activeMembership and they never appear in the
+            # dashboard door-history.
+            try:
+                _am_src = vr.get("activeMembershipId") if isinstance(vr, dict) else None
+                if _am_src in (None, "") and isinstance(_vr_user, dict):
+                    _am_src = _vr_user.get("activeMembershipId")
+                _resolved_am_id: int | None = int(_am_src) if _am_src not in (None, "") else None
+            except Exception:
+                _resolved_am_id = None
+
             # F-013: INSERT OR IGNORE into access_history BEFORE opening door.
             # rowcount==1 means this worker claimed the event; rowcount==0 means another worker already inserted it.
             # This prevents TOCTOU double door-open: the INSERT is atomic on the UNIQUE(event_id) constraint.
@@ -1161,8 +1176,11 @@ class DecisionService(threading.Thread):
                             cmd_ms=0.0,
                             cmd_ok=None,
                             cmd_error=None,
-                            raw=dict(ev.raw),
+                            # Tag QR/TOTP entries so the uploader emits type=QR_CODE
+                            # (software-verified QR has no device verifytype in the raw).
+                            raw={**dict(ev.raw), "scanMode": scan_mode} if scan_mode else dict(ev.raw),
                             user_id=_resolved_user_id,
+                            active_membership_id=_resolved_am_id,
                         )
                 except Exception as ex:
                     _history_claimed = 0
@@ -1262,6 +1280,19 @@ class DecisionService(threading.Thread):
             user = vr.get("user") if isinstance(vr, dict) else None
             user_name = _safe_str((user or {}).get("fullName"), "-") if isinstance(user, dict) else "-"
             user_phone = _safe_str((user or {}).get("phone"), "") if isinstance(user, dict) else ""
+
+            # Resolve the membership plan name + type (for the scan-popup badge). Best-effort:
+            # a missing/unknown membership just yields blank title and NORMAL type.
+            membership_brief: Dict[str, Any] = {}
+            if isinstance(user, dict):
+                try:
+                    membership_brief = get_sync_membership_brief(
+                        user.get("membershipId") or user.get("membership_id")
+                    )
+                except Exception:
+                    membership_brief = {}
+            user_membership_title = _safe_str(membership_brief.get("title"), "")
+            user_members_type = _safe_str(membership_brief.get("membersType"), "")
             user_id = _safe_str((user or {}).get("userId"), "") if isinstance(user, dict) else ""
             user_image = _safe_str((user or {}).get("image"), "") if isinstance(user, dict) else ""
             user_profile_image = _safe_str((user or {}).get("userProfileImage"), "") if isinstance(user, dict) else ""
@@ -1352,6 +1383,8 @@ class DecisionService(threading.Thread):
                 user_valid_from=_safe_str((user or {}).get("validFrom", (user or {}).get("valid_from")), "") if isinstance(user, dict) else "",
                 user_valid_to=_safe_str((user or {}).get("validTo", (user or {}).get("valid_to")), "") if isinstance(user, dict) else "",
                 user_membership_id=_safe_int(am_id, 0) if am_id else None,
+                user_membership_title=user_membership_title,
+                user_members_type=user_members_type,
                 user_birthday=_safe_str((user or {}).get("birthday"), "") if isinstance(user, dict) else "",
                 user_phone=user_phone,
                 device_id=int(ev.device_id),
@@ -1605,7 +1638,13 @@ class AgentRealtimeEngine:
 
         self._global_cache_at = 0.0
         self._global_cache: Dict[str, Any] = {}
-        self._global_cache_ttl_sec = 2.0
+        # 20s (was 2s): the notification worker loop reads global settings every
+        # tick; on the antivirus-slow gym PC each uncached read is 282-875ms
+        # (CACHE_LOAD_GLOBAL_SETTINGS ~53x/hr) and contends with the ULTRA worker
+        # for the same SQLite. A real settings apply still clears this immediately
+        # via reset_fast_patch_caches(), so the only cost is picking up an
+        # un-applied backend settings change up to 20s later — never a door change.
+        self._global_cache_ttl_sec = 20.0
 
     # ---------- settings providers (SQLite cached) ----------
 

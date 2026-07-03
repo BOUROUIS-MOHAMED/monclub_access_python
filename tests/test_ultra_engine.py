@@ -98,6 +98,7 @@ def _make_worker(
     worker._prefix = f"[ULTRA:{worker._device_id}]"
     worker._tel_wid = f"ULTRA:{worker._device_id}"
     worker._card_cooldown = {}
+    worker._staff_codes = {}
 
     worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
     worker._busy_max = int(settings.get("busy_sleep_max_ms", 50))
@@ -131,6 +132,7 @@ def _make_worker(
     worker._last_full_sync_error = ""
     worker._full_sync_running = False
     worker._cmd_queue = queue.Queue(maxsize=10)
+    worker._sdk_cmd_queue = queue.Queue(maxsize=8)
     worker._wake_evt = threading.Event()
     worker._sync_pause = threading.Event()
     worker._sync_paused_ack = threading.Event()
@@ -785,6 +787,38 @@ class TestTotpRescueFlow:
         # Counters
         assert worker._totp_rescues == 1
         assert worker._totp_failures == 0
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.verify_totp_resilient")
+    def test_valid_totp_persists_member_and_tags_qr_scanmode(self, mock_verify, mock_iah):
+        """Regression (door-history): a QR/TOTP row's card_no is a rotating token the
+        backend uploader cannot re-resolve, so the ULTRA path must persist the resolved
+        user_id + active_membership_id AND tag raw with scanMode=QR_TOTP. Without these
+        the backend drops the row from member-filtered door-history and labels it CARD
+        (shown as 'RFID'). Mirrors the AGENT path (realtime_agent.py)."""
+        mock_verify.return_value = {
+            "allowed": True,
+            "reason": "ALLOW",
+            "activeMembershipId": 42,
+            "user": {"fullName": "Bob", "userId": 777, "activeMembershipId": 42},
+        }
+
+        worker = _make_worker()
+        worker._cached_state = _EMPTY_LOCAL_STATE
+        worker._cached_state_ts = time.monotonic()
+        mock_sdk = MagicMock()
+        mock_sdk.open_door.return_value = True
+        worker._sdk = mock_sdk
+
+        worker._process_event(self._make_totp_event("91234567"))
+
+        mock_iah.assert_called_once()
+        kwargs = mock_iah.call_args.kwargs
+        assert kwargs["user_id"] == 777
+        assert kwargs["active_membership_id"] == 42
+        assert kwargs["event_type"] == "QR_TOTP"
+        assert isinstance(kwargs["raw"], dict)
+        assert kwargs["raw"].get("scanMode") == "QR_TOTP"
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.verify_totp_resilient")
@@ -1555,3 +1589,454 @@ def test_totp_index_rebuilds_on_generation_change():
     worker._maybe_rebuild_totp_index()
     s2, g2 = _ue._get_shared_totp_index()
     assert g2 == 6 and s2 is not s1
+
+
+def test_totp_index_accepts_newer_gen_without_thrash():
+    # Regression guard for the two-worker gen-thrash: a worker whose creds are at
+    # gen N must REUSE a shared index published at gen N+1 (a newer index is a
+    # subset of eligible creds => stricter on revocation), NOT rebuild/restamp it
+    # down. This is the >= gate (build + verify) that collapsed ~700 builds/hr.
+    settings = _make_settings()
+    worker = _make_worker(settings=settings)
+    worker._cached_state = ([_index_cred()], {}, {})
+    _ue._set_shared_totp_index(None, -1)
+    worker._cached_state_gen = 6
+    worker._maybe_rebuild_totp_index()
+    s6, g6 = _ue._get_shared_totp_index()
+    assert g6 == 6 and s6 is not None
+
+    worker._cached_state_gen = 5  # lagging worker (older creds)
+    worker._maybe_rebuild_totp_index()
+    s_after, g_after = _ue._get_shared_totp_index()
+    assert s_after is s6 and g_after == 6  # reused the newer index, no rebuild
+
+
+def test_reentry_block_flags_different_card_as_per_door_lockout():
+    # The smoking gun for the reported "random person's first scan rejected" bug:
+    # person A accepted (EVENT=0) on door 1, then person B's DIFFERENT card is
+    # rejected with EVENT=20 ("Too Short Punch Interval") on the same door shortly
+    # after. REENTRY_BLOCK must record same_card=False + A as the last accept =>
+    # DoorNIntertime is acting as a per-DOOR lockout, not per-card.
+    from unittest.mock import patch, MagicMock
+    worker = _make_worker()
+    worker._handle_allow = MagicMock()
+    worker._handle_rfid_rescue = MagicMock()
+    worker._handle_totp_rescue = MagicMock()
+
+    with patch.object(_ue, "_tel") as tel:
+        worker._process_event(_make_event(event_id="A", card_no="1111111", event_type=0, door_id=1))
+        worker._process_event(_make_event(event_id="B", card_no="2222222", event_type=20, door_id=1))
+
+    blocks = [c for c in tel.event.call_args_list if c.args and c.args[0] == "REENTRY_BLOCK"]
+    assert len(blocks) == 1
+    kw = blocks[0].kwargs
+    assert kw["door"] == 1
+    assert kw["same_card"] is False              # DIFFERENT card => per-door lockout signature
+    assert kw["last_accept_card"] == "11***11"   # person A masked
+    assert kw["rejected_card"] == "22***22"      # person B masked
+    assert 0 <= kw["last_accept_delta_s"] < 5    # A entered moments earlier
+
+
+def test_reentry_block_flags_same_card_as_genuine_reentry():
+    # A genuine per-CARD re-entry (same card blocked by the device) => same_card=
+    # True (working as intended, NOT the bug). Pre-seed the last-accept for the
+    # SAME card WITHOUT feeding EVENT=0 (which would also arm the software per-card
+    # cooldown and skip the EVENT=20 before telemetry); leave _card_cooldown empty
+    # so the EVENT=20 is processed.
+    from unittest.mock import patch, MagicMock
+    worker = _make_worker()
+    worker._handle_rfid_rescue = MagicMock()
+    worker._reentry_last_accept = {2: ("7654321", time.monotonic())}
+
+    with patch.object(_ue, "_tel") as tel:
+        worker._process_event(_make_event(event_id="B", card_no="7654321", event_type=20, door_id=2))
+
+    blocks = [c for c in tel.event.call_args_list if c.args and c.args[0] == "REENTRY_BLOCK"]
+    assert blocks and blocks[0].kwargs["same_card"] is True
+
+
+def test_shared_totp_index_publish_is_monotonic():
+    # A lagging worker must not lower the shared generation (defense-in-depth
+    # against a build-race); a clear (None) is always allowed.
+    _ue._set_shared_totp_index({"idx": "g6"}, 6)
+    _ue._set_shared_totp_index({"idx": "g5"}, 5)  # older -> rejected
+    s, g = _ue._get_shared_totp_index()
+    assert g == 6 and s == {"idx": "g6"}
+    _ue._set_shared_totp_index({"idx": "g7"}, 7)  # newer -> accepted
+    s, g = _ue._get_shared_totp_index()
+    assert g == 7 and s == {"idx": "g7"}
+    _ue._set_shared_totp_index(None, -1)  # clear -> always allowed
+    s, _ = _ue._get_shared_totp_index()
+    assert s is None
+
+
+# ---------------------------------------------------------------------------
+# Operator SDK command queue (DevicesPage control panel). Reads/writes a device
+# parameter or syncs the clock on the worker's single held SDK socket — never a
+# second Connect. Separate queue from the door-open path.
+# ---------------------------------------------------------------------------
+def test_request_run_sdk_round_trip():
+    worker = _make_worker()
+    worker._connected = True
+    mock_sdk = MagicMock()
+    mock_sdk.get_device_param.return_value = "Door1Intertime=30"
+    worker._sdk = mock_sdk
+    holder = {}
+
+    def caller():
+        holder["box"] = worker.request_run_sdk(
+            lambda sdk: sdk.get_device_param(items="Door1Intertime"),
+            label="read", timeout=2.0,
+        )
+
+    t = threading.Thread(target=caller)
+    t.start()
+    for _ in range(400):  # wait until the command is enqueued, then drain it
+        if not worker._sdk_cmd_queue.empty():
+            break
+        time.sleep(0.005)
+    worker._drain_sdk_commands()
+    t.join(timeout=2.0)
+    assert holder["box"]["ok"] is True
+    assert holder["box"]["result"] == "Door1Intertime=30"
+
+
+def _enqueue_sdk(worker, fn, label="op", deadline=None):
+    ev = threading.Event()
+    box = {"ok": False, "result": None, "error": "timeout", "label": label}
+    if deadline is None:
+        deadline = time.monotonic() + 60.0  # far future -> will execute
+    worker._sdk_cmd_queue.put_nowait((fn, label, ev, box, deadline))
+    return ev, box
+
+
+def test_drain_sdk_commands_skips_expired_write():
+    # A command past its deadline (caller already timed out) must NOT execute —
+    # a late SetDeviceParam landing on reconnect could silently change a device.
+    worker = _make_worker()
+    worker._connected = True
+    worker._sdk = MagicMock()
+    ran = {"v": False}
+
+    def writer(sdk):
+        ran["v"] = True
+        return "applied"
+
+    ev, box = _enqueue_sdk(worker, writer, label="reentry_set",
+                           deadline=time.monotonic() - 1.0)  # already expired
+    worker._drain_sdk_commands()
+    assert ran["v"] is False  # never executed
+    assert box["ok"] is False and "expired" in box["error"]
+    assert ev.is_set()
+
+
+def test_drain_sdk_commands_not_connected():
+    worker = _make_worker()
+    worker._connected = False
+    worker._sdk = MagicMock()
+    ev, box = _enqueue_sdk(worker, lambda sdk: "x")
+    worker._drain_sdk_commands()
+    assert ev.is_set()
+    assert box["ok"] is False and "not connected" in box["error"]
+
+
+def test_drain_sdk_commands_captures_full_error():
+    worker = _make_worker()
+    worker._connected = True
+    worker._sdk = MagicMock()
+
+    def boom(sdk):
+        raise RuntimeError("SetDeviceParam FAILED rc=-201 PullLastError=-201")
+
+    ev, box = _enqueue_sdk(worker, boom)
+    worker._drain_sdk_commands()
+    assert box["ok"] is False
+    assert "rc=-201" in box["error"]  # full SDK error preserved for the popup
+
+
+def test_request_run_sdk_times_out_without_drain():
+    worker = _make_worker()
+    worker._connected = True
+    worker._sdk = MagicMock()
+    box = worker.request_run_sdk(lambda sdk: "x", label="read", timeout=0.1)
+    assert box["ok"] is False and box["error"] == "timeout"
+    assert worker._sdk_cmd_queue.qsize() == 1  # still pending, not lost
+
+
+# ---------------------------------------------------------------------------
+# Staff re-entry exemption (TOTP): staff plans bypass the long re-entry block
+# but still pay the short debounce floor (so the C3 multi-event burst is deduped).
+# ---------------------------------------------------------------------------
+def test_staff_code_exempt_from_reentry_block_keeps_debounce_floor():
+    settings = _make_settings(
+        totp_prefix="9", totp_digits=6,
+        anti_fraude_qr_code=True, anti_fraude_card=True, anti_fraude_duration=30,
+    )
+    worker = _make_worker(settings=settings)
+    qr = "9123456"  # prefix '9' + 6 digits -> QR format
+
+    # Baseline: anti-fraud on -> the full 30s re-entry block.
+    assert worker._effective_card_cooldown_sec(qr) == 30.0
+
+    # Marked as a recently-rescued staff code -> only the debounce floor.
+    worker._staff_codes[qr] = time.monotonic() + 60.0
+    assert worker._effective_card_cooldown_sec(qr) == _ULTRA_CARD_DEBOUNCE_SEC
+
+    # An expired staff entry no longer exempts.
+    worker._staff_codes[qr] = time.monotonic() - 1.0
+    assert worker._effective_card_cooldown_sec(qr) == 30.0
+
+
+def test_non_staff_code_unaffected_by_exemption():
+    settings = _make_settings(
+        totp_prefix="9", totp_digits=6,
+        anti_fraude_qr_code=True, anti_fraude_duration=30,
+    )
+    worker = _make_worker(settings=settings)
+    # A different code, never marked staff, keeps the full block.
+    assert worker._effective_card_cooldown_sec("9777777") == 30.0
+    # And RFID cards are untouched by the staff-code path (not in _staff_codes).
+    worker._staff_codes["9123456"] = time.monotonic() + 60.0
+    assert worker._effective_card_cooldown_sec("9777777") == 30.0
+
+
+# ---------------------------------------------------------------------------
+# RFID staff-rescue (denied + valid + staff -> PC opens, skip delay; else deny).
+# Security-critical: a NEW door-opening path. Confirmed by the on-device log that
+# the C3 fires EVENT=20 (Too Short Punch Interval) with the card on an interval
+# block, per-door + per-card.
+# ---------------------------------------------------------------------------
+_STAFF_PLAN = 99
+_NONSTAFF_PLAN = 10
+_STAFF_CARD = "13604719"
+_NONSTAFF_CARD = "22222222"
+
+
+def _rescue_worker():
+    settings = _make_settings(totp_digits=7, totp_prefix="9")
+    settings.update({
+        "rfid_enabled": True,
+        "ultra_rfid_staff_rescue_enabled": True,
+        "anti_fraude_card": True,
+        "anti_fraude_duration": 30,
+        "totp_validation": True,
+    })
+    w = _make_worker(settings=settings)
+    staff_user = {"fullName": "Staff Person", "membershipId": _STAFF_PLAN, "activeMembershipId": 500,
+                  "image": "img", "phone": "111"}
+    member_user = {"fullName": "Regular Member", "membershipId": _NONSTAFF_PLAN, "activeMembershipId": 501}
+    w._cached_state = ([], {500: staff_user, 501: member_user},
+                       {_STAFF_CARD: [staff_user], _NONSTAFF_CARD: [member_user]})
+    w._cached_state_gen = get_local_state_generation()
+    w._cached_state_ts = time.monotonic()
+    return w
+
+
+def test_is_staff_rfid_card():
+    w = _rescue_worker()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        assert w._is_staff_rfid_card(_STAFF_CARD) is True
+        assert w._is_staff_rfid_card(_NONSTAFF_CARD) is False
+        assert w._is_staff_rfid_card("00000000") is False      # unknown card
+        assert w._is_staff_rfid_card("91234567") is False       # TOTP format -> not RFID
+    # setting off -> never staff
+    w._settings["ultra_rfid_staff_rescue_enabled"] = False
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        assert w._is_staff_rfid_card(_STAFF_CARD) is False
+
+
+def test_rfid_rescue_opens_for_valid_staff():
+    w = _rescue_worker()
+    w._open_door_with_retry = MagicMock(return_value=True)
+    w._enqueue_notification = MagicMock()
+    w._enqueue_history = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._handle_rfid_rescue(_STAFF_CARD, "t", "evt1", 1, "20", {})
+    w._open_door_with_retry.assert_called_once()
+    kw = w._enqueue_notification.call_args.kwargs
+    assert kw["allowed"] is True and kw["reason"] == "ALLOW_STAFF_RFID"
+    assert kw["user_full_name"] == "Staff Person"
+    assert kw["user_membership_id"] == 500 and kw["user_membership_plan_id"] == _STAFF_PLAN
+
+
+def test_rfid_rescue_denies_valid_non_staff():
+    w = _rescue_worker()
+    w._open_door_with_retry = MagicMock(return_value=True)
+    w._handle_deny = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._handle_rfid_rescue(_NONSTAFF_CARD, "t", "evt2", 1, "20", {})
+    w._open_door_with_retry.assert_not_called()   # non-staff -> device deny stands
+    w._handle_deny.assert_called_once()
+
+
+def test_rfid_rescue_denies_unknown_card():
+    w = _rescue_worker()
+    w._open_door_with_retry = MagicMock(return_value=True)
+    w._handle_deny = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._handle_rfid_rescue("00000000", "t", "evt3", 1, "20", {})
+    w._open_door_with_retry.assert_not_called()
+    w._handle_deny.assert_called_once()
+
+
+def test_rfid_rescue_respects_disable_flag():
+    w = _rescue_worker()
+    w._settings["ultra_rfid_staff_rescue_enabled"] = False
+    w._open_door_with_retry = MagicMock(return_value=True)
+    w._handle_deny = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._handle_rfid_rescue(_STAFF_CARD, "t", "evt4", 1, "20", {})
+    w._open_door_with_retry.assert_not_called()
+    w._handle_deny.assert_called_once()
+
+
+def test_rfid_rescue_door_fail_reports_failure():
+    w = _rescue_worker()
+    w._open_door_with_retry = MagicMock(return_value=False)
+    w._enqueue_notification = MagicMock()
+    w._enqueue_history = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._handle_rfid_rescue(_STAFF_CARD, "t", "evt5", 1, "20", {})
+    kw = w._enqueue_notification.call_args.kwargs
+    assert kw["allowed"] is False and kw["reason"] == "DOOR_CMD_FAILED"
+
+
+def _deny_evt(card, eid):
+    return {"cardNo": card, "eventType": "20", "eventTime": "2026-06-28T20:43:25",
+            "eventId": eid, "doorId": 1, "rawRow": {}}
+
+
+def test_cooldown_lets_staff_rfid_reentry_reach_rescue():
+    # Staff re-tap within the anti-fraud window but past the debounce floor must
+    # NOT be skipped (so the rescue runs and re-opens for staff).
+    w = _rescue_worker()
+    w._card_cooldown = {_STAFF_CARD: time.monotonic() - 8.0}  # 8s ago: < 30s window, > 3s floor
+    w._handle_rfid_rescue = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._process_event(_deny_evt(_STAFF_CARD, "e20"))
+    w._handle_rfid_rescue.assert_called_once()
+
+
+def test_cooldown_skips_nonstaff_rfid_reentry():
+    w = _rescue_worker()
+    w._card_cooldown = {_NONSTAFF_CARD: time.monotonic() - 8.0}
+    w._handle_rfid_rescue = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._process_event(_deny_evt(_NONSTAFF_CARD, "e21"))
+    w._handle_rfid_rescue.assert_not_called()   # non-staff -> cooldown skips it (deny stands)
+
+
+def test_cooldown_skips_staff_within_debounce_floor():
+    # A burst re-tap inside the debounce floor is still deduped, even for staff.
+    w = _rescue_worker()
+    w._card_cooldown = {_STAFF_CARD: time.monotonic() - 1.0}  # 1s ago: within ~3s floor
+    w._handle_rfid_rescue = MagicMock()
+    with patch.object(_ue, "get_staff_membership_ids_cached", return_value={_STAFF_PLAN}):
+        w._process_event(_deny_evt(_STAFF_CARD, "e22"))
+    w._handle_rfid_rescue.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestOffLoopHistoryWriter — per-event history insert moved OFF the live loop
+#
+# Regression guard for the ~30-min "freeze": a sync flooding the DbWriter used to
+# stall the worker loop for seconds per event because insert_access_history ran
+# synchronously on it. The insert now runs on a dedicated writer thread; the loop
+# only enqueues. These tests verify both the async (writer-thread) path and the
+# synchronous inline fallback (no writer thread, e.g. unit tests / writer died).
+# ---------------------------------------------------------------------------
+
+class TestOffLoopHistoryWriter:
+    def _history_kwargs(self, event_id="evt-async-1", card_no="555555"):
+        return dict(
+            event_id=event_id,
+            allowed=True,
+            reason="ALLOW_TEST",
+            event_type="0",
+            card_no=card_no,
+            event_time="2026-06-30 10:00:00",
+            door_id=1,
+        )
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    def test_inline_fallback_when_no_writer_thread(self, mock_iah):
+        # No writer thread (unit-test path): the insert runs inline and the record
+        # lands on _history_q synchronously — preserving existing test behavior.
+        w = _make_worker()
+        assert getattr(w, "_history_writer_thread", None) is None
+        w._enqueue_history(**self._history_kwargs())
+        assert mock_iah.call_count == 1
+        rec = w._history_q.get_nowait()
+        assert isinstance(rec, HistoryRecord)
+        assert rec.event_id == "evt-async-1"
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    def test_async_path_persists_off_loop(self, mock_iah):
+        # With the writer thread alive, _enqueue_history only enqueues (does NOT
+        # call the DB inline); the writer thread performs the insert and the record
+        # appears on _history_q shortly after.
+        w = _make_worker()
+        w._ensure_history_writer()
+        try:
+            assert w._history_writer_thread.is_alive()
+            w._enqueue_history(**self._history_kwargs(event_id="evt-async-2"))
+            # The worker loop must NOT have done the insert itself.
+            rec = w._history_q.get(timeout=2.0)  # writer thread fills this
+            assert rec.event_id == "evt-async-2"
+            assert mock_iah.call_count == 1
+        finally:
+            w._stop_evt.set()
+            w._history_writer_thread.join(timeout=2.0)
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=0)
+    def test_duplicate_not_forwarded_to_backend_queue(self, mock_iah):
+        # rowcount==0 (INSERT OR IGNORE hit a dup) must NOT enqueue to _history_q.
+        w = _make_worker()
+        w._enqueue_history(**self._history_kwargs(event_id="dup-1"))
+        assert mock_iah.call_count == 1
+        assert w._history_q.empty()
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    def test_write_q_overflow_drops_oldest_never_blocks(self, mock_iah):
+        # Simulate a stalled writer: fill the bounded write queue past capacity via
+        # the async path and confirm enqueue never blocks and drops the OLDEST.
+        w = _make_worker()
+        # A live-but-idle writer thread so _enqueue_history takes the async branch,
+        # but we keep the queue from draining by holding the stop flag unset and
+        # using a tiny queue we control directly.
+        w._history_write_q = queue.Queue(maxsize=2)
+
+        class _AliveThread:
+            def is_alive(self_inner):
+                return True
+
+        w._history_writer_thread = _AliveThread()
+        w._enqueue_history(**self._history_kwargs(event_id="q1"))
+        w._enqueue_history(**self._history_kwargs(event_id="q2"))
+        w._enqueue_history(**self._history_kwargs(event_id="q3"))  # overflow -> drop oldest
+        assert w._history_write_q.qsize() == 2
+        ids = []
+        while not w._history_write_q.empty():
+            ids.append(w._history_write_q.get_nowait()["event_id"])
+        assert ids == ["q2", "q3"]  # q1 (oldest) was dropped
+        assert mock_iah.call_count == 0  # nothing was inserted on the loop
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    def test_flush_persists_all_pending(self, mock_iah):
+        # _flush_history_writes drains and persists everything queued (shutdown path).
+        w = _make_worker()
+        wq = w._get_history_write_q()
+
+        class _AliveThread:
+            def is_alive(self_inner):
+                return True
+
+        w._history_writer_thread = _AliveThread()  # force async enqueue
+        for i in range(5):
+            w._enqueue_history(**self._history_kwargs(event_id=f"flush-{i}"))
+        assert w._history_q.empty()       # nothing persisted yet (async)
+        assert wq.qsize() == 5
+        w._history_writer_thread = None   # drop the fake so flush can run cleanly
+        w._flush_history_writes()
+        assert mock_iah.call_count == 5
+        assert w._history_q.qsize() == 5

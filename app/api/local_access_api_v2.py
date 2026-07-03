@@ -1861,6 +1861,73 @@ def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
     ctx.send_json(200, {"memberships": list_sync_memberships()})
 
 
+def _handle_members_roster(ctx: _Ctx) -> None:
+    """Local-first, searchable/filterable/paginated member roster for the Access UI.
+    Backed by the local sync cache (incl. projected offline-pending members), so it
+    works fully offline; when online the cache is kept fresh by the normal sync."""
+    from app.core.db import list_members_roster
+
+    q = ctx.q("q", "search", default="")
+    status = ctx.q("status", default="all")
+    sort_by = ctx.q("sortBy", "sort_by", default="name")
+    sort_dir = ctx.q("sortDir", "sort_dir", default="asc")
+    limit = ctx.q_int("limit", default=25)
+    offset = ctx.q_int("offset", default=0)
+
+    rows, total, counts = list_members_roster(
+        q=q,
+        status=status,
+        limit=limit,
+        offset=offset,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    ctx.send_json(200, {
+        "ok": True,
+        "rows": rows,
+        "total": total,
+        "counts": counts,
+        "limit": max(1, int(limit or 25)),
+        "offset": max(0, int(offset or 0)),
+    })
+
+
+def _handle_member_photo(ctx: _Ctx) -> None:
+    """Attach a member photo. For a SYNCED member (real activeMembershipId) it uploads
+    immediately via the managed-media presign flow; for an OFFLINE-PENDING member
+    (offlinePendingLocalId) it stores the photo and defers the upload until reconcile."""
+    body = ctx.body()
+    image_b64 = _safe_str(body.get("imageBase64") or body.get("image_base64"), "").strip()
+    if not image_b64:
+        ctx.send_json(400, {"ok": False, "error": "imageBase64 is required"})
+        return
+    if image_b64.startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    content_type = _safe_str(body.get("contentType") or body.get("content_type"), "image/jpeg")
+    file_name = _safe_str(body.get("fileName") or body.get("file_name"), "member.jpg")
+    local_id = _safe_str(body.get("offlinePendingLocalId") or body.get("localId") or body.get("local_id"), "").strip()
+    am_raw = body.get("activeMembershipId")
+    if am_raw is None:
+        am_raw = body.get("active_membership_id")
+    try:
+        am_id = int(am_raw) if am_raw is not None and str(am_raw).strip() != "" else 0
+    except Exception:
+        am_id = 0
+
+    try:
+        if local_id:
+            res = ctx.app.store_member_photo_pending(creation_local_id=local_id, image_base64=image_b64, content_type=content_type, file_name=file_name)
+        elif am_id > 0:
+            res = ctx.app.upload_member_photo_now(active_membership_id=am_id, image_base64=image_b64, content_type=content_type, file_name=file_name)
+        else:
+            ctx.send_json(400, {"ok": False, "error": "Provide offlinePendingLocalId (pending member) or a real activeMembershipId (synced member)."})
+            return
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+        return
+    ctx.send_json(200 if res.get("ok") else 400, res)
+
+
 def _handle_sync_cache_devices(ctx: _Ctx) -> None:
     from app.core.db import list_sync_devices_payload, list_sync_devices_payload_from_cache, peek_sync_cache
     include_door_presets = _safe_bool(
@@ -3452,6 +3519,107 @@ def _handle_offline_creations_process_due(ctx: _Ctx) -> None:
     ctx.send_json(200, {"ok": True, "summary": summary})
 
 
+def _handle_offline_subresources_list(ctx: _Ctx) -> None:
+    """List deferred sub-resources (fingerprint/photo) captured for offline members.
+    Optional ?localId= filters to one creation row; otherwise returns active rows."""
+    from app.core.db import list_due_offline_subresources, list_offline_subresources_for
+
+    local_id = _safe_str(ctx.q("localId", "local_id", default=""), "").strip()
+    if local_id:
+        rows = list_offline_subresources_for(local_id)
+    else:
+        rows = list_due_offline_subresources(limit=ctx.q_int("limit", default=500))
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": len(rows)})
+
+
+def _handle_offline_subresources_process_due(ctx: _Ctx) -> None:
+    """Manually drain deferred sub-resources whose parent member has reconciled."""
+    res = ctx.app.process_due_offline_subresources(limit=ctx.q_int("limit", default=200))
+    ctx.send_json(200, res)
+
+
+def _handle_member_mutation(ctx: _Ctx) -> None:
+    """Submit a lifecycle mutation (edit/delete/freeze/tax/...) on a SYNCED member.
+    Online-first → queue-on-failure. The body is generic so the UI builds each op:
+      { opKind, targetKind?, targetId, payload, expectedVersion?, money?, dependsOnLocalId? }
+    Always replies HTTP 200 with an outcome (ok/queued/conflict/needsFix) so the UI decides."""
+    body = ctx.body()
+    op_kind = _safe_str(body.get("opKind") or body.get("op_kind"), "").strip().lower()
+    target_kind = _safe_str(body.get("targetKind") or body.get("target_kind"), "active_membership").strip().lower()
+    raw_tid = body.get("targetId")
+    if raw_tid is None:
+        raw_tid = body.get("target_id")
+    try:
+        tid = int(raw_tid)
+    except Exception:
+        tid = 0
+    payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+    ev_raw = body.get("expectedVersion")
+    if ev_raw is None:
+        ev_raw = body.get("expected_version")
+    try:
+        ev = int(ev_raw) if ev_raw is not None and str(ev_raw).strip() != "" else None
+    except Exception:
+        ev = None
+    money = body.get("money")
+    depends = _safe_str(body.get("dependsOnLocalId") or body.get("depends_on_local_id"), "").strip() or None
+
+    if not op_kind or tid <= 0:
+        ctx.send_json(400, {"ok": False, "error": "opKind and a positive targetId are required"})
+        return
+    try:
+        res = ctx.app.submit_offline_mutation(
+            op_kind=op_kind, target_kind=target_kind, target_id=tid, payload=payload,
+            money=money, expected_version=ev, depends_on_local_id=depends,
+        )
+    except Exception as e:
+        ctx.send_json(400, {"ok": False, "error": str(e)})
+        return
+    ctx.send_json(200, res)
+
+
+def _handle_mutations_list(ctx: _Ctx) -> None:
+    from app.core.db import list_offline_mutations, count_offline_mutations
+    raw = ctx.q("state", "states", default="")
+    states = [s.strip().lower() for s in raw.replace(";", ",").split(",") if s.strip()] or None
+    include_archived = _safe_str(ctx.q("includeArchived", "include", default=""), "") in ("1", "true")
+    limit = ctx.q_int("limit", default=200)
+    offset = ctx.q_int("offset", default=0)
+    rows = list_offline_mutations(states=states, include_archived=include_archived, limit=limit, offset=offset)
+    total = count_offline_mutations(states=states, include_archived=include_archived)
+    ctx.send_json(200, {"ok": True, "rows": rows, "total": total})
+
+
+def _handle_mutations_process_due(ctx: _Ctx) -> None:
+    res = ctx.app.process_due_offline_mutations(source="manual", limit=ctx.q_int("limit", default=100))
+    ctx.send_json(200, res)
+
+
+def _handle_mutation_retry(ctx: _Ctx) -> None:
+    res = ctx.app.process_offline_mutation_row(ctx.param("localId"), source="manual_retry", force=True)
+    ctx.send_json(200, res)
+
+
+def _handle_mutation_cancel(ctx: _Ctx) -> None:
+    from app.core.db import cancel_offline_mutation
+    body = ctx.body()
+    row = cancel_offline_mutation(ctx.param("localId"), reason=_safe_str(body.get("reason"), "") or None)
+    ctx.send_json(200, {"ok": True, "row": row})
+
+
+def _handle_mutation_resolve(ctx: _Ctx) -> None:
+    body = ctx.body()
+    action = _safe_str(body.get("action"), "").strip().lower()
+    new_payload = body.get("payload") if isinstance(body.get("payload"), dict) else None
+    nev_raw = body.get("expectedVersion")
+    try:
+        nev = int(nev_raw) if nev_raw is not None and str(nev_raw).strip() != "" else None
+    except Exception:
+        nev = None
+    res = ctx.app.resolve_offline_mutation_conflict(ctx.param("localId"), action=action, new_payload=new_payload, new_expected_version=nev)
+    ctx.send_json(200 if res.get("ok") else 400, res)
+
+
 # ==================== 5) DEVICES (PullSDK) ====================
 
 # Keep a small pool of per-device SDK connections for session-like use.
@@ -3712,6 +3880,319 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
     finally:
         try: sdk.disconnect()
         except Exception: pass
+
+
+def _parse_device_param_kv(raw: str) -> Dict[str, str]:
+    """Parse a PullSDK 'k=v\\r\\nk=v,k=v' device-param blob into a dict."""
+    out: Dict[str, str] = {}
+    for part in (raw or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        for seg in part.split(","):
+            seg = seg.strip()
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+def _read_device_control_settings(sdk) -> Dict[str, Any]:
+    """Read live control settings from a connected SDK: per-door re-entry interval
+    (Door{N}Intertime) + RTC drift vs the PC. Works on both PullSDK (DEVICE-mode)
+    and PullSDKDevice (ULTRA worker) — both expose get_device_param. Read-only."""
+    from app.sdk.pullsdk import zk_datetime_decode
+    out: Dict[str, Any] = {"doors": [], "clock": {}}
+    if not sdk.supports_get_device_param():
+        return out
+    raw = sdk.get_device_param(
+        items="Door1Intertime,Door2Intertime,Door3Intertime,Door4Intertime,DateTime",
+        initial_size=65536,
+    )
+    kv = _parse_device_param_kv(raw or "")
+    for n in (1, 2, 3, 4):
+        key = f"Door{n}Intertime"
+        if key in kv:
+            try:
+                out["doors"].append({"doorNumber": n, "intertimeSec": int(kv[key])})
+            except (ValueError, TypeError):
+                pass
+    dt = kv.get("DateTime")
+    if dt is not None:
+        try:
+            y, mo, d, h, mi, s = zk_datetime_decode(int(dt))
+            dev_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0, -1))
+            pc_now = time.time()
+            out["clock"] = {
+                "deviceEpoch": round(dev_epoch),
+                "pcEpoch": round(pc_now),
+                "driftSec": round(pc_now - dev_epoch, 1),
+            }
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return out
+
+
+def _handle_device_settings_get(ctx: _Ctx) -> None:
+    """GET /devices/{id}/settings — live re-entry interval per door + clock drift.
+
+    ULTRA devices: the read is marshalled onto the worker's held SDK socket via
+    request_run_sdk (never a 2nd Connect — handle-leak/daily-lockup safe). For
+    DEVICE-mode/unmanaged devices it opens a one-shot connection.
+    """
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    r = _run_on_device_sdk(ctx, did, _read_device_control_settings, label="settings_get")
+    if r["ok"]:
+        ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
+    else:
+        payload = {"ok": False, "error": r["error"]}
+        if "downForSec" in r:
+            payload["downForSec"] = r["downForSec"]
+        ctx.send_json(r["status"], payload)
+
+
+def _device_door_numbers(did: int) -> List[int]:
+    """Door numbers to write the re-entry param to — the same set device_sync
+    iterates (its synced door presets). Falls back to [1, 2] (C3-200 default)."""
+    try:
+        from app.core.db import list_sync_device_door_presets_payload
+        presets = list_sync_device_door_presets_payload(did) or []
+        nums = sorted({_safe_int((p or {}).get("doorNumber"), 0) for p in presets})
+        nums = [n for n in nums if n >= 1]
+        if nums:
+            return nums
+    except Exception:
+        pass
+    return [1, 2]
+
+
+def _verify_reentry_readback(readback: Dict[str, Any], door_numbers: List[int], effective: int) -> bool:
+    """True iff every written door reads back the effective interval (green check)."""
+    by_door = {d.get("doorNumber"): d.get("intertimeSec") for d in (readback.get("doors") or [])}
+    return bool(door_numbers) and all(by_door.get(n) == effective for n in door_numbers)
+
+
+def _apply_software_reentry(worker: Any, enabled: bool, seconds: int) -> bool:
+    """Hot-swap the worker's anti_fraude_* so the QR/TOTP per-card cooldown matches
+    the device-side block. Live (update_device, no restart). Persistence is handled
+    by _save_reentry_to_backend in the same handler (best-effort, surfaced via the
+    backendSaved flag) — on success the change survives the next sync; if the
+    backend save fails the next sync re-pushes the old value and this reverts."""
+    try:
+        cur = dict(getattr(worker, "_settings", {}) or {})
+        cur["anti_fraude_qr_code"] = bool(enabled)
+        cur["anti_fraude_card"] = bool(enabled)
+        if enabled and seconds > 0:
+            cur["anti_fraude_duration"] = int(seconds)
+        worker.update_device(getattr(worker, "_device", {}) or {}, cur)
+        return True
+    except Exception as e:
+        _logger.warning("[LocalAPI] reentry software-side update failed: did=? err=%s", e)
+        return False
+
+
+def _handle_device_reentry_set(ctx: _Ctx) -> None:
+    """POST /devices/{id}/reentry {enabled, seconds} — set the re-entry block.
+
+    RFID (device-opened): SetDeviceParam(Door{N}Intertime) on the controller via
+    the worker's held socket (never a 2nd Connect). QR (PC-opened): hot-swap the
+    worker anti_fraude_* per-card cooldown. The device value is read back to
+    verify. enabled=false writes 0 (off). Backend persistence is slice 3.
+    """
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    body = ctx.body()
+    enabled = _safe_bool(body.get("enabled"), False)
+    seconds = _safe_int(body.get("seconds"), 0)
+    # When enabled, clamp to 5-255 so the device (range 0-255) and the backend
+    # (antiFraudeDuration clamped 5-300) agree on the stored value. When disabled
+    # the device gets 0 (off) and the backend toggles carry the off-state.
+    if enabled:
+        seconds = max(5, min(255, seconds))
+    else:
+        seconds = 0
+    effective = seconds  # 0 when disabled
+
+    door_numbers = _device_door_numbers(did)
+    items = ",".join(f"Door{n}Intertime={effective}" for n in door_numbers)
+
+    def _apply(sdk):
+        if not sdk.supports_set_device_param():
+            raise RuntimeError("SetDeviceParam not supported by this device/dll")
+        sdk.set_device_param(items=items)  # raises PullSDKError (rc+PullLastError) on failure
+        return _read_device_control_settings(sdk)  # read-back for the green-check verify
+
+    r = _run_on_device_sdk(ctx, did, _apply, label="reentry_set")
+    if not r["ok"]:
+        payload = {"ok": False, "error": r["error"]}
+        if "downForSec" in r:
+            payload["downForSec"] = r["downForSec"]
+        ctx.send_json(r["status"], payload)
+        return
+    readback = r["result"] or {}
+    rfid_ok = _verify_reentry_readback(readback, door_numbers, effective)
+
+    # QR software-side cooldown — ULTRA only (DEVICE-mode has no PC-side worker).
+    qr_ok = False
+    if r["mode"] == "ultra":
+        ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+        worker = ultra_eng._workers.get(did) if ultra_eng else None
+        if worker:
+            qr_ok = _apply_software_reentry(worker, enabled, effective)
+
+    # Persist to the backend so the change survives the next sync (it re-pushes
+    # anti_fraude_* and would otherwise revert both halves). Best-effort: the
+    # live apply already succeeded, and the visible backendSaved flag exposes
+    # whether persistence worked rather than assuming it.
+    backend_saved, backend_error = _save_reentry_to_backend(ctx, did, enabled, seconds)
+
+    ctx.send_json(200, {
+        "ok": True, "mode": r["mode"],
+        "enabled": enabled, "effectiveSec": effective, "doorsWritten": door_numbers,
+        "rfid": rfid_ok, "qr": qr_ok,
+        "backendSaved": backend_saved, "backendError": backend_error,
+        "readBack": readback,
+    })
+
+
+def _save_reentry_to_backend(ctx: _Ctx, did: int, enabled: bool, seconds: int) -> Tuple[bool, str]:
+    """Persist anti_fraude_* to the backend GymDevice (best-effort). Returns
+    (saved, error). The device-duration is clamped to the backend's 5-300 range;
+    on/off is carried by the card/qr toggles so 'off' keeps a valid duration."""
+    try:
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        token = getattr(auth, "token", None) if auth else None
+        if not token:
+            return False, "not logged in"
+        api = ctx.app._api() if hasattr(ctx.app, "_api") else None
+        if api is None or not hasattr(api, "update_device_control_settings"):
+            return False, "backend save not available"
+        dur = min(300, max(5, int(seconds) if int(seconds) >= 5 else 30))
+        api.update_device_control_settings(
+            token=token, device_id=did,
+            anti_fraude_card=bool(enabled), anti_fraude_qr_code=bool(enabled),
+            anti_fraude_duration=dur,
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 5.0) -> Dict[str, Any]:
+    """Run ``fn(sdk)`` against a device and return {ok,result,error,mode,status}.
+
+    Single place for the connection rule: ULTRA devices go through the worker's
+    held socket via the command queue (NEVER a 2nd Connect — handle-leak safe);
+    DEVICE-mode/unmanaged devices get a one-shot connection. Keeps the control
+    handlers (settings/reentry/clock) consistent.
+    """
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    if ultra_eng and getattr(ultra_eng, "running", False):
+        worker = ultra_eng._workers.get(did)
+        if worker:
+            down_for = float(getattr(worker, "_down_for_seconds", lambda: 0.0)())
+            if down_for > 0 and not getattr(worker, "_connected", False):
+                return {"ok": False, "result": None, "error": "device unreachable",
+                        "mode": "ultra", "status": 503, "downForSec": round(down_for, 1)}
+            res = worker.request_run_sdk(fn, label=label, timeout=timeout)
+            if res.get("ok"):
+                return {"ok": True, "result": res.get("result"), "error": "", "mode": "ultra", "status": 200}
+            err = res.get("error") or "device command failed"
+            status = 503 if err in ("timeout", "device not connected", "expired (not executed)") else 500
+            return {"ok": False, "result": None, "error": err, "mode": "ultra", "status": status}
+
+    sdk, err = _connect_device(ctx, did)
+    if err:
+        return {"ok": False, "result": None, "error": err, "mode": "device", "status": 503}
+    try:
+        return {"ok": True, "result": fn(sdk), "error": "", "mode": "device", "status": 200}
+    except Exception as e:
+        return {"ok": False, "result": None, "error": str(e), "mode": "device", "status": 500}
+    finally:
+        try: sdk.disconnect()
+        except Exception: pass
+
+
+def _read_device_clock(sdk) -> Dict[str, Any]:
+    """Read device RTC and compute drift vs the PC. Read-only; works on PullSDK
+    and PullSDKDevice (uses get_device_param only)."""
+    from app.sdk.pullsdk import zk_datetime_decode
+    if not sdk.supports_get_device_param():
+        return {}
+    kv = _parse_device_param_kv(sdk.get_device_param(items="DateTime") or "")
+    dt = kv.get("DateTime")
+    if dt is None:
+        return {}
+    try:
+        y, mo, d, h, mi, s = zk_datetime_decode(int(dt))
+        dev_epoch = time.mktime((y, mo, d, h, mi, s, 0, 0, -1))
+        pc_now = time.time()
+        return {
+            "deviceEpoch": round(dev_epoch), "pcEpoch": round(pc_now),
+            "driftSec": round(pc_now - dev_epoch, 1),
+        }
+    except (ValueError, TypeError, OverflowError):
+        return {}
+
+
+def _sync_device_clock(sdk) -> Dict[str, Any]:
+    """Set device RTC to the PC's current time, then read back the drift. Uses
+    set_device_param(DateTime=...) so it works on both SDK classes."""
+    from app.sdk.pullsdk import zk_datetime_encode
+    if not sdk.supports_set_device_param():
+        raise RuntimeError("SetDeviceParam not supported by this device/dll")
+    lt = time.localtime(time.time())
+    enc = zk_datetime_encode(lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec)
+    sdk.set_device_param(items=f"DateTime={enc}")
+    return _read_device_clock(sdk)
+
+
+def _handle_device_clock_get(ctx: _Ctx) -> None:
+    """GET /devices/{id}/clock — device RTC drift vs the PC (read-only)."""
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    r = _run_on_device_sdk(ctx, did, _read_device_clock, label="clock_get")
+    if r["ok"]:
+        ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
+    else:
+        payload = {"ok": False, "error": r["error"]}
+        if "downForSec" in r:
+            payload["downForSec"] = r["downForSec"]
+        ctx.send_json(r["status"], payload)
+
+
+def _handle_device_clock_sync(ctx: _Ctx) -> None:
+    """POST /devices/{id}/clock/sync {confirm} — set the device RTC to PC time.
+
+    Requires confirm=true: pushing a WRONG PC clock onto the device would
+    consistently reject valid TOTP codes (see project_totp_clock_skew), so the
+    UI must surface the "is the PC NTP-synced?" caution and confirm first.
+    """
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    if not _safe_bool(ctx.body().get("confirm"), False):
+        ctx.send_json(412, {
+            "ok": False,
+            "error": "confirm required",
+            "warning": "This pushes the PC clock to the device. Make sure the PC clock "
+                       "is correct (NTP-synced) first — a wrong PC time will reject valid QR codes.",
+        })
+        return
+    r = _run_on_device_sdk(ctx, did, _sync_device_clock, label="clock_sync")
+    if r["ok"]:
+        ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
+    else:
+        payload = {"ok": False, "error": r["error"]}
+        if "downForSec" in r:
+            payload["downForSec"] = r["downForSec"]
+        ctx.send_json(r["status"], payload)
 
 
 def _handle_device_force_resync(ctx: _Ctx) -> None:
@@ -4013,8 +4494,12 @@ def _handle_agent_device_disable(ctx: _Ctx) -> None:
 def _handle_agent_events_sse(ctx: _Ctx) -> None:
     """SSE stream: agent events (access decisions, device status, popups)."""
     client_addr = getattr(ctx.handler, "client_address", ("?", "?"))
+    # ?client=popup|main|agent — tags which window this SSE is, so connect/deliver/
+    # loss logs are unambiguous (otherwise only ip:port is visible).
+    client_tag = (ctx.q("client", default="") or "?")[:16]
     _logger.info(
-        "[SSE/agent_events] client connected: %s:%s", client_addr[0], client_addr[1]
+        "[SSE/agent_events] client connected: %s:%s tag=%s",
+        client_addr[0], client_addr[1], client_tag,
     )
     eng = getattr(ctx.app, "_agent_engine", None)
     _logger.debug(
@@ -4161,7 +4646,7 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                     # the backlog flushing to the popup window after a freeze.
                     _tel.event(
                         "POPUP_SSE_DELIVER", count=len(ultra_popup_events),
-                        client=f"{client_addr[0]}:{client_addr[1]}",
+                        client=f"{client_addr[0]}:{client_addr[1]}", tag=client_tag,
                     )
                 for popup_seq, payload in ultra_popup_events:
                     alive = ctx.send_sse_event("popup", payload)
@@ -4170,7 +4655,7 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                             "[SSE/agent_events] client disconnected (ULTRA popup): %s:%s",
                             client_addr[0], client_addr[1],
                         )
-                        _tel.warn("POPUP_SSE_CLIENT_LOST", client=f"{client_addr[0]}:{client_addr[1]}")
+                        _tel.warn("POPUP_SSE_CLIENT_LOST", client=f"{client_addr[0]}:{client_addr[1]}", tag=client_tag)
                         return
                     last_ultra_popup_seq = popup_seq
                     wrote_event = True
@@ -4199,6 +4684,86 @@ def _handle_agent_events_sse(ctx: _Ctx) -> None:
                 client_addr[0], client_addr[1], _sse_loop_exc,
             )
             return
+
+
+def _handle_popup_telemetry(ctx: _Ctx) -> None:
+    """POST /api/v2/popup/telemetry — popup-window heartbeat / SSE-lifecycle beacon.
+
+    The popup is a separate webview the backend cannot introspect; if it HANGS,
+    these beacons stop arriving, so a gap in POPUP_HB pinpoints a webview/JS
+    freeze (vs. a backend or data-delivery problem, where they keep arriving).
+    Auth-exempt + loopback-only (diagnostic, harmless — same security boundary
+    as /status). Best-effort: always returns 200.
+    """
+    try:
+        b = ctx.body() or {}
+        _tel.event(
+            "POPUP_HB",
+            kind=str(b.get("kind") or "hb")[:24],
+            win=str(b.get("window") or "popup")[:16],
+            lanes=_safe_int(b.get("lanes"), -1),
+            sse=str(b.get("sse") or "")[:16],
+            reconns=_safe_int(b.get("sseReconnects"), -1),
+            sse_age_ms=_safe_int(b.get("lastSseAgeMs"), -1),
+            shown_age_ms=_safe_int(b.get("lastShownAgeMs"), -1),
+            uptime_ms=_safe_int(b.get("uptimeMs"), -1),
+        )
+    except Exception:
+        pass
+    try:
+        ctx.send_json(200, {"ok": True})
+    except Exception:
+        pass
+
+
+def _handle_popup_poll(ctx: _Ctx) -> None:
+    """GET /api/v2/popup/poll?since_agent=<n>&since_ultra=<m> — polling fallback
+    for the popup window.
+
+    Returns popup events newer than the per-engine cursors the client last saw.
+    Unlike the SSE stream this is STATELESS — each request is independent — so it
+    cannot silently half-die on a stalled/half-open socket; the popup can never
+    stay stuck longer than the poll interval. On the FIRST poll (cursor < 0) it
+    returns the CURRENT head with NO backlog (live-only, so it never re-shows an
+    old member — the "ancient user on open" bug). Same payload shape as the SSE
+    "popup" event; the client dedupes SSE + poll by eventId. Requires auth (member
+    PII) — same token boundary as the SSE (NOT in _AUTH_EXEMPT).
+    """
+    LIMIT = 20
+    eng = getattr(ctx.app, "_agent_engine", None)
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    since_agent = ctx.q_int("since_agent", "sinceAgent", default=-1)
+    since_ultra = ctx.q_int("since_ultra", "sinceUltra", default=-1)
+    events: List[Dict[str, Any]] = []
+
+    seq_agent = max(0, since_agent)
+    try:
+        if eng and eng.is_running():
+            if since_agent < 0:
+                seq_agent = int(eng.get_latest_popup_event_seq())  # head, no backlog
+            else:
+                for s, payload in eng.get_popup_events_since(since_agent, limit=LIMIT):
+                    events.append(payload)
+                    seq_agent = s
+    except Exception:
+        seq_agent = max(0, since_agent)
+
+    seq_ultra = max(0, since_ultra)
+    try:
+        if ultra_eng and getattr(ultra_eng, "running", False):
+            if since_ultra < 0:
+                seq_ultra = int(ultra_eng.get_latest_popup_event_seq())  # head, no backlog
+            else:
+                for s, payload in ultra_eng.get_popup_events_since(since_ultra, limit=LIMIT):
+                    events.append(payload)
+                    seq_ultra = s
+    except Exception:
+        seq_ultra = max(0, since_ultra)
+
+    try:
+        ctx.send_json(200, {"seqAgent": seq_agent, "seqUltra": seq_ultra, "events": events})
+    except Exception:
+        pass
 
 
 def _handle_agent_settings_global(ctx: _Ctx) -> None:
@@ -5792,6 +6357,10 @@ class LocalApiServerV2:
                         # and the local API only listens on 127.0.0.1, so loopback
                         # is already the security boundary.
                         "_handle_logs_flush",
+                        # Popup-window diagnostic beacon (heartbeat/SSE lifecycle).
+                        # The popup webview may not carry the token; loopback-only +
+                        # harmless (logs POPUP_HB), so exempt like /status.
+                        "_handle_popup_telemetry",
                     }
                     fn_name = getattr(handler_fn, "__name__", "")
                     if fn_name not in _AUTH_EXEMPT:

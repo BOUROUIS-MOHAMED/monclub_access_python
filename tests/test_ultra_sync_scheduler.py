@@ -55,7 +55,7 @@ def test_ultra_sync_scheduler_sync_device_passes_changed_ids(monkeypatch):
             self.cfg = cfg
             self.logger = logger
 
-        def build_device_sync_fingerprint(self, *, device, users):
+        def build_device_sync_fingerprint(self, *, device, users, local_fp_index=None, detail_out=None):
             return ("hash-1", 1)
 
         def run_one_device_blocking(
@@ -274,7 +274,7 @@ def test_ultra_sync_scheduler_sync_all_routes_full_sync_to_live_worker(monkeypat
             self.cfg = cfg
             self.logger = logger
 
-        def build_device_sync_fingerprint(self, *, device, users):
+        def build_device_sync_fingerprint(self, *, device, users, local_fp_index=None, detail_out=None):
             return ("hash-live-worker", 1)
 
     sync_device_calls: list[int] = []

@@ -127,16 +127,22 @@ class ChangeDetectorService:
         self._logger.debug("[ChangeDetector] response: status=%s", resp.status_code)
 
         if resp.status_code == 401:
-            self._logger.info("[ChangeDetector] 401 — attempting re-login")
+            self._logger.info("[ChangeDetector] 401 — attempting silent token refresh")
             new_token = self._re_login()
             if not new_token:
-                self._logger.error(
-                    "[ChangeDetector] Re-login failed — auto-sync disabled. "
-                    "Restart the Access app."
+                # The refresh may have failed because of a transient error
+                # (network/5xx) OR because the session is truly gone. Either way,
+                # do NOT permanently disable auto-sync (the old behaviour stopped
+                # the poller until an app restart, so a single blip silently froze
+                # turnstile data). Back off and retry; a later cycle — or an
+                # operator re-login — recovers it automatically.
+                self._logger.warning(
+                    "[ChangeDetector] token refresh failed — backing off and retrying"
                 )
-                self.stop()
+                self._consecutive_failures = min(self._consecutive_failures + 1, 5)
                 return
-            self._logger.info("[ChangeDetector] re-login OK, retrying poll")
+            self._logger.info("[ChangeDetector] token refresh OK, retrying poll")
+            self._consecutive_failures = 0
             try:
                 resp = _requests.get(
                     url,
@@ -145,8 +151,9 @@ class ChangeDetectorService:
                 )
             except _requests.RequestException as exc:
                 self._logger.warning(
-                    "[ChangeDetector] Retry after re-login failed: %s", exc
+                    "[ChangeDetector] Retry after token refresh failed: %s", exc
                 )
+                self._consecutive_failures = min(self._consecutive_failures + 1, 5)
                 return
 
         if resp.status_code != 200:

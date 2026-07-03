@@ -4,7 +4,12 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.core.db import ACCESS_HISTORY_SOURCE_ULTRA, ACCESS_HISTORY_SYNC_PENDING, AccessHistoryRow
+from app.core.db import (
+    ACCESS_HISTORY_SOURCE_AGENT,
+    ACCESS_HISTORY_SOURCE_ULTRA,
+    ACCESS_HISTORY_SYNC_PENDING,
+    AccessHistoryRow,
+)
 from app.core.device_attendance import DeviceAttendanceMaintenanceEngine
 
 
@@ -85,3 +90,58 @@ def test_sync_pending_history_posts_raw_array_payload() -> None:
     assert isinstance(payload, list)
     assert payload[0]["activeMembership"] == 17406
     assert result == {"uploaded": 1, "failed": 0}
+
+
+def _make_qr_row() -> AccessHistoryRow:
+    # QR/TOTP entry: card_no is a rotating TOTP token (NOT a member card, absent from
+    # users_by_card) and raw_json has no pin — so _resolve_history_user cannot map it.
+    # The realtime agent persisted the member it resolved at verify time.
+    return AccessHistoryRow(
+        id=42,
+        created_at="2026-04-06T18:00:00Z",
+        event_id="evt-qr-42",
+        device_id=5,
+        door_id=1,
+        card_no="884422119900",
+        event_time="2026-04-06 18:00:00",
+        event_type="RTLOG",
+        allowed=1,
+        reason="granted",
+        poll_ms=None,
+        decision_ms=None,
+        cmd_ms=None,
+        cmd_ok=None,
+        cmd_error=None,
+        raw_json=json.dumps({"cardNo": "884422119900", "scanMode": "QR_TOTP"}),
+        history_source=ACCESS_HISTORY_SOURCE_AGENT,
+        backend_sync_state=ACCESS_HISTORY_SYNC_PENDING,
+        backend_attempt_count=0,
+        backend_failure_count=0,
+        backend_last_attempt_at=None,
+        backend_next_retry_at=None,
+        backend_synced_at=None,
+        backend_last_error=None,
+        user_id=77,
+        active_membership_id=17406,
+    )
+
+
+def test_serialize_qr_row_recovers_membership_and_type() -> None:
+    """Regression: QR/TOTP rows cannot be re-resolved from card/pin (rotating token,
+    no pin), so they used to upload with activeMembership=None and the backend silently
+    dropped them ('QR entries not displayed'). The persisted activeMembership + scanMode
+    now let the uploader send a row the backend keeps, labeled QR_CODE."""
+    engine = DeviceAttendanceMaintenanceEngine(cfg=SimpleNamespace(), logger=MagicMock())
+    row = _make_qr_row()
+
+    item = engine._serialize_row_for_backend(
+        row=row,
+        users_by_am={17406: _make_user()},
+        users_by_card={"13206664": _make_user()},  # QR token deliberately absent
+        devices_by_id={5: {"name": "door 1"}},
+    )
+
+    assert item["activeMembership"] == 17406  # recovered from row.active_membership_id
+    assert item["activeMembershipId"] == 17406
+    assert item["userId"] == 77               # recovered from row.user_id
+    assert item["type"] == "QR_CODE"          # from injected scanMode tag

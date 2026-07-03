@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MÉRIDIEN — React port (MonClub Access)</title>
+
+  <!--
+    ──────────────────────────────────────────────────────────────────────────
+    MÉRIDIEN rebuilt as a REACT component, wired to MonClub's PopupEvent data.
+    ──────────────────────────────────────────────────────────────────────────
+    The original "Borne d'accueil — MÉRIDIEN" was a Claude Design export
+    (x-dc / dc-runtime). This file re-implements that exact design as plain
+    React so it can be ported into tauri-ui/src/pages/PopupWindow.tsx.
+
+    SOURCE-MIRROR block below (MÉRIDIEN theme, helpers, IdleScreen, SingleView,
+    MultiView, MeridienScreen) is the portable design. Everything under the
+    "PREVIEW HARNESS" banner is mock data + controls (do NOT port).
+
+    Data mapping (MÉRIDIEN scan  ←  PopupEvent):
+      name        ← userFullName        plan      ← userMembershipTitle
+      photo       ← lane.imgUrl         memberNo  ← userMembershipId (if no title)
+      granted     ← allowed             category  ← userMembersType (STAFF/KIDS)
+      denyReason  ← reason              validFrom ← userValidFrom (YYYY-MM-DD)
+      device      ← deviceName          validTo   ← userValidTo
+      method      ← scanMode (QR/FP/RFID→card)   birthday ← userBirthday
+    ──────────────────────────────────────────────────────────────────────────
+  -->
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    *{box-sizing:border-box;}
+    html,body{margin:0;height:100%;background:#070809;overflow:hidden;}
+    #root{height:100vh;width:100vw;}
+    @keyframes drift{0%{transform:translate3d(0,0,0) scale(1);}50%{transform:translate3d(3%,2%,0) scale(1.12);}100%{transform:translate3d(0,0,0) scale(1);}}
+    @keyframes breathe{0%,100%{opacity:.55;}50%{opacity:1;}}
+    @keyframes ringspin{to{transform:rotate(360deg);}}
+    @keyframes pulseDot{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.4;transform:scale(.8);}}
+    @keyframes confettiFall{0%{transform:translateY(-14vh) rotate(0deg);}100%{transform:translateY(116vh) rotate(720deg);}}
+    @keyframes meridienEnter{0%{transform:translateY(20px) scale(.99);}100%{transform:none;}}
+
+    /* ── control panel (preview-only) ── */
+    .cp{position:fixed;top:12px;right:12px;z-index:100000;width:300px;max-height:calc(100vh - 24px);overflow-y:auto;
+      background:rgba(10,10,12,0.92);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.10);border-radius:14px;
+      color:#e5e7eb;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.6);}
+    .cp-head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,0.08);position:sticky;top:0;background:rgba(10,10,12,0.96);}
+    .cp-title{font-weight:700;}.cp-sub{font-size:11px;color:#71717a;margin-top:2px;}
+    .cp-body{padding:12px 14px;display:flex;flex-direction:column;gap:14px;}
+    .cp-group{display:flex;flex-direction:column;gap:7px;}
+    .cp-label{font-size:11px;text-transform:uppercase;letter-spacing:0.12em;color:#8b8b94;}
+    .cp-row{display:flex;flex-wrap:wrap;gap:6px;}
+    .cp-btn{flex:1 1 auto;min-width:0;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);
+      background:rgba(255,255,255,0.04);color:#d4d4d8;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap;transition:all .12s;}
+    .cp-btn:hover{background:rgba(255,255,255,0.10);}
+    .cp-btn.active{background:oklch(0.82 0.18 142);border-color:oklch(0.82 0.18 142);color:#062a14;}
+    .cp-btn.wide{flex-basis:100%;}
+    .cp-field{display:flex;flex-direction:column;gap:4px;}.cp-field>span{font-size:11px;color:#a1a1aa;}
+    .cp-input{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:7px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.4);color:#f4f4f5;font-size:12px;}
+    .cp-min{position:fixed;top:12px;right:12px;z-index:100000;padding:8px 12px;border-radius:10px;cursor:pointer;background:rgba(10,10,12,0.92);border:1px solid rgba(255,255,255,0.12);color:#e5e7eb;font:600 13px system-ui;backdrop-filter:blur(10px);}
+    .cp-hint{font-size:10.5px;color:#6b6b73;line-height:1.5;}
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/plain" id="app-src">
+  const { useState, useEffect, useRef, useMemo } = React;
+  const h = React.createElement;
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     ▼▼▼ SOURCE-MIRROR — MÉRIDIEN design ported to React (portable to .tsx) ▼▼▼
+     ════════════════════════════════════════════════════════════════════════ */
+
+  // Parse an inline CSS string into a React style object (lets us keep the
+  // original markup's exact inline styles verbatim).
+  function css(s) {
+    const o = {};
+    String(s).split(";").forEach((decl) => {
+      decl = decl.trim();
+      if (!decl) return;
+      const i = decl.indexOf(":");
+      if (i < 0) return;
+      const prop = decl.slice(0, i).trim();
+      const val = decl.slice(i + 1).trim();
+      if (prop.indexOf("--") === 0) { o[prop] = val; return; }
+      o[prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = val;
+    });
+    return o;
+  }
+
+  const GREEN = "oklch(0.82 0.18 142)";
+  const RED   = "oklch(0.62 0.21 25)";
+  const GOLD  = "oklch(0.82 0.14 85)";
+  const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+  const MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+  function sameDay(a, b) { return a.getDate() === b.getDate() && a.getMonth() === b.getMonth(); }
+  function fmtClock(d) { return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); }
+  function fmtLongDate(d) { return DAYS[d.getDay()] + " " + d.getDate() + " " + MONTHS[d.getMonth()] + " " + d.getFullYear(); }
+  function fmtDate(d) { return d.getDate() + " " + MONTHS_SHORT[d.getMonth()] + " " + d.getFullYear(); }
+  function fmtMonthYear(d) { return MONTHS_SHORT[d.getMonth()] + " " + d.getFullYear(); }
+  function methodLabel(m) { return m === "qr" ? "QR Code" : (m === "fingerprint" ? "Fingerprint" : "Card"); }
+  function planLabel(scan) { return scan.plan || (scan.memberNo ? ("No. " + scan.memberNo) : "Member"); }
+  function initials(name) {
+    const p = (name || "").trim().split(/\s+/).filter(Boolean);
+    if (!p.length) return "—";
+    const a = p[0][0] || "";
+    const b = p.length > 1 ? p[p.length - 1][0] : "";
+    return (a + b).toUpperCase();
+  }
+
+  function makeMark(granted, color, size) {
+    if (granted) return h("span", { style: { display: "block", width: Math.round(size * 0.5) + "px", height: size + "px", borderRight: "3px solid " + color, borderBottom: "3px solid " + color, transform: "rotate(45deg)", marginTop: -Math.round(size * 0.18) + "px", boxSizing: "border-box" } });
+    return h("span", { style: { position: "relative", width: size + "px", height: size + "px", display: "block" } },
+      h("span", { key: "a", style: { position: "absolute", top: "50%", left: 0, right: 0, height: "3px", marginTop: "-1.5px", background: color, borderRadius: "2px", transform: "rotate(45deg)" } }),
+      h("span", { key: "b", style: { position: "absolute", top: "50%", left: 0, right: 0, height: "3px", marginTop: "-1.5px", background: color, borderRadius: "2px", transform: "rotate(-45deg)" } }));
+  }
+  function makeDisc(granted, accent) {
+    return h("span", { style: { display: "inline-flex", alignItems: "center", justifyContent: "center", flex: "0 0 auto", width: "clamp(44px,3.4vw,64px)", height: "clamp(44px,3.4vw,64px)", borderRadius: "50%", background: accent } }, makeMark(granted, "#070809", 22));
+  }
+  function makeMethodIcon(m) {
+    const wrap = (ch) => h("span", { style: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: "1.05em", height: "1.05em", color: "currentColor" } }, ch);
+    if (m === "qr") {
+      const cells = [1,1,0,1,0,1,0,1,1];
+      return wrap(h("span", { style: { display: "grid", gridTemplateColumns: "repeat(3,1fr)", gridTemplateRows: "repeat(3,1fr)", gap: "1.5px", width: "1em", height: "1em" } },
+        cells.map((v, i) => h("span", { key: i, style: { background: v ? "currentColor" : "transparent", borderRadius: ".5px" } }))));
+    }
+    if (m === "fingerprint") {
+      return wrap(h("span", { style: { position: "relative", width: "1em", height: "1em", display: "block" } },
+        h("span", { key: "a", style: { position: "absolute", inset: 0, borderRadius: "50%", border: "1.5px solid currentColor" } }),
+        h("span", { key: "b", style: { position: "absolute", inset: "26%", borderRadius: "50%", border: "1.5px solid currentColor" } }),
+        h("span", { key: "c", style: { position: "absolute", inset: "44%", borderRadius: "50%", background: "currentColor" } })));
+    }
+    return wrap(h("span", { style: { position: "relative", display: "block", width: "1.05em", height: ".72em", border: "1.5px solid currentColor", borderRadius: "3px" } },
+      h("span", { style: { position: "absolute", top: "2px", left: "-1px", right: "-1px", height: "2.5px", background: "currentColor" } })));
+  }
+  function makeConfetti() {
+    const cols = [GOLD, "#f3f4f2", GREEN];
+    const arr = [];
+    for (let i = 0; i < 26; i++) {
+      const left = Math.random() * 100;
+      const dur = 4.5 + Math.random() * 3;
+      const delay = -Math.random() * 7;
+      const sz = 5 + Math.random() * 7;
+      const round = Math.random() > 0.5;
+      arr.push(h("span", { key: i, style: { position: "absolute", top: "-14vh", left: left + "%", width: sz + "px", height: (round ? sz : sz * 0.45) + "px", background: cols[i % cols.length], borderRadius: round ? "50%" : "1px", opacity: 0.8, animation: "confettiFall " + dur + "s linear " + delay + "s infinite" } }));
+    }
+    return h(React.Fragment, null, arr);
+  }
+  function categoryStyle(cat) {
+    const c = cat === "staff" ? "oklch(0.7 0.12 250)" : "oklch(0.78 0.12 195)";
+    return { display: "inline-flex", alignItems: "center", gap: "10px", padding: "11px 20px", borderRadius: "999px", fontFamily: "'Hanken Grotesk',sans-serif", fontWeight: 600, fontSize: "clamp(15px,1.35vw,21px)", color: c, background: "color-mix(in oklch," + c + ",transparent 90%)", border: "1px solid color-mix(in oklch," + c + ",transparent 62%)" };
+  }
+
+  function accentFor(scan, now) {
+    const bd = !!(scan.birthday && sameDay(scan.birthday, now));
+    return scan.granted ? (bd ? GOLD : GREEN) : RED;
+  }
+
+  function resolveScan(scan, now) {
+    const granted = !!scan.granted;
+    const bd = !!(scan.birthday && sameDay(scan.birthday, now));
+    const accent = granted ? (bd ? GOLD : GREEN) : RED;
+    const name = scan.name || "Membre";
+    const fn = name.split(/\s+/)[0];
+    const len = name.length;
+    const size = len > 34 ? "clamp(28px,3vw,56px)" : (len > 22 ? "clamp(38px,4.6vw,84px)" : "clamp(50px,6.6vw,116px)");
+    const cat = scan.category || "standard";
+    const out = {
+      metaLine: scan.device || "Tourniquet",
+      methodLabel: methodLabel(scan.method),
+      methodIcon: makeMethodIcon(scan.method),
+      hasPhoto: !!scan.photo,
+      hasNoPhoto: !scan.photo,
+      photoStyle: { position: "absolute", inset: 0, backgroundImage: 'url("' + (scan.photo || "") + '")', backgroundSize: "contain", backgroundPosition: "center", backgroundRepeat: "no-repeat", filter: granted ? "none" : "grayscale(.75) brightness(.7) contrast(1.05)" },
+      initials: initials(name),
+      granted: granted,
+      statusText: granted ? "ACCESS GRANTED" : "ACCESS DENIED",
+      statusGlyph: makeDisc(granted, accent),
+      name: name,
+      nameStyle: { fontFamily: "'Hanken Grotesk',sans-serif", fontWeight: 800, lineHeight: 0.95, letterSpacing: "-.02em", marginTop: "clamp(14px,1.4vw,26px)", fontSize: size, color: "var(--ink)", overflowWrap: "break-word", hyphens: "auto", maxWidth: "15ch" },
+      isBirthday: bd,
+      birthdayLine: "Happy birthday, " + fn + "!",
+      planLabel: planLabel(scan),
+      hasCategoryBadge: cat !== "standard",
+      categoryLabel: cat === "staff" ? "Staff" : (cat === "kids" ? "Kids Club" : ""),
+      categoryStyle: categoryStyle(cat),
+      showReason: !granted,
+      reason: scan.denyReason || "Access denied",
+      showValidity: granted && !!scan.validFrom && !!scan.validTo,
+      showExpiring: false
+    };
+    if (out.showValidity) {
+      const from = scan.validFrom, to = scan.validTo;
+      const pct = Math.max(4, Math.min(100, Math.round((now - from) / (to - from) * 100)));
+      out.memberSince = "Member since " + fmtMonthYear(from);
+      out.validToLabel = "Valid until " + fmtDate(to);
+      out.progressStyle = { width: pct + "%", height: "100%", borderRadius: "999px", background: accent };
+      const dleft = Math.ceil((to - now) / 86400000);
+      out.showExpiring = dleft <= 14 && dleft > 0;
+      out.expiringLabel = "Expires in " + dleft + " day" + (dleft > 1 ? "s" : "");
+    }
+    return out;
+  }
+  function resolveCard(scan, now) {
+    const granted = !!scan.granted;
+    const bd = !!(scan.birthday && sameDay(scan.birthday, now));
+    const accent = granted ? (bd ? GOLD : GREEN) : RED;
+    return {
+      cardStyle: { position: "relative", display: "flex", flexDirection: "column", borderRadius: "22px", overflow: "hidden", background: "#0c0d11", border: "1px solid var(--line)", boxShadow: "0 30px 70px -30px rgba(0,0,0,.7)", "--card-accent": accent },
+      hasPhoto: !!scan.photo,
+      hasNoPhoto: !scan.photo,
+      photoStyle: { position: "absolute", inset: 0, backgroundImage: 'url("' + (scan.photo || "") + '")', backgroundSize: "contain", backgroundPosition: "center", backgroundRepeat: "no-repeat", filter: granted ? "none" : "grayscale(.75) brightness(.7)" },
+      initials: initials(scan.name),
+      granted: granted,
+      statusText: granted ? "GRANTED" : "DENIED",
+      mark: makeMark(granted, "#070809", 13),
+      name: scan.name || "Member",
+      detail: granted ? planLabel(scan) : (scan.denyReason || "Access denied"),
+      detailStyle: { marginTop: "9px", fontSize: "clamp(15px,1.3vw,22px)", fontWeight: granted ? 500 : 600, color: granted ? "var(--muted)" : "var(--card-accent)" },
+      metaLabel: methodLabel(scan.method)
+    };
+  }
+
+  // ── Idle ──────────────────────────────────────────────────────────────────
+  function IdleScreen({ gymName, now }) {
+    return (
+      <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:clamp(48px,5vw,104px);")}>
+        <div style={css("display:flex;justify-content:space-between;align-items:flex-start;gap:24px;")}>
+          <div>
+            <div style={css("font-weight:800;font-size:clamp(28px,2.9vw,52px);letter-spacing:-.01em;line-height:.95;")}>{gymName || "MonClub Access"}</div>
+          </div>
+          <div style={css("display:flex;align-items:center;gap:11px;")}>
+            <span style={css("width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent);animation:pulseDot 2.6s ease-in-out infinite;")}></span>
+            <span style={css("text-transform:uppercase;letter-spacing:.24em;font-size:clamp(11px,1vw,15px);color:var(--accent);font-weight:700;")}>Open</span>
+          </div>
+        </div>
+        <div style={css("text-align:center;")}>
+          <div style={css("font-weight:700;font-size:clamp(108px,22vw,340px);line-height:.8;letter-spacing:-.04em;font-variant-numeric:tabular-nums;")}>{fmtClock(now)}</div>
+          <div style={css("margin-top:clamp(16px,1.6vw,30px);color:var(--muted);text-transform:uppercase;letter-spacing:.3em;font-size:clamp(13px,1.3vw,21px);font-weight:600;")}>{fmtLongDate(now)}</div>
+          <div style={css("margin-top:clamp(10px,1vw,18px);text-transform:uppercase;letter-spacing:.34em;font-size:clamp(10px,.95vw,14px);font-weight:600;color:var(--faint);")}>powered by <span style={css("color:var(--accent);font-weight:800;")}>monclub</span></div>
+        </div>
+        <div style={css("display:flex;flex-direction:column;align-items:center;gap:22px;")}>
+          <div style={css("position:relative;width:clamp(56px,5.6vw,80px);height:clamp(56px,5.6vw,80px);")}>
+            <div style={css("position:absolute;inset:0;border-radius:50%;border:2px dashed color-mix(in oklch,var(--accent),transparent 40%);animation:ringspin 11s linear infinite;")}></div>
+            <div style={css("position:absolute;inset:38%;border-radius:50%;background:var(--accent);box-shadow:0 0 20px var(--accent);")}></div>
+          </div>
+          <div style={css("text-transform:uppercase;letter-spacing:.2em;font-size:clamp(13px,1.35vw,22px);font-weight:600;color:rgba(243,244,242,.82);animation:breathe 3.8s ease-in-out infinite;")}>Present your card, QR code or fingerprint</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Single ────────────────────────────────────────────────────────────────
+  function SingleView({ s }) {
+    return (
+      <div style={css("position:absolute;inset:0;display:flex;align-items:center;padding:clamp(44px,4.5vw,96px);gap:clamp(40px,4.5vw,88px);")}>
+        <div style={css("flex:0 0 33%;max-width:470px;align-self:stretch;display:flex;padding:clamp(28px,3vw,64px) 0;")}>
+          <div style={css("position:relative;flex:1;border-radius:26px;overflow:hidden;background:linear-gradient(165deg,#181a20,#0c0d11);border:1px solid var(--line);box-shadow:0 50px 100px -40px rgba(0,0,0,.8);")}>
+            {s.hasPhoto && <div style={s.photoStyle}></div>}
+            {s.hasNoPhoto && (
+              <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:radial-gradient(80% 70% at 50% 40%,color-mix(in oklch,var(--accent),transparent 82%),transparent 70%);")}>
+                <span style={css("font-weight:800;font-size:clamp(76px,11vw,176px);color:var(--accent);line-height:1;letter-spacing:-.02em;")}>{s.initials}</span>
+                <span style={css("text-transform:uppercase;letter-spacing:.24em;font-size:clamp(10px,.95vw,14px);font-weight:600;color:var(--muted);")}>No photo</span>
+              </div>
+            )}
+            <div style={css("position:absolute;left:0;right:0;bottom:0;height:34%;background:linear-gradient(to top,rgba(7,8,9,.65),transparent);pointer-events:none;")}></div>
+            <div style={css("position:absolute;inset:0;border-radius:26px;box-shadow:inset 0 0 0 2px color-mix(in oklch,var(--accent),transparent 58%);pointer-events:none;")}></div>
+          </div>
+        </div>
+
+        <div style={css("flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;")}>
+          <div style={css("display:flex;align-items:center;gap:13px;color:var(--faint);text-transform:uppercase;letter-spacing:.2em;font-size:clamp(12px,1.05vw,16px);font-weight:600;")}>
+            <span>{s.metaLine}</span>
+            <span style={css("width:4px;height:4px;border-radius:50%;background:currentColor;")}></span>
+            <span style={css("display:inline-flex;align-items:center;gap:9px;")}>{s.methodIcon}<span>{s.methodLabel}</span></span>
+          </div>
+
+          <div style={css("display:flex;align-items:center;gap:clamp(14px,1.3vw,22px);margin-top:clamp(22px,2.2vw,40px);")}>
+            {s.statusGlyph}
+            <span style={css("font-size:clamp(27px,3.1vw,54px);font-weight:700;letter-spacing:-.015em;color:var(--accent);white-space:nowrap;line-height:1;")}>{s.statusText}</span>
+          </div>
+
+          <div style={s.nameStyle}>{s.name}</div>
+
+          {s.isBirthday && (
+            <div style={css("margin-top:clamp(16px,1.6vw,26px);display:inline-flex;align-self:flex-start;align-items:center;gap:12px;padding:11px 20px;border-radius:999px;background:color-mix(in oklch,var(--accent),transparent 88%);border:1px solid color-mix(in oklch,var(--accent),transparent 60%);white-space:nowrap;")}>
+              <span style={css("width:11px;height:11px;background:var(--accent);transform:rotate(45deg);box-shadow:0 0 12px var(--accent);")}></span>
+              <span style={css("font-weight:700;font-size:clamp(16px,1.5vw,27px);color:var(--accent);")}>{s.birthdayLine}</span>
+            </div>
+          )}
+
+          <div style={css("margin-top:clamp(22px,2.2vw,38px);display:flex;flex-wrap:wrap;gap:12px;align-items:center;")}>
+            <span style={css("display:inline-flex;align-items:center;gap:10px;padding:11px 20px;border-radius:999px;border:1px solid var(--line);background:var(--surface);font-weight:600;font-size:clamp(15px,1.35vw,21px);color:var(--ink);white-space:nowrap;")}>
+              <span style={css("width:8px;height:8px;border-radius:50%;background:var(--accent);")}></span>{s.planLabel}
+            </span>
+            {s.hasCategoryBadge && <span style={s.categoryStyle}>{s.categoryLabel}</span>}
+          </div>
+
+          {s.showReason && (
+            <div style={css("margin-top:clamp(24px,2.4vw,40px);padding:clamp(20px,1.8vw,30px) clamp(22px,2vw,34px);border-radius:20px;background:color-mix(in oklch,var(--accent),transparent 91%);max-width:48ch;")}>
+              <div style={css("text-transform:uppercase;letter-spacing:.2em;font-size:clamp(12px,1vw,15px);font-weight:700;color:var(--accent);margin-bottom:10px;")}>Reason</div>
+              <div style={css("font-size:clamp(20px,2vw,32px);font-weight:700;color:var(--ink);line-height:1.15;")}>{s.reason}</div>
+              <div style={css("margin-top:12px;color:var(--muted);font-size:clamp(14px,1.2vw,19px);font-weight:500;")}>Please see the front desk.</div>
+            </div>
+          )}
+
+          {s.showValidity && (
+            <div style={css("margin-top:clamp(24px,2.4vw,40px);max-width:46ch;")}>
+              <div style={css("display:flex;justify-content:space-between;gap:16px;color:var(--muted);font-size:clamp(13px,1.05vw,17px);font-weight:500;margin-bottom:12px;")}>
+                <span>{s.memberSince}</span>
+                <span>{s.validToLabel}</span>
+              </div>
+              <div style={css("height:5px;border-radius:999px;background:var(--surface);overflow:hidden;")}>
+                <div style={s.progressStyle}></div>
+              </div>
+              {s.showExpiring && <div style={css("margin-top:12px;color:var(--accent);font-weight:600;font-size:clamp(13px,1.1vw,18px);")}>{s.expiringLabel}</div>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Multi ─────────────────────────────────────────────────────────────────
+  function MultiView({ cards, count, device, now }) {
+    return (
+      <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;padding:clamp(44px,4.5vw,84px);")}>
+        <div style={css("display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:clamp(28px,2.8vw,48px);gap:24px;")}>
+          <div>
+            <div style={css("font-weight:800;font-size:clamp(44px,6vw,112px);line-height:.85;letter-spacing:-.03em;")}><span style={css("color:var(--accent);")}>{count}</span> members</div>
+            <div style={css("margin-top:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.22em;font-size:clamp(12px,1.1vw,18px);font-weight:600;")}>Simultaneous scans</div>
+          </div>
+          <div style={css("text-align:right;color:var(--muted);text-transform:uppercase;letter-spacing:.16em;font-size:clamp(12px,1.05vw,17px);font-weight:600;")}>
+            <div>{device}</div>
+            <div style={css("margin-top:9px;font-size:clamp(20px,1.8vw,30px);letter-spacing:0;color:var(--ink);font-weight:700;")}>{fmtClock(now)}</div>
+          </div>
+        </div>
+        <div style={css("flex:1;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:clamp(18px,1.8vw,30px);min-height:0;")}>
+          {cards.map((c, i) => (
+            <div key={i} style={c.cardStyle}>
+              <div style={css("position:relative;flex:1;min-height:0;background:linear-gradient(165deg,#181a20,#0c0d11);")}>
+                {c.hasPhoto && <div style={c.photoStyle}></div>}
+                {c.hasNoPhoto && (
+                  <div style={css("position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(80% 70% at 50% 40%,color-mix(in oklch,var(--card-accent),transparent 82%),transparent 70%);")}>
+                    <span style={css("font-weight:800;font-size:clamp(50px,6vw,108px);color:var(--card-accent);line-height:1;letter-spacing:-.02em;")}>{c.initials}</span>
+                  </div>
+                )}
+                <div style={css("position:absolute;left:0;right:0;bottom:0;height:58%;background:linear-gradient(to top,#0c0d11 8%,rgba(12,13,17,.35) 55%,transparent);pointer-events:none;")}></div>
+                <div style={css("position:absolute;top:16px;left:16px;display:inline-flex;align-items:center;gap:8px;padding:8px 15px;border-radius:999px;background:var(--card-accent);")}>
+                  {c.mark}
+                  <span style={css("font-weight:700;color:#070809;font-size:clamp(13px,1.05vw,18px);letter-spacing:.02em;")}>{c.statusText}</span>
+                </div>
+              </div>
+              <div style={css("padding:clamp(18px,1.5vw,26px);")}>
+                <div style={css("font-weight:800;font-size:clamp(21px,1.9vw,36px);line-height:1.04;letter-spacing:-.01em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;")}>{c.name}</div>
+                <div style={c.detailStyle}>{c.detail}</div>
+                <div style={css("margin-top:14px;color:var(--faint);text-transform:uppercase;letter-spacing:.16em;font-size:clamp(11px,.92vw,15px);font-weight:600;")}>{c.metaLabel}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Screen wrapper (idle / single / multi) ──────────────────────────────────
+  const ROOT_STYLE = "position:fixed;inset:0;font-family:'Hanken Grotesk',sans-serif;color:#f3f4f2;background:radial-gradient(140% 120% at 50% -8%,#15171c 0%,#0b0c10 52%,#070809 100%);overflow:hidden;--ink:#f3f4f2;--muted:rgba(243,244,242,.46);--faint:rgba(243,244,242,.3);--line:rgba(243,244,242,.12);--surface:rgba(243,244,242,.045);";
+
+  function MeridienScreen({ scans, idle, gymName, sceneKey }) {
+    const [now, setNow] = useState(new Date());
+    useEffect(() => {
+      const id = setInterval(() => setNow(new Date()), 1000);
+      return () => clearInterval(id);
+    }, []);
+
+    const single = !idle && scans.length === 1;
+    const multi = !idle && scans.length > 1;
+
+    const accent = idle ? GREEN : (single ? accentFor(scans[0], now) : GREEN);
+    const rootStyle = Object.assign({}, css(ROOT_STYLE), { "--accent": accent });
+
+    const s = single ? resolveScan(scans[0], now) : null;
+    const cards = multi ? scans.map((x) => resolveCard(x, now)) : null;
+    const showConfetti = single && s.isBirthday;
+
+    return (
+      <div style={rootStyle}>
+        <div style={css("position:absolute;inset:0;background:radial-gradient(72% 62% at 24% 28%,color-mix(in oklch,var(--accent),transparent 89%),transparent 64%);pointer-events:none;z-index:0;animation:drift 38s ease-in-out infinite;")}></div>
+        <div style={css("position:absolute;top:0;left:0;right:0;height:3px;background:var(--accent);box-shadow:0 0 22px color-mix(in oklch,var(--accent),transparent 45%);z-index:7;")}></div>
+
+        <div key={sceneKey} style={Object.assign(css("position:absolute;inset:0;z-index:2;"), { animation: "meridienEnter 600ms cubic-bezier(.16,.84,.3,1) both" })}>
+          {idle && <IdleScreen gymName={gymName} now={now} />}
+          {single && <SingleView s={s} />}
+          {multi && <MultiView cards={cards} count={String(scans.length)} device={scans[0].device || "North Turnstile"} now={now} />}
+        </div>
+
+        {showConfetti && <div style={css("position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden;")}>{makeConfetti()}</div>}
+      </div>
+    );
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════════
+     ▲▲▲ END SOURCE-MIRROR ▲▲▲   —   PREVIEW HARNESS below (do NOT port)
+     ════════════════════════════════════════════════════════════════════════ */
+
+  // Map a MonClub PopupEvent (+ resolved imgUrl) → a MÉRIDIEN "scan".
+  function parseDate(s) {
+    if (!s) return null;
+    const p = String(s).slice(0, 10).split("-");
+    if (p.length < 3) return null;
+    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  }
+  // Real engine scanMode values are "RFID_CARD" / "QR_TOTP" / "RFID_DIRECT" etc.
+  // — classify like the backend's _credential_type_from_raw, not exact "QR"/"FP".
+  function mMethodFor(scanMode) {
+    const sm = String(scanMode || "").toUpperCase();
+    if (sm.includes("QR") || sm.includes("TOTP")) return "qr";
+    if (sm.includes("FP") || sm.includes("FINGER") || sm.includes("BIO")) return "fingerprint";
+    return "card";
+  }
+  function mapLaneToScan(lane) {
+    const e = lane.event;
+    return {
+      name: e.userFullName,
+      photo: lane.imgUrl,
+      granted: e.allowed,
+      denyReason: e.reason,
+      plan: e.userMembershipTitle || null,
+      memberNo: (!e.userMembershipTitle && e.userMembershipId != null) ? String(e.userMembershipId) : null,
+      category: e.userMembersType === "STAFF" ? "staff" : (e.userMembersType === "KIDS" ? "kids" : "standard"),
+      validFrom: parseDate(e.userValidFrom),
+      validTo: parseDate(e.userValidTo),
+      birthday: e.userBirthday ? parseDate(e.userBirthday) : null,
+      device: e.deviceName,
+      method: mMethodFor(e.scanMode)
+    };
+  }
+
+  const _t = new Date();
+  const TODAY_BD = "1991-" + String(_t.getMonth() + 1).padStart(2, "0") + "-" + String(_t.getDate()).padStart(2, "0");
+  const PHOTO = (n) => "https://i.pravatar.cc/800?img=" + n;
+
+  const POOL = {
+    granted: [
+      { userFullName: "Camille Laurent", photo: PHOTO(5),  userMembershipTitle: "Premium",  userMembershipId: 1042, userMembersType: "NORMAL", userValidFrom: "2023-09-01", userValidTo: "2027-09-01", deviceName: "North Turnstile", scanMode: "RFID" },
+      { userFullName: "Mehdi Brahimi",   photo: PHOTO(12), userMembershipTitle: "Unlimited", userMembershipId: 2231, userMembersType: "NORMAL", userValidFrom: "2026-03-01", userValidTo: "2027-02-28", deviceName: "North Turnstile", scanMode: "QR" },
+      { userFullName: "Sofia Nguyen",    photo: PHOTO(45), userMembershipTitle: "Premium",  userMembershipId: 3310, userMembersType: "NORMAL", userValidFrom: "2024-01-10", userValidTo: "2026-07-05", deviceName: "South Turnstile",  scanMode: "FP" },
+    ],
+    staff: [
+      { userFullName: "Maximilien de la Rochefoucauld-Montbazon", photo: null, userMembershipTitle: "", userMembershipId: "STAFF-0042", userMembersType: "STAFF", userValidFrom: "", userValidTo: "", deviceName: "Staff Entrance", scanMode: "RFID" },
+      { userFullName: "Nadia Trabelsi",  photo: PHOTO(32), userMembershipTitle: "Reception", userMembershipId: 9002, userMembersType: "STAFF", userValidFrom: "2025-06-01", userValidTo: "2027-06-01", deviceName: "Staff Entrance", scanMode: "RFID" },
+      { userFullName: "Omar Saidi",      photo: PHOTO(51), userMembershipTitle: "Manager",   userMembershipId: 9003, userMembersType: "STAFF", userValidFrom: "2025-01-01", userValidTo: "2028-01-01", deviceName: "Staff Entrance", scanMode: "FP" },
+    ],
+    kids: [
+      { userFullName: "Noé Petit",   photo: PHOTO(15), userMembershipTitle: "Kids Club", userMembershipId: 4101, userMembersType: "KIDS", userValidFrom: "2026-01-10", userValidTo: "2026-07-10", deviceName: "North Turnstile", scanMode: "RFID" },
+      { userFullName: "Lina Gharbi", photo: PHOTO(20), userMembershipTitle: "Kids Club", userMembershipId: 4102, userMembersType: "KIDS", userValidFrom: "2026-02-01", userValidTo: "2026-08-01", deviceName: "North Turnstile", scanMode: "QR" },
+      { userFullName: "Maya Jelassi",photo: PHOTO(9),  userMembershipTitle: "Kids Club", userMembershipId: 4103, userMembersType: "KIDS", userValidFrom: "2026-03-05", userValidTo: "2026-09-05", deviceName: "South Turnstile",  scanMode: "FP" },
+    ],
+    birthday: [
+      { userFullName: "Inès Bouchard", photo: PHOTO(45), userMembershipTitle: "Coach", userMembershipId: 1042, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2022-03-15", userValidTo: "2027-03-15", deviceName: "North Turnstile", scanMode: "FP" },
+      { userFullName: "Camille Laurent", photo: PHOTO(5), userMembershipTitle: "Premium", userMembershipId: 2231, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2023-09-01", userValidTo: "2027-09-01", deviceName: "North Turnstile", scanMode: "QR" },
+      { userFullName: "Sofia Nguyen", photo: PHOTO(45), userMembershipTitle: "Premium", userMembershipId: 3310, userMembersType: "NORMAL", userBirthday: TODAY_BD, userValidFrom: "2024-02-15", userValidTo: "2026-08-15", deviceName: "South Turnstile", scanMode: "RFID" },
+    ],
+    denied: [
+      { userFullName: "Julien Mercier", photo: PHOTO(13), userMembershipTitle: "Standard", userMembershipId: 1199, userMembersType: "NORMAL", allowed: false, reason: "Membership expired on 31 May 2026", deviceName: "South Turnstile", scanMode: "QR" },
+      { userFullName: "Rania Mansour",  photo: PHOTO(47), userMembershipTitle: "Unlimited", userMembershipId: 1288, userMembersType: "NORMAL", allowed: false, reason: "Outside access hours", deviceName: "North Turnstile", scanMode: "QR" },
+      { userFullName: "Bilel Ayari",    photo: PHOTO(68), userMembershipTitle: "Standard", userMembershipId: 1377, userMembersType: "NORMAL", allowed: false, reason: "Card not recognized", deviceName: "South Turnstile", scanMode: "RFID" },
+    ],
+    mixed: [
+      { userFullName: "Léa Fontaine",  photo: PHOTO(20), userMembershipTitle: "Premium",  userMembershipId: 1042, userMembersType: "NORMAL", userValidFrom: "2025-01-01", userValidTo: "2027-01-01", deviceName: "North Turnstile", scanMode: "QR" },
+      { userFullName: "Thomas Girard", photo: PHOTO(33), userMembershipTitle: "Standard", userMembershipId: 1288, userMembersType: "NORMAL", allowed: false, reason: "Payment pending", deviceName: "North Turnstile", scanMode: "RFID" },
+      { userFullName: "Noé Petit",     photo: PHOTO(15), userMembershipTitle: "Kids Club", userMembershipId: 4101, userMembersType: "KIDS", userValidFrom: "2026-01-10", userValidTo: "2026-07-10", deviceName: "North Turnstile", scanMode: "RFID" },
+    ],
+  };
+
+  const SCENARIOS = [
+    { key: "granted",  label: "Granted" },
+    { key: "staff",    label: "Staff" },
+    { key: "kids",     label: "Kids" },
+    { key: "birthday", label: "Birthday" },
+    { key: "denied",   label: "Denied" },
+    { key: "mixed",    label: "Mixed" },
+  ];
+
+  function buildEvent(member, showPhotos) {
+    return {
+      userFullName: member.userFullName || "",
+      userValidFrom: member.userValidFrom || "",
+      userValidTo: member.userValidTo || "",
+      userMembershipId: member.userMembershipId == null ? null : member.userMembershipId,
+      userMembershipTitle: member.userMembershipTitle,
+      userMembersType: member.userMembersType,
+      deviceName: member.deviceName || "",
+      allowed: member.allowed !== false,
+      reason: member.reason || "",
+      scanMode: member.scanMode || "",
+      userBirthday: member.userBirthday,
+      __photo: showPhotos ? member.photo : null,
+    };
+  }
+
+  function PreviewApp() {
+    const [panelOpen, setPanelOpen] = useState(true);
+    const [view, setView] = useState("popup");
+    const [laneCount, setLaneCount] = useState(1);
+    const [scenario, setScenario] = useState("granted");
+    const [showPhotos, setShowPhotos] = useState(true);
+    const [replayNonce, setReplayNonce] = useState(0);
+    const [gymName, setGymName] = useState("FitZone Tunis");
+    const [c1, setC1] = useState({ userFullName: "", deviceName: "", userMembershipTitle: "", scanMode: "", reason: "" });
+
+    const members = useMemo(() => {
+      const pool = POOL[scenario] || POOL.granted;
+      const picked = pool.slice(0, laneCount).map((m) => Object.assign({}, m));
+      if (picked[0]) {
+        const o = picked[0];
+        if (c1.userFullName) o.userFullName = c1.userFullName;
+        if (c1.deviceName) o.deviceName = c1.deviceName;
+        if (c1.userMembershipTitle) o.userMembershipTitle = c1.userMembershipTitle;
+        if (c1.scanMode) o.scanMode = c1.scanMode;
+        if (c1.reason) { o.reason = c1.reason; o.allowed = false; }
+      }
+      return picked;
+    }, [scenario, laneCount, c1]);
+
+    const scans = members.map((m) => mapLaneToScan({ event: buildEvent(m, showPhotos), imgUrl: showPhotos ? m.photo : null }));
+    const idle = view === "idle";
+    const sceneKey = view + "-" + scenario + "-" + laneCount + "-" + replayNonce;
+
+    const seg = (val, cur, set, label) => h("button", { className: "cp-btn" + (val === cur ? " active" : ""), onClick: () => set(val) }, label);
+
+    return h(React.Fragment, null,
+      h(MeridienScreen, { scans: scans, idle: idle, gymName: gymName, sceneKey: sceneKey }),
+
+      !panelOpen && h("button", { className: "cp-min", onClick: () => setPanelOpen(true) }, "☰ Contrôles"),
+
+      panelOpen && h("div", { className: "cp" },
+        h("div", { className: "cp-head" },
+          h("div", null,
+            h("div", { className: "cp-title" }, "MÉRIDIEN · React"),
+            h("div", { className: "cp-sub" }, "entry display port")),
+          h("button", { className: "cp-btn", style: { flex: "0 0 auto" }, onClick: () => setPanelOpen(false) }, "✕")),
+        h("div", { className: "cp-body" },
+          h("div", { className: "cp-group" },
+            h("div", { className: "cp-label" }, "View"),
+            h("div", { className: "cp-row" }, seg("popup", view, setView, "Scan"), seg("idle", view, setView, "Idle"))),
+          h("div", { className: "cp-group" },
+            h("div", { className: "cp-label" }, "Simultaneous members"),
+            h("div", { className: "cp-row" }, seg(1, laneCount, setLaneCount, "1 · solo"), seg(2, laneCount, setLaneCount, "2"), seg(3, laneCount, setLaneCount, "3"))),
+          h("div", { className: "cp-group" },
+            h("div", { className: "cp-label" }, "Scenario"),
+            h("div", { className: "cp-row" },
+              SCENARIOS.map((s) => h("button", { key: s.key, className: "cp-btn" + (scenario === s.key ? " active" : ""), style: { flexBasis: "31%" }, onClick: () => setScenario(s.key) }, s.label)))),
+          h("div", { className: "cp-group" },
+            h("div", { className: "cp-label" }, "Photos"),
+            h("div", { className: "cp-row" }, seg(true, showPhotos, setShowPhotos, "With photo"), seg(false, showPhotos, setShowPhotos, "Initials"))),
+          h("div", { className: "cp-group" },
+            h("div", { className: "cp-label" }, "Animation"),
+            h("div", { className: "cp-row" }, h("button", { className: "cp-btn wide", onClick: () => setReplayNonce((x) => x + 1) }, "↻ Replay entrance"))),
+          view === "idle"
+            ? h("div", { className: "cp-group" },
+                h("div", { className: "cp-label" }, "Idle"),
+                h("label", { className: "cp-field" }, h("span", null, "Venue name"),
+                  h("input", { className: "cp-input", value: gymName, onChange: (e) => setGymName(e.target.value) })))
+            : h("div", { className: "cp-group" },
+                h("div", { className: "cp-label" }, "Member 1 — fields"),
+                field("Full name", "(default)", c1.userFullName, (v) => setC1(Object.assign({}, c1, { userFullName: v }))),
+                field("Membership", "(default)", c1.userMembershipTitle, (v) => setC1(Object.assign({}, c1, { userMembershipTitle: v }))),
+                field("Device", "(default)", c1.deviceName, (v) => setC1(Object.assign({}, c1, { deviceName: v }))),
+                field("Scan mode", "RFID / QR / FP", c1.scanMode, (v) => setC1(Object.assign({}, c1, { scanMode: v }))),
+                field("Reason (forces denial)", "(Denied scenario)", c1.reason, (v) => setC1(Object.assign({}, c1, { reason: v })))),
+          h("div", { className: "cp-hint" },
+            "Faithful React port of your MÉRIDIEN design, wired to MonClub PopupEvent data. 1 member = solo view, 2-3 = \"simultaneous scans\" wall.")
+        )));
+  }
+
+  function field(label, ph, val, onChange) {
+    return h("label", { className: "cp-field" }, h("span", null, label),
+      h("input", { className: "cp-input", placeholder: ph, value: val, onChange: (e) => onChange(e.target.value) }));
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(h(PreviewApp));
+  </script>
+
+  <script>
+    (function () {
+      function run() {
+        try {
+          var src = document.getElementById("app-src").textContent;
+          var out = Babel.transform(src, { presets: [["react", { runtime: "classic" }]] });
+          (0, eval)(out.code);
+        } catch (err) {
+          document.getElementById("root").innerHTML =
+            '<pre style="color:#f87171;padding:24px;font:13px monospace;white-space:pre-wrap">' +
+            "Preview build error:\n\n" + String(err && err.stack ? err.stack : err) + "</pre>";
+          console.error("[meridien-react] build error", err);
+        }
+      }
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run);
+      else run();
+    })();
+  </script>
+</body>
+</html>

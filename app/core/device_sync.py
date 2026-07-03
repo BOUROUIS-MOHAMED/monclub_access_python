@@ -106,6 +106,24 @@ def _pin_str(v) -> str:
     return str(v).strip()
 
 
+def _normalize_device_card(raw) -> str:
+    """The card value the ZKTeco device can actually store: digits only (strips
+    admin markers like the '99999+' anti-abuse prefix), within the 4-byte CardNo
+    range (1..4294967295, i.e. <= 10 digits). Returns '' if empty or out of range
+    (caller then omits CardNo). Used by BOTH the device push AND the desired-state
+    hash so a card edit only forces a re-sync when the value the DEVICE receives
+    truly changes — otherwise a non-numeric / too-long marker flips the sync
+    checksum forever while to_sync stays 0 (the wasted, popup-freezing sync)."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if not digits:
+        return ""
+    try:
+        n = int(digits)
+    except ValueError:
+        return ""
+    return str(n) if 1 <= n <= 4294967295 else ""
+
+
 def _safe_one_line(s: str) -> str:
     if not s:
         return ""
@@ -284,6 +302,10 @@ class DeviceSyncEngine:
         # and the member is stuck at the turnstile. Called between SetDeviceData
         # chunks, when the connection is idle — safe and serialized on the worker.
         self._door_yield_cb: "Callable[[], None] | None" = None
+        # Sibling hook: poll+process RTLog scans between chunks so member scans
+        # (and the popup) stay live during a long inline push, not just queued
+        # door-opens. Gated/throttled on the worker side; None when unset.
+        self._rtlog_yield_cb: "Callable[[], None] | None" = None
         self._run_lock = threading.Lock()
         self._running = False
         self._progress_cond = threading.Condition()
@@ -553,6 +575,19 @@ class DeviceSyncEngine:
         except Exception:
             pass
 
+    def _maybe_yield_rtlog(self) -> None:
+        """Poll+process RTLog scans (if a hook is set) between device-push
+        chunks, so a member scanning mid-sync is seen — and PC-verified QR/TOTP
+        members are let in — within ~a second instead of waiting for the whole
+        inline push. Gating/throttling lives in the worker hook. Never raises."""
+        cb = self._rtlog_yield_cb
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            pass
+
     def _run_single_device_sync(
         self,
         *,
@@ -719,7 +754,7 @@ class DeviceSyncEngine:
                 sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
             )
 
-            card_valid = card if (card and card.isdigit()) else ""
+            card_valid = _normalize_device_card(card)
             if card and not card_valid:
                 self.logger.warning(
                     "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric - skipping CardNo",
@@ -1684,9 +1719,13 @@ class DeviceSyncEngine:
         door_bitmask: int,
         templates: List[Dict[str, Any]],
         authorize_timezone_id: int,
+        fields_out: Dict[str, Any] | None = None,
     ) -> str:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
-        card = _pin_str(user.get("firstCardId") or "")
+        # Hash the DEVICE-effective card (digits-only, marker stripped, 10-digit
+        # clamped) — the same value the push sends — so toggling a '99999+' marker
+        # no longer flips the checksum without a real device change.
+        card = _normalize_device_card(user.get("firstCardId"))
         doors_norm = str(door_bitmask)
         tz = int(authorize_timezone_id or 1)
 
@@ -1709,6 +1748,15 @@ class DeviceSyncEngine:
             f"doors={doors_norm}\nauthorizeTimezoneId={tz}\n"
             f"templates={tpl_blob}\n"
         )
+        # Diagnostic breakdown (only when a caller asks for it — zero cost otherwise).
+        # Lets the scheduler log WHICH field flips the device-sync fingerprint.
+        if fields_out is not None:
+            fields_out["name"] = full_name
+            fields_out["card"] = card
+            fields_out["doors"] = doors_norm
+            fields_out["tz"] = str(tz)
+            fields_out["tplh"] = _sha1_hex(tpl_blob)[:12] if tpl_blob else ""
+            fields_out["tpln"] = len(tpl_parts)
         return _sha1_hex(payload)
 
     def build_device_sync_fingerprint(
@@ -1717,6 +1765,7 @@ class DeviceSyncEngine:
         device: Dict[str, Any],
         users: List[Dict[str, Any]],
         local_fp_index: Dict[str, List[Any]] | None = None,
+        detail_out: Dict[str, Any] | None = None,
     ) -> Tuple[str, int]:
         normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
         default_door_id = self._default_authorize_door_id()
@@ -1753,6 +1802,11 @@ class DeviceSyncEngine:
             f"fingerprintEnabled={1 if fingerprint_enabled else 0}",
         ]
 
+        if detail_out is not None:
+            # Header (device-level) part of the fingerprint, before per-user parts.
+            detail_out["header"] = "\n".join(fingerprint_parts)
+            detail_out["users"] = {}
+
         for pin in sorted(desired):
             user = desired.get(pin)
             if not isinstance(user, dict):
@@ -1763,15 +1817,19 @@ class DeviceSyncEngine:
                 local_fp_index=local_fp_index,
                 fingerprint_enabled=fingerprint_enabled,
             )
-            fingerprint_parts.append(
-                self._compute_desired_hash(
-                    pin=pin,
-                    user=user,
-                    door_bitmask=door_bitmask,
-                    templates=templates,
-                    authorize_timezone_id=authorize_timezone_id,
-                )
+            _fo: Dict[str, Any] | None = {} if detail_out is not None else None
+            comp = self._compute_desired_hash(
+                pin=pin,
+                user=user,
+                door_bitmask=door_bitmask,
+                templates=templates,
+                authorize_timezone_id=authorize_timezone_id,
+                fields_out=_fo,
             )
+            fingerprint_parts.append(comp)
+            if detail_out is not None and _fo is not None:
+                _fo["h"] = comp[:12]
+                detail_out["users"][pin] = _fo
 
         payload = "\n".join(fingerprint_parts)
         return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest(), len(desired)
@@ -1884,6 +1942,7 @@ class DeviceSyncEngine:
                 _hash_i += 1
                 if (_hash_i & 0x7F) == 0:  # every 128 users
                     self._maybe_yield_doors()
+                    self._maybe_yield_rtlog()
 
         # Delta hint: when the backend reported only a subset of users changed,
         # prune pins_to_sync to those users + any with a failed/missing prev sync.
@@ -2182,7 +2241,7 @@ class DeviceSyncEngine:
                         continue
                     full_name = _safe_one_line(u.get("fullName") or "") or f"U{pin}"
                     card = _pin_str(u.get("firstCardId") or "")
-                    card_valid = card if (card and card.isdigit()) else ""
+                    card_valid = _normalize_device_card(card)
                     pairs = [f"Pin={pin}"]
                     if use_name:
                         pairs.append(f"Name={full_name}")
@@ -2198,8 +2257,10 @@ class DeviceSyncEngine:
                         # Map user-phase progress to 0..total: the user push is the
                         # dominant wall-clock phase, so tracking it drives the bar.
                         _maybe_set_progress(current=min(_total_pins, ok_so_far))
-                        # Let the worker open any door queued mid-push (door-not-open fix).
+                        # Let the worker open any door queued mid-push (door-not-open fix)
+                        # and poll+process RTLog scans (popup-live-during-sync fix).
                         self._maybe_yield_doors()
+                        self._maybe_yield_rtlog()
 
                     ok_u, failed_u = sdk.set_device_data_batch(
                         table="user", rows=user_rows, chunk_size=50,
@@ -2236,6 +2297,7 @@ class DeviceSyncEngine:
                                 current=min(_retry_total, _retry_baseline + ok_so_far)
                             )
                             self._maybe_yield_doors()
+                            self._maybe_yield_rtlog()
 
                         ok_r, failed_r = sdk.set_device_data_batch(
                             table="user", rows=retry_rows, chunk_size=50,
@@ -2340,6 +2402,7 @@ class DeviceSyncEngine:
                             def _auth_progress_cb(_ok_so_far: int, _batch_total: int) -> None:
                                 _maybe_set_progress(current=_auth_total)
                                 self._maybe_yield_doors()
+                                self._maybe_yield_rtlog()
 
                             ok_a, failed_a = sdk.set_device_data_batch(
                                 table="userauthorize", rows=auth_rows, chunk_size=50,
@@ -2486,7 +2549,7 @@ class DeviceSyncEngine:
                             sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
                         )
 
-                        card_valid = card if (card and card.isdigit()) else ""
+                        card_valid = _normalize_device_card(card)
                         if card and not card_valid:
                             self.logger.warning(
                                 "[DeviceSync] Device id=%s Pin=%s CardNo=%r is not numeric — skipping CardNo",

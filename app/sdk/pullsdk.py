@@ -58,6 +58,13 @@ class PullSDK:
         self.logger = logger
         self._dll = None
         self._h: Optional[int] = None
+        # Per-connection "already applied" cache for set_device_param(): maps each
+        # "K=V" device-parameter key to the last value written ON THIS PullSDK
+        # instance. Because connect() creates a NEW PullSDK per (re)connection
+        # (PullSDKDevice.connect: _pending_sdk = PullSDK(...)), this dict is
+        # inherently connection-scoped — a reconnect / rebooted controller starts
+        # empty and gets a full one-time re-apply, so a param is never left stale.
+        self._applied_params: Dict[str, str] = {}
 
     def load(self) -> None:
         if self._dll is not None:
@@ -763,18 +770,46 @@ class PullSDK:
         return self._dll is not None and hasattr(self._dll, "SetDeviceParam")
 
     def set_device_param(self, *, items: str) -> int:
+        it = (items or "").strip()
+        if not it:
+            raise PullSDKError("items is empty for SetDeviceParam")
+        # Skip-if-unchanged: the ULTRA device sync re-applies static door-timing /
+        # anti-fraud params on EVERY cycle. On the antivirus-slow gym PC each
+        # SetDeviceParam is a ~200ms round-trip, so 5-10 of them blocked the live
+        # worker ~1.8s per sync (the recurring freeze). Skip the round-trip only
+        # when every "K=V" pair was already written with the same value on THIS
+        # connection (see _applied_params — connection-scoped, reset on reconnect).
+        applied = getattr(self, "_applied_params", None)
+        if applied is None:
+            applied = self._applied_params = {}
+        pairs = []
+        all_cached = True
+        for part in it.split(","):
+            kv = part.split("=", 1)
+            if len(kv) == 2:
+                k = kv[0].strip()
+                v = kv[1].strip()
+                pairs.append((k, v))
+                if applied.get(k) != v:
+                    all_cached = False
+            else:
+                # Unparseable token (no '=') — never risk skipping; force the write.
+                all_cached = False
+        if pairs and all_cached:
+            self.logger.debug(f"SetDeviceParam({it!r}) skipped (unchanged on this connection)")
+            return 0  # already applied on this connection; rc>=0 == success
         h = self._require_handle()
         self.load()
         if self._dll is None or not hasattr(self._dll, "SetDeviceParam"):
             raise PullSDKError("SetDeviceParam not available in this plcommpro.dll build.")
-        it = (items or "").strip()
-        if not it:
-            raise PullSDKError("items is empty for SetDeviceParam")
         self.logger.debug(f"SetDeviceParam({it!r})")
         rc = int(self._dll.SetDeviceParam(c_void_p(h), encode_ansi(it)))
         if rc < 0:
             err = self.pull_last_error()
             raise PullSDKError(f"SetDeviceParam FAILED rc={rc} PullLastError={err} items={it!r}")
+        # Record only after a successful write so a failed param is retried next cycle.
+        for k, v in pairs:
+            applied[k] = v
         return rc
 
 
@@ -1025,6 +1060,42 @@ class PullSDKDevice:
             except Exception as e:
                 self.logger.warning(f"[PullSDKDevice][{self.device_id}] set_device_time FAILED: {e}")
                 return False
+
+    def supports_get_device_param(self) -> bool:
+        return self._sdk is not None and self._sdk.supports_get_device_param()
+
+    def supports_set_device_param(self) -> bool:
+        return self._sdk is not None and self._sdk.supports_set_device_param()
+
+    def get_device_param(self, *, items: str, initial_size: int | None = None) -> Optional[str]:
+        """Read raw device parameters over the held connection (thread-safe).
+
+        Mirrors get_device_time: acquires the SDK lock + ensure_connected, then
+        delegates to the inner PullSDK. Returns the raw 'k=v,k=v' string, or None
+        when unsupported / not connected. Used by the DevicesPage control panel
+        via the worker command queue — no second Connect.
+        """
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                return None
+            assert self._sdk is not None
+            if not self._sdk.supports_get_device_param():
+                return None
+            return self._sdk.get_device_param(items=items, initial_size=initial_size)
+
+    def set_device_param(self, *, items: str) -> int:
+        """Write device parameters over the held connection (thread-safe).
+
+        Raises PullSDKError on failure (the message carries rc + PullLastError for
+        the control-panel error popup). Caller decides whether a change is safe.
+        """
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                raise PullSDKError("device not connected")
+            assert self._sdk is not None
+            if not self._sdk.supports_set_device_param():
+                raise PullSDKError("SetDeviceParam not supported by this dll/device")
+            return self._sdk.set_device_param(items=items)
 
     def get_table_count(self, *, table: str, filter_expr: str = "", options: str = "") -> int:
         with self._sdk_lock:

@@ -44,6 +44,16 @@ class MonClubApiHttpError(MonClubApiError):
         self.body = str(body or "")
 
 
+class MonClubApiConflictError(MonClubApiHttpError):
+    """HTTP 409 on a lifecycle mutation — the target moved under us (stale @Version or a
+    business conflict). Subclasses HttpError so existing handlers still catch it, but the
+    offline-mutation drain checks isinstance to route it to the 'conflict' state with the
+    fresh server entity (when the backend returns it in the 409 body)."""
+    def __init__(self, message: str, *, status_code: int = 409, body: str = "", server_state: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message, status_code=status_code, body=body)
+        self.server_state = server_state if isinstance(server_state, dict) else None
+
+
 
 def _now_epoch_ms() -> str:
     # backend-friendly numeric timestamp (string)
@@ -116,6 +126,66 @@ class MonClubApi:
         prefix = ("/" + "/".join(parts[:2])) if len(parts) >= 2 else ""
         return f"{parsed.scheme}://{parsed.netloc}{prefix}"
 
+    def update_device_control_settings(
+        self,
+        *,
+        token: str,
+        device_id: int,
+        anti_fraude_card: bool,
+        anti_fraude_qr_code: bool,
+        anti_fraude_duration: int,
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        """Persist a device's anti-fraud (re-entry) settings to the backend GymDevice.
+
+        Reuses the backend's /connected/gym-device endpoints (POST get/{id} then
+        POST update, both @PostMapping under /api/v1) — fetch the full GymDeviceDto,
+        patch ONLY the three anti-fraud fields, post it back — so no other field is
+        lost. base is _derive_api_base() = {scheme}://{host}/api/v1 (the backend
+        serves /api/v1/connected/**; using only the host 405s at nginx). Best-effort:
+        any failure is surfaced via the backendSaved flag, not silently assumed.
+        Duration clamped to backend 5-300.
+        """
+        base = self._derive_api_base()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        get_url = f"{base}/connected/gym-device/get/{int(device_id)}"
+        try:
+            r = self._session.post(get_url, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"getGymDevice request failed: {e}") from e
+        if r.status_code < 200 or r.status_code >= 300:
+            raise MonClubApiHttpError(
+                f"getGymDevice failed: HTTP {r.status_code} -> {(r.text or '')[:300]}",
+                status_code=r.status_code, body=(r.text or ""),
+            )
+        body = r.json()
+        model = body.get("data", body) if isinstance(body, dict) else body
+        if not isinstance(model, dict):
+            raise MonClubApiError(f"getGymDevice returned unexpected payload type {type(model).__name__}")
+
+        model["antiFraudeCard"] = bool(anti_fraude_card)
+        model["antiFraudeQrCode"] = bool(anti_fraude_qr_code)
+        model["antiFraudeDuration"] = min(300, max(5, int(anti_fraude_duration)))
+
+        upd_url = f"{base}/connected/gym-device/update"
+        try:
+            r2 = self._session.post(upd_url, json=model, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"updateGymDevice request failed: {e}") from e
+        if r2.status_code < 200 or r2.status_code >= 300:
+            raise MonClubApiHttpError(
+                f"updateGymDevice failed: HTTP {r2.status_code} -> {(r2.text or '')[:300]}",
+                status_code=r2.status_code, body=(r2.text or ""),
+            )
+        try:
+            return r2.json()
+        except Exception:
+            return {"ok": True}
+
     @_tel.timed("API_LOGIN", slow_ms=0, warn_ms=3000)
     def login(self, *, email: str, password: str, timeout: int = 15) -> str:
         """Authenticate and return the access token.
@@ -177,11 +247,17 @@ class MonClubApi:
         return access_token
 
     @_tel.timed("API_TOKEN_REFRESH", slow_ms=0, warn_ms=3000)
-    def do_proactive_refresh(self, *, email: str, timeout: int = 15) -> bool:
-        """Silently rotate the refresh token if the proactive-refresh deadline has passed.
+    def do_proactive_refresh(self, *, email: str, timeout: int = 15, force: bool = False) -> bool:
+        """Rotate the refresh token and persist a fresh access token.
 
         Reads the stored refresh token from the local database, calls
         ``/public/account/refresh``, and saves the new tokens on success.
+
+        When ``force`` is False (proactive use) this is a no-op unless the
+        proactive-refresh deadline has passed. When ``force`` is True (reactive
+        use after a 401) the deadline check is skipped and a rotation is
+        attempted immediately — this is how a token that expired earlier than
+        the proactive schedule expected is recovered without a full re-login.
 
         Returns True if the access token was refreshed (callers should reload
         the auth state from the database), False if no refresh was needed or
@@ -192,7 +268,7 @@ class MonClubApi:
             from shared.auth_state import is_refresh_due, next_refresh_at_from_expires
 
             next_refresh_at = load_next_refresh_at()
-            if not is_refresh_due(next_refresh_at or ""):
+            if not force and not is_refresh_due(next_refresh_at or ""):
                 return False
 
             stored_refresh = load_refresh_token()
@@ -488,6 +564,202 @@ class MonClubApi:
             timeout=timeout,
         )
 
+
+    # ---------------- Managed media (member photo) presign client ----------------
+    def media_create_upload_session(
+        self,
+        *,
+        token: str,
+        file_name: str,
+        content_type: str,
+        size_bytes: int,
+        active_membership_id: int,
+        replace_existing: bool = True,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """Reserve a managed-media upload session for a member photo, targeting the
+        member's ActiveMembership so finalize links the StoredFile directly to it.
+        POST {base}/manager/media/upload-sessions (base = _derive_api_base() = /api/v1)."""
+        url = f"{self._derive_api_base()}/manager/media/upload-sessions"
+        body = {
+            "fileName": file_name,
+            "contentType": content_type,
+            "declaredSizeBytes": int(size_bytes),
+            "fileRole": "ACTIVE_MEMBERSHIP_USER_IMAGE",
+            "targetEntityType": "ACTIVE_MEMBERSHIP",
+            "targetEntityId": int(active_membership_id),
+            "replaceExisting": bool(replace_existing),
+        }
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
+        try:
+            r = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"createUploadSession request failed: {e}") from e
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            raise MonClubApiHttpError(
+                f"createUploadSession failed: HTTP {r.status_code} -> {txt[:400]}{_extract_trace_info(txt)}",
+                status_code=r.status_code, body=txt,
+            )
+        data = r.json()
+        if not isinstance(data, dict):
+            raise MonClubApiError("createUploadSession returned a non-object body.")
+        return data
+
+    def media_put_object(
+        self,
+        *,
+        upload_url: str,
+        upload_method: str | None,
+        upload_headers: Dict[str, str] | None,
+        upload_fields: Dict[str, str] | None,
+        data: bytes,
+        content_type: str,
+        file_name: str,
+        timeout: int = 120,
+    ) -> None:
+        """Upload the raw bytes to the presigned storage URL. Handles both presigned-PUT
+        (R2/S3 — headers carry the signature) and form-POST (Cloudinary — uploadFields).
+        The storage URL is NOT a backend URL, so the bearer token MUST NOT be attached."""
+        u = (upload_url or "").strip()
+        if not u:
+            raise MonClubApiError("uploadUrl is empty in the upload session response.")
+        try:
+            if upload_fields:
+                # Cloudinary-style multipart form upload: signed fields + the file part.
+                files = {"file": (file_name, data, content_type)}
+                r = requests.post(u, data=dict(upload_fields), files=files, timeout=timeout)
+            else:
+                method = (upload_method or "PUT").upper()
+                headers = dict(upload_headers or {})
+                if not any(k.lower() == "content-type" for k in headers):
+                    headers["Content-Type"] = content_type
+                r = requests.request(method, u, data=data, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"storage upload request failed: {e}") from e
+        if r.status_code < 200 or r.status_code >= 300:
+            raise MonClubApiHttpError(
+                f"storage upload failed: HTTP {r.status_code} -> {(r.text or '')[:300]}",
+                status_code=r.status_code, body=(r.text or ""),
+            )
+
+    def media_finalize_upload(
+        self,
+        *,
+        token: str,
+        session_id: int,
+        active_membership_id: int,
+        replace_existing: bool = True,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """Finalize the session and LINK the StoredFile to the member's ActiveMembership
+        (role ACTIVE_MEMBERSHIP_USER_IMAGE) — this is what makes the photo show on the
+        member, with no edit-member endpoint needed.
+        POST {base}/connected/media/upload-sessions/{id}/finalize."""
+        url = f"{self._derive_api_base()}/connected/media/upload-sessions/{int(session_id)}/finalize"
+        body = {
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": int(active_membership_id),
+            "role": "ACTIVE_MEMBERSHIP_USER_IMAGE",
+            "replaceExisting": bool(replace_existing),
+        }
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
+        try:
+            r = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"finalizeUpload request failed: {e}") from e
+        if r.status_code < 200 or r.status_code >= 300:
+            txt = (r.text or "").strip()
+            raise MonClubApiHttpError(
+                f"finalizeUpload failed: HTTP {r.status_code} -> {txt[:400]}{_extract_trace_info(txt)}",
+                status_code=r.status_code, body=txt,
+            )
+        data = r.json()
+        return data if isinstance(data, dict) else {"ok": True}
+
+    # ---------------- Lifecycle mutations (edit/renew/freeze/balance/delete/taxes) ----------------
+    # All paths are relative to _derive_api_base() (= {scheme}://{host}/api/v1).
+    _LIFECYCLE_ROUTES = {
+        "edit": ("POST", "/gym/activeMembership/updateActiveMembership"),
+        "renew": ("POST", "/gym/activeMembership/renew"),
+        "balance_adjust": ("POST", "/gym/activeMembership/updateUserBalance"),
+        "pay_rest": ("POST", "/gym/activeMembership/payRest"),
+        "pay_tolerance": ("POST", "/gym/activeMembership/payTolerance"),
+        "tax_assign": ("POST", "/activeMembershipTaxes/assign"),
+        "tax_mark_paid": ("POST", "/activeMembershipTaxes/markPaid"),
+        "tax_toggle": ("POST", "/activeMembershipTaxes/toggle"),
+        "tax_cancel": ("POST", "/activeMembershipTaxes/cancel"),
+        "freeze_create": ("POST", "/activeMembershipFreezes/create"),
+        "freeze_cancel": ("POST", "/activeMembershipFreezes/cancel"),
+        # "delete" is handled specially (DELETE verb + path param).
+    }
+
+    def _lifecycle_request(
+        self, *, method: str, url: str, token: str, payload: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None, expected_version: Optional[int] = None, timeout: int = 25,
+    ) -> Dict[str, Any]:
+        """Single transport for all lifecycle mutations. Injects the idempotency key
+        (X-Idempotency-Key header + clientRequestId in body, belt-and-suspenders) and the
+        optional expected @Version; raises MonClubApiConflictError on 409 so the drain can
+        distinguish a stale-version conflict from a retryable failure."""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
+        if idempotency_key:
+            headers["X-Idempotency-Key"] = str(idempotency_key)
+        if expected_version is not None:
+            headers["X-Expected-Version"] = str(int(expected_version))
+        body = dict(payload or {})
+        if idempotency_key and "clientRequestId" not in body:
+            body["clientRequestId"] = str(idempotency_key)
+        if expected_version is not None and "expectedVersion" not in body:
+            body["expectedVersion"] = int(expected_version)
+
+        m = (method or "POST").upper()
+        self.logger.info("API lifecycle %s -> %s", m, url)
+        try:
+            if m == "DELETE":
+                r = self._session.delete(url, headers=headers, timeout=timeout)
+            else:
+                r = self._session.request(m, url, json=body, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"lifecycle {m} request failed: {e}") from e
+
+        txt = (r.text or "").strip()
+        if r.status_code == 409:
+            raise MonClubApiConflictError(
+                f"lifecycle conflict: HTTP 409 -> {txt[:400]}", status_code=409, body=txt,
+                server_state=_load_error_payload(txt) or None,
+            )
+        if r.status_code < 200 or r.status_code >= 300:
+            raise MonClubApiHttpError(
+                f"lifecycle {m} failed: HTTP {r.status_code} -> {txt[:400]}{_extract_trace_info(txt)}",
+                status_code=r.status_code, body=txt,
+            )
+        try:
+            data = r.json()
+        except Exception:
+            return {"ok": True} if not txt else {"ok": True, "raw": txt}
+        return data if isinstance(data, dict) else {"ok": True, "raw": data}
+
+    def apply_lifecycle_mutation(
+        self, *, op_kind: str, target_id: int, payload: Dict[str, Any], token: str,
+        idempotency_key: Optional[str] = None, expected_version: Optional[int] = None, timeout: int = 25,
+    ) -> Dict[str, Any]:
+        """Apply one lifecycle mutation by op_kind. Used by the offline-mutation drain
+        (online-first attempt + retry). The SAME idempotency_key is sent on every retry of
+        the same logical action so a replay is a server-side no-op."""
+        base = self._derive_api_base()
+        ok = (op_kind or "").strip().lower()
+        if ok == "delete":
+            url = f"{base}/connected/activeMembership/deleteActiveMembership/{int(target_id)}"
+            return self._lifecycle_request(method="DELETE", url=url, token=token, idempotency_key=idempotency_key, timeout=timeout)
+        route = self._LIFECYCLE_ROUTES.get(ok)
+        if not route:
+            raise MonClubApiError(f"unknown lifecycle op_kind: {op_kind!r}")
+        method, path = route
+        return self._lifecycle_request(
+            method=method, url=f"{base}{path}", token=token, payload=payload,
+            idempotency_key=idempotency_key, expected_version=expected_version, timeout=timeout,
+        )
 
     def _post_access_creation(self, *, url: str, token: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
         u = (url or "").strip()
