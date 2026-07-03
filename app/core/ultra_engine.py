@@ -1015,6 +1015,13 @@ class UltraDeviceWorker(threading.Thread):
                 if self._sdk is None or not self._connected:
                     self.request_member_sync(member_id)
                     break
+                # Push drivers: same livelock hazard as the full-sync drain — a
+                # None raw handle would re-queue this member forever. Use the
+                # driver's targeted roster push instead (always terminates).
+                if getattr(self._sdk, "owns_event_source", False):
+                    self._run_standalone_member_sync(member_id)
+                    drained += 1
+                    continue
                 raw_sdk = getattr(self._sdk, "_sdk", None)
                 if raw_sdk is None:
                     self.request_member_sync(member_id)
@@ -1058,6 +1065,144 @@ class UltraDeviceWorker(threading.Thread):
             drained += 1
         return drained
 
+    # ------------------------------------------------------------------ #
+    # ZK_STANDALONE (push-driver) sync path
+    #
+    # DeviceSyncEngine's push internals are PullSDK-table-specific (user/
+    # userauthorize/templatev10 via SetDeviceData) and its entry point takes a
+    # raw PullSDK handle. A standalone driver (MB2000/zkemkeeper) has neither —
+    # extracting `_sdk` yields None and the old code would re-queue the request
+    # forever (a livelock: _mark_full_sync_finished never fires, manual-sync
+    # pending counters never ack). These helpers give push drivers their own
+    # roster path that reuses the protocol-NEUTRAL parts of DeviceSyncEngine
+    # (user filtering + template collection) and always terminates the request.
+    # ------------------------------------------------------------------ #
+
+    def _build_standalone_roster(
+        self, cache: Any, *, only_member_ids: set[int] | None = None
+    ) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]]]:
+        """(users, templates_by_pin) for driver.push_roster().
+
+        Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
+        VALID_ONLY policy / pin derivation: activeMembershipId, else userId) and
+        _collect_templates_for_pin (cache fingerprints -> local SQLite fallback)
+        so a standalone device sees exactly the roster a PullSDK panel would.
+        Cards are passed RAW (digits handled by the driver): the 4-byte CardNo
+        clamp is a PullSDK/C3 constraint, and the MB2000 card space is verified
+        on-site (plan GATE 6) before any capability-based clamping is added.
+        """
+        from app.core.device_sync import DeviceSyncEngine
+
+        engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
+        device = dict(self._device or {})
+        users_all = list(getattr(cache, "users", []) or [])
+        by_pin = engine._filter_users_for_device(
+            users=users_all, device=device, default_door_id=1,
+        )
+        if only_member_ids is not None:
+            wanted = {str(int(m)) for m in only_member_ids}
+            by_pin = {p: u for p, u in by_pin.items() if p in wanted}
+
+        fp_enabled = bool(self._settings.get("fingerprint_enabled", False))
+        local_fp_index = engine._build_local_fp_index_for_pins(
+            pins=set(by_pin.keys()), fingerprint_enabled=fp_enabled,
+        )
+
+        users_out: list[Dict[str, Any]] = []
+        templates_by_pin: Dict[str, list[Dict[str, Any]]] = {}
+        for pin, u in by_pin.items():
+            users_out.append({
+                "pin": pin,
+                "name": str(u.get("fullName") or ""),
+                "card": str(u.get("firstCardId") or ""),
+            })
+            tpls = engine._collect_templates_for_pin(
+                user=u, pin=pin, local_fp_index=local_fp_index,
+                fingerprint_enabled=fp_enabled,
+            )
+            if tpls:
+                templates_by_pin[pin] = tpls
+        return users_out, templates_by_pin
+
+    def _run_standalone_full_sync(self, *, reason: str, fingerprint_hash: str | None) -> None:
+        """Full roster push for a push driver, with FULL parity on the started/
+        finished bookkeeping so scheduler skip-hashes and manual-sync pending
+        counters keep working. Always terminates (never re-queues itself)."""
+        started_at = time.time()
+        started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
+        cache = load_sync_cache()
+        if cache is None:
+            logger.warning("%s standalone full sync skipped: no sync cache", self._prefix)
+            self._mark_full_sync_finished(reason=reason, ok=False, duration_ms=0.0,
+                                          error="no sync cache available")
+            self._notify_full_sync_finished(reason=reason, ok=False, fingerprint_hash=None,
+                                            duration_ms=0.0, error="no sync cache available")
+            return
+
+        self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
+        self._notify_full_sync_started(reason=reason)
+        _tel.set_state(self._tel_wid, "full_sync", f"reason={reason}")
+        _tel.event("FULL_SYNC_START", worker=self._tel_wid, reason=reason,
+                   users=len(getattr(cache, "users", []) or []))
+        result: Dict[str, Any] = {}
+        try:
+            users, templates_by_pin = self._build_standalone_roster(cache)
+            # Daytime pushes must NOT EnableDevice-lock the terminal (it is the
+            # gym's sole verifier); only the explicit nightly/manual reconcile
+            # brackets. See plan decision D6.
+            bracket = reason in ("user-sync", "daily-forced-sync", "hard-reset")
+            result = self._sdk.push_roster(users, templates_by_pin,
+                                           bracket_enable_device=bracket)
+            sync_ok = bool(result.get("ok"))
+            sync_error = "" if sync_ok else str(
+                (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
+            )
+        except Exception as exc:
+            sync_ok = False
+            sync_error = str(exc)
+        duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
+        _tel.event("FULL_SYNC_DONE", worker=self._tel_wid, reason=reason, ok=sync_ok,
+                   dur_ms=round(duration_ms), pushed=result.get("pushed"),
+                   failed=result.get("failed"))
+        self._mark_full_sync_finished(reason=reason, ok=sync_ok,
+                                      duration_ms=duration_ms, error=sync_error)
+        self._notify_full_sync_finished(
+            reason=reason, ok=sync_ok,
+            fingerprint_hash=fingerprint_hash if sync_ok else None,
+            duration_ms=duration_ms, error=sync_error,
+        )
+
+    def _run_standalone_member_sync(self, member_id: int) -> None:
+        """Targeted single-member push for a push driver. Failure logs + telemetry
+        (no endless re-queue — the periodic full sync is the safety net)."""
+        _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
+        _ms_t0 = time.monotonic()
+        try:
+            cache = load_sync_cache()
+            if cache is None:
+                logger.warning("%s standalone member sync skipped: no sync cache", self._prefix)
+                return
+            users, templates_by_pin = self._build_standalone_roster(
+                cache, only_member_ids={int(member_id)},
+            )
+            if not users:
+                logger.info("%s standalone member sync: member %s not in device roster",
+                            self._prefix, member_id)
+                return
+            result = self._sdk.push_roster(users, templates_by_pin)
+            if not result.get("ok"):
+                _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
+                          member_id=member_id, err="push_roster")
+        except Exception as exc:
+            logger.warning("%s standalone member sync failed: member_id=%s err=%s",
+                           self._prefix, member_id, exc)
+            _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
+                      member_id=member_id, err=type(exc).__name__)
+        finally:
+            _tel.event("MEMBER_SYNC_DONE", worker=self._tel_wid, member_id=member_id,
+                       dur_ms=round((time.monotonic() - _ms_t0) * 1000),
+                       pending=len(self._pending_member_syncs))
+
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
@@ -1076,6 +1221,16 @@ class UltraDeviceWorker(threading.Thread):
                 if self._sdk is None or not self._connected:
                     self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
                     break
+                # Push drivers (ZK_STANDALONE) have no raw PullSDK handle — the
+                # extraction below would yield None and re-queue this request
+                # FOREVER. Route them to their own roster path, which always
+                # terminates the request (mark/notify fire on both outcomes).
+                if getattr(self._sdk, "owns_event_source", False):
+                    self._run_standalone_full_sync(
+                        reason=reason, fingerprint_hash=fingerprint_hash,
+                    )
+                    drained += 1
+                    continue
                 raw_sdk = getattr(self._sdk, "_sdk", None)
                 if raw_sdk is None:
                     self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)

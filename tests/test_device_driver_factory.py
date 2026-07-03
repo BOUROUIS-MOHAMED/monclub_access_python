@@ -17,7 +17,6 @@ import pytest
 from app.sdk.device_driver import (
     DeviceDriver,
     DeviceProtocol,
-    UnsupportedDeviceProtocolError,
     get_driver,
     resolve_device_protocol,
 )
@@ -75,11 +74,23 @@ class TestGetDriver:
         assert drv.port == 4371
         assert drv.is_connected is False  # constructed, not connected — no side effects
 
-    def test_standalone_raises_not_silent_fallback(self):
-        with pytest.raises(UnsupportedDeviceProtocolError):
-            get_driver(_c3_payload(deviceProtocol="ZK_STANDALONE"))
+    def test_standalone_returns_zk_standalone_driver(self):
+        # Step 2 shipped the ZK_STANDALONE driver: the factory now constructs it
+        # (it does NOT fall back to PullSDK, which cannot drive an MB2000).
+        from app.sdk.zk_standalone import ZKStandaloneDevice
+        drv = get_driver(_c3_payload(deviceProtocol="ZK_STANDALONE"))
+        assert isinstance(drv, ZKStandaloneDevice)
+        assert not isinstance(drv, PullSDKDevice)
+        assert isinstance(drv, DeviceDriver)
+        assert drv.owns_event_source is True
 
-    def test_unsupported_is_a_notimplementederror(self):
-        # Callers may catch NotImplementedError generically.
-        with pytest.raises(NotImplementedError):
-            get_driver(_c3_payload(deviceProtocol="MB2000"))
+    def test_standalone_alias_mb2000_routes_to_standalone_driver(self):
+        from app.sdk.zk_standalone import ZKStandaloneDevice
+        drv = get_driver(_c3_payload(deviceProtocol="MB2000"))
+        assert isinstance(drv, ZKStandaloneDevice)
+
+    def test_standalone_driver_construction_has_no_side_effects(self):
+        # Constructing the driver must not spawn threads or touch COM/network.
+        drv = get_driver(_c3_payload(deviceProtocol="ZK_STANDALONE"))
+        assert drv.is_connected is False
+        assert drv._sta_thread is None

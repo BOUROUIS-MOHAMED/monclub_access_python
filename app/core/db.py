@@ -1037,7 +1037,9 @@ def init_db() -> None:
                 anti_fraude_card             INTEGER NOT NULL DEFAULT 1,
                 anti_fraude_qr_code          INTEGER NOT NULL DEFAULT 1,
                 anti_fraude_duration         INTEGER NOT NULL DEFAULT 30,
-                anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0
+                anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0,
+
+                device_protocol TEXT
             );
             """
         )
@@ -1096,6 +1098,11 @@ def init_db() -> None:
         _ensure_column(conn, "sync_devices", "anti_fraude_duration",         "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
         _ensure_column(conn, "sync_devices", "anti_fraude_daily_pass_limit", "anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0")
 
+        # SDK-family routing for the device-driver factory (app/sdk/device_driver.py).
+        # NULL/absent -> ZK_PULLSDK (safe default: every pre-existing device is a
+        # PullSDK panel); 'ZK_STANDALONE' -> MB2000-class standalone terminals.
+        _ensure_column(conn, "sync_devices", "device_protocol", "device_protocol TEXT")
+
         # F-015: Deduplicate sync_devices by id before adding unique index
         conn.execute("""
             DELETE FROM sync_devices WHERE rowid NOT IN (
@@ -1120,7 +1127,8 @@ def init_db() -> None:
                 updated_at TEXT,
                 favorite_enabled INTEGER NOT NULL DEFAULT 0,
                 favorite_order INTEGER,
-                favorite_shortcut TEXT
+                favorite_shortcut TEXT,
+                direction TEXT
             );
             """
         )
@@ -1129,6 +1137,9 @@ def init_db() -> None:
         _ensure_column(conn, "sync_device_door_presets", "favorite_enabled", "favorite_enabled INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "sync_device_door_presets", "favorite_order", "favorite_order INTEGER")
         _ensure_column(conn, "sync_device_door_presets", "favorite_shortcut", "favorite_shortcut TEXT")
+        # Per-door IN/OUT direction (backend GymDeviceDoorPreset.direction, V53). Drives
+        # entry-vs-exit labeling of access history at multi-turnstile gyms.
+        _ensure_column(conn, "sync_device_door_presets", "direction", "direction TEXT")
 
         # -----------------------------
         # infrastructures
@@ -2765,8 +2776,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                 """
                 INSERT OR REPLACE INTO sync_device_door_presets (
                     remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
-                    favorite_enabled, favorite_order, favorite_shortcut
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    favorite_enabled, favorite_order, favorite_shortcut, direction
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     _to_int_or_none(p.get("id")),
@@ -2779,6 +2790,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
                     1 if p.get("favoriteEnabled") else 0,
                     _to_int_or_none(p.get("favoriteOrder")),
                     _safe_str(p.get("favoriteShortcut"), None),
+                    _safe_str(p.get("direction"), None),
                 ),
             )
 
@@ -2823,7 +2835,9 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             created_at, updated_at,
 
             anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration,
-            anti_fraude_daily_pass_limit
+            anti_fraude_daily_pass_limit,
+
+            device_protocol
         )
         VALUES (
             ?, ?, ?, ?,
@@ -2843,6 +2857,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?,
             ?, ?,
             ?, ?, ?,
+            ?,
             ?
         )
         """,
@@ -2917,6 +2932,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _bool_to_i(d.get("antiFraudeQrCode", True), default=1),
             _to_int_or_none(d.get("antiFraudeDuration", 30)) or 30,
             _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
+
+            (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
         ),
     )
 
@@ -4196,7 +4213,7 @@ def _load_synced_door_presets_index() -> Dict[int, List[Dict[str, Any]]]:
         rows = conn.execute(
             """
             SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
-                   favorite_enabled, favorite_order, favorite_shortcut
+                   favorite_enabled, favorite_order, favorite_shortcut, direction
             FROM sync_device_door_presets
             ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
             """
@@ -4223,6 +4240,7 @@ def _build_synced_door_presets_index_from_rows(rows: List[Dict[str, Any]]) -> Di
                 "favoriteEnabled": bool(r.get("favorite_enabled")),
                 "favoriteOrder": r.get("favorite_order"),
                 "favoriteShortcut": r.get("favorite_shortcut"),
+                "direction": r.get("direction"),
             }
         )
     return idx
@@ -4238,7 +4256,7 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
         rows = conn.execute(
             """
             SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
-                   favorite_enabled, favorite_order, favorite_shortcut
+                   favorite_enabled, favorite_order, favorite_shortcut, direction
             FROM sync_device_door_presets
             WHERE device_id = ?
             ORDER BY door_number ASC, remote_id ASC, id ASC
@@ -4260,6 +4278,7 @@ def list_sync_device_door_presets_payload(device_id: int) -> List[Dict[str, Any]
                 "favoriteEnabled": bool(r["favorite_enabled"]),  # type: ignore[index]
                 "favoriteOrder": r["favorite_order"],  # type: ignore[index]
                 "favoriteShortcut": r["favorite_shortcut"],  # type: ignore[index]
+                "direction": r["direction"],  # type: ignore[index]
             }
         )
     return payload
@@ -4357,6 +4376,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "portNumber": g("portNumber", "port_number"),
 
         "accessDataMode": adm,
+
+        # SDK-family routing (device-driver factory). None/absent -> the factory's
+        # ZK_PULLSDK default, so pre-protocol rows keep working unchanged.
+        "deviceProtocol": g("deviceProtocol", "device_protocol"),
 
         "model": g("model"),
         "installedModels": installed,
@@ -4883,7 +4906,7 @@ def _fetch_sync_cache_snapshot() -> Dict[str, Any] | None:
             for r in conn.execute(
                 """
                 SELECT remote_id, device_id, door_number, pulse_seconds, door_name, created_at, updated_at,
-                       favorite_enabled, favorite_order, favorite_shortcut
+                       favorite_enabled, favorite_order, favorite_shortcut, direction
                 FROM sync_device_door_presets
                 ORDER BY device_id ASC, door_number ASC, remote_id ASC, id ASC
                 """
@@ -5547,6 +5570,7 @@ def list_sync_device_door_presets_payload_from_cache(
                     "favoriteEnabled": bool(preset.get("favoriteEnabled")),
                     "favoriteOrder": preset.get("favoriteOrder"),
                     "favoriteShortcut": preset.get("favoriteShortcut"),
+                    "direction": preset.get("direction"),
                 }
             )
         return payload

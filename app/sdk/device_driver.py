@@ -26,7 +26,10 @@ the MB2000 standalone driver. This file is only the interface + factory.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import threading
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
@@ -94,16 +97,86 @@ class UnsupportedDeviceProtocolError(NotImplementedError):
     """
 
 
+# --------------------------------------------------------------------------- #
+# Local protocol override (bring-up / kill-switch)
+#
+# A desktop-side map {device_id -> protocol} consulted BEFORE the backend payload
+# key, so a new device family can be brought up on-site without waiting for the
+# backend deploy — and flipped back instantly if a driver misbehaves. Sources:
+#   * env var MONCLUB_DEVICE_PROTOCOL_OVERRIDES = '{"12": "ZK_STANDALONE"}'
+#     (read once, lazily; malformed JSON is logged and ignored)
+#   * set_protocol_override(device_id, protocol) — programmatic/tests
+# --------------------------------------------------------------------------- #
+
+_OVERRIDES_ENV_VAR = "MONCLUB_DEVICE_PROTOCOL_OVERRIDES"
+_overrides_lock = threading.Lock()
+_protocol_overrides: Dict[int, str] = {}
+_env_overrides_loaded = False
+
+
+def set_protocol_override(device_id: Any, protocol: str | None) -> None:
+    """Set (or clear, with None) a local protocol override for one device."""
+    try:
+        did = int(device_id)
+    except (TypeError, ValueError):
+        return
+    with _overrides_lock:
+        if protocol is None:
+            _protocol_overrides.pop(did, None)
+        else:
+            _protocol_overrides[did] = str(protocol).strip().upper()
+
+
+def _load_env_overrides_once() -> None:
+    global _env_overrides_loaded
+    if _env_overrides_loaded:
+        return
+    with _overrides_lock:
+        if _env_overrides_loaded:
+            return
+        _env_overrides_loaded = True
+        raw = os.environ.get(_OVERRIDES_ENV_VAR, "").strip()
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    try:
+                        _protocol_overrides[int(k)] = str(v).strip().upper()
+                    except (TypeError, ValueError):
+                        continue
+                _log.info(
+                    "device protocol overrides loaded from %s: %s",
+                    _OVERRIDES_ENV_VAR, dict(_protocol_overrides),
+                )
+        except Exception as exc:
+            _log.warning("ignoring malformed %s: %s", _OVERRIDES_ENV_VAR, exc)
+
+
+def _override_for(device_payload: Any) -> Optional[str]:
+    if not isinstance(device_payload, dict):
+        return None
+    _load_env_overrides_once()
+    try:
+        did = int(device_payload.get("id"))
+    except (TypeError, ValueError):
+        return None
+    with _overrides_lock:
+        return _protocol_overrides.get(did)
+
+
 def resolve_device_protocol(device_payload: Any) -> DeviceProtocol:
     """Pick the protocol family for a device payload.
 
-    Reads ``deviceProtocol`` (camelCase, backend convention) or ``device_protocol``.
+    Order: (1) local override map (bring-up/kill-switch, see above);
+    (2) ``deviceProtocol`` (camelCase, backend convention) or ``device_protocol``.
     Absent / empty / unrecognised -> ZK_PULLSDK (the safe default: every device onboarded
     so far is a ZK PullSDK panel, and no gym should regress before the backend even sends
     a protocol). Only an explicitly-recognised standalone value routes to ZK_STANDALONE.
     """
-    raw = ""
-    if isinstance(device_payload, dict):
+    raw = _override_for(device_payload) or ""
+    if not raw and isinstance(device_payload, dict):
         raw = str(
             device_payload.get("deviceProtocol")
             or device_payload.get("device_protocol")
@@ -128,8 +201,12 @@ def get_driver(device_payload: Dict[str, Any], logger: Any | None = None) -> Dev
 
         return PullSDKDevice(device_payload, logger=logger)
 
-    raise UnsupportedDeviceProtocolError(
+    if protocol == DeviceProtocol.ZK_STANDALONE:
+        from app.sdk.zk_standalone import ZKStandaloneDevice
+
+        return ZKStandaloneDevice(device_payload, logger=logger)
+
+    raise UnsupportedDeviceProtocolError(  # pragma: no cover - future protocols
         f"No driver implemented for device protocol {protocol.value!r} "
-        f"(device id={device_payload.get('id') if isinstance(device_payload, dict) else '?'}). "
-        f"Only ZK_PULLSDK is supported in this build."
+        f"(device id={device_payload.get('id') if isinstance(device_payload, dict) else '?'})."
     )
