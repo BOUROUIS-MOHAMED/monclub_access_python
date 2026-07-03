@@ -26,6 +26,7 @@ from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
+from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
@@ -510,7 +511,9 @@ class DeviceWorker(threading.Thread):
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
 
-        self._device = PullSDKDevice(self.device_payload, logger=self.logger)
+        # Route through the driver factory (protocol-keyed). Defaults to ZK_PULLSDK
+        # -> PullSDKDevice, so this is a pure indirection for existing gyms.
+        self._device = get_driver(self.device_payload, logger=self.logger)
 
         # F-009: device timezone offset for local-time -> UTC epoch conversion
         self._device_tz_offset_sec: int = _safe_int(

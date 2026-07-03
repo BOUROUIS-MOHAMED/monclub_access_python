@@ -22,6 +22,7 @@ from app.core.db import (
 from app.core.settings_reader import get_backend_global_settings, normalize_device_settings
 from app.core.utils import now_iso
 from app.sdk.pullsdk import PullSDKDevice
+from app.sdk.device_driver import get_driver
 from shared.api.monclub_api import MonClubApi, MonClubApiError, MonClubApiHttpError
 
 UPLOAD_BATCH_SIZE = 200
@@ -534,7 +535,9 @@ class DeviceAttendanceMaintenanceEngine:
             return summary
 
         sdk_initial_size = _safe_int(global_settings.get("sdk_read_initial_bytes"), 1_048_576)
-        sdk_device = PullSDKDevice(self._prepare_pullsdk_payload(device_payload, device_settings), logger=self.logger)
+        # Route through the driver factory (protocol-keyed). Defaults to ZK_PULLSDK
+        # -> PullSDKDevice, so this is a pure indirection for existing gyms.
+        sdk_device = get_driver(self._prepare_pullsdk_payload(device_payload, device_settings), logger=self.logger)
 
         try:
             if read_due:

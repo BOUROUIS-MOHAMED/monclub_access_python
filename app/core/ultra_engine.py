@@ -32,6 +32,7 @@ from app.core.db import (
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
+from app.sdk.device_driver import get_driver
 
 logger = logging.getLogger("zkapp")
 
@@ -655,7 +656,9 @@ class UltraDeviceWorker(threading.Thread):
             self._connect_failures,
         )
         try:
-            self._sdk = PullSDKDevice(device_payload=self._device, logger=logger)
+            # Route through the driver factory (protocol-keyed). Defaults to ZK_PULLSDK
+            # -> PullSDKDevice, so this is a pure indirection for the C3 gym today.
+            self._sdk = get_driver(device_payload=self._device, logger=logger)
             ok = self._sdk.connect()
             if ok:
                 was_down_for = self._down_for_seconds()

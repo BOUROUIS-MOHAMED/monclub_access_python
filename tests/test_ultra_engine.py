@@ -1154,7 +1154,7 @@ class TestConnectBackoff:
         fake_sdk.connect.return_value = False
 
         with (
-            patch("app.core.ultra_engine.PullSDKDevice", return_value=fake_sdk),
+            patch("app.core.ultra_engine.get_driver", return_value=fake_sdk),
             patch("app.core.ultra_engine.time.monotonic", return_value=100.0),
         ):
             worker._connect()
@@ -1172,7 +1172,7 @@ class TestConnectBackoff:
         fake_sdk = MagicMock()
         fake_sdk.connect.return_value = True
 
-        with patch("app.core.ultra_engine.PullSDKDevice", return_value=fake_sdk):
+        with patch("app.core.ultra_engine.get_driver", return_value=fake_sdk):
             worker._connect()
 
         assert worker._connected is True
