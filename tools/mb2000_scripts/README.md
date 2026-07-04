@@ -35,6 +35,7 @@ signatures it uses, so a fix here maps 1:1 to the driver).
 | 8 | `8_live_monitor.ps1` | live punch table (pin, FINGER/CARD, time) — polls new attendance records |
 | 9 | `9_unlock_door.ps1` | ACUnlock relay test (SDK **and** wiring) |
 | 10 | `10_backup_restore_device.ps1` | dump ALL users+templates to `backups\*.json` / restore (clone terminals, pre-wipe safety) |
+| 11 | `11_portability_test.ps1` | **the decisive gate**: push a ZK9500 desk template then auto-watch the log 90s for a live finger match → prints **PASS / FAIL** |
 
 ## Local template store
 
@@ -49,8 +50,9 @@ signatures it uses, so a fix here maps 1:1 to the driver).
 ## Typical workflows
 
 - **Template portability test (do this before enrolling members!):**
-  `4` (enroll at the desk) → `5` (push to terminal) → put the real finger on
-  the terminal → watch it match in `8`.
+  `4` (enroll yourself at the desk) → `11` (auto push + 90s live-match watch →
+  PASS/FAIL). PASS = desk enrollment works. FAIL = enroll on the terminal instead,
+  and the gym's onboarding workflow changes — so decide this BEFORE mass enrollment.
 - **Clone terminal A to B/C:** run `10` (Backup) against A, then `10` (Restore)
   against B and C.
 - **Verify-method table for the app driver:** run `8`, punch finger then card,
