@@ -8,6 +8,18 @@
 
 $ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------------- bundled DLLs
+# The pack ships the x86 SDK DLLs in .\sdk\ (zkemkeeper.dll + its plcommpro dep,
+# and the ZK9500 libzkfp/libzkfpcsharp set). Put that folder on PATH so the COM
+# object and the .NET wrapper's native deps resolve without any system install.
+$script:SdkDir = Join-Path $PSScriptRoot 'sdk'
+if (Test-Path $script:SdkDir) {
+    if (($env:PATH -split ';') -notcontains $script:SdkDir) {
+        $env:PATH = "$script:SdkDir;$env:PATH"
+    }
+    try { [void][Runtime.InteropServices.Marshal] } catch {}
+}
+
 # ---------------------------------------------------------------- 32-bit shim
 function Assert-32Bit {
     param([string]$ScriptPath, [object[]]$ScriptArgs)

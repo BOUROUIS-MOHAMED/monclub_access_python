@@ -22,6 +22,7 @@ $cfg = Get-Config
 $dllPath = $cfg.zkfingerDll
 if (-not ($dllPath -and (Test-Path $dllPath))) {
     $guess = @(
+        (Join-Path $PSScriptRoot 'sdk\libzkfpcsharp.dll'),   # bundled with the pack
         (Join-Path $PSScriptRoot 'libzkfpcsharp.dll'),
         'C:\Program Files (x86)\ZKTeco\ZKFinger SDK\lib\libzkfpcsharp.dll',
         'C:\Windows\SysWOW64\libzkfpcsharp.dll'
