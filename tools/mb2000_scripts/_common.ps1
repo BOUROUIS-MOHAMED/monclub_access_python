@@ -1,9 +1,9 @@
-# _common.ps1 — shared helpers for the MB2000/zkemkeeper dev-script folder.
+# _common.ps1 - shared helpers for the MB2000/zkemkeeper dev-script folder.
 # Dot-sourced by every numbered script:   . "$PSScriptRoot\_common.ps1"
 #
 # WHY THIS FOLDER: fix each script alone on the gym PC (no .exe rebuild),
 # then merge the proven calls into MonClub Access (app/sdk/zk_standalone.py).
-# Everything runs in 32-BIT PowerShell because zkemkeeper.dll is 32-bit COM —
+# Everything runs in 32-BIT PowerShell because zkemkeeper.dll is 32-bit COM -
 # Assert-32Bit relaunches the script under SysWOW64 automatically.
 
 $ErrorActionPreference = 'Stop'
@@ -50,7 +50,7 @@ function Get-Config {
             foreach ($k in @($defaults.Keys)) {
                 if ($null -ne $j.$k -and "$($j.$k)" -ne '') { $defaults[$k] = $j.$k }
             }
-        } catch { Write-Warn "config.json unreadable — using defaults ($_)" }
+        } catch { Write-Warn "config.json unreadable - using defaults ($_)" }
     }
     return $defaults
 }
@@ -67,7 +67,7 @@ function Ask-Default { param([string]$prompt, [string]$default)
 }
 
 # ---------------------------------------------------------------- zkemkeeper
-# SIGNATURES USED (fix here once if a firmware disagrees — all scripts inherit):
+# SIGNATURES USED (fix here once if a firmware disagrees - all scripts inherit):
 #   New-Object -ComObject zkemkeeper.CZKEM   (fallback: zkemkeeper.ZKEM)
 #   $zk.SetCommPassword([int]$key)           # BEFORE Connect_Net when key set
 #   $zk.Connect_Net($ip, $port) -> bool
@@ -89,7 +89,7 @@ function Connect-Zkem {
     Write-Info "connecting to $($cfg.deviceIp):$($cfg.devicePort) ..."
     $ok = $zk.Connect_Net($cfg.deviceIp, [int]$cfg.devicePort)
     if (-not $ok) {
-        Write-Err "Connect_Net returned FALSE — check IP/port, network, device COMM key."
+        Write-Err "Connect_Net returned FALSE - check IP/port, network, device COMM key."
         Pause-End; exit 1
     }
     Write-Ok "connected"

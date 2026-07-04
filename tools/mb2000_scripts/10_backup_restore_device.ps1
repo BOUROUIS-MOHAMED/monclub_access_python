@@ -1,4 +1,4 @@
-# 10_backup_restore_device.ps1 — dump EVERY user (pin/name/card) + all their
+# 10_backup_restore_device.ps1 - dump EVERY user (pin/name/card) + all their
 # fingerprint templates from the device into one timestamped JSON file, or
 # restore such a backup onto a device. Your safety net before wiping/replacing
 # a terminal, and the fastest way to CLONE one terminal onto the other two.

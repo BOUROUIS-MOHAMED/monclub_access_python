@@ -1,4 +1,4 @@
-# 2_get_member_templates.ps1 — list the users ON THE DEVICE and read their
+# 2_get_member_templates.ps1 - list the users ON THE DEVICE and read their
 # fingerprint templates (all members, or search by pin/name/card). Optionally
 # save what you read into the local store (templates\<pin>.json) so script 5
 # can push it to another device.
@@ -35,7 +35,7 @@ try {
     Write-Ok "$($users.Count) user(s) on the device"
 
     # ---- optional search ------------------------------------------------------
-    $q = Read-Host "Search (pin / name / card — ENTER for ALL)"
+    $q = Read-Host "Search (pin / name / card - ENTER for ALL)"
     $sel = if ([string]::IsNullOrWhiteSpace($q)) { $users } else {
         $qq = $q.Trim().ToLower()
         $users | Where-Object {

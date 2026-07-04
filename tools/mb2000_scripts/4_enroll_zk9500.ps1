@@ -1,11 +1,11 @@
-# 4_enroll_zk9500.ps1 — capture a fingerprint on the ZK9500 USB desk reader
+# 4_enroll_zk9500.ps1 - capture a fingerprint on the ZK9500 USB desk reader
 # (3 samples merged into one registered template) and SAVE IT LOCALLY into
 # templates\<pin>.json. No device/network needed. Push later with script 5.
 #
 # REQUIREMENT: the ZKFinger SDK's .NET wrapper 'libzkfpcsharp.dll' (and its
-# native libzkfp.dll) — install the ZKFinger SDK or copy its x86 DLLs into a
+# native libzkfp.dll) - install the ZKFinger SDK or copy its x86 DLLs into a
 # folder; the script asks once and remembers the path in config.json.
-# NOTE: use the x86 (32-bit) wrapper — this script runs 32-bit like the others.
+# NOTE: use the x86 (32-bit) wrapper - this script runs 32-bit like the others.
 #
 # API USED (libzkfpcsharp.zkfp2, fix alone if wrapper version differs):
 #   Init() -> 0 ok | GetDeviceCount() | OpenDevice(0) -> IntPtr
@@ -45,7 +45,7 @@ $fid  = [int](Ask-Default "Finger ID (0-9)" '6')
 if ($fid -lt 0 -or $fid -gt 9) { Write-Err "fingerId 0-9"; Pause-End; exit 1 }
 
 # ---- open reader ---------------------------------------------------------------
-if ($zkfp::Init() -ne 0) { Write-Err "zkfp Init failed — reader plugged in? drivers installed?"; Pause-End; exit 1 }
+if ($zkfp::Init() -ne 0) { Write-Err "zkfp Init failed - reader plugged in? drivers installed?"; Pause-End; exit 1 }
 try {
     if ($zkfp::GetDeviceCount() -lt 1) { Write-Err "no ZK9500 reader detected"; Pause-End; exit 1 }
     $h = $zkfp::OpenDevice(0)
@@ -59,7 +59,7 @@ try {
     try {
         for ($i = 1; $i -le 3; $i++) {
             Write-Host ""
-            Write-Host ">>> Sample $i / 3 — PLACE the finger on the reader..." -ForegroundColor Yellow
+            Write-Host ">>> Sample $i / 3 - PLACE the finger on the reader..." -ForegroundColor Yellow
             $tmpBuf = New-Object byte[] 2048
             $deadline = (Get-Date).AddSeconds(30)
             $got = $false
@@ -68,7 +68,7 @@ try {
                 $rc = $zkfp::AcquireFingerprint($h, $imgBuf, $tmpBuf, [ref]$size)
                 if ($rc -eq 0) {
                     $samples += ,@($tmpBuf[0..($size - 1)])
-                    Write-Ok "sample $i captured ($size bytes) — LIFT the finger"
+                    Write-Ok "sample $i captured ($size bytes) - LIFT the finger"
                     Start-Sleep -Milliseconds 900
                     $got = $true; break
                 }
@@ -97,7 +97,7 @@ try {
             source     = 'zk9500'
         })
         Save-Member $member
-        Write-Ok "member $pin now has $(@($member.fingers).Count) local finger(s) — push with 5_push_member_to_device.ps1"
+        Write-Ok "member $pin now has $(@($member.fingers).Count) local finger(s) - push with 5_push_member_to_device.ps1"
     } finally {
         if ($db -ne [IntPtr]::Zero) { [void]$zkfp::DBFree($db) }
         [void]$zkfp::CloseDevice($h)

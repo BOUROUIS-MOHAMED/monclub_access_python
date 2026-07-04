@@ -1,4 +1,4 @@
-# 8_live_monitor.ps1 — watch punches (fingerprint/card) appear in real time.
+# 8_live_monitor.ps1 - watch punches (fingerprint/card) appear in real time.
 # THE most useful script while testing: shows WHO verified, HOW, and WHEN.
 #
 # HOW IT WORKS: PowerShell cannot host COM event sinks reliably, so this polls
@@ -11,7 +11,7 @@
 #   SSR_GetGeneralLogData(1,[ref]pin,[ref]verifyMode,[ref]inOut,[ref]y,[ref]mo,
 #                         [ref]d,[ref]h,[ref]mi,[ref]s,[ref]workcode) -> bool (loop)
 #   verifyMode: 0=password 1=fingerprint 2=card (multi-verify firmwares shift values
-#   — record what YOUR device prints; that table goes into the app driver)
+#   - record what YOUR device prints; that table goes into the app driver)
 . "$PSScriptRoot\_common.ps1"
 Assert-32Bit $PSCommandPath $args
 Write-Title "8) LIVE punch monitor (CTRL+C to stop)"

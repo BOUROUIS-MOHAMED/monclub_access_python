@@ -1,4 +1,4 @@
-# 3_get_device_info.ps1 — identity + capacity + clock of the device.
+# 3_get_device_info.ps1 - identity + capacity + clock of the device.
 # Every read is independent (try/catch) so one unsupported call never hides the rest.
 #
 # SIGNATURES USED:
@@ -51,7 +51,7 @@ try {
             $devTime = Get-Date -Year $y -Month $mo -Day $d -Hour $h -Minute $mi -Second $s
             $skew = [math]::Round(($devTime - (Get-Date)).TotalSeconds, 1)
             Write-Host ("  {0,-22} {1}   (skew vs this PC: {2}s)" -f 'Device time', $devTime.ToString('yyyy-MM-dd HH:mm:ss'), $skew)
-            if ([math]::Abs($skew) -gt 30) { Write-Warn "clock skew > 30s — fix before trusting event times" }
+            if ([math]::Abs($skew) -gt 30) { Write-Warn "clock skew > 30s - fix before trusting event times" }
             if ((Ask-Default "Set device clock to this PC's time? (y/n)" 'n') -eq 'y') {
                 $now = Get-Date
                 if ($zk.SetDeviceTime2($mn, $now.Year, $now.Month, $now.Day, $now.Hour, $now.Minute, $now.Second)) {

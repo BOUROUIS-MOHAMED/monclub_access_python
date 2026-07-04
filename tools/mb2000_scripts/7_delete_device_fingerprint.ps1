@@ -1,4 +1,4 @@
-# 7_delete_device_fingerprint.ps1 — delete enrollment data ON THE DEVICE.
+# 7_delete_device_fingerprint.ps1 - delete enrollment data ON THE DEVICE.
 #
 # SIGNATURE USED:  SSR_DeleteEnrollData(1, pin, backupNumber) -> bool
 #   backupNumber:  0..9  = that single fingerprint
@@ -30,7 +30,7 @@ try {
         }
         '^F$' {
             $ok = $zk.SSR_DeleteEnrollData($mn, $pin, 11)
-            if (-not $ok) { Write-Warn "backup 11 returned FALSE — trying 13"; $ok = $zk.SSR_DeleteEnrollData($mn, $pin, 13) }
+            if (-not $ok) { Write-Warn "backup 11 returned FALSE - trying 13"; $ok = $zk.SSR_DeleteEnrollData($mn, $pin, 13) }
             if ($ok) { Write-Ok "all fingerprints deleted for pin $pin" } else { Write-Err "returned FALSE (11 and 13)" }
         }
         '^U$' {

@@ -1,4 +1,4 @@
-# 11_portability_test.ps1 — the decisive on-site experiment (plan GATE 3):
+# 11_portability_test.ps1 - the decisive on-site experiment (plan GATE 3):
 # does a fingerprint captured at the desk on the ZK9500 (script 4, source=zk9500)
 # actually MATCH a live finger on the MB2000?  Automates: push -> watch the
 # attendance log up to 90s -> print PASS / FAIL, instead of eyeballing the terminal.
@@ -26,7 +26,7 @@ $pin = Read-Host "PIN to test"
 $member = Load-Member $pin
 if (-not $member) { Write-Err "no templates\$pin.json in the local store"; Pause-End; exit 1 }
 
-# Prefer the ZK9500 desk-captured fingers — those are what this test is ABOUT.
+# Prefer the ZK9500 desk-captured fingers - those are what this test is ABOUT.
 # (Fingers pulled back from the device with script 2 would trivially match and
 #  prove nothing about desk-capture portability.)
 $allFingers  = @($member.fingers)
@@ -34,7 +34,7 @@ $deskFingers = @($allFingers | Where-Object { "$($_.source)" -match 'zk9500' })
 $testFingers = if ($deskFingers.Count -gt 0) { $deskFingers } else { $allFingers }
 
 if ($deskFingers.Count -eq 0) {
-    Write-Warn "this member has no source=zk9500 finger — testing all fingers, but a"
+    Write-Warn "this member has no source=zk9500 finger - testing all fingers, but a"
     Write-Warn "match only proves portability if the template was ZK9500-captured (script 4)."
 }
 Write-Info ("testing finger id(s): [{0}]" -f (($testFingers | ForEach-Object { $_.fingerId }) -join ','))
@@ -49,7 +49,7 @@ try {
     $card = ("$($member.card)" -replace '\D', '')
     try { [void]$zk.SetStrCardNumber($card) } catch { Write-Warn "SetStrCardNumber failed: $_" }
     $ok = $zk.SSR_SetUserInfo($mn, "$($member.pin)", "$($member.name)", '', 0, $true)
-    if (-not $ok) { Write-Err "SSR_SetUserInfo returned FALSE — aborting"; Pause-End; exit 1 }
+    if (-not $ok) { Write-Err "SSR_SetUserInfo returned FALSE - aborting"; Pause-End; exit 1 }
     Write-Ok "user row written (pin=$($member.pin), card='$card')"
 
     $uploaded = 0
@@ -65,7 +65,7 @@ try {
 
     if ($uploaded -eq 0) {
         Write-Host ""
-        Write-Err "RESULT: FAIL at UPLOAD — no desk template accepted by this firmware."
+        Write-Err "RESULT: FAIL at UPLOAD - no desk template accepted by this firmware."
         Write-Info "Compare script 3's ~ZKFPVersion with the capture version; record the encoding."
         Pause-End; exit 1
     }
@@ -108,13 +108,13 @@ try {
 
     Write-Host ""
     if ($matched) {
-        Write-Ok "RESULT:  ***** PASS *****  — ZK9500 desk enrollment MATCHES on the MB2000."
+        Write-Ok "RESULT:  ***** PASS *****  - ZK9500 desk enrollment MATCHES on the MB2000."
         Write-Info "The dashboard -> Access -> device fingerprint flow stands as designed."
     } elseif ($sawUser) {
-        Write-Err "RESULT:  PARTIAL — the user punched but not via FINGERPRINT (or match failed)."
+        Write-Err "RESULT:  PARTIAL - the user punched but not via FINGERPRINT (or match failed)."
         Write-Info "Retry a clean finger placement; if it never verifies=1, treat as FAIL-match."
     } else {
-        Write-Err "RESULT:  ***** FAIL / NO MATCH *****  — upload accepted but the live finger"
+        Write-Err "RESULT:  ***** FAIL / NO MATCH *****  - upload accepted but the live finger"
         Write-Err "         did not verify within 90s."
         Write-Info "If consistent: enroll fingerprints ON the terminal (device menu / StartEnrollEx)"
         Write-Info "-> change the gym onboarding workflow BEFORE enrolling real members."

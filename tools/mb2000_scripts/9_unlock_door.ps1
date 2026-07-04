@@ -1,5 +1,5 @@
-# 9_unlock_door.ps1 — fire the device's lock relay (ACUnlock). Listen for the
-# click and check the turnstile actually releases — this verifies BOTH the SDK
+# 9_unlock_door.ps1 - fire the device's lock relay (ACUnlock). Listen for the
+# click and check the turnstile actually releases - this verifies BOTH the SDK
 # call AND the physical wiring (lock contacts -> turnstile).
 #
 # SIGNATURE USED:  ACUnlock(1, delayDeciseconds) -> bool   (10 = 1 second)
@@ -20,10 +20,10 @@ try {
     Write-Info "ACUnlock($($cfg.machineNumber), $delayDs) ..."
     $ok = $zk.ACUnlock([int]$cfg.machineNumber, $delayDs)
     if ($ok) {
-        Write-Ok "ACUnlock returned TRUE — did you HEAR the relay and did the turnstile release?"
+        Write-Ok "ACUnlock returned TRUE - did you HEAR the relay and did the turnstile release?"
         Write-Info "TRUE + no physical release = wiring problem, not SDK."
     } else {
-        Write-Err "ACUnlock returned FALSE — likely unsupported on this firmware; keep open_door disabled in the app."
+        Write-Err "ACUnlock returned FALSE - likely unsupported on this firmware; keep open_door disabled in the app."
     }
 } finally { Disconnect-Zkem $zk }
 Pause-End

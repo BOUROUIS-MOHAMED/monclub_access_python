@@ -1,4 +1,4 @@
-# 0_MENU.ps1 — start here. Lists every script, shows the saved config, runs your pick.
+# 0_MENU.ps1 - start here. Lists every script, shows the saved config, runs your pick.
 . "$PSScriptRoot\_common.ps1"
 Assert-32Bit $PSCommandPath $args
 

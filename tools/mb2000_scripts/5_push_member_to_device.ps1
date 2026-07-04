@@ -1,4 +1,4 @@
-# 5_push_member_to_device.ps1 — push ONE member (user + card + local templates)
+# 5_push_member_to_device.ps1 - push ONE member (user + card + local templates)
 # from templates\<pin>.json to the device. This is the on-hardware test of the
 # exact sequence MonClub Access uses (app/sdk/zk_standalone.py push_roster):
 #
@@ -11,7 +11,7 @@
 # TEMPLATE NOTE: templates saved by script 4 are BASE64 (ZK9500/ZKFinger10);
 # templates saved by script 2 are in the device's own string encoding. If an
 # upload returns FALSE, the encoding may not match this firmware's BASE64
-# property — that finding goes straight into the app driver.
+# property - that finding goes straight into the app driver.
 . "$PSScriptRoot\_common.ps1"
 Assert-32Bit $PSCommandPath $args
 Write-Title "5) Push member + fingerprints to the device"
@@ -52,10 +52,10 @@ try {
     try { [void]$zk.RefreshData($mn) } catch { }
     Write-Host ""
     if ($pushed -gt 0) {
-        Write-Ok "$pushed finger(s) on the device — NOW PLACE THE REAL FINGER on the terminal to verify the match"
+        Write-Ok "$pushed finger(s) on the device - NOW PLACE THE REAL FINGER on the terminal to verify the match"
         Write-Info "(a successful live match here = GATE 3 template-portability PASS)"
     } else {
-        Write-Warn "no finger uploaded — user+card were still written"
+        Write-Warn "no finger uploaded - user+card were still written"
     }
 } finally { Disconnect-Zkem $zk }
 Pause-End

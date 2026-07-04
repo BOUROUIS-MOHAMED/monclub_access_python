@@ -1,4 +1,4 @@
-# 6_delete_local_fingerprint.ps1 — remove a finger (or a whole member) from the
+# 6_delete_local_fingerprint.ps1 - remove a finger (or a whole member) from the
 # LOCAL store (templates\<pin>.json). Never touches the device (script 7 does).
 . "$PSScriptRoot\_common.ps1"
 Assert-32Bit $PSCommandPath $args
