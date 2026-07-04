@@ -1039,7 +1039,9 @@ def init_db() -> None:
                 anti_fraude_duration         INTEGER NOT NULL DEFAULT 30,
                 anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0,
 
-                device_protocol TEXT
+                device_protocol TEXT,
+
+                device_capabilities TEXT
             );
             """
         )
@@ -1102,6 +1104,11 @@ def init_db() -> None:
         # NULL/absent -> ZK_PULLSDK (safe default: every pre-existing device is a
         # PullSDK panel); 'ZK_STANDALONE' -> MB2000-class standalone terminals.
         _ensure_column(conn, "sync_devices", "device_protocol", "device_protocol TEXT")
+
+        # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
+        # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
+        # parsed back to a dict on payload projection. NULL/absent -> no capabilities.
+        _ensure_column(conn, "sync_devices", "device_capabilities", "device_capabilities TEXT")
 
         # F-015: Deduplicate sync_devices by id before adding unique index
         conn.execute("""
@@ -2761,6 +2768,42 @@ def _safe_str(v: Any, default: str = "") -> str:
         return default
 
 
+def _device_capabilities_to_text(v: Any) -> Optional[str]:
+    """Serialize the opaque deviceCapabilities payload for storage.
+
+    The backend treats deviceCapabilities as an opaque JSON TEXT column; we store
+    the raw JSON string unchanged. Accepts a dict (json.dumps) or a non-empty
+    string (stored as-is); anything else -> None. Never raises.
+    """
+    if isinstance(v, dict):
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s or None
+    return None
+
+
+def _device_capabilities_from_stored(v: Any) -> Optional[Dict[str, Any]]:
+    """Parse the stored deviceCapabilities TEXT back into a dict.
+
+    Returns the parsed dict when the stored string is valid JSON (or when the
+    value is already a dict, e.g. from the in-memory cache path); None on
+    absent/malformed/non-dict values. Never raises.
+    """
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            parsed = json.loads(v)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
     """Insert a single device (presets + device row) into sync tables. Helper shared by save_sync_cache and save_sync_cache_delta."""
     if not isinstance(d, dict):
@@ -2837,7 +2880,9 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration,
             anti_fraude_daily_pass_limit,
 
-            device_protocol
+            device_protocol,
+
+            device_capabilities
         )
         VALUES (
             ?, ?, ?, ?,
@@ -2857,6 +2902,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?,
             ?, ?,
             ?, ?, ?,
+            ?,
             ?,
             ?
         )
@@ -2934,6 +2980,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
 
             (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
+
+            _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
     )
 
@@ -4380,6 +4428,12 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         # SDK-family routing (device-driver factory). None/absent -> the factory's
         # ZK_PULLSDK default, so pre-protocol rows keep working unchanged.
         "deviceProtocol": g("deviceProtocol", "device_protocol"),
+
+        # Opaque capability descriptor (e.g. {"fingerprintTemplateVersion": 9}).
+        # Parsed dict when the stored JSON is valid, else None.
+        "deviceCapabilities": _device_capabilities_from_stored(
+            g("deviceCapabilities", "device_capabilities")
+        ),
 
         "model": g("model"),
         "installedModels": installed,

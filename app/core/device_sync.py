@@ -27,7 +27,10 @@ from app.core.db import (
     insert_push_pin_batch,
     update_push_batch,
 )
-from app.core.settings_reader import get_backend_global_settings  # ✅ NEW: backend-driven settings (SQLite)
+from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLite)
+    get_backend_global_settings,
+    parse_fingerprint_template_version,
+)
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDK, PullSDKError
 
@@ -744,6 +747,7 @@ class DeviceSyncEngine:
         authorize_timezone_id: int,
         templates: List[Dict[str, Any]],
         fingerprint_enabled: bool = True,
+        template_version_override: int | None = None,
     ) -> bool:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
@@ -829,6 +833,7 @@ class DeviceSyncEngine:
                     pin=pin,
                     templates=templates,
                     device_id=device_id,
+                    template_version_override=template_version_override,
                 )
                 if errs:
                     self.logger.warning(
@@ -1000,6 +1005,7 @@ class DeviceSyncEngine:
             authorize_timezone_id=authorize_timezone_id,
             templates=templates,
             fingerprint_enabled=fingerprint_enabled,
+            template_version_override=normalized_device.get("fingerprintTemplateVersion"),
         )
 
     def _global_defaults(self) -> Dict[str, Any]:
@@ -1170,6 +1176,13 @@ class DeviceSyncEngine:
             "pushingToDevicePolicy": pushing_policy,
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
             "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
+            # Per-device fingerprint template-version override (9 or 10) parsed
+            # from the opaque deviceCapabilities JSON; None when absent/malformed.
+            # Consumed by _push_templates to bias which template table is tried
+            # FIRST — the probe fallback still tries both tables.
+            "fingerprintTemplateVersion": parse_fingerprint_template_version(
+                g("deviceCapabilities", "device_capabilities")
+            ),
 
             # Anti-fraud settings (per-device)
             "anti_fraude_card":             _boolish(g("anti_fraude_card",             "antiFraudeCard",             default=True), True),
@@ -1416,12 +1429,18 @@ class DeviceSyncEngine:
         pin: str,
         templates: List[Dict[str, Any]],
         device_id: int,
+        template_version_override: int | None = None,
     ) -> Tuple[int, List[str]]:
         """Push fingerprint templates to device.
 
         Tries the cached (table, body_index) combo first for each template (1 SDK call).
         Falls back to the full retry loop on cache miss or if the cached combo fails.
         Caches the winning combo on first successful discovery for the session.
+
+        ``template_version_override`` (9 or 10, from the device's deviceCapabilities
+        fingerprintTemplateVersion) wins over the per-record templateVersion for the
+        PREFERRED table order ONLY — the cached-combo fast path and the probe loop
+        (which still tries both tables) are unchanged.
         """
         failed_fp_errs: List[str] = []
         ok = 0
@@ -1439,6 +1458,8 @@ class DeviceSyncEngine:
         for t in templates:
             fid = int(t.get("fingerId"))
             tv = int(t.get("templateVersion") or 10)
+            if template_version_override in (9, 10):
+                tv = int(template_version_override)
             size = int(t.get("templateSize") or 0)
             tpl = _safe_template_text(str(t.get("templateData") or ""))
 
@@ -1866,6 +1887,15 @@ class DeviceSyncEngine:
             device=device,
             default_door_id=default_door_id,
         )
+
+        # Per-device template-table bias (deviceCapabilities.fingerprintTemplateVersion).
+        # Both callers pass a _normalize_device() dict (which carries the parsed key);
+        # the raw-capabilities re-parse is a belt-and-braces fallback.
+        template_version_override = device.get("fingerprintTemplateVersion")
+        if template_version_override is None:
+            template_version_override = parse_fingerprint_template_version(
+                device.get("deviceCapabilities") or device.get("device_capabilities")
+            )
 
         if dev_id is None:
             self.logger.warning(f"[DeviceSync] Skip device name={dev_name!r}: missing id")
@@ -2447,7 +2477,8 @@ class DeviceSyncEngine:
                             try:
                                 ok_count, errs = self._push_templates(
                                     sdk, pin=pin, templates=templates,
-                                    device_id=int(dev_id) if dev_id is not None else 0)
+                                    device_id=int(dev_id) if dev_id is not None else 0,
+                                    template_version_override=template_version_override)
                                 pushed_templates += ok_count
                                 if errs:
                                     warn_templates_users += 1
@@ -2614,7 +2645,8 @@ class DeviceSyncEngine:
                         if templates:
                             ok_count, errs = self._push_templates(
                                 sdk, pin=pin, templates=templates,
-                                device_id=int(dev_id) if dev_id is not None else 0)
+                                device_id=int(dev_id) if dev_id is not None else 0,
+                                template_version_override=template_version_override)
                             pushed_templates += ok_count
                             if errs:
                                 warn_templates_users += 1

@@ -181,6 +181,43 @@ def _extract_devices_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any
 
 # --------------- normalization ---------------
 
+def parse_fingerprint_template_version(capabilities: Any) -> Optional[int]:
+    """Extract the per-device fingerprint template-version override (9 or 10)
+    from the opaque deviceCapabilities payload (dict or JSON string).
+
+    The dashboard writes e.g. {"fingerprintTemplateVersion": 9} on a device to
+    BIAS which template table (template vs templatev10) device_sync tries FIRST
+    when pushing fingerprints; the auto-negotiating probe fallback still tries
+    both tables. Accepts fingerprintTemplateVersion / template_version /
+    templateVersion keys. Returns None on absent/malformed input or any value
+    other than 9/10 — never raises.
+    """
+    caps = capabilities
+    if isinstance(caps, str):
+        s = caps.strip()
+        if not s:
+            return None
+        try:
+            caps = json.loads(s)
+        except Exception:
+            return None
+    if not isinstance(caps, dict):
+        return None
+
+    v: Any = None
+    for key in ("fingerprintTemplateVersion", "template_version", "templateVersion"):
+        if key in caps:
+            v = caps.get(key)
+            break
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        iv = int(str(v).strip())
+    except Exception:
+        return None
+    return iv if iv in (9, 10) else None
+
+
 def normalize_access_data_mode(v: Any) -> str:
     """Normalize accessDataMode to 'DEVICE', 'AGENT', or 'ULTRA'."""
     s = _safe_str(v, "DEVICE").strip().upper()
@@ -367,6 +404,11 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
     # device capability flags
     fingerprint_enabled = _boolish(dev.get("fingerprintEnabled"), False)
     face_id_enabled = _boolish(dev.get("faceIdEnabled"), False)
+    # Per-device fingerprint template-version override (9 or 10) carried in the
+    # opaque deviceCapabilities JSON; None when absent/malformed.
+    fingerprint_template_version = parse_fingerprint_template_version(
+        dev.get("deviceCapabilities") or dev.get("device_capabilities")
+    )
 
     # policy/timezone
     authorize_timezone_id = _safe_int(dev.get("authorizeTimezoneId"), 1)
@@ -383,6 +425,7 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "pushing_to_device_policy": pushing_to_device_policy,
         "fingerprint_enabled": bool(fingerprint_enabled),
         "face_id_enabled": bool(face_id_enabled),
+        "fingerprint_template_version": fingerprint_template_version,
 
         # ids
         "door_ids": list(door_ids),
