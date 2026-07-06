@@ -18,10 +18,25 @@ Write-Title "4) Enroll fingerprint from ZK9500 -> local store"
 
 $cfg = Get-Config
 
+# ---- preflight: is the whole ZKFinger algorithm chain present? ---------------
+# The #1 cause of ZKFPM_Init -1 in the field is a MISSING chain DLL (fppswsk12.dll
+# is often left out of hand-assembled SDK folders). Name it before we even try.
+$missingDlls = Test-ZkfpRuntime
+if ($missingDlls.Count -gt 0) {
+    Write-Err ("ZKFinger runtime INCOMPLETE - missing: {0}" -f ($missingDlls -join ', '))
+    Write-Warn "The fingerprint algorithm library cannot initialize without these"
+    Write-Warn "(the chain is libzkfp -> fpslib -> zkfpsliblow -> fppswsk12 + ZKFPCap)."
+    Write-Warn "FIX: install the COMPLETE official ZKFinger SDK for Windows (as admin),"
+    Write-Warn "     which places the full runtime incl. fppswsk12.dll into SysWOW64;"
+    Write-Warn "     OR drop the missing file(s) into this pack's sdk\ folder."
+    Write-Warn "     Do NOT grab DLLs from random 'dll download' sites (biometric access!)."
+    Pause-End; exit 1
+}
+
 # ---- load the .NET wrapper ---------------------------------------------------
 # PREFERRED: the bundled sdk\ set, loaded via Load-ZkfpWrapper which preloads
-# libzkfp + its companions (fpslib/ZKFPCap) BY FULL PATH from sdk\ so a ZKFinger
-# SDK also installed on the PC cannot mix versions into it (the rc=-1 cause).
+# libzkfp + its companions BY FULL PATH from sdk\ so a separately installed
+# ZKFinger SDK cannot mix versions into it.
 $zkfp = $null
 if (Test-Path (Join-Path $PSScriptRoot 'sdk\libzkfpcsharp.dll')) {
     try { $zkfp = Load-ZkfpWrapper }

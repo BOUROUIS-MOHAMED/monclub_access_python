@@ -25,6 +25,22 @@ if (Test-Path $script:SdkDir) {
 # and ZKFPM_Init returns -1 (see app/sdk/zkfinger.py:597). Same fix the app uses:
 # preload the companions AND libzkfp itself from sdk\ BY FULL PATH so the pinned
 # copies win by base-name match - one consistent SDK build, no mixing.
+# Preflight: the ZK9500 algorithm chain is libzkfp -> fpslib -> zkfpsliblow ->
+# fppswsk12, plus ZKFPCap. If ANY link is missing on the PC, ZKFPM_Init returns
+# -1 ("algorithm library failed to init") with no hint. Check them explicitly and
+# name the missing one. Searches sdk\, then the Windows system dirs.
+function Test-ZkfpRuntime {
+    $required = @('libzkfp.dll', 'fpslib.dll', 'zkfpsliblow.dll', 'fppswsk12.dll', 'ZKFPCap.dll')
+    $dirs = @($script:SdkDir, "$env:WINDIR\SysWOW64", "$env:WINDIR\System32") | Where-Object { $_ -and (Test-Path $_) }
+    $missing = @()
+    foreach ($dll in $required) {
+        $found = $false
+        foreach ($d in $dirs) { if (Test-Path (Join-Path $d $dll)) { $found = $true; break } }
+        if (-not $found) { $missing += $dll }
+    }
+    return $missing
+}
+
 function Load-ZkfpWrapper {
     if (-not (Test-Path $script:SdkDir)) { throw "sdk\ folder not found next to the scripts" }
     if (-not ('Mb.Native' -as [type])) {
