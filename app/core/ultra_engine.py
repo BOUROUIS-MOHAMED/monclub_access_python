@@ -76,6 +76,20 @@ _ULTRA_STAFF_CODE_TTL_SEC = 120.0
 # (and letting PC-verified QR/TOTP members through) within ~a second.
 _ULTRA_SYNC_RTLOG_YIELD_MIN_INTERVAL_SEC = 0.75
 
+# ---- MIRROR pushing policy (per-device, ZK_STANDALONE) ----------------------
+# The destructive reconcile that deletes device users NOT in the app roster.
+# Guardrails (see _maybe_mirror_reconcile):
+#  - only these reasons reconcile (the bracketed full syncs; never a daytime or a
+#    spurious device-sync-flip full sync);
+#  - abort if it would delete more than this fraction of the roster;
+#  - pins >= the reserved floor are protected (manual/admin/staff enrollments);
+#  - never delete a pin pushed within the grace window (a just-enrolled member the
+#    stale roster hasn't caught up to yet).
+_MIRROR_RECONCILE_REASONS = ("user-sync", "daily-forced-sync", "hard-reset")
+_MIRROR_MAX_DELETE_FRACTION = 0.25
+_MIRROR_RESERVED_PIN_FLOOR = 90000
+_MIRROR_ENROLL_GRACE_SEC = 600.0
+
 
 # ---------------------------------------------------------------------------
 # UltraDeviceWorker
@@ -1157,6 +1171,15 @@ class UltraDeviceWorker(threading.Thread):
             sync_error = "" if sync_ok else str(
                 (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
             )
+            # MIRROR pushing policy: after a SUCCESSFUL full push, optionally delete
+            # device users not in the app roster. Heavily guarded + dry-run by default;
+            # a no-op for PRESERVE (the default) and for PullSDK drivers. Never allowed
+            # to fail the sync.
+            if sync_ok:
+                try:
+                    self._maybe_mirror_reconcile(reason=reason, roster_users=users)
+                except Exception as exc:
+                    logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
@@ -1193,6 +1216,10 @@ class UltraDeviceWorker(threading.Thread):
             if not result.get("ok"):
                 _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
                           member_id=member_id, err="push_roster")
+            else:
+                # grace window: mark these pins as just-pushed so a MIRROR full sync
+                # racing this enroll/change can't delete them before the roster catches up.
+                self._note_recent_pushes(u.get("pin") for u in users)
         except Exception as exc:
             logger.warning("%s standalone member sync failed: member_id=%s err=%s",
                            self._prefix, member_id, exc)
@@ -1202,6 +1229,140 @@ class UltraDeviceWorker(threading.Thread):
             _tel.event("MEMBER_SYNC_DONE", worker=self._tel_wid, member_id=member_id,
                        dur_ms=round((time.monotonic() - _ms_t0) * 1000),
                        pending=len(self._pending_member_syncs))
+
+    # ------------------------------------------------------------------ #
+    # MIRROR pushing policy (destructive reconcile) — helpers + consumer
+    # ------------------------------------------------------------------ #
+    def _note_recent_pushes(self, pins) -> None:
+        """Record pins we just pushed (member sync) with a monotonic timestamp, for the
+        MIRROR grace window. Prunes entries older than the grace window."""
+        m = getattr(self, "_recent_member_push", None)
+        if m is None:
+            m = {}
+            self._recent_member_push = m
+        now = time.monotonic()
+        for p in pins or []:
+            s = str(p or "").strip()
+            if s:
+                m[s] = now
+        cutoff = now - _MIRROR_ENROLL_GRACE_SEC
+        for k in [k for k, v in m.items() if v < cutoff]:
+            m.pop(k, None)
+
+    def _mirror_grace_pins(self) -> set[str]:
+        m = getattr(self, "_recent_member_push", None) or {}
+        now = time.monotonic()
+        return {p for p, t in m.items() if (now - t) < _MIRROR_ENROLL_GRACE_SEC}
+
+    def _mirror_allowlist_pins(self) -> set[str]:
+        """Operator pin allowlist from deviceCapabilities.mirrorProtectedPins (never deleted)."""
+        caps = (self._device or {}).get("deviceCapabilities")
+        out: set[str] = set()
+        if isinstance(caps, dict):
+            for p in (caps.get("mirrorProtectedPins") or []):
+                s = str(p).strip()
+                if s:
+                    out.add(s)
+        return out
+
+    def _maybe_mirror_reconcile(self, *, reason: str, roster_users: list[Dict[str, Any]]) -> None:
+        """MIRROR pushing policy: delete device users NOT in the app roster.
+
+        DESTRUCTIVE — removes users off a live turnstile. Every gate is an early
+        return with a MIRROR_SKIP_*/ABORT telemetry event; the first run on a device
+        is dry-run only (logs the plan, deletes nothing) until an operator arms it via
+        db.arm_mirror_reconcile. PRESERVE (default) and PullSDK drivers never get here.
+        """
+        # 1) policy gate
+        policy = str((self._device or {}).get("rosterPushingPolicy") or "").strip().upper()
+        if policy != "MIRROR":
+            return  # PRESERVE / null / pre-migration -> additive, nothing to reconcile
+
+        # 2) reason gate — only the bracketed full reconciles (never daytime/spurious)
+        if reason not in _MIRROR_RECONCILE_REASONS:
+            _tel.event("MIRROR_SKIP_REASON", worker=self._tel_wid, reason=reason)
+            return
+
+        # 3) capability gate — driver must enumerate + delete (PullSDK cannot)
+        lister = getattr(self._sdk, "list_device_users", None)
+        deleter = getattr(self._sdk, "delete_users", None)
+        if not callable(lister) or not callable(deleter):
+            _tel.event("MIRROR_SKIP_NO_CAPABILITY", worker=self._tel_wid)
+            return
+
+        # 4) empty-roster HARD rail — a transient/empty roster must never wipe the device
+        roster_pins = {str(u.get("pin")).strip()
+                       for u in (roster_users or []) if str(u.get("pin") or "").strip()}
+        roster_count = len(roster_pins)
+        if roster_count == 0:
+            _tel.warn("MIRROR_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
+            return
+
+        # 5) list device users — FAIL CLOSED (a failed/partial list is NOT "empty device")
+        listing = lister()
+        if not (isinstance(listing, dict) and listing.get("ok")):
+            _tel.warn("MIRROR_SKIP_LIST_FAILED", worker=self._tel_wid,
+                      err=str((listing or {}).get("error"))[:120])
+            return
+        device_pins = {str(u.get("pin")).strip()
+                       for u in (listing.get("users") or []) if str(u.get("pin") or "").strip()}
+
+        # 6/7) protected floor + operator allowlist + grace window; only numeric pins
+        allow = self._mirror_allowlist_pins()
+        grace = self._mirror_grace_pins()
+        extras: set[str] = set()
+        for p in (device_pins - roster_pins - allow - grace):
+            if not p.isdigit():
+                continue  # never delete a non-numeric device row
+            if int(p) >= _MIRROR_RESERVED_PIN_FLOOR:
+                continue  # reserved floor: manual/admin/staff enrollments
+            extras.add(p)
+
+        if not extras:
+            _tel.event("MIRROR_NOOP", worker=self._tel_wid,
+                       device=len(device_pins), roster=roster_count)
+            return
+
+        # 8) percent-floor — refuse a mass delete (corrupt/partial roster protection)
+        if len(extras) > roster_count * _MIRROR_MAX_DELETE_FRACTION:
+            _tel.warn("MIRROR_ABORT_FLOOR", worker=self._tel_wid,
+                      extras=len(extras), roster=roster_count,
+                      max_frac=_MIRROR_MAX_DELETE_FRACTION)
+            return
+
+        sample = ",".join(sorted(extras)[:20])
+        from app.core.db import (mirror_reconcile_is_armed, mirror_reconcile_record_plan,
+                                 delete_device_mirror_pin)
+
+        # 9) dry-run gate — first run logs the plan, deletes NOTHING until armed
+        if not mirror_reconcile_is_armed(device_id=self._device_id):
+            try:
+                mirror_reconcile_record_plan(device_id=self._device_id,
+                                             count=len(extras), sample=sample)
+            except Exception:
+                pass
+            _tel.event("MIRROR_PLAN", worker=self._tel_wid,
+                       would_delete=len(extras), sample=sample, armed=False)
+            logger.warning("%s MIRROR dry-run: WOULD delete %d device users not in the roster "
+                           "(sample: %s). Review, then arm: "
+                           "db.arm_mirror_reconcile(device_id=%d)",
+                           self._prefix, len(extras), sample, self._device_id)
+            return
+
+        # 10) armed — log, delete, keep the write-through content mirror consistent
+        _tel.event("MIRROR_PLAN", worker=self._tel_wid,
+                   would_delete=len(extras), sample=sample, armed=True)
+        result = deleter(sorted(extras)) or {}
+        for p in extras:
+            try:
+                delete_device_mirror_pin(device_id=self._device_id, pin=p)
+            except Exception:
+                pass
+        _tel.event("MIRROR_DONE", worker=self._tel_wid,
+                   deleted=result.get("deleted"), failed=result.get("failed"),
+                   ok=result.get("ok"))
+        logger.warning("%s MIRROR reconcile: deleted %s device users not in roster (failed=%s)",
+                       self._prefix, result.get("deleted"), result.get("failed"))
 
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:

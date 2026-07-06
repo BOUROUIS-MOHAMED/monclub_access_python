@@ -428,6 +428,32 @@ class ZKStandaloneDevice:
         self._refresh_pin_card_map()
         return result
 
+    def list_device_users(self, *, timeout_sec: float = 60.0) -> Dict[str, Any]:
+        """Enumerate ALL users currently on the terminal (for the MIRROR policy).
+
+        Returns {'ok': bool, 'users': [{'pin','name','card','enabled'}], 'error'?: str}.
+        ok=False means the enumeration FAILED or was incomplete — the MIRROR reconcile
+        MUST treat ok=False as "unknown", NEVER as "empty device" (that would delete
+        every member).
+        """
+        try:
+            return self._call("list_users", timeout=timeout_sec)
+        except Exception as exc:
+            self.logger.warning("%s list_device_users failed: %s", self._prefix, exc)
+            return {"ok": False, "users": [], "error": str(exc)}
+
+    def delete_users(self, pins: List[str], *, timeout_sec: float = 300.0) -> Dict[str, Any]:
+        """Delete whole users (fingers+card+password) from the terminal (MIRROR policy).
+
+        Returns {'ok': bool, 'deleted': int, 'failed': int, 'errors': [str]}.
+        Does NOT bracket EnableDevice — MIRROR runs inside push_roster's bracket window.
+        """
+        try:
+            return self._call("delete_users", args={"pins": list(pins or [])}, timeout=timeout_sec)
+        except Exception as exc:
+            self.logger.warning("%s delete_users failed: %s", self._prefix, exc)
+            return {"ok": False, "deleted": 0, "failed": len(pins or []), "errors": [str(exc)]}
+
     # ------------------------------------------------------------------ #
     # DeviceDriver surface — PullSDK-shaped members: INERT, never raise (D8)
     # ------------------------------------------------------------------ #
@@ -533,6 +559,17 @@ class ZKStandaloneDevice:
                                     templates_by_pin=cmd.args["templates_by_pin"],
                                     bracket=cmd.args["bracket"],
                                 )
+                        elif cmd.op == "list_users":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "users": [], "error": "not connected"}
+                            else:
+                                cmd.result = self._do_list_users(zk)
+                        elif cmd.op == "delete_users":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "deleted": 0, "failed": 0,
+                                              "error": "not connected"}
+                            else:
+                                cmd.result = self._do_delete_users(zk, cmd.args["pins"])
                         else:
                             cmd.error = ValueError(f"unknown op {cmd.op!r}")
                     except BaseException as exc:  # noqa: BLE001 - captured for the caller
@@ -710,7 +747,11 @@ class ZKStandaloneDevice:
                         try:
                             # ZKTeco FAQ: upload requires the slot to be EMPTY —
                             # delete-first makes re-enrollment deterministic.
-                            zk.SSR_DeleteEnrollData(1, pin, 1, finger_idx)
+                            # SSR_DeleteEnrollData is 3-arg (mn, pin, backupNumber);
+                            # backupNumber 0..9 == that finger (proven by the .ps1 pack,
+                            # scripts 5/7). The earlier 4-arg call silently raised here
+                            # (swallowed) so the slot was never actually cleared.
+                            zk.SSR_DeleteEnrollData(1, pin, int(finger_idx))
                         except Exception:
                             pass
                         okt = bool(zk.SetUserTmpExStr(1, pin, finger_idx, 1, tmp))
@@ -743,3 +784,98 @@ class ZKStandaloneDevice:
                                 self._prefix, skipped_pin, _MAX_PIN_DIGITS)
         return {"ok": ok, "pushed": pushed, "failed": failed,
                 "skipped_pin": skipped_pin, "errors": errors}
+
+    def _do_list_users(self, zk: Any) -> Dict[str, Any]:
+        """Enumerate every user on the device. Ports 2_get_member_templates.ps1.
+
+        Returns {'ok': bool, 'users': [{'pin','name','card','enabled'}]}. ok=False
+        distinguishes "listed OK, 0 users" from "list FAILED / incomplete" — the
+        MIRROR reconcile hinges on this: a failed enumeration must NEVER be read as an
+        empty device (that would delete every member). Any read failure fails CLOSED.
+
+        NB: the win32com marshalling of SSR_GetAllUserInfo's [out] params is
+        firmware/typelib-dependent. This handles both the "pass placeholders" and the
+        "auto-alloc" conventions and fails closed on any unexpected shape. Confirming
+        the exact tuple order on the real MB2000 is an on-hardware GATE.
+        """
+        try:
+            if not zk.ReadAllUserID(1):
+                return {"ok": False, "users": [], "error": "ReadAllUserID returned False"}
+        except Exception as exc:
+            return {"ok": False, "users": [], "error": f"ReadAllUserID: {exc}"}
+
+        users: List[Dict[str, Any]] = []
+        try:
+            while True:
+                try:
+                    # (ok, pin, name, password, privilege, enabled)
+                    res = zk.SSR_GetAllUserInfo(1, "", "", "", 0, 0)
+                except TypeError:
+                    res = zk.SSR_GetAllUserInfo(1)
+                if not (isinstance(res, (tuple, list)) and len(res) >= 6):
+                    return {"ok": False, "users": [],
+                            "error": f"SSR_GetAllUserInfo unexpected shape: {type(res).__name__}"}
+                if not res[0]:
+                    break  # clean end of the user table
+                pin = str(res[1] or "").strip()
+                name = str(res[2] or "")
+                enabled = bool(res[5])
+                card = ""
+                try:
+                    cres = zk.GetStrCardNumber("")
+                    if isinstance(cres, (tuple, list)) and len(cres) >= 2:
+                        card = _digits_only(cres[1])
+                    elif isinstance(cres, str):
+                        card = _digits_only(cres)
+                except Exception:
+                    card = ""
+                if pin:
+                    users.append({"pin": pin, "name": name, "card": card, "enabled": enabled})
+        except Exception as exc:
+            # a mid-enumeration failure => the list is INCOMPLETE => fail closed
+            return {"ok": False, "users": [], "error": f"SSR_GetAllUserInfo: {exc}"}
+        return {"ok": True, "users": users}
+
+    def _do_delete_users(self, zk: Any, pins: List[str]) -> Dict[str, Any]:
+        """Delete whole users from the device. Ports 7_delete_device_fingerprint.ps1.
+
+        backupNumber 12 == the WHOLE user (fingerprints + card + password). Skips
+        non-numeric / over-length pins with the SAME guard push_roster uses, so a
+        garbage device row can never be deleted by accident.
+        """
+        deleted = 0
+        failed = 0
+        errors: List[str] = []
+        for raw in pins or []:
+            pin = str(raw or "").strip()
+            if not pin.isdigit() or len(pin) > _MAX_PIN_DIGITS:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"skip invalid pin={pin!r}")
+                continue
+            try:
+                if bool(zk.SSR_DeleteEnrollData(1, pin, 12)):  # 12 = whole user
+                    deleted += 1
+                else:
+                    failed += 1
+                    if len(errors) < 5:
+                        errors.append(f"SSR_DeleteEnrollData(pin={pin}) returned False")
+            except Exception as exc:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f"pin={pin}: {exc}")
+        try:
+            zk.RefreshData(1)
+        except Exception:
+            pass
+        try:
+            self._refresh_pin_card_map()
+        except Exception:
+            pass
+        ok = failed == 0
+        try:
+            _tel.event("ZKEM_DELETE_DONE", worker=self._tel_wid,
+                       deleted=deleted, failed=failed, ok=ok)
+        except Exception:
+            pass
+        return {"ok": ok, "deleted": deleted, "failed": failed, "errors": errors}

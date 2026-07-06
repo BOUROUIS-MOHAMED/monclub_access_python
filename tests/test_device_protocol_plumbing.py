@@ -87,6 +87,43 @@ class TestDeviceProtocolSurvival:
         assert payload[0]["deviceProtocol"] == "ZK_STANDALONE"
 
 
+class TestRosterPushingPolicySurvival:
+    """Same failure family as deviceProtocol: the per-device rosterPushingPolicy must
+    survive ingest INSERT -> sync_devices column -> payload projection, or the desktop
+    silently reads null and the MIRROR reconcile stays PRESERVE. Also guards the
+    sync_devices INSERT column/value alignment (a prior off-by-one lived here)."""
+
+    def test_mirror_policy_survives_ingest_to_payload(self, db):
+        _ingest(db, _device(rosterPushingPolicy="MIRROR"))
+        payload = db.list_sync_devices_payload()
+        assert len(payload) == 1
+        assert payload[0]["rosterPushingPolicy"] == "MIRROR"
+        # deviceProtocol on the SAME row must still be correct (alignment guard)
+        assert payload[0]["deviceProtocol"] is None
+
+    def test_absent_policy_defaults_to_none(self, db):
+        _ingest(db, _device())  # no rosterPushingPolicy key
+        payload = db.list_sync_devices_payload()
+        assert payload[0]["rosterPushingPolicy"] is None
+
+    def test_policy_is_normalized_uppercase(self, db):
+        _ingest(db, _device(rosterPushingPolicy="mirror"))
+        payload = db.list_sync_devices_payload()
+        assert payload[0]["rosterPushingPolicy"] == "MIRROR"
+
+    def test_get_single_device_payload_carries_policy(self, db):
+        _ingest(db, _device(rosterPushingPolicy="MIRROR"))
+        p = db.get_sync_device_payload(42)
+        assert p is not None and p["rosterPushingPolicy"] == "MIRROR"
+
+    def test_policy_and_protocol_coexist_on_one_row(self, db):
+        """Both new columns set together must project independently (no INSERT skew)."""
+        _ingest(db, _device(deviceProtocol="ZK_STANDALONE", rosterPushingPolicy="MIRROR"))
+        p = db.list_sync_devices_payload()[0]
+        assert p["deviceProtocol"] == "ZK_STANDALONE"
+        assert p["rosterPushingPolicy"] == "MIRROR"
+
+
 class TestPresetDirectionSurvival:
     def test_direction_survives_to_device_payload_presets(self, db):
         _ingest(db, _device())

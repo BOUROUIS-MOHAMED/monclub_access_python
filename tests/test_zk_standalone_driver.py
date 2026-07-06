@@ -44,6 +44,13 @@ class FakeZkem:
         self.unlock_ok = True
         self.setuserinfo_ok = True
         self.settmp_ok = True
+        # device-user enumeration (list_device_users / MIRROR)
+        self.device_users: List[Dict[str, Any]] = []  # {pin,name,card,enabled}
+        self.readall_ok = True
+        self._enum_idx = 0
+        self._cur_card = ""
+        self.raise_on_enum_index = None  # set to an int to raise mid-enumeration
+        self.deleted: List[tuple] = []
 
     def _rec(self, name, *args):
         self.calls.append((name, *args))
@@ -87,8 +94,11 @@ class FakeZkem:
         self._rec("SSR_SetUserInfo", machine, pin, name, pw, priv, enabled)
         return self.setuserinfo_ok
 
-    def SSR_DeleteEnrollData(self, machine, pin, emachine, backup):
-        self._rec("SSR_DeleteEnrollData", machine, pin, emachine, backup); return True
+    def SSR_DeleteEnrollData(self, machine, pin, backup):
+        # 3-arg SSR_ form (mn, pin, backupNumber): 0..9=finger, 12=whole user.
+        self._rec("SSR_DeleteEnrollData", machine, pin, backup)
+        self.deleted.append((str(pin), int(backup)))
+        return True
 
     def SetUserTmpExStr(self, machine, pin, finger, flag, tmp):
         self._rec("SetUserTmpExStr", machine, pin, finger, flag, tmp)
@@ -96,6 +106,28 @@ class FakeZkem:
 
     def RefreshData(self, machine):
         self._rec("RefreshData", machine); return True
+
+    # device-user enumeration (ports script 2)
+    def ReadAllUserID(self, machine):
+        self._rec("ReadAllUserID", machine)
+        self._enum_idx = 0
+        return self.readall_ok
+
+    def SSR_GetAllUserInfo(self, machine, *placeholders):
+        # win32com "pass placeholders" convention -> returns
+        # (ok, pin, name, password, privilege, enabled); ok False ends the table.
+        if self.raise_on_enum_index is not None and self._enum_idx == self.raise_on_enum_index:
+            raise RuntimeError("simulated mid-enumeration COM error")
+        if self._enum_idx >= len(self.device_users):
+            return (False, "", "", "", 0, 0)
+        u = self.device_users[self._enum_idx]
+        self._enum_idx += 1
+        self._cur_card = str(u.get("card", ""))
+        return (True, str(u["pin"]), str(u.get("name", "")), "", 0,
+                1 if u.get("enabled", True) else 0)
+
+    def GetStrCardNumber(self, *placeholders):
+        return (True, self._cur_card)
 
 
 def _make_driver(payload_extra: Dict[str, Any] | None = None,
@@ -310,6 +342,53 @@ class TestPushRoster:
         drv.connect()
         res = drv.push_roster([{"pin": "117", "name": "Bob", "card": "1"}], {})
         assert res["ok"] is False and res["failed"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Device-user enumerate + delete (MIRROR pushing-policy primitives)
+# --------------------------------------------------------------------------- #
+
+class TestDeviceUserListAndDelete:
+    def test_list_users_happy(self):
+        drv, zk = _make_driver()
+        zk.device_users = [
+            {"pin": "40000", "name": "LAJNEF", "card": "1419213", "enabled": True},
+            {"pin": "95503411", "name": "malek", "card": "27114027", "enabled": True},
+            {"pin": "117", "name": "Bob", "card": "", "enabled": False},
+        ]
+        res = drv._do_list_users(zk)
+        assert res["ok"] is True
+        assert [u["pin"] for u in res["users"]] == ["40000", "95503411", "117"]
+        assert res["users"][0]["card"] == "1419213"
+        assert res["users"][2]["enabled"] is False
+
+    def test_list_users_readall_false_is_not_empty(self):
+        """The load-bearing distinction: a FAILED list must be ok=False, NOT an empty device."""
+        drv, zk = _make_driver()
+        zk.readall_ok = False
+        zk.device_users = [{"pin": "1"}]
+        res = drv._do_list_users(zk)
+        assert res["ok"] is False and res["users"] == []
+
+    def test_list_users_midloop_raise_fails_closed(self):
+        drv, zk = _make_driver()
+        zk.device_users = [{"pin": "1"}, {"pin": "2"}, {"pin": "3"}]
+        zk.raise_on_enum_index = 1  # blow up on the 2nd row
+        res = drv._do_list_users(zk)
+        assert res["ok"] is False  # never a partial delete set
+
+    def test_list_users_unexpected_shape_fails_closed(self):
+        drv, zk = _make_driver()
+        zk.SSR_GetAllUserInfo = lambda *a: True  # bare bool, not a tuple
+        res = drv._do_list_users(zk)
+        assert res["ok"] is False and "unexpected shape" in (res.get("error") or "")
+
+    def test_delete_users_skips_invalid_and_deletes_whole_user(self):
+        drv, zk = _make_driver()
+        res = drv._do_delete_users(zk, ["40000", "abc", "1234567890", "117"])
+        assert res["deleted"] == 2 and res["failed"] == 2
+        assert ("40000", 12) in zk.deleted and ("117", 12) in zk.deleted  # 12 = whole user
+        assert sum(1 for c in zk.calls if c[0] == "RefreshData") == 1     # once at the end
 
 
 # --------------------------------------------------------------------------- #

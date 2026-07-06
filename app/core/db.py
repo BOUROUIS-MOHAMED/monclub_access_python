@@ -1041,6 +1041,8 @@ def init_db() -> None:
 
                 device_protocol TEXT,
 
+                roster_pushing_policy TEXT,
+
                 device_capabilities TEXT
             );
             """
@@ -1105,6 +1107,11 @@ def init_db() -> None:
         # PullSDK panel); 'ZK_STANDALONE' -> MB2000-class standalone terminals.
         _ensure_column(conn, "sync_devices", "device_protocol", "device_protocol TEXT")
 
+        # Per-device roster pushing policy (backend rosterPushingPolicy). NULL/absent
+        # -> PRESERVE (additive, current behavior); 'MIRROR' -> the standalone full
+        # sync deletes device users not in the app roster (guarded, ZK_STANDALONE only).
+        _ensure_column(conn, "sync_devices", "roster_pushing_policy", "roster_pushing_policy TEXT")
+
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
         # parsed back to a dict on payload projection. NULL/absent -> no capabilities.
@@ -1117,6 +1124,25 @@ def init_db() -> None:
             )
         """)
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_devices_id ON sync_devices(id);")
+
+        # -----------------------------
+        # MIRROR pushing-policy first-run dry-run acknowledgement (per device).
+        # SEPARATE from sync_devices on purpose: sync_devices rows are INSERT-OR-REPLACEd
+        # on every sync-cache save, which would wipe the arm flag. A MIRROR reconcile
+        # DELETES users off a live turnstile, so it stays in dry-run (logs the plan,
+        # deletes nothing) until this row is armed=1 by an operator review.
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mirror_reconcile_ack (
+                device_id       INTEGER PRIMARY KEY,
+                armed           INTEGER NOT NULL DEFAULT 0,
+                last_plan_at    TEXT,
+                last_plan_count INTEGER,
+                last_plan_sample TEXT
+            );
+            """
+        )
 
         # -----------------------------
         # door presets synced from backend (GymDeviceDoorPresetDto)
@@ -2019,6 +2045,67 @@ def clear_device_mirror(*, device_id: int) -> None:
         conn.commit()
 
 
+# --------------------------------------------------------------------------- #
+# MIRROR pushing-policy dry-run acknowledgement.
+# NB: unrelated to `device_content_mirror` above (that is a write-through cache of
+# what the app PUSHED). This tracks whether the destructive MIRROR reconcile
+# (delete device users not in the app roster) has been armed by an operator for a
+# device. Until armed, the reconcile logs its plan and deletes NOTHING.
+# --------------------------------------------------------------------------- #
+def mirror_reconcile_is_armed(*, device_id: int) -> bool:
+    """True only if an operator has explicitly armed MIRROR deletions for this device."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT armed FROM mirror_reconcile_ack WHERE device_id=?", (int(device_id),)
+            ).fetchone()
+        return bool(row and int(row["armed"]) == 1)
+    except Exception:
+        return False  # fail closed: unknown => not armed => dry-run only
+
+
+def mirror_reconcile_record_plan(*, device_id: int, count: int, sample: str) -> None:
+    """Record the most recent dry-run deletion plan (for operator review before arming)."""
+    at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO mirror_reconcile_ack (device_id, armed, last_plan_at, last_plan_count, last_plan_sample)
+            VALUES (?, 0, ?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                last_plan_at = excluded.last_plan_at,
+                last_plan_count = excluded.last_plan_count,
+                last_plan_sample = excluded.last_plan_sample
+            """,
+            (int(device_id), at, int(count), str(sample or "")),
+        )
+        conn.commit()
+
+
+def arm_mirror_reconcile(*, device_id: int) -> None:
+    """Operator action: arm MIRROR deletions for a device (after reviewing the plan)."""
+    at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO mirror_reconcile_ack (device_id, armed, last_plan_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(device_id) DO UPDATE SET armed = 1
+            """,
+            (int(device_id), at),
+        )
+        conn.commit()
+
+
+def disarm_mirror_reconcile(*, device_id: int) -> None:
+    """Re-require operator review before the next MIRROR deletion (e.g. policy changed)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE mirror_reconcile_ack SET armed = 0 WHERE device_id=?", (int(device_id),)
+        )
+        conn.commit()
+
+
 # -----------------------------
 # P6: Member shadow
 # -----------------------------
@@ -2882,6 +2969,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             device_protocol,
 
+            roster_pushing_policy,
+
             device_capabilities
         )
         VALUES (
@@ -2902,6 +2991,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?,
             ?, ?,
             ?, ?, ?,
+            ?,
             ?,
             ?,
             ?
@@ -2980,6 +3070,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
 
             (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
+
+            (_safe_str(d.get("rosterPushingPolicy") or d.get("roster_pushing_policy"), "").strip().upper() or None),
 
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
@@ -4428,6 +4520,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         # SDK-family routing (device-driver factory). None/absent -> the factory's
         # ZK_PULLSDK default, so pre-protocol rows keep working unchanged.
         "deviceProtocol": g("deviceProtocol", "device_protocol"),
+
+        # Roster pushing policy (PRESERVE default / MIRROR). None -> engine treats as
+        # PRESERVE, so pre-migration rows keep the additive behavior.
+        "rosterPushingPolicy": g("rosterPushingPolicy", "roster_pushing_policy"),
 
         # Opaque capability descriptor (e.g. {"fingerprintTemplateVersion": 9}).
         # Parsed dict when the stored JSON is valid, else None.
