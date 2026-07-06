@@ -46,9 +46,24 @@ $fid  = [int](Ask-Default "Finger ID (0-9)" '6')
 if ($fid -lt 0 -or $fid -gt 9) { Write-Err "fingerId 0-9"; Pause-End; exit 1 }
 
 # ---- open reader ---------------------------------------------------------------
-if ($zkfp::Init() -ne 0) { Write-Err "zkfp Init failed - reader plugged in? drivers installed?"; Pause-End; exit 1 }
+# Init() loads OK (the bundled DLLs work) but returns non-zero when the SDK cannot
+# talk to the sensor - almost always the USB DRIVER is not installed on THIS PC,
+# or the reader is not plugged into THIS PC.
+$initRc = $zkfp::Init()
+if ($initRc -ne 0) {
+    Write-Err "zkfp Init() returned $initRc - the ZKFinger SDK could not initialize the reader."
+    Write-Warn "Checklist on THIS PC (the enroll only needs the ZK9500, not the MB2000):"
+    Write-Warn "  1) ZK9500 plugged into THIS PC (try another USB port / cable)."
+    Write-Warn "  2) Driver installed on THIS PC: run the ZKFinger SDK 'setup.exe' once,"
+    Write-Warn "     then reboot. In Device Manager the reader must show with NO yellow (!)."
+    Write-Warn "  3) No other app holding the reader (close MonClub Access + any enroll window)."
+    Write-Warn "  4) Quick check: the SDK's own Demo.exe should see the reader; if it can't, it's driver/hardware."
+    Pause-End; exit 1
+}
 try {
-    if ($zkfp::GetDeviceCount() -lt 1) { Write-Err "no ZK9500 reader detected"; Pause-End; exit 1 }
+    $devCount = $zkfp::GetDeviceCount()
+    Write-Info "readers detected: $devCount"
+    if ($devCount -lt 1) { Write-Err "Init OK but no ZK9500 detected - plug it in / try another port"; Pause-End; exit 1 }
     $h = $zkfp::OpenDevice(0)
     if ($h -eq [IntPtr]::Zero) { Write-Err "OpenDevice failed"; Pause-End; exit 1 }
     Write-Ok "reader open"
