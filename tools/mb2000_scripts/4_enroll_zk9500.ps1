@@ -69,11 +69,15 @@ $fid  = [int](Ask-Default "Finger ID (0-9)" '6')
 if ($fid -lt 0 -or $fid -gt 9) { Write-Err "fingerId 0-9"; Pause-End; exit 1 }
 
 # ---- open reader ---------------------------------------------------------------
-# ZKFinger error codes (pyzkfp/standard SDK): -1 = algorithm library init failed,
-# -2 = capture library init failed, -3 = NO device connected. So a -1 here is NOT
-# "no reader" - the algorithm library could not initialize. On a laptop with a
-# built-in fingerprint sensor (Windows Hello), the Windows Biometric Framework
-# claims the ZK9500 and the SDK cannot get exclusive access -> algorithm init -1.
+# ZKFinger error codes (ZKFinger Reader SDK C API): -1 = algorithm library init
+# failed, -2 = capture library init failed, -3 = NO device connected.
+# EVIDENCE (tested, do not re-guess): with the COMPLETE matched runtime bundled in
+# sdk\ (libzkfp/fpslib/zkfpslibLow/fppswsk12/ZKFPCap all present + same build),
+# ZKFPM_Init still returns -1 on a PC with NO reader attached. So -1 here is NOT a
+# missing/mismatched DLL, and NOT (as earlier believed) the Windows Biometric
+# Framework - that was disproven (disabling WbioSrvc and a reader-less PC both
+# still gave -1). The remaining unproven variable is the READER itself: this SDK
+# build appears to need the ZK9500 present for the algorithm to initialize.
 $initRc = $zkfp::Init()
 if ($initRc -ne 0) {
     $meaning = switch ($initRc) {
@@ -107,30 +111,29 @@ if ($initRc -ne 0) {
         Write-Host ""; Pause-End; exit 1
     }
 
-    # Reader present but algorithm init failed -> the Windows biometric stack is the usual cause.
+    # WbioSrvc state - informational only. NOTE: disabling it was already tested and
+    # did NOT fix -1, so it is NOT the cause; we just record it.
     Write-Host ""
-    Write-Info "2) Windows Biometric Service (it claims the reader for Windows Hello):"
+    Write-Info "2) Windows Biometric Service (recorded for the log, NOT the cause):"
     $wbio = $null
     try { $wbio = Get-Service -Name 'WbioSrvc' -ErrorAction Stop } catch {}
     if ($wbio) { Write-Info ("   WbioSrvc status = $($wbio.Status)  startType = $($wbio.StartType)") }
     else { Write-Info "   WbioSrvc not found." }
 
     Write-Host ""
-    if ($hasOther -and $initRc -eq -1) {
-        Write-Warn "LIKELY CAUSE: this PC has ANOTHER fingerprint sensor (Windows Hello), so the"
-        Write-Warn "Windows Biometric Framework is holding the ZK9500 and the ZKTeco SDK cannot"
-        Write-Warn "get exclusive access. This is a known ZKTeco-on-laptops issue."
+    Write-Info "VERDICT (evidence-based):"
+    if (-not $hasZk -and -not $seen) {
+        Write-Warn "  No ZK9500 is enumerated on THIS PC. The bundled runtime is complete, so"
+        Write-Warn "  -1 here is consistent with 'no reader'. Plug the ZK9500 in and retry."
+    } elseif ($hasZk) {
+        Write-Err  "  A ZK9500 IS present AND the complete matched runtime is bundled, yet Init"
+        Write-Err  "  is -1. That rules out DLLs and WBF. This is the REAL defect to escalate."
+        Write-Err  "  Next, on THIS SAME PC: run the ZKFinger SDK's own Demo.exe. If Demo ALSO"
+        Write-Err  "  fails -1, the fault is the reader's driver binding / the device, not our"
+        Write-Err  "  code. If Demo WORKS, capture its DLL load list vs ours and compare."
+    } else {
+        Write-Warn "  A non-ZK biometric sensor is present but no ZK9500. Plug in the ZK9500."
     }
-    Write-Warn "TRY THIS (in an ADMIN PowerShell), then re-run this script:"
-    Write-Warn "  a) Stop + disable the Windows Biometric Service:"
-    Write-Warn "       Stop-Service WbioSrvc -Force"
-    Write-Warn "       Set-Service WbioSrvc -StartupType Disabled"
-    Write-Warn "     (re-enable later with: Set-Service WbioSrvc -StartupType Manual)"
-    Write-Warn "  b) Windows 11 only: Settings > Accounts > Sign-in options ->"
-    Write-Warn "     turn OFF 'Sign-in Security (Enhanced)'/ESS, reboot, retry."
-    Write-Warn "  c) Close MonClub Access / any app that may hold the reader."
-    Write-Warn "  d) Cross-check with the ZKFinger SDK's own Demo.exe - if it ALSO fails"
-    Write-Warn "     with WbioSrvc running and WORKS once it's disabled, that confirms it."
     Write-Host ""
     Pause-End; exit 1
 }

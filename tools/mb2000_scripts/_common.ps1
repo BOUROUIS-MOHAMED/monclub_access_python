@@ -52,8 +52,14 @@ public static extern bool SetDllDirectory(string path);
 '@
     }
     [void][Mb.Native]::SetDllDirectory($script:SdkDir)
-    # companions first, then libzkfp - all pinned from sdk\ by full path
-    foreach ($d in 'ZKFPCap.dll', 'fpslib.dll', 'libzkfp.dll') {
+    # ZKFPCap loads its sensor plugins from a ZKFPSensors\ subfolder relative to the
+    # current directory, so point cwd at sdk\ while we load.
+    try { Set-Location $script:SdkDir } catch { }
+    # Whole algorithm chain, companions FIRST then libzkfp - all pinned from sdk\ by
+    # full path so the bundled matched copies win over any system-installed ones.
+    # Chain (proven from the DLLs' own import/strings): libzkfp -> fpslib ->
+    # zkfpslibLow -> fppswsk12, plus ZKFPCap (+ ZKFPSensors\ capture plugins).
+    foreach ($d in 'ZKFPCap.dll', 'fpslib.dll', 'zkfpslibLow.dll', 'fppswsk12.dll', 'libzkfp.dll') {
         $p = Join-Path $script:SdkDir $d
         if (Test-Path $p) {
             $h = [Mb.Native]::LoadLibrary($p)
