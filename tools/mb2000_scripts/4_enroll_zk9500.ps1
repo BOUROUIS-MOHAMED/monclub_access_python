@@ -54,14 +54,24 @@ $fid  = [int](Ask-Default "Finger ID (0-9)" '6')
 if ($fid -lt 0 -or $fid -gt 9) { Write-Err "fingerId 0-9"; Pause-End; exit 1 }
 
 # ---- open reader ---------------------------------------------------------------
-# Verified on real DLLs: this libzkfp build's ZKFPM_Init returns -1 when NO ZK9500
-# is accessible (reproduced with a clean single-folder DLL set + no reader). So a
-# -1 here means Windows/the SDK cannot see the reader on THIS PC.
+# ZKFinger error codes (pyzkfp/standard SDK): -1 = algorithm library init failed,
+# -2 = capture library init failed, -3 = NO device connected. So a -1 here is NOT
+# "no reader" - the algorithm library could not initialize. On a laptop with a
+# built-in fingerprint sensor (Windows Hello), the Windows Biometric Framework
+# claims the ZK9500 and the SDK cannot get exclusive access -> algorithm init -1.
 $initRc = $zkfp::Init()
 if ($initRc -ne 0) {
-    Write-Err "zkfp Init() returned $initRc - the SDK cannot access a ZK9500 on this PC."
+    $meaning = switch ($initRc) {
+        -1 { "algorithm library failed to init (NOT a missing reader)" }
+        -2 { "capture library failed to init (companion DLL problem)" }
+        -3 { "no device connected" }
+        default { "generic failure" }
+    }
+    Write-Err "ZKFPM_Init() returned $initRc - $meaning."
     Write-Host ""
-    Write-Info "Checking whether Windows even sees a fingerprint reader..."
+
+    # Is a reader enumerated at all?
+    Write-Info "1) Does Windows see a fingerprint reader?"
     $seen = $null
     try {
         $seen = Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
@@ -71,25 +81,42 @@ if ($initRc -ne 0) {
         try { $seen = Get-WmiObject Win32_PnPEntity -ErrorAction Stop | Where-Object {
             ($_.Name -match 'finger|ZKTeco|ZK9500|SLK20|biometric') -or ($_.PNPClass -eq 'Biometric') } } catch { }
     }
-    if ($seen) {
-        foreach ($d in @($seen)) {
-            $nm = if ($d.FriendlyName) { $d.FriendlyName } else { $d.Name }
-            $st = if ($d.Status) { $d.Status } else { 'unknown' }
-            Write-Ok ("reader IS present: '$nm'  status=$st")
-        }
-        Write-Warn "A reader is enumerated but Init still failed -> likely a driver-state or"
-        Write-Warn "version issue. Note the status above (must be OK, no yellow ! in Device Mgr)."
-        Write-Warn "Close any app holding it (MonClub Access), unplug/replug, then retry."
-    } else {
-        Write-Err "NO fingerprint reader is enumerated by Windows on THIS PC."
-        Write-Warn "=> The ZK9500 is not physically connected to THIS PC, or the USB driver"
-        Write-Warn "   did not bind. Do THIS on the PC running this script:"
-        Write-Warn "   1) Plug the ZK9500 into THIS PC (different USB port / cable)."
-        Write-Warn "   2) Open Device Manager - the reader must appear with NO yellow (!)."
-        Write-Warn "   3) If missing/errored, run the ZKFinger SDK 'setup.exe', reboot, replug."
+    $hasZk = $false; $hasOther = $false
+    foreach ($d in @($seen)) {
+        $nm = if ($d.FriendlyName) { $d.FriendlyName } else { $d.Name }
+        Write-Info ("   present: '$nm'  status=$(if ($d.Status){$d.Status}else{'?'})")
+        if ($nm -match 'ZK|SLK') { $hasZk = $true } else { $hasOther = $true }
     }
+    if (-not $seen) {
+        Write-Err "   NO reader enumerated -> plug the ZK9500 into THIS PC, check Device Manager."
+        Write-Host ""; Pause-End; exit 1
+    }
+
+    # Reader present but algorithm init failed -> the Windows biometric stack is the usual cause.
     Write-Host ""
-    Write-Info "Cross-check: the SDK's own Demo.exe will also fail if no reader is seen."
+    Write-Info "2) Windows Biometric Service (it claims the reader for Windows Hello):"
+    $wbio = $null
+    try { $wbio = Get-Service -Name 'WbioSrvc' -ErrorAction Stop } catch {}
+    if ($wbio) { Write-Info ("   WbioSrvc status = $($wbio.Status)  startType = $($wbio.StartType)") }
+    else { Write-Info "   WbioSrvc not found." }
+
+    Write-Host ""
+    if ($hasOther -and $initRc -eq -1) {
+        Write-Warn "LIKELY CAUSE: this PC has ANOTHER fingerprint sensor (Windows Hello), so the"
+        Write-Warn "Windows Biometric Framework is holding the ZK9500 and the ZKTeco SDK cannot"
+        Write-Warn "get exclusive access. This is a known ZKTeco-on-laptops issue."
+    }
+    Write-Warn "TRY THIS (in an ADMIN PowerShell), then re-run this script:"
+    Write-Warn "  a) Stop + disable the Windows Biometric Service:"
+    Write-Warn "       Stop-Service WbioSrvc -Force"
+    Write-Warn "       Set-Service WbioSrvc -StartupType Disabled"
+    Write-Warn "     (re-enable later with: Set-Service WbioSrvc -StartupType Manual)"
+    Write-Warn "  b) Windows 11 only: Settings > Accounts > Sign-in options ->"
+    Write-Warn "     turn OFF 'Sign-in Security (Enhanced)'/ESS, reboot, retry."
+    Write-Warn "  c) Close MonClub Access / any app that may hold the reader."
+    Write-Warn "  d) Cross-check with the ZKFinger SDK's own Demo.exe - if it ALSO fails"
+    Write-Warn "     with WbioSrvc running and WORKS once it's disabled, that confirms it."
+    Write-Host ""
     Pause-End; exit 1
 }
 try {
