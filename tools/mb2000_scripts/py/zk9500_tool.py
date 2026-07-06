@@ -334,7 +334,9 @@ def enroll(dll_dir, pin, name, card, finger, samples=3, timeout_s=30):
         member = {"pin": pin, "name": name, "card": card, "fingers": []}
         if os.path.exists(fpath):
             try:
-                member = json.load(open(fpath, encoding="utf-8"))
+                # the .ps1 pack writes the store with a UTF-8 BOM (Set-Content -Encoding UTF8),
+                # so read BOM-aware or json.load rejects it.
+                member = json.load(open(fpath, encoding="utf-8-sig"))
             except Exception:
                 pass
         member["name"] = name or member.get("name", "")
