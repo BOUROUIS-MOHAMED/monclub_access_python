@@ -17,7 +17,39 @@ if (Test-Path $script:SdkDir) {
     if (($env:PATH -split ';') -notcontains $script:SdkDir) {
         $env:PATH = "$script:SdkDir;$env:PATH"
     }
-    try { [void][Runtime.InteropServices.Marshal] } catch {}
+}
+
+# ZK9500 wrapper loader (script 4). PATH is not enough: Windows searches
+# System32/SysWOW64 BEFORE PATH, so if a ZKFinger SDK is also installed on the
+# PC, libzkfp.dll mixes with a different-version algorithm module (fpslib/ZKFPCap)
+# and ZKFPM_Init returns -1 (see app/sdk/zkfinger.py:597). Same fix the app uses:
+# preload the companions AND libzkfp itself from sdk\ BY FULL PATH so the pinned
+# copies win by base-name match - one consistent SDK build, no mixing.
+function Load-ZkfpWrapper {
+    if (-not (Test-Path $script:SdkDir)) { throw "sdk\ folder not found next to the scripts" }
+    if (-not ('Mb.Native' -as [type])) {
+        Add-Type -Namespace 'Mb' -Name 'Native' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern System.IntPtr LoadLibrary(string path);
+[System.Runtime.InteropServices.DllImport("kernel32", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern bool SetDllDirectory(string path);
+'@
+    }
+    [void][Mb.Native]::SetDllDirectory($script:SdkDir)
+    # companions first, then libzkfp - all pinned from sdk\ by full path
+    foreach ($d in 'ZKFPCap.dll', 'fpslib.dll', 'libzkfp.dll') {
+        $p = Join-Path $script:SdkDir $d
+        if (Test-Path $p) {
+            $h = [Mb.Native]::LoadLibrary($p)
+            if ($h -eq [IntPtr]::Zero) {
+                Write-Warn ("preload {0} failed (Win32 error {1})" -f $d, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            } else { Write-Info "pinned $d from sdk\" }
+        } else { Write-Warn "$d missing from sdk\ (enroll may hit mixed-version -1)" }
+    }
+    $wrapper = Join-Path $script:SdkDir 'libzkfpcsharp.dll'
+    if (-not (Test-Path $wrapper)) { throw "sdk\libzkfpcsharp.dll not found" }
+    Add-Type -Path $wrapper
+    return [libzkfpcsharp.zkfp2]
 }
 
 # ---------------------------------------------------------------- 32-bit shim

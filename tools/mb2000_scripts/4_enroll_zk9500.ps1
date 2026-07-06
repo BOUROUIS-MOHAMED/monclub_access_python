@@ -19,22 +19,30 @@ Write-Title "4) Enroll fingerprint from ZK9500 -> local store"
 $cfg = Get-Config
 
 # ---- load the .NET wrapper ---------------------------------------------------
-$dllPath = $cfg.zkfingerDll
-if (-not ($dllPath -and (Test-Path $dllPath))) {
-    $guess = @(
-        (Join-Path $PSScriptRoot 'sdk\libzkfpcsharp.dll'),   # bundled with the pack
-        (Join-Path $PSScriptRoot 'libzkfpcsharp.dll'),
-        'C:\Program Files (x86)\ZKTeco\ZKFinger SDK\lib\libzkfpcsharp.dll',
-        'C:\Windows\SysWOW64\libzkfpcsharp.dll'
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-    $dllPath = if ($guess) { $guess } else { Read-Host "Full path to libzkfpcsharp.dll (x86)" }
+# PREFERRED: the bundled sdk\ set, loaded via Load-ZkfpWrapper which preloads
+# libzkfp + its companions (fpslib/ZKFPCap) BY FULL PATH from sdk\ so a ZKFinger
+# SDK also installed on the PC cannot mix versions into it (the rc=-1 cause).
+$zkfp = $null
+if (Test-Path (Join-Path $PSScriptRoot 'sdk\libzkfpcsharp.dll')) {
+    try { $zkfp = Load-ZkfpWrapper }
+    catch { Write-Err "loading bundled ZKFinger DLLs failed: $_"; Pause-End; exit 1 }
+} else {
+    # FALLBACK: no bundle - use an installed ZKFinger SDK wrapper.
+    $dllPath = $cfg.zkfingerDll
+    if (-not ($dllPath -and (Test-Path $dllPath))) {
+        $guess = @(
+            (Join-Path $PSScriptRoot 'libzkfpcsharp.dll'),
+            'C:\Program Files (x86)\ZKTeco\ZKFinger SDK\lib\libzkfpcsharp.dll',
+            'C:\Windows\SysWOW64\libzkfpcsharp.dll'
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        $dllPath = if ($guess) { $guess } else { Read-Host "Full path to libzkfpcsharp.dll (x86)" }
+    }
+    if (-not (Test-Path $dllPath)) { Write-Err "not found: $dllPath"; Pause-End; exit 1 }
+    $cfg.zkfingerDll = (Resolve-Path $dllPath).Path
+    Save-Config $cfg
+    try { Add-Type -Path $cfg.zkfingerDll } catch { Write-Err "Add-Type failed: $_"; Pause-End; exit 1 }
+    $zkfp = [libzkfpcsharp.zkfp2]
 }
-if (-not (Test-Path $dllPath)) { Write-Err "not found: $dllPath"; Pause-End; exit 1 }
-$cfg.zkfingerDll = (Resolve-Path $dllPath).Path
-Save-Config $cfg
-
-try { Add-Type -Path $cfg.zkfingerDll } catch { Write-Err "Add-Type failed: $_"; Pause-End; exit 1 }
-$zkfp = [libzkfpcsharp.zkfp2]
 
 # ---- member identity ----------------------------------------------------------
 $pin  = Read-Host "Member PIN (numeric, max 9 digits)"
@@ -46,18 +54,42 @@ $fid  = [int](Ask-Default "Finger ID (0-9)" '6')
 if ($fid -lt 0 -or $fid -gt 9) { Write-Err "fingerId 0-9"; Pause-End; exit 1 }
 
 # ---- open reader ---------------------------------------------------------------
-# Init() loads OK (the bundled DLLs work) but returns non-zero when the SDK cannot
-# talk to the sensor - almost always the USB DRIVER is not installed on THIS PC,
-# or the reader is not plugged into THIS PC.
+# Verified on real DLLs: this libzkfp build's ZKFPM_Init returns -1 when NO ZK9500
+# is accessible (reproduced with a clean single-folder DLL set + no reader). So a
+# -1 here means Windows/the SDK cannot see the reader on THIS PC.
 $initRc = $zkfp::Init()
 if ($initRc -ne 0) {
-    Write-Err "zkfp Init() returned $initRc - the ZKFinger SDK could not initialize the reader."
-    Write-Warn "Checklist on THIS PC (the enroll only needs the ZK9500, not the MB2000):"
-    Write-Warn "  1) ZK9500 plugged into THIS PC (try another USB port / cable)."
-    Write-Warn "  2) Driver installed on THIS PC: run the ZKFinger SDK 'setup.exe' once,"
-    Write-Warn "     then reboot. In Device Manager the reader must show with NO yellow (!)."
-    Write-Warn "  3) No other app holding the reader (close MonClub Access + any enroll window)."
-    Write-Warn "  4) Quick check: the SDK's own Demo.exe should see the reader; if it can't, it's driver/hardware."
+    Write-Err "zkfp Init() returned $initRc - the SDK cannot access a ZK9500 on this PC."
+    Write-Host ""
+    Write-Info "Checking whether Windows even sees a fingerprint reader..."
+    $seen = $null
+    try {
+        $seen = Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
+            ($_.FriendlyName -match 'finger|ZKTeco|ZK9500|SLK20|biometric') -or ($_.Class -eq 'Biometric')
+        }
+    } catch {
+        try { $seen = Get-WmiObject Win32_PnPEntity -ErrorAction Stop | Where-Object {
+            ($_.Name -match 'finger|ZKTeco|ZK9500|SLK20|biometric') -or ($_.PNPClass -eq 'Biometric') } } catch { }
+    }
+    if ($seen) {
+        foreach ($d in @($seen)) {
+            $nm = if ($d.FriendlyName) { $d.FriendlyName } else { $d.Name }
+            $st = if ($d.Status) { $d.Status } else { 'unknown' }
+            Write-Ok ("reader IS present: '$nm'  status=$st")
+        }
+        Write-Warn "A reader is enumerated but Init still failed -> likely a driver-state or"
+        Write-Warn "version issue. Note the status above (must be OK, no yellow ! in Device Mgr)."
+        Write-Warn "Close any app holding it (MonClub Access), unplug/replug, then retry."
+    } else {
+        Write-Err "NO fingerprint reader is enumerated by Windows on THIS PC."
+        Write-Warn "=> The ZK9500 is not physically connected to THIS PC, or the USB driver"
+        Write-Warn "   did not bind. Do THIS on the PC running this script:"
+        Write-Warn "   1) Plug the ZK9500 into THIS PC (different USB port / cable)."
+        Write-Warn "   2) Open Device Manager - the reader must appear with NO yellow (!)."
+        Write-Warn "   3) If missing/errored, run the ZKFinger SDK 'setup.exe', reboot, replug."
+    }
+    Write-Host ""
+    Write-Info "Cross-check: the SDK's own Demo.exe will also fail if no reader is seen."
     Pause-End; exit 1
 }
 try {
