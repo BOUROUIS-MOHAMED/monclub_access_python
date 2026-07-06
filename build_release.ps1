@@ -228,6 +228,12 @@ if ($meta.RequiresSdkDlls) {
   if (Test-Path $internalSdk) {
     New-Item -ItemType Directory -Force $publicSdk | Out-Null
     Copy-Item (Join-Path $internalSdk "*.dll") $publicSdk -Force -ErrorAction SilentlyContinue
+    # ZKFPSensors\ capture-plugin SUBFOLDER (the flat *.dll copy above skips it) - the
+    # ZK9500 capture needs these beside the public sdk DLLs.
+    $internalSensors = Join-Path $internalSdk "ZKFPSensors"
+    if (Test-Path $internalSensors) {
+      Copy-Item $internalSensors $publicSdk -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 

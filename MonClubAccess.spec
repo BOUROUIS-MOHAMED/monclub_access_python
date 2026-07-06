@@ -36,6 +36,14 @@ binaries = []
 if SDK_DIR.exists():
     for dll in SDK_DIR.glob("*.dll"):
         binaries.append((str(dll), "sdk"))
+    # ZK9500 capture plugins live in a ZKFPSensors\ SUBFOLDER that ZKFPCap.dll loads
+    # at runtime. The flat glob above misses them, so ship them explicitly beside the
+    # other sdk DLLs (dest keeps the subfolder). Without this, fingerprint capture on
+    # a clean PC fails once ZKFPCap tries to load a sensor plugin.
+    sensors_dir = SDK_DIR / "ZKFPSensors"
+    if sensors_dir.exists():
+        for dll in sensors_dir.glob("*.dll"):
+            binaries.append((str(dll), "sdk/ZKFPSensors"))
 
 # --------------------------
 # Data files (certifi)
