@@ -4195,6 +4195,59 @@ def _handle_device_clock_sync(ctx: _Ctx) -> None:
         ctx.send_json(r["status"], payload)
 
 
+# ---------------------------------------------------------------------------
+# MIRROR pushing-policy review screen (local DB only — no device SDK).
+# The desktop keeps MIRROR in dry-run (logs a plan, deletes nothing) until an
+# operator reviews the would-delete list here and ARMS it.
+# ---------------------------------------------------------------------------
+def _handle_device_mirror_plan_get(ctx: _Ctx) -> None:
+    """GET /devices/{id}/mirror-plan — MIRROR policy + armed state + last dry-run plan."""
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    try:
+        from app.core.db import get_mirror_reconcile_state, get_sync_device
+        dev = get_sync_device(did) or {}
+        policy = str(dev.get("rosterPushingPolicy") or "").strip().upper() or "PRESERVE"
+        ctx.send_json(200, {"ok": True, "policy": policy, **get_mirror_reconcile_state(device_id=did)})
+    except Exception as e:  # noqa: BLE001
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_device_mirror_arm(ctx: _Ctx) -> None:
+    """POST /devices/{id}/mirror/arm {confirm:true} — enable MIRROR deletions after review."""
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    if not bool(ctx.body().get("confirm")):
+        ctx.send_json(400, {"ok": False, "error": "confirm required — review the plan first"})
+        return
+    try:
+        from app.core.db import arm_mirror_reconcile, get_mirror_reconcile_state
+        arm_mirror_reconcile(device_id=did)
+        _tel.event("MIRROR_ARMED", device_id=did)
+        ctx.send_json(200, {"ok": True, **get_mirror_reconcile_state(device_id=did)})
+    except Exception as e:  # noqa: BLE001
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_device_mirror_disarm(ctx: _Ctx) -> None:
+    """POST /devices/{id}/mirror/disarm — return MIRROR to dry-run only (deletes nothing)."""
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    try:
+        from app.core.db import disarm_mirror_reconcile, get_mirror_reconcile_state
+        disarm_mirror_reconcile(device_id=did)
+        _tel.event("MIRROR_DISARMED", device_id=did)
+        ctx.send_json(200, {"ok": True, **get_mirror_reconcile_state(device_id=did)})
+    except Exception as e:  # noqa: BLE001
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
 def _handle_device_force_resync(ctx: _Ctx) -> None:
     """F-015: Clear sync hashes for a device to force full re-push of all users on next sync cycle."""
     did = ctx.param_int("deviceId")

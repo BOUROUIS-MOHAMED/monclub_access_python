@@ -49,6 +49,16 @@ interface ControlState {
   reentrySeconds: string;
   reentry: VerifyState;
   clock: VerifyState;
+  // MIRROR pushing-policy review (only meaningful when policy === "MIRROR")
+  policy: string;
+  mirror: {
+    armed: boolean;
+    count: number | null;
+    sample: string[];
+    at: string | null;
+    status: "idle" | "saving";
+    error?: string;
+  };
   errorPopup: { title: string; text: string } | null;
 }
 
@@ -99,7 +109,9 @@ export default function DevicesPage() {
     setControl({
       deviceId, deviceName, loading: true, loadError: null, mode: "",
       doors: [], driftSec: null, reentryEnabled: false, reentrySeconds: "30",
-      reentry: { status: "idle" }, clock: { status: "idle" }, errorPopup: null,
+      reentry: { status: "idle" }, clock: { status: "idle" },
+      policy: "", mirror: { armed: false, count: null, sample: [], at: null, status: "idle" },
+      errorPopup: null,
     });
     try {
       const s = await pullsdk.getSettings(deviceId);
@@ -111,6 +123,15 @@ export default function DevicesPage() {
         reentryEnabled: maxInt > 0,
         reentrySeconds: maxInt > 0 ? String(maxInt) : "30",
       } : p);
+      // MIRROR review (best-effort; standalone devices only, ignored elsewhere)
+      try {
+        const m = await pullsdk.getMirrorPlan(deviceId);
+        setControl((p) => p && p.deviceId === deviceId ? {
+          ...p, policy: String(m.policy || "PRESERVE"),
+          mirror: { armed: !!m.armed, count: m.lastPlanCount ?? null,
+            sample: m.lastPlanSample || [], at: m.lastPlanAt ?? null, status: "idle" },
+        } : p);
+      } catch { /* endpoint absent / non-standalone — leave policy blank */ }
     } catch (e) {
       setControl((p) => p && p.deviceId === deviceId ? { ...p, loading: false, loadError: String(e) } : p);
     }
@@ -161,6 +182,24 @@ export default function DevicesPage() {
       } : p);
     } catch (e) {
       setControl((p) => p && p.deviceId === deviceId ? { ...p, clock: { status: "err", error: String(e) } } : p);
+    }
+  }, [control, pullsdk]);
+
+  // Arm / disarm the destructive MIRROR reconcile (after reviewing the dry-run plan).
+  const setMirrorArmed = useCallback(async (arm: boolean) => {
+    if (!control) return;
+    const { deviceId } = control;
+    setControl((p) => p ? { ...p, mirror: { ...p.mirror, status: "saving", error: undefined } } : p);
+    try {
+      const res = arm ? await pullsdk.armMirror(deviceId) : await pullsdk.disarmMirror(deviceId);
+      setControl((p) => p && p.deviceId === deviceId ? {
+        ...p, mirror: { armed: !!res.armed, count: res.lastPlanCount ?? p.mirror.count,
+          sample: res.lastPlanSample || p.mirror.sample, at: res.lastPlanAt ?? p.mirror.at,
+          status: "idle" },
+      } : p);
+      setToast(arm ? "MIRROR armé — les suppressions sont activées" : "MIRROR désarmé (mode simulation)");
+    } catch (e) {
+      setControl((p) => p && p.deviceId === deviceId ? { ...p, mirror: { ...p.mirror, status: "idle", error: String(e) } } : p);
     }
   }, [control, pullsdk]);
 
@@ -584,6 +623,63 @@ export default function DevicesPage() {
                   </div>
                 )}
               </div>
+
+              {/* MIRROR pushing-policy review (standalone devices set to MIRROR) */}
+              {control.policy === "MIRROR" && (
+                <>
+                  <div className="border-t" />
+                  <div className="space-y-2.5">
+                    <div>
+                      <p className="text-sm font-medium flex items-center gap-2">
+                        Synchronisation miroir (MIRROR)
+                        {control.mirror.armed
+                          ? <Badge variant="destructive" className="text-xs">Suppressions activées</Badge>
+                          : <Badge variant="secondary" className="text-xs">Simulation (dry-run)</Badge>}
+                      </p>
+                      <p className="text-xs text-muted-foreground">À chaque synchro complète, supprime de l'appareil les utilisateurs absents du fichier de l'app.</p>
+                    </div>
+
+                    {control.mirror.count != null ? (
+                      <Alert variant={control.mirror.count > 0 ? "destructive" : "info"}>
+                        <AlertDescription className="text-xs">
+                          {control.mirror.count > 0 ? (
+                            <>
+                              Dernière simulation : <strong>{control.mirror.count}</strong> utilisateur(s) seraient supprimés
+                              {control.mirror.sample.length > 0 && (
+                                <span className="font-mono"> — PIN {control.mirror.sample.slice(0, 12).join(", ")}{control.mirror.count > control.mirror.sample.length ? "…" : ""}</span>
+                              )}
+                              {control.mirror.at && <span className="text-muted-foreground"> ({control.mirror.at})</span>}
+                            </>
+                          ) : (
+                            <>Dernière simulation : aucun utilisateur à supprimer.</>
+                          )}
+                        </AlertDescription>
+                      </Alert>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">Aucune simulation encore enregistrée — elle apparaîtra après la prochaine synchro complète.</p>
+                    )}
+
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {control.mirror.armed ? (
+                        <Button size="sm" variant="outline" onClick={() => setMirrorArmed(false)} disabled={control.mirror.status === "saving"}>
+                          {control.mirror.status === "saving" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null} Repasser en simulation
+                        </Button>
+                      ) : (
+                        <Button size="sm" variant="destructive" onClick={() => setMirrorArmed(true)} disabled={control.mirror.status === "saving" || control.mirror.count == null || control.mirror.count === 0}>
+                          {control.mirror.status === "saving" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null} Activer les suppressions
+                        </Button>
+                      )}
+                      {control.mirror.error && (
+                        <span className="inline-flex items-center gap-1 text-xs font-medium text-destructive"><XCircle className="h-3.5 w-3.5" /> {control.mirror.error.slice(0, 80)}</span>
+                      )}
+                    </div>
+
+                    {!control.mirror.armed && (
+                      <Alert variant="info"><AlertDescription className="text-xs">Tant que non activé, MIRROR ne supprime rien : il journalise seulement ce qu'il supprimerait. Vérifiez la liste ci-dessus avant d'activer.</AlertDescription></Alert>
+                    )}
+                  </div>
+                </>
+              )}
 
               <p className="text-[11px] text-muted-foreground flex items-center gap-1.5"><Router className="h-3 w-3" /> Écritures via la connexion du worker · valeur relue pour confirmer{control.mode ? ` · mode ${control.mode}` : ""}</p>
             </div>

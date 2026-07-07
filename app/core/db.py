@@ -2106,6 +2106,29 @@ def disarm_mirror_reconcile(*, device_id: int) -> None:
         conn.commit()
 
 
+def get_mirror_reconcile_state(*, device_id: int) -> Dict[str, Any]:
+    """MIRROR dry-run state for the desktop review screen: whether deletions are armed
+    + the last logged plan (count + sample pins + when). No row yet -> unarmed/empty."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT armed, last_plan_at, last_plan_count, last_plan_sample "
+                "FROM mirror_reconcile_ack WHERE device_id=?", (int(device_id),)
+            ).fetchone()
+    except Exception:
+        row = None
+    if not row:
+        return {"armed": False, "lastPlanAt": None, "lastPlanCount": None, "lastPlanSample": []}
+    d = dict(row)
+    sample = [s for s in str(d.get("last_plan_sample") or "").split(",") if s]
+    return {
+        "armed": bool(d.get("armed")),
+        "lastPlanAt": d.get("last_plan_at"),
+        "lastPlanCount": d.get("last_plan_count"),
+        "lastPlanSample": sample,
+    }
+
+
 # -----------------------------
 # P6: Member shadow
 # -----------------------------

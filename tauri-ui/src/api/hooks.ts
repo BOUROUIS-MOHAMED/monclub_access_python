@@ -195,6 +195,11 @@ export function usePullSdk() {
     getClock: (deviceId: number) => get<any>(`/devices/${deviceId}/clock`),
     syncClock: (deviceId: number) =>
       post<any>(`/devices/${deviceId}/clock/sync`, { confirm: true }),
+    // ── MIRROR pushing-policy review (dry-run plan + arm/disarm) ──
+    getMirrorPlan: (deviceId: number) => get<any>(`/devices/${deviceId}/mirror-plan`),
+    armMirror: (deviceId: number) =>
+      post<any>(`/devices/${deviceId}/mirror/arm`, { confirm: true }),
+    disarmMirror: (deviceId: number) => post<any>(`/devices/${deviceId}/mirror/disarm`),
   };
 }
 
