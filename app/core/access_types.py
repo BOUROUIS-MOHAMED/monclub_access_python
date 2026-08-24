@@ -52,6 +52,21 @@ class NotificationRequest:
     popup_enabled: bool = True
     win_notify_enabled: bool = True
 
+    # ── Frequent-pass VISUAL alert (X passages inside Y minutes) ──
+    # Set only when the device has the alert configured AND the threshold is
+    # crossed. ALERT ONLY: these never influence `allowed`, the door pulse, or
+    # any access decision — they exist so the entry screen can tell the front
+    # desk "this member already came through N minutes ago".
+    #   repeat_count      : this member's passages in the window, INCLUDING this one.
+    #   repeat_limit      : the configured X, so the screen can say "plus de X".
+    #   repeat_window_min : the configured Y in minutes.
+    #   previous_entry_at : "YYYY-MM-DD HH:MM:SS" of the previous passage, which the
+    #                       screen renders as "premier passage à HH:MM".
+    repeat_count: int = 0
+    repeat_limit: int = 0
+    repeat_window_min: int = 0
+    previous_entry_at: str = ""
+
 
 @dataclass
 class HistoryRecord:

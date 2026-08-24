@@ -1189,6 +1189,9 @@ class DeviceSyncEngine:
             "anti_fraude_qr_code":          _boolish(g("anti_fraude_qr_code",          "antiFraudeQrCode",           default=True), True),
             "anti_fraude_duration":         _to_int(g("anti_fraude_duration",          "antiFraudeDuration",         default=30), default=30) or 30,
             "anti_fraude_daily_pass_limit": _to_int(g("anti_fraude_daily_pass_limit",  "antiFraudeDailyPassLimit",   default=0),  default=0)  or 0,
+            # Frequent-pass VISUAL alert (never blocks; independent of the daily cap).
+            "frequent_pass_limit":          _to_int(g("frequent_pass_limit",          "frequentPassLimit",          default=0),  default=0)  or 0,
+            "frequent_pass_window_minutes": _to_int(g("frequent_pass_window_minutes", "frequentPassWindowMinutes",  default=0),  default=0)  or 0,
         }
 
     @_tel.timed("SYNC_FILTER_USERS", slow_ms=100)

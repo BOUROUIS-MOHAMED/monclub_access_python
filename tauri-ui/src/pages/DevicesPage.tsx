@@ -1,8 +1,8 @@
-import { useState, useCallback } from "react";
-import { useDevices, usePullSdk } from "@/api/hooks";
+import { useState, useCallback, useMemo } from "react";
+import { useDevices, usePullSdk, usePopupStream } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
+import { usePageChrome } from "@/context/PageChromeContext";
 import { get, post } from "@/api/client";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -13,11 +13,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Switch } from "@/components/ui/switch";
-import StatusChip from "@/components/StatusChip2";
 import { cn } from "@/lib/utils";
 import {
   RefreshCw, Router, Wifi, WifiOff, DoorOpen, Info, LockOpen, Loader2, AlertCircle,
-  SlidersHorizontal, Clock, CheckCircle2, XCircle,
+  SlidersHorizontal, Clock, CheckCircle2, XCircle, Monitor, Bug, ListChecks,
 } from "lucide-react";
 
 interface DoorPreset { id: number; deviceId: number; doorNumber: number; pulseSeconds: number; doorName: string; }
@@ -69,10 +68,73 @@ const CONTENT_TABLES = [
   { key: "transaction", label: "Transactions" },
 ] as const;
 
+// ── Row state ──────────────────────────────────────────────────────────────
+// IMPORTANT: /sync/cache/devices returns the backend-declared device roster —
+// configuration only. There is NO reachability/lastSeen field anywhere in
+// _coerce_device_row_to_payload, so this page cannot say whether a device is
+// "en ligne". The only liveness signal available is `isConnected()`, which is
+// THIS app's own PullSDK session, not device health — hence "Connecté" /
+// "Non connecté" rather than "En ligne" / "Hors ligne".
+type DeviceState = "connected" | "idle" | "noaddress" | "inactive";
+
+function deviceStateOf(d: any, connected: boolean): DeviceState {
+  if (d.active === false) return "inactive";
+  const ip = String(d.ip ?? d.ipAddress ?? "").trim();
+  if (!ip) return "noaddress";
+  return connected ? "connected" : "idle";
+}
+
+const STATE_LABEL: Record<DeviceState, string> = {
+  connected: "Connecté",
+  idle: "Non connecté",
+  noaddress: "Adresse absente",
+  inactive: "Inactif",
+};
+
+/** Design's `.ch` chip. */
+function Chip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children: React.ReactNode }) {
+  const tones = {
+    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
+    no: "bg-primary/[0.09] text-primary",
+    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
+    flat: "bg-muted text-muted-foreground",
+  } as const;
+  return (
+    <span className={cn("inline-flex h-[22px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-[11px] font-bold", tones[tone])}>
+      {children}
+    </span>
+  );
+}
+
+const STATE_TONE: Record<DeviceState, "ok" | "no" | "wn" | "flat"> = {
+  connected: "ok", idle: "flat", noaddress: "wn", inactive: "flat",
+};
+
+/** Design's mode badge — ULTRA is the violet one. */
+function ModeBadge({ mode }: { mode: string }) {
+  const m = (mode || "").toUpperCase();
+  const style =
+    m === "AGENT" ? "bg-primary text-primary-foreground"
+    : m === "ULTRA" ? "bg-violet-700 text-white"
+    : "bg-muted text-muted-foreground";
+  return (
+    <span className={cn("inline-flex h-[18px] items-center rounded-lg px-2 text-[9.5px] font-bold tracking-[0.04em]", style)}>
+      {m || "—"}
+    </span>
+  );
+}
+
+const GRID = "grid grid-cols-[1.7fr_1.1fr_0.8fr_1.5fr] gap-3.5 items-center";
+
+function Lb({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <span className={cn("text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground", className)}>{children}</span>;
+}
+
 export default function DevicesPage() {
   const { data, loading, error, reload } = useDevices(false);
   const pullsdk = usePullSdk();
-  const { status } = useApp();
+  const { status, syncNow } = useApp();
+  const { openPopupWindow, sendTestNotification } = usePopupStream();
 
   const [connectedIds, setConnectedIds] = useState<Set<number>>(new Set());
   const [toast, setToast] = useState<string | null>(null);
@@ -296,70 +358,334 @@ export default function DevicesPage() {
     ? Object.keys(infoDialog.content.rows[0]).filter((key) => !HIDE_KEYS.has(key)).slice(0, 8)
     : [];
 
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Router className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold">Appareils</h1>
-          <Badge variant="secondary" className="text-xs">{devices.length}</Badge>
-        </div>
-        <Button size="sm" variant="outline" onClick={reload} disabled={loading}>
-          <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} /> Recharger
+  // Fleet composition — counted from the roster itself rather than status.mode,
+  // which is a separate aggregate and can disagree with the list on screen.
+  const parc = useMemo(() => {
+    const byMode: Record<string, number> = { DEVICE: 0, AGENT: 0, ULTRA: 0 };
+    let needsAttention = 0;
+    const problems: { d: any; did: number; name: string; state: DeviceState }[] = [];
+    for (const d of devices as any[]) {
+      const m = String(d.accessDataMode ?? d.access_data_mode ?? "").toUpperCase();
+      if (m in byMode) byMode[m] += 1;
+      const did = d.id ?? d.deviceId;
+      const st = deviceStateOf(d, isConnected(d));
+      if (st === "noaddress" || st === "inactive") {
+        needsAttention += 1;
+        problems.push({ d, did, name: d.name || d.deviceName || `Appareil #${did}`, state: st });
+      }
+    }
+    return { byMode, needsAttention, problems };
+  }, [devices, connectedIds, status?.pullsdk?.connected, status?.pullsdk?.deviceId]);
+
+  const firstProblem = parc.problems[0] ?? null;
+
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: `${devices.length} appareil${devices.length > 1 ? "s" : ""} déclaré${devices.length > 1 ? "s" : ""}`,
+    actions: (
+      <>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          onClick={reload}
+          disabled={loading}
+        >
+          <RefreshCw className={cn("h-[15px] w-[15px]", loading && "animate-spin")} />
+          Recharger
         </Button>
+        <Button
+          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+          onClick={() => { void syncNow(); }}
+          disabled={status?.sync?.running}
+        >
+          <RefreshCw className={cn("h-4 w-4", status?.sync?.running && "animate-spin")} />
+          {status?.sync?.running ? "En cours…" : "Synchroniser"}
+        </Button>
+      </>
+    ),
+  }), [devices.length, loading, reload, syncNow, status?.sync?.running]);
+
+  return (
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : le parc, pleine hauteur ──────────────────────────── */}
+      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <Router className="h-[17px] w-[17px] text-primary" />
+          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">Le parc</span>
+          <span className="ml-1 text-[12px] text-muted-foreground">
+            {devices.length} appareil{devices.length > 1 ? "s" : ""} déclaré{devices.length > 1 ? "s" : ""}
+          </span>
+        </div>
+
+        {error && (
+          <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{error}</AlertDescription></Alert>
+        )}
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className={cn(GRID, "flex-none border-b border-border px-6 py-[11px]")}>
+            <Lb>Appareil</Lb><Lb>Adresse</Lb><Lb>État</Lb><Lb className="text-right">Actions</Lb>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {devices.length === 0 && !loading && (
+              <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-2 text-center">
+                <Router className="h-8 w-8 text-muted-foreground/40" />
+                <p className="text-[13px] font-semibold text-foreground">Aucun appareil trouvé</p>
+                <p className="max-w-[340px] text-[11.5px] text-muted-foreground">
+                  Lancez une synchronisation pour charger les appareils déclarés côté serveur.
+                </p>
+              </div>
+            )}
+            {loading && devices.length === 0 && (
+              <div className="flex h-full min-h-[240px] items-center justify-center">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              </div>
+            )}
+
+            {(devices as any[]).map((d, i) => {
+              const did = d.id ?? d.deviceId ?? i;
+              const name = d.name || d.deviceName || `Appareil #${did}`;
+              const ip = String(d.ip ?? d.ipAddress ?? "").trim();
+              const mode = String(d.accessDataMode ?? d.access_data_mode ?? "").toUpperCase();
+              const conn = isConnected(d);
+              const state = deviceStateOf(d, conn);
+              const faulty = state === "noaddress" || state === "inactive";
+              return (
+                <div
+                  key={did}
+                  className={cn(
+                    GRID,
+                    "border-b border-border/60 px-6 py-3.5 last:border-b-0",
+                    faulty && "bg-primary/[0.035]",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-[11px]">
+                    <span className={cn(
+                      "flex h-9 w-9 shrink-0 items-center justify-center rounded-[18px]",
+                      state === "connected" ? "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400"
+                        : faulty ? "bg-primary/[0.09] text-primary"
+                        : "bg-muted text-muted-foreground",
+                    )}>
+                      {faulty ? <WifiOff className="h-[19px] w-[19px]" /> : <Router className="h-[19px] w-[19px]" />}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="truncate text-[14px] font-bold text-foreground">{name}</div>
+                      <div className="mt-0.5 flex items-center gap-1.5">
+                        <ModeBadge mode={mode} />
+                        <span className="truncate text-[11px] text-muted-foreground">
+                          {d.zone || d.model || (d.deviceProtocol ? String(d.deviceProtocol) : "—")}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <span className="truncate font-mono text-[12px] text-muted-foreground">
+                    {ip ? `${ip}:${d.portNumber ?? d.port ?? 4370}` : "adresse absente"}
+                  </span>
+
+                  <span><Chip tone={STATE_TONE[state]}>{STATE_LABEL[state]}</Chip></span>
+
+                  <div className="flex items-center justify-end gap-1.5">
+                    {state === "noaddress" || state === "inactive" ? (
+                      <Button
+                        variant="outline"
+                        className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                        onClick={() => handleInfo(did)}
+                      >
+                        <Info className="h-3.5 w-3.5" />Détails
+                      </Button>
+                    ) : (
+                      <>
+                        <Button
+                          variant="outline"
+                          className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                          onClick={() => setDoorDialog({ deviceId: did, deviceName: name })}
+                        >
+                          <DoorOpen className="h-3.5 w-3.5" />Porte
+                        </Button>
+                        <Button
+                          variant="outline"
+                          className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                          onClick={() => openControl(did, name)}
+                        >
+                          <SlidersHorizontal className="h-3.5 w-3.5" />Contrôle
+                        </Button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-7 shrink-0 rounded-[14px]"
+                              onClick={() => (conn ? handleDisconnect(did) : handleConnect(did))}
+                            >
+                              {conn ? <WifiOff className="h-3.5 w-3.5" /> : <Wifi className="h-3.5 w-3.5" />}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{conn ? "Déconnecter (PullSDK)" : "Connecter (PullSDK)"}</TooltipContent>
+                        </Tooltip>
+                      </>
+                    )}
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="h-7 w-7 shrink-0 rounded-[14px]"
+                      onClick={() => handleInfo(did)}
+                    >
+                      <Info className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
-      {error && <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{error}</AlertDescription></Alert>}
+      {/* ── Le rail ─────────────────────────────────────────────────────── */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className={cn(
+            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
+            firstProblem ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
+          )}>
+            <ListChecks className="h-3 w-3" />À traiter
+          </span>
+        </div>
 
-      {devices.length === 0 && !loading ? (
-        <div className="flex flex-col items-center gap-3 py-16 text-muted-foreground">
-          <Router className="h-12 w-12 opacity-30" />
-          <p className="font-medium">Aucun appareil trouvé</p>
-          <p className="text-sm">Lancez une synchronisation pour charger les appareils.</p>
+        {firstProblem ? (
+          <div className="flex-none rounded-3xl border-[1.5px] border-primary/30 bg-card px-[22px] py-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+            <div className="mb-3.5 flex items-center gap-[13px]">
+              <span className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-[18px] bg-primary/[0.09] text-primary">
+                <WifiOff className="h-[23px] w-[23px]" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-display text-[16px] font-extrabold leading-[1.2] tracking-[-0.02em] text-foreground">
+                  {firstProblem.name}
+                </div>
+                <div className="mt-1 text-[11.5px] text-muted-foreground">
+                  {firstProblem.state === "noaddress" ? "aucune adresse IP déclarée" : "désactivé côté serveur"}
+                </div>
+              </div>
+            </div>
+            <p className="mb-3.5 text-[12px] leading-[1.55] text-muted-foreground">
+              {firstProblem.state === "noaddress"
+                ? "Cet appareil est déclaré mais n'a pas d'adresse réseau, donc l'application ne peut pas le joindre. Renseignez son adresse IP côté serveur, puis synchronisez."
+                : "Cet appareil est marqué inactif côté serveur : il est ignoré par la synchronisation et par le moteur d'accès. Réactivez-le côté serveur, puis synchronisez."}
+            </p>
+            <Button
+              className="h-[34px] w-full justify-center gap-[7px] rounded-full text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+              onClick={() => handleInfo(firstProblem.did)}
+            >
+              <Info className="h-4 w-4" />Voir la fiche
+            </Button>
+            {parc.needsAttention > 1 && (
+              <p className="mt-2.5 text-center text-[11px] text-muted-foreground">
+                +{parc.needsAttention - 1} autre{parc.needsAttention - 1 > 1 ? "s" : ""} appareil{parc.needsAttention - 1 > 1 ? "s" : ""} à vérifier
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="flex-none rounded-3xl bg-card px-[22px] py-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+            <div className="flex items-center gap-[13px]">
+              <span className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
+                <CheckCircle2 className="h-[23px] w-[23px]" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="font-display text-[16px] font-extrabold leading-[1.2] tracking-[-0.02em] text-foreground">
+                  Rien à traiter
+                </div>
+                <div className="mt-1 text-[11.5px] text-muted-foreground">
+                  Tous les appareils déclarés ont une adresse et sont actifs.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Composition — every number below is counted from the roster on screen. */}
+        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <Router className="h-3 w-3" />Composition
+          </span>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {devices.map((d: any, i: number) => {
-            const did = d.id ?? d.deviceId ?? i;
-            const name = d.name || d.deviceName || `Appareil #${did}`;
-            const ip = d.ip || d.ipAddress || "—";
-            const mode = (d.accessDataMode || d.access_data_mode || "—").toUpperCase();
-            const conn = isConnected(d);
-            return (
-              <Card key={did} className="py-4">
-                <CardHeader className="pb-2">
-                  <div className="flex items-center justify-between">
-                    <CardTitle className="text-sm">{name}</CardTitle>
-                    <Badge variant={mode === "ULTRA" ? "default" : mode === "AGENT" ? "default" : mode === "DEVICE" ? "secondary" : "outline"} className={cn("text-[10px]", mode === "ULTRA" && "bg-violet-500 hover:bg-violet-600")}>{mode}</Badge>
-                  </div>
-                  <p className="text-xs text-muted-foreground font-mono">{ip}:{d.port || 4370}</p>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="flex items-center gap-2">
-                    <StatusChip variant={conn ? "online" : "offline"} label={conn ? "Connecté" : "Déconnecté"} />
-                  </div>
-                  <div className="flex gap-1.5 flex-wrap">
-                    {conn ? (
-                      <Button size="sm" variant="outline" onClick={() => handleDisconnect(did)}><WifiOff className="h-3.5 w-3.5" /> Déconnecter</Button>
-                    ) : (
-                      <Button size="sm" variant="outline" onClick={() => handleConnect(did)}><Wifi className="h-3.5 w-3.5" /> Connecter</Button>
-                    )}
-                    <Button size="sm" variant="outline" onClick={() => setDoorDialog({ deviceId: did, deviceName: name })}><DoorOpen className="h-3.5 w-3.5" /> Porte</Button>
-                    <Button size="sm" variant="outline" onClick={() => openControl(did, name)}><SlidersHorizontal className="h-3.5 w-3.5" /> Contrôle</Button>
-                    <Button size="sm" variant="ghost" onClick={() => handleInfo(did)}><Info className="h-3.5 w-3.5" /></Button>
-                  </div>
-                </CardContent>
-              </Card>
-            );
-          })}
+        <div className="flex min-h-0 flex-1 flex-col gap-[11px] rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="mb-0.5 flex items-baseline gap-2.5">
+            <span className="num text-[30px] leading-none">{devices.length}</span>
+            <span className="text-[13px] text-muted-foreground">
+              appareil{devices.length > 1 ? "s" : ""} déclaré{devices.length > 1 ? "s" : ""}
+            </span>
+          </div>
+          <div className="h-px bg-border" />
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Appareil direct (DEVICE)</span>
+            <span className="text-[12.5px] font-bold text-foreground">{parc.byMode.DEVICE}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Agent</span>
+            <span className="text-[12.5px] font-bold text-foreground">{parc.byMode.AGENT}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Ultra</span>
+            <span className="text-[12.5px] font-bold text-foreground">{parc.byMode.ULTRA}</span>
+          </div>
+          <div className="h-px bg-border" />
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Lecteur PullSDK</span>
+            <span className="font-mono text-[12px] text-foreground">
+              {status?.pullsdk?.connected
+                ? `#${status.pullsdk.deviceId ?? "—"}`
+                : "non connecté"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Session PullSDK ouverte</span>
+            <span className="text-[12.5px] font-bold text-foreground">{connectedIds.size}</span>
+          </div>
+          {parc.needsAttention > 0 && (
+            <div className="flex items-center justify-between gap-2.5">
+              <span className="text-[12px] text-muted-foreground">À vérifier</span>
+              <span className="text-[12.5px] font-bold text-primary">{parc.needsAttention}</span>
+            </div>
+          )}
+          <p className="mt-auto pt-2 text-[10.5px] leading-[1.5] text-muted-foreground">
+            L'état d'un appareil reflète la session PullSDK de cette application. Le serveur ne publie
+            pas d'indicateur d'accessibilité par appareil.
+          </p>
         </div>
-      )}
+
+        {/* Action tile — same tile as the dashboard's, real handlers. */}
+        <div className="flex-none rounded-[18px] bg-card px-5 py-[15px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="mb-3 flex items-center gap-2.5">
+            <Monitor className="h-[18px] w-[18px] shrink-0 text-primary" />
+            <div className="min-w-0 flex-1">
+              <div className="text-[12.5px] font-bold text-foreground">Écran d'entrée</div>
+              <div className="truncate text-[10.5px] text-muted-foreground">Affiche les accès en temps réel</div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
+              onClick={openPopupWindow}
+            >
+              <Monitor className="h-[15px] w-[15px]" />Ouvrir
+            </Button>
+            <Button
+              variant="outline"
+              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
+              onClick={sendTestNotification}
+            >
+              <Bug className="h-[15px] w-[15px]" />Tester
+            </Button>
+          </div>
+        </div>
+      </div>
 
       {/* Manual Door Open Dialog */}
       <Dialog open={!!doorDialog} onOpenChange={(open: boolean) => { if (!open) setDoorDialog(null); }}>
-        <DialogContent className="max-w-xs">
+        <DialogContent className="rounded-3xlmax-w-xs">
           <DialogHeader>
-            <DialogTitle>Ouvrir la porte — {doorDialog?.deviceName}</DialogTitle>
+            <DialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Ouvrir la porte — {doorDialog?.deviceName}</DialogTitle>
           </DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5">
@@ -380,9 +706,9 @@ export default function DevicesPage() {
 
       {/* Info Dialog */}
       <Dialog open={!!infoDialog} onOpenChange={(open: boolean) => { if (!open) setInfoDialog(null); }}>
-        <DialogContent className="max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
+        <DialogContent className="rounded-3xlmax-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
           <DialogHeader>
-            <DialogTitle>Info Appareil #{infoDialog?.deviceId}</DialogTitle>
+            <DialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Info Appareil #{infoDialog?.deviceId}</DialogTitle>
           </DialogHeader>
           <Tabs defaultValue="cached" className="flex-1 overflow-hidden flex flex-col">
             <TabsList className="w-full justify-start">
@@ -533,9 +859,9 @@ export default function DevicesPage() {
 
       {/* Control panel: re-entry block + clock */}
       <Dialog open={!!control} onOpenChange={(open: boolean) => { if (!open) setControl(null); }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="rounded-3xlmax-w-lg">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><SlidersHorizontal className="h-4 w-4" /> Contrôle — {control?.deviceName}</DialogTitle>
+            <DialogTitle className="flex items-center gap-2 font-display text-[18px] font-extrabold tracking-[-0.02em]"><SlidersHorizontal className="h-4 w-4" /> Contrôle — {control?.deviceName}</DialogTitle>
           </DialogHeader>
           {control?.loading ? (
             <div className="py-10 flex justify-center"><Loader2 className="h-6 w-6 animate-spin text-primary" /></div>
@@ -692,7 +1018,7 @@ export default function DevicesPage() {
 
       {/* Control error popup (full SDK log) */}
       <Dialog open={!!control?.errorPopup} onOpenChange={(open: boolean) => { if (!open) setControl((p) => p ? { ...p, errorPopup: null } : p); }}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="rounded-3xlmax-w-lg">
           <DialogHeader><DialogTitle className="flex items-center gap-2"><AlertCircle className="h-4 w-4 text-destructive" /> {control?.errorPopup?.title || "Erreur"}</DialogTitle></DialogHeader>
           <pre className="text-xs font-mono whitespace-pre-wrap text-destructive max-h-[50vh] overflow-auto bg-muted rounded-md p-3">{control?.errorPopup?.text || "(aucun détail)"}</pre>
           <DialogFooter><Button variant="outline" onClick={() => setControl((p) => p ? { ...p, errorPopup: null } : p)}>Fermer</Button></DialogFooter>

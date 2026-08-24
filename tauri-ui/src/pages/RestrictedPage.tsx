@@ -1,61 +1,85 @@
+// Accès restreint — Access v3, screen 09b. Shown when the session or the club
+// contract has lapsed. The refonte replaces the bullet list of reasons with one
+// explained card per reason, and leaves a single action.
+//
+// The reason strings come from the backend as-is (app/ui/app.py
+// `_restriction_reasons`) and are ALREADY full French sentences — e.g. "Votre
+// session a expirée (dernière connexion il y a N jours). Veuillez vous
+// reconnecter." So they are rendered verbatim; only the icon is derived, by
+// looking for "session" / "contrat" in the text. Nothing is reworded, because
+// rewording a reason we did not author risks changing what it actually says.
+
 import { useApp } from "@/context/AppContext";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Separator } from "@/components/ui/separator";
-import { ShieldX, LogIn } from "lucide-react";
+import { TOPO_BACKGROUND_IMAGE } from "@/lib/topo";
+import { ShieldX, LogIn, Clock, FileText, LifeBuoy } from "lucide-react";
+
+function iconForReason(reason: string) {
+  const r = reason.toLowerCase();
+  if (r.includes("session") || r.includes("connexion") || r.includes("login")) return Clock;
+  if (r.includes("contrat") || r.includes("contract")) return FileText;
+  return ShieldX;
+}
 
 export default function RestrictedPage() {
   const { status, logout } = useApp();
   const reasons = status?.session?.reasons ?? [];
-  const s = status?.session;
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-background p-4">
-      <Card className="w-full max-w-md">
-        <CardHeader className="text-center">
-          <div className="mx-auto mb-2 flex h-14 w-14 items-center justify-center rounded-full bg-destructive/10">
-            <ShieldX className="h-7 w-7 text-destructive" />
+    <div className="relative flex h-screen items-center justify-center overflow-hidden bg-background p-4">
+      <div
+        className="pointer-events-none absolute inset-0 opacity-[0.06] dark:opacity-[0.09] dark:invert"
+        style={{ backgroundImage: TOPO_BACKGROUND_IMAGE, backgroundSize: "cover", backgroundPosition: "center" }}
+      />
+
+      <div className="relative w-[452px] rounded-3xl bg-card px-9 pb-[30px] pt-[34px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+        <div className="mb-6 flex flex-col items-center text-center">
+          <div className="mb-4 flex h-[60px] w-[60px] items-center justify-center rounded-3xl bg-primary/[0.09] text-primary">
+            <ShieldX className="h-[30px] w-[30px]" />
           </div>
-          <CardTitle className="text-xl">Accès restreint</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <Alert variant="destructive">
-            <AlertTitle>Accès refusé</AlertTitle>
-            <AlertDescription>Vous ne pouvez pas utiliser l'application pour le moment.</AlertDescription>
-          </Alert>
+          <h2 className="mb-[9px] font-display text-[26px] font-extrabold leading-[1.1] tracking-[-0.025em] text-foreground">
+            Accès suspendu
+          </h2>
+          <p className="max-w-[330px] text-[13.5px] leading-[1.6] text-muted-foreground">
+            {reasons.length > 0
+              ? "Le poste ne peut pas être utilisé pour le moment. Voici pourquoi :"
+              : "Le poste ne peut pas être utilisé pour le moment."}
+          </p>
+        </div>
 
-          {reasons.length > 0 && (
-            <div className="space-y-1.5">
-              {reasons.map((r, i) => (
-                <p key={i} className="text-sm text-muted-foreground">• {r}</p>
-              ))}
-            </div>
-          )}
-
-          {s && s.loginDaysRemaining != null && s.loginDaysRemaining <= 0 && (
-            <>
-              <Separator />
-              <p className="text-sm text-muted-foreground">Votre session a expiré. Veuillez vous reconnecter.</p>
-            </>
-          )}
-
-          {s && s.contractEndDate && s.contractDaysRemaining != null && s.contractDaysRemaining <= 0 && (
-            <>
-              <Separator />
-              <p className="text-sm text-muted-foreground">
-                Contrat expiré le <strong>{s.contractEndDate}</strong>. Contactez l'équipe MonClub.
-              </p>
-            </>
-          )}
-
-          <div className="flex justify-center pt-2">
-            <Button onClick={logout}>
-              <LogIn className="h-4 w-4" /> Se reconnecter
-            </Button>
+        {reasons.length > 0 && (
+          <div className="mb-6 flex flex-col gap-2.5">
+            {reasons.map((reason, i) => {
+              const Icon = iconForReason(reason);
+              return (
+                <div
+                  key={i}
+                  className="flex items-start gap-[13px] rounded-[18px] border border-primary/20 bg-primary/[0.05] px-4 py-3.5"
+                >
+                  <span className="flex h-[34px] w-[34px] shrink-0 items-center justify-center rounded-[18px] bg-primary/[0.09] text-primary">
+                    <Icon className="h-[18px] w-[18px]" />
+                  </span>
+                  <p className="min-w-0 flex-1 text-[12.5px] leading-[1.5] text-foreground">{reason}</p>
+                </div>
+              );
+            })}
           </div>
-        </CardContent>
-      </Card>
+        )}
+
+        <Button
+          onClick={logout}
+          className="h-11 w-full justify-center gap-2 rounded-full text-[13.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+        >
+          <LogIn className="h-[17px] w-[17px]" />Se reconnecter
+        </Button>
+
+        <div className="mt-5 flex items-center justify-center gap-2">
+          <LifeBuoy className="h-[15px] w-[15px] text-muted-foreground" />
+          <span className="text-[11.5px] text-muted-foreground">
+            Les portes continuent de fonctionner en mode hors ligne
+          </span>
+        </div>
+      </div>
     </div>
   );
 }

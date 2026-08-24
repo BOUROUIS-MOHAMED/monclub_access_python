@@ -7,6 +7,7 @@ import { EnrollmentProvider } from "./context/EnrollmentContext";
 import { useEnrollmentListener } from "./hooks/useEnrollmentListener";
 import { Loader2 } from "lucide-react";
 import MainLayout from "./layouts/MainLayout";
+import { PageChromeProvider } from "./context/PageChromeContext";
 import LoginPage from "./pages/LoginPage";
 import DashboardPage from "./pages/DashboardPage";
 import DevicesPage from "./pages/DevicesPage";
@@ -63,7 +64,9 @@ function AppRoutes() {
 
   return (
     <Routes>
-      <Route element={<MainLayout />}>
+      {/* PageChromeProvider must wrap MainLayout: pages publish their header
+          subtitle/actions upward into the shell's 54px header. */}
+      <Route element={<PageChromeProvider><MainLayout /></PageChromeProvider>}>
         <Route index element={<DashboardPage />} />
         <Route path="devices" element={<DevicesPage />} />
         <Route path="users" element={<UsersPage />} />
@@ -83,8 +86,10 @@ function AppRoutes() {
 }
 
 export default function App() {
+  // Access v3 is a light interface (see src/theme/colors.ts). Users who have
+  // already picked a theme keep it — storageKey persists their choice.
   return (
-    <ThemeProvider attribute="class" defaultTheme="dark" enableSystem={false} storageKey="monclub-theme">
+    <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} storageKey="monclub-theme">
       <TooltipProvider>
         <BrowserRouter>
           <Routes>

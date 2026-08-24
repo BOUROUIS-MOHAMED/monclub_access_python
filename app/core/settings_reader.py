@@ -475,6 +475,12 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "anti_fraude_duration":         _clamp_int(dev.get("antiFraudeDuration"), default=30, lo=5, hi=300),
         "anti_fraude_daily_pass_limit": _clamp_int(dev.get("antiFraudeDailyPassLimit"), default=0, lo=0, hi=100),
 
+        # Frequent-pass VISUAL alert (X passages inside Y minutes). Alert only —
+        # never blocks a member, never changes the access decision. Independent of
+        # anti_fraude_daily_pass_limit above, which is a calendar-day cap.
+        "frequent_pass_limit":          _clamp_int(dev.get("frequentPassLimit"), default=0, lo=0, hi=100),
+        "frequent_pass_window_minutes": _clamp_int(dev.get("frequentPassWindowMinutes"), default=0, lo=0, hi=1440),
+
         # internal defaults (not in backend models yet)
         "replay_block_window_seconds": 10,
         "replay_lru_size": 2000,

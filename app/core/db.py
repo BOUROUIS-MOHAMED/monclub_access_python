@@ -14,7 +14,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
@@ -1038,6 +1038,9 @@ def init_db() -> None:
                 anti_fraude_qr_code          INTEGER NOT NULL DEFAULT 1,
                 anti_fraude_duration         INTEGER NOT NULL DEFAULT 30,
                 anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0,
+                -- Frequent-pass VISUAL alert (never blocks). 0 disables.
+                frequent_pass_limit          INTEGER NOT NULL DEFAULT 0,
+                frequent_pass_window_minutes INTEGER NOT NULL DEFAULT 0,
 
                 device_protocol TEXT,
 
@@ -1101,6 +1104,8 @@ def init_db() -> None:
         _ensure_column(conn, "sync_devices", "anti_fraude_qr_code",          "anti_fraude_qr_code INTEGER NOT NULL DEFAULT 1")
         _ensure_column(conn, "sync_devices", "anti_fraude_duration",         "anti_fraude_duration INTEGER NOT NULL DEFAULT 30")
         _ensure_column(conn, "sync_devices", "anti_fraude_daily_pass_limit", "anti_fraude_daily_pass_limit INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_devices", "frequent_pass_limit",          "frequent_pass_limit INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_devices", "frequent_pass_window_minutes", "frequent_pass_window_minutes INTEGER NOT NULL DEFAULT 0")
 
         # SDK-family routing for the device-driver factory (app/sdk/device_driver.py).
         # NULL/absent -> ZK_PULLSDK (safe default: every pre-existing device is a
@@ -2989,6 +2994,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             anti_fraude_card, anti_fraude_qr_code, anti_fraude_duration,
             anti_fraude_daily_pass_limit,
+            frequent_pass_limit, frequent_pass_window_minutes,
 
             device_protocol,
 
@@ -3091,6 +3097,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _bool_to_i(d.get("antiFraudeQrCode", True), default=1),
             _to_int_or_none(d.get("antiFraudeDuration", 30)) or 30,
             _to_int_or_none(d.get("antiFraudeDailyPassLimit", 0)) or 0,
+            _to_int_or_none(d.get("frequentPassLimit", 0)) or 0,
+            _to_int_or_none(d.get("frequentPassWindowMinutes", 0)) or 0,
 
             (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
 
@@ -4617,6 +4625,8 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         "antiFraudeQrCode":           _boolish(g("anti_fraude_qr_code", default=1), True),
         "antiFraudeDuration":         _to_int_or_none(g("anti_fraude_duration", default=30)) or 30,
         "antiFraudeDailyPassLimit":   int(g("anti_fraude_daily_pass_limit", default=0) or 0),
+        "frequentPassLimit":          int(g("frequent_pass_limit", default=0) or 0),
+        "frequentPassWindowMinutes":  int(g("frequent_pass_window_minutes", default=0) or 0),
 
         # attached later by list_sync_devices_payload (synced presets)
         "doorPresets": g("doorPresets", "door_presets", default=None) or [],
@@ -6759,6 +6769,44 @@ def count_today_for_user_door(
     with get_conn() as conn:
         row = conn.execute(sql, (int(user_id), int(device_id), int(door_id))).fetchone()
     return int(row[0]) if row else 0
+
+
+def count_recent_for_user_door(
+    *, user_id: int, device_id: int, door_id: int, window_minutes: int
+) -> "Tuple[int, Optional[str]]":
+    """PRIOR allowed entries by this user on this device+door inside a rolling window.
+
+    Returns ``(count, last_created_at)`` where ``count`` counts rows ALREADY in
+    access_history — it deliberately does NOT include the scan being decided right
+    now, because ULTRA writes history asynchronously (_enqueue_history is drained on
+    a later tick) so the current row is not visible here. Callers add 1 for the
+    in-flight scan. ``last_created_at`` is the most recent of those prior rows and is
+    what the entry screen shows as "premier passage à HH:MM".
+
+    Powers the frequent-pass VISUAL alert. Never used to allow or deny anything.
+
+    Uses ix_access_history_user_door_day — ON (user_id, device_id, door_id, allowed,
+    created_at) — whose trailing created_at makes this range scan an index seek, so
+    it stays cheap on the live decision path.
+    """
+    if user_id is None or window_minutes is None or int(window_minutes) <= 0:
+        return (0, None)
+    sql = """
+        SELECT COUNT(*), MAX(created_at) FROM access_history
+        WHERE user_id = ?
+          AND device_id = ?
+          AND door_id = ?
+          AND allowed = 1
+          AND created_at >= datetime('now', 'localtime', ?)
+    """
+    offset = "-{} minutes".format(int(window_minutes))
+    with get_conn() as conn:
+        row = conn.execute(
+            sql, (int(user_id), int(device_id), int(door_id), offset)
+        ).fetchone()
+    if not row:
+        return (0, None)
+    return (int(row[0] or 0), row[1])
 
 
 def prune_access_history(*, retention_days: int) -> int:

@@ -2,6 +2,9 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { useEnroll, useUsers } from "@/api/hooks";
 import { ApiError, openSSE } from "@/api/client";
 import { useEnrollment } from "@/context/EnrollmentContext";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { cn } from "@/lib/utils";
+import { User, Info } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -454,6 +457,53 @@ export default function EnrollPage() {
 
   const selectedUser = users.find((u) => String(u.userId) === selectedUserId);
 
+  // ── Access v3 (Partie 1, screen 03) ───────────────────────────────────
+  // The subject is the capture in progress, not a form. `scanProgress` is the
+  // REAL 0–3 sample counter the SSE stream reports (data.sampleNum, and the
+  // "sample N/3 captured" log line); `phase` is the authoritative step.
+  const phaseCopy: Record<string, { title: string; hint: string }> = {
+    idle: { title: "Prêt à enrôler", hint: "Choisissez un membre et un doigt, puis démarrez la capture." },
+    connecting: { title: "Connexion…", hint: "Vérification des informations." },
+    device_init: { title: "Ouverture du lecteur", hint: "Initialisation du scanner ZK9500." },
+    wait_finger: { title: "Posez votre doigt", hint: "Appuyez fermement sur le scanner ZK9500." },
+    lift_finger: { title: "Levez le doigt", hint: "Puis reposez-le pour l'échantillon suivant." },
+    sample_rejected: { title: "Échantillon rejeté", hint: "Qualité insuffisante — reposez le doigt." },
+    pushing: { title: "Envoi à l'appareil…", hint: "L'empreinte est transmise au lecteur." },
+    success: { title: "Empreinte enregistrée", hint: "La capture est terminée." },
+    failed: { title: "Échec de la capture", hint: "Consultez le journal ci-dessous." },
+    cancelled: { title: "Capture annulée", hint: "Vous pouvez relancer une capture." },
+  };
+  const pc = phaseCopy[phase] ?? phaseCopy.idle;
+  const captureActive = running && phase !== "idle";
+
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: captureActive
+      ? `capture en cours${selectedUser?.fullName ? ` · ${selectedUser.fullName}` : ""}`
+      : `${fingerprints.length} empreinte${fingerprints.length > 1 ? "s" : ""} locale${fingerprints.length > 1 ? "s" : ""}`,
+    actions: (
+      <>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          onClick={toggleSound}
+        >
+          {soundEnabled ? <Volume2 className="h-[15px] w-[15px]" /> : <VolumeX className="h-[15px] w-[15px]" />}
+          {soundEnabled ? "Son activé" : "Son coupé"}
+        </Button>
+        <Button
+          variant="outline"
+          className="h-[34px] gap-[7px] rounded-[14px] border-[1.5px] border-primary/45 px-[14px] text-[12.5px] font-semibold text-primary hover:bg-primary/5 disabled:opacity-40"
+          onClick={handleCancel}
+          disabled={!running}
+        >
+          <Square className="h-4 w-4" />Annuler la capture
+        </Button>
+      </>
+    ),
+    // Primitives only — a changing function reference here loops the effect.
+  }), [captureActive, selectedUser?.fullName, fingerprints.length, soundEnabled, running]);
+
   return (
     <>
     <EnrollOverlay
@@ -469,41 +519,237 @@ export default function EnrollPage() {
       onDismiss={handleOverlayDismiss}
       onRetryPush={handleRetryPush}
     />
-    <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <Fingerprint className="h-5 w-5 text-primary" />
-        <h1 className="text-lg font-semibold">Enrolement d&apos;empreinte</h1>
-        <div className="ml-auto">
-          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={toggleSound} title={soundEnabled ? "Son active" : "Son desactive"}>
-            {soundEnabled ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4 text-muted-foreground" />}
-          </Button>
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : la capture ───────────────────────────────────────── */}
+      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className={cn(
+            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
+            captureActive ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
+          )}>
+            {captureActive && <span className="relative inline-block h-1.5 w-1.5"><span className="absolute inset-0 animate-ping rounded-full bg-primary opacity-60" /><span className="absolute inset-0 rounded-full bg-primary" /></span>}
+            {captureActive ? "En cours" : "Au repos"}
+          </span>
+          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">
+            Capture de l'empreinte
+          </span>
+        </div>
+
+        {/* The live capture panel — phase + sample counter are both real. */}
+        <div className="relative flex-none overflow-hidden rounded-3xl bg-card px-8 py-[30px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="relative flex items-center gap-8">
+            <div className="relative flex h-28 w-28 flex-none items-center justify-center">
+              {captureActive && <span className="absolute h-[104px] w-[104px] animate-ping rounded-full bg-primary/[0.12]" />}
+              <div className={cn(
+                "relative flex h-20 w-20 items-center justify-center rounded-full border-2",
+                captureActive ? "border-primary bg-primary/[0.08] text-primary" : "border-border bg-muted text-muted-foreground",
+              )}>
+                <Fingerprint className="h-10 w-10" />
+              </div>
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <h2 className="mb-2 font-display text-[30px] font-extrabold leading-[1.1] tracking-[-0.03em] text-foreground">
+                {pc.title}
+              </h2>
+              <p className="mb-[18px] text-[15px] leading-[1.55] text-muted-foreground">{pc.hint}</p>
+              <div className="flex items-center gap-[11px]">
+                <span className="flex items-center gap-2">
+                  {[1, 2, 3].map((i) => (
+                    <span
+                      key={i}
+                      className={cn(
+                        "h-[13px] w-[13px] rounded-full border-2",
+                        scanProgress >= i
+                          ? "border-emerald-700 bg-emerald-700 dark:border-emerald-400 dark:bg-emerald-400"
+                          : "border-border",
+                      )}
+                    />
+                  ))}
+                </span>
+                <span className="text-[12.5px] text-muted-foreground">
+                  échantillon <b className="text-foreground">{Math.min(3, Math.max(0, scanProgress))}</b> sur 3
+                </span>
+              </div>
+            </div>
+
+            <div className="flex-none text-right">
+              <div className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">Doigt</div>
+              <div className="num text-[40px] leading-none">{fingerId}</div>
+            </div>
+          </div>
+        </div>
+
+        {/* Journal — the same `logs` the SSE stream fills. */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="flex flex-none items-center justify-between gap-3.5 border-b border-border px-6 pb-[11px] pt-[13px]">
+            <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">
+              Journal de la capture
+            </span>
+            <span className="text-[11.5px] text-muted-foreground">source&nbsp;: flux SSE</span>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-[11px] font-mono text-[11.5px] font-medium leading-[1.95] text-muted-foreground">
+            {logs.length === 0 ? (
+              <p className="pt-6 text-center font-sans text-[13px]">En attente du démarrage…</p>
+            ) : logs.map((line, i) => (
+              <div key={i} className="break-all">{line}</div>
+            ))}
+          </div>
+        </div>
+
+        {result && (
+          <Alert className="flex-none" variant={result === "success" ? "success" : result === "cancelled" ? "warning" : "destructive"}>
+            <AlertDescription>
+              {result === "success" ? "Enrôlement réussi !" : result === "cancelled" ? "Enrôlement annulé." : "Enrôlement échoué."}
+            </AlertDescription>
+          </Alert>
+        )}
+      </div>
+
+      {/* ── Le rail ─────────────────────────────────────────────────────── */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px] overflow-y-auto">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <User className="h-3 w-3" />Membre
+          </span>
+        </div>
+
+        <div className="flex-none rounded-3xl bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          {selectedUser ? (
+            <>
+              <div className="mb-3.5 flex items-center gap-[13px]">
+                <span className="flex h-[46px] w-[46px] shrink-0 items-center justify-center rounded-3xl bg-muted text-[16px] font-bold text-muted-foreground">
+                  {(String(selectedUser.fullName || "?").trim().split(/\s+/).map((w: string) => w[0]).slice(0, 2).join("") || "?").toUpperCase()}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-display text-[17px] font-extrabold leading-[1.15] tracking-[-0.02em] text-foreground">
+                    {selectedUser.fullName || "—"}
+                  </div>
+                  <div className="mt-[3px] truncate text-[11.5px] text-muted-foreground">
+                    ID {selectedUser.userId}
+                  </div>
+                </div>
+              </div>
+              <div className="mb-3 h-px bg-border" />
+            </>
+          ) : (
+            <p className="mb-3 text-[12.5px] text-muted-foreground">Aucun membre sélectionné.</p>
+          )}
+          <div className="mb-2 flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Type d'enrôlement</span>
+            <span className="text-[12px] font-semibold text-foreground">{enrollType === "BACKEND" ? "Backend" : "Local"}</span>
+          </div>
+          <div className="mb-2 flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Doigt</span>
+            <span className="font-mono text-[12px] text-foreground">{fingerId}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Étape</span>
+            <span className={cn("text-[12px] font-semibold", captureActive ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
+              {phase}
+            </span>
+          </div>
+        </div>
+
+        {enrollMeta && (
+          <div className="flex flex-none items-start gap-[9px] rounded-[18px] border border-blue-500/20 bg-blue-500/[0.05] px-5 py-3.5">
+            <Info className="mt-px h-4 w-4 shrink-0 text-blue-700 dark:text-blue-400" />
+            <span className="flex-1 text-[11.5px] leading-[1.5] text-muted-foreground">
+              Capture lancée depuis le tableau de bord.
+              {enrollMeta.fullName ? ` Membre : ${enrollMeta.fullName}.` : ""} Le membre doit lever puis
+              reposer le doigt entre chaque échantillon.
+            </span>
+            <button className="shrink-0 text-muted-foreground hover:text-foreground" onClick={clearMeta}>×</button>
+          </div>
+        )}
+
+        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <Fingerprint className="h-3 w-3" />Déjà enregistrées
+          </span>
+          <span className="text-[11.5px] text-muted-foreground">{fingerprints.length}</span>
+          {fpLoading && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
+        </div>
+        <div className="flex min-h-[120px] flex-none flex-col gap-[11px] rounded-[18px] bg-card px-5 py-[15px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          {fingerprints.length === 0 ? (
+            <p className="text-[12px] text-muted-foreground">Aucune empreinte locale stockée.</p>
+          ) : fingerprints.map((fp: any, i: number) => (
+            <div key={fp.id}>
+              {i > 0 && <div className="mb-[11px] h-px bg-border" />}
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[18px] bg-muted text-[11px] font-bold text-muted-foreground">
+                  {(String(fp.label || fp.pin || "?").trim().slice(0, 2) || "?").toUpperCase()}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[12.5px] font-semibold text-foreground">{fp.label || fp.pin || `#${fp.id}`}</div>
+                  <div className="truncate text-[10.5px] text-muted-foreground">
+                    doigt {fp.fingerId} · {fp.templateSize} o
+                  </div>
+                </div>
+                <button
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-primary hover:bg-primary/10"
+                  onClick={() => { if (confirm(`Supprimer l'empreinte #${fp.id} ?`)) void removeFp(fp.id); }}
+                >
+                  <Trash2 className="h-[15px] w-[15px]" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Setup — member picker + finger + start. Kept in the rail so the
+            capture stays the subject, per the design. */}
+        <div className="flex flex-none flex-col gap-2.5 rounded-[18px] bg-card px-5 py-[15px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground">Nouvelle capture</div>
+          <Input
+            placeholder="Rechercher un membre…"
+            value={userSearch}
+            onChange={(e) => setUserSearch(e.target.value)}
+            className="h-8 rounded-xl text-[12.5px]"
+          />
+          {userSearch && (
+            <div className="max-h-32 overflow-y-auto rounded-xl border border-border">
+              {filteredUsers.length === 0 ? (
+                <p className="p-2.5 text-center text-[12px] text-muted-foreground">Aucun membre trouvé</p>
+              ) : filteredUsers.map((u: any) => (
+                <button
+                  key={u.userId}
+                  onClick={() => setSelectedUserId(String(u.userId))}
+                  className={cn(
+                    "flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[12.5px] transition-colors hover:bg-muted",
+                    selectedUserId === String(u.userId) && "bg-primary/10 text-primary",
+                  )}
+                >
+                  <span className="truncate font-medium">{u.fullName || "—"}</span>
+                  <span className="shrink-0 text-[11px] text-muted-foreground">#{u.userId}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="flex items-center gap-2">
+            <span className="text-[12px] text-muted-foreground">Doigt</span>
+            <Input
+              type="number"
+              min={0}
+              max={9}
+              value={fingerId}
+              onChange={(e) => setFingerId(e.target.value)}
+              disabled={running}
+              className="h-8 w-16 rounded-xl text-[12.5px]"
+            />
+            <Button
+              className="ml-auto h-8 gap-1.5 rounded-full px-4 text-[12px] font-bold"
+              onClick={handleStart}
+              disabled={running || (enrollType === "BACKEND" && !selectedUserId)}
+            >
+              {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+              {running ? "En cours…" : "Démarrer"}
+            </Button>
+          </div>
         </div>
       </div>
 
-      {enrollMeta && (
-        <div className="relative rounded-xl overflow-hidden border border-primary/30 bg-gradient-to-r from-primary/10 via-primary/5 to-transparent p-4">
-          <div className="flex items-center gap-3">
-            <div className="flex-shrink-0 w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
-              <Fingerprint className="h-5 w-5 text-primary animate-pulse" />
-            </div>
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold text-foreground">Enrolement demarre depuis le tableau de bord</p>
-              <p className="text-xs text-muted-foreground truncate">
-                {enrollMeta.fullName ? `Membre : ${enrollMeta.fullName}` : `ID : ${enrollMeta.userId}`}
-                {enrollMeta.fingerId !== undefined ? ` · Doigt #${enrollMeta.fingerId}` : ""}
-              </p>
-            </div>
-            <button
-              className="text-xs text-muted-foreground hover:text-foreground transition-colors px-2 py-1 rounded"
-              onClick={clearMeta}
-            >
-              ×
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div className="hidden">
         <Card>
           <CardHeader>
             <CardTitle className="text-sm">Nouvelle empreinte</CardTitle>
@@ -615,6 +861,7 @@ export default function EnrollPage() {
         </Card>
       </div>
 
+      <div className="hidden">
       <Separator />
       <div className="flex items-center gap-3">
         <Fingerprint className="h-4 w-4 text-primary" />
@@ -670,9 +917,10 @@ export default function EnrollPage() {
           </TableBody>
         </Table>
       </div>
+      </div>
 
       <AlertDialog open={errorOpen} onOpenChange={setErrorOpen}>
-        <AlertDialogContent>
+        <AlertDialogContent className="rounded-3xl">
           <AlertDialogHeader>
             <AlertDialogTitle>Erreur</AlertDialogTitle>
             <AlertDialogDescription className="whitespace-pre-wrap">{errorMsg}</AlertDialogDescription>

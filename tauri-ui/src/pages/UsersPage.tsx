@@ -45,7 +45,14 @@ import {
   Trash2,
   Users as UsersIcon,
   XCircle,
+  UserPlus,
+  CloudUpload,
+  GitMerge,
+  AlertCircle,
+  CheckCircle2,
 } from "lucide-react";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { cn } from "@/lib/utils";
 
 type MembershipChoice = { id: number | string; title?: string };
 
@@ -207,6 +214,46 @@ function statusBadge(status?: string): "success" | "destructive" | "warning" | "
 }
 
 // Turn a raw backend error into an operator-friendly hint for the decision dialog.
+// ── Access v3 roster primitives ────────────────────────────────────────────
+const ROSTER_GRID = "grid grid-cols-[2fr_1.1fr_1.15fr_0.8fr_0.75fr_1.25fr] gap-[13px] items-center";
+const LB = "text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground";
+
+function initialsOf(name: string | null | undefined): string {
+  const p = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (!p.length) return "—";
+  return ((p[0][0] || "") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase();
+}
+
+function RosterChip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children: React.ReactNode }) {
+  const tones = {
+    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
+    no: "bg-primary/[0.09] text-primary",
+    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
+    flat: "bg-muted text-muted-foreground",
+  } as const;
+  return (
+    <span className={cn("inline-flex h-[18px] shrink-0 items-center whitespace-nowrap rounded-lg px-2 text-[10px] font-bold", tones[tone])}>
+      {children}
+    </span>
+  );
+}
+
+function IconAction({ title, disabled, onClick, children }: {
+  title: string; disabled?: boolean; onClick: () => void; children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+    >
+      {children}
+    </button>
+  );
+}
+
 function friendlyConflict(a: OfflineAttemptResponse | undefined): string | null {
   const msg = nl(a?.error);
   if (!msg) return null;
@@ -884,51 +931,103 @@ export default function UsersPage() {
 
   const saveLaterRecommended = decision?.attempt?.recommendation === "save_later";
   const conflictHint = friendlyConflict(decision?.attempt);
+
+  // ── Access v3 layout ──────────────────────────────────────────────────
+  // The design makes the directory the subject at full height and moves
+  // creation/queue administration behind the header's "Nouveau membre" pill.
+  // The existing forms and queue panels below are NOT rewritten — they are
+  // toggled, so their wiring is untouched.
+  const [showForms, setShowForms] = useState(false);
+
+  // Rail figures. Every one is derived from the roster page the API returned
+  // (rosterCounts) or from flags the backend already sets on each row
+  // (offlinePending / hasConflict / pendingDelete / pendingMutations).
+  const railFacts = useMemo(() => {
+    const conflicts = roster.filter((m) => m.hasConflict);
+    const offlineNew = roster.filter((m) => m.offlinePending);
+    const deleting = roster.filter((m) => m.pendingDelete);
+    const syncing = roster.filter((m) => !m.hasConflict && !m.pendingDelete && (m.pendingMutations?.length ?? 0) > 0);
+    return { conflicts, offlineNew, deleting, syncing };
+  }, [roster]);
+
+  const attentionCount =
+    railFacts.conflicts.length + railFacts.offlineNew.length + railFacts.deleting.length + railFacts.syncing.length;
+
+  const firstNames = (rows: MemberRosterRow[], max = 3) =>
+    rows.slice(0, max).map((m) => (m.fullName || "—").split(/\s+/)[0]).join(", ") +
+    (rows.length > max ? ` +${rows.length - max}` : "");
+
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: `${rosterTotal} membre${rosterTotal > 1 ? "s" : ""}`,
+    actions: (
+      <>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          disabled={loading || queueLoading}
+          onClick={() => runAction(async () => {
+            await Promise.all([reloadUsers(), loadMemberships(), refreshQueue(), loadRoster()]);
+          })}
+        >
+          <RefreshCw className={`h-[15px] w-[15px] ${loading || queueLoading ? "animate-spin" : ""}`} />
+          Recharger
+        </Button>
+        <Button
+          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+          onClick={() => setShowForms((v) => !v)}
+        >
+          {showForms ? <ChevronLeft className="h-4 w-4" /> : <UserPlus className="h-4 w-4" />}
+          {showForms ? "Retour au répertoire" : "Nouveau membre"}
+        </Button>
+      </>
+    ),
+    // Deps are PRIMITIVES ONLY on purpose. `runAction` is a plain arrow
+    // function (not useCallback), so it is a new reference on every render —
+    // including it here re-ran this effect every render, which called
+    // setChrome, which re-rendered, which… "Maximum update depth exceeded".
+    // The handlers below are only invoked from clicks, and the loaders they
+    // call (reloadUsers / loadMemberships / refreshQueue / loadRoster) are
+    // stable useCallbacks, so capturing them from the last committed render is
+    // correct.
+  }), [rosterTotal, loading, queueLoading, showForms]);
   const rosterTotalPages = Math.max(1, Math.ceil(rosterTotal / ROSTER_SIZE));
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-3">
-          <UsersIcon className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold">Members</h1>
-          <Badge variant="secondary" className="text-xs">{rosterCounts.all ?? users.length}</Badge>
-          {queueLoading ? <Clock3 className="h-4 w-4 animate-pulse text-muted-foreground" /> : null}
-        </div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Manual retry executed.")}>
-            <Repeat className="h-3.5 w-3.5" /> Retry due now
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            disabled={loading || queueLoading}
-            onClick={() => runAction(async () => {
-              await Promise.all([reloadUsers(), loadMemberships(), refreshQueue(), loadRoster()]);
-            })}
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading || queueLoading ? "animate-spin" : ""}`} /> Refresh
-          </Button>
-        </div>
-      </div>
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : le répertoire, pleine hauteur ────────────────────── */}
+      <div className={cn("flex min-w-0 flex-1 flex-col gap-[11px]", showForms && "overflow-y-auto pr-1")}>
 
-      {error ? <Alert variant="destructive"><AlertTitle>Users error</AlertTitle><AlertDescription>{error}</AlertDescription></Alert> : null}
-      {queueError ? <Alert variant="destructive"><AlertTitle>Queue error</AlertTitle><AlertDescription>{queueError}</AlertDescription></Alert> : null}
-      {message ? <Alert variant="success"><AlertTitle>Done</AlertTitle><AlertDescription>{message}</AlertDescription></Alert> : null}
+        {error ? <Alert variant="destructive"><AlertTitle>Users error</AlertTitle><AlertDescription>{error}</AlertDescription></Alert> : null}
+        {queueError ? <Alert variant="destructive"><AlertTitle>Queue error</AlertTitle><AlertDescription>{queueError}</AlertDescription></Alert> : null}
+        {message ? <Alert variant="success"><AlertTitle>Done</AlertTitle><AlertDescription>{message}</AlertDescription></Alert> : null}
 
-      {editing ? (
-        <Alert variant="info">
-          <AlertTitle>Editing pending row {editing.local_id}</AlertTitle>
-          <AlertDescription className="flex items-center justify-between gap-2">
-            <span>Update values and submit to keep this pending row valid.</span>
-            <Button size="sm" variant="outline" onClick={cancelEdit}>
-              <XCircle className="h-3.5 w-3.5" /> Cancel edit
+        {editing ? (
+          <Alert variant="info">
+            <AlertTitle>Editing pending row {editing.local_id}</AlertTitle>
+            <AlertDescription className="flex items-center justify-between gap-2">
+              <span>Update values and submit to keep this pending row valid.</span>
+              <Button size="sm" variant="outline" onClick={cancelEdit}>
+                <XCircle className="h-3.5 w-3.5" /> Cancel edit
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {showForms ? (
+          <div className="flex flex-none items-center justify-between gap-3">
+            <div className="flex items-center gap-[9px]">
+              <UserPlus className="h-[17px] w-[17px] text-primary" />
+              <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">Gestion</span>
+              <span className="ml-1 text-[12px] text-muted-foreground">création, file d'attente et historique</span>
+            </div>
+            <Button size="sm" variant="outline" onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Manual retry executed.")}>
+              <Repeat className="h-3.5 w-3.5" /> Retry due now
             </Button>
-          </AlertDescription>
-        </Alert>
-      ) : null}
+          </div>
+        ) : null}
 
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+      <div className={cn("grid grid-cols-1 xl:grid-cols-2 gap-4", !showForms && "hidden")}>
         {/* ----- existing-user subscription ----- */}
         <Card>
           <CardHeader>
@@ -1087,7 +1186,7 @@ export default function UsersPage() {
         </Card>
       </div>
 
-      <Card>
+      <Card className={cn(!showForms && "hidden")}>
         <CardHeader><CardTitle className="text-sm">Pending queue (active rows)</CardTitle></CardHeader>
         <CardContent>
           <Table>
@@ -1131,7 +1230,7 @@ export default function UsersPage() {
         </CardContent>
       </Card>
 
-      <Card>
+      <Card className={cn(!showForms && "hidden")}>
         <CardHeader>
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <CardTitle className="text-sm">Processed history</CardTitle>
@@ -1184,102 +1283,153 @@ export default function UsersPage() {
         </CardContent>
       </Card>
 
-      {/* ----- local-first searchable member roster ----- */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <CardTitle className="text-sm">Members directory</CardTitle>
-            <div className="flex items-center gap-2 flex-wrap">
-              <div className="relative">
-                <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  className="w-[220px] pl-7"
-                  placeholder="Search name, email, phone, card…"
-                  value={rosterQInput}
-                  onChange={(e) => setRosterQInput(e.target.value)}
-                />
+      {/* ----- local-first searchable member roster (Access v3) ----- */}
+      <div className={cn("flex min-h-0 flex-1 flex-col gap-[11px]", showForms && "hidden")}>
+        <div className="flex flex-none items-center gap-[9px]">
+          <div className="flex h-[34px] max-w-[340px] flex-1 items-center gap-[9px] rounded-xl border border-border bg-card px-3">
+            <Search className="h-[17px] w-[17px] shrink-0 text-muted-foreground" />
+            <input
+              value={rosterQInput}
+              onChange={(e) => setRosterQInput(e.target.value)}
+              placeholder="Nom, e-mail, téléphone, carte…"
+              className="min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
+            />
+          </div>
+          <div className="flex gap-[5px]">
+            {([
+              ["all", "Tous", rosterCounts.all],
+              ["active", "Actifs", rosterCounts.active],
+              ["expired", "Expirés", rosterCounts.expired],
+              ["pending", "En attente", rosterCounts.pending],
+            ] as const).map(([key, label, count]) => (
+              <button
+                key={key}
+                onClick={() => { setRosterPage(0); setRosterStatus(key as any); }}
+                className={cn(
+                  "inline-flex h-7 items-center whitespace-nowrap rounded-full px-[11px] text-[12px] transition-colors",
+                  rosterStatus === key
+                    ? "bg-foreground font-bold text-background"
+                    : "border border-border bg-card font-semibold text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {label} {count ?? 0}
+              </button>
+            ))}
+          </div>
+          {rosterLoading ? <Clock3 className="h-4 w-4 animate-pulse text-muted-foreground" /> : null}
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className={cn(ROSTER_GRID, "flex-none border-b border-border px-6 py-[11px]")}>
+            <span className={LB}>Nom complet</span>
+            <span className={LB}>Téléphone</span>
+            <span className={LB}>Abonnement</span>
+            <span className={LB}>Fin</span>
+            <span className={LB}>Statut</span>
+            <span className={cn(LB, "text-right")}>Actions</span>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {roster.length === 0 ? (
+              <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-2 text-center">
+                <UsersIcon className="h-8 w-8 text-muted-foreground/40" />
+                <p className="text-[13px] font-semibold text-foreground">Aucun membre ne correspond</p>
+                <p className="max-w-[340px] text-[11.5px] text-muted-foreground">
+                  Ajustez la recherche ou le filtre, ou synchronisez pour charger le répertoire.
+                </p>
               </div>
-              <Select value={rosterStatus} onValueChange={(v) => { setRosterPage(0); setRosterStatus(v as any); }}>
-                <SelectTrigger className="w-[150px]"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All ({rosterCounts.all ?? 0})</SelectItem>
-                  <SelectItem value="active">Active ({rosterCounts.active ?? 0})</SelectItem>
-                  <SelectItem value="expired">Expired ({rosterCounts.expired ?? 0})</SelectItem>
-                  <SelectItem value="pending">Offline pending ({rosterCounts.pending ?? 0})</SelectItem>
-                </SelectContent>
-              </Select>
-              {rosterLoading ? <Clock3 className="h-4 w-4 animate-pulse text-muted-foreground" /> : null}
+            ) : roster.map((m) => {
+              const flag = m.hasConflict ? "conflit"
+                : m.offlinePending ? "créé hors ligne"
+                : m.pendingDelete ? "suppression…"
+                : (m.pendingMutations?.length ?? 0) > 0 ? "sync en attente"
+                : null;
+              const flagTone = m.hasConflict ? "no" : m.offlinePending || m.pendingDelete ? "wn" : "flat";
+              const st = statusBadge(m.status);
+              return (
+                <div
+                  key={`${m.userId}-${m.activeMembershipId || "na"}`}
+                  className={cn(
+                    ROSTER_GRID,
+                    "border-b border-border/60 px-6 py-[9px] last:border-b-0",
+                    m.hasConflict && "bg-primary/[0.035]",
+                  )}
+                >
+                  <div className="flex min-w-0 items-center gap-[11px]">
+                    <span className={cn(
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-[18px] text-[12px] font-bold",
+                      m.hasConflict ? "bg-primary/[0.09] text-primary"
+                        : m.offlinePending ? "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400"
+                        : "bg-muted text-muted-foreground",
+                    )}>
+                      {initialsOf(m.fullName)}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-[7px]">
+                        <span className="truncate text-[13.5px] font-semibold text-foreground">{m.fullName || "—"}</span>
+                        {flag ? <RosterChip tone={flagTone as any}>{flag}</RosterChip> : null}
+                      </div>
+                      <div className="truncate text-[11px] text-muted-foreground">{m.email || m.accountUsernameId || ""}</div>
+                    </div>
+                  </div>
+
+                  <span className="truncate font-mono text-[12px] text-muted-foreground">{m.phone || "—"}</span>
+                  <span className="truncate text-[12px] text-muted-foreground">{m.membershipTitle || (m.membershipId ?? "—")}</span>
+                  <span className="truncate font-mono text-[12px] text-muted-foreground">
+                    {n(m.validTo) ? String(m.validTo).slice(0, 10) : "—"}
+                  </span>
+                  <span>
+                    <RosterChip tone={st === "success" ? "ok" : st === "destructive" ? "no" : st === "warning" ? "wn" : "flat"}>
+                      {m.status || "—"}
+                    </RosterChip>
+                  </span>
+
+                  <div className="flex items-center justify-end gap-[5px]">
+                    {!m.offlinePending && Number(m.activeMembershipId) > 0 ? (
+                      <>
+                        <IconAction title="Modifier l'abonnement" disabled={mutBusy} onClick={() => openEdit(m)}><Pencil className="h-3.5 w-3.5" /></IconAction>
+                        <IconAction title="Geler l'abonnement" disabled={mutBusy} onClick={() => setFreezeTarget(m)}><Snowflake className="h-3.5 w-3.5" /></IconAction>
+                        <IconAction title="Supprimer l'abonnement" disabled={mutBusy} onClick={() => setDeleteTarget(m)}><Trash2 className="h-3.5 w-3.5" /></IconAction>
+                      </>
+                    ) : null}
+                    <IconAction title="Ajouter / remplacer la photo" disabled={photoBusy} onClick={() => pickPhoto(m)}><ImagePlus className="h-3.5 w-3.5" /></IconAction>
+                    <IconAction title="Enrôler une empreinte" onClick={() => setEnrollMember(m)}><Fingerprint className="h-3.5 w-3.5" /></IconAction>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-none items-center justify-between border-t border-border px-6 py-2.5">
+            <span className="text-[11.5px] text-muted-foreground">
+              {rosterTotal} membre{rosterTotal > 1 ? "s" : ""} · page {rosterPage + 1} / {rosterTotalPages}
+            </span>
+            <div className="flex gap-1.5">
+              <Button
+                variant="outline"
+                className="h-[26px] gap-1 rounded-[14px] px-2.5 text-[11.5px] font-semibold"
+                disabled={rosterPage <= 0}
+                onClick={() => setRosterPage((p) => Math.max(0, p - 1))}
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />Précédent
+              </Button>
+              <Button
+                variant="outline"
+                className="h-[26px] gap-1 rounded-[14px] px-2.5 text-[11.5px] font-semibold"
+                disabled={rosterPage + 1 >= rosterTotalPages}
+                onClick={() => setRosterPage((p) => p + 1)}
+              >
+                Suivant<ChevronRight className="h-3.5 w-3.5" />
+              </Button>
             </div>
           </div>
-        </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Full name</TableHead>
-                <TableHead>Username</TableHead>
-                <TableHead>Phone</TableHead>
-                <TableHead>Membership</TableHead>
-                <TableHead>Valid to</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="text-right">Actions</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {roster.length === 0 ? (
-                <TableRow><TableCell colSpan={7} className="h-20 text-center text-muted-foreground">No members match.</TableCell></TableRow>
-              ) : roster.map((m) => (
-                <TableRow key={`${m.userId}-${m.activeMembershipId || "na"}`}>
-                  <TableCell>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span>{m.fullName || "-"}</span>
-                      {m.offlinePending ? <Badge variant="warning">offline pending</Badge> : null}
-                      {m.hasConflict ? <Badge variant="destructive">conflict</Badge>
-                        : m.pendingDelete ? <Badge variant="warning">deleting…</Badge>
-                        : (m.pendingMutations?.length ?? 0) > 0 ? <Badge variant="secondary">pending sync</Badge> : null}
-                    </div>
-                    <div className="text-xs text-muted-foreground">{m.email || ""}</div>
-                  </TableCell>
-                  <TableCell className="text-xs">{m.accountUsernameId || "-"}</TableCell>
-                  <TableCell className="text-xs">{m.phone || "-"}</TableCell>
-                  <TableCell className="text-xs">{m.membershipTitle || (m.membershipId ?? "-")}</TableCell>
-                  <TableCell className="text-xs">{n(m.validTo) ? String(m.validTo).slice(0, 10) : "-"}</TableCell>
-                  <TableCell><Badge variant={statusBadge(m.status)}>{m.status || "-"}</Badge></TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1 flex-wrap">
-                      {!m.offlinePending && Number(m.activeMembershipId) > 0 ? (
-                        <>
-                          <Button size="sm" variant="outline" disabled={mutBusy} onClick={() => openEdit(m)} title="Edit membership"><Pencil className="h-3.5 w-3.5" /></Button>
-                          <Button size="sm" variant="outline" disabled={mutBusy} onClick={() => setFreezeTarget(m)} title="Freeze membership"><Snowflake className="h-3.5 w-3.5" /></Button>
-                          <Button size="sm" variant="outline" disabled={mutBusy} onClick={() => setDeleteTarget(m)} title="Delete membership"><Trash2 className="h-3.5 w-3.5" /></Button>
-                        </>
-                      ) : null}
-                      <Button size="sm" variant="outline" disabled={photoBusy} onClick={() => pickPhoto(m)} title="Add / replace member photo"><ImagePlus className="h-3.5 w-3.5" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => setEnrollMember(m)} title="Enroll fingerprint"><Fingerprint className="h-3.5 w-3.5" /></Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <div className="flex items-center justify-between pt-2 text-xs text-muted-foreground">
-            <span>{rosterTotal} member(s) · page {rosterPage + 1} / {rosterTotalPages}</span>
-            <div className="flex items-center gap-1">
-              <Button size="sm" variant="outline" disabled={rosterPage <= 0} onClick={() => setRosterPage((p) => Math.max(0, p - 1))}>
-                <ChevronLeft className="h-3.5 w-3.5" /> Prev
-              </Button>
-              <Button size="sm" variant="outline" disabled={rosterPage + 1 >= rosterTotalPages} onClick={() => setRosterPage((p) => p + 1)}>
-                Next <ChevronRight className="h-3.5 w-3.5" />
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
 
       <AlertDialog open={decisionOpen} onOpenChange={setDecisionOpen}>
-        <AlertDialogContent>
+        <AlertDialogContent className="rounded-3xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Creation failed</AlertDialogTitle>
+            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Creation failed</AlertDialogTitle>
             <AlertDialogDescription className="space-y-2">
               {conflictHint ? <p className="font-medium text-foreground">{conflictHint}</p> : null}
               <p>{decision?.attempt.error || "Unknown error"}</p>
@@ -1324,7 +1474,7 @@ export default function UsersPage() {
       </AlertDialog>
 
       {/* ----- lifecycle changes queue ----- */}
-      <Card>
+      <Card className={cn(!showForms && "hidden")}>
         <CardHeader>
           <div className="flex items-center justify-between gap-2 flex-wrap">
             <CardTitle className="text-sm">Lifecycle changes queue</CardTitle>
@@ -1376,12 +1526,139 @@ export default function UsersPage() {
           </Table>
         </CardContent>
       </Card>
+      </div>
+
+      {/* ── Le rail ───────────────────────────────────────────────────────
+          Everything below is derived from flags the backend already sets on
+          each roster row — no state is inferred or invented here. */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className={cn(
+            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
+            attentionCount > 0 ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
+          )}>
+            <AlertCircle className="h-3 w-3" />À traiter
+          </span>
+          {attentionCount > 0 && (
+            <span className="text-[11.5px] text-muted-foreground">
+              {attentionCount} fiche{attentionCount > 1 ? "s" : ""}
+            </span>
+          )}
+        </div>
+
+        {attentionCount > 0 ? (
+          <div className={cn(
+            "flex-none rounded-3xl bg-card px-5 py-[17px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]",
+            railFacts.conflicts.length > 0 && "border-[1.5px] border-primary/30",
+          )}>
+            {railFacts.conflicts.length > 0 && (
+              <>
+                <div className="mb-[11px] flex items-center gap-3">
+                  <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-primary/[0.09] text-primary">
+                    <GitMerge className="h-5 w-5" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] font-bold text-foreground">
+                      {railFacts.conflicts.length} conflit{railFacts.conflicts.length > 1 ? "s" : ""} à arbitrer
+                    </div>
+                    <div className="mt-0.5 truncate text-[11px] leading-[1.45] text-muted-foreground">
+                      {firstNames(railFacts.conflicts)} — modifié hors ligne <b className="text-foreground">et</b> sur le serveur
+                    </div>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  className="h-8 w-full justify-center gap-1.5 rounded-[14px] border-[1.5px] border-primary/45 text-[12px] font-semibold text-primary hover:bg-primary/5"
+                  onClick={() => setShowForms(true)}
+                >
+                  <GitMerge className="h-[15px] w-[15px] " />Ouvrir la file d'attente
+                </Button>
+              </>
+            )}
+
+            {railFacts.conflicts.length > 0 && (railFacts.offlineNew.length > 0 || railFacts.syncing.length > 0 || railFacts.deleting.length > 0) && (
+              <div className="my-3.5 h-px bg-border" />
+            )}
+
+            {(railFacts.offlineNew.length > 0 || railFacts.syncing.length > 0 || railFacts.deleting.length > 0) && (
+              <>
+                <div className="mb-[11px] flex items-center gap-3">
+                  <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-amber-500/[0.14] text-amber-700 dark:text-amber-400">
+                    <CloudUpload className="h-5 w-5" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13.5px] font-bold text-foreground">
+                      {railFacts.offlineNew.length + railFacts.syncing.length + railFacts.deleting.length} en attente de synchro
+                    </div>
+                    <div className="mt-0.5 truncate text-[11px] leading-[1.45] text-muted-foreground">
+                      {railFacts.offlineNew.length > 0 && `${firstNames(railFacts.offlineNew)} — créés hors ligne`}
+                      {railFacts.offlineNew.length > 0 && railFacts.syncing.length > 0 && " · "}
+                      {railFacts.syncing.length > 0 && `${railFacts.syncing.length} modification${railFacts.syncing.length > 1 ? "s" : ""}`}
+                      {railFacts.deleting.length > 0 && ` · ${railFacts.deleting.length} suppression${railFacts.deleting.length > 1 ? "s" : ""}`}
+                    </div>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
+                  onClick={() => runAction(() => post("/offline-creations/process-due", {}), "Manual retry executed.")}
+                >
+                  <RefreshCw className="h-[15px] w-[15px]" />Envoyer maintenant
+                </Button>
+              </>
+            )}
+          </div>
+        ) : (
+          <div className="flex-none rounded-3xl bg-card px-5 py-[17px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+            <div className="flex items-center gap-3">
+              <span className="flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
+                <CheckCircle2 className="h-5 w-5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-[13.5px] font-bold text-foreground">Rien à traiter</div>
+                <div className="mt-0.5 text-[11px] leading-[1.45] text-muted-foreground">
+                  Aucun conflit ni fiche en attente sur cette page.
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <UsersIcon className="h-3 w-3" />L'effectif
+          </span>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col gap-[11px] overflow-y-auto rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="mb-0.5 flex items-baseline gap-2.5">
+            <span className="num text-[30px] leading-none">{rosterCounts.all ?? 0}</span>
+            <span className="text-[13px] text-muted-foreground">membre{(rosterCounts.all ?? 0) > 1 ? "s" : ""}</span>
+          </div>
+          <div className="h-px bg-border" />
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Actifs</span>
+            <span className="text-[12.5px] font-bold text-emerald-700 dark:text-emerald-400">{rosterCounts.active ?? 0}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Expirés</span>
+            <span className="text-[12.5px] font-bold text-primary">{rosterCounts.expired ?? 0}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">En attente</span>
+            <span className="text-[12.5px] font-bold text-amber-700 dark:text-amber-400">{rosterCounts.pending ?? 0}</span>
+          </div>
+          <p className="mt-auto pt-2 text-[10.5px] leading-[1.5] text-muted-foreground">
+            Les indicateurs « à traiter » portent sur la page affichée ({roster.length} fiche
+            {roster.length > 1 ? "s" : ""}) ; les totaux ci-dessus portent sur tout le répertoire.
+          </p>
+        </div>
+      </div>
 
       {/* ----- edit membership dialog ----- */}
       <AlertDialog open={!!editTarget} onOpenChange={(o) => { if (!o) setEditTarget(null); }}>
-        <AlertDialogContent>
+        <AlertDialogContent className="rounded-3xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Edit membership — {editTarget?.fullName}</AlertDialogTitle>
+            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Edit membership — {editTarget?.fullName}</AlertDialogTitle>
             <AlertDialogDescription>Applies online if connected, otherwise queues and syncs automatically.</AlertDialogDescription>
           </AlertDialogHeader>
           <div className="space-y-2">
@@ -1416,9 +1693,9 @@ export default function UsersPage() {
 
       {/* ----- freeze membership dialog ----- */}
       <AlertDialog open={!!freezeTarget} onOpenChange={(o) => { if (!o) setFreezeTarget(null); }}>
-        <AlertDialogContent>
+        <AlertDialogContent className="rounded-3xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Freeze membership — {freezeTarget?.fullName}</AlertDialogTitle>
+            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Freeze membership — {freezeTarget?.fullName}</AlertDialogTitle>
             <AlertDialogDescription>Pauses the membership for the given duration.</AlertDialogDescription>
           </AlertDialogHeader>
           <div className="space-y-2">
@@ -1438,9 +1715,9 @@ export default function UsersPage() {
 
       {/* ----- delete membership confirm ----- */}
       <AlertDialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}>
-        <AlertDialogContent>
+        <AlertDialogContent className="rounded-3xl">
           <AlertDialogHeader>
-            <AlertDialogTitle>Delete membership — {deleteTarget?.fullName}?</AlertDialogTitle>
+            <AlertDialogTitle className="font-display text-[18px] font-extrabold tracking-[-0.02em]">Delete membership — {deleteTarget?.fullName}?</AlertDialogTitle>
             <AlertDialogDescription>
               This removes the membership and drops the member's card from the turnstiles. Applies online if connected, otherwise queues and syncs automatically.
             </AlertDialogDescription>

@@ -378,6 +378,11 @@ def _popup_payload_from_request(req: NotificationRequest) -> Dict[str, Any]:
         "imageSource": req.image_source,
         "userImageStatus": req.user_image_status,
         "userProfileImage": req.user_profile_image,
+        # Frequent-pass visual alert (0 / "" when not triggered).
+        "repeatCount": req.repeat_count,
+        "repeatLimit": req.repeat_limit,
+        "repeatWindowMin": req.repeat_window_min,
+        "previousEntryAt": req.previous_entry_at,
     }
 
 

@@ -1,4 +1,4 @@
-// Multi-lane TV popup for the gym entry display — MÉRIDIEN design.
+// Multi-lane TV popup for the gym entry display — "Écran d'entrée", direction A.
 //
 // Renders up to N concurrent member cards (default 3, configurable from
 // backend via /status → popup.lanes). Each lane lives for its full
@@ -9,17 +9,17 @@
 // upstream by the access_history INSERT-OR-IGNORE constraint, so this UI
 // trusts the backend stream.
 //
-// The presentation layer is the MÉRIDIEN "Borne d'accueil" design: one
-// screen-level component (MeridienScreen) that shows an idle standby, a
-// single hero card (1 scan), or a "simultaneous scans" wall (2-3 scans).
+// The presentation layer is the "Écran d'entrée — direction A" design: one
+// screen-level component (EntryScreen) that shows an idle standby, a single
+// full-field verdict (1 scan), or a wall of verdict fields (2+ scans).
 // All data/lifecycle plumbing below the SOURCE banner is unchanged.
 
-import { useState, useEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties, type ReactNode } from "react";
 import { getApiBaseUrl, openSSE, get } from "@/api/client";
 import type { PopupEvent } from "@/api/types";
 import { LOCAL_API_PREFIX } from "@/config/appConst";
 import { buildPopupImageCandidates, toPopupCachedImageUrl } from "@/lib/popupImages";
-// Self-hosted Hanken Grotesk (the MÉRIDIEN display font) — bundled by Vite so the
+// Self-hosted Hanken Grotesk (the entry screen's display face) — bundled by Vite so the
 // gym TVs render correctly offline, no Google Fonts request at runtime.
 import "@fontsource/hanken-grotesk/400.css";
 import "@fontsource/hanken-grotesk/500.css";
@@ -33,6 +33,13 @@ const MAX_LANES = 5;
 const DEFAULT_DURATION_SEC = 5; // TV-friendly default; backend overrides
 const MIN_DURATION_MS = 2500;
 const FADE_OUT_MS = 350;
+
+// Direction A draws the refusal states in full (section 01 of the design calls
+// "Autorisé · Refusé" the two states that are 99% of the day, and rules 1 and 5
+// are both about the refusal). The popup wall nevertheless still shows GRANTED
+// entries for identified members only — unchanged behaviour. Flip this to true
+// to actually surface refusals on the entry screen; nothing else needs editing.
+const SHOW_DENIED_ENTRIES = false;
 
 // ── Types ─────────────────────────────────────────────────────────────────
 interface ActiveLane {
@@ -76,6 +83,12 @@ function toPopupEvent(raw: any): PopupEvent {
     imageSource: raw?.imageSource ? String(raw.imageSource) : undefined,
     userImageStatus: raw?.userImageStatus ? String(raw.userImageStatus) : undefined,
     userProfileImage: String(raw?.userProfileImage ?? ""),
+    // Frequent-pass VISUAL alert. Absent/0 on every normal scan, which keeps the
+    // screen on its usual granted layout.
+    repeatCount: Number(raw?.repeatCount ?? 0) || 0,
+    repeatLimit: Number(raw?.repeatLimit ?? 0) || 0,
+    repeatWindowMin: Number(raw?.repeatWindowMin ?? 0) || 0,
+    previousEntryAt: raw?.previousEntryAt ? String(raw.previousEntryAt) : undefined,
   };
 }
 
@@ -84,72 +97,119 @@ function laneIdFor(eventId: string): string {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   ▼▼▼ MÉRIDIEN design — ported from the Claude Design "Borne d'accueil" export.
-   Pure presentation: takes the active lanes and renders idle / single / multi.
+   ▼▼▼ ÉCRAN D'ENTRÉE — DIRECTION A
+   Ported from the Claude Design export `Ecran d'entree - A.dc.html`.
+
+   The rule of the direction: THE VERDICT IS THE SCREEN. A turnstile has a
+   green light or a red one — not a label. So the whole field is green / red /
+   gold / dark, never a badge floating on neutral. Its five rules, which the
+   code below follows literally:
+     1. the background carries the decision;
+     2. hierarchy comes from solid colours, never from opacity (on a saturated
+        field, lowering opacity drags text toward the background and kills it);
+     3. the first name first, enormous — the only word that matters to the member;
+     4. the photo is a verification, not the subject — a white-ringed medallion;
+     5. a refusal always says what to do (the technical code becomes a sentence
+        followed by an action).
+
+   The design is drawn on a fixed 1280×720 frame and deploys at 1920×1080 —
+   same ratio — so it renders on a 1280×720 stage scaled uniformly to whatever
+   size the popup window happens to be. Every measurement below is therefore
+   the design's own pixel value, unmodified.
+
+   Glyphs are inline SVG rather than the design's Material Symbols web font:
+   this window is deliberately offline-safe (Hanken Grotesk is self-hosted via
+   @fontsource) and must not acquire a Google Fonts dependency.
    ════════════════════════════════════════════════════════════════════════ */
 
-// Parse an inline CSS string into a React style object (keeps the design's
-// exact inline styles verbatim, incl. custom props like --accent).
-function css(s: string): CSSProperties {
-  const o: Record<string, string> = {};
-  for (const decl of String(s).split(";")) {
-    const d = decl.trim();
-    if (!d) continue;
-    const i = d.indexOf(":");
-    if (i < 0) continue;
-    const prop = d.slice(0, i).trim();
-    const val = d.slice(i + 1).trim();
-    if (prop.indexOf("--") === 0) { o[prop] = val; continue; }
-    o[prop.replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase())] = val;
-  }
-  return o as CSSProperties;
-}
+const STAGE_W = 1280;
+const STAGE_H = 720;
 
-const M_GREEN = "oklch(0.82 0.18 142)";
-const M_RED = "oklch(0.62 0.21 25)";
-const M_GOLD = "oklch(0.82 0.14 85)";
-const M_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-const M_MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const M_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+// Design-system tokens. The design rebases the old oklch accents onto the real
+// tokens so this screen belongs to the rest of the product.
+const A_GREEN = "#10B981";
+const A_GREEN_INK = "#0A2E22";
+const A_GREEN_DOT = "#114A38";
+const A_RED = "#E2203F";
+const A_RED_SUB = "#FFD9DF";
+// --wigo-orange. The design uses it for "deuxieme passage" instead of red on
+// purpose: red means "you are not a member", and treating a paid-up member like
+// an expired one is a mistake of tone. Orange says "a verifier", not "refuse".
+const A_ORANGE = "#E24A24";
+const A_ORANGE_SUB = "#FFD9CF";
+const A_ORANGE_INK_DEEP = "#A8320F";
+const A_GOLD = "#E7BB4E";
+const A_GOLD_INK = "#3A2A05";
+const A_GOLD_INK_SOFT = "#5A4108";
+const A_DARK = "#181818";
+const A_DARK_SUB = "#C9CED2";
+const A_DARK_FAINT = "#4A5056";
 
-type ScanCategory = "standard" | "staff" | "kids";
+const A_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+const A_DAYS = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
+
+type ScanCategory = "standard" | "staff" | "kids" | "coach" | "vip";
+
+/** Wire members_type (backend MembersType enum) -> popup badge category. */
+const A_MEMBERS_TYPE_CAT: Record<string, ScanCategory> = {
+  STAFF: "staff",
+  KIDS: "kids",
+  COACH: "coach",
+  VIP: "vip",
+};
+
+/** Badge wording. "standard" never renders a badge. */
+const A_CATEGORY_LABEL: Record<ScanCategory, string> = {
+  standard: "",
+  staff: "Équipe",
+  kids: "Kids Club",
+  coach: "Coach",
+  vip: "VIP",
+};
+
 type ScanMethod = "card" | "qr" | "fingerprint";
+type GlyphName = "check" | "cancel" | "cake" | "sparkle" | "schedule" | "card" | "qr" | "fingerprint" | "history";
 
-interface MeridienScan {
+interface EntryScan {
   laneId: string;
-  name: string;
+  fullName: string;
+  firstName: string;
+  lastName: string;
   imgUrl: string | null;
   granted: boolean;
-  denyReason: string;
+  reason: string;
   plan: string | null;
   memberNo: string | null;
   category: ScanCategory;
-  validFrom: Date | null;
   validTo: Date | null;
   birthday: Date | null;
   device: string;
   method: ScanMethod;
+  at: Date;
+  // Frequent-pass VISUAL alert, set by the engine only when it fired. 0 = inert.
+  repeatCount: number;
+  repeatLimit: number;
+  repeatWindowMin: number;
+  previousEntryAt: Date | null;
 }
 
-function mSameDay(a: Date, b: Date): boolean { return a.getDate() === b.getDate() && a.getMonth() === b.getMonth(); }
-function mClock(d: Date): string { return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); }
-function mLongDate(d: Date): string { return M_DAYS[d.getDay()] + " " + d.getDate() + " " + M_MONTHS[d.getMonth()] + " " + d.getFullYear(); }
-function mShortDate(d: Date): string { return d.getDate() + " " + M_MONTHS_SHORT[d.getMonth()] + " " + d.getFullYear(); }
-function mMonthYear(d: Date): string { return M_MONTHS_SHORT[d.getMonth()] + " " + d.getFullYear(); }
-function mMethodLabel(m: ScanMethod): string { return m === "qr" ? "QR Code" : (m === "fingerprint" ? "Fingerprint" : "Card"); }
-function mPlanLabel(scan: MeridienScan): string { return scan.plan || (scan.memberNo ? ("No. " + scan.memberNo) : "Member"); }
-function mInitials(name: string): string {
+// ── Formatting ──────────────────────────────────────────────────────────────
+function aPad2(n: number): string { return n < 10 ? "0" + n : String(n); }
+function aClock(d: Date): string { return aPad2(d.getHours()) + ":" + aPad2(d.getMinutes()); }
+function aDayNum(d: Date): string { return d.getDate() === 1 ? "1er" : String(d.getDate()); }
+function aLongDate(d: Date): string { return A_DAYS[d.getDay()] + " " + aDayNum(d) + " " + A_MONTHS[d.getMonth()]; }
+function aFullDate(d: Date): string { return aDayNum(d) + " " + A_MONTHS[d.getMonth()] + " " + d.getFullYear(); }
+function aSameDay(a: Date, b: Date): boolean { return a.getDate() === b.getDate() && a.getMonth() === b.getMonth(); }
+function aMethodLabel(m: ScanMethod): string { return m === "qr" ? "QR Code" : (m === "fingerprint" ? "Empreinte" : "Carte"); }
+function aPlural(n: number, one: string, many: string): string { return n > 1 ? many : one; }
+function aInitials(name: string): string {
   const p = (name || "").trim().split(/\s+/).filter(Boolean);
   if (!p.length) return "—";
   const a = p[0][0] || "";
   const b = p.length > 1 ? p[p.length - 1][0] : "";
   return (a + b).toUpperCase();
 }
-function mAccent(scan: MeridienScan, now: Date): string {
-  const bd = !!(scan.birthday && mSameDay(scan.birthday, now));
-  return scan.granted ? (bd ? M_GOLD : M_GREEN) : M_RED;
-}
-function mParseDate(s: string | undefined | null): Date | null {
+function aParseDate(s: string | undefined | null): Date | null {
   if (!s) return null;
   const p = String(s).slice(0, 10).split("-");
   if (p.length < 3) return null;
@@ -157,271 +217,502 @@ function mParseDate(s: string | undefined | null): Date | null {
   if (!y || !mo || !da) return null;
   return new Date(y, mo - 1, da);
 }
+// Age only when the stored birth year is plausible — placeholder years (1900,
+// 1970) would otherwise render an absurd "126 ans aujourd'hui".
+function aAgeToday(bd: Date | null, now: Date): number | null {
+  if (!bd) return null;
+  let age = now.getFullYear() - bd.getFullYear();
+  const dm = now.getMonth() - bd.getMonth();
+  if (dm < 0 || (dm === 0 && now.getDate() < bd.getDate())) age -= 1;
+  return age >= 3 && age <= 100 ? age : null;
+}
+function aDaysLeft(validTo: Date | null, now: Date): number | null {
+  if (!validTo) return null;
+  // validTo is a date at local midnight; the membership is good through that day.
+  const end = new Date(validTo.getFullYear(), validTo.getMonth(), validTo.getDate(), 23, 59, 59);
+  return Math.ceil((end.getTime() - now.getTime()) / 86400000);
+}
 
 // Real scanMode values from the access engine look like "RFID_CARD" / "QR_TOTP" /
 // "RFID_DIRECT" / "RFID_ONLY" — NOT "QR"/"FP". Classify the same way the backend's
 // _credential_type_from_raw does (QR/TOTP → QR, FP/FINGER/BIO → fingerprint, else card).
-function mMethodFor(scanMode: string | undefined): ScanMethod {
+function aMethodFor(scanMode: string | undefined): ScanMethod {
   const sm = String(scanMode || "").toUpperCase();
   if (sm.includes("QR") || sm.includes("TOTP")) return "qr";
   if (sm.includes("FP") || sm.includes("FINGER") || sm.includes("BIO")) return "fingerprint";
   return "card";
 }
 
-function mapLaneToScan(lane: ActiveLane): MeridienScan {
+function aSplitName(full: string): { first: string; last: string } {
+  const parts = String(full || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return { first: "Membre", last: "" };
+  if (parts.length === 1) return { first: parts[0], last: "" };
+  return { first: parts[0], last: parts.slice(1).join(" ") };
+}
+
+function mapLaneToScan(lane: ActiveLane): EntryScan {
   const e = lane.event;
   const title = e.userMembershipTitle && String(e.userMembershipTitle).trim() ? String(e.userMembershipTitle) : null;
-  const cat: ScanCategory = e.userMembersType === "STAFF" ? "staff" : (e.userMembersType === "KIDS" ? "kids" : "standard");
+  const cat: ScanCategory = A_MEMBERS_TYPE_CAT[String(e.userMembersType || "").toUpperCase()] ?? "standard";
+  const full = e.userFullName || "Membre";
+  const { first, last } = aSplitName(full);
   return {
     laneId: lane.laneId,
-    name: e.userFullName || "Member",
+    fullName: full,
+    firstName: first,
+    lastName: last,
     imgUrl: lane.imgUrl,
     granted: !!e.allowed,
-    denyReason: e.reason || "Access denied",
+    reason: e.reason || "",
     plan: title,
-    memberNo: (!title && e.userMembershipId != null) ? String(e.userMembershipId) : null,
+    memberNo: e.userMembershipId != null ? String(e.userMembershipId) : null,
     category: cat,
-    validFrom: mParseDate(e.userValidFrom),
-    validTo: mParseDate(e.userValidTo),
-    birthday: e.userBirthday ? mParseDate(e.userBirthday) : null,
-    device: e.deviceName || "Turnstile",
-    method: mMethodFor(e.scanMode),
+    validTo: aParseDate(e.userValidTo),
+    birthday: e.userBirthday ? aParseDate(e.userBirthday) : null,
+    device: e.deviceName || "Entrée",
+    method: aMethodFor(e.scanMode),
+    at: new Date(lane.arrivedAt),
+    repeatCount: Number(e.repeatCount ?? 0) || 0,
+    repeatLimit: Number(e.repeatLimit ?? 0) || 0,
+    repeatWindowMin: Number(e.repeatWindowMin ?? 0) || 0,
+    previousEntryAt: aParseDateTime(e.previousEntryAt),
   };
 }
 
-// ── icon glyphs ─────────────────────────────────────────────────────────────
-function MMark({ granted, color, size }: { granted: boolean; color: string; size: number }) {
-  if (granted) {
-    return <span style={{ display: "block", width: Math.round(size * 0.5) + "px", height: size + "px", borderRight: "3px solid " + color, borderBottom: "3px solid " + color, transform: "rotate(45deg)", marginTop: -Math.round(size * 0.18) + "px", boxSizing: "border-box" }} />;
-  }
-  return (
-    <span style={{ position: "relative", width: size + "px", height: size + "px", display: "block" }}>
-      <span style={{ position: "absolute", top: "50%", left: 0, right: 0, height: "3px", marginTop: "-1.5px", background: color, borderRadius: "2px", transform: "rotate(45deg)" }} />
-      <span style={{ position: "absolute", top: "50%", left: 0, right: 0, height: "3px", marginTop: "-1.5px", background: color, borderRadius: "2px", transform: "rotate(-45deg)" }} />
-    </span>
-  );
-}
-function MDisc({ granted, accent }: { granted: boolean; accent: string }) {
-  return (
-    <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", flex: "0 0 auto", width: "clamp(44px,3.4vw,64px)", height: "clamp(44px,3.4vw,64px)", borderRadius: "50%", background: accent }}>
-      <MMark granted={granted} color="#070809" size={22} />
-    </span>
-  );
-}
-function MMethodIcon({ m }: { m: ScanMethod }) {
-  const wrapStyle: CSSProperties = { display: "inline-flex", alignItems: "center", justifyContent: "center", width: "1.05em", height: "1.05em", color: "currentColor" };
-  if (m === "qr") {
-    const cells = [1, 1, 0, 1, 0, 1, 0, 1, 1];
-    return (
-      <span style={wrapStyle}>
-        <span style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gridTemplateRows: "repeat(3,1fr)", gap: "1.5px", width: "1em", height: "1em" }}>
-          {cells.map((v, i) => <span key={i} style={{ background: v ? "currentColor" : "transparent", borderRadius: ".5px" }} />)}
-        </span>
-      </span>
-    );
-  }
-  if (m === "fingerprint") {
-    return (
-      <span style={wrapStyle}>
-        <span style={{ position: "relative", width: "1em", height: "1em", display: "block" }}>
-          <span style={{ position: "absolute", inset: 0, borderRadius: "50%", border: "1.5px solid currentColor" }} />
-          <span style={{ position: "absolute", inset: "26%", borderRadius: "50%", border: "1.5px solid currentColor" }} />
-          <span style={{ position: "absolute", inset: "44%", borderRadius: "50%", background: "currentColor" }} />
-        </span>
-      </span>
-    );
-  }
-  return (
-    <span style={wrapStyle}>
-      <span style={{ position: "relative", display: "block", width: "1.05em", height: ".72em", border: "1.5px solid currentColor", borderRadius: "3px" }}>
-        <span style={{ position: "absolute", top: "2px", left: "-1px", right: "-1px", height: "2.5px", background: "currentColor" }} />
-      </span>
-    </span>
-  );
-}
-function MConfetti() {
-  const cols = [M_GOLD, "#f3f4f2", M_GREEN];
-  const arr = [];
-  for (let i = 0; i < 26; i++) {
-    const left = Math.random() * 100;
-    const dur = 4.5 + Math.random() * 3;
-    const delay = -Math.random() * 7;
-    const sz = 5 + Math.random() * 7;
-    const round = Math.random() > 0.5;
-    arr.push(<span key={i} style={{ position: "absolute", top: "-14vh", left: left + "%", width: sz + "px", height: (round ? sz : sz * 0.45) + "px", background: cols[i % cols.length], borderRadius: round ? "50%" : "1px", opacity: 0.8, animation: "confettiFall " + dur + "s linear " + delay + "s infinite" }} />);
-  }
-  return <>{arr}</>;
-}
-function mCategoryStyle(cat: ScanCategory): CSSProperties {
-  const c = cat === "staff" ? "oklch(0.7 0.12 250)" : "oklch(0.78 0.12 195)";
-  return { display: "inline-flex", alignItems: "center", gap: "10px", padding: "11px 20px", borderRadius: "999px", fontFamily: "'Hanken Grotesk',sans-serif", fontWeight: 600, fontSize: "clamp(15px,1.35vw,21px)", color: c, background: "color-mix(in oklch," + c + ",transparent 90%)", border: "1px solid color-mix(in oklch," + c + ",transparent 62%)" };
+/** "YYYY-MM-DD HH:MM:SS" (local wall-clock, no zone) -> Date. */
+function aParseDateTime(s: string | undefined | null): Date | null {
+  const t = String(s || "").trim();
+  if (!t) return null;
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return isNaN(d.getTime()) ? null : d;
 }
 
-// ── Idle standby ────────────────────────────────────────────────────────────
-function MeridienIdle({ gymName, now }: { gymName: string; now: Date }) {
+/** True when the refusal is the pre-existing re-entry block (not a real refusal). */
+function aIsReentryDeny(reason: string): boolean {
+  const r = String(reason || "").trim().toUpperCase();
+  return r === "DENY_ANTI_FRAUD_CARD" || r === "DENY_ANTI_FRAUD_QR";
+}
+
+// ── Rule 5: a refusal always says what to do ────────────────────────────────
+// The engines emit SCREAMING_SNAKE codes (app/core/access_verification.py,
+// realtime_agent.py, ultra_engine.py). Each becomes a sentence plus an action.
+interface DenyCopy { title: string; action: string; short: string }
+const A_DENY_FALLBACK: DenyCopy = {
+  title: "Cet accès n'a pas pu être validé",
+  action: "Présentez-vous à l'accueil — nous réglons ça tout de suite.",
+  short: "Accès refusé",
+};
+const A_DENY: Record<string, DenyCopy> = {
+  DENY_NO_CARD_MATCH: { title: "Cette carte n'est pas reconnue", action: "Présentez-vous à l'accueil — nous la réassocierons en un instant.", short: "Carte non reconnue" },
+  DENY_NO_MATCH: { title: "Ce badge n'est pas reconnu", action: "Présentez-vous à l'accueil — nous le réassocierons en un instant.", short: "Badge non reconnu" },
+  INVALID_CARD_FORMAT: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible" },
+  INVALID_CARD_LENGTH: { title: "Carte illisible", action: "Représentez-la bien à plat sur le lecteur.", short: "Carte illisible" },
+  INVALID_FORMAT: { title: "Lecture illisible", action: "Représentez votre carte ou votre code.", short: "Lecture illisible" },
+  DENY_CARD_COLLISION: { title: "Cette carte est associée à plusieurs comptes", action: "Présentez-vous à l'accueil pour la régulariser.", short: "Carte en double" },
+  DENY_COLLISION: { title: "Ce code correspond à plusieurs comptes", action: "Présentez-vous à l'accueil pour le régulariser.", short: "Code en double" },
+  DENY_EXPIRED: { title: "Ce code QR a expiré", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR expiré" },
+  DENY_TOTP_FAILED: { title: "Ce code QR n'est pas valide", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR invalide" },
+  DENY_AMBIGUOUS_COUNTER: { title: "Ce code QR a déjà été utilisé", action: "Régénérez-le dans l'application MonClub.", short: "Code QR déjà utilisé" },
+  DENY_FUTURE_SKEW: { title: "L'heure de votre téléphone est décalée", action: "Activez l'heure automatique, puis représentez votre code.", short: "Heure du téléphone décalée" },
+  DENY_ANTI_FRAUD_CARD: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre carte.", short: "Passage déjà enregistré" },
+  DENY_ANTI_FRAUD_QR: { title: "Vous venez déjà de passer", action: "Patientez un instant avant de représenter votre code.", short: "Passage déjà enregistré" },
+  DENY_RFID_DISABLED: { title: "Le badge n'est pas activé sur cette entrée", action: "Utilisez votre code QR, ou présentez-vous à l'accueil.", short: "Badge désactivé ici" },
+  DENY_HANDLE_SLOW: { title: "Le tourniquet n'a pas répondu à temps", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
+  DOOR_CMD_FAILED: { title: "Le tourniquet n'a pas répondu", action: "Représentez votre carte — si cela persiste, voyez l'accueil.", short: "Tourniquet sans réponse" },
+};
+function aDenyCopy(raw: string): DenyCopy {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return A_DENY_FALLBACK;
+  const hit = A_DENY[trimmed.toUpperCase()];
+  if (hit) return hit;
+  // Some paths already emit a human sentence rather than a code — show it, but
+  // still append an action so rule 5 holds.
+  if (/\s/.test(trimmed) && trimmed !== trimmed.toUpperCase()) {
+    return { title: trimmed, action: A_DENY_FALLBACK.action, short: trimmed };
+  }
+  return A_DENY_FALLBACK;
+}
+
+// ── The colour field ────────────────────────────────────────────────────────
+interface Field {
+  bg: string;
+  ink: string;       // primary text
+  soft: string;      // secondary text (device name, eyebrow)
+  sub: string;       // surname
+  dot: string;       // footer separator — a SOLID darker tint, never an alpha
+                     // of the ink (rule 2: on a saturated field, opacity drags
+                     // a mark toward the background and kills it)
+  glyph: GlyphName;  // the giant watermark
+  glyphOpacity: number;
+  ring: string;      // photo medallion ring
+  markColor: string; // wordmark colour
+  markOpacity: number;
+}
+function aFieldFor(scan: EntryScan, now: Date): Field {
+  if (!scan.granted && aIsReentryDeny(scan.reason)) {
+    // Re-entry block (anti_fraude_duration). The member IS paid up — the door just
+    // stayed shut because they passed seconds ago. Orange, not red.
+    return { bg: A_ORANGE, ink: "#fff", soft: "#fff", sub: A_ORANGE_SUB, dot: A_ORANGE_SUB, glyph: "history", glyphOpacity: 0.1, ring: "rgba(255,255,255,.5)", markColor: "#fff", markOpacity: 0.6 };
+  }
+  if (!scan.granted) {
+    return { bg: A_RED, ink: "#fff", soft: "#fff", sub: A_RED_SUB, dot: A_RED_SUB, glyph: "cancel", glyphOpacity: 0.1, ring: "rgba(255,255,255,.45)", markColor: "#fff", markOpacity: 0.6 };
+  }
+  if (scan.birthday && aSameDay(scan.birthday, now)) {
+    return { bg: A_GOLD, ink: A_GOLD_INK, soft: A_GOLD_INK_SOFT, sub: A_GOLD_INK_SOFT, dot: A_GOLD_INK, glyph: "cake", glyphOpacity: 0.1, ring: "rgba(255,255,255,.6)", markColor: A_GOLD_INK, markOpacity: 1 };
+  }
+  return { bg: A_GREEN, ink: A_GREEN_INK, soft: A_GREEN_INK, sub: A_GREEN_INK, dot: A_GREEN_DOT, glyph: "check", glyphOpacity: 0.09, ring: "rgba(255,255,255,.55)", markColor: A_GREEN_INK, markOpacity: 1 };
+}
+
+// ── Glyphs (inline SVG — no web-font dependency) ────────────────────────────
+// The filled disc glyphs use fillRule="evenodd" so the mark is a true hole in
+// the disc, exactly as a Material Symbols filled icon knocks out.
+const A_PATHS: Partial<Record<GlyphName, string>> = {
+  check: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-1.4 14.9L5.2 11.5l1.6-1.6 3.8 3.8 6.6-6.6 1.6 1.6z",
+  cancel: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm4.2 4.4L12 10.6 7.8 6.4 6.4 7.8 10.6 12l-4.2 4.2 1.4 1.4L12 13.4l4.2 4.2 1.4-1.4L13.4 12z",
+  cake: "M12 6c1.11 0 2-.9 2-2 0-.38-.1-.73-.29-1.03L12 0l-1.71 2.97c-.19.3-.29.65-.29 1.03 0 1.1.9 2 2 2zm4.6 9.99-1.07-1.07-1.08 1.07c-1.3 1.3-3.58 1.31-4.89 0l-1.07-1.07-1.09 1.07C6.75 16.64 5.88 17 4.96 17c-.73 0-1.4-.23-1.96-.61V21c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-4.61c-.56.38-1.23.61-1.96.61-.92 0-1.79-.36-2.44-1.01zM18 9h-5V7h-2v2H6c-1.66 0-3 1.34-3 3v1.54c0 1.08.88 1.96 1.96 1.96.52 0 1.02-.2 1.38-.57l2.14-2.13 2.13 2.13c.74.74 2.03.74 2.77 0l2.14-2.13 2.13 2.13c.37.37.86.57 1.38.57 1.08 0 1.96-.88 1.96-1.96V12c0-1.66-1.34-3-3-3z",
+  sparkle: "M12 2.2l1.95 6.15 6.15 1.95-6.15 1.95L12 18.4l-1.95-6.15L3.9 10.3l6.15-1.95z",
+  history: "M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 2.05 4.95l-1.42 1.42A9 9 0 1 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8z",
+  schedule: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-.9 4.4h1.8v5.35l4.15 2.47-.9 1.48-5.05-3.02z",
+  card: "M20 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2Zm0 14H4v-6h16zM20 8H4V6h16z",
+};
+
+function AGlyph({ name, size, color, opacity, style }: { name: GlyphName; size: number; color?: string; opacity?: number; style?: CSSProperties }) {
+  const common: CSSProperties = { width: size + "px", height: size + "px", display: "block", flex: "none", color: color || "currentColor", opacity, ...style };
+  if (name === "fingerprint") {
+    return (
+      <svg viewBox="0 0 24 24" style={common} fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" aria-hidden="true">
+        <path d="M6 10.5a6 6 0 0 1 12 0v1.7" />
+        <path d="M9 10.6a3 3 0 0 1 6 0v5.6" />
+        <path d="M12 10.9v7.3" />
+        <path d="M6.2 14.2v-1.1" />
+        <path d="M6.9 18.4c.5-.9.8-1.9.9-2.9" />
+        <path d="M17.4 18.8c.4-.9.6-1.8.6-2.8" />
+      </svg>
+    );
+  }
+  if (name === "qr") {
+    return (
+      <svg viewBox="0 0 24 24" style={common} fill="currentColor" aria-hidden="true">
+        <path fillRule="evenodd" d="M3 3h7.5v7.5H3zm2 2v3.5h3.5V5z" />
+        <path fillRule="evenodd" d="M13.5 3H21v7.5h-7.5zm2 2v3.5H19V5z" />
+        <path fillRule="evenodd" d="M3 13.5h7.5V21H3zm2 2V19h3.5v-3.5z" />
+        <path d="M13.5 13.5h3v3h-3zm4.5 0h3v3h-3zm-4.5 4.5h3v3h-3zm4.5 0h3v3h-3z" />
+      </svg>
+    );
+  }
   return (
-    <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;justify-content:space-between;padding:clamp(48px,5vw,104px);")}>
-      <div style={css("display:flex;justify-content:space-between;align-items:flex-start;gap:24px;")}>
-        <div>
-          <div style={css("font-weight:800;font-size:clamp(28px,2.9vw,52px);letter-spacing:-.01em;line-height:.95;")}>{gymName || "MonClub Access"}</div>
+    <svg viewBox="0 0 24 24" style={common} fill="currentColor" aria-hidden="true">
+      <path fillRule="evenodd" d={A_PATHS[name]} />
+    </svg>
+  );
+}
+
+function AMethodGlyph({ m, size }: { m: ScanMethod; size: number }) {
+  return <AGlyph name={m === "qr" ? "qr" : (m === "fingerprint" ? "fingerprint" : "card")} size={size} />;
+}
+
+// The design ships `assets/monclub-wordmark.png`, but that export is a broken
+// placeholder (two solid red blocks, no lettering), so the mark is set
+// typographically in the screen's own display face. Drop a real wordmark in
+// src/assets/ and swap this component's body to an <img> when one exists.
+function AWordmark({ size, color, opacity }: { size: number; color: string; opacity?: number }) {
+  return (
+    <span style={{ fontFamily: "'Hanken Grotesk',sans-serif", fontWeight: 800, fontSize: size + "px", lineHeight: 1, letterSpacing: "-.045em", color, opacity, display: "block", whiteSpace: "nowrap" }}>monclub</span>
+  );
+}
+
+// ── Rule 4: the photo is a verification, not the subject ────────────────────
+// A white-ringed medallion. The design crops with `cover` at 22% from the top
+// (faces sit high in a portrait); this replaces the previous `contain` fit,
+// which cannot look right inside a circle.
+function APhoto({ scan, field, size, ring, onImageError }: { scan: EntryScan; field: Field; size: number; ring: number; onImageError: (laneId: string) => void }) {
+  return (
+    <div style={{ position: "relative", width: size + "px", height: size + "px", flex: "none", borderRadius: "50%", overflow: "hidden", background: "#101010", boxShadow: "0 0 0 " + ring + "px " + field.ring }}>
+      {scan.imgUrl ? (
+        <img
+          src={scan.imgUrl}
+          alt=""
+          onError={() => onImageError(scan.laneId)}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", objectPosition: "center 22%", filter: scan.granted ? "none" : "grayscale(1) contrast(1.05)" }}
+        />
+      ) : (
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,.92)", fontWeight: 800, fontSize: Math.round(size * 0.34) + "px", letterSpacing: "-.03em" }}>
+          {aInitials(scan.fullName)}
         </div>
-        <div style={css("display:flex;align-items:center;gap:11px;")}>
-          <span style={css("width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 14px var(--accent);animation:pulseDot 2.6s ease-in-out infinite;")} />
-          <span style={css("text-transform:uppercase;letter-spacing:.24em;font-size:clamp(11px,1vw,15px);color:var(--accent);font-weight:700;")}>Open</span>
-        </div>
-      </div>
-      <div style={css("text-align:center;")}>
-        <div style={css("font-weight:700;font-size:clamp(108px,22vw,340px);line-height:.8;letter-spacing:-.04em;font-variant-numeric:tabular-nums;")}>{mClock(now)}</div>
-        <div style={css("margin-top:clamp(16px,1.6vw,30px);color:var(--muted);text-transform:uppercase;letter-spacing:.3em;font-size:clamp(13px,1.3vw,21px);font-weight:600;")}>{mLongDate(now)}</div>
-        <div style={css("margin-top:clamp(10px,1vw,18px);text-transform:uppercase;letter-spacing:.34em;font-size:clamp(10px,.95vw,14px);font-weight:600;color:var(--faint);")}>powered by <span style={css("color:var(--accent);font-weight:800;")}>monclub</span></div>
-      </div>
-      <div style={css("display:flex;flex-direction:column;align-items:center;gap:22px;")}>
-        <div style={css("position:relative;width:clamp(56px,5.6vw,80px);height:clamp(56px,5.6vw,80px);")}>
-          <div style={css("position:absolute;inset:0;border-radius:50%;border:2px dashed color-mix(in oklch,var(--accent),transparent 40%);animation:ringspin 11s linear infinite;")} />
-          <div style={css("position:absolute;inset:38%;border-radius:50%;background:var(--accent);box-shadow:0 0 20px var(--accent);")} />
-        </div>
-        <div style={css("text-transform:uppercase;letter-spacing:.2em;font-size:clamp(13px,1.35vw,22px);font-weight:600;color:rgba(243,244,242,.82);animation:breathe 3.8s ease-in-out infinite;")}>Present your card, QR code or fingerprint</div>
-      </div>
+      )}
     </div>
   );
 }
 
-// ── Single hero card ────────────────────────────────────────────────────────
-function MeridienSingle({ scan, now, onImageError }: { scan: MeridienScan; now: Date; onImageError: (laneId: string) => void }) {
-  const granted = scan.granted;
-  const bd = !!(scan.birthday && mSameDay(scan.birthday, now));
-  const accent = granted ? (bd ? M_GOLD : M_GREEN) : M_RED;
-  const name = scan.name;
-  const fn = name.split(/\s+/)[0];
-  const len = name.length;
-  const nameSize = len > 34 ? "clamp(28px,3vw,56px)" : (len > 22 ? "clamp(38px,4.6vw,84px)" : "clamp(50px,6.6vw,116px)");
-  const showValidity = granted && !!scan.validFrom && !!scan.validTo;
+// ── Shared type styles ──────────────────────────────────────────────────────
+const A_EYEBROW: CSSProperties = { fontWeight: 700, letterSpacing: ".26em", textTransform: "uppercase" };
+const A_NAME: CSSProperties = { fontWeight: 800, letterSpacing: "-.045em", lineHeight: 0.93, overflowWrap: "break-word" };
+const A_TABULAR: CSSProperties = { fontWeight: 700, letterSpacing: "-.02em", fontVariantNumeric: "tabular-nums" };
 
-  let memberSince = "", validToLabel = "", expiringLabel = "", pct = 0;
-  let showExpiring = false;
-  if (showValidity && scan.validFrom && scan.validTo) {
-    pct = Math.max(4, Math.min(100, Math.round((now.getTime() - scan.validFrom.getTime()) / (scan.validTo.getTime() - scan.validFrom.getTime()) * 100)));
-    memberSince = "Member since " + mMonthYear(scan.validFrom);
-    validToLabel = "Valid until " + mShortDate(scan.validTo);
-    const dleft = Math.ceil((scan.validTo.getTime() - now.getTime()) / 86400000);
-    showExpiring = dleft <= 14 && dleft > 0;
-    expiringLabel = "Expires in " + dleft + " day" + (dleft > 1 ? "s" : "");
-  }
+// Rule 3: the first name is enormous — but it still has to fit the frame.
+function aFirstSize(s: string, base: number): number {
+  const n = s.length;
+  if (n <= 5) return base;
+  if (n <= 7) return Math.round(base * 0.89);
+  if (n <= 9) return Math.round(base * 0.76);
+  if (n <= 12) return Math.round(base * 0.63);
+  if (n <= 16) return Math.round(base * 0.5);
+  return Math.round(base * 0.4);
+}
+function aLastSize(first: number, s: string): number {
+  const base = Math.round(first * 0.455);
+  const n = s.length;
+  if (n <= 11) return base;
+  if (n <= 17) return Math.round(base * 0.78);
+  return Math.round(base * 0.62);
+}
 
-  const photoImgStyle: CSSProperties = { ...css("position:absolute;inset:0;width:100%;height:100%;object-fit:contain;object-position:center;"), filter: granted ? "none" : "grayscale(.75) brightness(.7) contrast(1.05)" };
-
+function APill({ children, bg, color }: { children: ReactNode; bg: string; color: string }) {
   return (
-    <div style={css("position:absolute;inset:0;display:flex;align-items:center;padding:clamp(44px,4.5vw,96px);gap:clamp(40px,4.5vw,88px);")}>
-      <div style={css("flex:0 0 33%;max-width:470px;align-self:stretch;display:flex;padding:clamp(28px,3vw,64px) 0;")}>
-        <div style={css("position:relative;flex:1;border-radius:26px;overflow:hidden;background:linear-gradient(165deg,#181a20,#0c0d11);border:1px solid var(--line);box-shadow:0 50px 100px -40px rgba(0,0,0,.8);")}>
-          {scan.imgUrl ? (
-            <img src={scan.imgUrl} alt="" style={photoImgStyle} onError={() => onImageError(scan.laneId)} />
-          ) : (
-            <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;background:radial-gradient(80% 70% at 50% 40%,color-mix(in oklch,var(--accent),transparent 82%),transparent 70%);")}>
-              <span style={css("font-weight:800;font-size:clamp(76px,11vw,176px);color:var(--accent);line-height:1;letter-spacing:-.02em;")}>{mInitials(name)}</span>
-              <span style={css("text-transform:uppercase;letter-spacing:.24em;font-size:clamp(10px,.95vw,14px);font-weight:600;color:var(--muted);")}>No photo</span>
-            </div>
-          )}
-          <div style={css("position:absolute;left:0;right:0;bottom:0;height:34%;background:linear-gradient(to top,rgba(7,8,9,.65),transparent);pointer-events:none;")} />
-          <div style={css("position:absolute;inset:0;border-radius:26px;box-shadow:inset 0 0 0 2px color-mix(in oklch,var(--accent),transparent 58%);pointer-events:none;")} />
-        </div>
-      </div>
-
-      <div style={css("flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;")}>
-        <div style={css("display:flex;align-items:center;gap:13px;color:var(--faint);text-transform:uppercase;letter-spacing:.2em;font-size:clamp(12px,1.05vw,16px);font-weight:600;")}>
-          <span>{scan.device}</span>
-          <span style={css("width:4px;height:4px;border-radius:50%;background:currentColor;")} />
-          <span style={css("display:inline-flex;align-items:center;gap:9px;")}><MMethodIcon m={scan.method} /><span>{mMethodLabel(scan.method)}</span></span>
-        </div>
-
-        <div style={css("display:flex;align-items:center;gap:clamp(14px,1.3vw,22px);margin-top:clamp(22px,2.2vw,40px);")}>
-          <MDisc granted={granted} accent={accent} />
-          <span style={css("font-size:clamp(27px,3.1vw,54px);font-weight:700;letter-spacing:-.015em;color:var(--accent);white-space:nowrap;line-height:1;")}>{granted ? "ACCESS GRANTED" : "ACCESS DENIED"}</span>
-        </div>
-
-        <div style={{ fontFamily: "'Hanken Grotesk',sans-serif", fontWeight: 800, lineHeight: 0.95, letterSpacing: "-.02em", marginTop: "clamp(14px,1.4vw,26px)", fontSize: nameSize, color: "var(--ink)", overflowWrap: "break-word", hyphens: "auto", maxWidth: "15ch" }}>{name}</div>
-
-        {bd && (
-          <div style={css("margin-top:clamp(16px,1.6vw,26px);display:inline-flex;align-self:flex-start;align-items:center;gap:12px;padding:11px 20px;border-radius:999px;background:color-mix(in oklch,var(--accent),transparent 88%);border:1px solid color-mix(in oklch,var(--accent),transparent 60%);white-space:nowrap;")}>
-            <span style={css("width:11px;height:11px;background:var(--accent);transform:rotate(45deg);box-shadow:0 0 12px var(--accent);")} />
-            <span style={css("font-weight:700;font-size:clamp(16px,1.5vw,27px);color:var(--accent);")}>{"Happy birthday, " + fn + "!"}</span>
-          </div>
-        )}
-
-        <div style={css("margin-top:clamp(22px,2.2vw,38px);display:flex;flex-wrap:wrap;gap:12px;align-items:center;")}>
-          <span style={css("display:inline-flex;align-items:center;gap:10px;padding:11px 20px;border-radius:999px;border:1px solid var(--line);background:var(--surface);font-weight:600;font-size:clamp(15px,1.35vw,21px);color:var(--ink);white-space:nowrap;")}>
-            <span style={css("width:8px;height:8px;border-radius:50%;background:var(--accent);")} />{mPlanLabel(scan)}
-          </span>
-          {scan.category !== "standard" && <span style={mCategoryStyle(scan.category)}>{scan.category === "staff" ? "Staff" : "Kids Club"}</span>}
-        </div>
-
-        {!granted && (
-          <div style={css("margin-top:clamp(24px,2.4vw,40px);padding:clamp(20px,1.8vw,30px) clamp(22px,2vw,34px);border-radius:20px;background:color-mix(in oklch,var(--accent),transparent 91%);max-width:48ch;")}>
-            <div style={css("text-transform:uppercase;letter-spacing:.2em;font-size:clamp(12px,1vw,15px);font-weight:700;color:var(--accent);margin-bottom:10px;")}>Reason</div>
-            <div style={css("font-size:clamp(20px,2vw,32px);font-weight:700;color:var(--ink);line-height:1.15;")}>{scan.denyReason}</div>
-            <div style={css("margin-top:12px;color:var(--muted);font-size:clamp(14px,1.2vw,19px);font-weight:500;")}>Please see the front desk.</div>
-          </div>
-        )}
-
-        {showValidity && (
-          <div style={css("margin-top:clamp(24px,2.4vw,40px);max-width:46ch;")}>
-            <div style={css("display:flex;justify-content:space-between;gap:16px;color:var(--muted);font-size:clamp(13px,1.05vw,17px);font-weight:500;margin-bottom:12px;")}>
-              <span>{memberSince}</span>
-              <span>{validToLabel}</span>
-            </div>
-            <div style={css("height:5px;border-radius:999px;background:var(--surface);overflow:hidden;")}>
-              <div style={{ width: pct + "%", height: "100%", borderRadius: "999px", background: accent }} />
-            </div>
-            {showExpiring && <div style={css("margin-top:12px;color:var(--accent);font-weight:600;font-size:clamp(13px,1.1vw,18px);")}>{expiringLabel}</div>}
-          </div>
-        )}
-      </div>
-    </div>
+    <span style={{ display: "inline-flex", alignItems: "center", gap: "10px", height: "44px", padding: "0 20px", borderRadius: "999px", background: bg, color, fontWeight: 700, whiteSpace: "nowrap" }}>
+      {children}
+    </span>
   );
 }
 
-// ── Simultaneous-scans wall (2-3) ───────────────────────────────────────────
-function MeridienMulti({ scans, now, onImageError }: { scans: MeridienScan[]; now: Date; onImageError: (laneId: string) => void }) {
+// ── 01 · The verdict screen (one scan) ──────────────────────────────────────
+function AVerdict({ scan, now, onImageError }: { scan: EntryScan; now: Date; onImageError: (laneId: string) => void }) {
+  const f = aFieldFor(scan, now);
+  const birthday = f.glyph === "cake";
+  const age = birthday ? aAgeToday(scan.birthday, now) : null;
+  const daysLeft = scan.granted ? aDaysLeft(scan.validTo, now) : null;
+  const expiring = !birthday && daysLeft != null && daysLeft > 0 && daysLeft <= 7;
+
+  const firstSize = aFirstSize(scan.firstName, 132);
+  const lastSize = aLastSize(firstSize, scan.lastName);
+  // Frequent-pass VISUAL alert. `repeatCount` is only ever non-zero when the
+  // engine actually crossed the threshold, so this is inert on a normal scan.
+  const repeat = scan.repeatCount > 1;
+  const reentryDeny = !scan.granted && aIsReentryDeny(scan.reason);
+  const showBadge = repeat || reentryDeny;
+
+  const eyebrow = reentryDeny
+    ? "Deuxième passage"
+    : scan.granted
+      ? (birthday ? "Joyeux anniversaire" : "Accès autorisé")
+      : "Accès refusé";
+  const deny = scan.granted ? null : aDenyCopy(scan.reason);
+
   return (
-    <div style={css("position:absolute;inset:0;display:flex;flex-direction:column;padding:clamp(44px,4.5vw,84px);")}>
-      <div style={css("display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:clamp(28px,2.8vw,48px);gap:24px;")}>
-        <div>
-          <div style={css("font-weight:800;font-size:clamp(44px,6vw,112px);line-height:.85;letter-spacing:-.03em;")}><span style={css("color:var(--accent);")}>{String(scans.length)}</span> members</div>
-          <div style={css("margin-top:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.22em;font-size:clamp(12px,1.1vw,18px);font-weight:600;")}>Simultaneous scans</div>
+    <div style={{ position: "absolute", inset: 0, background: f.bg, color: f.ink, display: "flex", overflow: "hidden" }}>
+      <AGlyph
+        name={f.glyph}
+        size={birthday ? 560 : 620}
+        color={f.ink}
+        opacity={f.glyphOpacity}
+        style={{ position: "absolute", right: (birthday ? -70 : -90) + "px", top: "50%", transform: "translateY(-50%)" }}
+      />
+
+      <div style={{ position: "relative", flex: 1, minWidth: 0, display: "flex", flexDirection: "column", padding: "34px 46px" }}>
+        {/* header */}
+        <div style={{ flex: "none", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "20px" }}>
+          <AWordmark size={23} color={f.markColor} opacity={f.markOpacity} />
+          <div style={{ display: "flex", alignItems: "center", gap: "18px" }}>
+            <span style={{ fontSize: "18px", fontWeight: 600, color: f.soft }}>{scan.device}</span>
+            <span style={{ ...A_TABULAR, fontSize: "32px", color: f.ink }}>{aClock(now)}</span>
+          </div>
         </div>
-        <div style={css("text-align:right;color:var(--muted);text-transform:uppercase;letter-spacing:.16em;font-size:clamp(12px,1.05vw,17px);font-weight:600;")}>
-          <div>{scans[0].device}</div>
-          <div style={css("margin-top:9px;font-size:clamp(20px,1.8vw,30px);letter-spacing:0;color:var(--ink);font-weight:700;")}>{mClock(now)}</div>
+
+        {/* rule 3 + rule 4 */}
+        <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", gap: "46px", animation: "aRise .32s cubic-bezier(.4,0,.2,1)" }}>
+          <div style={{ position: "relative", flex: "none" }}>
+            <APhoto scan={scan} field={f} size={268} ring={8} onImageError={onImageError} />
+            {showBadge && (
+              <div style={{ position: "absolute", right: "-6px", bottom: "2px", height: "44px", padding: "0 16px", borderRadius: "999px", background: "#fff", color: A_ORANGE_INK_DEEP, fontSize: "19px", fontWeight: 800, display: "flex", alignItems: "center", gap: "8px", boxShadow: "0 4px 14px rgba(0,0,0,.2)" }}>
+                <AGlyph name="history" size={22} />
+                {scan.repeatCount > 1 ? scan.repeatCount : 2}
+                <sup style={{ fontSize: "12px", lineHeight: 1 }}>e</sup>
+              </div>
+            )}
+          </div>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={{ ...A_EYEBROW, fontSize: "19px", color: f.soft, marginBottom: "18px", display: "flex", alignItems: "center", gap: "12px" }}>
+              {birthday && <AGlyph name="sparkle" size={24} />}
+              {eyebrow}
+            </div>
+            <div style={{ ...A_NAME, fontSize: firstSize + "px", marginBottom: "2px", color: f.ink }}>{scan.firstName}</div>
+            {!!scan.lastName && <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub }}>{scan.lastName}</div>}
+          </div>
         </div>
-      </div>
-      <div style={css("flex:1;display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:clamp(18px,1.8vw,30px);min-height:0;")}>
-        {scans.map((scan) => {
-          const granted = scan.granted;
-          const bd = !!(scan.birthday && mSameDay(scan.birthday, now));
-          const accent = granted ? (bd ? M_GOLD : M_GREEN) : M_RED;
-          const cardStyle: CSSProperties = { position: "relative", display: "flex", flexDirection: "column", borderRadius: "22px", overflow: "hidden", background: "#0c0d11", border: "1px solid var(--line)", boxShadow: "0 30px 70px -30px rgba(0,0,0,.7)", "--card-accent": accent } as CSSProperties;
-          const imgStyle: CSSProperties = { ...css("position:absolute;inset:0;width:100%;height:100%;object-fit:contain;object-position:center;"), filter: granted ? "none" : "grayscale(.75) brightness(.7)" };
-          return (
-            <div key={scan.laneId} style={cardStyle}>
-              <div style={css("position:relative;flex:1;min-height:0;background:linear-gradient(165deg,#181a20,#0c0d11);")}>
-                {scan.imgUrl ? (
-                  <img src={scan.imgUrl} alt="" style={imgStyle} onError={() => onImageError(scan.laneId)} />
-                ) : (
-                  <div style={css("position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(80% 70% at 50% 40%,color-mix(in oklch,var(--card-accent),transparent 82%),transparent 70%);")}>
-                    <span style={css("font-weight:800;font-size:clamp(50px,6vw,108px);color:var(--card-accent);line-height:1;letter-spacing:-.02em;")}>{mInitials(scan.name)}</span>
+
+        {/* footer — one of four states */}
+        {deny ? (
+          <div style={{ flex: "none", display: "flex", alignItems: "stretch", gap: "20px", padding: "22px 26px", borderRadius: "18px", background: "rgba(0,0,0,.26)" }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: "27px", fontWeight: 700, marginBottom: "6px", color: "#fff" }}>{deny.title}</div>
+              <div style={{ fontSize: "20px", fontWeight: 500, color: "#fff" }}>{deny.action}</div>
+            </div>
+            {/* The two-line timeline only renders when the engine actually gave us a
+                previous passage — never fabricated from the current time. */}
+            {reentryDeny && scan.previousEntryAt && (
+              <>
+                <div style={{ width: "1px", flex: "none", background: "rgba(255,255,255,.28)" }} />
+                <div style={{ flex: "none", display: "flex", flexDirection: "column", justifyContent: "center", gap: "9px", minWidth: "190px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "11px" }}>
+                    <span style={{ ...A_TABULAR, fontSize: "21px", color: "#fff", width: "58px" }}>{aClock(scan.previousEntryAt)}</span>
+                    <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#fff", flex: "none" }} />
+                    <span style={{ fontSize: "17px", fontWeight: 600, color: A_ORANGE_SUB }}>1<sup style={{ fontSize: "10px" }}>er</sup> passage</span>
                   </div>
-                )}
-                <div style={css("position:absolute;left:0;right:0;bottom:0;height:58%;background:linear-gradient(to top,#0c0d11 8%,rgba(12,13,17,.35) 55%,transparent);pointer-events:none;")} />
-                <div style={css("position:absolute;top:16px;left:16px;display:inline-flex;align-items:center;gap:8px;padding:8px 15px;border-radius:999px;background:var(--card-accent);")}>
-                  <MMark granted={granted} color="#070809" size={13} />
-                  <span style={css("font-weight:700;color:#070809;font-size:clamp(13px,1.05vw,18px);letter-spacing:.02em;")}>{granted ? "GRANTED" : "DENIED"}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "11px" }}>
+                    <span style={{ ...A_TABULAR, fontSize: "21px", color: "#fff", width: "58px" }}>{aClock(scan.at)}</span>
+                    <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#fff", flex: "none" }} />
+                    <span style={{ fontSize: "17px", fontWeight: 700, color: "#fff" }}>maintenant</span>
+                  </div>
                 </div>
+              </>
+            )}
+          </div>
+        ) : repeat ? (
+          /* Door opened normally — the passage is merely SIGNALLED to the front desk. */
+          <div style={{ flex: "none", display: "flex", alignItems: "center", gap: "18px", padding: "20px 24px", borderRadius: "18px", background: "#fff" }}>
+            <AGlyph name="history" size={34} color={A_ORANGE_INK_DEEP} />
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: "24px", fontWeight: 700, color: "#121A1C" }}>
+                {scan.repeatCount}<sup style={{ fontSize: "13px" }}>e</sup> passage en {scan.repeatWindowMin} minute{scan.repeatWindowMin > 1 ? "s" : ""}
               </div>
-              <div style={css("padding:clamp(18px,1.5vw,26px);")}>
-                <div style={css("font-weight:800;font-size:clamp(21px,1.9vw,36px);line-height:1.04;letter-spacing:-.01em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;")}>{scan.name}</div>
-                <div style={{ marginTop: "9px", fontSize: "clamp(15px,1.3vw,22px)", fontWeight: granted ? 500 : 600, color: granted ? "var(--muted)" : "var(--card-accent)" }}>{granted ? mPlanLabel(scan) : scan.denyReason}</div>
-                <div style={css("margin-top:14px;color:var(--faint);text-transform:uppercase;letter-spacing:.16em;font-size:clamp(11px,.92vw,15px);font-weight:600;")}>{mMethodLabel(scan.method)}</div>
+              <div style={{ fontSize: "19px", fontWeight: 500, color: "#4A5056" }}>
+                {scan.previousEntryAt
+                  ? `Premier passage à ${aClock(scan.previousEntryAt)} — signalé au poste d'accueil.`
+                  : "Signalé au poste d'accueil."}
               </div>
+            </div>
+            <span style={{ flex: "none", fontSize: "19px", fontWeight: 600, color: "#4A5056", whiteSpace: "nowrap" }}>
+              {[scan.plan, scan.memberNo ? "nº " + scan.memberNo : null].filter(Boolean).join(" · ")}
+            </span>
+          </div>
+        ) : expiring ? (
+          <div style={{ flex: "none", display: "flex", alignItems: "center", gap: "18px", padding: "20px 24px", borderRadius: "18px", background: A_GOLD_INK }}>
+            <AGlyph name="schedule" size={34} color={A_GOLD} />
+            <div style={{ minWidth: 0, flex: 1 }}>
+              <div style={{ fontSize: "24px", fontWeight: 700, color: "#fff", marginBottom: "4px" }}>
+                {"Votre abonnement se termine dans " + daysLeft + " " + aPlural(daysLeft as number, "jour", "jours")}
+              </div>
+              <div style={{ fontSize: "19px", fontWeight: 500, color: A_GOLD }}>Passez à l'accueil quand vous voulez pour le renouveler.</div>
+            </div>
+            {!!scan.memberNo && <span style={{ flex: "none", fontSize: "18px", fontWeight: 600, color: A_GOLD }}>{"nº " + scan.memberNo}</span>}
+          </div>
+        ) : (
+          <div style={{ flex: "none", display: "flex", alignItems: "center", gap: "14px", fontSize: "21px", fontWeight: 600, color: f.soft }}>
+            {birthday && age != null && (
+              <APill bg="rgba(58,42,5,.14)" color={A_GOLD_INK}>{age + " ans aujourd'hui"}</APill>
+            )}
+            {scan.category !== "standard" && (
+              <APill bg="rgba(255,255,255,.22)" color={f.ink}>{A_CATEGORY_LABEL[scan.category]}</APill>
+            )}
+            {!!scan.plan && <span>{scan.plan}</span>}
+            {!birthday && !!scan.plan && !!scan.validTo && (
+              <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: f.dot }} />
+            )}
+            {!birthday && !!scan.validTo && <span>{"valable jusqu'au " + aFullDate(scan.validTo)}</span>}
+            <span style={{ marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "9px", whiteSpace: "nowrap" }}>
+              {birthday ? (
+                <>
+                  <AGlyph name="check" size={24} />
+                  Accès autorisé · bonne séance&nbsp;!
+                </>
+              ) : (
+                <>
+                  <AMethodGlyph m={scan.method} size={24} />
+                  {aMethodLabel(scan.method) + (scan.memberNo ? " · nº " + scan.memberNo : "")}
+                </>
+              )}
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 03 · Simultaneous scans — every lane is its own full-height field ───────
+// The design draws three. `popup_lanes` may be up to MAX_LANES (5), so 4-5
+// wrap onto a second row (2×2, then 3+2) and the type steps down — five 256px
+// columns cannot carry a 62px first name.
+function aMultiGrid(n: number): { columns: string; rows: string; span: (i: number) => number } {
+  if (n === 4) return { columns: "repeat(2,1fr)", rows: "repeat(2,1fr)", span: () => 1 };
+  if (n >= 5) return { columns: "repeat(6,1fr)", rows: "repeat(2,1fr)", span: (i) => (i < 3 ? 2 : 3) };
+  return { columns: "repeat(" + Math.max(1, n) + ",1fr)", rows: "1fr", span: () => 1 };
+}
+
+function AMulti({ scans, now, onImageError }: { scans: EntryScan[]; now: Date; onImageError: (laneId: string) => void }) {
+  const n = scans.length;
+  const grid = aMultiGrid(n);
+  const dense = n > 3;
+  const photo = dense ? 78 : 104;
+  const photoRing = dense ? 4 : 5;
+  const ebSize = dense ? 12 : 14;
+  const firstBase = dense ? 44 : 62;
+  const footSize = dense ? 15 : 17;
+  const watermark = dense ? 200 : 280;
+
+  return (
+    <div style={{ position: "absolute", inset: 0, background: A_DARK, display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: "none", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "20px", padding: "22px 30px 16px" }}>
+        <AWordmark size={20} color="#fff" opacity={0.5} />
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <span style={{ fontSize: "16px", fontWeight: 600, color: A_DARK_SUB }}>{n + " passages simultanés · " + scans[0].device}</span>
+          <span style={{ ...A_TABULAR, fontSize: "28px", color: "#fff" }}>{aClock(now)}</span>
+        </div>
+      </div>
+
+      <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: grid.columns, gridTemplateRows: grid.rows, gap: "14px", padding: "0 24px 24px" }}>
+        {scans.map((scan, i) => {
+          const f = aFieldFor(scan, now);
+          const birthday = f.glyph === "cake";
+          const deny = scan.granted ? null : aDenyCopy(scan.reason);
+          const firstSize = aFirstSize(scan.firstName, firstBase);
+          const lastSize = aLastSize(firstSize, scan.lastName);
+          return (
+            <div
+              key={scan.laneId}
+              style={{
+                gridColumn: "span " + grid.span(i),
+                minWidth: 0,
+                position: "relative",
+                overflow: "hidden",
+                borderRadius: "24px",
+                background: f.bg,
+                color: f.ink,
+                display: "flex",
+                flexDirection: "column",
+                padding: dense ? "20px 20px" : "26px 24px",
+                animation: "aRise .3s cubic-bezier(.4,0,.2,1) " + (i * 0.06).toFixed(2) + "s both",
+              }}
+            >
+              <AGlyph name={f.glyph} size={watermark} color={f.ink} opacity={f.glyphOpacity + 0.01} style={{ position: "absolute", right: "-52px", bottom: "-52px" }} />
+              <div style={{ position: "relative", marginBottom: dense ? "16px" : "22px" }}>
+                <APhoto scan={scan} field={f} size={photo} ring={photoRing} onImageError={onImageError} />
+              </div>
+              <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
+                <div style={{ ...A_EYEBROW, fontSize: ebSize + "px", color: f.soft, marginBottom: dense ? "9px" : "12px" }}>
+                  {scan.granted ? (birthday ? "Anniversaire" : "Autorisé") : "Refusé"}
+                </div>
+                <div style={{ ...A_NAME, fontSize: firstSize + "px", marginBottom: "2px", color: f.ink }}>{scan.firstName}</div>
+                {!!scan.lastName && (
+                  <div style={{ ...A_NAME, fontSize: lastSize + "px", color: f.sub, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{scan.lastName}</div>
+                )}
+              </div>
+              {deny ? (
+                <div style={{ position: "relative", flex: "none", padding: "14px 16px", borderRadius: "14px", background: "rgba(0,0,0,.26)" }}>
+                  <div style={{ fontSize: (footSize + 1) + "px", fontWeight: 700, marginBottom: "3px", color: "#fff" }}>{deny.short}</div>
+                  <div style={{ fontSize: (footSize - 2) + "px", fontWeight: 500, color: "#fff" }}>Voyez l'accueil</div>
+                </div>
+              ) : (
+                <div style={{ position: "relative", flex: "none", fontSize: footSize + "px", fontWeight: 600, color: f.soft }}>
+                  <div style={{ marginBottom: "5px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{scan.plan || (scan.memberNo ? "nº " + scan.memberNo : "Membre")}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "9px" }}>
+                    <AMethodGlyph m={scan.method} size={footSize + 3} />
+                    {aMethodLabel(scan.method) + " · " + aClock(scan.at)}
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}
@@ -430,10 +721,137 @@ function MeridienMulti({ scans, now, onImageError }: { scans: MeridienScan[]; no
   );
 }
 
-const M_ROOT_STYLE = "position:fixed;inset:0;font-family:'Hanken Grotesk',sans-serif;color:#f3f4f2;background:radial-gradient(140% 120% at 50% -8%,#15171c 0%,#0b0c10 52%,#070809 100%);overflow:hidden;--ink:#f3f4f2;--muted:rgba(243,244,242,.46);--faint:rgba(243,244,242,.3);--line:rgba(243,244,242,.12);--surface:rgba(243,244,242,.045);";
+// ── 04 · Standby ────────────────────────────────────────────────────────────
+// The only state with no verdict colour: the design-system dark means "no
+// decision in progress", which is what makes the arrival of green or red so
+// abrupt. The breathing dot says the reader is listening — without it, a
+// frozen screen and a broken one look identical.
+const A_TOPO_URL = (() => {
+  const rings: string[] = [];
+  const centres: Array<[number, number, number]> = [[190, 205, 1.35], [455, 445, 0.85]];
+  for (const [cx, cy, k] of centres) {
+    for (let i = 1; i <= 11; i++) {
+      const r = i * 26 * k;
+      rings.push('<ellipse cx="' + cx + '" cy="' + cy + '" rx="' + (r * 1.18).toFixed(1) + '" ry="' + r.toFixed(1) + '" transform="rotate(' + (i * 3 - 14) + ' ' + cx + ' ' + cy + ')"/>');
+    }
+  }
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640"><g fill="none" stroke="#ffffff" stroke-width="1.6">' + rings.join("") + "</g></svg>";
+  return 'url("data:image/svg+xml,' + encodeURIComponent(svg) + '")';
+})();
 
-// Screen-level component: idle / single / multi from the active lanes.
-function MeridienScreen({ lanes, idle, gymName, onImageError }: { lanes: ActiveLane[]; idle: boolean; gymName: string; onImageError: (laneId: string) => void }) {
+function ABreathDot({ color }: { color: string }) {
+  return (
+    <span style={{ position: "relative", display: "inline-block", width: "9px", height: "9px", flex: "none" }}>
+      <i style={{ position: "absolute", inset: 0, borderRadius: "50%", background: color, animation: "aBreathe 2.6s ease-out infinite" }} />
+      <i style={{ position: "absolute", inset: 0, borderRadius: "50%", background: color }} />
+    </span>
+  );
+}
+
+function AIdle({ place, now, linkUp, todayCount }: { place: string; now: Date; linkUp: boolean; todayCount: number }) {
+  return (
+    <div style={{ position: "absolute", inset: 0, background: A_DARK, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+      <div style={{ position: "absolute", inset: 0, backgroundImage: A_TOPO_URL, backgroundSize: "cover", backgroundPosition: "center", opacity: 0.06 }} />
+      <div style={{ position: "absolute", top: "30px", left: "36px" }}><AWordmark size={20} color="#fff" opacity={0.5} /></div>
+      <div style={{ position: "absolute", top: "30px", right: "36px", display: "inline-flex", alignItems: "center", gap: "11px", height: "38px", padding: "0 16px", borderRadius: "12px", background: "rgba(255,255,255,.08)" }}>
+        <ABreathDot color={linkUp ? A_GREEN : A_RED} />
+        <span style={{ fontSize: "16px", fontWeight: 600, color: A_DARK_SUB }}>{linkUp ? "Lecteur actif" : "Lecteur hors ligne"}</span>
+      </div>
+
+      <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center" }}>
+        <div style={{ ...A_TABULAR, fontSize: "152px", lineHeight: 1, letterSpacing: "-.05em", color: "#fff", marginBottom: "12px" }}>{aClock(now)}</div>
+        <div style={{ fontSize: "26px", fontWeight: 500, color: A_DARK_SUB, marginBottom: "54px" }}>{aLongDate(now)}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: "18px", padding: "20px 34px", borderRadius: "999px", background: A_RED, color: "#fff" }}>
+          <AGlyph name="card" size={34} />
+          <span style={{ fontSize: "28px", fontWeight: 700, letterSpacing: "-.01em" }}>Présentez votre carte</span>
+        </div>
+      </div>
+
+      <div style={{ position: "absolute", bottom: "32px", left: 0, right: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: "24px", fontSize: "16px", color: A_DARK_SUB }}>
+        <span>{place}</span>
+        {todayCount > 0 && (
+          <>
+            <span style={{ width: "5px", height: "5px", borderRadius: "50%", background: A_DARK_FAINT }} />
+            <span>{todayCount + " " + aPlural(todayCount, "passage", "passages") + " aujourd'hui"}</span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── The 1280×720 stage ──────────────────────────────────────────────────────
+// Uniformly scaled to the window so the design's own pixel values hold at any
+// size (1920×1080 is the same ratio). The window background is painted with
+// the field colour too, so on a non-16:9 window the letterbox still reads as
+// the verdict rather than as a black bar.
+function AStage({ background, children }: { background: string; children: ReactNode }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const [scale, setScale] = useState(1);
+
+  const measure = useCallback(() => {
+    const el = hostRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const next = Math.min(r.width / STAGE_W, r.height / STAGE_H);
+    // setState with an unchanged number bails out, so this never loops.
+    if (next > 0) setScale(next);
+  }, []);
+
+  useLayoutEffect(() => {
+    measure();
+    window.addEventListener("resize", measure);
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(measure);
+      ro.observe(hostRef.current as Element);
+    }
+    return () => {
+      window.removeEventListener("resize", measure);
+      if (ro) ro.disconnect();
+    };
+  }, [measure]);
+
+  // Self-heal: ResizeObserver notifications are delivered on the frame
+  // lifecycle, so a webview that is resized while not compositing (moved to
+  // another monitor, un-minimised, fullscreened) can come back with a stale
+  // scale and a letterboxed or overflowing stage. This screen re-renders every
+  // second from its own clock, so re-measuring on every render costs one
+  // getBoundingClientRect per second and guarantees the stage corrects itself.
+  useLayoutEffect(measure);
+
+  return (
+    <div ref={hostRef} style={{ position: "fixed", inset: 0, overflow: "hidden", background, transition: "background 280ms ease" }}>
+      <div
+        style={{
+          position: "absolute",
+          left: "50%",
+          top: "50%",
+          width: STAGE_W + "px",
+          height: STAGE_H + "px",
+          transform: "translate(-50%,-50%) scale(" + scale + ")",
+          transformOrigin: "center center",
+          overflow: "hidden",
+          fontFamily: "'Hanken Grotesk',sans-serif",
+          WebkitFontSmoothing: "antialiased",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// Screen-level component: standby / verdict / wall from the active lanes.
+function EntryScreen({ lanes, idle, gymName, linkUp, todayCount, onImageError }: {
+  lanes: ActiveLane[];
+  idle: boolean;
+  gymName: string;
+  linkUp: boolean;
+  todayCount: number;
+  onImageError: (laneId: string) => void;
+}) {
   const [now, setNow] = useState<Date>(() => new Date());
   useEffect(() => {
     const id = window.setInterval(() => setNow(new Date()), 1000);
@@ -443,28 +861,29 @@ function MeridienScreen({ lanes, idle, gymName, onImageError }: { lanes: ActiveL
   const scans = useMemo(() => lanes.map(mapLaneToScan), [lanes]);
   const single = !idle && scans.length === 1;
   const multi = !idle && scans.length > 1;
-  const accent = idle ? M_GREEN : (single ? mAccent(scans[0], now) : M_GREEN);
-  const rootStyle: CSSProperties = { ...css(M_ROOT_STYLE), "--accent": accent } as CSSProperties;
-  const showConfetti = single && !!(scans[0].birthday && mSameDay(scans[0].birthday, now));
+
+  // The standby screen has no event to name the door, so remember the last one.
+  const [lastDevice, setLastDevice] = useState("");
+  useEffect(() => {
+    const d = scans.length ? scans[0].device : "";
+    if (d) setLastDevice(d);
+  }, [scans]);
+
+  const stageBg = single ? aFieldFor(scans[0], now).bg : A_DARK;
   const sceneKey = idle ? "idle" : scans.map((s) => s.laneId).join("|");
 
   return (
-    <div style={rootStyle}>
-      <div style={css("position:absolute;inset:0;background:radial-gradient(72% 62% at 24% 28%,color-mix(in oklch,var(--accent),transparent 89%),transparent 64%);pointer-events:none;z-index:0;animation:drift 38s ease-in-out infinite;")} />
-      <div style={css("position:absolute;top:0;left:0;right:0;height:3px;background:var(--accent);box-shadow:0 0 22px color-mix(in oklch,var(--accent),transparent 45%);z-index:7;")} />
-
-      <div key={sceneKey} style={{ ...css("position:absolute;inset:0;z-index:2;"), animation: "meridienEnter 600ms cubic-bezier(.16,.84,.3,1) both" }}>
-        {idle && <MeridienIdle gymName={gymName} now={now} />}
-        {single && <MeridienSingle scan={scans[0]} now={now} onImageError={onImageError} />}
-        {multi && <MeridienMulti scans={scans} now={now} onImageError={onImageError} />}
+    <AStage background={stageBg}>
+      <div key={sceneKey} style={{ position: "absolute", inset: 0, animation: "aScene 420ms cubic-bezier(.16,.84,.3,1) both" }}>
+        {idle && <AIdle place={lastDevice || gymName || "MonClub Access"} now={now} linkUp={linkUp} todayCount={todayCount} />}
+        {single && <AVerdict scan={scans[0]} now={now} onImageError={onImageError} />}
+        {multi && <AMulti scans={scans} now={now} onImageError={onImageError} />}
       </div>
-
-      {showConfetti && <div style={css("position:absolute;inset:0;z-index:3;pointer-events:none;overflow:hidden;")}><MConfetti /></div>}
-    </div>
+    </AStage>
   );
 }
 
-/* ▲▲▲ END MÉRIDIEN design ▲▲▲ */
+/* ▲▲▲ END DIRECTION A ▲▲▲ */
 
 // ── Main component ────────────────────────────────────────────────────────
 // ── Freeze telemetry beacon (popup → backend) ────────────────────────────────
@@ -488,6 +907,10 @@ export default function PopupWindow() {
   const [gymName, setGymName] = useState<string>("");
   const [maxLanes, setMaxLanes] = useState<number>(DEFAULT_LANES);
   const [defaultDurationSec, setDefaultDurationSec] = useState<number>(DEFAULT_DURATION_SEC);
+  // Standby-screen chrome. `linkUp` starts optimistic so opening the window
+  // never flashes "hors ligne" before the first poll lands.
+  const [linkUp, setLinkUp] = useState<boolean>(true);
+  const [todayCount, setTodayCount] = useState<number>(0);
 
   const lanesRef = useRef<ActiveLane[]>([]);
   const seenEventIdsRef = useRef<Map<string, number>>(new Map()); // event_id → seen-at, for cheap cross-channel dedupe
@@ -580,9 +1003,9 @@ export default function PopupWindow() {
       // Show ONLY granted entries for identified members. Denied scans and
       // unidentified ("Inconnu") cards are not surfaced on the popup wall.
       // (History/audit still records everything via the drawer — this filter is
-      // popup-display only.)
+      // popup-display only.) See SHOW_DENIED_ENTRIES.
       const knownUser = !!evt.userFullName && evt.userFullName.trim().length > 0;
-      if (!evt.allowed || !knownUser) {
+      if ((!evt.allowed && !SHOW_DENIED_ENTRIES) || !knownUser) {
         console.debug("[popup] skip (not a granted+known entry)", {
           eventId: evt.eventId, allowed: evt.allowed,
           user: evt.userFullName, reason: evt.reason,
@@ -794,6 +1217,7 @@ export default function PopupWindow() {
     let timer: number | undefined;
     let sinceAgent = -1; // -1 => first poll pins the cursor at HEAD (live-only)
     let sinceUltra = -1;
+    let misses = 0;
     const poll = async () => {
       try {
         const res = await get<any>("/popup/poll", {
@@ -801,13 +1225,26 @@ export default function PopupWindow() {
           since_ultra: String(sinceUltra),
         });
         if (cancelled) return;
+        // This poll is the popup's only connection-independent link to the
+        // backend, so it also drives the standby screen's "Lecteur actif"
+        // indicator. Both setState calls are no-ops when the value is
+        // unchanged, so the 1.5s cadence costs no re-renders.
+        misses = 0;
+        setLinkUp(true);
+        if (typeof res?.todayCount === "number") setTodayCount(res.todayCount);
         if (typeof res?.seqAgent === "number") sinceAgent = res.seqAgent;
         if (typeof res?.seqUltra === "number") sinceUltra = res.seqUltra;
         const evs = Array.isArray(res?.events) ? res.events : [];
         for (const ev of evs) {
           try { enqueue(toPopupEvent(ev)); } catch { /* ignore one bad event */ }
         }
-      } catch { /* transient (stall/offline) — the next tick just retries */ }
+      } catch {
+        // transient (stall/offline) — the next tick just retries. Only call the
+        // reader offline after two consecutive misses so a single blip on a
+        // busy backend does not flicker the standby badge.
+        misses += 1;
+        if (!cancelled && misses >= 2) setLinkUp(false);
+      }
       finally {
         if (!cancelled) timer = window.setTimeout(poll, 1500);
       }
@@ -838,17 +1275,19 @@ export default function PopupWindow() {
     return () => window.clearInterval(id);
   }, []);
 
-  // Active lanes → MÉRIDIEN screen (idle when none, single for 1, multi for 2-3)
+  // Active lanes → entry screen (standby when none, verdict for 1, wall for 2+)
   const visibleLanes = useMemo(() => lanes, [lanes]);
   const laneCount = visibleLanes.length;
 
   // ── Render ─────────────────────────────────────────────────────────────
   return (
     <>
-      <MeridienScreen
+      <EntryScreen
         lanes={visibleLanes}
         idle={laneCount === 0}
         gymName={gymName}
+        linkUp={linkUp}
+        todayCount={todayCount}
         onImageError={handleImageError}
       />
       <style>{globalKeyframes}</style>
@@ -858,10 +1297,7 @@ export default function PopupWindow() {
 
 // ── Keyframes shared across the window (Hanken Grotesk is bundled via @fontsource) ─
 const globalKeyframes = `
-  @keyframes drift{0%{transform:translate3d(0,0,0) scale(1);}50%{transform:translate3d(3%,2%,0) scale(1.12);}100%{transform:translate3d(0,0,0) scale(1);}}
-  @keyframes breathe{0%,100%{opacity:.55;}50%{opacity:1;}}
-  @keyframes ringspin{to{transform:rotate(360deg);}}
-  @keyframes pulseDot{0%,100%{opacity:1;transform:scale(1);}50%{opacity:.4;transform:scale(.8);}}
-  @keyframes confettiFall{0%{transform:translateY(-14vh) rotate(0deg);}100%{transform:translateY(116vh) rotate(720deg);}}
-  @keyframes meridienEnter{0%{transform:translateY(20px) scale(.99);}100%{transform:none;}}
+  @keyframes aRise{from{opacity:0;transform:translateY(16px);}to{opacity:1;transform:none;}}
+  @keyframes aBreathe{0%,100%{transform:scale(1);opacity:.5;}50%{transform:scale(1.7);opacity:0;}}
+  @keyframes aScene{from{opacity:0;}to{opacity:1;}}
 `;

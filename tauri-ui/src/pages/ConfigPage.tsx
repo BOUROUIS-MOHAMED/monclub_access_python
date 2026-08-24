@@ -172,9 +172,18 @@ function OverlayAnchorPicker({
   );
 }
 
+// Access v3 imports (Partie 2, screen 05)
+import { usePageChrome } from "@/context/PageChromeContext";
+import { ArrowRightLeft } from "lucide-react";
+import { cn } from "@/lib/utils";
+
 export default function ConfigPage() {
   const { status } = useApp();
   const [cfg, setCfg] = useState<Record<string, any>>({});
+  // Snapshot of the config as last loaded/saved. The design's rail lists the
+  // pending edits field by field; `dirty` alone is only a boolean, so the diff
+  // is computed against this baseline — real values, nothing inferred.
+  const [baseline, setBaseline] = useState<Record<string, any>>({});
   const [serverSettings, setServerSettings] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -235,6 +244,7 @@ export default function ConfigPage() {
         }
       }
       setCfg(nextCfg);
+      setBaseline(nextCfg);
       setServerSettings(res.serverSettings || {});
       broadcastFeedbackConfig(nextCfg);
     } catch (e) { setError(String(e)); }
@@ -249,6 +259,7 @@ export default function ConfigPage() {
       const res = await patch<any>("/config", cfg);
       const nextCfg = res.config || cfg;
       setCfg(nextCfg);
+      setBaseline(nextCfg);
       broadcastFeedbackConfig(nextCfg);
       // Reposition the floating favorites overlay (if open) to match the
       // newly-persisted anchor. Silent no-op under web.
@@ -373,24 +384,66 @@ export default function ConfigPage() {
   const antiFraudDurationUploading = soundUploading.antiFraudDuration;
   const antiFraudDailyLimitUploading = soundUploading.antiFraudDailyLimit;
 
+  // Pending edits, computed field by field against the last loaded/saved config.
+  // NOTE: this and usePageChrome below MUST stay above the `if (loading)` early
+  // return — a hook after a conditional return changes the hook count between
+  // renders ("Rendered more hooks than during the previous render").
+  const changes = Object.keys({ ...baseline, ...cfg })
+    .filter((k) => JSON.stringify(baseline[k]) !== JSON.stringify(cfg[k]))
+    .map((k) => ({ key: k, from: baseline[k], to: cfg[k] }));
+
+  const fmtVal = (v: any): string => {
+    if (v === true) return "activé";
+    if (v === false) return "désactivé";
+    if (v == null || v === "") return "vide";
+    if (typeof v === "object") return JSON.stringify(v).slice(0, 40);
+    return String(v).slice(0, 40);
+  };
+
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: changes.length > 0 ? (
+      <span className="inline-flex h-[22px] items-center rounded-lg bg-amber-500/[0.14] px-2 text-[11px] font-bold text-amber-700 dark:text-amber-400">
+        {changes.length} modification{changes.length > 1 ? "s" : ""} non enregistrée{changes.length > 1 ? "s" : ""}
+      </span>
+    ) : undefined,
+    actions: (
+      <>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          onClick={() => { setCfg(baseline); setDirty(false); }}
+          disabled={changes.length === 0 || saving}
+        >
+          Annuler
+        </Button>
+        <Button
+          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+          onClick={handleSave}
+          disabled={!dirty || saving}
+        >
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          Enregistrer
+        </Button>
+      </>
+    ),
+    // Primitives only — see PageChromeContext: an unstable dep loops the effect.
+  }), [changes.length, dirty, saving]);
+
   if (loading) {
     return <div className="flex items-center justify-center py-20"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Settings className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold">Configuration</h1>
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : les réglages ─────────────────────────────────────── */}
+      <div className="flex min-w-0 flex-1 flex-col gap-[11px] overflow-y-auto pr-1">
+        <div className="flex flex-none items-center gap-[9px]">
+          <Settings className="h-[17px] w-[17px] text-primary" />
+          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">
+            Réglages du poste
+          </span>
         </div>
-        {dirty && (
-          <Button onClick={handleSave} disabled={saving}>
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            Enregistrer
-          </Button>
-        )}
-      </div>
 
       {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
       {success && <Alert variant="success"><CheckCircle className="h-4 w-4" /><AlertDescription>Configuration enregistrée !</AlertDescription></Alert>}
@@ -1042,7 +1095,7 @@ export default function ConfigPage() {
 
       {/* Password dialog */}
       <Dialog open={pwdDialogOpen} onOpenChange={setPwdDialogOpen}>
-        <DialogContent className="max-w-xs">
+        <DialogContent className="rounded-3xlmax-w-xs">
           <DialogHeader>
             <DialogTitle>Paramètres avancés</DialogTitle>
             <DialogDescription>Entrez le mot de passe administrateur.</DialogDescription>
@@ -1061,7 +1114,7 @@ export default function ConfigPage() {
 
       {/* Update details dialog */}
       <Dialog open={updateDialog} onOpenChange={setUpdateDialog}>
-        <DialogContent className="max-w-sm">
+        <DialogContent className="rounded-3xlmax-w-sm">
           <DialogHeader>
             <DialogTitle>Mise à jour disponible</DialogTitle>
           </DialogHeader>
@@ -1081,6 +1134,130 @@ export default function ConfigPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      </div>
+
+      {/* ── Le rail ─────────────────────────────────────────────────────── */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className={cn(
+            "inline-flex h-[22px] items-center gap-1.5 rounded-lg px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em]",
+            changes.length > 0 ? "bg-primary/[0.08] text-primary" : "bg-muted text-muted-foreground",
+          )}>
+            {changes.length > 0 && <span className="relative inline-block h-1.5 w-1.5"><span className="absolute inset-0 animate-ping rounded-full bg-primary opacity-60" /><span className="absolute inset-0 rounded-full bg-primary" /></span>}
+            {changes.length > 0 ? "Non enregistré" : "À jour"}
+          </span>
+        </div>
+
+        {changes.length > 0 ? (
+          <div className="flex max-h-[45%] flex-none flex-col rounded-3xl border-[1.5px] border-primary/30 bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+            <div className="mb-3 text-[14px] font-bold text-foreground">
+              {changes.length} modification{changes.length > 1 ? "s" : ""}
+            </div>
+            {/* Raw setting keys on purpose — there is no French label catalogue
+                in the codebase, and inventing one risks mislabelling a field. */}
+            <div className="mb-[15px] flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto">
+              {changes.map((c) => (
+                <div key={c.key} className="flex items-start gap-[9px]">
+                  <ArrowRightLeft className="mt-0.5 h-[15px] w-[15px] shrink-0 text-muted-foreground" />
+                  <div className="min-w-0">
+                    <div className="truncate font-mono text-[11.5px] font-semibold text-foreground">{c.key}</div>
+                    <div className="truncate text-[10.5px] text-muted-foreground">
+                      {fmtVal(c.from)} → {fmtVal(c.to)}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-none gap-2">
+              <Button
+                variant="outline"
+                className="h-[34px] flex-1 justify-center rounded-[14px] text-[12px] font-semibold"
+                onClick={() => { setCfg(baseline); setDirty(false); }}
+                disabled={saving}
+              >
+                Annuler
+              </Button>
+              <Button
+                className="h-[34px] flex-[1.3] justify-center gap-1.5 rounded-full text-[12px] font-bold"
+                onClick={handleSave}
+                disabled={saving}
+              >
+                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                Enregistrer
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-none rounded-3xl bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+            <div className="flex items-center gap-3">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
+                <CheckCircle className="h-[19px] w-[19px]" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-[13.5px] font-bold text-foreground">Tout est enregistré</div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">Aucune modification en attente.</div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <Info className="h-3 w-3" />Ce poste
+          </span>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col gap-[11px] overflow-y-auto rounded-[18px] bg-card px-5 py-4 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Version installée</span>
+            <span className="font-mono text-[12px] text-foreground">{currentVersionDisplay}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Canal</span>
+            <span className="text-[12px] font-semibold text-foreground">{updates?.channel || "stable"}</span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Plateforme</span>
+            <span className="text-[12px] font-semibold text-foreground">{updates?.platform || "WINDOWS"}</span>
+          </div>
+          <div className="h-px bg-border" />
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Agent temps réel</span>
+            <span className={cn("text-[12px] font-semibold", status?.agent?.running ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
+              {status?.agent?.running ? "actif" : "arrêté"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-2.5">
+            <span className="text-[12px] text-muted-foreground">Lecteur PullSDK</span>
+            <span className={cn("text-[12px] font-semibold", status?.pullsdk?.connected ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground")}>
+              {status?.pullsdk?.connected ? (status.pullsdk.ip || "connecté") : "non connecté"}
+            </span>
+          </div>
+
+          {updates?.updateAvailable && (
+            <>
+              <div className="h-px bg-border" />
+              <div className="flex items-start gap-2.5 rounded-xl bg-primary/[0.05] px-3 py-[11px]">
+                <Download className="mt-px h-[17px] w-[17px] shrink-0 text-primary" />
+                <div className="min-w-0">
+                  <div className="text-[12px] font-bold text-foreground">
+                    Version {updates.latestVersion ?? ""} disponible
+                  </div>
+                  <div className="mt-[3px] text-[10.5px] leading-[1.5] text-muted-foreground">
+                    {updates.downloaded ? "Téléchargée — à installer à la fermeture du club." : "À installer à la fermeture du club."}
+                  </div>
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
+                onClick={() => setUpdateDialog(true)}
+              >
+                <Info className="h-[15px] w-[15px]" />Voir les détails
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

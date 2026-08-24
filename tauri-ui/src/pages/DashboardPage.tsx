@@ -1,497 +1,530 @@
-import { useState, useEffect } from "react";
+// Dashboard — "Fil + rail double", from the Claude Design Access v3 refonte
+// (`Access v3 - Partie 1 Pilotage.dc.html`, screen 01).
+//
+// The grammar the whole refonte inherits: one subject at full height on the
+// left (here the day's timeline of entries), and a 330px rail on the right cut
+// in two — "Maintenant" (what needs an action now) on top, "Aujourd'hui" (the
+// summary, machine included) below, with action tiles at the foot of the rail.
+//
+// Where the data comes from:
+//   · the timeline and the day's totals/curve → GET /api/v2/dashboard/overview,
+//     which resolves access_history rows to members (that table stores only a
+//     card number, so unresolved rows fall back to "Carte ####" by design);
+//   · the sync/agent/reader/session/update lines → the existing /status poll;
+//   · the popup tile → usePopupStream, unchanged.
+
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { usePopupStream } from "@/api/hooks";
-import { post } from "@/api/client";
+import { get, post } from "@/api/client";
+import { usePageChrome } from "@/context/PageChromeContext";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
-import { Progress } from "@/components/ui/progress";
-import DashboardSuccessBeacon from "@/components/DashboardSuccessBeacon";
-import StatusChip from "@/components/StatusChip2";
 import ScanCardModal from "@/components/ScanCardModal";
+import { LiveDot } from "@/layouts/MainLayout";
 import { cn } from "@/lib/utils";
+import type { DashboardFeedItem, DashboardOverview, DashboardToday } from "@/api/types";
 import {
-  RefreshCw, RotateCcw, Router, Bot, Users, CheckCircle, Monitor,
-  Bug, AlertTriangle, Play, Square, Upload, CreditCard,
+  RefreshCw, RotateCcw, Users, Monitor, Bug, Upload, CreditCard, Fingerprint,
+  QrCode, Play, Square, WifiOff, History, Clock, DownloadCloud, AlertTriangle,
 } from "lucide-react";
 
-function Panel({
-  title,
-  icon,
-  children,
-  className,
-}: {
-  title: string;
-  icon: React.ReactNode;
-  children: React.ReactNode;
-  className?: string;
-}) {
+const OVERVIEW_POLL_MS = 5000;
+
+// ── small design primitives ───────────────────────────────────────────────
+/** Section marker above a column ("Passages", "Maintenant", "Aujourd'hui"). */
+function ZoneTitle({ children }: { children: React.ReactNode }) {
+  return <div className="flex flex-none items-center gap-[9px]">{children}</div>;
+}
+
+/** Uppercase micro-label used on card headers. */
+function Lb({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className={cn("rounded-xl border border-border bg-card overflow-hidden", className)}>
-      <div className="flex items-center gap-2.5 px-5 py-3.5 border-b border-border/60">
-        {icon}
-        <span className="text-[13px] font-semibold tracking-tight">{title}</span>
-      </div>
-      <div className="px-5 py-4">{children}</div>
-    </div>
+    <span className={cn("text-[10px] font-bold uppercase tracking-[0.18em] text-muted-foreground", className)}>
+      {children}
+    </span>
   );
 }
 
-function Row({ label, value }: { label: string; value: React.ReactNode }) {
+function Card({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <div className={cn("rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]", className)}>{children}</div>;
+}
+
+function Tile({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <div className={cn("rounded-[18px] bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]", className)}>{children}</div>;
+}
+
+function Chip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children: React.ReactNode }) {
+  const tones = {
+    ok: "bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400",
+    no: "bg-primary/[0.09] text-primary",
+    wn: "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400",
+    flat: "bg-muted text-muted-foreground",
+  } as const;
   return (
-    <div className="flex items-center justify-between gap-4 py-[3px]">
-      <span className="text-[12px] text-muted-foreground shrink-0">{label}</span>
-      <span className="text-[13px] text-right font-medium">{value ?? "—"}</span>
-    </div>
+    <span className={cn("inline-flex h-[22px] shrink-0 items-center whitespace-nowrap rounded-lg px-2 text-[11px] font-bold", tones[tone])}>
+      {children}
+    </span>
   );
 }
 
-function StatusDot({ ok, pulse }: { ok: boolean; pulse?: boolean }) {
-  return (
-    <span
-      className={cn(
-        "inline-block h-1.5 w-1.5 rounded-full",
-        ok ? "bg-emerald-400" : "bg-zinc-500",
-        pulse && ok && "animate-pulse",
-      )}
-    />
-  );
+function Sep({ className }: { className?: string }) {
+  return <div className={cn("h-px bg-border", className)} />;
+}
+
+function initialsOf(name: string): string {
+  const p = name.trim().split(/\s+/).filter(Boolean);
+  if (!p.length) return "—";
+  return ((p[0][0] || "") + (p.length > 1 ? p[p.length - 1][0] : "")).toUpperCase();
+}
+
+function methodIcon(method: string) {
+  const m = (method || "").toUpperCase();
+  if (m.includes("QR") || m.includes("TOTP")) return QrCode;
+  if (m.includes("FINGER") || m.includes("FP") || m.includes("BIO")) return Fingerprint;
+  return CreditCard;
+}
+
+function methodLabel(method: string): string {
+  const m = (method || "").toUpperCase();
+  if (m.includes("QR") || m.includes("TOTP")) return "QR Code";
+  if (m.includes("FINGER") || m.includes("FP") || m.includes("BIO")) return "empreinte";
+  return "carte";
+}
+
+/** Backend timestamps are LOCAL wall-clock with no zone ("…THH:MM:SS"). */
+function hhmm(iso: string): string {
+  const t = String(iso || "");
+  const i = t.indexOf("T") >= 0 ? t.indexOf("T") : t.indexOf(" ");
+  return i > 0 ? t.slice(i + 1, i + 6) : "--:--";
+}
+
+/** Local HH:MM for live rows — never toISOString(), which would print UTC. */
+function clockOf(d: Date): string {
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Primary label for a feed row — the member, or the card when unresolved. */
+function rowTitle(it: DashboardFeedItem): string {
+  if (it.userFullName.trim()) return it.userFullName;
+  return it.cardNo ? `Carte ${it.cardNo}` : "Badge inconnu";
+}
+
+/** Secondary label — plan and credential, mirroring "Annuel salle · carte 0042 8871". */
+function rowDetail(it: DashboardFeedItem): string {
+  const bits: string[] = [];
+  if (it.membershipTitle.trim()) bits.push(it.membershipTitle);
+  if (it.userFullName.trim() && it.cardNo) bits.push(`${methodLabel(it.method)} ${it.cardNo}`);
+  else bits.push(methodLabel(it.method));
+  if (it.deviceName) bits.push(it.deviceName);
+  return bits.join(" · ");
 }
 
 export default function DashboardPage() {
   const { status, syncNow, hardSyncNow } = useApp();
   const { openPopupWindow, sendTestNotification } = usePopupStream();
   const [scanOpen, setScanOpen] = useState(false);
+  const [overview, setOverview] = useState<DashboardOverview | null>(null);
+  const [now, setNow] = useState<Date>(() => new Date());
 
-  // Listen for tray "Scanner carte" click
+  // Tray "Scanner carte"
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     import("@tauri-apps/api/event").then(({ listen }) => {
-      listen("tray-scan-card", () => {
-        setScanOpen(true);
-      }).then((fn) => { unlisten = fn; });
+      listen("tray-scan-card", () => setScanOpen(true)).then((fn) => { unlisten = fn; });
     }).catch(() => {/* not in Tauri context */});
     return () => { if (unlisten) unlisten(); };
   }, []);
 
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // Timeline + day aggregates. Independent request per tick, so a stalled
+  // response can never wedge the page.
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const tick = async () => {
+      try {
+        const res = await get<DashboardOverview>("/dashboard/overview", { limit: "40" });
+        if (!cancelled) setOverview(res);
+      } catch { /* transient — the next tick retries */ }
+      finally { if (!cancelled) timer = window.setTimeout(tick, OVERVIEW_POLL_MS); }
+    };
+    void tick();
+    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
+  }, []);
+
+  const syncRunning = status?.sync?.running ?? false;
+  const feed = overview?.feed ?? [];
+  const today: DashboardToday = overview?.today ?? { total: 0, granted: 0, denied: 0, hourly: [], peakHour: null };
+  const lastEntry = useMemo(() => feed.find((f) => f.allowed && f.userFullName.trim()) ?? null, [feed]);
+  const headDevice = feed[0]?.deviceName ?? "";
+
+  const handleSync = useCallback(() => { void syncNow(); }, [syncNow]);
+
+  // Publish the header's subtitle + actions into the shell.
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: `${headDevice ? `${headDevice} · ` : ""}${clockOf(now)}`,
+    actions: (
+      <>
+        <Button
+          variant="outline"
+          className="h-[34px] gap-[7px] rounded-[14px] border-[1.5px] border-primary/45 bg-card px-[14px] text-[12.5px] font-semibold text-primary hover:bg-primary/5"
+          onClick={() => setScanOpen(true)}
+        >
+          <CreditCard className="h-4 w-4" />
+          Scanner une carte
+        </Button>
+        <Button
+          className="h-[34px] gap-[7px] rounded-full px-[18px] text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
+          onClick={handleSync}
+          disabled={syncRunning}
+        >
+          <RefreshCw className={cn("h-4 w-4", syncRunning && "animate-spin")} />
+          {syncRunning ? "En cours…" : "Synchroniser"}
+        </Button>
+      </>
+    ),
+  }), [headDevice, now.getMinutes(), syncRunning, handleSync]);
+
   if (!status) return <p className="text-[13px] text-muted-foreground">Chargement…</p>;
 
-  const s = status.session;
-  const mode = status.mode;
-  const sync = status.sync;
   const agent = status.agent;
+  const sync = status.sync;
+  const mode = status.mode;
+  const s = status.session;
   const dsp = status.deviceSync?.progress;
-  const dspActive = !!(dsp?.running);
-  const dspPushing = dspActive && dsp.total > 0;
-  const dspPct = dspPushing ? Math.round((dsp.current / dsp.total) * 100) : 0;
+  const dspActive = !!dsp?.running;
+  const dspPct = dspActive && dsp!.total > 0 ? Math.round((dsp!.current / dsp!.total) * 100) : 0;
+  const devicesTotal = mode.DEVICE + mode.AGENT + (mode.ULTRA ?? 0) + mode.UNKNOWN;
+
+  // The design's third "Maintenant" line is an alert. Only real, currently
+  // observable faults are surfaced — /status carries no per-device reachability,
+  // so "device offline" is deliberately not synthesised here.
+  const alert =
+    !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
+    : !status.pullsdk.connected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
+    : !sync.lastOk ? { icon: AlertTriangle, text: "Dernière synchronisation en échec", action: "Relancer", run: handleSync }
+    : null;
+
+  const maxBar = Math.max(1, ...today.hourly);
 
   return (
-    <div className="space-y-5">
-      {/* Device-sync progress banner */}
-      {dspActive && (
-        <div className="rounded-xl border border-primary/30 bg-primary/5 px-5 py-4 space-y-3">
-          <div className="flex items-center gap-2.5">
-            <Upload className="h-4 w-4 text-primary animate-pulse" />
-            <span className="text-[13px] font-semibold tracking-tight">
-              {dspPushing
-                ? `Envoi des utilisateurs vers l'appareil${dsp.deviceName ? ` "${dsp.deviceName}"` : ""}`
-                : `Connexion à l'appareil${dsp.deviceName ? ` "${dsp.deviceName}"` : ""}…`}
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : le fil de la journée ─────────────────────────────── */}
+      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
+        <ZoneTitle>
+          <Users className="h-[17px] w-[17px] text-primary" />
+          <span className="font-display text-[13px] font-extrabold tracking-[-0.01em] text-foreground">Passages</span>
+          <span className="ml-1 text-[12px] text-muted-foreground">
+            {today.total} aujourd'hui{today.denied > 0 ? ` · ${today.denied} refusé${today.denied > 1 ? "s" : ""}` : ""}
+          </span>
+        </ZoneTitle>
+
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div className="flex flex-none items-center justify-between gap-3.5 border-b border-border px-6 pb-3 pt-3.5">
+            <Lb>Fil de la journée</Lb>
+            <div className="flex items-center gap-2.5">
+              <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">
+                <span className="h-[7px] w-[7px] rounded-full bg-emerald-500" />passages
+              </span>
+              <span className="inline-flex items-center gap-[5px] text-[11px] text-muted-foreground">
+                <span className="h-[7px] w-[7px] rounded-sm bg-muted-foreground" />système
+              </span>
+            </div>
+          </div>
+
+          <div className="relative min-h-0 flex-1 overflow-y-auto px-6 pt-2.5">
+            {/* the rule the timeline hangs from */}
+            <div className="pointer-events-none absolute bottom-2 left-[60px] top-3 w-px bg-border" />
+
+            {/* Live system row — real, from /status */}
+            {dspActive && (
+              <div className="relative flex items-center gap-3.5 py-[7px]">
+                <span className="w-9 shrink-0 font-mono text-[12px] text-muted-foreground">{clockOf(now)}</span>
+                <span className="h-[11px] w-[11px] shrink-0 animate-pulse rounded-[3px] bg-primary shadow-[0_0_0_3px_hsl(var(--card))]" />
+                <span className="flex w-8 shrink-0 justify-center"><Upload className="h-[18px] w-[18px] text-primary" /></span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13.5px] text-foreground">
+                    Envoi des membres vers l'appareil{dsp!.deviceName ? ` « ${dsp!.deviceName} »` : ""}
+                  </div>
+                  <div className="truncate text-[11px] text-muted-foreground">
+                    {dsp!.total > 0 ? `${dsp!.current} / ${dsp!.total} — ne fermez pas l'application` : "Connexion à l'appareil…"}
+                  </div>
+                </div>
+                {dsp!.total > 0 && <Chip tone="no">{dspPct} %</Chip>}
+              </div>
+            )}
+
+            {feed.length === 0 && !dspActive && (
+              <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 text-center">
+                <History className="h-7 w-7 text-muted-foreground/50" />
+                <p className="text-[13px] font-semibold text-foreground">Aucun passage enregistré</p>
+                <p className="max-w-[320px] text-[11.5px] text-muted-foreground">
+                  Le fil se remplit dès qu'un membre se présente à un lecteur.
+                </p>
+              </div>
+            )}
+
+            {feed.map((it) => {
+              const MIcon = methodIcon(it.method);
+              const resolved = !!it.userFullName.trim();
+              return (
+                <div key={it.eventId || `${it.at}-${it.cardNo}`} className="relative flex items-center gap-3.5 py-[7px]">
+                  <span className="w-9 shrink-0 font-mono text-[12px] text-muted-foreground">{hhmm(it.at)}</span>
+                  <span
+                    className={cn(
+                      "h-[11px] w-[11px] shrink-0 rounded-full shadow-[0_0_0_3px_hsl(var(--card))]",
+                      it.allowed ? "bg-emerald-500" : "bg-primary",
+                    )}
+                  />
+                  <span
+                    className={cn(
+                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-[18px] text-[12px] font-bold",
+                      resolved
+                        ? it.allowed ? "bg-muted text-muted-foreground" : "bg-primary/[0.09] text-primary"
+                        : "bg-muted text-muted-foreground",
+                    )}
+                  >
+                    {resolved ? initialsOf(it.userFullName) : <MIcon className="h-[18px] w-[18px]" />}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[13.5px] font-semibold text-foreground">{rowTitle(it)}</div>
+                    <div className={cn("truncate text-[11px]", it.allowed ? "text-muted-foreground" : "text-primary")}>
+                      {it.allowed ? rowDetail(it) : (it.reason || "Accès refusé")}
+                    </div>
+                  </div>
+                  <Chip tone={it.allowed ? "ok" : "no"}>{it.allowed ? "Autorisé" : "Refusé"}</Chip>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      </div>
+
+      {/* ── Le rail ─────────────────────────────────────────────────────── */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
+        {/* Maintenant */}
+        <ZoneTitle>
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.08] px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-primary">
+            <LiveDot className="h-[6px] w-[6px]" />
+            Maintenant
+          </span>
+        </ZoneTitle>
+
+        <Card className="flex-none px-[22px] py-[18px]">
+          {lastEntry ? (
+            <div className="mb-[15px] flex items-center gap-3.5">
+              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-3xl bg-emerald-500/[0.055] text-[17px] font-bold text-emerald-700 dark:text-emerald-400">
+                {initialsOf(lastEntry.userFullName)}
+              </span>
+              <div className="min-w-0 flex-1">
+                <Lb className="mb-1 block text-emerald-700 dark:text-emerald-400">
+                  Vient d'entrer · {hhmm(lastEntry.at)}
+                </Lb>
+                <div className="truncate font-display text-[17px] font-extrabold leading-[1.15] tracking-[-0.02em] text-foreground">
+                  {lastEntry.userFullName}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-[15px] flex items-center gap-3.5">
+              <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-3xl bg-muted text-muted-foreground">
+                <Users className="h-5 w-5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <Lb className="mb-1 block">En attente</Lb>
+                <div className="truncate text-[13px] text-muted-foreground">Aucun passage pour l'instant</div>
+              </div>
+            </div>
+          )}
+
+          <Sep className="mb-[13px]" />
+
+          <div className="mb-[9px] flex items-center justify-between gap-2.5">
+            <span className="text-[12px] font-semibold text-foreground">
+              {dspActive ? "Envoi des membres" : "Synchronisation"}
+            </span>
+            <span className="text-[12.5px] font-bold text-primary">
+              {dspActive ? `${dspPct} %` : sync.lastOk ? "à jour" : "à relancer"}
             </span>
           </div>
-          {dspPushing ? (
-            <>
-              <Progress value={dspPct} className="h-2" />
-              <div className="flex items-center justify-between text-[12px] text-muted-foreground">
-                <span>
-                  <span className="font-mono font-semibold text-foreground">{dsp.current}</span>
-                  {" / "}
-                  <span className="font-mono font-semibold text-foreground">{dsp.total}</span>
-                  {" utilisateurs"}
-                </span>
-                <span className="font-mono">{dspPct}%</span>
-              </div>
-            </>
+          <div className="mb-[13px] h-1.5 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-300"
+              style={{ width: `${dspActive ? dspPct : sync.lastOk ? 100 : 8}%` }}
+            />
+          </div>
+
+          {alert ? (
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-primary/[0.09] text-primary">
+                <alert.icon className="h-4 w-4" />
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">{alert.text}</span>
+              <Button
+                variant="outline"
+                className="h-[26px] shrink-0 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                onClick={() => { void alert.run(); }}
+              >
+                {alert.action}
+              </Button>
+            </div>
           ) : (
-            <Progress value={undefined} className="h-2 animate-pulse" />
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
+                <Play className="h-3.5 w-3.5" />
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">Tout fonctionne</span>
+            </div>
           )}
-          <p className="text-[11px] text-muted-foreground/80">
-            Veuillez ne pas fermer l'application pendant la synchronisation.
-          </p>
-        </div>
-      )}
+        </Card>
 
-      {/* Expiry warnings */}
-      {s.loginWarning && s.loginDaysRemaining != null && s.loginDaysRemaining > 0 && (
-        <Alert variant="warning">
-          <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Session expirante</AlertTitle>
-          <AlertDescription>
-            Votre session expire dans{" "}
-            <strong>{s.loginDaysRemaining} jour{s.loginDaysRemaining > 1 ? "s" : ""}</strong>.{" "}
-            Veuillez vous reconnecter.
-          </AlertDescription>
-        </Alert>
-      )}
-      {s.contractWarning && s.contractDaysRemaining != null && s.contractDaysRemaining > 0 && (
-        <Alert variant="destructive">
-          <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>Contrat en fin de validité</AlertTitle>
-          <AlertDescription>
-            Votre contrat expire dans{" "}
-            <strong>{s.contractDaysRemaining} jour{s.contractDaysRemaining > 1 ? "s" : ""}</strong>.{" "}
-            Contactez l'équipe MonClub pour renouveler.
-          </AlertDescription>
-        </Alert>
-      )}
+        {/* Aujourd'hui */}
+        <ZoneTitle>
+          <span className="mt-[3px] inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <History className="h-3 w-3" />
+            Aujourd'hui
+          </span>
+        </ZoneTitle>
 
-      {/* System status strip — no card, horizontal info row */}
-      <div className="flex items-center gap-5 text-[12px] pb-4 border-b border-border/60">
-        <div className="flex items-center gap-1.5">
-          <StatusDot ok={agent.running} pulse />
-          <span className="text-muted-foreground">Agent</span>
-          <span className="font-medium">{agent.running ? "Actif" : "Arrêté"}</span>
-        </div>
-
-        <div className="h-3.5 w-px bg-border" />
-
-        <div className="flex items-center gap-1.5">
-          <StatusDot ok={sync.lastOk} />
-          <span className="text-muted-foreground">Sync</span>
-        </div>
-
-        <div className="h-3.5 w-px bg-border" />
-
-        <div className="flex items-center gap-1.5">
-          <StatusDot ok={status.pullsdk.connected} />
-          <span className="text-muted-foreground">PullSDK</span>
-        
-        </div>
-
-        <div className="h-3.5 w-px bg-border" />
-
-        <div className="flex items-center gap-1 text-muted-foreground font-mono">
-          <span className="text-foreground">{mode.DEVICE}</span>
-          <span>D</span>
-          <span className="mx-1 opacity-40">·</span>
-          <span className="text-foreground">{mode.AGENT}</span>
-          <span>A</span>
-          {(mode.ULTRA ?? 0) > 0 && (
-            <>
-              <span className="mx-1 opacity-40">·</span>
-              <span className="text-violet-400">{mode.ULTRA}</span>
-              <span>U</span>
-            </>
-          )}
-          {mode.UNKNOWN > 0 && (
-            <>
-              <span className="mx-1 opacity-40">·</span>
-              <span className="text-amber-400">{mode.UNKNOWN}</span>
-              <span>?</span>
-            </>
-          )}
-        </div>
-
-        <div className="ml-auto flex items-center gap-2">
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-[12px] gap-1.5 px-3 text-emerald-500 border-emerald-500/40 hover:bg-emerald-500/10 hover:text-emerald-400"
-            onClick={() => setScanOpen(true)}
-            title="Scanner une carte RFID"
-          >
-            <CreditCard className="h-3 w-3" />
-            Scan
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-[12px] gap-1.5 px-3"
-            onClick={syncNow}
-            disabled={sync.running}
-            title="Synchroniser — pousse uniquement les différences vers les appareils"
-          >
-            <RefreshCw className={cn("h-3 w-3", sync.running && "animate-spin")} />
-            {sync.running ? "En cours…" : "Synchroniser"}
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-[12px] gap-1.5 px-3 text-amber-500 border-amber-500/40 hover:bg-amber-500/10 hover:text-amber-400"
-            onClick={hardSyncNow}
-            disabled={sync.running}
-            title="Réinitialisation complète — force le rechargement de tous les membres sur les appareils"
-          >
-            <RotateCcw className={cn("h-3 w-3", sync.running && "animate-spin")} />
-            {sync.running ? "En cours…" : "Hard Reset"}
-          </Button>
-          <DashboardSuccessBeacon />
-        </div>
-      </div>
-
-      {/* Main grid — 3 columns, varying spans */}
-      <div className="grid grid-cols-3 gap-4">
-
-        {/* Agent — dominant, spans 2 columns */}
-        <Panel
-          className="col-span-2"
-          title="Agent Temps Réel"
-          icon={
-            <Bot
-              className={cn(
-                "h-3.5 w-3.5",
-                agent.running ? "text-emerald-400" : "text-amber-400",
-              )}
-            />
-          }
-        >
-          <div className="flex items-start gap-10 mb-5">
+        <Tile className="flex min-h-0 flex-1 flex-col px-5 py-4">
+          <div className="mb-3.5 flex items-end gap-5">
             <div>
-              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1.5">
-                File d'attente
-              </div>
-              <div className="text-3xl font-bold font-mono leading-none tabular-nums">
-                {agent.eventQueueDepth}
-              </div>
+              <div className="num text-[30px] leading-none">{today.total}</div>
+              <div className="mt-1 whitespace-nowrap text-[10.5px] text-muted-foreground">passages</div>
             </div>
             <div>
-              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1.5">
-                Décision moy.
-              </div>
-              <div className="text-3xl font-bold font-mono leading-none tabular-nums">
-                {agent.avgDecisionMs.toFixed(1)}
-                <span className="text-sm font-normal text-muted-foreground ml-1.5">ms</span>
-              </div>
+              <div className="text-[15px] font-bold text-emerald-700 dark:text-emerald-400">{today.granted}</div>
+              <div className="mt-[3px] text-[10.5px] text-muted-foreground">ok</div>
             </div>
-            <div className="ml-auto">
-              <StatusChip
-                variant={agent.running ? "online" : "offline"}
-                label={agent.running ? "Actif" : "Arrêté"}
+            <div>
+              <div className="text-[15px] font-bold text-primary">{today.denied}</div>
+              <div className="mt-[3px] text-[10.5px] text-muted-foreground">refusés</div>
+            </div>
+            {today.peakHour != null && (
+              <div className="ml-auto text-right">
+                <div className="text-[13px] font-bold text-foreground">{today.peakHour} h</div>
+                <div className="mt-[3px] whitespace-nowrap text-[10.5px] text-muted-foreground">pointe</div>
+              </div>
+            )}
+          </div>
+
+          {/* Hourly curve — 24 slots, the peak in the accent colour */}
+          <div className="mb-3.5 flex h-[34px] items-end gap-[2px]">
+            {(today.hourly.length === 24 ? today.hourly : new Array(24).fill(0)).map((v, h) => (
+              <span
+                key={h}
+                title={`${h} h — ${v}`}
+                className={cn("flex-1 rounded-sm", h === today.peakHour && v > 0 ? "bg-primary" : "bg-muted")}
+                style={{ height: `${Math.max(6, Math.round((v / maxBar) * 100))}%` }}
               />
+            ))}
+          </div>
+
+          <Sep className="mb-3" />
+
+          <div className="flex flex-col gap-2.5">
+            <div className="flex items-center gap-2.5">
+              <LiveDot className="h-2 w-2" tone={agent.running ? "ok" : "off"} />
+              <span className="flex-1 text-[12px] text-foreground">Agent</span>
+              <span className="font-mono text-[12px] text-muted-foreground">
+                {agent.eventQueueDepth} · {agent.avgDecisionMs.toFixed(1)} ms
+              </span>
+            </div>
+            <div className="flex items-center gap-2.5">
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", status.pullsdk.connected ? "bg-emerald-500" : "bg-primary")} />
+              <span className="flex-1 text-[12px] text-foreground">Lecteur</span>
+              <span className="truncate font-mono text-[12px] text-muted-foreground">
+                {status.pullsdk.ip || (status.pullsdk.connected ? "connecté" : "hors ligne")}
+              </span>
+            </div>
+            <div className="flex items-center gap-2.5">
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", devicesTotal > 0 ? "bg-emerald-500" : "bg-muted-foreground")} />
+              <span className="flex-1 text-[12px] text-foreground">Appareils</span>
+              <span className="text-[12px] font-semibold text-muted-foreground">
+                {devicesTotal} déclaré{devicesTotal > 1 ? "s" : ""}
+              </span>
+            </div>
+          </div>
+
+          <div className="mt-auto flex flex-col gap-2.5 border-t border-border pt-3">
+            {s.loginDaysRemaining != null && (
+              <div className="flex items-center gap-2.5">
+                <span className={cn(
+                  "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[7px]",
+                  s.loginWarning ? "bg-amber-500/[0.14] text-amber-700 dark:text-amber-400" : "bg-muted text-muted-foreground",
+                )}>
+                  <Clock className="h-[15px] w-[15px]" />
+                </span>
+                <span className="flex-1 text-[12px] text-foreground">Session</span>
+                <span className={cn(
+                  "whitespace-nowrap text-[12.5px] font-bold",
+                  s.loginWarning ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
+                )}>
+                  {s.loginDaysRemaining} jour{s.loginDaysRemaining > 1 ? "s" : ""} restant{s.loginDaysRemaining > 1 ? "s" : ""}
+                </span>
+              </div>
+            )}
+            <div className="flex items-center gap-2.5">
+              <span className="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[7px] bg-muted text-muted-foreground">
+                <DownloadCloud className="h-[15px] w-[15px]" />
+              </span>
+              <span className="flex-1 text-[12px] text-foreground">Mise à jour</span>
+              <span className="whitespace-nowrap text-[12px] text-muted-foreground">
+                {status.updates.updateAvailable
+                  ? `${status.updates.latestVersion ?? ""} ${status.updates.downloaded ? "prête" : "disponible"}`.trim()
+                  : "à jour"}
+              </span>
+            </div>
+          </div>
+        </Tile>
+
+        {/* Action tile */}
+        <Tile className="flex-none px-5 py-[15px]">
+          <div className="mb-3 flex items-center gap-2.5">
+            <Monitor className="h-[18px] w-[18px] shrink-0 text-primary" />
+            <div className="min-w-0 flex-1">
+              <div className="text-[12.5px] font-bold text-foreground">Écran d'entrée</div>
+              <div className="truncate text-[10.5px] text-muted-foreground">Affiche les accès en temps réel</div>
             </div>
           </div>
           <div className="flex gap-2">
             <Button
-              size="sm"
               variant="outline"
-              className="flex-1 h-8 text-[12px]"
-              disabled={agent.running}
-              onClick={() => post("/agent/start")}
-            >
-              <Play className="h-3 w-3" /> Démarrer
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              className="flex-1 h-8 text-[12px]"
-              disabled={!agent.running}
-              onClick={() => post("/agent/stop")}
-            >
-              <Square className="h-3 w-3" /> Arrêter
-            </Button>
-          </div>
-        </Panel>
-
-        {/* Session — right column */}
-        <Panel
-          title="Session"
-          icon={<CheckCircle className="h-3.5 w-3.5 text-emerald-400" />}
-        >
-          <div className="space-y-[2px]">
-            <Row
-              label="Email"
-              value={<span className="font-mono text-[12px]">{s.email}</span>}
-            />
-            <Row
-              label="Dernière connexion"
-              value={
-                <span className="font-mono text-[12px]">
-                  {s.lastLoginAt?.replace("T", " ").slice(0, 16) ?? "—"}
-                </span>
-              }
-            />
-            <Row
-              label="Session"
-              value={
-                s.loginDaysRemaining != null ? (
-                  <Badge
-                    className={
-                      s.loginWarning
-                        ? "border-amber-500/30 bg-amber-500/10 text-amber-400 text-[11px]"
-                        : "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
-                    }
-                  >
-                    {s.loginDaysRemaining}j
-                  </Badge>
-                ) : (
-                  "—"
-                )
-              }
-            />
-            <Row
-              label="Contrat"
-              value={
-                <Badge
-                  className={
-                    s.contractStatus
-                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400 text-[11px]"
-                      : "border-red-500/30 bg-red-500/10 text-red-400 text-[11px]"
-                  }
-                >
-                  {s.contractStatus ? "Actif" : "Inactif"}
-                </Badge>
-              }
-            />
-            {s.contractEndDate && (
-              <Row
-                label="Échéance"
-                value={
-                  <span className="font-mono text-[12px]">{s.contractEndDate}</span>
-                }
-              />
-            )}
-          </div>
-        </Panel>
-
-        {/* Sync */}
-        <Panel
-          title="Synchronisation"
-          icon={<RefreshCw className="h-3.5 w-3.5 text-primary" />}
-        >
-          <div className="space-y-[2px]">
-            <Row
-              label="Statut"
-              value={
-                <StatusChip
-                  variant={sync.running ? "syncing" : sync.lastOk ? "online" : "error"}
-                  label={sync.running ? "En cours" : sync.lastOk ? "OK" : "Échoué"}
-                />
-              }
-            />
-            <Row
-              label="Dernière sync"
-              value={
-                <span className="font-mono text-[12px]">
-                  {sync.lastSyncAt?.replace("T", " ").slice(0, 16) ?? "Jamais"}
-                </span>
-              }
-            />
-          </div>
-        </Panel>
-
-        {/* PullSDK */}
-        <Panel
-          title="PullSDK"
-          icon={<Users className="h-3.5 w-3.5 text-primary" />}
-        >
-          <div className="space-y-[2px]">
-            <Row
-              label="Connecté"
-              value={
-                <StatusChip
-                  variant={status.pullsdk.connected ? "online" : "offline"}
-                  label={status.pullsdk.connected ? "Oui" : "Non"}
-                />
-              }
-            />
-            {status.pullsdk.deviceId && (
-              <Row
-                label="Appareil"
-                value={
-                  <span className="font-mono text-[12px]">#{status.pullsdk.deviceId}</span>
-                }
-              />
-            )}
-            {status.pullsdk.ip && (
-              <Row
-                label="IP"
-                value={
-                  <span className="font-mono text-[12px]">{status.pullsdk.ip}</span>
-                }
-              />
-            )}
-          </div>
-        </Panel>
-
-        {/* Notification Screen */}
-        <Panel
-          title="Écran Notification"
-          icon={<Monitor className="h-3.5 w-3.5 text-primary" />}
-        >
-          <p className="text-[12px] text-muted-foreground mb-3 leading-relaxed">
-            Ouvrez l'écran pour afficher les accès en temps réel.
-          </p>
-          <div className="flex gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              className="flex-1 h-8 text-[12px]"
+              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
               onClick={openPopupWindow}
             >
-              <Monitor className="h-3 w-3" /> Ouvrir
+              <Monitor className="h-[15px] w-[15px]" />Ouvrir
             </Button>
             <Button
-              size="sm"
-              variant="ghost"
-              className="h-8 text-[12px]"
+              variant="outline"
+              className="h-8 flex-1 gap-1.5 rounded-[14px] text-[12px] font-semibold"
               onClick={sendTestNotification}
             >
-              <Bug className="h-3 w-3" /> Test
+              <Bug className="h-[15px] w-[15px]" />Tester
             </Button>
           </div>
-        </Panel>
+        </Tile>
 
-        {/* Appareils */}
-        <Panel
-          title="Appareils"
-          icon={<Router className="h-3.5 w-3.5 text-primary" />}
+        {/* Hard reset stays reachable — it is a destructive action the old
+            dashboard exposed, and the design has no other home for it. */}
+        <Button
+          variant="ghost"
+          className="h-8 shrink-0 gap-1.5 self-start px-2 text-[11.5px] text-muted-foreground hover:text-primary"
+          onClick={() => { void hardSyncNow(); }}
+          disabled={syncRunning}
+          title="Réinitialisation complète — recharge tous les membres sur les appareils"
         >
-          <div className="flex gap-6">
-            <div>
-              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
-                Device
-              </div>
-              <div className="text-2xl font-bold font-mono tabular-nums">{mode.DEVICE}</div>
-            </div>
-            <div>
-              <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
-                Agent
-              </div>
-              <div className="text-2xl font-bold font-mono tabular-nums">{mode.AGENT}</div>
-            </div>
-            {(mode.ULTRA ?? 0) > 0 && (
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
-                  Ultra
-                </div>
-                <div className="text-2xl font-bold font-mono tabular-nums text-violet-400">
-                  {mode.ULTRA}
-                </div>
-              </div>
-            )}
-            {mode.UNKNOWN > 0 && (
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mb-1">
-                  Inconnu
-                </div>
-                <div className="text-2xl font-bold font-mono tabular-nums text-amber-400">
-                  {mode.UNKNOWN}
-                </div>
-              </div>
-            )}
-          </div>
-        </Panel>
-
+          <RotateCcw className={cn("h-3.5 w-3.5", syncRunning && "animate-spin")} />
+          Réinitialisation complète
+        </Button>
       </div>
 
-      <ScanCardModal
-        open={scanOpen}
-        onClose={(cardNumber) => {
-          setScanOpen(false);
-          if (cardNumber) {
-            console.log("Scanned card:", cardNumber);
-          }
-        }}
-      />
+      <ScanCardModal open={scanOpen} onClose={() => setScanOpen(false)} />
     </div>
   );
 }

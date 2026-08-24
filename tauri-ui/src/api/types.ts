@@ -100,6 +100,40 @@ export interface StatusResponse extends ApiOk {
   updates: UpdatesBlock;
 }
 
+// ─── A-bis) Dashboard (GET /api/v2/dashboard/overview) ───
+/** One row of the dashboard's "Fil de la journée", resolved from access_history. */
+export interface DashboardFeedItem {
+  eventId: string;
+  /** "YYYY-MM-DDTHH:MM:SS" local. */
+  at: string;
+  allowed: boolean;
+  reason: string;
+  cardNo: string;
+  deviceId: number | null;
+  deviceName: string;
+  /** Credential family as classified by the backend (CARD | QR | FINGERPRINT | …). */
+  method: string;
+  /** Empty when the row could not be resolved to a member — show the card instead. */
+  userFullName: string;
+  membershipTitle: string;
+  membersType: string;
+  source: string;
+}
+
+export interface DashboardToday {
+  total: number;
+  granted: number;
+  denied: number;
+  /** 24 slots, index = hour of the local day. */
+  hourly: number[];
+  peakHour: number | null;
+}
+
+export interface DashboardOverview extends ApiOk {
+  feed: DashboardFeedItem[];
+  today: DashboardToday;
+}
+
 // ─── B) Auth ───
 export interface LoginRequest { email: string; password: string }
 export interface LoginResponse extends ApiOk { token: string }
@@ -1065,7 +1099,7 @@ export interface PopupEvent {
   userMembershipId: number | null;
   /** Membership plan name (title) of the scanning member, if known. */
   userMembershipTitle?: string;
-  /** Membership category: "NORMAL" | "KIDS" | "STAFF" (badge in the popup). */
+  /** Membership category: "NORMAL" | "KIDS" | "STAFF" | "COACH" | "VIP" (badge in the popup). */
   userMembersType?: string;
   userPhone: string;
   deviceId: number;
@@ -1078,6 +1112,18 @@ export interface PopupEvent {
   winNotifyEnabled?: boolean;
   /** Timestamp when the event was received client-side */
   receivedAt?: number;
+  // ── Frequent-pass VISUAL alert (X passages inside Y minutes) ──
+  // Set by the access engine only when the device has the alert configured AND the
+  // threshold is crossed. ALERT ONLY — never affects `allowed`, the door, or any
+  // access decision. 0 / "" means "not triggered", which is the normal case.
+  /** This member's passages inside the window, INCLUDING the current one. */
+  repeatCount?: number;
+  /** The configured X, so the screen can say "plus de X passages". */
+  repeatLimit?: number;
+  /** The configured Y, in minutes. */
+  repeatWindowMin?: number;
+  /** "YYYY-MM-DD HH:MM:SS" of the previous passage — "premier passage a HH:MM". */
+  previousEntryAt?: string;
   /** ISO date string (YYYY-MM-DD) of the member's birthday, if available */
   userBirthday?: string;
   /** "PROFILE_BORROWED" | "GYM_UPLOAD" | "GYM_CAPTURE" | "GYM_GALLERY" | undefined */

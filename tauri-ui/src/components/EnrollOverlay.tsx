@@ -83,24 +83,23 @@ export default function EnrollOverlay({
       <div
         role="dialog"
         aria-modal="true"
-        className="bg-card border rounded-2xl p-8 max-w-sm w-full mx-4 shadow-2xl flex flex-col items-center gap-5"
+        className="mx-4 flex w-full max-w-sm flex-col items-center gap-5 rounded-3xl bg-card p-8 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.45)]"
       >
-        {/* Member info strip */}
+        {/* Member strip — the design keeps the same silhouette on every phase:
+            initials, name, and the finger number in mono on the right. */}
         {(fullName || fingerId !== undefined) && (
-          <div className="flex items-center gap-3 w-full bg-muted/50 rounded-lg px-3 py-2">
-            <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center flex-shrink-0">
-              <User className="w-4 h-4 text-primary" />
+          <div className="flex w-full items-center gap-2 rounded-xl bg-muted px-[9px] py-1.5">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-[18px] bg-primary/10 text-[10px] font-bold text-primary">
+              {fullName
+                ? (fullName.trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("") || "?").toUpperCase()
+                : <User className="h-3.5 w-3.5" />}
+            </span>
+            <div className="min-w-0 flex-1 text-left">
+              <div className="truncate text-[11.5px] font-semibold text-foreground">{fullName ?? "—"}</div>
             </div>
-            <div className="flex-1 min-w-0">
-              {fullName && (
-                <p className="text-sm font-medium truncate">{fullName}</p>
-              )}
-              {fingerId !== undefined && (
-                <p className="text-xs text-muted-foreground">
-                  Doigt #{fingerId}
-                </p>
-              )}
-            </div>
+            {fingerId !== undefined && (
+              <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">#{fingerId}</span>
+            )}
           </div>
         )}
 
@@ -112,8 +111,8 @@ export default function EnrollOverlay({
 
         {/* Timeout warning */}
         {timedOut && (
-          <p className="text-xs text-orange-500 animate-pulse">
-            Cette etape prend plus de temps que prevu...
+          <p className="animate-pulse text-[11.5px] text-amber-600 dark:text-amber-400">
+            Cette étape prend plus de temps que prévu…
           </p>
         )}
 
@@ -126,37 +125,33 @@ export default function EnrollOverlay({
             variant="outline"
             size="sm"
             onClick={onCancel}
-            className="w-full"
+            className="h-[30px] w-full justify-center rounded-[14px] text-[12px] font-semibold"
           >
             Annuler
           </Button>
         )}
         {phase === "failed" && (
-          <div className="flex flex-col gap-2 w-full">
+          <div className="flex w-full flex-col gap-2">
             {retryAvailable && onRetryPush && (
               <Button
-                variant="default"
-                size="sm"
                 onClick={onRetryPush}
-                className="w-full"
+                className="h-[34px] w-full justify-center rounded-full text-[12.5px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
               >
-                Reessayer la sauvegarde
+                Réessayer la sauvegarde
               </Button>
             )}
             <Button
               variant="outline"
               size="sm"
               onClick={onDismiss}
-              className="w-full"
+              className="h-[30px] w-full justify-center rounded-[14px] text-[12px] font-semibold"
             >
               Fermer
             </Button>
           </div>
         )}
         {phase === "success" && (
-          <p className="text-xs text-muted-foreground">
-            Fermeture automatique...
-          </p>
+          <p className="text-[11.5px] text-muted-foreground">Fermeture automatique…</p>
         )}
       </div>
     </div>,
@@ -269,7 +264,7 @@ const PHASE_COPY: Record<EnrollPhase, { title: string; instruction: string }> = 
   connecting:      { title: "Connexion...",            instruction: "Vérification des informations..." },
   device_init:     { title: "Initialisation scanner", instruction: "Connexion au ZK9500..." },
   wait_finger:     { title: "Posez votre doigt",       instruction: "Appuyez fermement sur le scanner ZK9500" },
-  lift_finger:     { title: "Levez le doigt !",        instruction: "Décolllez puis replacez votre doigt" },
+  lift_finger:     { title: "Levez le doigt !",        instruction: "Décollez puis reposez votre doigt" },
   sample_rejected: { title: "Réessayez",               instruction: "Même doigt — appuyez plus fermement" },
   processing:      { title: "Traitement...",           instruction: "Fusion des empreintes en cours..." },
   push:            { title: "Sauvegarde...",           instruction: "Enregistrement sur le serveur..." },

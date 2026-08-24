@@ -26,7 +26,11 @@ import {
   Eye,
   EyeOff,
   X,
+  Timer,
+  AlertCircle,
 } from "lucide-react";
+import { usePageChrome } from "@/context/PageChromeContext";
+import { cn } from "@/lib/utils";
 import * as XLSX from "xlsx";
 import {
   buildSmartColumns,
@@ -67,14 +71,13 @@ function fmtMs(ms: number): string {
 // ─── lock screen ──────────────────────────────────────────────────────────────
 
 function LockScreen({ onUnlock }: { onUnlock: () => void }) {
-  const [dialogOpen, setDialogOpen] = useState(false);
   const [password, setPassword] = useState("");
   const [showPwd, setShowPwd] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleConfirm = useCallback(async () => {
-    if (!password.trim() || loading) return;
+    if (!password.trim() || loading) return; // eslint-disable-line
     setLoading(true);
     setError(null);
     try {
@@ -86,7 +89,6 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
       if (res.ok) {
         const exp = Date.now() + SESSION_MS;
         sessionStorage.setItem(UNLOCK_KEY, JSON.stringify({ exp }));
-        setDialogOpen(false);
         setPassword("");
         onUnlock();
       } else {
@@ -102,161 +104,95 @@ function LockScreen({ onUnlock }: { onUnlock: () => void }) {
     }
   }, [password, loading, onUnlock]);
 
-  const closeDialog = useCallback(() => {
-    if (loading) return;
-    setDialogOpen(false);
-    setPassword("");
-    setError(null);
-  }, [loading]);
-
+  // Access v3, screen 07 — the only screen in the refonte WITHOUT a rail: when
+  // there is exactly one thing to do, everything else disappears. The password
+  // is entered inline rather than in a dialog (design's explicit change); the
+  // auth call itself is untouched.
   return (
     <>
-      {/* ── animated ring keyframes ── */}
       <style>{`
         @keyframes db-ring {
-          0%   { transform: scale(1);   opacity: 0.5; }
-          100% { transform: scale(2.2); opacity: 0;   }
+          0%   { transform: scale(1);   opacity: .5; }
+          100% { transform: scale(2.2); opacity: 0;  }
         }
-        .db-ring-1 { animation: db-ring 2.6s ease-out infinite; }
-        .db-ring-2 { animation: db-ring 2.6s ease-out infinite 1.3s; }
+        .db-ring-1 { animation: db-ring 2.8s ease-out infinite; }
+        .db-ring-2 { animation: db-ring 2.8s ease-out infinite 1.4s; }
       `}</style>
 
-      {/* ── lock screen ── */}
-      <div className="flex flex-col items-center justify-center min-h-[72vh] select-none">
+      <div className="relative flex h-full min-h-0 select-none items-center justify-center overflow-hidden">
+        <div className="relative flex w-[420px] flex-col items-center text-center">
 
-        {/* icon with rings */}
-        <div className="relative flex items-center justify-center mb-8" style={{ width: 96, height: 96 }}>
-          <span
-            className="db-ring-1 absolute inset-0 rounded-full border border-primary/25"
-            style={{ borderRadius: "50%" }}
-          />
-          <span
-            className="db-ring-2 absolute inset-0 rounded-full border border-primary/12"
-            style={{ borderRadius: "50%" }}
-          />
-          <div
-            className="w-20 h-20 rounded-full flex items-center justify-center"
-            style={{
-              background: "rgba(30,144,255,0.05)",
-              border: "1.5px solid rgba(30,144,255,0.2)",
-              boxShadow: "0 0 28px rgba(30,144,255,0.08), inset 0 0 16px rgba(30,144,255,0.03)",
-            }}
-          >
-            <Lock className="w-8 h-8 text-primary" strokeWidth={1.8} />
+          <div className="relative mb-[30px] flex h-[108px] w-[108px] items-center justify-center">
+            <span className="db-ring-1 absolute h-24 w-24 rounded-full bg-primary/10" />
+            <span className="db-ring-2 absolute h-24 w-24 rounded-full bg-primary/[0.08]" />
+            <div className="relative flex h-[88px] w-[88px] items-center justify-center rounded-full border-[1.5px] border-primary/20 bg-card text-primary shadow-[0_8px_20px_rgba(226,32,63,0.10)]">
+              <Lock className="h-[38px] w-[38px]" strokeWidth={1.6} />
+            </div>
           </div>
-        </div>
 
-        {/* label */}
-        <p
-          className="text-[10px] font-mono tracking-[0.38em] mb-3 uppercase"
-          style={{ color: "rgba(30,144,255,0.55)" }}
-        >
-          ACCÈS RESTREINT
-        </p>
+          <p className="mb-3.5 font-mono text-[10px] font-bold uppercase tracking-[0.38em] text-primary">
+            Accès restreint
+          </p>
+          <h2 className="mb-3 font-display text-[32px] font-extrabold leading-[1.1] tracking-[-0.03em] text-foreground">
+            Autorisation requise
+          </h2>
+          <p className="mb-[30px] max-w-[330px] text-[14.5px] leading-[1.6] text-muted-foreground">
+            Cette section contient les données brutes du club. Saisissez le mot de passe
+            administrateur pour l'ouvrir.
+          </p>
 
-        {/* headline */}
-        <h2 className="text-[1.45rem] font-bold text-foreground mb-3 tracking-tight">
-          Autorisation requise
-        </h2>
-
-        {/* body */}
-        <p className="text-sm text-muted-foreground text-center max-w-[280px] leading-relaxed mb-8">
-          Cette section est protégée.
-          <br />
-          Entrez le mot de passe administrateur
-          <br />
-          pour y accéder temporairement.
-        </p>
-
-        {/* unlock button */}
-        <Button
-          variant="outline"
-          onClick={() => setDialogOpen(true)}
-          className="gap-2 font-mono text-[11px] tracking-widest uppercase h-10 px-6"
-          style={{
-            borderColor: "rgba(30,144,255,0.28)",
-            color: "rgba(30,144,255,0.9)",
-          }}
-        >
-          <Key className="w-3.5 h-3.5" />
-          Entrer le mot de passe
-        </Button>
-      </div>
-
-      {/* ── password dialog ── */}
-      <Dialog open={dialogOpen} onOpenChange={closeDialog}>
-        <DialogContent className="sm:max-w-[360px]">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-[15px]">
-              <Key className="w-4 h-4 text-primary" />
-              Autorisation administrateur
-            </DialogTitle>
-          </DialogHeader>
-
-          <div className="space-y-3 pt-1 pb-2">
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">
-                Mot de passe admin
-              </Label>
-              <div className="relative">
-                <Input
-                  type={showPwd ? "text" : "password"}
-                  value={password}
-                  onChange={(e) => {
-                    setPassword(e.target.value);
-                    setError(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !loading) handleConfirm();
-                  }}
-                  disabled={loading}
-                  autoFocus
-                  placeholder="••••••••"
-                  className="pr-9"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPwd((v) => !v)}
-                  tabIndex={-1}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  {showPwd
-                    ? <EyeOff className="w-3.5 h-3.5" />
-                    : <Eye className="w-3.5 h-3.5" />}
-                </button>
-              </div>
+          <div className="flex w-[320px] flex-col gap-[11px]">
+            <div className="relative">
+              <Key className="pointer-events-none absolute left-[15px] top-1/2 h-[19px] w-[19px] -translate-y-1/2 text-muted-foreground" />
+              <Input
+                type={showPwd ? "text" : "password"}
+                value={password}
+                onChange={(e) => { setPassword(e.target.value); setError(null); }}
+                onKeyDown={(e) => { if (e.key === "Enter" && !loading) handleConfirm(); }}
+                disabled={loading}
+                autoFocus
+                placeholder="••••••••"
+                className={cn(
+                  "h-[46px] rounded-xl border-[1.5px] pl-[46px] pr-[42px] text-[15px] tracking-[0.1em]",
+                  error ? "border-primary" : "border-border focus-visible:border-primary",
+                )}
+              />
+              <button
+                type="button"
+                tabIndex={-1}
+                onClick={() => setShowPwd((v) => !v)}
+                className="absolute right-[15px] top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
+              >
+                {showPwd ? <EyeOff className="h-[18px] w-[18px]" /> : <Eye className="h-[18px] w-[18px]" />}
+              </button>
             </div>
 
             {error && (
-              <Alert variant="destructive" className="py-2">
-                <AlertDescription className="text-xs">{error}</AlertDescription>
-              </Alert>
+              <div className="flex items-start gap-[9px] rounded-xl border border-primary/20 bg-primary/[0.05] px-[13px] py-2.5 text-left">
+                <AlertCircle className="mt-px h-4 w-4 shrink-0 text-primary" />
+                <span className="text-[12px] leading-[1.5] text-primary">{error}</span>
+              </div>
             )}
-          </div>
 
-          <DialogFooter className="gap-2">
             <Button
-              variant="ghost"
-              size="sm"
-              onClick={closeDialog}
-              disabled={loading}
-            >
-              Annuler
-            </Button>
-            <Button
-              size="sm"
               onClick={handleConfirm}
               disabled={loading || !password.trim()}
-              className="gap-1.5"
+              className="h-[46px] w-full justify-center gap-2 rounded-full text-[14px] font-bold shadow-[0_8px_20px_rgba(226,32,63,0.22)]"
             >
-              {loading
-                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                : <LockOpen className="w-3.5 h-3.5" />}
-              {loading ? "Vérification…" : "Confirmer"}
+              {loading ? <Loader2 className="h-[18px] w-[18px] animate-spin" /> : <LockOpen className="h-[18px] w-[18px]" />}
+              {loading ? "Vérification…" : "Déverrouiller"}
             </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          </div>
+
+          {/* The duration below is SESSION_MS, not the design's placeholder copy. */}
+          <div className="mt-[26px] flex items-center gap-2">
+            <Timer className="h-[15px] w-[15px] text-muted-foreground" />
+            <span className="text-[11.5px] text-muted-foreground">
+              La session se reverrouille automatiquement après {Math.round(SESSION_MS / 60000)} minutes
+            </span>
+          </div>
+        </div>
+      </div>
     </>
   );
 }
@@ -479,6 +415,70 @@ export default function LocalDbPage() {
     "fingerprints", "access_history", "auth_tokens", "sync_cache_meta",
   ];
 
+  // Rail table list with row counts — GET /api/v2/db/tables already returns
+  // [{name, rowCount}] for every table in the SQLite file, so no count is
+  // estimated here. Loaded once per unlock.
+  const [tableStats, setTableStats] = useState<{ name: string; rowCount: number }[]>([]);
+  useEffect(() => {
+    if (!unlocked) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await get<{ tables?: { name: string; rowCount: number }[] }>("/db/tables");
+        if (!cancelled) setTableStats(Array.isArray(res?.tables) ? res.tables : []);
+      } catch { /* rail falls back to the static TABLES list without counts */ }
+    })();
+    return () => { cancelled = true; };
+  }, [unlocked]);
+
+  const countOf = useCallback(
+    (name: string) => tableStats.find((t) => t.name === name)?.rowCount ?? null,
+    [tableStats],
+  );
+
+  // Which dataset the current tab is showing, for the export action + card meta.
+  const activeExport = tab === "sync"
+    ? { rows: syncUsers, name: "sync-users" }
+    : tab === "history"
+      ? { rows: historyRows, name: "access-history" }
+      : { rows: rawRows, name: tableName };
+
+  const sessionPct = Math.max(0, Math.min(100, Math.round((remaining / SESSION_MS) * 100)));
+
+  usePageChrome(() => ({
+    fill: true,
+    subtitle: unlocked ? (
+      <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-emerald-500/[0.055] px-2 text-[11px] font-bold text-emerald-700 dark:text-emerald-400">
+        <LockOpen className="h-3 w-3" />Déverrouillée · {fmtMs(remaining)}
+      </span>
+    ) : (
+      <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.09] px-2 text-[11px] font-bold text-primary">
+        <Lock className="h-3 w-3" />Verrouillée
+      </span>
+    ),
+    actions: unlocked ? (
+      <>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          disabled={activeExport.rows.length === 0}
+          onClick={() => exportToExcel(activeExport.rows, activeExport.name)}
+        >
+          <Download className="h-[15px] w-[15px]" />Exporter en Excel
+        </Button>
+        <Button
+          variant="outline"
+          className="h-[30px] gap-1.5 rounded-[14px] px-[13px] text-[12px] font-semibold"
+          onClick={handleLock}
+        >
+          <Lock className="h-[15px] w-[15px]" />Verrouiller
+        </Button>
+      </>
+    ) : undefined,
+    // Primitives only — see the note in UsersPage: a changing function
+    // reference here re-runs the effect on every render and loops.
+  }), [unlocked, remaining, tab, activeExport.rows.length, activeExport.name]);
+
   // ── render lock screen ──
   if (!unlocked) {
     return <LockScreen onUnlock={handleUnlock} />;
@@ -487,24 +487,24 @@ export default function LocalDbPage() {
   // ── render content ──
   return (
     <TooltipProvider>
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <Database className="h-5 w-5 text-primary" />
-          <h1 className="text-lg font-semibold">Base de données locale</h1>
+    <div className="flex h-full min-h-0 gap-4">
+      {/* ── Le sujet : la table, pleine hauteur ─────────────────────────── */}
+      <div className="flex min-w-0 flex-1 flex-col gap-[11px]">
+      <Tabs value={tab} onValueChange={setTab} className="flex min-h-0 flex-1 flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <TabsList className="h-[34px] rounded-xl bg-muted p-[3px]">
+            <TabsTrigger value="sync" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Cache Sync</TabsTrigger>
+            <TabsTrigger value="history" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Historique accès</TabsTrigger>
+            <TabsTrigger value="raw" className="h-7 rounded-[9px] px-[13px] text-[12.5px] data-[state=active]:font-bold">Table brute</TabsTrigger>
+          </TabsList>
+          <span className="ml-auto inline-flex items-center gap-2 text-[11.5px] text-muted-foreground">
+            <Database className="h-[15px] w-[15px]" />
+            {activeExport.rows.length} ligne{activeExport.rows.length > 1 ? "s" : ""} chargée{activeExport.rows.length > 1 ? "s" : ""}
+          </span>
         </div>
-        <SessionBadge remaining={remaining} onLock={handleLock} />
-      </div>
-
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList>
-          <TabsTrigger value="sync">Cache Sync</TabsTrigger>
-          <TabsTrigger value="history">Historique accès</TabsTrigger>
-          <TabsTrigger value="raw">Table brute</TabsTrigger>
-        </TabsList>
 
         {/* Sync cache tab */}
-        <TabsContent value="sync" className="space-y-3">
+        <TabsContent value="sync" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
           <div className="flex items-center gap-2">
             <Button size="sm" variant="outline" onClick={loadSync} disabled={syncLoading}>
               {syncLoading
@@ -544,7 +544,7 @@ export default function LocalDbPage() {
         </TabsContent>
 
         {/* History tab */}
-        <TabsContent value="history" className="space-y-3">
+        <TabsContent value="history" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
           <div className="flex items-center gap-2">
             <Button size="sm" variant="outline" onClick={loadHistory} disabled={historyLoading}>
               {historyLoading
@@ -581,7 +581,7 @@ export default function LocalDbPage() {
         </TabsContent>
 
         {/* Raw table tab */}
-        <TabsContent value="raw" className="space-y-3">
+        <TabsContent value="raw" className="mt-0 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-3xl bg-card p-5 shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
           <div className="flex items-center gap-2 flex-wrap">
             <Select
               value={tableName}
@@ -632,6 +632,73 @@ export default function LocalDbPage() {
           )}
         </TabsContent>
       </Tabs>
+      </div>
+
+      {/* ── Le rail ─────────────────────────────────────────────────────── */}
+      <div className="flex w-[330px] flex-none flex-col gap-[11px]">
+        <div className="flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-primary/[0.08] px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-primary">
+            <Timer className="h-3 w-3" />Session
+          </span>
+        </div>
+
+        {/* The countdown is the real sessionStorage lease (SESSION_MS), the same
+            value that re-locks the page when it reaches zero. */}
+        <div className="flex-none rounded-3xl bg-card px-5 py-[18px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          <div className="mb-[13px] flex items-center gap-[13px]">
+            <span className="flex h-[42px] w-[42px] shrink-0 items-center justify-center rounded-[18px] bg-emerald-500/[0.055] text-emerald-700 dark:text-emerald-400">
+              <LockOpen className="h-[21px] w-[21px]" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="num text-[20px] leading-none">{fmtMs(remaining)}</div>
+              <div className="mt-1 text-[11.5px] text-muted-foreground">avant reverrouillage</div>
+            </div>
+          </div>
+          <div className="mb-[13px] h-1.5 overflow-hidden rounded-full bg-muted">
+            <div className="h-full rounded-full bg-emerald-500 transition-[width] duration-1000" style={{ width: `${sessionPct}%` }} />
+          </div>
+          <Button
+            variant="outline"
+            className="h-8 w-full justify-center gap-1.5 rounded-[14px] text-[12px] font-semibold"
+            onClick={handleLock}
+          >
+            <Lock className="h-[15px] w-[15px]" />Verrouiller maintenant
+          </Button>
+        </div>
+
+        <div className="mt-[3px] flex flex-none items-center gap-[9px]">
+          <span className="inline-flex h-[22px] items-center gap-1.5 rounded-lg bg-muted px-[9px] text-[10.5px] font-bold uppercase tracking-[0.05em] text-muted-foreground">
+            <Database className="h-3 w-3" />Tables
+          </span>
+          <span className="text-[11.5px] text-muted-foreground">{tableStats.length || TABLES.length}</span>
+        </div>
+        <div className="flex min-h-0 flex-1 flex-col gap-[3px] overflow-y-auto rounded-[18px] bg-card px-[18px] py-[11px] shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
+          {(tableStats.length ? tableStats.map((t) => t.name) : TABLES).map((name) => {
+            const active = tab === "raw" && tableName === name;
+            const c = countOf(name);
+            return (
+              <button
+                key={name}
+                onClick={() => { setTab("raw"); setTableName(name); void loadRawTable(name); }}
+                className={cn(
+                  "flex items-center justify-between gap-2.5 rounded-[10px] px-2.5 py-[7px] text-left transition-colors",
+                  active ? "bg-foreground" : "hover:bg-muted",
+                )}
+              >
+                <span className={cn("truncate font-mono text-[12px]", active ? "font-semibold text-background" : "text-muted-foreground")}>
+                  {name}
+                </span>
+                {c != null && (
+                  <span className={cn("shrink-0 font-mono text-[11px]", active ? "text-background/70" : "text-muted-foreground")}>
+                    {c.toLocaleString("fr-FR")}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
       <CellDetailModal state={modalState} onClose={closeModal} />
     </div>
     </TooltipProvider>

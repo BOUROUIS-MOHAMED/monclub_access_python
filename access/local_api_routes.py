@@ -103,6 +103,7 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/agent/events", "_handle_agent_events_sse"),
     ("GET", "/api/v2/popup/poll", "_handle_popup_poll"),
     ("POST", "/api/v2/popup/telemetry", "_handle_popup_telemetry"),
+    ("GET", "/api/v2/dashboard/overview", "_handle_dashboard_overview"),
     ("GET", "/api/v2/agent/settings/global", "_handle_agent_settings_global"),
     ("GET", "/api/v2/agent/settings/device/{deviceId}", "_handle_agent_settings_device"),
     ("POST", "/api/v2/enroll/start", "_handle_enroll_start"),

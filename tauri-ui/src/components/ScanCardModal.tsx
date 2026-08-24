@@ -54,9 +54,9 @@ export default function ScanCardModal({ open, onClose }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!v) handleClose(); }}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="rounded-3xl sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+          <DialogTitle className="flex items-center gap-2 font-display text-[18px] font-extrabold tracking-[-0.02em]">
             <CreditCard className="h-5 w-5" />
             Scanner une carte
           </DialogTitle>

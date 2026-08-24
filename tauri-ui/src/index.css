@@ -1,5 +1,19 @@
 @import "tailwindcss";
 
+/* Access v3 type pair — Red Hat Display for headings/numerals, Source Sans 3
+ * for everything else. Self-hosted via @fontsource (bundled by Vite) so the
+ * desktop app renders correctly offline, with no Google Fonts request. */
+@import "@fontsource/red-hat-display/500.css";
+@import "@fontsource/red-hat-display/600.css";
+@import "@fontsource/red-hat-display/700.css";
+@import "@fontsource/red-hat-display/800.css";
+@import "@fontsource/red-hat-display/900.css";
+@import "@fontsource/source-sans-3/400.css";
+@import "@fontsource/source-sans-3/500.css";
+@import "@fontsource/source-sans-3/600.css";
+@import "@fontsource/source-sans-3/700.css";
+@import "@fontsource/source-sans-3/800.css";
+
 /*
  * Brand palette -- derived from src/theme/colors.ts
  * Colors are injected from src/theme/colors.ts at runtime.
@@ -44,6 +58,27 @@
 :root {
   --radius: 0.625rem;
   --font-mono: "IBM Plex Mono", "Consolas", "Cascadia Code", monospace;
+  /* Access v3 type pair */
+  --font-display: "Red Hat Display", "Segoe UI Variable Display", system-ui, sans-serif;
+  --font-sans-ui: "Source Sans 3", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+}
+
+@theme inline {
+  --font-display: var(--font-display);
+}
+
+@layer utilities {
+  /* Headings, page titles and every big numeral in the design use Red Hat
+     Display with tight tracking; body copy uses Source Sans 3. */
+  .font-display {
+    font-family: var(--font-display);
+  }
+  .num {
+    font-family: var(--font-display);
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    font-variant-numeric: tabular-nums;
+  }
 }
 
 .dark {
@@ -69,7 +104,7 @@
     @apply bg-background text-foreground;
     margin: 0;
     overflow: hidden;
-    font-family: "IBM Plex Sans", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    font-family: var(--font-sans-ui);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }

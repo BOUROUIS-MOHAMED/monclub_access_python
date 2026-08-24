@@ -4769,6 +4769,52 @@ def _handle_popup_telemetry(ctx: _Ctx) -> None:
         pass
 
 
+# Granted-entries-today counter for the popup idle screen ("N passages
+# aujourd'hui"). CACHED ON PURPOSE: the popup polls /popup/poll every 1.5s and
+# the access DB sits on the hot path of the access engine, so the COUNT is
+# evaluated at most once a minute (and only ever while a popup window is open).
+_POPUP_TODAY_TTL_SEC = 60.0
+_popup_today_lock = threading.Lock()
+_popup_today_cache: Dict[str, Any] = {"day": "", "value": 0, "at": 0.0}
+
+
+def _popup_granted_today() -> int:
+    """Number of GRANTED access events recorded for the local calendar day.
+
+    Rows are stamped with local time (``now_iso()`` → "YYYY-MM-DD HH:MM:SS"), so
+    a leading substr comparison is both correct and index-free. Never raises —
+    the idle screen simply hides the counter when this returns 0.
+    """
+    import datetime as _dt
+
+    now = time.time()
+    today = _dt.datetime.now().strftime("%Y-%m-%d")
+    with _popup_today_lock:
+        if _popup_today_cache["day"] == today and now - float(_popup_today_cache["at"]) < _POPUP_TODAY_TTL_SEC:
+            return int(_popup_today_cache["value"])
+
+    value = 0
+    try:
+        from access.store import get_conn as _get_conn
+
+        with _get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM access_history
+                WHERE allowed = 1
+                  AND substr(COALESCE(NULLIF(event_time, ''), created_at), 1, 10) = ?
+                """,
+                (today,),
+            ).fetchone()
+        value = int(row[0]) if row else 0
+    except Exception:
+        value = 0
+
+    with _popup_today_lock:
+        _popup_today_cache.update({"day": today, "value": value, "at": now})
+    return value
+
+
 def _handle_popup_poll(ctx: _Ctx) -> None:
     """GET /api/v2/popup/poll?since_agent=<n>&since_ultra=<m> — polling fallback
     for the popup window.
@@ -4814,7 +4860,178 @@ def _handle_popup_poll(ctx: _Ctx) -> None:
         seq_ultra = max(0, since_ultra)
 
     try:
-        ctx.send_json(200, {"seqAgent": seq_agent, "seqUltra": seq_ultra, "events": events})
+        ctx.send_json(200, {
+            "seqAgent": seq_agent,
+            "seqUltra": seq_ultra,
+            "events": events,
+            # Idle-screen footer ("N passages aujourd'hui"); TTL-cached, see above.
+            "todayCount": _popup_granted_today(),
+        })
+    except Exception:
+        pass
+
+
+# ==================== 6a-bis) DASHBOARD ====================
+#
+# Feeds the Access v3 dashboard ("Fil + rail double"): the day's timeline down
+# the middle and the day's totals in the rail. Both come from `access_history`,
+# which stores only card_no/event_time/allowed/reason — no member name — so rows
+# are resolved to a member through the same helpers the backend uploader uses
+# (_user_indexes / _resolve_history_user), and the plan title through the
+# already-warm membership-brief cache. Rows that cannot be resolved are returned
+# with userFullName="" and the UI falls back to the card number.
+
+_DASH_FEED_LIMIT_MAX = 60
+_DASH_USERS_TTL_SEC = 60.0
+_DASH_TODAY_TTL_SEC = 30.0
+_dash_lock = threading.Lock()
+_dash_users_cache: Dict[str, Any] = {"at": 0.0, "by_am": {}, "by_card": {}, "devices": {}}
+_dash_today_cache: Dict[str, Any] = {"at": 0.0, "day": "", "value": None}
+
+
+def _dash_user_indexes() -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
+    """Member/device lookup tables for the feed, TTL-cached.
+
+    load_sync_cache() reads the whole member roster; doing that per request
+    would put a full deserialize on every dashboard poll, so it is rebuilt at
+    most once a minute.
+    """
+    now = time.time()
+    with _dash_lock:
+        if now - float(_dash_users_cache["at"]) < _DASH_USERS_TTL_SEC and _dash_users_cache["at"]:
+            return _dash_users_cache["by_am"], _dash_users_cache["by_card"], _dash_users_cache["devices"]
+
+    by_am: Dict[int, Dict[str, Any]] = {}
+    by_card: Dict[str, Dict[str, Any]] = {}
+    devices: Dict[int, str] = {}
+    try:
+        from app.core.device_attendance import _user_indexes
+        from access.store import load_sync_cache, list_sync_devices_payload
+
+        cache = load_sync_cache()
+        users = list(getattr(cache, "users", []) or []) if cache else []
+        by_am, by_card = _user_indexes(users)
+        for dev in list_sync_devices_payload() or []:
+            try:
+                devices[int(dev.get("id") or dev.get("deviceId") or 0)] = _safe_str(dev.get("name"), "")
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    with _dash_lock:
+        _dash_users_cache.update({"at": now, "by_am": by_am, "by_card": by_card, "devices": devices})
+    return by_am, by_card, devices
+
+
+def _dash_today() -> Dict[str, Any]:
+    """Totals + 24-slot hourly histogram + peak hour, for the local day.
+
+    TTL-cached like _popup_granted_today: this is a scan of access_history and
+    the dashboard polls, so it must not run per request.
+    """
+    import datetime as _dt
+
+    now = time.time()
+    today = _dt.datetime.now().strftime("%Y-%m-%d")
+    with _dash_lock:
+        cached = _dash_today_cache["value"]
+        if cached is not None and _dash_today_cache["day"] == today and now - float(_dash_today_cache["at"]) < _DASH_TODAY_TTL_SEC:
+            return cached
+
+    hourly = [0] * 24
+    total = granted = denied = 0
+    try:
+        from access.store import get_conn as _get_conn
+
+        with _get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT CAST(substr(COALESCE(NULLIF(event_time, ''), created_at), 12, 2) AS INTEGER) AS hh,
+                       COALESCE(allowed, 0) AS ok,
+                       COUNT(*) AS n
+                FROM access_history
+                WHERE substr(COALESCE(NULLIF(event_time, ''), created_at), 1, 10) = ?
+                GROUP BY hh, ok
+                """,
+                (today,),
+            ).fetchall()
+        for hh, ok, n in rows:
+            n = int(n or 0)
+            total += n
+            if int(ok or 0) == 1:
+                granted += n
+            else:
+                denied += n
+            if hh is not None and 0 <= int(hh) <= 23:
+                hourly[int(hh)] += n
+    except Exception:
+        hourly = [0] * 24
+        total = granted = denied = 0
+
+    peak_hour = None
+    if total > 0:
+        peak_hour = max(range(24), key=lambda h: hourly[h])
+        if hourly[peak_hour] <= 0:
+            peak_hour = None
+
+    value = {"total": total, "granted": granted, "denied": denied, "hourly": hourly, "peakHour": peak_hour}
+    with _dash_lock:
+        _dash_today_cache.update({"at": now, "day": today, "value": value})
+    return value
+
+
+def _handle_dashboard_overview(ctx: _Ctx) -> None:
+    """GET /api/v2/dashboard/overview?limit=<n> — timeline + day totals.
+
+    Requires auth (member PII), same boundary as /popup/poll.
+    """
+    limit = max(1, min(ctx.q_int("limit", default=40), _DASH_FEED_LIMIT_MAX))
+    feed: List[Dict[str, Any]] = []
+    try:
+        from app.core.device_attendance import (
+            _credential_type_from_raw,
+            _load_json_object,
+            _lower_keys,
+            _normalize_card_token,
+            _normalize_datetime_text,
+            _resolve_history_user,
+        )
+        from app.core.db import get_membership_brief_index_cached
+        from access.store import get_recent_access_history
+
+        by_am, by_card, device_names = _dash_user_indexes()
+        try:
+            briefs = get_membership_brief_index_cached() or {}
+        except Exception:
+            briefs = {}
+
+        for row in get_recent_access_history(limit=limit):
+            raw = _load_json_object(row.raw_json)
+            lowered = _lower_keys(raw)
+            user = _resolve_history_user(row, raw, by_am, by_card) or {}
+            plan_id = _safe_int(user.get("membershipId") or user.get("membership_id"), 0)
+            brief = briefs.get(plan_id) if plan_id else None
+            device_id = int(row.device_id) if row.device_id is not None else None
+            feed.append({
+                "eventId": _safe_str(row.event_id, ""),
+                "at": _normalize_datetime_text(row.event_time, fallback=row.created_at),
+                "allowed": bool(row.allowed),
+                "reason": _safe_str(row.reason, ""),
+                "cardNo": _normalize_card_token(row.card_no),
+                "deviceId": device_id,
+                "deviceName": device_names.get(int(device_id or 0), ""),
+                "method": _credential_type_from_raw(lowered),
+                "userFullName": _safe_str(user.get("fullName") or user.get("full_name"), ""),
+                "membershipTitle": _safe_str((brief or {}).get("title"), ""),
+                "membersType": _safe_str((brief or {}).get("membersType"), ""),
+                "source": _safe_str(row.history_source, ""),
+            })
+    except Exception:
+        feed = []
+
+    try:
+        ctx.send_json(200, {"ok": True, "feed": feed, "today": _dash_today()})
     except Exception:
         pass
 
