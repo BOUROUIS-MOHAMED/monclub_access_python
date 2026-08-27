@@ -239,21 +239,141 @@ begin
   end;
 end;
 
+function ZkemkeeperRegisteredDll(): string;
+var
+  Clsid: string;
+  DllRef: string;
+begin
+  // Setup declares no ArchitecturesInstallIn64BitMode, so it runs as a 32-bit
+  // process and HKCR reads resolve against the 32-bit registry view -- the
+  // correct view for the 32-bit zkemkeeper COM server.
+  Result := '';
+  if not RegQueryStringValue(HKEY_CLASSES_ROOT, 'zkemkeeper.CZKEM\CLSID', '', Clsid) then
+    Exit;
+  Clsid := Trim(Clsid);
+  if Clsid = '' then
+    Exit;
+  if not RegQueryStringValue(HKEY_CLASSES_ROOT, 'CLSID\' + Clsid + '\InprocServer32', '', DllRef) then
+    Exit;
+  Result := RemoveQuotes(Trim(DllRef));
+end;
+
+function ZkemkeeperIsRegistered(): Boolean;
+var
+  DllRef: string;
+begin
+  // A CLSID whose InprocServer32 points at a file that no longer exists is
+  // worse than no registration at all -- report that as unregistered so we
+  // re-register instead of silently skipping.
+  DllRef := ZkemkeeperRegisteredDll();
+  Result := (DllRef <> '') and FileExists(DllRef);
+end;
+
 procedure RegisterZkemkeeper();
 var
   Regsvr: string;
   DllPath: string;
+  ResultCode: Integer;
+  Failure: string;
 begin
+  DllPath := ExpandConstant('{app}\current\sdk\zkemkeeper.dll');
+  if not FileExists(DllPath) then
+  begin
+    Log('ZKEMKeeper DLL not found: ' + DllPath);
+    Exit;
+  end;
+
+  // Skip when it is already registered AND the target file still exists, so
+  // routine updates and re-installs raise no needless elevation prompt.
+  if ZkemkeeperIsRegistered() then
+  begin
+    Log('ZKEMKeeper COM already registered -> ' + ZkemkeeperRegisteredDll() + ' (skipping regsvr32).');
+    Exit;
+  end;
+
   if IsWin64 then
     Regsvr := ExpandConstant('{syswow64}\regsvr32.exe')
   else
     Regsvr := ExpandConstant('{sys}\regsvr32.exe');
 
+  // Three separate defects are fixed here. All three had to be, because each
+  // one alone was enough to stop a fingerprint turnstile from ever working:
+  //
+  //   1. Do NOT route this through ExecAndLog. That helper wraps its argument
+  //      in 'cmd /C', and this command line carries FOUR quote characters,
+  //      which trips cmd's quote-stripping rule (see 'cmd /?'): it strips the
+  //      leading quote and the final quote and mangles the line. Measured
+  //      behaviour was cmd exiting 1 with regsvr32 never launched at all.
+  //      ShellExec below runs regsvr32 directly, with no cmd in between.
+  //   2. Elevate. PrivilegesRequired=lowest, but DllRegisterServer writes to
+  //      HKLM\SOFTWARE\Classes, which a standard user may not do. The 'runas'
+  //      verb raises the UAC prompt this step has always silently needed.
+  //   3. Honour ResultCode. ExecAndLog logged the exit code then discarded it,
+  //      so a failed registration looked exactly like a successful one.
+  //
+  // zkemkeeper.dll statically imports zkemsdk.dll -> commpro.dll; both now ship
+  // in sdk/ beside it, which is what regsvr32 needs to resolve the load chain.
+  Failure := '';
+  if not ShellExec('runas', Regsvr, '/s "' + DllPath + '"', '',
+                   SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Failure := 'the elevation prompt was declined, or regsvr32 could not be started'
+  else if ResultCode <> 0 then
+    Failure := 'regsvr32 exited with code ' + IntToStr(ResultCode)
+  else if not ZkemkeeperIsRegistered() then
+    Failure := 'regsvr32 reported success but the COM class is still not registered';
+
+  if Failure = '' then
+  begin
+    Log('ZKEMKeeper COM registered OK -> ' + DllPath);
+    Exit;
+  end;
+
+  // Never fail the whole install over this: gyms whose turnstiles speak PullSDK
+  // do not need the standalone SDK at all. Surface it loudly instead -- a silent
+  // skip here is precisely how this reached a client unnoticed.
+  Log('ZKEMKeeper registration FAILED (' + Failure + '). DLL: ' + DllPath);
+  if not WizardSilent() then
+    MsgBox('MonClub Access could not register the ZKTeco standalone SDK' + #13#10 +
+           '(' + Failure + ').' + #13#10 + #13#10 +
+           'The application will install and run normally. Fingerprint turnstiles' + #13#10 +
+           'such as the MB2000 will NOT connect until this is registered.' + #13#10 + #13#10 +
+           'To fix it, run this once from an ADMINISTRATOR command prompt:' + #13#10 + #13#10 +
+           '  ' + Regsvr + ' "' + DllPath + '"',
+           mbError, MB_OK);
+end;
+
+procedure UnregisterZkemkeeper();
+var
+  Regsvr: string;
+  DllPath: string;
+  Registered: string;
+  ResultCode: Integer;
+begin
+  // Only unregister when the live registration still points inside THIS
+  // install. Another product -- ZKTeco's own software, or the on-site script
+  // pack -- may own the registration and point it at C:\Windows\SysWOW64.
+  // Tearing that down on our uninstall would break software we do not own.
   DllPath := ExpandConstant('{app}\current\sdk\zkemkeeper.dll');
-  if FileExists(DllPath) then
-    ExecAndLog('"' + Regsvr + '" /s "' + DllPath + '"')
+  Registered := ZkemkeeperRegisteredDll();
+  if (Registered = '') or (CompareText(Registered, DllPath) <> 0) then
+  begin
+    Log('ZKEMKeeper: registration is not ours (' + Registered + ') -- leaving it alone.');
+    Exit;
+  end;
+  if not FileExists(DllPath) then
+    Exit;
+
+  if IsWin64 then
+    Regsvr := ExpandConstant('{syswow64}\regsvr32.exe')
   else
-    Log('ZKEMKeeper DLL not found: ' + DllPath);
+    Regsvr := ExpandConstant('{sys}\regsvr32.exe');
+
+  // Best-effort only: an uninstall must not stall on a declined UAC prompt.
+  if ShellExec('runas', Regsvr, '/s /u "' + DllPath + '"', '',
+               SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+    Log('ZKEMKeeper COM unregistered.')
+  else
+    Log('ZKEMKeeper unregister skipped or failed (exit=' + IntToStr(ResultCode) + ').');
 end;
 
 function IsWebView2RuntimePresent(var Version: string): Boolean;
@@ -523,6 +643,9 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
+    // Drop our own COM registration before {app} is deleted, otherwise the
+    // CLSID is left pointing at a file that no longer exists.
+    UnregisterZkemkeeper();
     KillRunningMonClubProcesses();
     Sleep(900);
   end;

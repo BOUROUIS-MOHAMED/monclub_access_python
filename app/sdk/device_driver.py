@@ -14,8 +14,9 @@ STEP 1 (this file) is deliberately a ZERO-BEHAVIOUR-CHANGE indirection:
   * ``get_driver(device_payload)`` is the single construction point that the engines
     call instead of ``PullSDKDevice(...)`` directly. It defaults to ZK_PULLSDK when the
     device carries no protocol, so existing gyms behave EXACTLY as before.
-  * The second driver (ZK_STANDALONE / MB2000) is not built yet — an explicit
-    ZK_STANDALONE device raises, so it can never silently fall back onto the C3 path.
+  * The second driver (ZK_STANDALONE / MB2000, ``app/sdk/zk_standalone.py``) now
+    exists and is routed to here; an unrecognised protocol still raises rather
+    than silently falling back onto the C3 path.
 
 Later steps (see project_device_driver_abstraction memory) add: the backend
 ``deviceProtocol`` column, a ``CapabilityDescriptor`` (poll|push, has_fingerprint,
@@ -42,7 +43,10 @@ class DeviceProtocol(str, Enum):
     ZK_PULLSDK   — ZKTeco access panels via plcommpro.dll / PullSDK (C2/C3/C4/inBio).
                    Poll-based (GetRTLogExt). One persistent TCP connection per panel.
     ZK_STANDALONE — ZKTeco standalone terminals via the standalone SDK (zkemkeeper COM
-                   / TCP 4370 / Push-ADMS), e.g. MB2000. Event-push. NOT YET IMPLEMENTED.
+                   / TCP 4370 / Push-ADMS), e.g. MB2000. Event-push. Implemented by
+                   ``app/sdk/zk_standalone.py``. NOTE: zkemkeeper is a COM server and
+                   must be REGISTERED on the PC (regsvr32, elevated, 32-bit) — shipping
+                   the DLL is not enough.
     """
 
     ZK_PULLSDK = "ZK_PULLSDK"
@@ -166,6 +170,45 @@ def _override_for(device_payload: Any) -> Optional[str]:
         return _protocol_overrides.get(did)
 
 
+def _resolve_with_source(device_payload: Any) -> tuple["DeviceProtocol", str]:
+    """Resolve the protocol AND report which input decided it.
+
+    Returns ``(protocol, source)`` where source is ``override`` (local kill-switch
+    map / env var), ``payload`` (the backend's deviceProtocol key), or ``default``
+    (nothing usable was supplied, so the ZK_PULLSDK fallback applied).
+
+    The source matters operationally: ``default`` on a device that is physically an
+    MB2000 means the app is about to drive plcommpro.dll at a terminal that does not
+    speak PullSDK, and the only symptom would be a generic connect failure.
+    """
+    override = _override_for(device_payload) or ""
+    if override:
+        if override in _STANDALONE_ALIASES:
+            return DeviceProtocol.ZK_STANDALONE, "override"
+        return DeviceProtocol.ZK_PULLSDK, "override"
+
+    raw = ""
+    if isinstance(device_payload, dict):
+        raw = str(
+            device_payload.get("deviceProtocol")
+            or device_payload.get("device_protocol")
+            or ""
+        ).strip().upper()
+    if not raw:
+        return DeviceProtocol.ZK_PULLSDK, "default"
+    if raw in _STANDALONE_ALIASES:
+        return DeviceProtocol.ZK_STANDALONE, "payload"
+    # An explicit, known protocol value is "payload", not a fallback. The backend
+    # column defaults to ZK_PULLSDK (GymDeviceDto), so this is the ordinary case
+    # for every PullSDK gym and must not be reported as a misconfiguration.
+    if raw in {member.value for member in DeviceProtocol}:
+        return DeviceProtocol.ZK_PULLSDK, "payload"
+    # A non-empty but unrecognised value (typo, new spelling) still falls back to
+    # PullSDK so no working gym can regress -- but it is NOT the same as "absent",
+    # and get_driver() logs it distinctly so a typo is visible instead of silent.
+    return DeviceProtocol.ZK_PULLSDK, "unrecognised:" + raw
+
+
 def resolve_device_protocol(device_payload: Any) -> DeviceProtocol:
     """Pick the protocol family for a device payload.
 
@@ -175,26 +218,68 @@ def resolve_device_protocol(device_payload: Any) -> DeviceProtocol:
     so far is a ZK PullSDK panel, and no gym should regress before the backend even sends
     a protocol). Only an explicitly-recognised standalone value routes to ZK_STANDALONE.
     """
-    raw = _override_for(device_payload) or ""
-    if not raw and isinstance(device_payload, dict):
-        raw = str(
-            device_payload.get("deviceProtocol")
-            or device_payload.get("device_protocol")
-            or ""
-        ).strip().upper()
-    if raw in _STANDALONE_ALIASES:
-        return DeviceProtocol.ZK_STANDALONE
-    return DeviceProtocol.ZK_PULLSDK
+    protocol, _source = _resolve_with_source(device_payload)
+    return protocol
+
+
+# Remembers the last (protocol, source) logged per device so a reconnect loop cannot
+# spam the log, while any genuine CHANGE is always surfaced.
+_driver_log_lock = threading.Lock()
+_last_driver_log: Dict[Any, tuple] = {}
+
+
+def _log_driver_choice(device_payload: Any, protocol: "DeviceProtocol", source: str, logger: Any) -> None:
+    payload = device_payload if isinstance(device_payload, dict) else {}
+    did = payload.get("id")
+    key = did if did is not None else id(device_payload)
+    entry = (protocol.value, source)
+    with _driver_log_lock:
+        if _last_driver_log.get(key) == entry:
+            return
+        _last_driver_log[key] = entry
+
+    log = logger if logger is not None else _log
+    try:
+        log.info(
+            "[DRIVER] device id=%s name=%r protocol=%s source=%s addr=%s:%s",
+            did,
+            payload.get("name"),
+            protocol.value,
+            source,
+            payload.get("ipAddress") or payload.get("ip_address"),
+            payload.get("portNumber") or payload.get("port_number"),
+        )
+        # A standalone terminal that resolved only by fallback is a misconfiguration,
+        # not a preference -- say so loudly, because the resulting connect failure is
+        # indistinguishable from a network fault.
+        if source == "default" or source.startswith("unrecognised:"):
+            model = str(payload.get("model") or "").strip().upper()
+            if model and any(alias in model for alias in ("MB2000", "MB-2000")):
+                log.warning(
+                    "[DRIVER] device id=%s model=%r resolved to %s via %s -- a standalone "
+                    "terminal is about to be driven over PullSDK. Set deviceProtocol="
+                    "ZK_STANDALONE on the backend, or use %s to override on-site.",
+                    did, payload.get("model"), protocol.value, source, _OVERRIDES_ENV_VAR,
+                )
+    except Exception:
+        # Diagnostics must never break device construction.
+        pass
 
 
 def get_driver(device_payload: Dict[str, Any], logger: Any | None = None) -> DeviceDriver:
     """Single construction point for a device driver — replaces direct ``PullSDKDevice(...)``.
 
-    Returns a driver satisfying :class:`DeviceDriver`. Today ZK_PULLSDK -> ``PullSDKDevice``
-    (byte-for-byte the same object the engines built before), so this is a pure indirection.
-    ZK_STANDALONE raises :class:`UnsupportedDeviceProtocolError` until its driver exists.
+    Returns a driver satisfying :class:`DeviceDriver`. ZK_PULLSDK -> ``PullSDKDevice``
+    (byte-for-byte the same object the engines built before); ZK_STANDALONE ->
+    ``ZKStandaloneDevice``. Anything else raises :class:`UnsupportedDeviceProtocolError`.
+
+    Logs the resolved protocol and WHICH input chose it, once per device and again on
+    any change. Nothing logged which protocol won before this, so a device silently
+    falling back to PullSDK was invisible in the field.
     """
-    protocol = resolve_device_protocol(device_payload)
+    protocol, source = _resolve_with_source(device_payload)
+    _log_driver_choice(device_payload, protocol, source, logger)
+
     if protocol == DeviceProtocol.ZK_PULLSDK:
         # Lazy import keeps this module import-cycle-free (pullsdk never imports us).
         from app.sdk.pullsdk import PullSDKDevice

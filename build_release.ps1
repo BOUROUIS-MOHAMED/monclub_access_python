@@ -11,6 +11,14 @@ param(
 
   [switch]$SkipTauriBuild,
 
+  # Package from a working tree that does not match HEAD. OFF by default:
+  # 1.4.20 and 1.4.21 were both built from an uncommitted tree, which is how a
+  # broken SQL statement shipped to a client before it was ever committed.
+  [switch]$AllowDirty,
+
+  # Skip the pre-package source gates. For local experiments only.
+  [switch]$SkipChecks,
+
   [switch]$DryRun
 )
 
@@ -285,6 +293,45 @@ if ($gitCmd) {
   if ($r3.ok) { $git.dirty = (-not [string]::IsNullOrWhiteSpace($r3.out)) }
 }
 
+# --------------------------------------------------------------------------
+# Release gates. These run BEFORE PyInstaller so a bad tree never gets packaged.
+# --------------------------------------------------------------------------
+if (-not $SkipChecks) {
+
+  # Gate 1: the working tree must match HEAD.
+  # Rationale: the 1.4.20/1.4.21 artifacts were built from a dirty tree, so the
+  # shipped binary corresponded to no commit and could not be reproduced or
+  # reviewed. $git.dirty was already computed here and then silently discarded.
+  if ($git.available -and ($git.dirty -eq $true)) {
+    Write-Host "" 
+    Write-Host "BUILD BLOCKED - the working tree has uncommitted changes." -ForegroundColor Red
+    Write-Host "  The artifact would correspond to no commit and be unreproducible." -ForegroundColor Red
+    Write-Host "  Commit (or stash) first, or re-run with -AllowDirty if you accept that." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Uncommitted:" -ForegroundColor Yellow
+    git status --short
+    if (-not $AllowDirty) {
+      throw "Refusing to build from a dirty working tree (use -AllowDirty to override)."
+    }
+    Write-Host "-AllowDirty given - continuing from a dirty tree." -ForegroundColor Yellow
+  }
+
+  # Gate 2: no SQL statement may bind the wrong number of values.
+  # This is the exact defect that took a gym offline: sync_devices named 59
+  # columns and supplied 57, so every sync raised OperationalError and the whole
+  # transaction rolled back. Catching it here costs under a second.
+  $arityScript = Join-Path $PSScriptRoot "tools\check_sql_arity.py"
+  if (Test-Path $arityScript) {
+    Write-Host "Gate: SQL statement arity..." -ForegroundColor Yellow
+    python $arityScript app
+    if ($LASTEXITCODE -ne 0) {
+      throw "SQL arity check FAILED - see the mismatches above. This is the 1.4.21 class of bug; do not ship."
+    }
+  } else {
+    throw "Release gate missing: $arityScript"
+  }
+}
+
 $baseName = "{0}-{1}" -f $artifactName, $ReleaseId
 New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
@@ -309,6 +356,10 @@ $versionObj = [ordered]@{
   channel = $Channel
   releaseId = $ReleaseId
   builtAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+  # Provenance: previously computed and thrown away, which made it impossible to
+  # tell which source a shipped exe came from. Tags are not a substitute here --
+  # access_1.4.12 through access_1.4.21 all point at the same commit.
+  git = $git
 }
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($versionPath, ($versionObj | ConvertTo-Json -Depth 5), $utf8NoBom)

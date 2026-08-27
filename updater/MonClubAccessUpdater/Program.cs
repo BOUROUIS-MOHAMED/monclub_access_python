@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -141,6 +141,21 @@ namespace MonClubDesktopUpdater
                 {
                     log.Info("Moving payload -> current");
                     MoveDirectoryWithRetries(payloadRoot, currentDir, log, maxSeconds: 60);
+
+                    // 6b) COM registration self-heal.
+                    //
+                    // The installer registers zkemkeeper.dll, but this updater only
+                    // unzips and swaps directories -- it never runs the installer, so
+                    // CurStepChanged/ssPostInstall cannot fire. A machine provisioned
+                    // purely by the updater therefore never gets the COM class
+                    // registered, and fingerprint terminals (MB2000) silently fail to
+                    // connect with no obvious cause.
+                    //
+                    // The registered path is {app}\current\sdk\zkemkeeper.dll, which is
+                    // stable across updates (we swap the directory contents, not the
+                    // path), so a machine registered once stays registered. This only
+                    // has to cover the never-installed case.
+                    EnsureZkemkeeperRegistered(currentDir, log);
 
                     // 7) Start new app
                     string exePath = Path.Combine(currentDir, appExeName);
@@ -404,6 +419,108 @@ namespace MonClubDesktopUpdater
             // 0x80070021 (ERROR_LOCK_VIOLATION=33)
             int hr = ex.HResult;
             return hr == unchecked((int)0x80070020) || hr == unchecked((int)0x80070021);
+        }
+
+        /// <summary>
+        /// Make sure the 32-bit zkemkeeper COM class is registered, best-effort.
+        ///
+        /// Deliberately does NOT elevate. An update can run unattended on a gym PC
+        /// overnight; a UAC prompt would block the updater indefinitely with nobody
+        /// there to answer it. We attempt a silent, non-elevated regsvr32 (which
+        /// fails fast when it cannot write HKLM) and log the outcome either way.
+        /// The app's own startup probe reports the real state to the operator.
+        ///
+        /// Never throws: a failure here must not fail or roll back an update.
+        /// </summary>
+        private static void EnsureZkemkeeperRegistered(string currentDir, SimpleLogger log)
+        {
+            try
+            {
+                string dllPath = Path.Combine(currentDir, "sdk", "zkemkeeper.dll");
+                if (!File.Exists(dllPath))
+                {
+                    // Normal for builds that do not ship the standalone SDK.
+                    log.Info($"zkemkeeper: no DLL at {dllPath} - nothing to register.");
+                    return;
+                }
+
+                if (IsZkemkeeperRegistered(log))
+                {
+                    log.Info("zkemkeeper: COM class already registered - leaving it alone.");
+                    return;
+                }
+
+                // This updater is win-x64 but zkemkeeper is a 32-bit in-process server,
+                // so registration must go through the 32-bit regsvr32 in SysWOW64.
+                string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                string regsvr = Path.Combine(windir, "SysWOW64", "regsvr32.exe");
+                if (!File.Exists(regsvr)) regsvr = Path.Combine(windir, "System32", "regsvr32.exe");
+
+                log.Warn("zkemkeeper: COM class NOT registered - attempting non-elevated registration.");
+                int code = RunAndWait(regsvr, $"/s \"{dllPath}\"", timeoutMs: 20000, log: log);
+
+                if (code == 0 && IsZkemkeeperRegistered(log))
+                {
+                    log.Info("zkemkeeper: registered successfully.");
+                    return;
+                }
+
+                log.Warn(
+                    "zkemkeeper: registration did NOT succeed (regsvr32 exit=" + code + "). " +
+                    "This needs one elevated command on this PC, otherwise fingerprint " +
+                    "terminals (MB2000) will not connect:");
+                log.Warn($"    {regsvr} \"{dllPath}\"");
+            }
+            catch (Exception ex)
+            {
+                log.Warn("zkemkeeper: registration check skipped (" + ex.Message + ")");
+            }
+        }
+
+        /// <summary>
+        /// True when the zkemkeeper ProgID resolves in the 32-bit registry view.
+        /// Uses reg.exe rather than Microsoft.Win32.Registry so the project needs no
+        /// extra package and no Windows-specific target framework. /reg:32 matters:
+        /// this process is 64-bit, and the 32-bit class lives under WOW6432Node.
+        /// </summary>
+        private static bool IsZkemkeeperRegistered(SimpleLogger log)
+        {
+            string windir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+            string reg = Path.Combine(windir, "System32", "reg.exe");
+            if (!File.Exists(reg)) reg = "reg.exe";
+            int code = RunAndWait(reg, "query \"HKCR\\zkemkeeper.CZKEM\\CLSID\" /reg:32", timeoutMs: 10000, log: null);
+            return code == 0;
+        }
+
+        /// <summary>Run a process, wait with a hard timeout, return its exit code (-1 on timeout/failure).</summary>
+        private static int RunAndWait(string fileName, string arguments, int timeoutMs, SimpleLogger? log)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = fileName,
+                    Arguments = arguments,
+                    UseShellExecute = false,   // no shell, so no UAC prompt and no window
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                using var proc = Process.Start(psi);
+                if (proc == null) return -1;
+                if (!proc.WaitForExit(timeoutMs))
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                    log?.Warn($"zkemkeeper: '{Path.GetFileName(fileName)}' timed out after {timeoutMs} ms.");
+                    return -1;
+                }
+                return proc.ExitCode;
+            }
+            catch (Exception ex)
+            {
+                log?.Warn($"zkemkeeper: could not run {Path.GetFileName(fileName)} ({ex.Message}).");
+                return -1;
+            }
         }
 
         private static void StartExe(string exePath, string workingDir)

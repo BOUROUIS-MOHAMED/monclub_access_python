@@ -3016,11 +3016,13 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?,
-            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?,
             ?, ?,
             ?, ?,
             ?, ?, ?,
             ?,
+            ?, ?,
             ?,
             ?,
             ?
@@ -6764,7 +6766,16 @@ def count_today_for_user_door(
           AND device_id = ?
           AND door_id = ?
           AND allowed = 1
-          AND date(created_at, 'localtime') = date('now', 'localtime')
+          -- created_at is written by now_iso() = datetime.now() -> ALREADY LOCAL,
+          -- with no timezone suffix (app/core/utils.py:301, unchanged since the
+          -- first commit). Applying SQLite's 'localtime' modifier to it would tell
+          -- SQLite the value is UTC and convert it a SECOND time, shifting rows in
+          -- the last <utc-offset> hours of each day onto tomorrow's date -- so the
+          -- anti-fraud daily limit silently counted 0 between 23:00 and midnight in
+          -- a UTC+1 gym. Compare the stored local date directly instead. This
+          -- matches count_recent_for_user_door below, which already treats
+          -- created_at as local.
+          AND date(created_at) = date('now', 'localtime')
     """
     with get_conn() as conn:
         row = conn.execute(sql, (int(user_id), int(device_id), int(door_id))).fetchone()

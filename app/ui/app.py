@@ -192,7 +192,7 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "ok": False,
         "windows": (os.name == "nt"),
-        "pythonBits": (64 if (8 * (8 if hasattr(__import__("struct"), "calcsize") else 8)) else None),
+        "pythonBits": None,  # filled in below from struct.calcsize on Windows
         "progId": "zkemkeeper.CZKEM",
         "clsid": None,
         "inprocServer32": None,
@@ -280,36 +280,85 @@ def check_zkemkeeper_registration() -> Dict[str, Any]:
         else:
             result["notes"].append("InprocServer32 not found for CLSID (COM may be broken).")
 
-        # Optional COM activation test (works with pywin32 or comtypes)
+        # REAL COM activation test.
+        #
+        # This must never be faked. The previous version called
+        # zkemkeeper_scanner.create_zkemkeeper_com_object(), which is a stub that
+        # returns (None, "powershell") and can never raise -- so the except branch
+        # was unreachable and comCreateOk/ok were set True unconditionally. The app
+        # therefore reported a healthy COM registration on machines where none
+        # existed. A diagnostic that always says "fine" is worse than none at all,
+        # because it is exactly what an on-site technician trusts.
+        #
+        # We Dispatch the same ProgIDs the ZK_STANDALONE driver tries, in the same
+        # order (app/sdk/zk_standalone.py). NOTE: the driver uses DispatchWithEvents,
+        # which additionally needs the type library and a working event sink. We
+        # deliberately do NOT do that here -- it is heavier and this runs on the
+        # startup thread -- so a green probe proves the class is registered and
+        # loadable, NOT that event delivery works. That limit is stated in notes
+        # rather than implied by a green flag.
         try:
-            from app.core.zkemkeeper_scanner import (
-                create_zkemkeeper_com_object,
-                initialize_com_apartment,
-            )
-
-            com_cleanup = None
+            import pythoncom  # type: ignore
+            import win32com.client as w32  # type: ignore
+        except Exception as exc:
+            result["comCreateOk"] = None  # untested, NOT "passed"
+            result["notes"].append(f"pywin32 unavailable; COM activation not tested ({exc}).")
+        else:
+            co_initialised = False
+            activation_error: Any = None
             try:
-                com_cleanup = initialize_com_apartment()
-                obj, backend = create_zkemkeeper_com_object()
-                # If Dispatch succeeded, registration is usable from this Python bitness
-                _ = obj is not None
-                result["comCreateOk"] = True
-                result["ok"] = True
-                result["notes"].append(f"COM activation succeeded via {backend}.")
-            except Exception as e:
-                result["comCreateOk"] = False
-                result["error"] = f"COM activation failed: {e}"
-            finally:
-                if com_cleanup is not None:
+                try:
+                    pythoncom.CoInitialize()
+                    co_initialised = True
+                except Exception:
+                    # Already initialised on this thread is fine; anything else will
+                    # surface as a Dispatch failure below.
+                    pass
+
+                obj = None
+                for prog_id in ("zkemkeeper.ZKEM", "zkemkeeper.CZKEM", "zkemkeeper.ZKEM.1"):
                     try:
-                        com_cleanup()
+                        obj = w32.Dispatch(prog_id)
+                        result["notes"].append(f"COM activation succeeded via {prog_id}.")
+                        break
+                    except Exception as exc:
+                        activation_error = exc
+
+                result["comCreateOk"] = obj is not None
+                if obj is None:
+                    result["error"] = f"COM activation failed: {activation_error}"
+                    # zkemkeeper is a 32-bit in-process COM server. A 64-bit process
+                    # cannot load it in-process and gets "Class not registered" even
+                    # when registration is perfectly good -- which is what a 64-bit
+                    # dev run sees. The SHIPPED app is always 32-bit (enforced in
+                    # build_release.ps1), so say this rather than let a developer
+                    # conclude the client PC is broken.
+                    if result.get("pythonBits") == 64:
+                        result["notes"].append(
+                            "Host process is 64-bit; zkemkeeper is a 32-bit in-process server, "
+                            "so activation cannot succeed here regardless of registration. "
+                            "The shipped app is 32-bit -- judge registration from that build."
+                        )
+                obj = None  # release the interface promptly
+            finally:
+                if co_initialised:
+                    try:
+                        pythoncom.CoUninitialize()
                     except Exception:
                         pass
-        except Exception:
-            result["notes"].append("pywin32/comtypes not installed; skipped COM activation test.")
-            # If registry is OK, we still consider it "registered" (but not proven callable)
-            result["ok"] = bool(result["registryFound"])
+            result["notes"].append(
+                "Event-sink activation (DispatchWithEvents) is exercised only at device "
+                "connect time and is NOT proven by this probe."
+            )
 
+        # 'ok' = the class is registered AND its server file exists AND, where we
+        # could test it, the object actually activates. comCreateOk is None when
+        # pywin32 is missing, which must not be treated as a pass or as a failure.
+        result["ok"] = bool(
+            result["registryFound"]
+            and result.get("inprocExists")
+            and result["comCreateOk"] is not False
+        )
         return result
 
     except Exception as e:
@@ -458,14 +507,16 @@ class MainApp:
             self._zkemkeeper_status = check_zkemkeeper_registration()
             st = self._zkemkeeper_status
             self.logger.info(
-                "[ZKEMKeeper] ok=%s registryFound=%s comCreateOk=%s clsid=%s inproc=%s exists=%s err=%s",
+                "[ZKEMKeeper] ok=%s registryFound=%s comCreateOk=%s bits=%s clsid=%s inproc=%s exists=%s err=%s notes=%s",
                 st.get("ok"),
                 st.get("registryFound"),
                 st.get("comCreateOk"),
+                st.get("pythonBits"),
                 st.get("clsid"),
                 st.get("inprocServer32"),
                 st.get("inprocExists"),
                 st.get("error"),
+                "; ".join(st.get("notes") or []),
             )
         except Exception as e:
             self._zkemkeeper_status = {"ok": False, "error": str(e)}
