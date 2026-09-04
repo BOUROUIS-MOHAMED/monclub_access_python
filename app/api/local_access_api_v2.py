@@ -1279,10 +1279,6 @@ def _handle_tv_auth_logout(ctx: _Ctx) -> None:
 
 
 def _handle_auth_logout(ctx: _Ctx) -> None:
-    try:
-        ctx.app.after(0, ctx.app._on_click_logout.__wrapped__ if hasattr(ctx.app._on_click_logout, '__wrapped__') else lambda: None)
-    except Exception:
-        pass
     # Direct logout (don't wait for Tk confirmation)
     try:
         ctx.app.stop_realtime_agent()
@@ -1305,6 +1301,25 @@ def _handle_auth_logout(ctx: _Ctx) -> None:
         save_sync_cache(None)
     except Exception:
         pass
+    # save_sync_cache(None) empties sync_users, sync_devices, sync_gym_access_credentials
+    # (the TOTP secrets) and five more tables. The version tokens MUST go with them: the
+    # post-login sync is scheduled with hint {"reason": "AUTH_LOGIN"}, which
+    # sync_scope.apply_trigger_hint_to_version_tokens leaves untouched, so a surviving
+    # credentialsVersion / devicesVersion makes the backend answer refreshCredentials=false
+    # / refreshDevices=false and the emptied tables never refill. SYNC-HEAL only covers
+    # members, and only when the token claims >= 50 of them. member_shadow and
+    # device_sync_state are content hashes and are deliberately kept, so the standalone
+    # incremental push re-sends only pins whose hash changed.
+    # [TEST: tests/test_logout_clears_version_tokens.py]
+    try:
+        from app.core.db import clear_version_tokens
+
+        clear_version_tokens()
+    except Exception:
+        ctx.app.logger.warning(
+            "Version-token clear failed during logout; the next sync may keep stale tokens.",
+            exc_info=True,
+        )
     ctx.app.logger.info("Logout via API v2.")
     try:
         ctx.app.after(0, ctx.app.evaluate_access_and_redirect)

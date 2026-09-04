@@ -384,12 +384,14 @@ Until a connect line settles it, **do not state either as the cause.**
 These are runnable, so "is this still true" is a command rather than a judgement.
 
 ```bash
-python -m pytest tests/ -q --ignore=tests/_pydeps
+python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*'
 ```
 
 `--ignore=tests/_pydeps` is **required** — that directory holds vendored third-party
 packages whose own tests break collection. There is no `pytest.ini`, so the flag is not
-applied for you. Last run: **833 passed** (2026-08-29). `[TEST]`
+applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
+`tests/.tmp_pytest*` scratch directories present in some working copies; they are not
+part of the suite. Last run: **955 passed** (2026-09-04). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py

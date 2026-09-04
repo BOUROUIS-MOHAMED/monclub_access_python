@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 import logging
 import os
@@ -2380,9 +2381,16 @@ def diff_member_shadow(
           "new":      [activeMembershipId, ...],   — not in shadow
           "modified": [activeMembershipId, ...],   — in shadow but fields changed
           "deleted":  [activeMembershipId, ...],   — in shadow but not in valid_member_ids
+          "membership_changed": [activeMembershipId, ...],
+                      — in shadow, access fields identical, only membership_id differs
         }
 
-    Uses only the fields that affect device access: card, name, fp_hash, validity dates.
+    "new" / "modified" use only the fields that affect device access: card, name,
+    fp_hash, validity dates — they narrow the device push. membership_id never reaches
+    a device, so a plan-only change is reported under "membership_changed" instead:
+    the caller writes those rows back to member_shadow (it now writes ONLY the diffed
+    rows, so the column would otherwise go stale) without adding them to the push set.
+    [TEST: tests/test_member_shadow_write_restricted.py]
     """
     with get_conn() as conn:
         shadow_rows = conn.execute("SELECT * FROM member_shadow").fetchall()
@@ -2391,6 +2399,7 @@ def diff_member_shadow(
     incoming_ids: set[int] = set()
     new_ids: List[int] = []
     modified_ids: List[int] = []
+    membership_changed_ids: List[int] = []
 
     for u in incoming_users or []:
         amid_raw = u.get("activeMembershipId") or u.get("active_membership_id")
@@ -2428,6 +2437,13 @@ def diff_member_shadow(
         )
         if changed:
             modified_ids.append(amid)
+            continue
+        incoming_mid = u.get("membershipId")
+        if incoming_mid is None:
+            incoming_mid = u.get("membership_id")
+        # INTEGER column vs a payload that may carry the id as a string: compare as ints.
+        if _to_int_or_none(incoming_mid) != _to_int_or_none(s.get("membership_id")):
+            membership_changed_ids.append(amid)
 
     deleted_ids: List[int] = []
     if valid_member_ids is not None:
@@ -2436,7 +2452,12 @@ def diff_member_shadow(
             if amid not in valid_set and amid not in incoming_ids:
                 deleted_ids.append(amid)
 
-    return {"new": new_ids, "modified": modified_ids, "deleted": deleted_ids}
+    return {
+        "new": new_ids,
+        "modified": modified_ids,
+        "deleted": deleted_ids,
+        "membership_changed": membership_changed_ids,
+    }
 
 
 # -----------------------------
@@ -3988,6 +4009,233 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     return {"applied": applied, "skipped": skipped, "ignored": None}
 
 
+# ---------------------------------------------------------------------------
+# FULL member refresh as a per-row diff (save_sync_cache_delta, membersDeltaMode=False)
+# ---------------------------------------------------------------------------
+# Column order == the sync_users INSERT used by the delta branch and upsert_delta_users.
+_SYNC_USER_COLUMNS: tuple[str, ...] = (
+    "user_id", "active_membership_id", "membership_id",
+    "full_name", "phone", "email", "valid_from", "valid_to",
+    "first_card_id", "second_card_id", "image",
+    "fingerprints_json", "face_id", "account_username_id", "qr_code_payload", "birthday",
+    "image_source", "user_image_status", "user_profile_image",
+)
+# Schema affinities (CREATE TABLE sync_users + the _ensure_column migrations): the three
+# ids are INTEGER, every other column is TEXT.
+_SYNC_USER_INTEGER_COLUMNS = frozenset({"user_id", "active_membership_id", "membership_id"})
+_SYNC_USER_COLUMN_IS_INTEGER: tuple[bool, ...] = tuple(
+    c in _SYNC_USER_INTEGER_COLUMNS for c in _SYNC_USER_COLUMNS
+)
+
+
+def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
+    """The 19 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
+
+    Mirrors the delta-branch INSERT exactly -- same activeMembershipId -> membershipId
+    fallback, same key aliases, same json.dumps of the templates -- so a full and a
+    delta refresh store byte-identical rows for the same member."""
+    fps = u.get("fingerprints") or []
+    if not isinstance(fps, list):
+        fps = []
+    am_id = u.get("activeMembershipId")
+    m_id = u.get("membershipId")
+    if am_id is None or str(am_id).strip() == "":
+        am_id = m_id
+    return (
+        u.get("userId"), am_id, m_id,
+        u.get("fullName"), u.get("phone"), u.get("email"),
+        u.get("validFrom"), u.get("validTo"),
+        u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
+        json.dumps(fps, ensure_ascii=False),
+        u.get("faceId"),
+        u.get("accountUsernameId") or u.get("account_username_id"),
+        u.get("qrCodePayload"), u.get("birthday"),
+        u.get("imageSource"),
+        u.get("userImageStatus"),
+        u.get("userProfileImage"),
+    )
+
+
+def _sqlite_affinity_norm(value: Any, *, integer: bool) -> Any:
+    """Normalise a value to what SQLite hands back after storing it in a column of the
+    given affinity, so an incoming payload value and a stored row value compare equal
+    exactly when SQLite would store them identically.
+
+      None -> None (NULL); bool -> 0/1; INTEGER affinity: numeric text -> int when
+      SQLite would store it as an integer (well-formed integer or integral real
+      literal, e.g. "100", "1e3", "1000.0"), non-integral numeric text -> float, other
+      text kept; TEXT affinity: numbers -> their text form.
+
+    A value this cannot normalise exactly can only cause a spurious UPDATE (one extra
+    write of an identical row) on a non-key column, never a missed change and never a
+    wrong delete. On a KEY column it would surface as a UNIQUE-index violation, i.e. a
+    loud failed write, not a silent wrong delete."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if integer:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if math.isfinite(value) and value.is_integer() else value
+        s = str(value).strip()
+        body = s[1:] if s[:1] in "+-" else s
+        if body.isdigit():
+            try:
+                return int(s)
+            except ValueError:
+                return s
+        # SQLite also converts a well-formed REAL literal in an INTEGER column, storing
+        # it as INTEGER when that is lossless ("1e3" -> 1000, "1000.0" -> 1000).
+        if body and (body[0].isdigit() or body[0] == "."):
+            try:
+                f = float(s)
+            except ValueError:
+                return s
+            if math.isfinite(f):
+                return int(f) if f.is_integer() else f
+        return s
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _apply_full_users_refresh(cur: sqlite3.Cursor, users: List[Any]) -> Dict[str, Any]:
+    """FULL member refresh as a per-row diff of sync_users against the incoming payload.
+
+    Replaces ``DELETE FROM sync_users`` + a re-INSERT of every row (2026-08-30 gym log:
+    4765 ms for the members step of 934 rows, most of it re-writing ~2 MB of unchanged
+    templates), which ran on every FULL refresh against a populated cache -- the
+    manual-mode "Sync data" click, the 22:00 daily sync, hard reset.
+
+    Rows are keyed on the PAIR (user_id, active_membership_id) -- the partial UNIQUE
+    index uq_sync_users_uid_amid -- where active_membership_id is the STORED value,
+    i.e. after the membershipId fallback the INSERT applies. A member carrying a
+    superseded and a current membership is two keys and both survive.
+
+      * key not stored                      -> INSERT
+      * key stored, any of the 19 columns
+        differs after affinity normalisation -> UPDATE ... WHERE rowid=?  (rowid stable)
+      * key stored, identical               -> untouched (no write at all)
+      * key stored, absent from the payload -> DELETE.  Derived from the incoming key
+        set, NOT from validMemberIds: the backend sends that as null in full mode.
+      * NULL-key rows (user_id or active_membership_id NULL) sit outside the partial
+        index and cannot be diffed; they are deleted and re-inserted from the payload
+        every refresh (as every row used to be) and never accumulate. Reported as
+        members_null_key_rows.
+      * a key repeated inside one payload keeps the LAST occurrence (the INSERT OR
+        REPLACE semantics of the old path).
+
+    The H-006 zero-users guard stays in the caller and runs before this. A wrong
+    delete here keeps an ex-member's card admitted at the turnstile
+    (access_verification reads this table) and their pin in every device roster.
+    [TEST: tests/test_full_replace_row_diff.py]
+    Returns counters and sub-timers for the DB write profile."""
+    t_fetch = time.perf_counter()
+    cols_sql = ", ".join(_SYNC_USER_COLUMNS)
+    existing = cur.execute(f"SELECT rowid, {cols_sql} FROM sync_users").fetchall()
+    fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
+
+    t_diff = time.perf_counter()
+    # key -> (rowid, normalised 19-tuple) for every diffable stored row
+    current: Dict[tuple, tuple[int, tuple]] = {}
+    doomed: List[int] = []  # NULL-key rows (+ defensively: a duplicate key, impossible under the index)
+    for row in existing:
+        rowid = int(row[0])
+        norm_vals = tuple(
+            _sqlite_affinity_norm(v, integer=is_int)
+            for v, is_int in zip(row[1:], _SYNC_USER_COLUMN_IS_INTEGER)
+        )
+        key = (norm_vals[0], norm_vals[1])
+        if key[0] is None or key[1] is None or key in current:
+            doomed.append(rowid)
+            continue
+        current[key] = (rowid, norm_vals)
+
+    inserted = updated = unchanged = null_key_inserted = 0
+    write_ms = 0.0
+    seen: set = set()
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        vals = _sync_user_row_values(u)
+        norm_vals = tuple(
+            _sqlite_affinity_norm(v, integer=is_int)
+            for v, is_int in zip(vals, _SYNC_USER_COLUMN_IS_INTEGER)
+        )
+        key = (norm_vals[0], norm_vals[1])
+        null_key = key[0] is None or key[1] is None
+        hit = None if null_key else current.get(key)
+        t_w = time.perf_counter()
+        if hit is None:
+            # Literal SQL on purpose: tools/check_sql_arity.py verifies literal INSERTs
+            # (the 59-column / 57-value INSERT that killed every sync in v1.4.20-21 is
+            # why it exists). Column order == _SYNC_USER_COLUMNS == _sync_user_row_values.
+            cur.execute(
+                """
+                INSERT INTO sync_users (
+                    user_id, active_membership_id, membership_id,
+                    full_name, phone, email, valid_from, valid_to,
+                    first_card_id, second_card_id, image,
+                    fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
+                    image_source, user_image_status, user_profile_image
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                vals,
+            )
+            if null_key:
+                null_key_inserted += 1
+            else:
+                current[key] = (int(cur.lastrowid), norm_vals)
+                inserted += 1
+                seen.add(key)
+        elif hit[1] != norm_vals:
+            cur.execute(
+                """
+                UPDATE sync_users SET
+                    user_id=?, active_membership_id=?, membership_id=?,
+                    full_name=?, phone=?, email=?, valid_from=?, valid_to=?,
+                    first_card_id=?, second_card_id=?, image=?,
+                    fingerprints_json=?, face_id=?, account_username_id=?, qr_code_payload=?, birthday=?,
+                    image_source=?, user_image_status=?, user_profile_image=?
+                WHERE rowid=?
+                """,
+                vals + (hit[0],),
+            )
+            current[key] = (hit[0], norm_vals)
+            updated += 1
+            seen.add(key)
+        else:
+            unchanged += 1
+            seen.add(key)
+        write_ms += (time.perf_counter() - t_w) * 1000.0
+    diff_ms = (time.perf_counter() - t_diff) * 1000.0 - write_ms
+
+    t_del = time.perf_counter()
+    absent = [rowid for key, (rowid, _vals) in current.items() if key not in seen]
+    to_delete = doomed + absent
+    for i in range(0, len(to_delete), 500):
+        chunk = to_delete[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        cur.execute(f"DELETE FROM sync_users WHERE rowid IN ({placeholders})", chunk)
+    delete_ms = (time.perf_counter() - t_del) * 1000.0
+
+    return {
+        "members_inserted": inserted,
+        "members_updated": updated,
+        "members_unchanged": unchanged,
+        "members_deleted": len(to_delete),
+        "members_null_key_rows": null_key_inserted,
+        "members_existing_fetch_ms": round(fetch_ms, 3),
+        "members_diff_ms": round(max(diff_ms, 0.0), 3),
+        "members_write_ms": round(write_ms, 3),
+        "members_delete_ms": round(delete_ms, 3),
+    }
+
+
 def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
@@ -4146,112 +4394,43 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                             old_count,
                         )
 
-                    # --- Content-hash guard: skip DELETE+INSERT if user data is unchanged ---
-                    # This prevents unnecessary DB churn and device re-sync when backend
-                    # returns refreshMembers=True but user data is actually the same.
-                    def _users_content_hash(user_list):
-                        """Compute a SHA-1 hash of the user list content for comparison."""
-                        h = hashlib.sha1()
-                        for u in sorted(user_list, key=lambda x: (x.get("userId") or 0, x.get("activeMembershipId") or x.get("membershipId") or 0)):
-                            am_id = u.get("activeMembershipId")
-                            m_id = u.get("membershipId")
-                            if am_id is None or str(am_id).strip() == "":
-                                am_id = m_id
-                            fps = u.get("fingerprints") or []
-                            row = (
-                                f"{u.get('userId')}|{am_id}|{m_id}|"
-                                f"{u.get('fullName')}|{u.get('phone')}|{u.get('email')}|"
-                                f"{u.get('validFrom')}|{u.get('validTo')}|"
-                                f"{u.get('firstCardId')}|{u.get('secondCardId')}|"
-                                f"{u.get('image')}|{json.dumps(fps, ensure_ascii=False, sort_keys=True)}|"
-                                f"{u.get('faceId')}|{u.get('accountUsernameId') or u.get('account_username_id')}|"
-                                f"{u.get('qrCodePayload')}|{u.get('birthday')}|"
-                                f"{u.get('imageSource')}|{u.get('userImageStatus')}|"
-                                f"{u.get('userProfileImage', '')}"
-                            )
-                            h.update(row.encode("utf-8", errors="replace"))
-                        return h.hexdigest()
-
-                    if users and old_count > 0:
-                        incoming_hash = _users_content_hash(users)
-                        # Build equivalent dicts from existing DB rows for comparison
-                        existing_rows = cur.execute(
-                            "SELECT user_id, active_membership_id, membership_id, "
-                            "full_name, phone, email, valid_from, valid_to, "
-                            "first_card_id, second_card_id, image, fingerprints_json, "
-                            "face_id, account_username_id, qr_code_payload, birthday, "
-                            "image_source, user_image_status, user_profile_image FROM sync_users"
-                        ).fetchall()
-                        existing_as_dicts = []
-                        for r in existing_rows:
-                            fps_raw = r[11] or "[]"
-                            try:
-                                fps_parsed = json.loads(fps_raw)
-                            except Exception:
-                                fps_parsed = []
-                            existing_as_dicts.append({
-                                "userId": r[0], "activeMembershipId": r[1], "membershipId": r[2],
-                                "fullName": r[3], "phone": r[4], "email": r[5],
-                                "validFrom": r[6], "validTo": r[7],
-                                "firstCardId": r[8], "secondCardId": r[9], "image": r[10],
-                                "fingerprints": fps_parsed,
-                                "faceId": r[12], "accountUsernameId": r[13],
-                                "qrCodePayload": r[14], "birthday": r[15],
-                                "imageSource": r[16], "userImageStatus": r[17],
-                                "userProfileImage": r[18],
-                            })
-                        existing_hash = _users_content_hash(existing_as_dicts)
-                        if incoming_hash == existing_hash:
-                            _logger.info(
-                                "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED (hash=%s), "
-                                "skipping DELETE+INSERT for %d users",
-                                incoming_hash[:12], len(users),
-                            )
-                            # Skip to next section — preserve device_sync_state hashes
-                            users = None  # sentinel: skip the INSERT loop below
-
-                    if users is not None:
-                        cur.execute("DELETE FROM sync_users")
-                        for u in users:
-                            if not isinstance(u, dict):
-                                continue
-                            fps = u.get("fingerprints") or []
-                            if not isinstance(fps, list):
-                                fps = []
-                            am_id = u.get("activeMembershipId")
-                            m_id = u.get("membershipId")
-                            if am_id is None or str(am_id).strip() == "":
-                                am_id = m_id
-                            cur.execute(
-                                """
-                                INSERT OR REPLACE INTO sync_users (
-                                    user_id, active_membership_id, membership_id,
-                                    full_name, phone, email, valid_from, valid_to,
-                                    first_card_id, second_card_id, image,
-                                    fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status, user_profile_image
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """,
-                                (
-                                    u.get("userId"), am_id, m_id,
-                                    u.get("fullName"), u.get("phone"), u.get("email"),
-                                    u.get("validFrom"), u.get("validTo"),
-                                    u.get("firstCardId"), u.get("secondCardId"), u.get("image"),
-                                    json.dumps(fps, ensure_ascii=False),
-                                    u.get("faceId"),
-                                    u.get("accountUsernameId") or u.get("account_username_id"),
-                                    u.get("qrCodePayload"), u.get("birthday"),
-                                    u.get("imageSource"),
-                                    u.get("userImageStatus"),
-                                    u.get("userProfileImage"),
-                                ),
-                            )
-
-                        new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                    # Per-row diff (2026-09-04). Until then this branch hashed the whole
+                    # table and, when the hash differed, ran DELETE FROM sync_users + a
+                    # re-INSERT of every row: 4765 ms for 934 rows on the gym PC, most of
+                    # it re-writing ~2 MB of unchanged templates -- and the hash compared
+                    # a missing userProfileImage as '' against the stored NULL, so it
+                    # rarely matched at all. The diff writes only rows that differ and
+                    # deletes only keys absent from the payload; an unchanged payload
+                    # does zero writes, which is what the hash guard was for
+                    # (member_shadow / device_sync_state hashes stay valid either way).
+                    # Keyed on the (user_id, active_membership_id) pair -- see
+                    # _apply_full_users_refresh. [TEST: tests/test_full_replace_row_diff.py]
+                    full_stats = _apply_full_users_refresh(cur, users)
+                    profile.update(full_stats)
+                    _logger.info(
+                        "[SYNC-DEBUG] save_sync_cache_delta: full refresh diff "
+                        "inserted=%d updated=%d unchanged=%d deleted=%d null_key=%d "
+                        "(fetch=%.0fms diff=%.0fms write=%.0fms delete=%.0fms)",
+                        full_stats["members_inserted"], full_stats["members_updated"],
+                        full_stats["members_unchanged"], full_stats["members_deleted"],
+                        full_stats["members_null_key_rows"],
+                        full_stats["members_existing_fetch_ms"], full_stats["members_diff_ms"],
+                        full_stats["members_write_ms"], full_stats["members_delete_ms"],
+                    )
+                    if not (
+                        full_stats["members_inserted"] or full_stats["members_updated"]
+                        or full_stats["members_deleted"] or full_stats["members_null_key_rows"]
+                    ):
                         _logger.info(
-                            "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
-                            new_count,
+                            "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED, "
+                            "%d rows untouched (no DELETE/INSERT)",
+                            full_stats["members_unchanged"],
                         )
+                    new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                    _logger.info(
+                        "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
+                        new_count,
+                    )
         else:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 
@@ -5455,12 +5634,19 @@ def list_members_roster(
     sort_dir: str = "asc",
 ) -> tuple[List[Dict[str, Any]], int, Dict[str, int]]:
     """Local-first member roster for the Access UI. Reads the local sync cache
-    (which already merges projected offline-pending members via list_sync_users)
-    so it works fully offline; enriches each row with a derived status
+    (which already merges projected offline-pending members via list_sync_users_page
+    at offset 0) so it works fully offline; enriches each row with a derived status
     (active | expired | pending) and the membership title, then applies free-text
     search, status filtering, sorting and pagination in memory. Returns
-    (page_rows, filtered_total, status_counts)."""
-    users = list_sync_users()
+    (page_rows, filtered_total, status_counts).
+
+    Reads the template-free projection: the enrich loop below never looks at
+    ``fingerprints`` and the roster contract (tauri-ui UsersPage ``MemberRosterRow``) has
+    no fingerprint field, so paying for ``fingerprints_json`` here was pure disk I/O.
+    Rows returned here therefore carry ``fingerprints == []`` -- see the CAUTION on
+    list_sync_users_page before adding a consumer that would read them.
+    [TEST: tests/test_local_state_template_free.py]"""
+    users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
     title_idx = _membership_title_index()
     muts_by_target = _active_mutations_by_target()
     today = datetime.now().date()

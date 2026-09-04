@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.core.db import (
-    list_sync_users,
+    list_sync_users_page,
     list_sync_gym_access_credentials,
 )
 from app.core import telemetry as _tel
@@ -707,7 +707,20 @@ def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]],
 
     with p.step("users"):
         try:
-            users = list_sync_users()
+            # Template-free projection on purpose. This state only indexes
+            # activeMembershipId / userId and the card fields below; its consumers
+            # (ultra_engine._get_cached_local_state -> users_by_am / users_by_card,
+            # realtime_agent._load_local_state, verify_totp_resilient,
+            # ultra_engine._prefetch_member_images) never read `fingerprints`. The push
+            # path takes templates from load_sync_cache() /
+            # DeviceSyncEngine._collect_templates_for_pin, never from here. Reading
+            # fingerprints_json (~90 % of the row bytes) is what made this reload cost
+            # 0.7-6.8 s per worker on the gym PC (DB_READ_users_split select_ms=6828).
+            # CAUTION (see list_sync_users_page): every user in this state has
+            # fingerprints == [], indistinguishable from "no fingerprints". No consumer
+            # of this state may count or push templates from it.
+            # [TEST: tests/test_local_state_template_free.py]
+            users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
         except Exception:
             users = []
 

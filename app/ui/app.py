@@ -31,7 +31,6 @@ from access.store import (
     cancel_offline_creation,
     claim_offline_creation_for_processing,
     classify_failure,
-    clear_auth_token,
     clear_version_tokens,
     duplicate_offline_creation,
     get_access_storage_status,
@@ -162,6 +161,21 @@ def _parse_dt_any(s: str) -> datetime | None:
     except Exception:
         pass
     return None
+
+
+def _shadow_am_id(u: Any) -> int | None:
+    """activeMembershipId of an incoming sync user as an int, parsed exactly like
+    db.upsert_member_shadow / db.diff_member_shadow do (None when absent or
+    non-numeric, so the write-set filter and the writer agree on every row)."""
+    if not isinstance(u, dict):
+        return None
+    raw = u.get("activeMembershipId") or u.get("active_membership_id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _log_sync_cache_write_profile(logger: Any, elapsed_ms: int) -> None:
@@ -829,7 +843,24 @@ class MainApp:
                         "[ShadowDiff] no member changes detected, "
                         "setting changed_ids=empty to skip pin push"
                     )
-            upsert_member_shadow(users=_incoming_users)
+            # Write back ONLY the rows the diff flagged. upsert_member_shadow is one
+            # INSERT ... ON CONFLICT per row (1535 ms for 934 rows on the gym PC,
+            # 2026-08-30 log) and the untouched rows already hold exactly these values.
+            # "membership_changed" (plan-only edits) is written too so the shadow's
+            # membership_id never goes stale, but it is deliberately NOT part of
+            # delta_changed_ids: a plan change is not an access field and must not
+            # trigger a device push. [TEST: tests/test_member_shadow_write_restricted.py]
+            _membership_changed = [int(x) for x in (_diff.get("membership_changed") or [])]
+            _shadow_write_ids = set(_shadow_changed)
+            _shadow_write_ids.update(_membership_changed)
+            _shadow_rows_to_write = [
+                u for u in _incoming_users if _shadow_am_id(u) in _shadow_write_ids
+            ]
+            self.logger.info(
+                "[ShadowDiff] writing %d/%d shadow rows (plan-only=%d)",
+                len(_shadow_rows_to_write), len(_incoming_users), len(_membership_changed),
+            )
+            upsert_member_shadow(users=_shadow_rows_to_write)
             if _shadow_deleted:
                 delete_member_shadow(active_membership_ids=_shadow_deleted)
             return delta_changed_ids
@@ -1244,34 +1275,10 @@ class MainApp:
             except Exception:
                 self._daily_sync_after_id = None
 
-    def force_login(self):
-        clear_auth_token()
-        clear_version_tokens()
-        try:
-            from tv.auth_bridge import clear_tv_auth_bridge_state
-
-            clear_tv_auth_bridge_state()
-        except Exception:
-            self.logger.warning("Failed to clear mirrored TV auth state during force_login.", exc_info=True)
-        try:
-            self._update_manager.stop()
-        except Exception:
-            pass
-        self.show_login()
-
-    def clear_auth(self):
-        clear_auth_token()
-        clear_version_tokens()
-        try:
-            from tv.auth_bridge import clear_tv_auth_bridge_state
-
-            clear_tv_auth_bridge_state()
-        except Exception:
-            self.logger.warning("Failed to clear mirrored TV auth state during clear_auth.", exc_info=True)
-        try:
-            self._update_manager.stop()
-        except Exception:
-            pass
+    # NOTE: force_login() / clear_auth() used to live here. They were the only code that
+    # cleared the version tokens on logout, and nothing called them. The single logout
+    # path is now POST /api/v2/auth/logout (_handle_auth_logout), which clears the tokens
+    # itself. [TEST: tests/test_logout_clears_version_tokens.py]
 
     def hide_to_tray(self):
         pass  # no-op, headless
