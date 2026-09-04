@@ -55,6 +55,9 @@ export interface UltraDeviceBlock {
    *  null/undefined = unknown -> keep the control live rather than hiding
    *  a command that may work. NOT derivable from the protocol. */
   supports_open_door?: boolean | null;
+  /** Which level decided supports_open_door on the standalone family:
+   *  "env" | "local" | "default"; null on drivers without the switch (PullSDK). */
+  open_door_source?: string | null;
   events_processed?: number;
   connect_failures?: number;
 }

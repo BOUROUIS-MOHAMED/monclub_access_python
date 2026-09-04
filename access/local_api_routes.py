@@ -85,6 +85,8 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("POST", "/api/v2/devices/{deviceId}/mirror/disarm", "_handle_device_mirror_disarm"),
     ("GET", "/api/v2/devices/{deviceId}/table/{tableName}", "_handle_device_table"),
     ("POST", "/api/v2/devices/{deviceId}/door/open", "_handle_device_door_open"),
+    ("GET", "/api/v2/devices/{deviceId}/open-door-switch", "_handle_device_open_door_switch_get"),
+    ("POST", "/api/v2/devices/{deviceId}/open-door-switch", "_handle_device_open_door_switch_set"),
     ("POST", "/api/v2/devices/{deviceId}/users/push", "_handle_device_users_push"),
     ("GET", "/api/v2/devices/{deviceId}/users", "_handle_device_users_list"),
     ("POST", "/api/v2/devices/{deviceId}/users/delete", "_handle_device_users_delete"),

@@ -1236,6 +1236,21 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_device_door_presets_device_id ON device_door_presets(device_id);")
 
         # -----------------------------
+        # local per-device OPERATOR settings. Deliberately NOT a sync_* table: those
+        # are replaced on every full sync / logout, this must survive. Today it holds
+        # the standalone-family door switch (NULL = not set -> family default).
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_local_settings (
+                device_id INTEGER PRIMARY KEY,
+                open_door_enabled INTEGER,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # -----------------------------
         # realtime rtlog cursor
         # -----------------------------
         conn.execute(
@@ -2742,6 +2757,62 @@ def delete_device_door_preset(preset_id: int) -> None:
     with get_conn() as conn:
         conn.execute("DELETE FROM device_door_presets WHERE id=?", (pid,))
         conn.commit()
+
+
+# -----------------------------
+# Local per-device operator settings (device_local_settings)
+# -----------------------------
+def get_device_open_door_switch(device_id: int) -> Optional[bool]:
+    """Persisted door switch for one device: True/False, or None when never set.
+
+    Consumed by app/sdk/zk_standalone.py::resolve_open_door_switch (env override >
+    this value > family default) via the projected device payload key
+    ``openDoorEnabled`` -- see list_sync_devices_payload / get_sync_device_payload.
+    """
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT open_door_enabled FROM device_local_settings WHERE device_id=?",
+            (int(device_id),),
+        ).fetchone()
+    if not r or r["open_door_enabled"] is None:
+        return None
+    return bool(int(r["open_door_enabled"]))
+
+
+def set_device_open_door_switch(device_id: int, enabled: Optional[bool]) -> None:
+    """Persist the door switch; ``None`` clears it (back to the family default)."""
+    did = int(device_id)
+    with get_conn() as conn:
+        if enabled is None:
+            conn.execute(
+                "UPDATE device_local_settings SET open_door_enabled=NULL, updated_at=? WHERE device_id=?",
+                (now_iso(), did),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO device_local_settings (device_id, open_door_enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(device_id) DO UPDATE SET
+                    open_door_enabled=excluded.open_door_enabled,
+                    updated_at=excluded.updated_at
+                """,
+                (did, 1 if enabled else 0, now_iso()),
+            )
+        conn.commit()
+
+
+def _load_device_open_door_switch_index() -> Dict[int, bool]:
+    """device_id -> persisted door switch, for the SET devices only."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                "SELECT device_id, open_door_enabled FROM device_local_settings "
+                "WHERE open_door_enabled IS NOT NULL"
+            ).fetchall()
+    except Exception:
+        return {}
+    return {int(r["device_id"]): bool(int(r["open_door_enabled"])) for r in rows}
 
 
 # -----------------------------
@@ -5811,12 +5882,17 @@ def list_sync_device_door_presets_payload_from_cache(
 
 def list_sync_devices_payload(*, include_door_presets: bool = True) -> List[Dict[str, Any]]:
     rows = list_sync_devices(include_door_presets=include_door_presets)
+    # Local operator switch merged into the payload (None = not set) so engines,
+    # drivers and the UI all see one value without a second lookup.
+    switch_idx = _load_device_open_door_switch_index()
     payload: List[Dict[str, Any]] = []
     for d in rows:
         p = _coerce_device_row_to_payload(d)
         presets = d.get("door_presets") or []
         if isinstance(presets, list):
             p["doorPresets"] = presets
+        did = _to_int_or_none(p.get("id"))
+        p["openDoorEnabled"] = switch_idx.get(int(did)) if did is not None else None
         payload.append(p)
     return payload
 
@@ -5829,6 +5905,7 @@ def get_sync_device_payload(device_id: int) -> Optional[Dict[str, Any]]:
     presets = d.get("door_presets") or []
     if isinstance(presets, list):
         p["doorPresets"] = presets
+    p["openDoorEnabled"] = get_device_open_door_switch(int(device_id))
     return p
 
 

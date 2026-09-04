@@ -214,11 +214,35 @@ OnAttTransactionEx(self, EnrollNumber, IsInValid, AttState, VerifyMethod,
 ```python
 zk.ACUnlock(1, int(delay_ds))    # -> bool ; delay is in DECISECONDS
 ```
-`open_door` converts: `delay_ds = max(1, int(round(pulse_time_ms / 100.0)))`, and the
-STA command deadline is `max(2.0, timeout_ms / 1000.0)` seconds. Any exception returns
-`False`. `[CODE]`
+`open_door` converts `delay_ds = round(pulse_time_ms / 100)` and **clamps it to
+1…600 ds** (0.1…60 s), logging a warning and stamping `clamped=True` on the telemetry
+line when it does. 600 ds is the app's own ceiling (the local API clamps `pulseSeconds`
+to 1–60 and `PullSDKDevice` clamps its seconds to 1–60); **the firmware's maximum for
+this argument is `[UNKNOWN]`** — nothing in this repo states it. The STA command
+deadline is `max(2.0, timeout_ms / 1000.0)` seconds. `[CODE: _pulse_ms_to_delay_ds,
+open_door]` `[TEST: test_mb2000_force_open.py::TestDriverDoorCommand::
+test_decisecond_conversion_and_clamp]`
 
-**Gated off by default — see §8.**
+The call goes through `_call()` like every other STA command, so the generation fence
+and wedge recovery of §2 apply unchanged: an `ACUnlock` that never returns is abandoned
+at the deadline (`ZKEM_STA_WEDGED`, `_sta_gen` bumped, `result=timeout`) and the next
+`connect()` rebuilds the thread. `[TEST: ::test_wedged_acunlock_times_out_abandons_sta_
+and_reports_timeout, ::test_recovery_after_wedge_is_serviced_by_the_new_thread]`
+
+Every attempt emits one telemetry line — `_tel.event` for `ok`, `_tel.warn` otherwise:
+
+```
+[T] DOOR_OPEN worker=ZKEM:<id> door=<n> result=<r> delay_ds=<ds> dur_ms=<ms> [clamped=True] source=<env|local|default> [err=<ExcName>]
+```
+`result ∈ {ok, false, exception, timeout, unsupported}` — a closed set,
+`_DOOR_OPEN_RESULTS`. `unsupported` = the switch was OFF and **no COM call was made**;
+`false` = `ACUnlock` answered `False` **or the driver was not connected** (the STA loop
+answers `False` without calling COM in that case). `[CODE]` `[TEST]`
+
+`door_id` is informational only: the machine number is always `1` and the MB2000 has
+one lock relay. `[CODE]`
+
+**Whether the switch allows the call is §6; whether the relay releases is §8.**
 
 ### Time
 
@@ -318,6 +342,17 @@ absent**, and the highest index is 12. `[CODE]`
 
 Any index that will not read is simply **omitted** — an unreadable status must never
 invent a capacity. `[CODE]` `[TEST]`
+
+**The `.ps1` lab contradicts this table on two indices.** `tools/mb2000_scripts/`
+scripts `3_get_device_info.ps1` and `12_force_open_door.ps1` label **6 = att logs** and
+**8 = face templates**, but `_STATUS_FIELDS` has **no index 6 at all** and maps
+**4 = `attendance_records`**, **8 = `user_capacity`**. One side is wrong; nothing in the
+repo settles which. `[UNVERIFIED]` Resolve on the MB2000 by reading indices 1–12 and
+comparing against the terminal's own on-screen counts. Until then the driver's `4` and
+the scripts' `6`/`8` labels are both suspect, and neither should be quoted to an
+operator as fact. The scripts' index→label *pairing* is at least mechanically correct
+as of 2026-09-04 — it was not before; see the `[ordered]`-indexed-by-integer note in
+§"PowerShell lab" below.
 
 ---
 
@@ -452,11 +487,29 @@ It **does** run after a member that completed normally and after one whose push 
 ## 6. Capability flags
 
 ```python
-owns_event_source = True            # [CODE]
-supports_device_params = False      # [CODE]
-supports_open_door = False          # [CODE] — see §8
-supports_transaction_table = False  # [CODE]
+owns_event_source = True                            # [CODE]
+supports_device_params = False                      # [CODE]
+supports_open_door = _OPEN_DOOR_FAMILY_DEFAULT      # [CODE] True; re-resolved per instance — see below and §8
+supports_transaction_table = False                  # [CODE]
 ```
+
+`supports_open_door` is **not a constant on this driver**. Every instance sets it in
+`__init__` from `resolve_open_door_switch(device_id, payload)` and can change it live
+through `apply_open_door_switch(local_value)`: `[CODE]` `[TEST:
+test_mb2000_force_open.py::TestOpenDoorSwitchResolution]`
+
+1. env `MONCLUB_ZK_STANDALONE_OPEN_DOOR` — `1|true|yes|on|all` ⇒ ON for all,
+   `0|false|no|off|none` ⇒ OFF for all, `8,12` ⇒ ON for those ids and OFF for the rest,
+   blank ⇒ no override, anything else ⇒ **logged and ignored**;
+2. the persisted per-device switch, `payload["openDoorEnabled"]` (from
+   `db.device_local_settings`, set from the Devices page control panel or
+   `POST /api/v2/devices/{id}/open-door-switch`);
+3. `_OPEN_DOOR_FAMILY_DEFAULT = True` — operator decision 2026-09-04.
+
+The effective value and its source are logged at construction (= every worker connect)
+and emitted as `[T] DOOR_OPEN_SWITCH worker=ZKEM:<id> enabled=… source=…`; the driver
+keeps it in `_open_door_source`, which the worker snapshot exposes as
+`open_door_source`. `[CODE]`
 
 `read_transaction_rows` / `get_table_count` / `delete_all_transaction_rows` are
 **inert** — callers must gate on `supports_transaction_table` and **skip the device**,
@@ -493,26 +546,62 @@ the existing attendance uploader carries it with zero changes. `[CODE]`
 
 ## 8. Unverified and unknown — do not treat as settled
 
-### `supports_open_door = False` `[UNVERIFIED — HARDWARE-GATED]`
+### `ACUnlock` releases the MB2000 turnstile `[UNVERIFIED — HARDWARE-GATED]`
 
 `ACUnlock` is documented SDK-wide but has **never been confirmed on MB2000 hardware**.
-It ships OFF: a door command that silently does nothing is worse than one that reports
-it cannot. `_do_open_door` implements the real call — the flag only decides whether the
-app is **allowed** to make it. `[CODE]`
+**This section stays `[UNVERIFIED]` until the operator reports that script 12 (or 9)
+passed on site** — a `DOOR_OPEN result=ok` line in the app log does **not** settle it:
+it proves the COM call returned `True`, not that the relay clicked or the turnstile
+released.
 
-Enable per-machine without a rebuild:
+What changed on 2026-09-04: the command is now **issued** instead of refused — the
+switch is ON for the family by operator decision (§6), after the desk was refused on
+every press while it shipped OFF `[FIELD: 2026-08-30, 13× DOOR_OPEN
+result=409_unsupported in ten seconds]`. `_do_open_door` implements the real call; the
+switch only decides whether the app is **allowed** to make it, and every attempt is
+loud (§4 Door: log line + `DOOR_OPEN` telemetry, French HTTP 500 to the desk on a
+`False`). `[CODE]` `[TEST: test_mb2000_force_open.py]`
+
+The env var is kept as an override in **both** directions:
 
 ```
 MONCLUB_ZK_STANDALONE_OPEN_DOOR
 ```
-Accepts `1｜true｜yes｜all` (every standalone terminal) or a device-id list like `8` or
-`8,12`. Anything else leaves it OFF. Parsed **per call**, so an operator can flip it
-without restarting. Enabling it logs a loud warning, deliberately. `[CODE]`
+`1｜true｜yes｜on｜all` forces ON everywhere, `0｜false｜no｜off｜none` forces OFF
+everywhere, a device-id list like `8` or `8,12` is an allowlist (ON for those, OFF for
+the rest). Blank = no override; anything else is **logged and ignored**. Parsed **per
+call**, so an operator can flip it without restarting. `[CODE: _open_door_env_override]`
 
-**Verify first** with `tools/mb2000_scripts/9_unlock_door.ps1`, which fires the
-identical `ACUnlock(1, ds)` call. Listen for the relay **and** confirm the turnstile
-physically releases — `ACUnlock` returning `True` with no release is a wiring fault,
-not an SDK one. `[COMMENT]`
+**Still verify** with the on-site script pack — two scripts fire the identical
+`ACUnlock(mn, ds)` call:
+
+- `tools/mb2000_scripts/9_unlock_door.ps1` — the minimal one-shot: fire once, ask
+  whether the relay clicked. Unchanged.
+- `tools/mb2000_scripts/12_force_open_door.ps1` — the **sustained** variant, added
+  2026-09-04: duration in seconds → deciseconds, `-Repeat`/`-IntervalSeconds` to hold
+  the door open, device info before/after, `-Auto` for the desk, and **every attempt
+  appended to `tools/mb2000_scripts/logs/force_open_*.log`** so the operator can send
+  the result back. Exit codes `0`/`1`/`2`/`3` = all TRUE / setup failure / some FALSE /
+  some call threw.
+
+Either way: listen for the relay **and** confirm the turnstile physically releases —
+`ACUnlock` returning `True` with no release is a wiring fault, not an SDK one.
+`[COMMENT]`
+
+No PASS has been reported from either script, so this section does not move:
+`ACUnlock` stays `[UNVERIFIED]` on the MB2000 until an operator reports one with a log
+(the *switch* being ON is a software decision — §6 — not evidence). What script 12
+adds is a **record**, not a result. `[CODE: 12_force_open_door.ps1]`
+
+Two limits of that record, stated in the script header so nobody over-reads it:
+the elapsed ms it prints is the duration of the **COM call**, not of the relay; and
+the app hardcodes `ACUnlock(1, ds)`, so a PASS obtained with a different machine
+number does not transfer. The **maximum** delay `ACUnlock` accepts is `[UNKNOWN]` —
+nothing in this guide documents one, so the script's own 600 ds ceiling is sourced
+from the app's `pulseSeconds 1..60` clamp and is labelled as an app limit, not an SDK
+one — the driver clamps at the same 600 ds (§4 Door). This SDK also exposes **no
+reason** for a `False` return; the script reports `FALSE` and no more, and the app
+reports `DOOR_OPEN result=false`. `[UNKNOWN]`
 
 ### Which `verifyMethod` integer means what `[UNKNOWN]`
 
@@ -592,6 +681,12 @@ Found by verification. Trust the code, not these. `[CODE — each checked]`
 - `list_users` fail-closed (three cases — but see §4 for what each asserts)
 - device occupancy reporting, including that an unreadable status invents no capacity
 - capability flags; `delete_all_transaction_rows` inertness
+- the door command end to end `[TEST — tests/test_mb2000_force_open.py]`: switch
+  resolution (env > local > default), `ACUnlock(1, ds)` argument values, the
+  1…600 ds clamp, every `DOOR_OPEN` result, the fence/abandon/rebuild on a wedged
+  `ACUnlock`, `_open_door_with_retry` and the worker command queue on this driver,
+  `POST /door/open` → 200/409/500/503/429, the switch endpoints, persistence and
+  payload projection, and a regression pin that the PullSDK door path is unchanged
 - protocol conformance via `isinstance` (a conformance check only — exercises no
   behaviour)
 
@@ -608,10 +703,10 @@ Found by verification. Trust the code, not these. `[CODE — each checked]`
 python -m pytest tests/ -q --ignore=tests/_pydeps
 ```
 `--ignore=tests/_pydeps` is **required** (vendored packages break collection; there is
-no `pytest.ini`). Last run: **833 passed**, 2026-08-29.
+no `pytest.ini`). Last run: **968 passed**, 2026-09-04.
 
 ```bash
-python -m pytest tests/test_zk_standalone_driver.py tests/test_device_sync_protocol_guard.py -q
+python -m pytest tests/test_zk_standalone_driver.py tests/test_device_sync_protocol_guard.py tests/test_mb2000_force_open.py -q
 ```
 
 Confirm §3 — the must-not-call — still holds. Match **calls** (`zk.`-prefixed), not the
@@ -634,5 +729,5 @@ grep -rn "\.push_roster(" app/ --include=*.py
 ```
 
 On-site ground truth before changing driver code — `tools/mb2000_scripts/` (`0_MENU.ps1`
-plus 11 scripts: COM registration, device info, ZK9500 enrol, push, live monitor,
-unlock, backup/restore, portability test).
+plus 12 scripts: COM registration, device info, ZK9500 enrol, push, live monitor,
+unlock, backup/restore, portability test, force-open).

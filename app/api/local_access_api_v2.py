@@ -3863,6 +3863,26 @@ def _handle_device_table(ctx: _Ctx) -> None:
 _door_open_last: Dict[int, float] = {}  # M-003: per-device rate limit for door open
 _DOOR_OPEN_COOLDOWN_SEC = 1.0
 
+
+def _door_open_error_fr(err: Any) -> str:
+    """Operator-facing French text for a failed ULTRA door command.
+
+    The worker's result box carries internal English strings ("open_door returned
+    False" = the driver's SDK call answered FALSE -- ACUnlock on the standalone
+    family, ControlDevice on PullSDK). The raw string is still returned as
+    ``detail`` for the log/grep; this is what the desk reads.
+    """
+    e = str(err or "").strip()
+    if e == "open_door returned False":
+        return ("l'appareil a refusé la commande d'ouverture (le SDK a répondu FALSE) "
+                "— vérifier le relais et le câblage de la porte")
+    if e == "not connected":
+        return "appareil non connecté"
+    if e == "superseded":
+        return "commande remplacée par un appui plus récent"
+    return f"échec de l'ouverture de porte ({e or 'erreur inconnue'})"
+
+
 def _handle_device_door_open(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
 
@@ -3922,26 +3942,30 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                     "lastConnectError": str(getattr(worker, "_last_connect_error", "")),
                 })
                 return
-            # A driver may declare that it cannot command the door at all. On the
-            # standalone family this ships OFF behind a hardware gate (ACUnlock is
-            # implemented but unverified on that terminal), so the command would
-            # come back False and used to surface as HTTP 500 with the internal
-            # English string "open_door returned False" -- a policy refusal
-            # rendered as a server crash. Answer the deliberate-refusal shape
-            # instead, and name the switch that enables it.
+            # A driver may declare that it cannot command the door. On the standalone
+            # family that is the per-device switch (env override > persisted local
+            # switch > family default ON -- zk_standalone.resolve_open_door_switch);
+            # PullSDK drivers have no flag and default True. Answer the deliberate
+            # -refusal shape (409 + unsupported) rather than a 500, and say what
+            # switched it off.
             _drv = getattr(worker, "_sdk", None)
             if _drv is not None and not getattr(_drv, "supports_open_door", True):
-                _logger.info(
-                    "[LocalAPI] door_open refused: device_id=%s driver=%s (door command disabled)",
-                    did, type(_drv).__name__,
+                _src = str(getattr(_drv, "_open_door_source", "") or "")
+                _logger.warning(
+                    "[LocalAPI] door_open refused: device_id=%s driver=%s switch=OFF source=%s",
+                    did, type(_drv).__name__, _src or "?",
                 )
                 ctx.send_json(409, {
                     "ok": False,
                     "unsupported": True,
-                    "error": "l'ouverture de porte est désactivée pour ce modèle "
-                             "(non validée sur ce matériel)",
+                    "source": _src or None,
+                    "error": "l'ouverture de porte est désactivée pour cet appareil "
+                             "(interrupteur « Commande d'ouverture » du panneau de contrôle"
+                             + (", forcé par MONCLUB_ZK_STANDALONE_OPEN_DOOR" if _src == "env" else "")
+                             + ")",
                 })
-                _tel.event("DOOR_OPEN", device_id=did, door=door, result="409_unsupported")
+                _tel.event("DOOR_OPEN", device_id=did, door=door, result="409_unsupported",
+                           source=_src or None)
                 return
             _logger.info(
                 "[LocalAPI] ULTRA door open via command queue: device_id=%s door=%s pulse_sec=%s",
@@ -3970,7 +3994,11 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 _tel.warn("DOOR_OPEN", device_id=did, door=door, result="503_timeout", wait_ms=_door_ms)
             else:
                 _logger.warning("[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s", did, door, err)
-                ctx.send_json(500, {"ok": False, "error": err or "door open failed"})
+                ctx.send_json(500, {
+                    "ok": False,
+                    "error": _door_open_error_fr(err),
+                    "detail": err or "door open failed",
+                })
                 _tel.warn("DOOR_OPEN", device_id=did, door=door, result="500_failed", err=str(err)[:40], wait_ms=_door_ms)
             return
 
@@ -3987,6 +4015,121 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
     finally:
         try: sdk.disconnect()
         except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Standalone-family door switch (persisted per device; env override wins)
+# ---------------------------------------------------------------------------
+
+_OPEN_DOOR_SWITCH_UNSUPPORTED_FR = (
+    "ce réglage ne s'applique qu'aux terminaux autonomes (zkemkeeper) ; "
+    "les panneaux PullSDK ouvrent toujours la porte"
+)
+
+
+def _open_door_switch_worker(ctx: _Ctx, did: int):
+    ultra_eng = getattr(ctx.app, "_ultra_engine", None)
+    if ultra_eng and getattr(ultra_eng, "running", False):
+        return ultra_eng._workers.get(did)
+    return None
+
+
+def _open_door_switch_state(ctx: _Ctx, did: int) -> Dict[str, Any]:
+    """Effective door switch for a standalone device, with every input shown."""
+    from app.core.db import get_device_open_door_switch
+    from app.sdk import zk_standalone as _zs
+
+    local = get_device_open_door_switch(did)
+    env = _zs._open_door_env_override(did)
+    enabled, source = _zs.resolve_open_door_switch(did, {_zs._OPEN_DOOR_PAYLOAD_KEY: local})
+    drv = getattr(_open_door_switch_worker(ctx, did), "_sdk", None)
+    live = bool(getattr(drv, "supports_open_door", True)) if drv is not None else None
+    return {
+        "enabled": bool(enabled),          # effective value
+        "source": source,                  # env | local | default
+        "local": local,                    # persisted switch, None = not set
+        "envOverride": env,                # None = env var unset
+        "familyDefault": bool(_zs._OPEN_DOOR_FAMILY_DEFAULT),
+        "live": live,                      # what the running driver holds (None = no driver)
+        # ACUnlock has never been confirmed to release the MB2000 turnstile; the
+        # relay proof is script 12/9 on site (zkemkeeper_guide.md §8).
+        "hardwareVerified": False,
+    }
+
+
+def _open_door_switch_guard(ctx: _Ctx) -> Tuple[int, str]:
+    """(deviceId, protocol) or (0, '') after having answered the request."""
+    did = ctx.param_int("deviceId")
+    if did <= 0:
+        ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return 0, ""
+    proto = _device_protocol_of(did)
+    if proto != "ZK_STANDALONE":
+        _logger.info("[LocalAPI] open_door_switch refused: deviceId=%s protocol=%s", did, proto)
+        ctx.send_json(409, {
+            "ok": False, "unsupported": True, "protocol": proto,
+            "error": _OPEN_DOOR_SWITCH_UNSUPPORTED_FR,
+        })
+        return 0, ""
+    return did, proto
+
+
+def _handle_device_open_door_switch_get(ctx: _Ctx) -> None:
+    """GET /devices/{id}/open-door-switch — effective door switch + its inputs."""
+    did, proto = _open_door_switch_guard(ctx)
+    if did <= 0:
+        return
+    try:
+        ctx.send_json(200, {"ok": True, "protocol": proto, **_open_door_switch_state(ctx, did)})
+    except Exception as e:  # noqa: BLE001
+        ctx.send_json(500, {"ok": False, "error": str(e)})
+
+
+def _handle_device_open_door_switch_set(ctx: _Ctx) -> None:
+    """POST /devices/{id}/open-door-switch {enabled: true|false|null}.
+
+    Persists the per-device switch (null = clear -> family default), applies it to
+    the running driver immediately (no reconnect) and stamps the worker's device
+    snapshot so a later reconnect re-resolves the same value before the next sync
+    refresh. MONCLUB_ZK_STANDALONE_OPEN_DOOR, when set, still wins -- the response
+    says so (source=env) rather than pretending the click took effect.
+    """
+    did, proto = _open_door_switch_guard(ctx)
+    if did <= 0:
+        return
+    from app.core.db import set_device_open_door_switch
+    from app.sdk import zk_standalone as _zs
+
+    raw = ctx.body().get("enabled")
+    local: Optional[bool] = None if raw is None else _safe_bool(raw, False)
+    try:
+        set_device_open_door_switch(did, local)
+    except Exception as e:  # noqa: BLE001
+        ctx.send_json(500, {"ok": False, "error": f"enregistrement impossible: {e}"})
+        return
+
+    applied = False
+    worker = _open_door_switch_worker(ctx, did)
+    if worker is not None:
+        try:
+            dev = getattr(worker, "_device", None)
+            if isinstance(dev, dict):
+                dev[_zs._OPEN_DOOR_PAYLOAD_KEY] = local
+            drv = getattr(worker, "_sdk", None)
+            if drv is not None and hasattr(drv, "apply_open_door_switch"):
+                drv.apply_open_door_switch(local)
+                applied = True
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[LocalAPI] open_door_switch live apply failed: deviceId=%s err=%s", did, e)
+
+    state = _open_door_switch_state(ctx, did)
+    _logger.warning(
+        "[LocalAPI] open_door_switch SET by operator: deviceId=%s local=%s -> effective=%s source=%s applied=%s",
+        did, local, state["enabled"], state["source"], applied,
+    )
+    _tel.event("DOOR_OPEN_SWITCH", device_id=did, enabled=state["enabled"], source=state["source"],
+               local=local, by="operator", applied=applied)
+    ctx.send_json(200, {"ok": True, "protocol": proto, "applied": applied, **state})
 
 
 def _parse_device_param_kv(raw: str) -> Dict[str, str]:

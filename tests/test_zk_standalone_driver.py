@@ -277,12 +277,28 @@ class TestDriverLifecycle:
         # queue drained; second poll is empty and non-blocking
         assert drv.poll_rtlog_once() == []
 
-    def test_open_door_gated_off_until_gate4(self, driver):
+    def test_open_door_default_on_for_the_family(self, driver, monkeypatch):
+        """Operator decision 2026-09-04: ON unless switched off per device or by env.
+        Whether the MB2000 relay releases on ACUnlock is still UNVERIFIED (script 12/9)."""
+        monkeypatch.delenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", raising=False)
         drv, zk = driver
         drv.connect()
-        assert drv.supports_open_door is False
-        assert drv.open_door(door_id=1, pulse_time_ms=3000) is False
-        assert all(c[0] != "ACUnlock" for c in zk.calls)
+        assert drv.supports_open_door is True
+        assert drv._open_door_source == "default"
+        assert drv.open_door(door_id=1, pulse_time_ms=3000) is True
+        assert [c for c in zk.calls if c[0] == "ACUnlock"] == [("ACUnlock", 1, 30)]
+
+    def test_open_door_switched_off_per_device_never_touches_com(self, monkeypatch):
+        monkeypatch.delenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", raising=False)
+        drv, zk = _make_driver({"openDoorEnabled": False})
+        drv.connect()
+        try:
+            assert drv.supports_open_door is False
+            assert drv._open_door_source == "local"
+            assert drv.open_door(door_id=1, pulse_time_ms=3000) is False
+            assert all(c[0] != "ACUnlock" for c in zk.calls)
+        finally:
+            drv.disconnect()
 
     def test_open_door_when_capability_enabled(self, driver):
         drv, zk = driver

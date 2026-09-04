@@ -33,14 +33,25 @@ try {
 
     Write-Host ""
     Write-Host "COUNTS (GetDeviceStatus)" -ForegroundColor Cyan
-    $statusMap = [ordered]@{ 1 = 'Admins'; 2 = 'Users'; 3 = 'Fingerprints'; 6 = 'Attendance logs'; 8 = 'Face templates' }
-    foreach ($idx in $statusMap.Keys) {
+    # Pairs, NOT [ordered]@{ 1 = 'admins'; ... }. In PowerShell an ordered dictionary
+    # indexed with an INTEGER returns the entry at that POSITION, not the entry with
+    # that KEY - so $map[6] is out of range and $map[1] is the SECOND entry. Written
+    # with a hashtable this loop silently mislabels the counters (the admin count
+    # printed as "users", and no label at all for indexes 6 and 8). Verified in 5.1.
+    # GetDeviceStatus index: 1=admins 2=users 3=fingerprints 6=att logs 8=face.
+    $statusFields = @(
+        @(1, 'Admins'), @(2, 'Users'), @(3, 'Fingerprints'),
+        @(6, 'Attendance logs'), @(8, 'Face templates')
+    )
+    foreach ($sf in $statusFields) {
+        $idx = [int]$sf[0]
+        $label = [string]$sf[1]
         try {
             $n = 0
-            if ($zk.GetDeviceStatus($mn, [int]$idx, [ref]$n)) {
-                Write-Host ("  {0,-22} {1}" -f $statusMap[$idx], $n)
+            if ($zk.GetDeviceStatus($mn, $idx, [ref]$n)) {
+                Write-Host ("  {0,-22} {1}" -f $label, $n)
             }
-        } catch { Write-Host ("  {0,-22} (unsupported)" -f $statusMap[$idx]) -ForegroundColor DarkGray }
+        } catch { Write-Host ("  {0,-22} (unsupported)" -f $label) -ForegroundColor DarkGray }
     }
 
     Write-Host ""

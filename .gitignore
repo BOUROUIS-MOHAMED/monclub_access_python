@@ -46,3 +46,10 @@ tmp/
 # which stays tracked.
 updater/**/bin/
 updater/**/obj/
+# MB2000 script-lab output written on the gym PC (script 12 run logs, script 10
+# device backups, the local template store, the saved device config). Operator data
+# and device identifiers -- never part of a commit.
+tools/mb2000_scripts/logs/
+tools/mb2000_scripts/backups/
+tools/mb2000_scripts/templates/
+tools/mb2000_scripts/config.json

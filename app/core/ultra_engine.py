@@ -3400,21 +3400,17 @@ class UltraDeviceWorker(threading.Thread):
             # Whether this driver may command the door at all. None = unknown (no
             # driver built yet) so a UI keeps the control live rather than hiding
             # one that may work; False is a definite "this cannot open a door".
-            # NOTE: read from the DRIVER, not the protocol -- the standalone
-            # family ships it off behind a hardware gate that an operator can
-            # flip per-machine, so protocol is the wrong thing to gate a UI on.
+            # NOTE: read from the DRIVER, not the protocol -- on the standalone
+            # family it is a persisted per-device switch (env override > local
+            # switch > family default ON, zk_standalone.resolve_open_door_switch),
+            # so protocol is the wrong thing to gate a UI on. open_door_source
+            # names which of those decided (None on drivers without the switch).
             "supports_open_door": (
                 bool(getattr(self._sdk, "supports_open_door", True))
                 if getattr(self, "_sdk", None) is not None else None
             ),
-            # Whether the door command is actually available on this driver.
-            # None = unknown (no driver built yet) -- the UI must keep the control
-            # LIVE on unknown rather than hiding a command that may well work.
-            # NOT derivable from the protocol: ZK_STANDALONE ships with the door
-            # command gated off, but MONCLUB_ZK_STANDALONE_OPEN_DOOR can enable it
-            # per machine once the relay has been verified on real hardware.
-            "supports_open_door": (
-                bool(getattr(self._sdk, "supports_open_door", True))
+            "open_door_source": (
+                getattr(self._sdk, "_open_door_source", None)
                 if getattr(self, "_sdk", None) is not None else None
             ),
             "events_processed": self._events_processed,
