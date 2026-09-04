@@ -468,15 +468,37 @@ class MonClubApi:
         }
 
         self.logger.info("API createUserFingerprint -> %s", url)
+        # This is the ONLY layer that sees the raw HTTP status and error body: the
+        # caller receives them flattened into a MonClubApiError message. Emitting
+        # the structured line here is what makes "did the enrolment reach the
+        # backend, and what did it answer?" a single grep. Correlate with the
+        # caller's ENROLL_BACKEND_REQ on (am_id, finger_id) -- deliberately not by
+        # threading enroll_id through this shared API surface.
+        _am = payload.get("activeMembershipId") if isinstance(payload, dict) else None
+        _fid = payload.get("fingerId") if isinstance(payload, dict) else None
+        _t0 = time.monotonic()
         try:
             r = self._session.post(url, json=payload, headers=headers, timeout=timeout)
         except Exception as e:
+            _tel.warn("ENROLL_BACKEND", am_id=_am, finger_id=_fid, status=None,
+                      result="request_failed", err=str(e)[:200],
+                      dur_ms=round((time.monotonic() - _t0) * 1000.0))
             raise MonClubApiError(f"createUserFingerprint request failed: {e}") from e
 
+        _dur_ms = round((time.monotonic() - _t0) * 1000.0)
         if r.status_code < 200 or r.status_code >= 300:
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
+            # The body is the diagnostic: HTTP 403 here has twice been a wrong
+            # activeMembershipId (a plan id, or the wrong row of a multi-membership
+            # member), not an actual permission problem.
+            _tel.warn("ENROLL_BACKEND", am_id=_am, finger_id=_fid,
+                      status=r.status_code, result="rejected",
+                      body=txt[:200].replace("\n", " ") or None, dur_ms=_dur_ms)
             raise MonClubApiError(f"createUserFingerprint failed: HTTP {r.status_code} -> {txt[:500]}{extra}")
+
+        _tel.event("ENROLL_BACKEND", am_id=_am, finger_id=_fid,
+                   status=r.status_code, result="ok", dur_ms=_dur_ms)
 
         try:
             data = r.json()

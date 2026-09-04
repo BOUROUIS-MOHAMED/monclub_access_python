@@ -660,6 +660,10 @@ class ZKStandaloneDevice:
                                # failures reported by the chunk, plus every member of
                                # a chunk that wedged (none of those were confirmed).
                                "failed_pins": []}
+        # Telemetry-only accumulators (never read by the engine).
+        agg_failed_reasons: Dict[str, str] = {}
+        agg_tpl_attempted = 0
+        agg_tpl_ok = 0
         consecutive_wedges = 0
         total = len(users)
         # Trace budgets span the WHOLE roster, not one chunk.
@@ -719,6 +723,18 @@ class ZKStandaloneDevice:
                     "%s push_roster chunk %d/%d WEDGED (pins %s) after %d pushed: %s",
                     self._prefix, idx, len(chunks), chunk_pins(part), agg["pushed"], exc,
                 )
+                # Named twin of the warning above. _abandon_sta_thread already emits
+                # ZKEM_STA_WEDGED with the abandon reason; this one names the CHUNK
+                # and the members lost with it, which that event cannot know.
+                try:
+                    _tel.warn(
+                        "ZKEM_PUSH_WEDGED", worker=self._tel_wid, chunk=idx,
+                        chunks=len(chunks), members=len(part),
+                        consecutive=consecutive_wedges,
+                        pushed_before=agg["pushed"], err=str(exc)[:120],
+                    )
+                except Exception:
+                    pass
                 if consecutive_wedges >= _PUSH_MAX_CONSECUTIVE_WEDGES:
                     self.logger.error(
                         "%s push_roster ABANDONED after %d consecutive wedged chunks "
@@ -727,6 +743,12 @@ class ZKStandaloneDevice:
                     )
                     agg["errors"].append(
                         f"abandoned after {consecutive_wedges} consecutive wedged chunks")
+                    try:
+                        _tel.warn("ZKEM_PUSH_ABANDONED", worker=self._tel_wid,
+                                  consecutive=consecutive_wedges, chunk=idx,
+                                  chunks=len(chunks), pushed=agg["pushed"])
+                    except Exception:
+                        pass
                     break
                 # Rebuild the link before the next chunk; without this every
                 # remaining _call raises "STA thread not running".
@@ -736,13 +758,28 @@ class ZKStandaloneDevice:
                             "%s push_roster: reconnect failed after a wedge -- stopping",
                             self._prefix,
                         )
+                        try:
+                            _tel.warn("ZKEM_PUSH_RECONNECT", worker=self._tel_wid,
+                                      chunk=idx, ok=False, err="connect_falsy")
+                        except Exception:
+                            pass
                         break
                 except Exception:
                     self.logger.warning(
                         "%s push_roster: reconnect raised after a wedge -- stopping",
                         self._prefix, exc_info=True,
                     )
+                    try:
+                        _tel.warn("ZKEM_PUSH_RECONNECT", worker=self._tel_wid,
+                                  chunk=idx, ok=False, err="connect_raised")
+                    except Exception:
+                        pass
                     break
+                try:
+                    _tel.event("ZKEM_PUSH_RECONNECT", worker=self._tel_wid,
+                               chunk=idx, ok=True)
+                except Exception:
+                    pass
                 continue
             consecutive_wedges = 0
             agg["pushed"] += int(res.get("pushed") or 0)
@@ -759,6 +796,26 @@ class ZKStandaloneDevice:
                 _p = str(_p or "").strip()
                 if _p and _p not in agg["failed_pins"]:
                     agg["failed_pins"].append(_p)
+            # One telemetry line per chunk (~93 for a full 928-member roster), which
+            # is where per-pin detail is aggregated to. Per-pin lines are deliberately
+            # NOT emitted inside the member loop: see the note in _do_push_roster.
+            try:
+                for _fp, _fr in (res.get("failed_reasons") or {}).items():
+                    agg_failed_reasons.setdefault(str(_fp), str(_fr))
+                agg_tpl_attempted += int(res.get("tpl_attempted") or 0)
+                agg_tpl_ok += int(res.get("tpl_ok") or 0)
+                _tel.event(
+                    "ZKEM_PUSH_CHUNK", worker=self._tel_wid, chunk=idx, chunks=len(chunks),
+                    members=len(part),
+                    first_pin=str((part or [{}])[0].get("pin") or "") or None,
+                    last_pin=str((part or [{}])[-1].get("pin") or "") or None,
+                    pushed=res.get("pushed"), failed=res.get("failed"),
+                    templates_failed=res.get("templates_failed"),
+                    tpl_attempted=res.get("tpl_attempted"), tpl_ok=res.get("tpl_ok"),
+                    dur_ms=res.get("chunk_ms"), ok=bool(res.get("ok", True)),
+                )
+            except Exception:
+                pass
             trace_members_left = int(res.get("trace_members_left", trace_members_left) or 0)
             trace_templates_left = int(res.get("trace_templates_left", trace_templates_left) or 0)
             for e in (res.get("errors") or [])[:5]:
@@ -796,7 +853,27 @@ class ZKStandaloneDevice:
         try:
             _tel.event("ZKEM_PUSH_DONE", worker=self._tel_wid, pushed=agg["pushed"],
                        failed=agg["failed"], skipped_pin=agg["skipped_pin"],
-                       ok=bool(agg["ok"]), chunks=len(chunks))
+                       ok=bool(agg["ok"]), chunks=len(chunks),
+                       tpl_attempted=agg_tpl_attempted, tpl_ok=agg_tpl_ok,
+                       tpl_failed=agg["templates_failed"])
+            # WHICH pins did not land, and WHY. One line, so "was pin X pushed?"
+            # is a single grep. A pin with no recorded reason came from a WEDGED
+            # chunk -- nothing in that chunk was confirmed -- which is itself the
+            # answer, so it is reported as such rather than left blank.
+            if agg["failed_pins"]:
+                _reasons = {
+                    str(p): agg_failed_reasons.get(str(p), "chunk_wedged_or_unconfirmed")
+                    for p in agg["failed_pins"]
+                }
+                _by_reason: Dict[str, int] = {}
+                for _r in _reasons.values():
+                    _by_reason[_r] = _by_reason.get(_r, 0) + 1
+                _tel.warn(
+                    "ZKEM_PUSH_FAILED_PINS", worker=self._tel_wid,
+                    count=len(agg["failed_pins"]), by_reason=_by_reason,
+                    pins=";".join(f"{p}={r}" for p, r in list(_reasons.items())[:40]),
+                    truncated=(len(_reasons) > 40) or None,
+                )
         except Exception:
             pass
         # keep the event-side identity map in step with what the device now holds
@@ -1185,6 +1262,26 @@ class ZKStandaloneDevice:
                 self._device_fp_version or "unknown",
                 self._device_status or "unreadable",
             )
+            # Structured twin of the connect line above. Adds NO device round-trip:
+            # both values were just read. This is the "device counters" record a
+            # field test compares before and after a push -- a push is bracketed by
+            # connects, so two consecutive lines answer "did the terminal's
+            # fingerprint count actually go up?".
+            #
+            # label_source names WHERE the names come from on purpose: the index ->
+            # name table below is CONTRADICTED by tools/mb2000_scripts (3 and 12
+            # label index 6 as attendance logs and 8 as face templates). Nothing in
+            # the repo settles it, so the provenance travels with the numbers rather
+            # than the labels being presented as fact. [UNVERIFIED]
+            try:
+                _tel.event(
+                    "ZKEM_DEVICE_COUNTERS", worker=self._tel_wid,
+                    device_fp_version=self._device_fp_version or None,
+                    label_source="driver._STATUS_FIELDS",
+                    **{f"c_{_k}": _v for _k, _v in (self._device_status or {}).items()},
+                )
+            except Exception:
+                pass
             self._warn_if_device_full()
         else:
             self.logger.warning("%s Connect_Net returned False (ip=%s port=%s)",
@@ -1285,11 +1382,27 @@ class ZKStandaloneDevice:
         # failed pin.
         failed_pins: List[str] = []
         _failed_seen: set = set()
+        # WHY each pin failed. failed_pins alone says a member did not land but not
+        # whether the member ROW was refused (SSR_SetUserInfo False), a FINGER was
+        # refused (SetUserTmpExStr False) or the member raised mid-push -- three
+        # different faults with three different remedies. Telemetry only: this is
+        # reported through ZKEM_PUSH_FAILED_PINS, never used to decide anything.
+        failed_reasons: Dict[str, str] = {}
+        # Template counters, accumulated in memory and reported at chunk boundaries.
+        # They are deliberately NOT emitted per finger: the STA loop services one
+        # command with no event pump for its whole duration, and the logging handler
+        # writes synchronously inline, so a per-finger line on a 928-member push
+        # widens the no-pump window -- a behaviour change, not instrumentation.
+        tpl_attempted = 0
+        tpl_ok = 0
 
-        def _mark_failed(p: str) -> None:
+        def _mark_failed(p: str, reason: str = "") -> None:
             if p and p not in _failed_seen:
                 _failed_seen.add(p)
                 failed_pins.append(p)
+            # First reason wins: it is the one that broke this member.
+            if p and reason and p not in failed_reasons:
+                failed_reasons[p] = reason
 
         # Progress instrumentation.
         #
@@ -1357,7 +1470,7 @@ class ZKStandaloneDevice:
                     ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, True))
                     if not ok:
                         failed += 1
-                        _mark_failed(pin)
+                        _mark_failed(pin, "set_user_info_false")
                         if len(errors) < 5:
                             errors.append(f"SSR_SetUserInfo pin={pin}")
                         continue
@@ -1393,7 +1506,10 @@ class ZKStandaloneDevice:
                             if templates_left > 0:
                                 templates_left -= 1
                             self.logger.info("%s push trace pin=%s -> SetUserTmpExStr(f=%s len=%d)", self._prefix, pin, finger_idx, len(tmp))
+                        tpl_attempted += 1
                         okt = bool(zk.SetUserTmpExStr(1, pin, finger_idx, 1, tmp))
+                        if okt:
+                            tpl_ok += 1
                         if not okt:
                             # Previously this only appended a string to errors[] and
                             # left `failed` untouched, so ok stayed True: the member
@@ -1402,7 +1518,7 @@ class ZKStandaloneDevice:
                             # "fingerprint unchanged". The member's finger was
                             # refused at the turnstile while Access said it worked.
                             templates_failed += 1
-                            _mark_failed(pin)
+                            _mark_failed(pin, f"template_refused_f{finger_idx}")
                             _st = getattr(self, "_device_status", None) or {}
                             _store = (
                                 f"{_st.get('fingerprints')}/{_st.get('fingerprint_capacity')}"
@@ -1420,12 +1536,40 @@ class ZKStandaloneDevice:
                                 getattr(self, "_device_fp_version", "") or "unknown",
                                 tpl.get("templateVersion") or "?", _store,
                             )
+                            # Structured twin of the warning above. Emitted only on
+                            # the REFUSAL path, which is rare, so the extra inline
+                            # write cannot widen the no-pump window on a healthy push.
+                            # Sizes and versions only -- never template bytes.
+                            try:
+                                _dev_ver = getattr(self, "_device_fp_version", "") or ""
+                                _tpl_ver = str(tpl.get("templateVersion") or "")
+                                _tel.warn(
+                                    "ZKEM_PUSH_TPL_REFUSED", worker=self._tel_wid,
+                                    pin=pin, finger=finger_idx, size=len(tmp),
+                                    template_version=_tpl_ver or None,
+                                    device_fp_version=_dev_ver or None,
+                                    fp_used=_st.get("fingerprints"),
+                                    fp_capacity=_st.get("fingerprint_capacity"),
+                                )
+                                # Version disagreement is one of the two documented
+                                # causes of a blanket refusal (the other is a full
+                                # store). Name it explicitly when both are known and
+                                # differ -- otherwise it stays buried in two fields.
+                                if _dev_ver and _tpl_ver and _dev_ver != _tpl_ver:
+                                    _tel.warn(
+                                        "ZKEM_TPL_VERSION_MISMATCH", worker=self._tel_wid,
+                                        pin=pin, finger=finger_idx,
+                                        template_version=_tpl_ver,
+                                        device_fp_version=_dev_ver,
+                                    )
+                            except Exception:
+                                pass
                             if len(errors) < 5:
                                 errors.append(f"SetUserTmpExStr pin={pin} finger={finger_idx}")
                     pushed += 1
                 except Exception as exc:
                     failed += 1
-                    _mark_failed(pin)
+                    _mark_failed(pin, f"exception:{type(exc).__name__}")
                     if len(errors) < 5:
                         errors.append(f"pin={pin}: {exc}")
 
@@ -1470,6 +1614,12 @@ class ZKStandaloneDevice:
                 "templates_failed": templates_failed,
                 "skipped_pin": skipped_pin, "errors": errors,
                 "failed_pins": failed_pins,
+                # Telemetry-only additions. Nothing decides on these; push_roster
+                # folds them into ZKEM_PUSH_CHUNK / ZKEM_PUSH_FAILED_PINS.
+                "failed_reasons": failed_reasons,
+                "tpl_attempted": tpl_attempted,
+                "tpl_ok": tpl_ok,
+                "chunk_ms": round((time.monotonic() - t_start) * 1000.0),
                 "trace_members_left": members_left,
                 "trace_templates_left": templates_left}
 
