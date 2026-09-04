@@ -132,7 +132,8 @@ This naming collision has caused real errors. There is no shared mechanism.
 |---|---|---|
 | `PullSDK.supports_get_rtlog()`, `supports_get_rtlog_ext()`, `supports_delete_device_data()`, `supports_control_device()`, `supports_get_device_param()`, `supports_set_device_param()` | low-level class | **Runtime DLL export probe** — literally `self.load()` then `hasattr(self._dll, "SymbolName")`. Answers "does this particular `plcommpro.dll` build export the symbol". `[CODE]` |
 | `PullSDKDevice.supports_get_device_param()` / `supports_set_device_param()` | driver | **Delegation** — `return self._sdk is not None and self._sdk.supports_…()`. Returns `False` when not connected. No lock, no `ensure_connected`. `[CODE]` |
-| `PullSDKDevice.supports_transaction_table = True`, `ZKStandaloneDevice.supports_open_door = False` | class body | **Static capability declaration.** A plain class attribute. `[CODE]` |
+| `PullSDKDevice.supports_transaction_table = True`, `ZKStandaloneDevice.supports_transaction_table = False` | class body | **Static capability declaration.** A plain class attribute; no instance ever reassigns it. `[CODE: pullsdk.py:1193, zk_standalone.py:325 — every other hit under app/ is a getattr read]` |
+| `ZKStandaloneDevice.supports_open_door` | class body, **re-resolved per instance** | **Per-device switch, mutable at runtime** — the one `supports_*` that is NOT static. The class body holds only the family default (`_OPEN_DOOR_FAMILY_DEFAULT = True` since 2026-09-04; it was `False` before). `__init__` re-resolves it for each device (env > the operator's per-device switch > family default) and the local API reassigns it on the **live** driver when the switch is flipped. Read it off the **instance**, never off the class: the class value ignores an operator's per-device OFF. `[CODE: zk_standalone.py:117/320/363, ::apply_open_door_switch; local_access_api_v2.py::_handle_device_open_door_switch_set]` — full priority table in `guide_for_agents_and_dev.md` §5.1 |
 
 Consumers read declarations defensively — `getattr(sdk_device, "supports_transaction_table", True)`
 — so a driver that omits the flag is treated as **having** the capability. `[CODE]`
@@ -554,7 +555,8 @@ What is actually pinned, and what is not.
 python -m pytest tests/ -q --ignore=tests/_pydeps
 ```
 `--ignore=tests/_pydeps` is **required** (vendored packages break collection; there is
-no `pytest.ini`). Last run: **833 passed**, 2026-08-29.
+no `pytest.ini`). Last run: **1071 passed**, 2026-09-04 — suite count only; this
+file's own claims were last swept 2026-08-29.
 
 ```bash
 python tools/check_sql_arity.py
