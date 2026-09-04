@@ -129,6 +129,7 @@ function resolveDeviceStatus(
   pullsdkConnected: boolean,
   pullsdkDeviceId: number | null | undefined,
   syncRunning: boolean,
+  ultraConnected: boolean,
 ): Pick<PanelDevice, "statusVariant" | "statusLabel" | "connected" | "lastError"> {
   const agentConnected = Boolean(agentDevice?.connected);
   const pullsdkLive = pullsdkConnected && pullsdkDeviceId === device.id;
@@ -140,7 +141,10 @@ function resolveDeviceStatus(
   if (lastError) {
     return { statusVariant: "error", statusLabel: "Agent error", connected: false, lastError };
   }
-  if (agentConnected || pullsdkLive) {
+  // ULTRA workers own their own connection and never enter the manual PullSDK
+  // session pool, so a live standalone terminal used to fall through to "Ready"
+  // forever. This is the worker's real connected flag, not an assumption.
+  if (agentConnected || pullsdkLive || ultraConnected) {
     return { statusVariant: "online", statusLabel: "Connected", connected: true, lastError: "" };
   }
   if (device.accessDataMode === "AGENT") {
@@ -224,7 +228,13 @@ export default function TrayPanelPage() {
         Boolean(status?.pullsdk?.connected),
         status?.pullsdk?.deviceId,
         Boolean(status?.sync?.running),
+        Boolean((status as any)?.ultra?.devices?.[String(normalized.id)]?.connected),
       ),
+      // Door availability comes from the DRIVER, never the protocol: a standalone
+      // terminal ships with the door command gated off but it can be enabled per
+      // machine once the relay is verified. undefined = unknown -> keep it live.
+      canOpenDoor:
+        (status as any)?.ultra?.devices?.[String(normalized.id)]?.supports_open_door !== false,
     };
   });
 
@@ -391,7 +401,9 @@ export default function TrayPanelPage() {
               icon={status?.sync?.running ? RefreshCw : Activity}
               label="Runtime"
               value={status?.sync?.running ? "Syncing" : "Ready"}
-              hint={status?.pullsdk?.connected ? "PullSDK live link active" : "Waiting for command"}
+              hint={connectedCount > 0
+                ? `${connectedCount} live link${connectedCount > 1 ? "s" : ""}`
+                : "Waiting for command"}
             />
           </div>
 
@@ -613,7 +625,10 @@ export default function TrayPanelPage() {
                                   size="sm"
                                   className="rounded-xl"
                                   onClick={() => void handleOpenPreset(device, preset)}
-                                  disabled={busyKey === actionKey}
+                                  disabled={busyKey === actionKey || (device as any).canOpenDoor === false}
+                                  title={(device as any).canOpenDoor === false
+                                    ? "Door command disabled for this device family (not validated on this hardware)"
+                                    : undefined}
                                 >
                                   <LockOpen className={`h-4 w-4 ${busyKey === actionKey ? "animate-pulse" : ""}`} />
                                   Open

@@ -298,8 +298,24 @@ def add_windows_dll_search_paths() -> None:
             pass
 
 
+def format_ts(value: dt.datetime) -> str:
+    """Render a datetime in the project's canonical timestamp shape.
+
+    Single source of truth for the string now_iso() produces:
+    "YYYY-MM-DD HH:MM:SS" -- local, second precision, SPACE separated.
+
+    Any value that will later be string-compared against now_iso() inside a
+    SQLite TEXT column MUST be produced by this function. datetime.isoformat()
+    is NOT interchangeable: it puts 'T' (0x54) at index 10 where this shape has
+    ' ' (0x20), so a T-separated value sorts ABOVE every same-day
+    space-separated one and a `col <= now_iso()` predicate can never match it
+    until the date component rolls over.
+    """
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def now_iso() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return format_ts(dt.datetime.now())
 
 
 def encode_ansi(s: str) -> bytes:

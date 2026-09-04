@@ -56,9 +56,44 @@ def test_read_settings_off_is_zero():
     assert abs(out["clock"]["driftSec"]) <= 3
 
 
-def test_read_settings_unsupported_param():
-    out = v2._read_device_control_settings(_FakeSDK("", supports=False))
-    assert out == {"doors": [], "clock": {}}
+class _FakeStandaloneSDK:
+    """zkemkeeper family: no get_device_param, but a real RTC via get_device_time."""
+
+    def __init__(self, device_epoch=None):
+        self._epoch = device_epoch
+
+    def supports_get_device_param(self):
+        return False
+
+    def get_device_time(self):
+        return self._epoch
+
+
+def test_read_settings_unsupported_param_says_so_instead_of_returning_empty():
+    """An unread value must not be indistinguishable from a value read as empty.
+
+    Returning a bare {"doors": [], "clock": {}} let the control panel render the
+    re-entry switch OFF with a default of 30s -- a factual claim about a terminal
+    that had never been asked. The response must declare that the parameter
+    surface does not exist.
+    """
+    out = v2._read_device_control_settings(_FakeStandaloneSDK())
+    assert out["supportsDeviceParams"] is False
+    assert out["doors"] == []
+    assert out["clock"] == {}, "an unreadable clock must stay unknown, never 0 drift"
+
+
+def test_pullsdk_read_still_declares_params_supported():
+    raw = f"Door1Intertime=30\r\nDateTime={_enc_behind(5)}"
+    out = v2._read_device_control_settings(_FakeSDK(raw))
+    assert out["supportsDeviceParams"] is True
+
+
+def test_standalone_clock_is_read_through_the_portable_api():
+    """The standalone driver has no DateTime param but DOES have get_device_time."""
+    out = v2._read_device_control_settings(_FakeStandaloneSDK(device_epoch=time.time() - 42))
+    assert out["supportsDeviceParams"] is False
+    assert 38 <= out["clock"]["driftSec"] <= 46, out["clock"]
 
 
 def test_read_settings_only_present_doors():

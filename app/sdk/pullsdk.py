@@ -148,7 +148,30 @@ class PullSDK:
                 self._dll = None
                 raise PullSDKError(f"Failed to load plcommpro.dll: {e}")
 
-    def connect(self, *, ip: str, port: int, timeout_ms: int, password: str, platform: str | None = None) -> None:
+    def connect(self, *, ip: str, port: int, timeout_ms: int, password: str) -> None:
+        """Open the TCP session.
+
+        NO ``platform`` PARAMETER — deliberately. It used to exist, was appended to
+        ``parts`` in the first version (d1ddea5), and was dropped from ``parts`` by
+        0548a1d while the signature and the log fragment were left behind. The result
+        was a parameter that callers passed, the log claimed had been sent, and the
+        DLL never received.
+
+        It is REMOVED rather than re-wired because ``plcommpro.dll`` has no such key.
+        The shipped DLL (one single build, sha256 82bda08d..., 254464 bytes, all 101
+        copies in this repo identical) contains ZERO occurrences of the byte string
+        "platform" in any casing, while its connection-string key table sits
+        contiguously in .rdata as::
+
+            ipaddress  port  deviceid  baudrate  passwd  protocol
+
+        (adjacent to pltcpcomm.dll / plusbcomm.dll; "timeout" is nearby). Re-adding
+        the key would push an unrecognised token into the connection string of live
+        C2-400 / C3-200 panels for no benefit.
+
+        The backend still sends a per-device ``platform`` field and the UI displays
+        it; it is informational only and reaches no SDK call. See pullsdk_guide.md §4.1.
+        """
         self.load()
         if self._dll is None:
             raise PullSDKError("PullSDK not loaded")
@@ -163,13 +186,14 @@ class PullSDK:
 
         conn_str = ",".join(parts)
 
+        # Mirrors `parts` exactly. Anything logged here that is not in `parts` is a
+        # lie about what the panel received -- that is the bug this shape prevents.
         self.logger.info(
-            "PullSDK Connect: protocol=TCP,ipaddress=%s,port=%s,timeout=%s,passwd=%s%s",
+            "PullSDK Connect: protocol=TCP,ipaddress=%s,port=%s,timeout=%s,passwd=%s",
             ip,
             port,
             timeout_ms,
             ("*" * min(8, len(password)) if password else ""),
-            (f",platform={platform}" if platform else ""),
         )
 
         h = self._dll.Connect(encode_ansi(conn_str))
@@ -858,7 +882,10 @@ class PullSDKDevice:
         self.ip = self._pick_str(["ip", "ipAddress", "ipaddress", "ip_address", "host", "address"], default="")
         self.port = self._pick_int(["port", "portNumber", "port_number", "devicePort"], default=4370)
         self.password = self._pick_str(["password", "passwd", "pass", "devicePassword"], default="")
-        self.platform = self._pick_str(["platform", "devicePlatform"], default="")
+        # NOTE: the payload's `platform` field is deliberately NOT read here. It never
+        # reached the DLL (plcommpro.dll has no such connection key -- see
+        # PullSDK.connect), so keeping an attribute for it only implied an effect that
+        # did not exist. The backend field and its UI display are untouched.
 
         self.timeout_ms = self._pick_int(["timeoutMs", "timeout", "connectTimeoutMs"], default=3000)
         self.dll_path = self._resolve_dll_path(self._pick_str(["dllPath", "dll_path", "pullsdkDllPath"], default=""))
@@ -911,7 +938,6 @@ class PullSDKDevice:
                 port=int(self.port),
                 timeout_ms=int(self.timeout_ms),
                 password=str(self.password or ""),
-                platform=str(self.platform or "") if (self.platform or "").strip() else None,
             )
             self._sdk = _pending_sdk
             self._connected = True
@@ -1161,6 +1187,10 @@ class PullSDKDevice:
             options=options,
             initial_size=initial_size,
         )
+
+    # Capability flags -- mirror app/sdk/zk_standalone.py. Declared explicitly so the
+    # contract is readable at both implementations instead of relying on a getattr default.
+    supports_transaction_table = True
 
     def delete_all_transaction_rows(self) -> int:
         return self.delete_table_rows(table="transaction", data="", options="")

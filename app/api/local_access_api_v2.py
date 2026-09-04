@@ -1851,8 +1851,25 @@ def _handle_sync_cache_users(ctx: _Ctx) -> None:
 
     limit = ctx.q_int("limit", default=0)
     offset = ctx.q_int("offset", default=0)
-    users, total = list_sync_users_page(limit=limit, offset=offset)
-    ctx.send_json(200, {"users": users, "total": total})
+    # ?templates=0 omits the fingerprint blobs. Opt-IN to the fast path so no existing
+    # caller changes behaviour: on the OXYGENE_FIT PC this query took up to 8.8s for
+    # 934 members, almost all of it disk I/O reading those blobs (DB_READ_users_split
+    # reported select_ms=6828 vs coerce_ms=47). A caller that only needs identity
+    # fields (id / card numbers) should pass it; anything that counts or pushes
+    # templates must NOT -- omitted templates look exactly like "no fingerprints".
+    include_templates = str(ctx.q("templates", default="1")).strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+    users, total = list_sync_users_page(
+        limit=limit, offset=offset, include_templates=include_templates
+    )
+    ctx.send_json(200, {
+        "users": users,
+        "total": total,
+        # Explicit so a consumer can never mistake a stripped response for a roster
+        # that genuinely has no fingerprints.
+        "templatesIncluded": include_templates,
+    })
 
 
 def _handle_sync_cache_memberships(ctx: _Ctx) -> None:
@@ -3660,9 +3677,61 @@ def _get_device_conn_params(ctx: _Ctx, device_id: int) -> Tuple[str, int, int, s
     return ip, port, timeout_ms, password
 
 
+def _device_protocol_of(device_id: int) -> str:
+    """Protocol family this device speaks, via the SAME factory the engines use.
+
+    Honours MONCLUB_DEVICE_PROTOCOL_OVERRIDES and the backend deviceProtocol key.
+    Falls back to ZK_PULLSDK on any error so a lookup failure can never take a
+    working PullSDK panel off its path.
+    """
+    from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
+    try:
+        from app.core.db import get_sync_device_payload
+        return resolve_device_protocol(get_sync_device_payload(device_id) or {}).value
+    except Exception:
+        return DeviceProtocol.ZK_PULLSDK.value
+
+
+def _unsupported_for_protocol(ctx: _Ctx, device_id: int, what: str) -> bool:
+    """Refuse a PullSDK-only operation with 409, and report whether it refused.
+
+    These handlers drive the LOW-LEVEL PullSDK surface (get_device_data_rows /
+    set_device_data / delete_device_data), which no other driver implements, so
+    refusing is the CORRECT answer -- get_driver() is not substitutable here.
+
+    But refusing with 500 told the operator the server had broken, on a
+    perfectly healthy terminal. 409 + unsupported:true is the same deliberate
+    -refusal shape /devices/{id}/connect already uses, so the UI can tell a
+    policy decision from a fault.
+    """
+    proto = _device_protocol_of(device_id)
+    if proto == "ZK_PULLSDK":
+        return False
+    _logger.info("[LocalAPI] %s refused: deviceId=%s protocol=%s", what, device_id, proto)
+    ctx.send_json(409, {
+        "ok": False, "unsupported": True, "protocol": proto,
+        "error": f"{what} n'est pas disponible sur ce modèle ({proto})",
+    })
+    return True
+
+
 def _connect_device(ctx: _Ctx, device_id: int) -> Tuple[Any, Optional[str]]:
-    """Connect to a device, returns (sdk, error_or_none)."""
+    """Open a one-shot PullSDK session. Returns (sdk, error_or_none).
+
+    PullSDK ONLY, by design. Every caller below drives the LOW-LEVEL PullSDK
+    surface (get_device_data_rows / set_device_data / delete_device_data /
+    door_pulse_open), which no other driver implements -- get_driver() returns
+    the device-oriented DeviceDriver surface and is NOT substitutable here.
+
+    So a non-PullSDK device is refused up front instead of being handed a
+    plcommpro socket it cannot answer: that burned the full connect timeout and
+    read as a cabling fault on a perfectly healthy terminal.
+    """
     from app.sdk.pullsdk import PullSDK
+    proto = _device_protocol_of(device_id)
+    if proto != "ZK_PULLSDK":
+        _logger.info("[LocalAPI] PullSDK session refused: deviceId=%s protocol=%s", device_id, proto)
+        return None, f"protocol {proto} is not driven over PullSDK"
     ip, port, timeout_ms, password = _get_device_conn_params(ctx, device_id)
     if not ip:
         return None, "Device has no IP address"
@@ -3680,6 +3749,19 @@ def _handle_device_connect(ctx: _Ctx) -> None:
     _logger.info("[LocalAPI] device_connect: deviceId=%s", did)
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    proto = _device_protocol_of(did)
+    if proto != "ZK_PULLSDK":
+        # Not a fault -- this family simply has no manual PullSDK session, so 409
+        # (conflict) rather than 500 lets the UI tell a deliberate refusal from a
+        # real failure. On ZK_STANDALONE the driver OWNS its connection and COM
+        # event sink (ZKStandaloneDevice.owns_event_source), and the ULTRA worker
+        # already holds it -- a second Connect would bind a second event sink.
+        _logger.info("[LocalAPI] device_connect refused: deviceId=%s protocol=%s", did, proto)
+        ctx.send_json(409, {
+            "ok": False, "unsupported": True, "protocol": proto,
+            "error": f"protocol {proto} has no manual PullSDK session",
+        })
         return
     sdk, err = _connect_device(ctx, did)
     if err:
@@ -3709,6 +3791,8 @@ def _handle_device_disconnect(ctx: _Ctx) -> None:
 
 def _handle_device_info(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    if _unsupported_for_protocol(ctx, did, "la lecture des paramètres appareil"):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
@@ -3757,6 +3841,8 @@ def _handle_device_table(ctx: _Ctx) -> None:
     flt = ctx.q("filter", default="")
     max_rows = ctx.q_int("maxRows", default=10000)
 
+    if _unsupported_for_protocol(ctx, did, "la lecture des tables PullSDK"):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
@@ -3836,6 +3922,27 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                     "lastConnectError": str(getattr(worker, "_last_connect_error", "")),
                 })
                 return
+            # A driver may declare that it cannot command the door at all. On the
+            # standalone family this ships OFF behind a hardware gate (ACUnlock is
+            # implemented but unverified on that terminal), so the command would
+            # come back False and used to surface as HTTP 500 with the internal
+            # English string "open_door returned False" -- a policy refusal
+            # rendered as a server crash. Answer the deliberate-refusal shape
+            # instead, and name the switch that enables it.
+            _drv = getattr(worker, "_sdk", None)
+            if _drv is not None and not getattr(_drv, "supports_open_door", True):
+                _logger.info(
+                    "[LocalAPI] door_open refused: device_id=%s driver=%s (door command disabled)",
+                    did, type(_drv).__name__,
+                )
+                ctx.send_json(409, {
+                    "ok": False,
+                    "unsupported": True,
+                    "error": "l'ouverture de porte est désactivée pour ce modèle "
+                             "(non validée sur ce matériel)",
+                })
+                _tel.event("DOOR_OPEN", device_id=did, door=door, result="409_unsupported")
+                return
             _logger.info(
                 "[LocalAPI] ULTRA door open via command queue: device_id=%s door=%s pulse_sec=%s",
                 did, door, pulse_sec,
@@ -3896,11 +4003,32 @@ def _parse_device_param_kv(raw: str) -> Dict[str, str]:
 
 def _read_device_control_settings(sdk) -> Dict[str, Any]:
     """Read live control settings from a connected SDK: per-door re-entry interval
-    (Door{N}Intertime) + RTC drift vs the PC. Works on both PullSDK (DEVICE-mode)
-    and PullSDKDevice (ULTRA worker) — both expose get_device_param. Read-only."""
+    (Door{N}Intertime) + RTC drift vs the PC. Read-only.
+
+    PullSDK families expose Door{N}Intertime via get_device_param. Standalone
+    (zkemkeeper) terminals do not, and report supportsDeviceParams=false so the
+    UI can say the value was not readable rather than invent one."""
     from app.sdk.pullsdk import zk_datetime_decode
-    out: Dict[str, Any] = {"doors": [], "clock": {}}
+    out: Dict[str, Any] = {"doors": [], "clock": {}, "supportsDeviceParams": True}
     if not sdk.supports_get_device_param():
+        # This family (zkemkeeper standalone terminals) exposes no
+        # Door{N}Intertime parameter. Returning bare empty lists made the panel
+        # indistinguishable from a SUCCESSFUL read of "no re-entry configured",
+        # so it rendered the switch OFF with a default of 30s -- a factual claim
+        # about the terminal that nothing had ever asked it. Say "not readable"
+        # instead, and never substitute a default for an unread value.
+        out["supportsDeviceParams"] = False
+        try:
+            dev_epoch = sdk.get_device_time()   # portable: both driver families
+        except Exception:
+            dev_epoch = None
+        if dev_epoch:
+            pc_now = time.time()
+            out["clock"] = {
+                "deviceEpoch": round(dev_epoch),
+                "pcEpoch": round(pc_now),
+                "driftSec": round(pc_now - dev_epoch, 1),
+            }
         return out
     raw = sdk.get_device_param(
         items="Door1Intertime,Door2Intertime,Door3Intertime,Door4Intertime,DateTime",
@@ -3941,7 +4069,8 @@ def _handle_device_settings_get(ctx: _Ctx) -> None:
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
         return
-    r = _run_on_device_sdk(ctx, did, _read_device_control_settings, label="settings_get")
+    # standalone path issues get_device_time() -> up to 10s in the driver
+    r = _run_on_device_sdk(ctx, did, _read_device_control_settings, label="settings_get", timeout=15.0)
     if r["ok"]:
         ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
     else:
@@ -4002,6 +4131,20 @@ def _handle_device_reentry_set(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
+        return
+    # Door{N}Intertime is a PullSDK parameter. On a family that has no such
+    # parameter this used to raise deep inside _apply, and the raw English
+    # "SetDeviceParam not supported by this device/dll" reached the operator as a
+    # red failure chip -- reading as "the device rejected my write" rather than
+    # "this control does not apply here". Refuse up front with the same
+    # deliberate-refusal shape /devices/{id}/connect uses.
+    _proto = _device_protocol_of(did)
+    if _proto != "ZK_PULLSDK":
+        _logger.info("[LocalAPI] reentry_set refused: deviceId=%s protocol=%s", did, _proto)
+        ctx.send_json(409, {
+            "ok": False, "unsupported": True, "protocol": _proto,
+            "error": "ce modèle n'expose pas de délai de ré-entrée côté appareil",
+        })
         return
     body = ctx.body()
     enabled = _safe_bool(body.get("enabled"), False)
@@ -4081,6 +4224,10 @@ def _save_reentry_to_backend(ctx: _Ctx, did: int, enabled: bool, seconds: int) -
         return False, str(e)
 
 
+# The standalone driver waits _DEFAULT_CMD_TIMEOUT_SEC (10s) inside EACH of its
+# own STA commands, so any handler that issues one must allow MORE than that or
+# the HTTP layer reports a timeout for an operation still in flight -- and, for a
+# write, one that may yet land. Callers below pass an explicit budget.
 def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 5.0) -> Dict[str, Any]:
     """Run ``fn(sdk)`` against a device and return {ok,result,error,mode,status}.
 
@@ -4117,11 +4264,29 @@ def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 
 
 
 def _read_device_clock(sdk) -> Dict[str, Any]:
-    """Read device RTC and compute drift vs the PC. Read-only; works on PullSDK
-    and PullSDKDevice (uses get_device_param only)."""
+    """Read device RTC and compute drift vs the PC. Read-only.
+
+    Prefers the PullSDK DateTime parameter where it exists, and falls back to the
+    portable ``get_device_time()`` that BOTH driver families implement
+    (pullsdk.PullSDKDevice and zk_standalone.ZKStandaloneDevice). Without the
+    fallback a standalone terminal reported "Dérive inconnue" forever, even
+    though ultra_engine._maybe_discipline_device_clock already reads its clock
+    through exactly this call.
+    """
     from app.sdk.pullsdk import zk_datetime_decode
     if not sdk.supports_get_device_param():
-        return {}
+        try:
+            dev_epoch = sdk.get_device_time()
+        except Exception:
+            dev_epoch = None
+        if not dev_epoch:
+            # Unknown, NOT zero drift. The panel shows "Dérive inconnue".
+            return {}
+        pc_now = time.time()
+        return {
+            "deviceEpoch": round(dev_epoch), "pcEpoch": round(pc_now),
+            "driftSec": round(pc_now - dev_epoch, 1),
+        }
     kv = _parse_device_param_kv(sdk.get_device_param(items="DateTime") or "")
     dt = kv.get("DateTime")
     if dt is None:
@@ -4139,11 +4304,27 @@ def _read_device_clock(sdk) -> Dict[str, Any]:
 
 
 def _sync_device_clock(sdk) -> Dict[str, Any]:
-    """Set device RTC to the PC's current time, then read back the drift. Uses
-    set_device_param(DateTime=...) so it works on both SDK classes."""
+    """Set device RTC to the PC's current time, then read back the drift.
+
+    set_device_param(DateTime=...) is a PullSDK-only surface. The portable call
+    is ``set_device_time(epoch)``, which BOTH families implement -- so a
+    standalone terminal is written through that instead of being told its clock
+    cannot be set. It CAN: only the parameter API is missing.
+
+    A drifted terminal clock is this codebase's documented cause of valid QR
+    codes being rejected en masse, and on a standalone gym the automatic hourly
+    correction is off by default -- this button is the only way to correct it.
+    """
     from app.sdk.pullsdk import zk_datetime_encode
     if not sdk.supports_set_device_param():
-        raise RuntimeError("SetDeviceParam not supported by this device/dll")
+        if not hasattr(sdk, "set_device_time"):
+            raise RuntimeError("clock write not supported by this device family")
+        # set_device_time() returns False on any COM failure. Surface that as an
+        # error: never let the panel print "Synchronisé" for a write that the
+        # device refused.
+        if not sdk.set_device_time(time.time()):
+            raise RuntimeError("device refused the clock write (SetDeviceTime returned False)")
+        return _read_device_clock(sdk)
     lt = time.localtime(time.time())
     enc = zk_datetime_encode(lt.tm_year, lt.tm_mon, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec)
     sdk.set_device_param(items=f"DateTime={enc}")
@@ -4156,7 +4337,8 @@ def _handle_device_clock_get(ctx: _Ctx) -> None:
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
         return
-    r = _run_on_device_sdk(ctx, did, _read_device_clock, label="clock_get")
+    # standalone path issues get_device_time() -> up to 10s in the driver
+    r = _run_on_device_sdk(ctx, did, _read_device_clock, label="clock_get", timeout=15.0)
     if r["ok"]:
         ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
     else:
@@ -4185,7 +4367,10 @@ def _handle_device_clock_sync(ctx: _Ctx) -> None:
                        "is correct (NTP-synced) first — a wrong PC time will reject valid QR codes.",
         })
         return
-    r = _run_on_device_sdk(ctx, did, _sync_device_clock, label="clock_sync")
+    # standalone path issues set_device_time() THEN a read-back get_device_time():
+    # two 10s driver waits. Cutting this short would report a failure for a clock
+    # write that actually landed.
+    r = _run_on_device_sdk(ctx, did, _sync_device_clock, label="clock_sync", timeout=25.0)
     if r["ok"]:
         ctx.send_json(200, {"ok": True, "mode": r["mode"], **(r["result"] or {})})
     else:
@@ -4282,6 +4467,11 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         ctx.send_json(400, {"ok": False, "error": "pin is required"})
         return
 
+    # Refuse rather than route: the standalone equivalent (push_roster) is
+    # roster-scoped and owned by the ULTRA worker, so serving it here would open
+    # a SECOND COM session against a terminal the worker already holds.
+    if _unsupported_for_protocol(ctx, did, "le push utilisateur direct"):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
@@ -4340,6 +4530,8 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
 
 def _handle_device_users_list(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
+    if _unsupported_for_protocol(ctx, did, "la liste des utilisateurs appareil"):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
@@ -4369,6 +4561,8 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
         ctx.send_json(400, {"ok": False, "error": "pin is required"})
         return
 
+    if _unsupported_for_protocol(ctx, did, "la suppression utilisateur directe"):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
@@ -4777,6 +4971,50 @@ _POPUP_TODAY_TTL_SEC = 60.0
 _popup_today_lock = threading.Lock()
 _popup_today_cache: Dict[str, Any] = {"day": "", "value": 0, "at": 0.0}
 
+_POPUP_CREDS_TTL_SEC = 60.0
+_popup_creds_lock = threading.Lock()
+_popup_creds_cache: Dict[str, Any] = {"value": None, "at": 0.0}
+
+
+def _popup_enabled_credentials() -> Optional[Dict[str, bool]]:
+    """Which credential families the synced access devices actually accept.
+
+    The idle screen used to tell every arriving member "Présentez votre carte"
+    next to a picture of a card -- on a terminal with rfidEnabled=false and no
+    card reader at all. Read the real per-device flags instead of assuming the
+    original family. Returns None when nothing is known, so the client keeps its
+    existing wording rather than being told something equally unfounded.
+
+    TTL-cached: the popup polls every ~1.5s and these flags change at sync speed.
+    """
+    now = time.time()
+    with _popup_creds_lock:
+        if _popup_creds_cache["value"] is not None and now - float(_popup_creds_cache["at"]) < _POPUP_CREDS_TTL_SEC:
+            return dict(_popup_creds_cache["value"])
+
+    value: Optional[Dict[str, bool]] = None
+    try:
+        from app.core.db import list_sync_devices_payload
+
+        devices = [
+            d for d in (list_sync_devices_payload() or [])
+            if isinstance(d, dict) and d.get("active", True) and d.get("accessDevice", True)
+        ]
+        if devices:
+            value = {
+                "rfid": any(bool(d.get("rfidEnabled")) for d in devices),
+                "fingerprint": any(bool(d.get("fingerprintEnabled")) for d in devices),
+                "qr": any(bool(d.get("totpEnabled")) for d in devices),
+                "face": any(bool(d.get("faceIdEnabled")) for d in devices),
+            }
+    except Exception:
+        value = None
+
+    with _popup_creds_lock:
+        _popup_creds_cache["value"] = value
+        _popup_creds_cache["at"] = now
+    return dict(value) if value else None
+
 
 def _popup_granted_today() -> int:
     """Number of GRANTED access events recorded for the local calendar day.
@@ -4859,6 +5097,28 @@ def _handle_popup_poll(ctx: _Ctx) -> None:
     except Exception:
         seq_ultra = max(0, since_ultra)
 
+    # Real reader connectivity for the idle screen.
+    #
+    # The popup used to light its green "Lecteur actif" dot purely on THIS request
+    # succeeding, which only proves the local HTTP server answered. On a standalone
+    # terminal the link lives entirely inside the ULTRA worker (the driver owns its
+    # own connection and COM event sink), so a dead reader was indistinguishable
+    # from a live one on the screen members look at all day.
+    #
+    # None = unknown (no ULTRA engine, e.g. an AGENT gym) -> the client keeps its
+    # previous behaviour rather than being told something false either way.
+    readers_up = None
+    readers_total = None
+    try:
+        if ultra_eng and getattr(ultra_eng, "running", False):
+            snaps = list((ultra_eng.get_status().get("devices") or {}).values())
+            if snaps:
+                readers_total = len(snaps)
+                readers_up = sum(1 for snap in snaps if snap.get("connected"))
+    except Exception:
+        readers_up = None
+        readers_total = None
+
     try:
         ctx.send_json(200, {
             "seqAgent": seq_agent,
@@ -4866,6 +5126,13 @@ def _handle_popup_poll(ctx: _Ctx) -> None:
             "events": events,
             # Idle-screen footer ("N passages aujourd'hui"); TTL-cached, see above.
             "todayCount": _popup_granted_today(),
+            # Counts, not a boolean: on a multi-door gym one dead door must not be
+            # hidden behind a green light just because a sibling is up.
+            "readersUp": readers_up,
+            "readersTotal": readers_total,
+            # Which credentials this gym's readers actually accept, so the idle
+            # screen stops naming a family the hardware does not have.
+            "credentials": _popup_enabled_credentials(),
         })
     except Exception:
         pass
@@ -5154,6 +5421,15 @@ def _handle_enroll_start(ctx: _Ctx) -> None:
     finger_id = _safe_str(body.get("fingerId"), "").strip()
     full_name = _safe_str(body.get("fullName"), "").strip()
     device = _safe_str(body.get("device"), "zk9500").strip()
+    # OPTIONAL and preferred. The dashboard's fingerprint screen is per-MEMBERSHIP, so it
+    # already knows this; sending it removes the userId -> membership guess entirely.
+    # One person can hold several active memberships in the same gym (observed:
+    # userId=35 -> 29849 AND 30008), and guessing wrong writes the fingerprint to the
+    # wrong membership while reporting success. Accepted under either spelling; absent
+    # -> previous behaviour.
+    active_membership_id = _safe_str(
+        body.get("activeMembershipId", body.get("active_membership_id")), ""
+    ).strip()
 
     # Your current implementation only supports backend enroll
     if target != "backend":
@@ -5168,12 +5444,16 @@ def _handle_enroll_start(ctx: _Ctx) -> None:
         finger_id=finger_id,
         full_name=full_name,
         device=device or "zk9500",
+        active_membership_id=active_membership_id,
     )
 
     if result.get("ok"):
         # Worker will call _enroll_reset() as its first action; set start_meta
         # now so SSE clients get member info immediately after the 202.
-        _enroll_set_start_meta({"userId": user_id, "fingerId": finger_id, "fullName": full_name})
+        _enroll_set_start_meta({
+            "userId": user_id, "fingerId": finger_id, "fullName": full_name,
+            "activeMembershipId": active_membership_id or None,
+        })
         _enroll_add_log("Enroll requested…")
         ctx.send_json(202, result)
     else:

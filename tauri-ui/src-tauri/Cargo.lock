@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "monclub-access-ui"
-version = "1.4.21"
+version = "1.4.28"
 dependencies = [
  "reqwest 0.12.28",
  "serde",

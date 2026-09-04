@@ -94,8 +94,17 @@ class FakeZkem:
         self._rec("SSR_SetUserInfo", machine, pin, name, pw, priv, enabled)
         return self.setuserinfo_ok
 
+    def SSR_DelUserTmpExt(self, machine, pin, finger_id):
+        # Clears ONE finger slot. This is what tools/mb2000_scripts/
+        # 5_push_member_to_device.ps1 -- the push sequence proven on the real
+        # MB2000 -- uses. SSR_DeleteEnrollData never returns for finger >= 1 on
+        # that firmware (12 of 19 field STA wedges had it as the last call).
+        self._rec("SSR_DelUserTmpExt", machine, pin, finger_id)
+        self.deleted.append((str(pin), int(finger_id)))
+
     def SSR_DeleteEnrollData(self, machine, pin, backup):
-        # 3-arg SSR_ form (mn, pin, backupNumber): 0..9=finger, 12=whole user.
+        # 3-arg SSR_ form (mn, pin, backupNumber). Retained ONLY for the
+        # whole-user delete (12), which is script 7's proven usage.
         self._rec("SSR_DeleteEnrollData", machine, pin, backup)
         self.deleted.append((str(pin), int(backup)))
         return True
@@ -309,7 +318,10 @@ class TestPushRoster:
         assert res["ok"] is True and res["pushed"] == 1
         names = [c[0] for c in zk.calls]
         assert names.index("SetStrCardNumber") < names.index("SSR_SetUserInfo")
-        assert names.index("SSR_DeleteEnrollData") < names.index("SetUserTmpExStr")
+        # The slot is cleared with SSR_DelUserTmpExt, never SSR_DeleteEnrollData:
+        # the latter hangs forever on this firmware for finger >= 1.
+        assert names.index("SSR_DelUserTmpExt") < names.index("SetUserTmpExStr")
+        assert "SSR_DeleteEnrollData" not in names
         tmp_calls = [c for c in zk.calls if c[0] == "SetUserTmpExStr"]
         assert tmp_calls == [("SetUserTmpExStr", 1, "117", 6, 1, "QUJD")]
         # daytime push: NEVER EnableDevice-locks the terminal
@@ -441,6 +453,18 @@ def _make_sync_worker(monkeypatch, driver=None, users=None):
          "fullName": "Alice", "firstCardId": "999"},
     ])
     monkeypatch.setattr(ue, "load_sync_cache", lambda: cache)
+
+    # The incremental full sync reads/writes per-pin state in device_sync_state.
+    # Keep these drains hermetic: no stored state (=> everything is pushed, the
+    # behaviour these tests were written against) and no writes to a real DB.
+    import app.core.db as _db
+    monkeypatch.setattr(_db, "list_device_sync_hashes_and_status", lambda **kw: {})
+    monkeypatch.setattr(_db, "save_device_sync_state_batch", lambda **kw: 0)
+    monkeypatch.setattr(_db, "prune_device_sync_state", lambda **kw: 0)
+    monkeypatch.setattr(_db, "delete_device_sync_state", lambda **kw: None)
+    import app.core.device_sync as _ds
+    monkeypatch.setattr(_ds.DeviceSyncEngine, "_build_local_fp_index_for_pins",
+                        lambda self, *, pins, fingerprint_enabled: {}, raising=True)
 
     # sentinel: the PullSDK push path must NEVER be reached for this driver
     import app.core.device_sync as ds

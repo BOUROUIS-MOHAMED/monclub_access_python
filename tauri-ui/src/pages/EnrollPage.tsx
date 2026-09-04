@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useEnroll, useUsers } from "@/api/hooks";
+import { useEnroll, useUsers, useDevices } from "@/api/hooks";
 import { ApiError, openSSE } from "@/api/client";
 import { useEnrollment } from "@/context/EnrollmentContext";
 import { usePageChrome } from "@/context/PageChromeContext";
@@ -34,6 +34,16 @@ export default function EnrollPage() {
   const enroll = useEnroll();
   const { data: userData } = useUsers();
   const users: any[] = userData?.users ?? [];
+
+  // A template is only delivered to devices whose synced payload has
+  // fingerprintEnabled=true -- the push path drops it otherwise
+  // (device_sync._collect_templates_for_pin returns [] for that device). The
+  // capture itself still succeeds and still reaches the backend, so without
+  // this check the page reports success for something no reader will receive.
+  const { data: deviceData } = useDevices(false);
+  const devicesLoaded = !!deviceData;
+  const fpDevices = (deviceData?.devices ?? []).filter((d: any) => d?.fingerprintEnabled);
+  const noFingerprintDevice = devicesLoaded && fpDevices.length === 0;
   const { enrollMeta, clearMeta } = useEnrollment();
 
   // Backend is the only implemented mode right now.
@@ -741,11 +751,27 @@ export default function EnrollPage() {
               className="ml-auto h-8 gap-1.5 rounded-full px-4 text-[12px] font-bold"
               onClick={handleStart}
               disabled={running || (enrollType === "BACKEND" && !selectedUserId)}
+              title={noFingerprintDevice
+                ? "Aucun appareil synchronisé n'accepte les empreintes : la capture sera enregistrée mais ne sera envoyée à aucun lecteur."
+                : undefined}
             >
               {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
               {running ? "En cours…" : "Démarrer"}
             </Button>
           </div>
+          {/* Do not silently promise a delivery that cannot happen. The capture
+              is still allowed (it is saved to the backend and will be pushed as
+              soon as a device is enabled) -- but say so. */}
+          {noFingerprintDevice ? (
+            <Alert>
+              <AlertDescription className="text-[12px]">
+                Aucun appareil synchronisé n'accepte les empreintes
+                (<span className="font-medium">fingerprintEnabled</span> désactivé).
+                L'empreinte sera enregistrée sur le compte du membre, mais elle ne sera
+                envoyée à aucun lecteur tant qu'un appareil ne l'autorise pas.
+              </AlertDescription>
+            </Alert>
+          ) : null}
         </div>
       </div>
 

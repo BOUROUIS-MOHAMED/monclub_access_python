@@ -176,7 +176,11 @@ export default function ProfilePage() {
               title={`${devicesTotal} appareil${devicesTotal > 1 ? "s" : ""}`}
               sub={`${status.mode?.DEVICE ?? 0} en direct · ${status.mode?.AGENT ?? 0} agent · ${status.mode?.ULTRA ?? 0} ultra`}
               chip={
-                status.pullsdk?.connected
+                // A standalone terminal is held by its ULTRA worker and never
+                // appears in the manual PullSDK session pool, so pullsdk alone
+                // reported "non connecté" on a gym whose reader was live.
+                (status.pullsdk?.connected ||
+                  Object.values((status as any).ultra?.devices ?? {}).some((d: any) => d?.connected))
                   ? <Chip tone="ok">lecteur connecté</Chip>
                   : <Chip tone="flat">lecteur non connecté</Chip>
               }

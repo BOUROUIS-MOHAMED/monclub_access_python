@@ -230,7 +230,23 @@ export default function PushHistoryPage() {
                   )) : (
                     <TableRow>
                       <TableCell colSpan={8} className="text-center py-10 text-sm text-muted-foreground">
-                        Aucun batch trouvé pour les filtres actuels.
+                        {/* Do not blame filters that are not set. On a gym whose only
+                            terminal is autonomous this is the ONLY message the page
+                            ever shows, and it sent operators hunting for a filter to
+                            clear that did not exist. */}
+                        {(statusFilter !== "__all" || deviceIdFilter.trim()) ? (
+                          "Aucun batch trouvé pour les filtres actuels."
+                        ) : (
+                          <span className="block space-y-1">
+                            <span className="block">Aucun batch enregistré.</span>
+                            <span className="block text-[12px]">
+                              Les batches sont enregistrés pour les centrales PullSDK. Les
+                              terminaux autonomes reçoivent leur liste via le service temps
+                              réel, qui n'enregistre pas de batch ici&nbsp;: consultez
+                              «&nbsp;Historique sync&nbsp;» et les journaux.
+                            </span>
+                          </span>
+                        )}
                       </TableCell>
                     </TableRow>
                   )}

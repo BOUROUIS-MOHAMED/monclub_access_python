@@ -37,3 +37,12 @@ build/
 release/
 tmp/
 .worktrees/
+
+# .NET build output for the shared desktop updater.
+# These 200+ binaries were tracked, so EVERY `dotnet build` dirtied the tree and
+# tripped the release dirty-tree gate -- which trains people into -AllowDirty and
+# defeats the gate. build_updater.ps1 regenerates them via `dotnet publish`, and the
+# artifact that actually ships is installer/updater/MonClubDesktopUpdater.exe,
+# which stays tracked.
+updater/**/bin/
+updater/**/obj/

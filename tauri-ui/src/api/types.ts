@@ -44,6 +44,27 @@ export interface PullSdkBlock {
   lastError: string | null;
 }
 
+/** One ULTRA worker's live state, from UltraEngine.get_status(). */
+export interface UltraDeviceBlock {
+  device_id: number;
+  device_name: string;
+  /** The driver's real connection state -- for ZK_STANDALONE terminals this is the
+   *  ONLY truthful connectivity signal: they never enter the manual PullSDK pool. */
+  connected: boolean;
+  /** Whether the door command is available on this driver.
+   *  null/undefined = unknown -> keep the control live rather than hiding
+   *  a command that may work. NOT derivable from the protocol. */
+  supports_open_door?: boolean | null;
+  events_processed?: number;
+  connect_failures?: number;
+}
+
+export interface UltraBlock {
+  running: boolean;
+  /** Keyed by device id as a string. */
+  devices: Record<string, UltraDeviceBlock>;
+}
+
 export interface AgentBlock {
   running: boolean;
   eventQueueDepth: number;
@@ -96,6 +117,9 @@ export interface StatusResponse extends ApiOk {
     } | null;
   };
   pullsdk: PullSdkBlock;
+  /** Present whenever the ULTRA engine is configured. Optional so older
+   *  backends (and tests) that omit it keep type-checking. */
+  ultra?: UltraBlock;
   agent: AgentBlock;
   updates: UpdatesBlock;
 }
@@ -278,6 +302,12 @@ export interface DeviceDto {
   timeoutMs: number;
   totpEnabled: boolean;
   rfidEnabled: boolean;
+  /** Per-device credential capabilities, served by /sync/cache/devices.
+   *  fingerprintEnabled=false makes the push path DROP the template
+   *  (device_sync._collect_templates_for_pin returns []), so any UI that
+   *  offers enrolment must consult it or it promises something undeliverable. */
+  fingerprintEnabled?: boolean;
+  faceIdEnabled?: boolean;
   showNotifications: boolean;
   [key: string]: unknown;
 }

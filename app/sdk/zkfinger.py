@@ -149,6 +149,34 @@ def _read_c_string(pe: bytes, off: int) -> str:
         return ""
 
 
+# Vendor DLLs the ZKFinger stack loads at RUNTIME, by bare name, from inside the
+# vendor DLLs themselves -- so they never appear in any PE import table and the
+# transitive-import walk cannot discover them.
+#
+# The real chain is:  libzkfp.dll -> fpslib.dll -> zkfpslibLow.dll -> fppswsk12.dll
+# but only the first hop is static. Verified by parsing the import tables with
+# _pe_imports() (libzkfp -> [ZKFPCap, fpslib]; fpslib -> [IPHLPAPI] only) while both
+# `zkfpslibLow.dll` and `fppswsk12.dll` appear as plain name strings inside
+# fpslib.dll / zkfpslibLow.dll. fppswsk12.dll carries 190 IEngine_* symbols -- it IS
+# the matching algorithm engine.
+#
+# WHY THIS MATTERS: a bare LoadLibrary("zkfpslibLow.dll") issued from inside a vendor
+# DLL uses the PROCESS search order (exe dir, system dirs, cwd, PATH). It does NOT
+# search the calling DLL's own folder, and os.add_dll_directory() does not help it
+# either -- AddDllDirectory only affects loads that pass LOAD_LIBRARY_SEARCH_* flags.
+# Our SDK DLLs live in <install>\sdk while the exe and cwd are <install>, so the
+# runtime hop could not be resolved and ZKFPM_Init returned -1 ("Failed to initialize
+# the algorithm library") on the OXYGENE_FIT PC at v1.4.26.
+#
+# Preloading them by ABSOLUTE path fixes it: once a module is in the process, Windows
+# resolves a later bare-name LoadLibrary to the already-loaded module of the same base
+# name. Absent files are skipped silently -- this list is best-effort, never a gate.
+_RUNTIME_LOADED_VENDOR_DLLS: tuple[str, ...] = (
+    "zkfpslibLow.dll",
+    "fppswsk12.dll",
+)
+
+
 def _pe_imports(path: Path) -> List[str]:
     try:
         pe = path.read_bytes()
@@ -339,7 +367,19 @@ class ZKFinger:
             self._log.info("ZKFinger: added DLL directory (handle kept): %s", dll_dir)
         except Exception:
             self._dll_dir_handle = None
-            os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
+
+        # PATH is prepended UNCONDITIONALLY, not only as a fallback.
+        # add_dll_directory() covers loads that pass LOAD_LIBRARY_SEARCH_* flags (i.e.
+        # our own ctypes loads). It does NOT cover a bare LoadLibrary("x.dll") issued
+        # from inside a vendor DLL -- and that is exactly how this stack pulls in
+        # zkfpslibLow.dll / fppswsk12.dll (see _RUNTIME_LOADED_VENDOR_DLLS). PATH *is*
+        # in the process search order, so it reaches those. Treating it as a fallback
+        # meant it was never applied on a healthy machine, which is where
+        # ZKFPM_Init=-1 came from.
+        _p = str(dll_dir)
+        _cur = os.environ.get("PATH", "")
+        if _p.lower() not in [x.strip().lower() for x in _cur.split(os.pathsep) if x.strip()]:
+            os.environ["PATH"] = _p + os.pathsep + _cur
             self._log.info("ZKFinger: prepended to PATH: %s", dll_dir)
 
     def _get_module_path(self, handle: int) -> Optional[str]:
@@ -541,6 +581,18 @@ class ZKFinger:
             self._log.info("ZKFinger: PE imports: %s", ", ".join(all_imports))
 
         failures = self._verify_vendor_imports(rt, vendor_imports)
+
+        # Preload the RUNTIME-loaded hops too. These are invisible to the import walk
+        # above (see _RUNTIME_LOADED_VENDOR_DLLS) and are the ones that actually
+        # decide whether ZKFPM_Init can bring up the algorithm engine.
+        for _name in _RUNTIME_LOADED_VENDOR_DLLS:
+            if (rt.dll_dir / _name).exists():
+                self._preload_from_dir(rt.dll_dir, _name)
+            else:
+                self._log.warning(
+                    "ZKFinger: runtime-loaded dependency %s not found in %s — "
+                    "ZKFPM_Init may fail with rc=-1", _name, rt.dll_dir,
+                )
         if failures:
             self._log.warning("ZKFinger: missing/failed dependency loads:")
             for k, v in failures.items():
@@ -595,15 +647,27 @@ class ZKFinger:
         rt = self._runtime
         hint = ""
         if rc == -1 and rt:
+            loaded = ", ".join(sorted(self._preloaded.keys())) or "(none)"
+            missing = [n for n in _RUNTIME_LOADED_VENDOR_DLLS if not (rt.dll_dir / n).exists()]
             hint = (
                 "\nMost common causes for rc=-1:\n"
-                "1) Missing companion DLLs (algorithm module) from the SAME SDK build.\n"
-                "2) Mixed DLL versions (fpslib/ZKFPCap/libzkfp not from same SDK) due to duplicate copies.\n"
+                "1) A runtime-loaded dependency could not be resolved. The chain is\n"
+                "   libzkfp.dll -> fpslib.dll -> zkfpslibLow.dll -> fppswsk12.dll, and only\n"
+                "   the FIRST hop is a static import; the rest are loaded by bare name and\n"
+                "   are NOT searched for in the sdk folder unless preloaded (we now do).\n"
+                "2) Missing companion DLLs (algorithm module) from the SAME SDK build.\n"
+                "3) Mixed DLL versions (fpslib/ZKFPCap/libzkfp not from the same SDK) due to\n"
+                "   duplicate copies shadowing each other.\n"
+                "4) The ZK9500 scanner driver is not installed, or no scanner is attached.\n"
+                f"\nDiagnostics: dll_dir={rt.dll_dir}\n"
+                f"  preloaded+pinned: {loaded}\n"
+                f"  runtime-dep files MISSING from dll_dir: {missing or 'none'}\n"
                 "Fix:\n"
                 f"- Put ALL x86 SDK DLLs in ONE folder: {rt.dll_dir}\n"
                 "- Ensure only ONE effective copy exists (avoid duplicates in other folders / cwd).\n"
                 "- Reinstall the ZKFinger driver from the same SDK package.\n"
-                "- Reboot, then retry.\n"
+                "- Cross-check with tools/mb2000_scripts/4_enroll_zk9500.ps1: if that script\n"
+                "  also fails on this PC, the fault is the driver/hardware, not this app.\n"
             )
 
         raise ZKFingerError(f"ZKFPM_Init failed: {_rc_explain(rc)}{hint}")

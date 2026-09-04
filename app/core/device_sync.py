@@ -33,6 +33,7 @@ from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLi
 )
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDK, PullSDKError
+from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
 
 
 @dataclass
@@ -1164,6 +1165,13 @@ class DeviceSyncEngine:
             "ipAddress": g("ipAddress", "ip_address", default=""),
             "portNumber": g("portNumber", "port_number", default=4370),
             "password": g("password", default=""),
+            # PROTOCOL ROUTING: this normalized dict is the ONLY thing every
+            # _sync_one_device caller receives. Dropping deviceProtocol here made
+            # resolve_device_protocol() answer ZK_PULLSDK/"default" for an MB2000,
+            # so a protocol guard placed downstream could never fire. Inert for
+            # PullSDK gyms: absent or "ZK_PULLSDK" resolves exactly as before.
+            "deviceProtocol": g("deviceProtocol", "device_protocol", default=None),
+            "model": g("model", default=""),
             "allowedMemberships": _as_list(allowed),
             "doorIds": _as_list(doors),
             "timeoutMs": _to_int(
@@ -1910,6 +1918,43 @@ class DeviceSyncEngine:
 
         if not ip:
             self.logger.warning(f"[DeviceSync] Skip device id={dev_id} name={dev_name!r}: missing ipAddress")
+            return
+
+        # ------------------------------------------------------------------ #
+        # PROTOCOL GUARD
+        #
+        # Everything below this line speaks the LOW-LEVEL PullSDK DLL surface
+        # (sdk.connect / set_device_data / delete_device_data / ...). No other
+        # driver implements it, so this engine is PullSDK-only by construction.
+        #
+        # Without this guard a ZK_STANDALONE terminal (MB2000 over zkemkeeper)
+        # was handed a plcommpro.dll socket: it cannot answer, so the connect
+        # burned its full timeout and looked exactly like a cabling fault
+        # (observed in the field as connect_ms=5110 on a healthy device).
+        #
+        # This is deliberately NOT a quiet `return`. A ZK_STANDALONE device that
+        # is in DEVICE mode gets its roster from NO engine at all -- the
+        # standalone push lives only on the ULTRA worker
+        # (ultra_engine._run_standalone_full_sync) -- so a silent skip would
+        # look like a successful sync while the device received nothing.
+        # ------------------------------------------------------------------ #
+        protocol = resolve_device_protocol(device)
+        if protocol != DeviceProtocol.ZK_PULLSDK:
+            self.logger.error(
+                "[DeviceSync] Device id=%s name=%r NOT synced: protocol=%s is not driven by "
+                "this engine (PullSDK only). Set accessDataMode=ULTRA on this device so the "
+                "ULTRA worker pushes its roster; in DEVICE mode it receives nothing.",
+                dev_id, dev_name, protocol.value,
+            )
+            try:
+                _tel.event(
+                    "DEVICE_SYNC_PROTOCOL_SKIP",
+                    device_id=did,
+                    protocol=protocol.value,
+                    access_data_mode=str(device.get("accessDataMode") or ""),
+                )
+            except Exception:
+                pass
             return
 
         # P1: resolve effective push policy for this device

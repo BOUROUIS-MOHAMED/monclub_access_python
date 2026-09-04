@@ -103,17 +103,33 @@ function clockOf(d: Date): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
-/** Primary label for a feed row — the member, or the card when unresolved. */
+/** "ZKPIN:<pin>" is NOT a card.
+ *
+ * A standalone terminal (MB2000) reports a fingerprint punch with no card number
+ * at all, so the driver synthesises this marker from the device PIN when its
+ * pin->card map has no entry — and flags it as an anomaly (ZKEM_PIN_UNMAPPED).
+ * On a fingerprint-only gym that is the NORMAL case, so the feed was telling the
+ * operator "Carte ZKPIN:1234" about a member who has no card and never presented
+ * one. Show it for what it is: an unmatched device PIN. */
+const ZKPIN_PREFIX = "ZKPIN:";
+function isDevicePin(cardNo: string): boolean {
+  return cardNo.startsWith(ZKPIN_PREFIX);
+}
+/** Primary label for a feed row — the member, or the credential when unresolved. */
 function rowTitle(it: DashboardFeedItem): string {
   if (it.userFullName.trim()) return it.userFullName;
-  return it.cardNo ? `Carte ${it.cardNo}` : "Badge inconnu";
+  if (!it.cardNo) return "Badge inconnu";
+  // Unresolved AND no card: the device PIN matched no member in the local roster.
+  return isDevicePin(it.cardNo)
+    ? `PIN ${it.cardNo.slice(ZKPIN_PREFIX.length)} — membre inconnu`
+    : `Carte ${it.cardNo}`;
 }
 
 /** Secondary label — plan and credential, mirroring "Annuel salle · carte 0042 8871". */
 function rowDetail(it: DashboardFeedItem): string {
   const bits: string[] = [];
   if (it.membershipTitle.trim()) bits.push(it.membershipTitle);
-  if (it.userFullName.trim() && it.cardNo) bits.push(`${methodLabel(it.method)} ${it.cardNo}`);
+  if (it.userFullName.trim() && it.cardNo) bits.push(`${methodLabel(it.method)} ${isDevicePin(it.cardNo) ? it.cardNo.slice(ZKPIN_PREFIX.length) : it.cardNo}`);
   else bits.push(methodLabel(it.method));
   if (it.deviceName) bits.push(it.deviceName);
   return bits.join(" · ");
@@ -201,12 +217,30 @@ export default function DashboardPage() {
   const dspPct = dspActive && dsp!.total > 0 ? Math.round((dsp!.current / dsp!.total) * 100) : 0;
   const devicesTotal = mode.DEVICE + mode.AGENT + (mode.ULTRA ?? 0) + mode.UNKNOWN;
 
+  // "Lecteur" = is ANY reader actually attached right now?
+  //
+  // status.pullsdk is fed ONLY by the manual Connect button's session pool, so a
+  // ZK_STANDALONE terminal (MB2000 over zkemkeeper) can never appear there: its
+  // driver owns its own COM connection and the ULTRA worker holds it. Reading only
+  // pullsdk left such a gym permanently showing "Lecteur non connecté" while the
+  // turnstile was working perfectly, next to a "Recharger" button that fixed
+  // nothing. Take the real per-worker `connected` flag into account too -- this
+  // reports actual state, it does not assume success.
+  const ultraDevices = Object.values(status.ultra?.devices ?? {});
+  const ultraConnected = ultraDevices.filter((d) => d?.connected);
+  const readerConnected = status.pullsdk.connected || ultraConnected.length > 0;
+  const readerLabel =
+    status.pullsdk.ip
+    ?? (ultraConnected.length === 1 ? ultraConnected[0].device_name : null)
+    ?? (ultraConnected.length > 1 ? `${ultraConnected.length} appareils` : null)
+    ?? (readerConnected ? "connecté" : "hors ligne");
+
   // The design's third "Maintenant" line is an alert. Only real, currently
   // observable faults are surfaced — /status carries no per-device reachability,
   // so "device offline" is deliberately not synthesised here.
   const alert =
     !agent.running ? { icon: Square, text: "Agent temps réel arrêté", action: "Démarrer", run: () => post("/agent/start") }
-    : !status.pullsdk.connected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
+    : !readerConnected ? { icon: WifiOff, text: "Lecteur non connecté", action: "Recharger", run: () => window.location.reload() }
     : !sync.lastOk ? { icon: AlertTriangle, text: "Dernière synchronisation en échec", action: "Relancer", run: handleSync }
     : null;
 
@@ -436,10 +470,10 @@ export default function DashboardPage() {
               </span>
             </div>
             <div className="flex items-center gap-2.5">
-              <span className={cn("h-2 w-2 shrink-0 rounded-full", status.pullsdk.connected ? "bg-emerald-500" : "bg-primary")} />
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", readerConnected ? "bg-emerald-500" : "bg-primary")} />
               <span className="flex-1 text-[12px] text-foreground">Lecteur</span>
               <span className="truncate font-mono text-[12px] text-muted-foreground">
-                {status.pullsdk.ip || (status.pullsdk.connected ? "connecté" : "hors ligne")}
+                {readerLabel}
               </span>
             </div>
             <div className="flex items-center gap-2.5">

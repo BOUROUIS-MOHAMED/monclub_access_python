@@ -268,7 +268,10 @@ const PHASE_COPY: Record<EnrollPhase, { title: string; instruction: string }> = 
   sample_rejected: { title: "Réessayez",               instruction: "Même doigt — appuyez plus fermement" },
   processing:      { title: "Traitement...",           instruction: "Fusion des empreintes en cours..." },
   push:            { title: "Sauvegarde...",           instruction: "Enregistrement sur le serveur..." },
-  success:         { title: "Enrôlement réussi !",     instruction: "L'empreinte a été enregistrée avec succès" },
+  // "enregistrée" = saved on the SERVER. Delivery to the terminal is a separate
+  // step (a targeted member sync is requested right after the save), so do not
+  // let this read as "the finger works now" -- it does not until the push lands.
+  success:         { title: "Empreinte enregistrée",   instruction: "Envoi vers le lecteur demandé — vérifiez le doigt sur le terminal" },
   failed:          { title: "Échec de l'enrôlement",   instruction: "" },
   cancelled:       { title: "Annulé",                  instruction: "" },
 };

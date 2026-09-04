@@ -118,23 +118,33 @@ def test_sync_cache_user_handlers_use_direct_queries(monkeypatch):
     from app.api import local_access_api_v2 as api_module
 
     sent: list[tuple[int, dict]] = []
+    seen_kwargs: dict = {}
     ctx = SimpleNamespace(
         q_int=lambda *args, default=0: default,
+        # ?templates was added when the fingerprint blobs were made opt-out; returning
+        # the default here keeps this test on the UNCHANGED path, which is the one it
+        # is about.
+        q=lambda *names, default=None: default,
         send_json=lambda status, payload: sent.append((status, payload)),
     )
 
+    def _fake_page(*, limit=0, offset=0, include_templates=True):
+        seen_kwargs["include_templates"] = include_templates
+        return ([{"activeMembershipId": 11}], 1)
+
     monkeypatch.setattr("access.store.load_sync_cache", _fail_full_cache)
-    monkeypatch.setattr(
-        "app.core.db.list_sync_users_page",
-        lambda *, limit=0, offset=0: ([{"activeMembershipId": 11}], 1),
-    )
+    monkeypatch.setattr("app.core.db.list_sync_users_page", _fake_page)
     monkeypatch.setattr("app.core.db.list_sync_memberships", lambda: [{"id": 7, "title": "Gold"}])
 
     api_module._handle_sync_cache_users(ctx)
     api_module._handle_sync_cache_memberships(ctx)
 
+    # Default must still be "templates included" — an accidental flip would strip
+    # fingerprints from every consumer of this endpoint, silently.
+    assert seen_kwargs["include_templates"] is True
+
     assert sent == [
-        (200, {"users": [{"activeMembershipId": 11}], "total": 1}),
+        (200, {"users": [{"activeMembershipId": 11}], "total": 1, "templatesIncluded": True}),
         (200, {"memberships": [{"id": 7, "title": "Gold"}]}),
     ]
 

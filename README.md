@@ -1,3 +1,10 @@
+> ⚠️ **This README is stale.** It describes the original single-purpose Tkinter tool
+> (PullSDK + ZK9500 only) and predates access modes, the device-driver abstraction,
+> the second SDK family (zkemkeeper / MB2000), the local API, and the Tauri UI.
+>
+> **For the current system, read [`guide_for_agents_and_dev.md`](guide_for_agents_and_dev.md).**
+> The sections below are kept only for the historical PullSDK/ZK9500 setup notes.
+
 # ZK Turnstile Manager (PullSDK + ZK9500)
 
 This is a Windows desktop app (Tkinter) that:

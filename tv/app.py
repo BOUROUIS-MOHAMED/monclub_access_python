@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import queue
+import secrets
 import threading
 import time
 import sys
@@ -78,6 +79,17 @@ class TvApp:
         self._sched_id_counter = 0
         self._sched_lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        # Local API session token.
+        #
+        # Without this the TV app had NO token at all, and the guard in
+        # local_access_api_v2 rejects on `not _expected_token` BEFORE it even
+        # looks at what the caller sent -- so every non-exempt TV route answered
+        # 401 forever, no matter what. That silently killed the whole Logs page
+        # (both /tv/logs/recent and the /tv/logs/stream SSE), which then sat
+        # behind a badge claiming "Reconnecting" that could never succeed.
+        # Mirrors app/ui/app.py, which has always done this.
+        self._local_api_token = secrets.token_urlsafe(32)
 
         self._local_api = None
         self._tauri_process = None
@@ -247,6 +259,10 @@ class TvApp:
 
     def _launch_tauri_ui(self) -> None:
         _host, port = self._effective_local_api_bind()
+        # The Tauri shell reads this env var (src-tauri/src/lib.rs) and hands it to
+        # the webview, which puts it on the X-Local-Token header and -- for SSE,
+        # which cannot send headers -- on the ?token= query string.
+        os.environ["MONCLUB_LOCAL_API_TOKEN"] = self._local_api_token
         self._tauri_process = launch_tauri_ui(
             role="tv",
             api_port=port,

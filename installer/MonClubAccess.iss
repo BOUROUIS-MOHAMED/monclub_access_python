@@ -239,23 +239,59 @@ begin
   end;
 end;
 
+function ZkemkeeperClsid(): string;
+var
+  Clsid: string;
+begin
+  // Read HKLM\SOFTWARE\Classes DIRECTLY, and only then fall back to the merged
+  // HKEY_CLASSES_ROOT view.
+  //
+  // Field failure (1.4.24): regsvr32 genuinely succeeded -- the same command run
+  // by hand straight afterwards worked -- yet this post-check said the class was
+  // missing and setup showed an alarming "still not registered" error. HKCR is a
+  // MERGED view (HKLM\Software\Classes + HKCU\Software\Classes) and a process
+  // that has already read it can keep serving that cached view, so the pre-check
+  // ("is it already registered?") poisoned the post-check in the very same run.
+  // Reading the real hive avoids the merged-view cache entirely.
+  Result := '';
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Classes\zkemkeeper.CZKEM\CLSID', '', Clsid) then
+  begin
+    Result := Trim(Clsid);
+    if Result <> '' then Exit;
+  end;
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\zkemkeeper.CZKEM\CLSID', '', Clsid) then
+  begin
+    Result := Trim(Clsid);
+    if Result <> '' then Exit;
+  end;
+  if RegQueryStringValue(HKEY_CLASSES_ROOT, 'zkemkeeper.CZKEM\CLSID', '', Clsid) then
+    Result := Trim(Clsid);
+end;
+
 function ZkemkeeperRegisteredDll(): string;
 var
   Clsid: string;
   DllRef: string;
 begin
   // Setup declares no ArchitecturesInstallIn64BitMode, so it runs as a 32-bit
-  // process and HKCR reads resolve against the 32-bit registry view -- the
+  // process and these reads resolve against the 32-bit registry view -- the
   // correct view for the 32-bit zkemkeeper COM server.
   Result := '';
-  if not RegQueryStringValue(HKEY_CLASSES_ROOT, 'zkemkeeper.CZKEM\CLSID', '', Clsid) then
-    Exit;
-  Clsid := Trim(Clsid);
+  Clsid := ZkemkeeperClsid();
   if Clsid = '' then
     Exit;
-  if not RegQueryStringValue(HKEY_CLASSES_ROOT, 'CLSID\' + Clsid + '\InprocServer32', '', DllRef) then
-    Exit;
-  Result := RemoveQuotes(Trim(DllRef));
+  if RegQueryStringValue(HKEY_LOCAL_MACHINE, 'SOFTWARE\Classes\CLSID\' + Clsid + '\InprocServer32', '', DllRef) then
+  begin
+    Result := RemoveQuotes(Trim(DllRef));
+    if Result <> '' then Exit;
+  end;
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\Classes\CLSID\' + Clsid + '\InprocServer32', '', DllRef) then
+  begin
+    Result := RemoveQuotes(Trim(DllRef));
+    if Result <> '' then Exit;
+  end;
+  if RegQueryStringValue(HKEY_CLASSES_ROOT, 'CLSID\' + Clsid + '\InprocServer32', '', DllRef) then
+    Result := RemoveQuotes(Trim(DllRef));
 end;
 
 function ZkemkeeperIsRegistered(): Boolean;
@@ -318,9 +354,18 @@ begin
                    SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     Failure := 'the elevation prompt was declined, or regsvr32 could not be started'
   else if ResultCode <> 0 then
-    Failure := 'regsvr32 exited with code ' + IntToStr(ResultCode)
-  else if not ZkemkeeperIsRegistered() then
-    Failure := 'regsvr32 reported success but the COM class is still not registered';
+    Failure := 'regsvr32 exited with code ' + IntToStr(ResultCode);
+
+  // Deliberately NOT treating "regsvr32 said OK but I cannot see the class" as a
+  // failure. In the field that combination was a false alarm every time: the
+  // registration had genuinely worked and the identical command run by hand a
+  // minute later succeeded. regsvr32's exit code is the authoritative signal;
+  // this process's own registry view is not (see ZkemkeeperClsid). Log the
+  // discrepancy so it stays diagnosable, but do not alarm the installer with a
+  // scary, wrong message about hardware that is in fact fine.
+  if (Failure = '') and (not ZkemkeeperIsRegistered()) then
+    Log('ZKEMKeeper: regsvr32 succeeded but this process cannot yet see the class '
+        + '(merged-view cache); treating as registered. DLL: ' + DllPath);
 
   if Failure = '' then
   begin

@@ -298,7 +298,10 @@ export default function LocalDbPage() {
     (async () => {
       try {
         const [usersRes, devicesRes] = await Promise.all([
-          get<any>("/sync/cache/users", { limit: "5000" }),
+          // templates=0: this call only builds the FK chip maps (userId / card
+          // numbers) and never reads fingerprints. Fetching the blobs made this
+          // ~6s of pure disk I/O on the gym PC.
+          get<any>("/sync/cache/users", { limit: "5000", templates: "0" }),
           get<any>("/sync/cache/devices", { includeDoorPresets: "0" }),
         ]);
 

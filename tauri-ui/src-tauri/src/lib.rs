@@ -175,17 +175,57 @@ fn fetch_presets(port: u16, device_id: i64) -> Vec<DoorPreset> {
         .unwrap_or_default()
 }
 
-fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i64) {
+/// Fire a door open from the native tray. Returns whether the door actually opened.
+///
+/// The result used to be discarded (`let _ = ... .send()`), so a refused open was
+/// indistinguishable from a successful one: nothing was shown and nothing was
+/// logged. That matters most on a standalone terminal, whose driver ships with
+/// the door command disabled behind a hardware gate and answers a deliberate
+/// refusal -- the operator pressed the tray item and the turnstile simply never
+/// moved, with no trace anywhere.
+///
+/// NOTE: the native tray has no toast surface (no notification plugin is wired),
+/// so this reports to stderr like the rest of this file. The in-app panels show
+/// the failure properly; this at least makes it diagnosable.
+fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i64) -> bool {
     let url = format!("{}/devices/{}/door/open", api_base(port), device_id);
     let body = serde_json::json!({
         "doorNumber": door_number,
         "pulseSeconds": pulse_seconds,
     });
-    let _ = reqwest::blocking::Client::new()
+    match reqwest::blocking::Client::new()
         .post(&url)
         .header("X-Local-Token", local_api_token())
         .json(&body)
-        .send();
+        .send()
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let payload = resp.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
+            // The endpoint answers 200 {"ok":false} for a driver-level refusal, so
+            // HTTP success alone is NOT proof the door opened.
+            let ok = status.is_success()
+                && payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(status.is_success());
+            if !ok {
+                let reason = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no error message");
+                eprintln!(
+                    "[tray-door] OPEN FAILED device={} door={} http={} reason={}",
+                    device_id, door_number, status.as_u16(), reason
+                );
+            }
+            ok
+        }
+        Err(e) => {
+            eprintln!(
+                "[tray-door] OPEN FAILED device={} door={} transport={}",
+                device_id, door_number, e
+            );
+            false
+        }
+    }
 }
 
 fn post_sync_now(port: u16) {
@@ -1488,7 +1528,7 @@ fn setup_access_tray(app: &AppHandle, tooltip: &str) -> Result<(), Box<dyn std::
                             parts[2].parse::<i64>(),
                         ) {
                             let p = port;
-                            std::thread::spawn(move || post_open_door(p, dev_id, door_num, pulse));
+                            std::thread::spawn(move || { let _opened = post_open_door(p, dev_id, door_num, pulse); });
                         }
                     }
                 }

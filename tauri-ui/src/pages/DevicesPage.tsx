@@ -44,6 +44,10 @@ interface ControlState {
   mode: string;
   doors: { doorNumber: number; intertimeSec: number }[];
   driftSec: number | null;
+  /** false when the device family exposes no Door{N}Intertime parameter
+   *  (zkemkeeper standalone terminals). The value was NOT read, so it must not
+   *  be rendered as a setting -- an unread value is not "off". */
+  supportsDeviceParams: boolean;
   reentryEnabled: boolean;
   reentrySeconds: string;
   reentry: VerifyState;
@@ -105,6 +109,22 @@ function Chip({ tone, children }: { tone: "ok" | "no" | "wn" | "flat"; children:
     </span>
   );
 }
+
+// Protocol family the device speaks. Mirrors app/sdk/device_driver.resolve_device_protocol:
+// anything absent or unrecognised resolves to ZK_PULLSDK (the backend column defaults to
+// it), so a missing field can never route a working PullSDK panel away from its path.
+const STANDALONE_ALIASES = new Set([
+  "ZK_STANDALONE", "STANDALONE", "ZKEMKEEPER", "ZKEM", "PUSH", "ADMS", "MB2000",
+]);
+type DeviceProtocol = "ZK_PULLSDK" | "ZK_STANDALONE";
+function protocolOf(d: any): DeviceProtocol {
+  const raw = String(d?.deviceProtocol ?? d?.device_protocol ?? "").trim().toUpperCase();
+  return STANDALONE_ALIASES.has(raw) ? "ZK_STANDALONE" : "ZK_PULLSDK";
+}
+const PROTOCOL_LABEL: Record<DeviceProtocol, string> = {
+  ZK_PULLSDK: "PullSDK",
+  ZK_STANDALONE: "ZKTeco autonome",
+};
 
 const STATE_TONE: Record<DeviceState, "ok" | "no" | "wn" | "flat"> = {
   connected: "ok", idle: "flat", noaddress: "wn", inactive: "flat",
@@ -170,7 +190,8 @@ export default function DevicesPage() {
   const openControl = useCallback(async (deviceId: number, deviceName: string) => {
     setControl({
       deviceId, deviceName, loading: true, loadError: null, mode: "",
-      doors: [], driftSec: null, reentryEnabled: false, reentrySeconds: "30",
+      doors: [], driftSec: null, supportsDeviceParams: true,
+      reentryEnabled: false, reentrySeconds: "30",
       reentry: { status: "idle" }, clock: { status: "idle" },
       policy: "", mirror: { armed: false, count: null, sample: [], at: null, status: "idle" },
       errorPopup: null,
@@ -182,6 +203,7 @@ export default function DevicesPage() {
       setControl((p) => p && p.deviceId === deviceId ? {
         ...p, loading: false, mode: String(s.mode || ""),
         doors, driftSec: s.clock?.driftSec ?? null,
+        supportsDeviceParams: (s as any).supportsDeviceParams !== false,
         reentryEnabled: maxInt > 0,
         reentrySeconds: maxInt > 0 ? String(maxInt) : "30",
       } : p);
@@ -350,6 +372,11 @@ export default function DevicesPage() {
     const did = d.id ?? d.deviceId;
     if (did && connectedIds.has(did)) return true;
     if (status?.pullsdk?.connected && status.pullsdk.deviceId === did) return true;
+    // A ZK_STANDALONE terminal never enters the manual PullSDK session pool -- its
+    // driver owns the COM connection and the ULTRA worker holds it. Without this a
+    // perfectly healthy MB2000 was listed as "Non connecté". This reads the worker's
+    // real `connected` flag; it does not assume a device is up.
+    if (did != null && status?.ultra?.devices?.[String(did)]?.connected) return true;
     return false;
   };
 
@@ -375,7 +402,7 @@ export default function DevicesPage() {
       }
     }
     return { byMode, needsAttention, problems };
-  }, [devices, connectedIds, status?.pullsdk?.connected, status?.pullsdk?.deviceId]);
+  }, [devices, connectedIds, status?.pullsdk?.connected, status?.pullsdk?.deviceId, status?.ultra]);
 
   const firstProblem = parc.problems[0] ?? null;
 
@@ -448,6 +475,12 @@ export default function DevicesPage() {
               const ip = String(d.ip ?? d.ipAddress ?? "").trim();
               const mode = String(d.accessDataMode ?? d.access_data_mode ?? "").toUpperCase();
               const conn = isConnected(d);
+              const protocol = protocolOf(d);
+              // Door availability comes from the DRIVER, never from the protocol:
+              // a standalone terminal ships with the door command gated off, but it
+              // can be enabled per machine once the relay is verified. undefined =
+              // unknown -> keep the control live.
+              const canOpenDoor = status?.ultra?.devices?.[String(did)]?.supports_open_door !== false;
               const state = deviceStateOf(d, conn);
               const faulty = state === "noaddress" || state === "inactive";
               return (
@@ -496,13 +529,31 @@ export default function DevicesPage() {
                       </Button>
                     ) : (
                       <>
-                        <Button
-                          variant="outline"
-                          className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
-                          onClick={() => setDoorDialog({ deviceId: did, deviceName: name })}
-                        >
-                          <DoorOpen className="h-3.5 w-3.5" />Porte
-                        </Button>
+                        {canOpenDoor ? (
+                          <Button
+                            variant="outline"
+                            className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                            onClick={() => setDoorDialog({ deviceId: did, deviceName: name })}
+                          >
+                            <DoorOpen className="h-3.5 w-3.5" />Porte
+                          </Button>
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span tabIndex={0}>
+                                <Button
+                                  variant="outline" disabled
+                                  className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
+                                >
+                                  <DoorOpen className="h-3.5 w-3.5" />Porte
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              Commande d'ouverture non activée pour ce modèle (à valider sur le matériel).
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
                         <Button
                           variant="outline"
                           className="h-7 gap-1.5 rounded-[14px] px-3 text-[11.5px] font-semibold"
@@ -510,19 +561,37 @@ export default function DevicesPage() {
                         >
                           <SlidersHorizontal className="h-3.5 w-3.5" />Contrôle
                         </Button>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="outline"
-                              size="icon"
-                              className="h-7 w-7 shrink-0 rounded-[14px]"
-                              onClick={() => (conn ? handleDisconnect(did) : handleConnect(did))}
-                            >
-                              {conn ? <WifiOff className="h-3.5 w-3.5" /> : <Wifi className="h-3.5 w-3.5" />}
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>{conn ? "Déconnecter (PullSDK)" : "Connecter (PullSDK)"}</TooltipContent>
-                        </Tooltip>
+                        {/* Manual connect exists only for PullSDK panels. A ZK_STANDALONE
+                            terminal is driven by its own COM event sink, which the live
+                            worker already owns -- offering "Connect" here would open a
+                            second session and could only ever fail. Show the protocol
+                            instead of a button that cannot work. */}
+                        {protocol === "ZK_PULLSDK" ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="icon"
+                                className="h-7 w-7 shrink-0 rounded-[14px]"
+                                onClick={() => (conn ? handleDisconnect(did) : handleConnect(did))}
+                              >
+                                {conn ? <WifiOff className="h-3.5 w-3.5" /> : <Wifi className="h-3.5 w-3.5" />}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              {conn ? `Déconnecter (${PROTOCOL_LABEL[protocol]})` : `Connecter (${PROTOCOL_LABEL[protocol]})`}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span><Chip tone="flat">{PROTOCOL_LABEL[protocol]}</Chip></span>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              Connexion gérée en continu par le service — pas de session manuelle.
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
                       </>
                     )}
                     <Button
@@ -648,8 +717,9 @@ export default function DevicesPage() {
             </div>
           )}
           <p className="mt-auto pt-2 text-[10.5px] leading-[1.5] text-muted-foreground">
-            L'état d'un appareil reflète la session PullSDK de cette application. Le serveur ne publie
-            pas d'indicateur d'accessibilité par appareil.
+            L'état reflète la connexion réelle de cette application&nbsp;: session PullSDK pour les
+            centrales, connexion du service temps réel pour les terminaux autonomes. Le serveur ne
+            publie pas d'indicateur d'accessibilité par appareil.
           </p>
         </div>
 
@@ -869,21 +939,31 @@ export default function DevicesPage() {
             <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{control.loadError}</AlertDescription></Alert>
           ) : control ? (
             <div className="space-y-5">
-              {/* Re-entry block */}
+              {/* Re-entry block. On a family with no Door{N}Intertime parameter the
+                  value was never read, so we say so rather than showing a switch
+                  that would read as "re-entry is off on this terminal". */}
               <div className="space-y-2.5">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium">Blocage de ré-entrée</p>
                     <p className="text-xs text-muted-foreground">Même carte/QR refusée pendant le délai · RFID (appareil) + QR (logiciel)</p>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <Switch checked={control.reentryEnabled} onCheckedChange={(v: boolean) => setControl((p) => p ? { ...p, reentryEnabled: v } : p)} />
-                    <Input type="number" min={5} max={255} className="w-16" value={control.reentrySeconds} disabled={!control.reentryEnabled}
-                      onChange={(e) => setControl((p) => p ? { ...p, reentrySeconds: e.target.value } : p)} />
-                    <span className="text-xs text-muted-foreground">sec</span>
-                  </div>
+                  {control.supportsDeviceParams ? (
+                    <div className="flex items-center gap-2 shrink-0">
+                      <Switch checked={control.reentryEnabled} onCheckedChange={(v: boolean) => setControl((p) => p ? { ...p, reentryEnabled: v } : p)} />
+                      <Input type="number" min={5} max={255} className="w-16" value={control.reentrySeconds} disabled={!control.reentryEnabled}
+                        onChange={(e) => setControl((p) => p ? { ...p, reentrySeconds: e.target.value } : p)} />
+                      <span className="text-xs text-muted-foreground">sec</span>
+                    </div>
+                  ) : null}
                 </div>
-                <div className="flex items-center gap-2 flex-wrap">
+                {!control.supportsDeviceParams ? (
+                  <Alert><AlertCircle className="h-4 w-4" /><AlertDescription className="text-xs">
+                    Ce modèle (terminal autonome) n'expose pas de paramètre de ré-entrée côté
+                    appareil&nbsp;: la valeur n'a pas pu être lue et ne peut pas être modifiée ici.
+                  </AlertDescription></Alert>
+                ) : null}
+                <div className={cn("flex items-center gap-2 flex-wrap", !control.supportsDeviceParams && "hidden")}>
                   <Button size="sm" onClick={applyReentry} disabled={control.reentry.status === "saving"}>
                     {control.reentry.status === "saving" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null} Appliquer
                   </Button>

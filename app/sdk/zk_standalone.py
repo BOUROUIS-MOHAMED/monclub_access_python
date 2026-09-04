@@ -36,8 +36,10 @@ until GATE 4), template portability, card number space.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("zkapp")
@@ -73,6 +75,22 @@ _DEFAULT_CMD_TIMEOUT_SEC = 10.0
 _CONNECT_TIMEOUT_SEC = 20.0
 _EVENT_QUEUE_MAX = 4096
 _STA_LOOP_IDLE_SLEEP_SEC = 0.25
+# How many members to trace call-by-call at the start of a roster push.
+_PUSH_TRACE_MEMBERS = 3
+# Template uploads to trace, counted SEPARATELY and carried across chunks. The
+# first members of a roster often have no fingerprints at all, so a member-only
+# budget can be exhausted before a single SetUserTmpExStr is ever reached -- which
+# is exactly how the wedging call stayed invisible in the field.
+_PUSH_TRACE_TEMPLATES = 5
+# Give up on the roster after this many chunks wedge back to back. One bad member
+# must not block the other 940; a terminal that wedges on everything must not be
+# hammered for 95 chunks (each wedge leaks an unkillable STA thread).
+_PUSH_MAX_CONSECUTIVE_WEDGES = 3
+# Members per STA command during a roster push. The STA loop is strictly
+# sequential, so ONE command == a window where no COM message is pumped and no
+# device event is drained. Chunking bounds that window, lets live events keep
+# flowing during a multi-minute push, and caps what a wedged call can cost.
+_PUSH_CHUNK_MEMBERS = 10
 
 # MB2000 user-ID space is 9 digits (vendor datasheet). Longer pins would be
 # silently truncated/rejected by the terminal — guard at push time.
@@ -81,6 +99,31 @@ _MAX_PIN_DIGITS = 9
 
 def _digits_only(v: Any) -> str:
     return "".join(ch for ch in str(v or "") if ch.isdigit())
+
+
+_OPEN_DOOR_ENV_VAR = "MONCLUB_ZK_STANDALONE_OPEN_DOOR"
+
+
+def _open_door_override(device_id: int) -> bool:
+    """Whether ACUnlock is enabled for this device (GATE 4 escape hatch).
+
+    MONCLUB_ZK_STANDALONE_OPEN_DOOR accepts:
+      "1" / "true" / "yes" / "all"  -> enable for every standalone terminal
+      "8" or "8,12"                 -> enable only for those device ids
+    Anything else (or unset) leaves it OFF. Parsed per call: this is a rare,
+    bring-up-time path, and reading it live means an operator can flip it without
+    restarting mid-session.
+    """
+    raw = str(os.environ.get(_OPEN_DOOR_ENV_VAR, "") or "").strip().lower()
+    if not raw:
+        return False
+    if raw in ("1", "true", "yes", "on", "all"):
+        return True
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) == int(device_id):
+            return True
+    return False
 
 
 def verify_method_to_scan_mode(verify_method: Any) -> str:
@@ -196,10 +239,22 @@ class ZKStandaloneDevice:
     # ---- capability flags (D8) ----
     owns_event_source = True
     supports_device_params = False
-    # ACUnlock is documented SDK-wide but UNVERIFIED on MB2000 (GATE 4). Until a
-    # positive on-site test flips this (config/env), open_door returns False and
-    # the worker's existing "open_door returned False" handling reports it.
+    # ACUnlock is documented SDK-wide but UNVERIFIED on MB2000 (GATE 4), so it
+    # ships OFF: a door command that silently does nothing is worse than one that
+    # reports it cannot. _do_open_door already implements the real call
+    # (zk.ACUnlock) -- this flag only decides whether we are allowed to make it.
+    #
+    # Flip it per-machine, without a rebuild, via MONCLUB_ZK_STANDALONE_OPEN_DOOR
+    # (see _open_door_override). Verify FIRST with the on-site script pack:
+    # tools/mb2000_scripts/9_unlock_door.ps1 fires the identical ACUnlock(1, ds)
+    # call -- listen for the relay AND confirm the turnstile physically releases.
+    # ACUnlock returning True with no physical release is a wiring fault, not SDK.
     supports_open_door = False
+    # The PullSDK "transaction" table has no analogue here: this driver reads
+    # events through the COM event sink, not a table. read_transaction_rows /
+    # get_table_count / delete_all_transaction_rows are all inert, so callers
+    # must SKIP this device rather than act on their return values.
+    supports_transaction_table = False
 
     def __init__(self, device_payload: Dict[str, Any], logger_inst: Any = None, *, logger: Any = None):
         # accept both kw spellings so get_driver(logger=...) works
@@ -220,8 +275,29 @@ class ZKStandaloneDevice:
         # zkemkeeper comm key ("SetCommPassword") — reuse the device password field.
         self.comm_key = str(_pick(["password", "commKey", "comm_key"], "") or "")
 
+        # Generation fence for the STA thread. zkemkeeper has no call timeout, so a
+        # terminal that stops answering wedges the thread forever. We cannot
+        # interrupt a blocked COM call, but we CAN abandon the thread and build a
+        # fresh one; the generation stops the zombie from ever servicing commands
+        # again if it later unblocks.
+        self._sta_gen = 0
+        # Terminal fingerprint algorithm version, filled on connect (see _read_fp_version).
+        self._device_fp_version = ""
+        # Terminal occupancy (users / fingerprints / capacities), filled on connect.
+        self._device_status: Dict[str, int] = {}
         self._prefix = f"[ZKEM:{self.device_id}]"
         self._tel_wid = f"ZKEM:{self.device_id}"
+
+        # Instance attribute shadows the class default when GATE 4 has been passed
+        # on this machine. Logged loudly: enabling an unverified door command is an
+        # operational decision that must be visible in the log afterwards.
+        if _open_door_override(self.device_id):
+            self.supports_open_door = True
+            self.logger.warning(
+                "%s open_door ENABLED via %s -- ACUnlock will be issued. Confirm "
+                "9_unlock_door.ps1 passed on this hardware.",
+                self._prefix, _OPEN_DOOR_ENV_VAR,
+            )
 
         # Whole-device lane direction from the synced door preset (D7).
         self._direction = self._direction_from_presets(self.payload)
@@ -411,22 +487,172 @@ class ZKStandaloneDevice:
         bracket_enable_device: ONLY the 22:00/manual full reconcile may set this —
         EnableDevice(False) locks the terminal UI and it is the gym's sole verifier.
         """
+        users = list(users or [])
+        templates_by_pin = templates_by_pin or {}
+
+        # The bracketed full reconcile must hold EnableDevice(False) across the
+        # WHOLE roster, so it stays a single command (its own deliberate window).
+        # Everything else is chunked.
+        if bracket_enable_device:
+            chunks = [users] if users else []
+        else:
+            chunks = [users[i:i + _PUSH_CHUNK_MEMBERS]
+                      for i in range(0, len(users), _PUSH_CHUNK_MEMBERS)] or [[]]
+
+        def chunk_pins(part: List[Dict[str, Any]]) -> str:
+            if not part:
+                return "?"
+            return f"{part[0].get('pin')}..{part[-1].get('pin')}"
+
+        agg: Dict[str, Any] = {"ok": True, "pushed": 0, "failed": 0,
+                               "templates_failed": 0, "skipped_pin": 0,
+                               "chunks_wedged": 0, "errors": [],
+                               # Every pin NOT confirmed on the terminal: per-member
+                               # failures reported by the chunk, plus every member of
+                               # a chunk that wedged (none of those were confirmed).
+                               "failed_pins": []}
+        consecutive_wedges = 0
+        total = len(users)
+        # Trace budgets span the WHOLE roster, not one chunk.
+        trace_members_left = _PUSH_TRACE_MEMBERS
+        trace_templates_left = _PUSH_TRACE_TEMPLATES
+        t_start = time.monotonic()
+        t_last_log = t_start
+        self.logger.info(
+            "%s push_roster START users=%d templates_for=%d chunks=%d bracket=%s",
+            self._prefix, total, len(templates_by_pin), len(chunks), bool(bracket_enable_device),
+        )
+        for idx, part in enumerate(chunks, 1):
+            # Bound each command. A wedged terminal now costs ONE chunk and is
+            # detected in seconds, instead of hanging the worker for the full
+            # timeout and leaving the device dead until the app restarts.
+            if bracket_enable_device:
+                chunk_timeout = timeout_sec
+            else:
+                # ~1-2s per member on real hardware, so 5s each is ~3x headroom;
+                # the 45s floor protects a small final chunk. The caller's
+                # timeout_sec is a HARD cap so this can never exceed it.
+                chunk_timeout = min(timeout_sec, max(45.0, len(part) * 5.0))
+            try:
+                res = self._call(
+                    "push_roster",
+                    args={
+                        "users": part,
+                        "templates_by_pin": templates_by_pin,
+                        "bracket": bool(bracket_enable_device),
+                        "trace_members": trace_members_left,
+                        "trace_templates": trace_templates_left,
+                    },
+                    timeout=chunk_timeout,
+                ) or {}
+            except Exception as exc:
+                # A chunk wedged. _call has already abandoned the STA thread, so
+                # rebuild the connection and CARRY ON with the next chunk.
+                #
+                # Aborting the whole roster here meant one bad member blocked all
+                # 950: the retry restarted at chunk 1, wedged at the same chunk,
+                # and the gym never got more than the first 10 members. Skipping
+                # the bad chunk delivers the other ~940 and names the ones missed.
+                agg["ok"] = False
+                agg["error"] = str(exc)
+                agg["chunks_wedged"] += 1
+                consecutive_wedges += 1
+                # Nothing in a wedged chunk is confirmed -- the STA thread died mid-way
+                # and no per-member result came back. Every one of its pins must be
+                # retried by the next sync.
+                for _u in part:
+                    _p = str(_u.get("pin") or "").strip()
+                    if _p and _p not in agg["failed_pins"]:
+                        agg["failed_pins"].append(_p)
+                if len(agg["errors"]) < 5:
+                    agg["errors"].append(f"chunk {idx}/{len(chunks)} (pins {chunk_pins(part)}): {exc}")
+                self.logger.warning(
+                    "%s push_roster chunk %d/%d WEDGED (pins %s) after %d pushed: %s",
+                    self._prefix, idx, len(chunks), chunk_pins(part), agg["pushed"], exc,
+                )
+                if consecutive_wedges >= _PUSH_MAX_CONSECUTIVE_WEDGES:
+                    self.logger.error(
+                        "%s push_roster ABANDONED after %d consecutive wedged chunks "
+                        "-- the terminal is not accepting this roster",
+                        self._prefix, consecutive_wedges,
+                    )
+                    agg["errors"].append(
+                        f"abandoned after {consecutive_wedges} consecutive wedged chunks")
+                    break
+                # Rebuild the link before the next chunk; without this every
+                # remaining _call raises "STA thread not running".
+                try:
+                    if not self.connect():
+                        self.logger.warning(
+                            "%s push_roster: reconnect failed after a wedge -- stopping",
+                            self._prefix,
+                        )
+                        break
+                except Exception:
+                    self.logger.warning(
+                        "%s push_roster: reconnect raised after a wedge -- stopping",
+                        self._prefix, exc_info=True,
+                    )
+                    break
+                continue
+            consecutive_wedges = 0
+            agg["pushed"] += int(res.get("pushed") or 0)
+            agg["failed"] += int(res.get("failed") or 0)
+            agg["skipped_pin"] += int(res.get("skipped_pin") or 0)
+            agg["templates_failed"] += int(res.get("templates_failed") or 0)
+            _chunk_failed = res.get("failed_pins")
+            if _chunk_failed is None and not res.get("ok", True):
+                # A failed chunk that cannot say WHICH pins failed confirmed none of
+                # them. Anything less would let the engine record unpushed pins as
+                # synced and never retry them.
+                _chunk_failed = [str(u.get("pin") or "").strip() for u in part]
+            for _p in (_chunk_failed or []):
+                _p = str(_p or "").strip()
+                if _p and _p not in agg["failed_pins"]:
+                    agg["failed_pins"].append(_p)
+            trace_members_left = int(res.get("trace_members_left", trace_members_left) or 0)
+            trace_templates_left = int(res.get("trace_templates_left", trace_templates_left) or 0)
+            for e in (res.get("errors") or [])[:5]:
+                if len(agg["errors"]) < 5:
+                    agg["errors"].append(e)
+            if not res.get("ok", True):
+                agg["ok"] = False
+
+            # Cumulative progress, throttled. This is the line that tells an
+            # operator "moving" vs "wedged" -- the whole reason the first field
+            # incident was unreadable.
+            done = agg["pushed"] + agg["failed"] + agg["skipped_pin"]
+            now = time.monotonic()
+            if (now - t_last_log >= 10.0 or idx == len(chunks)) and done:
+                t_last_log = now
+                elapsed = now - t_start
+                rate = done / elapsed if elapsed > 0 else 0.0
+                eta = (max(total - done, 0) / rate) if rate > 0 else float("nan")
+                self.logger.info(
+                    "%s push_roster progress %d/%d (%.0f%%) ok=%d failed=%d skipped=%d "
+                    "%.1f users/s elapsed=%.0fs eta=%.0fs",
+                    self._prefix, done, total, (100.0 * done / total) if total else 100.0,
+                    agg["pushed"], agg["failed"], agg["skipped_pin"], rate, elapsed, eta,
+                )
+
+        self.logger.info(
+            "%s push_roster DONE ok=%s pushed=%d failed=%d templates_failed=%d "
+            "skipped_pin=%d chunks_wedged=%d in %.0fs%s",
+            self._prefix, agg["ok"], agg["pushed"], agg["failed"],
+            agg["templates_failed"], agg["skipped_pin"], agg["chunks_wedged"],
+            time.monotonic() - t_start,
+            (" errors=" + "; ".join(agg["errors"][:5])) if agg["errors"] else "",
+        )
+        # One telemetry event for the whole roster, not one per chunk.
         try:
-            result = self._call(
-                "push_roster",
-                args={
-                    "users": users or [],
-                    "templates_by_pin": templates_by_pin or {},
-                    "bracket": bool(bracket_enable_device),
-                },
-                timeout=timeout_sec,
-            )
-        except Exception as exc:
-            self.logger.warning("%s push_roster failed: %s", self._prefix, exc)
-            return {"ok": False, "pushed": 0, "failed": 0, "error": str(exc)}
+            _tel.event("ZKEM_PUSH_DONE", worker=self._tel_wid, pushed=agg["pushed"],
+                       failed=agg["failed"], skipped_pin=agg["skipped_pin"],
+                       ok=bool(agg["ok"]), chunks=len(chunks))
+        except Exception:
+            pass
         # keep the event-side identity map in step with what the device now holds
         self._refresh_pin_card_map()
-        return result
+        return agg
 
     def list_device_users(self, *, timeout_sec: float = 60.0) -> Dict[str, Any]:
         """Enumerate ALL users currently on the terminal (for the MIRROR policy).
@@ -479,6 +705,16 @@ class ZKStandaloneDevice:
     def read_transaction_rows(self, *, options: str = "new record", initial_size: int | None = None) -> List[Dict[str, str]]:
         return []
 
+    def delete_all_transaction_rows(self) -> int:
+        """INERT -- and deliberately so.
+
+        The terminal's attendance log (GLog) is NOT the PullSDK 'transaction'
+        table, and this driver does not READ it yet. Clearing it would destroy
+        records that were never persisted to SQLite. Call sites must gate on
+        ``supports_transaction_table``, never on this return value.
+        """
+        return 0
+
     # ------------------------------------------------------------------ #
     # Command funnel internals
     # ------------------------------------------------------------------ #
@@ -489,8 +725,9 @@ class ZKStandaloneDevice:
             return
         self._stop_evt.clear()
         self._connected_flag.clear()
-        t = threading.Thread(target=self._sta_main, daemon=True,
-                             name=f"ZKemSTA-{self.device_id}")
+        gen = self._sta_gen
+        t = threading.Thread(target=self._sta_main, args=(gen,), daemon=True,
+                             name=f"ZKemSTA-{self.device_id}-g{gen}")
         self._sta_thread = t
         try:
             t.start()
@@ -501,6 +738,29 @@ class ZKStandaloneDevice:
                 pass
             raise
 
+    def _abandon_sta_thread(self, reason: str) -> None:
+        """Fence off a wedged STA thread so a fresh one can take over.
+
+        The old thread is NOT killable -- Python cannot interrupt a blocked COM
+        call -- so it leaks until the process exits or the call finally returns.
+        Bumping the generation guarantees that if it ever does return, it exits
+        its loop instead of racing the new thread for commands.
+        """
+        with self._pin_map_lock:
+            self._sta_gen += 1
+            gen = self._sta_gen
+        self._sta_thread = None
+        self._connected_flag.clear()
+        self.logger.error(
+            "%s STA thread WEDGED (%s) - abandoning it and rebuilding (gen=%d). "
+            "The stuck thread leaks until the call returns or the app restarts.",
+            self._prefix, reason, gen,
+        )
+        try:
+            _tel.warn("ZKEM_STA_WEDGED", worker=self._tel_wid, reason=str(reason)[:120], gen=gen)
+        except Exception:
+            pass
+
     def _call(self, op: str, args: Dict[str, Any] | None = None,
               timeout: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Any:
         if self._sta_thread is None or not self._sta_thread.is_alive():
@@ -508,6 +768,11 @@ class ZKStandaloneDevice:
         cmd = _Cmd(op, args)
         self._cmd_queue.put(cmd)
         if not cmd.done.wait(timeout=timeout):
+            # The STA thread is stuck inside a COM call that will never return.
+            # Previously we raised and left it alive, so _ensure_sta_thread saw a
+            # live thread, never replaced it, and the terminal stayed dead until
+            # the app was restarted. Abandon it so the worker can rebuild.
+            self._abandon_sta_thread(f"command {op!r} timed out after {timeout}s")
             raise TimeoutError(f"zkemkeeper command {op!r} timed out after {timeout}s")
         if cmd.error is not None:
             raise cmd.error
@@ -517,7 +782,7 @@ class ZKStandaloneDevice:
     # STA thread — the ONLY code allowed to touch the COM object
     # ------------------------------------------------------------------ #
 
-    def _sta_main(self) -> None:  # noqa: C901 - one linear device loop, kept together
+    def _sta_main(self, gen: int = 0) -> None:  # noqa: C901 - one linear device loop, kept together
         zk = None
         connected = False
         try:
@@ -527,11 +792,29 @@ class ZKStandaloneDevice:
             return
         try:
             while not self._stop_evt.is_set():
+                if gen != self._sta_gen:
+                    # We were abandoned as wedged and a newer thread owns the
+                    # device now. Exit rather than race it for commands.
+                    self.logger.warning("%s STA gen=%d superseded by gen=%d - exiting",
+                                        self._prefix, gen, self._sta_gen)
+                    break
                 # 1) service pending commands (each with its own error capture)
                 try:
                     cmd = self._cmd_queue.get(timeout=_STA_LOOP_IDLE_SLEEP_SEC)
                 except queue.Empty:
                     cmd = None
+                if cmd is not None and gen != self._sta_gen:
+                    # Superseded BETWEEN the top-of-loop check and this dequeue. The
+                    # command belongs to the successor thread that _abandon_sta_thread
+                    # made room for -- a thread that was merely SLOW (not stuck in COM)
+                    # would otherwise steal the successor's reconnect, service it on
+                    # its own COM object, then exit and tear that state down, leaving
+                    # connect() returning True with is_connected False and every later
+                    # command answered "not connected". Hand it back and go.
+                    self._cmd_queue.put(cmd)
+                    self.logger.warning("%s STA gen=%d handed %r back to gen=%d and exited",
+                                        self._prefix, gen, cmd.op, self._sta_gen)
+                    break
                 if cmd is not None:
                     try:
                         if cmd.op == "connect":
@@ -550,14 +833,24 @@ class ZKStandaloneDevice:
                                           and self._do_set_time(zk, cmd.args["epoch"]))
                         elif cmd.op == "push_roster":
                             if zk is None or not connected:
+                                # Nothing was attempted, so nothing is confirmed: name
+                                # every pin so the caller retries all of them rather
+                                # than recording them as synced.
                                 cmd.result = {"ok": False, "pushed": 0, "failed": 0,
-                                              "error": "not connected"}
+                                              "error": "not connected",
+                                              "failed_pins": [
+                                                  str(u.get("pin") or "").strip()
+                                                  for u in (cmd.args.get("users") or [])
+                                                  if str(u.get("pin") or "").strip()
+                                              ]}
                             else:
                                 cmd.result = self._do_push_roster(
                                     zk,
                                     users=cmd.args["users"],
                                     templates_by_pin=cmd.args["templates_by_pin"],
                                     bracket=cmd.args["bracket"],
+                                    trace_members=int(cmd.args.get("trace_members") or 0),
+                                    trace_templates=int(cmd.args.get("trace_templates") or 0),
                                 )
                         elif cmd.op == "list_users":
                             if zk is None or not connected:
@@ -590,7 +883,11 @@ class ZKStandaloneDevice:
                         except Exception:
                             pass
                         connected = False
-                        self._connected_flag.clear()
+                        # Only the CURRENT owner may touch the shared flag: a thread
+                        # superseded mid-iteration must not report the successor's
+                        # live connection as down.
+                        if gen == self._sta_gen:
+                            self._connected_flag.clear()
 
                 # 3) COM message pump (belt-and-braces for sink delivery)
                 try:
@@ -605,13 +902,118 @@ class ZKStandaloneDevice:
                     except Exception:
                         pass
             finally:
-                self._connected_flag.clear()
+                # Disconnecting our OWN COM object above is local. Clearing the
+                # SHARED connected flag is not: a superseded thread exiting here
+                # while the successor is connected would flip is_connected to False
+                # and send the worker into a needless reconnect loop.
+                if gen == self._sta_gen:
+                    self._connected_flag.clear()
                 try:
                     self._co_uninit()
                 except Exception:
                     pass
 
     # ---- STA-side operations (zk = the COM object; never called elsewhere) ----
+
+    # GetDeviceStatus indices, standard ZKTeco standalone SDK. Reported raw as well
+    # as named, because index meanings vary a little across firmware -- never state
+    # a capacity we did not actually read.
+    _STATUS_FIELDS = {
+        1: "admins", 2: "users", 3: "fingerprints", 4: "attendance_records",
+        5: "passwords", 7: "fingerprint_capacity", 8: "user_capacity",
+        9: "attendance_capacity", 10: "fingerprints_free", 11: "users_free",
+        12: "attendance_free",
+    }
+
+    def _read_device_status(self, zk: Any) -> Dict[str, int]:
+        """How full the terminal actually is.
+
+        NOTHING in this driver used to ask. We pushed a 900-member roster into a
+        terminal that may already be full of another system's enrolments and had
+        no way to see it -- SetUserTmpExStr just returns False, with no reason, for
+        every single template. A gym migrating from older software keeps those old
+        fingerprints until someone removes them, so "device full" is the NORMAL
+        first-install state, not an edge case.
+
+        Best-effort: any index that will not read is simply omitted.
+        """
+        out: Dict[str, int] = {}
+        for idx, name in self._STATUS_FIELDS.items():
+            for attempt in ("byref", "tuple"):
+                try:
+                    if attempt == "byref":
+                        from win32com.client import VARIANT  # type: ignore
+                        import pywintypes  # type: ignore
+                        box = VARIANT(pywintypes.VT_BYREF | pywintypes.VT_I4, 0)
+                        if bool(zk.GetDeviceStatus(1, int(idx), box)):
+                            out[name] = int(box.value)
+                            break
+                    else:
+                        res = zk.GetDeviceStatus(1, int(idx), 0)
+                        if isinstance(res, (tuple, list)) and len(res) >= 2 and res[0]:
+                            out[name] = int(res[1])
+                            break
+                except Exception:
+                    continue
+        return out
+
+    def _read_fp_version(self, zk: Any) -> str:
+        """The terminal's fingerprint ALGORITHM version (~ZKFPVersion), e.g. "9"/"10".
+
+        This is the single most useful number when templates are refused. A ZK9500
+        desk scanner captures v10; a terminal running v9 rejects every one of them,
+        and SetUserTmpExStr just returns False with no reason -- which in the field
+        looked like 339 silent refusals and no clue why. Log it once per connect so
+        the mismatch is visible without running the on-site script pack.
+
+        Best-effort: this is a diagnostic, never a gate. win32com maps the ByRef
+        out-param differently across builds, so try both shapes and give up quietly.
+        """
+        for attempt in ("byref", "tuple"):
+            try:
+                if attempt == "byref":
+                    import pythoncom  # noqa: F401  (win32com is already in use here)
+                    from win32com.client import VARIANT  # type: ignore
+                    import pywintypes  # type: ignore
+                    out = VARIANT(pywintypes.VT_BYREF | pywintypes.VT_BSTR, "")
+                    if bool(zk.GetSysOption(1, "~ZKFPVersion", out)):
+                        return str(out.value or "").strip()
+                else:
+                    res = zk.GetSysOption(1, "~ZKFPVersion", "")
+                    if isinstance(res, (tuple, list)) and len(res) >= 2 and res[0]:
+                        return str(res[1] or "").strip()
+            except Exception:
+                continue
+        return ""
+
+    def _warn_if_device_full(self) -> None:
+        """Say it plainly when the terminal has no room for more fingerprints.
+
+        A full store makes EVERY SetUserTmpExStr return False -- which in the field
+        looked like 339 identical refusals with no cause. Members WITHOUT
+        fingerprints keep pushing fine, so the roster looks partly successful and
+        the real problem hides.
+        """
+        st = getattr(self, "_device_status", None) or {}
+        used = st.get("fingerprints")
+        cap = st.get("fingerprint_capacity")
+        free = st.get("fingerprints_free")
+
+        if free is not None and free <= 0:
+            self.logger.error(
+                "%s DEVICE FINGERPRINT STORE IS FULL (%s/%s used, 0 free). No template "
+                "can be uploaded until space is freed. A terminal carried over from "
+                "previous software keeps its old enrolments -- those occupy this space.",
+                self._prefix, used if used is not None else "?", cap or "?",
+            )
+            return
+        if used is not None and cap:
+            pct = (100.0 * used / cap) if cap else 0.0
+            if pct >= 90.0:
+                self.logger.warning(
+                    "%s device fingerprint store %.0f%% full (%s/%s) - uploads will "
+                    "start failing soon.", self._prefix, pct, used, cap,
+                )
 
     def _do_connect(self, zk: Any) -> bool:
         if self.comm_key:
@@ -626,7 +1028,15 @@ class ZKStandaloneDevice:
                 zk.RegEvent(1, _REGEVENT_ATT_TRANSACTION)
             except Exception as exc:
                 self.logger.warning("%s RegEvent failed: %s", self._prefix, exc)
-            self.logger.info("%s connected ip=%s port=%s", self._prefix, self.ip, self.port)
+            self._device_fp_version = self._read_fp_version(zk)
+            self._device_status = self._read_device_status(zk)
+            self.logger.info(
+                "%s connected ip=%s port=%s deviceFpVersion=%s status=%s",
+                self._prefix, self.ip, self.port,
+                self._device_fp_version or "unknown",
+                self._device_status or "unreadable",
+            )
+            self._warn_if_device_full()
         else:
             self.logger.warning("%s Connect_Net returned False (ip=%s port=%s)",
                                 self._prefix, self.ip, self.port)
@@ -705,14 +1115,57 @@ class ZKStandaloneDevice:
 
     def _do_push_roster(self, zk: Any, *, users: List[Dict[str, Any]],
                         templates_by_pin: Dict[str, List[Dict[str, Any]]],
-                        bracket: bool) -> Dict[str, Any]:
+                        bracket: bool,
+                        trace_members: int = 0, trace_templates: int = 0) -> Dict[str, Any]:
         """Per-member: SetStrCardNumber -> SSR_SetUserInfo -> per finger
         (delete-if-occupied -> SetUserTmpExStr Flag=1). See plan D6.
         """
         pushed = 0
         failed = 0
         skipped_pin = 0
+        # Fingerprint templates that the terminal REFUSED. Counted separately from
+        # `failed` (which is per-member) because a member row can be written fine
+        # while its finger upload is rejected -- and that member then cannot get
+        # through the turnstile. It must NOT be reported as a successful sync.
+        templates_failed = 0
         errors: List[str] = []
+        # WHICH pins did not land completely (member row refused, a template refused,
+        # or an exception mid-member). The aggregate counts above cannot say which;
+        # without this the engine had to treat a single refused finger as "re-push
+        # all 928 next time". Deduplicated: a member with two refused fingers is one
+        # failed pin.
+        failed_pins: List[str] = []
+        _failed_seen: set = set()
+
+        def _mark_failed(p: str) -> None:
+            if p and p not in _failed_seen:
+                _failed_seen.add(p)
+                failed_pins.append(p)
+
+        # Progress instrumentation.
+        #
+        # A full roster is ~1000 members and each one costs several COM round
+        # trips (SetStrCardNumber + SSR_SetUserInfo, then per finger
+        # SSR_DeleteEnrollData + SetUserTmpExStr), so a first sync legitimately
+        # runs for MINUTES. Previously this loop logged nothing until it
+        # finished, which made "slow" and "hung" indistinguishable from the
+        # outside -- the worker only emitted WORKER_STALL warnings. Emit a
+        # heartbeat with a real rate and ETA so the operator can see it moving.
+        total_users = len(users or [])
+        t_start = time.monotonic()
+        # Progress for the WHOLE roster is reported by push_roster() (the caller),
+        # which is the only place that knows the totals. This is one chunk.
+        # Which members this chunk covers. One line per chunk, and it is the only
+        # thing that identifies the member a wedge died on -- the field incident
+        # showed chunk 1 always succeeding and chunk 2 always hanging, with no way
+        # to tell WHICH member chunk 2 started at.
+        _first_pin = str((users or [{}])[0].get("pin") or "?")
+        _last_pin = str((users or [{}])[-1].get("pin") or "?")
+        self.logger.info(
+            "%s push chunk pins %s..%s (n=%d)", self._prefix, _first_pin, _last_pin, total_users,
+        )
+        members_left = int(trace_members or 0)
+        templates_left = int(trace_templates or 0)
 
         if bracket:
             try:
@@ -722,6 +1175,19 @@ class ZKStandaloneDevice:
 
         try:
             for u in users or []:
+                done_so_far = pushed + failed + skipped_pin
+                # Trace the first few members call-by-call, BEFORE each call.
+                # zkemkeeper has no call timeout: if the terminal stops answering,
+                # the COM call blocks forever and this thread never returns, so a
+                # post-hoc timing log would never be written. Only a PRE-call line
+                # survives a hang -- the last line in the log names the culprit.
+                # Budgets are carried ACROSS chunks by the caller. Tracing only the
+                # first chunk hid the failure: the first members had no fingerprints,
+                # so the template calls -- the ones that actually wedge -- were never
+                # traced at all.
+                traced = members_left > 0
+                if traced:
+                    members_left -= 1
                 pin = str(u.get("pin") or "").strip()
                 name = str(u.get("name") or "")[:24]
                 card = _digits_only(u.get("card"))
@@ -730,12 +1196,19 @@ class ZKStandaloneDevice:
                     continue
                 try:
                     if card:
+                        if traced:
+                            self.logger.info("%s push trace pin=%s -> SetStrCardNumber(%s)", self._prefix, pin, card)
                         zk.SetStrCardNumber(card)  # must precede SSR_SetUserInfo
                     else:
+                        if traced:
+                            self.logger.info("%s push trace pin=%s -> SetStrCardNumber('')", self._prefix, pin)
                         zk.SetStrCardNumber("")
+                    if traced:
+                        self.logger.info("%s push trace pin=%s -> SSR_SetUserInfo", self._prefix, pin)
                     ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, True))
                     if not ok:
                         failed += 1
+                        _mark_failed(pin)
                         if len(errors) < 5:
                             errors.append(f"SSR_SetUserInfo pin={pin}")
                         continue
@@ -745,23 +1218,83 @@ class ZKStandaloneDevice:
                         if not tmp:
                             continue
                         try:
-                            # ZKTeco FAQ: upload requires the slot to be EMPTY —
+                            # ZKTeco FAQ: upload requires the slot to be EMPTY --
                             # delete-first makes re-enrollment deterministic.
-                            # SSR_DeleteEnrollData is 3-arg (mn, pin, backupNumber);
-                            # backupNumber 0..9 == that finger (proven by the .ps1 pack,
-                            # scripts 5/7). The earlier 4-arg call silently raised here
-                            # (swallowed) so the slot was never actually cleared.
-                            zk.SSR_DeleteEnrollData(1, pin, int(finger_idx))
+                            #
+                            # USE SSR_DelUserTmpExt, NOT SSR_DeleteEnrollData.
+                            # tools/mb2000_scripts/5_push_member_to_device.ps1 -- the
+                            # push sequence proven on this hardware -- clears the slot
+                            # with SSR_DelUserTmpExt(mn, pin, fingerId). A previous
+                            # comment here claimed SSR_DeleteEnrollData was "proven by
+                            # scripts 5/7"; that is wrong for script 5. Script 7 uses
+                            # SSR_DeleteEnrollData for WHOLE-USER / face / password
+                            # backup numbers (11/12/13), which is a different operation.
+                            #
+                            # It matters: on this firmware SSR_DeleteEnrollData with
+                            # backupNumber >= 1 NEVER RETURNS. Field trace, v1.4.25 --
+                            # 12 of 19 STA wedges had SSR_DeleteEnrollData(f=1) as the
+                            # last call made, 2 more had f=2, and finger 0 always
+                            # returned normally. That hang is what stalled the roster.
+                            if traced or templates_left > 0:
+                                self.logger.info("%s push trace pin=%s -> SSR_DelUserTmpExt(f=%s)", self._prefix, pin, finger_idx)
+                            zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))
                         except Exception:
                             pass
+                        if traced or templates_left > 0:
+                            if templates_left > 0:
+                                templates_left -= 1
+                            self.logger.info("%s push trace pin=%s -> SetUserTmpExStr(f=%s len=%d)", self._prefix, pin, finger_idx, len(tmp))
                         okt = bool(zk.SetUserTmpExStr(1, pin, finger_idx, 1, tmp))
-                        if not okt and len(errors) < 5:
-                            errors.append(f"SetUserTmpExStr pin={pin} finger={finger_idx}")
+                        if not okt:
+                            # Previously this only appended a string to errors[] and
+                            # left `failed` untouched, so ok stayed True: the member
+                            # was reported synced, the roster hash was stamped, and
+                            # the scheduler then skipped every later cycle as
+                            # "fingerprint unchanged". The member's finger was
+                            # refused at the turnstile while Access said it worked.
+                            templates_failed += 1
+                            _mark_failed(pin)
+                            _st = getattr(self, "_device_status", None) or {}
+                            _store = (
+                                f"{_st.get('fingerprints')}/{_st.get('fingerprint_capacity')}"
+                                if _st.get("fingerprint_capacity") else "unknown"
+                            )
+                            self.logger.warning(
+                                "%s template REFUSED pin=%s finger=%s (%d bytes) "
+                                "deviceFpVersion=%s templateVersion=%s fpStore=%s - this "
+                                "member cannot verify on the device. If EVERY template is "
+                                "refused, the two usual causes are (1) the terminal's "
+                                "fingerprint store is FULL -- old enrolments from previous "
+                                "software still occupy it -- or (2) the algorithm versions "
+                                "disagree (a ZK9500 desk capture is v10).",
+                                self._prefix, pin, finger_idx, len(tmp),
+                                getattr(self, "_device_fp_version", "") or "unknown",
+                                tpl.get("templateVersion") or "?", _store,
+                            )
+                            if len(errors) < 5:
+                                errors.append(f"SetUserTmpExStr pin={pin} finger={finger_idx}")
                     pushed += 1
                 except Exception as exc:
                     failed += 1
+                    _mark_failed(pin)
                     if len(errors) < 5:
                         errors.append(f"pin={pin}: {exc}")
+
+                # Let COM deliver anything queued for this apartment.
+                #
+                # The STA loop is strictly sequential (service ONE command -> pump
+                # events -> PumpWaitingMessages), so for the entire duration of this
+                # push nothing is pumped. An event sink IS registered on this
+                # connection (RegEvent in _do_connect) and the proven-working script
+                # pack never registers one -- the app is the only caller that pushes
+                # a roster while a sink is live. Pump here so a device-initiated
+                # callback cannot starve behind this loop.
+                try:
+                    self._pump()
+                except Exception:
+                    pass
+
+
         finally:
             if bracket:
                 try:
@@ -773,17 +1306,23 @@ class ZKStandaloneDevice:
             except Exception:
                 pass
 
-        ok = failed == 0
-        try:
-            _tel.event("ZKEM_PUSH_DONE", worker=self._tel_wid, pushed=pushed,
-                       failed=failed, skipped_pin=skipped_pin, ok=ok)
-        except Exception:
-            pass
+        # A refused template is a failed sync. Reporting ok=True here is what let a
+        # non-working fingerprint be stamped as "synced" and never retried.
+        ok = failed == 0 and templates_failed == 0
+        self.logger.debug(
+            "%s push chunk done pushed=%d failed=%d templates_failed=%d skipped_pin=%d in %.1fs",
+            self._prefix, pushed, failed, templates_failed, skipped_pin,
+            time.monotonic() - t_start,
+        )
         if skipped_pin:
             self.logger.warning("%s push_roster skipped %d users with non-numeric/>%d-digit pins",
                                 self._prefix, skipped_pin, _MAX_PIN_DIGITS)
         return {"ok": ok, "pushed": pushed, "failed": failed,
-                "skipped_pin": skipped_pin, "errors": errors}
+                "templates_failed": templates_failed,
+                "skipped_pin": skipped_pin, "errors": errors,
+                "failed_pins": failed_pins,
+                "trace_members_left": members_left,
+                "trace_templates_left": templates_left}
 
     def _do_list_users(self, zk: Any) -> Dict[str, Any]:
         """Enumerate every user on the device. Ports 2_get_member_templates.ps1.

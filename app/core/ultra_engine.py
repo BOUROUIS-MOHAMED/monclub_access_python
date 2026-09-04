@@ -1,5 +1,6 @@
 """ULTRA mode engine: device-firmware RFID/FP + PC-side RTLog observer + TOTP rescue."""
 
+import hashlib
 import logging
 import queue
 import threading
@@ -29,6 +30,8 @@ from app.core.db import (
     get_membership_brief_index_cached,
     get_staff_membership_ids,
     get_staff_membership_ids_cached,
+    insert_push_batch,
+    update_push_batch,
 )
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
@@ -90,6 +93,48 @@ _MIRROR_RECONCILE_REASONS = ("user-sync", "daily-forced-sync", "hard-reset")
 _MIRROR_MAX_DELETE_FRACTION = 0.25
 _MIRROR_RESERVED_PIN_FLOOR = 90000
 _MIRROR_ENROLL_GRACE_SEC = 600.0
+
+
+def _standalone_pin_hash(entry: Dict[str, Any], templates: Any) -> str:
+    """Change-detection hash of EXACTLY what push_roster hands the terminal for one pin.
+
+    Deliberately NOT DeviceSyncEngine._compute_desired_hash: that one hashes the
+    PullSDK payload (10-digit-clamped card, door bitmask, authorize timezone), none
+    of which reaches a standalone terminal. Hashing fields the terminal never sees
+    would (a) force a full re-push whenever a door preset changes and, worse, (b)
+    let two different raw cards collapse onto one clamped value and hide a real
+    change. So this mirrors the driver's own input transforms instead: the name is
+    cut at 24 chars and the card reduced to its digits, exactly as _do_push_roster
+    does before SSR_SetUserInfo / SetStrCardNumber. Templates are sorted so finger
+    order cannot flip the hash.
+    """
+    name = str(entry.get("name") or "")[:24]
+    card = "".join(ch for ch in str(entry.get("card") or "") if ch.isdigit())
+    tpl_parts: list[str] = []
+    for t in templates or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            fid = int(t.get("fingerId"))
+        except (TypeError, ValueError):
+            continue
+        td = str(t.get("templateData") or "")
+        if not td:
+            continue
+        try:
+            tv = int(t.get("templateVersion") or 10)
+        except (TypeError, ValueError):
+            tv = 10
+        try:
+            ts = int(t.get("templateSize") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        tpl_parts.append(f"{fid}:{tv}:{ts}:{td}")
+    payload = (
+        f"pin={str(entry.get('pin') or '')}\nname={name}\ncard={card}\n"
+        f"templates={'|'.join(sorted(tpl_parts))}\n"
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1095,8 +1140,12 @@ class UltraDeviceWorker(threading.Thread):
 
     def _build_standalone_roster(
         self, cache: Any, *, only_member_ids: set[int] | None = None
-    ) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]]]:
-        """(users, templates_by_pin) for driver.push_roster().
+    ) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]], Dict[str, str]]:
+        """(users, templates_by_pin, hashes_by_pin) for driver.push_roster().
+
+        hashes_by_pin is the per-pin change-detection hash (_standalone_pin_hash) of
+        the exact entry + templates handed to the driver, used by the incremental
+        full sync and recorded in device_sync_state after each push.
 
         Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
         VALID_ONLY policy / pin derivation: activeMembershipId, else userId) and
@@ -1125,19 +1174,104 @@ class UltraDeviceWorker(threading.Thread):
 
         users_out: list[Dict[str, Any]] = []
         templates_by_pin: Dict[str, list[Dict[str, Any]]] = {}
+        hashes_by_pin: Dict[str, str] = {}
         for pin, u in by_pin.items():
-            users_out.append({
+            entry = {
                 "pin": pin,
                 "name": str(u.get("fullName") or ""),
                 "card": str(u.get("firstCardId") or ""),
-            })
+            }
+            users_out.append(entry)
             tpls = engine._collect_templates_for_pin(
                 user=u, pin=pin, local_fp_index=local_fp_index,
                 fingerprint_enabled=fp_enabled,
             )
             if tpls:
                 templates_by_pin[pin] = tpls
-        return users_out, templates_by_pin
+            hashes_by_pin[pin] = _standalone_pin_hash(entry, tpls)
+        return users_out, templates_by_pin, hashes_by_pin
+
+    # ------------------------------------------------------------------ #
+    # Incremental standalone sync: per-pin state in device_sync_state
+    #
+    # WHY: push_roster has no diff of its own -- every full sync re-sent the whole
+    # roster (928 members, 419s on the OXYGENE_FIT MB2000, v1.4.26). And a
+    # targeted member sync never updated the scheduler's roster-hash baseline
+    # (_last_hash is set only when a FULL sync finishes), so the very next hash
+    # evaluation after an enrolment concluded "roster changed" and queued that
+    # 7-minute full push for a single new fingerprint (field report, v1.4.28).
+    #
+    # The PullSDK path already solves this with device_sync_state (one
+    # desired_hash per (device, pin), skip when unchanged). This reuses the same
+    # table so a standalone terminal gets the same behaviour: after the first
+    # complete push, a full sync only sends pins that are new, changed, or failed
+    # last time. A member sync records its pin as synced, so the enrolment
+    # cascade becomes a no-op reconcile that finishes in seconds.
+    #
+    # SAFETY DIRECTION: any failure to READ state means "push everything" (never
+    # skip a pin because a lookup broke); any failure to WRITE state is logged
+    # and ignored (the worst case is an unnecessary re-push next time).
+    # ------------------------------------------------------------------ #
+    def _standalone_pins_needing_push(
+        self, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str]
+    ) -> tuple[list[Dict[str, Any]], int]:
+        """Return (pins to push, number skipped as unchanged)."""
+        try:
+            from app.core.db import list_device_sync_hashes_and_status
+            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+        except Exception:
+            logger.warning(
+                "%s per-pin sync state unreadable -- pushing the FULL roster (safe default)",
+                self._prefix, exc_info=True,
+            )
+            return list(users), 0
+        to_push: list[Dict[str, Any]] = []
+        for u in users:
+            pin = str(u.get("pin") or "").strip()
+            prev_hash, prev_ok = state.get(pin, ("", False))
+            if prev_ok and prev_hash and prev_hash == hashes_by_pin.get(pin):
+                continue
+            to_push.append(u)
+        return to_push, len(users) - len(to_push)
+
+    def _record_standalone_pin_state(
+        self, *, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str],
+        result: Dict[str, Any],
+    ) -> None:
+        """Persist per-pin outcome of one push_roster call.
+
+        Uses the driver's ``failed_pins`` when present. A driver that predates it
+        (or reports ok=False with an empty list) yields only the aggregate, and the
+        only safe reading of "something failed, unknown what" is: every attempted
+        pin is unconfirmed -- record all of them ok=False so they are retried.
+        """
+        if not users:
+            return
+        result = result or {}
+        failed = result.get("failed_pins")
+        if failed is None or (not failed and not result.get("ok")):
+            failed_set = (
+                {str(u.get("pin") or "").strip() for u in users}
+                if not result.get("ok") else set()
+            )
+        else:
+            failed_set = {str(p or "").strip() for p in failed if str(p or "").strip()}
+        err: str | None = None
+        if failed_set:
+            errs = result.get("errors") or []
+            err = str(errs[0]) if errs else str(result.get("error") or "push_roster failed")
+        rows: list[tuple[str, str | None, bool, str | None]] = []
+        for u in users:
+            pin = str(u.get("pin") or "").strip()
+            if not pin:
+                continue
+            ok = pin not in failed_set
+            rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err))
+        try:
+            from app.core.db import save_device_sync_state_batch
+            save_device_sync_state_batch(device_id=self._device_id, rows=rows)
+        except Exception:
+            logger.debug("%s per-pin sync state not recorded", self._prefix, exc_info=True)
 
     def _run_standalone_full_sync(self, *, reason: str, fingerprint_hash: str | None) -> None:
         """Full roster push for a push driver, with FULL parity on the started/
@@ -1160,34 +1294,129 @@ class UltraDeviceWorker(threading.Thread):
         _tel.event("FULL_SYNC_START", worker=self._tel_wid, reason=reason,
                    users=len(getattr(cache, "users", []) or []))
         result: Dict[str, Any] = {}
+        # Record a push-batch row. Without this "Historique push" was structurally
+        # dead for a standalone terminal: an ULTRA *PullSDK* device gets rows (via
+        # DeviceSyncEngine.run_one_device_on_connected_sdk -> insert_push_batch),
+        # so on a mixed gym the page showed every device EXCEPT this one -- which
+        # reads as "the MB2000 never syncs" minutes after a real reconcile.
+        batch_id: int | None = None
+        batch_attempted = 0
+        skipped_unchanged = 0
+        skipped_note = ""
+        desired_pins: list[str] = []
         try:
-            users, templates_by_pin = self._build_standalone_roster(cache)
+            users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
+            desired_pins = [str(u.get("pin") or "").strip() for u in users]
             # Daytime pushes must NOT EnableDevice-lock the terminal (it is the
             # gym's sole verifier); only the explicit nightly/manual reconcile
             # brackets. See plan decision D6.
             bracket = reason in ("user-sync", "daily-forced-sync", "hard-reset")
-            result = self._sdk.push_roster(users, templates_by_pin,
-                                           bracket_enable_device=bracket)
-            sync_ok = bool(result.get("ok"))
-            sync_error = "" if sync_ok else str(
-                (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
-            )
+            # Bracketed = explicit/nightly full reconcile: keep pushing EVERY pin
+            # (unchanged semantics). Everything else is incremental.
+            if bracket:
+                to_push = list(users)
+            else:
+                to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
+            batch_attempted = len(to_push)
+            try:
+                batch_id = insert_push_batch(
+                    sync_run_id=None,
+                    device_id=self._device_id,
+                    device_name=self._device_name,
+                    policy=str((self._device or {}).get("rosterPushingPolicy") or "PRESERVE").strip().upper(),
+                    status="IN_PROGRESS",
+                    created_at=started_iso,
+                )
+            except Exception:
+                logger.debug("%s push-batch row not recorded", self._prefix, exc_info=True)
+            if not to_push:
+                # Everything desired is already on the terminal with the same
+                # content. Skip the COM round-trips entirely; still finish with full
+                # bookkeeping so the scheduler records the roster hash and stops
+                # re-evaluating this as "changed".
+                result = {"ok": True, "pushed": 0, "failed": 0, "templates_failed": 0,
+                          "skipped_pin": 0, "chunks_wedged": 0, "errors": [],
+                          "failed_pins": []}
+                sync_ok = True
+                sync_error = ""
+                if not users:
+                    skipped_note = "desired roster is empty -- nothing to push"
+                    logger.info("%s full sync (reason=%s): desired roster is empty -- nothing to push",
+                                self._prefix, reason)
+                else:
+                    skipped_note = (
+                        f"{skipped_unchanged} pin(s) unchanged since the last push -- nothing sent"
+                    )
+                    logger.info(
+                        "%s full sync (reason=%s): all %d desired pins already on the terminal "
+                        "-- nothing to push", self._prefix, reason, skipped_unchanged,
+                    )
+            else:
+                if skipped_unchanged:
+                    logger.info(
+                        "%s full sync (reason=%s): pushing %d new/changed/failed pin(s), "
+                        "%d unchanged skipped", self._prefix, reason, len(to_push), skipped_unchanged,
+                    )
+                to_push_pins = {str(u.get("pin") or "").strip() for u in to_push}
+                templates_to_push = {p: t for p, t in (templates_by_pin or {}).items()
+                                     if p in to_push_pins}
+                result = self._sdk.push_roster(to_push, templates_to_push,
+                                               bracket_enable_device=bracket)
+                sync_ok = bool(result.get("ok"))
+                sync_error = "" if sync_ok else str(
+                    (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
+                )
+                # Record per-pin outcome BEFORE mirror/prune so a failed pin is
+                # remembered as failed even if a later step raises.
+                self._record_standalone_pin_state(
+                    users=to_push, hashes_by_pin=hashes_by_pin, result=result,
+                )
             # MIRROR pushing policy: after a SUCCESSFUL full push, optionally delete
             # device users not in the app roster. Heavily guarded + dry-run by default;
             # a no-op for PRESERVE (the default) and for PullSDK drivers. Never allowed
             # to fail the sync.
             if sync_ok:
+                # NOTE: roster_users is the FULL desired roster (`users`), never the
+                # incremental `to_push` subset -- MIRROR deletes device users absent
+                # from this list, so passing the subset would delete every unchanged
+                # member.
                 try:
                     self._maybe_mirror_reconcile(reason=reason, roster_users=users)
                 except Exception as exc:
                     logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
+                # Forget state for pins no longer desired, so a member who leaves and
+                # later returns is pushed again rather than assumed present.
+                try:
+                    from app.core.db import prune_device_sync_state
+                    prune_device_sync_state(device_id=self._device_id, keep_pins=desired_pins)
+                except Exception:
+                    logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
         duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
+        if batch_id is not None:
+            try:
+                # A refused fingerprint template is a FAILED pin here, not a
+                # success: the member row landed but that member cannot verify.
+                pins_failed = int(result.get("failed") or 0) + int(result.get("templates_failed") or 0)
+                pins_success = max(0, int(result.get("pushed") or 0) - int(result.get("templates_failed") or 0))
+                update_push_batch(
+                    id=batch_id,
+                    pins_attempted=batch_attempted,
+                    pins_success=pins_success,
+                    pins_failed=pins_failed,
+                    status=("SUCCESS" if sync_ok else ("PARTIAL" if pins_success else "FAILED")),
+                    duration_ms=int(duration_ms),
+                    # A no-op reconcile would otherwise read "0/0 pins" with no
+                    # explanation; say why nothing was sent.
+                    error_message=(sync_error or skipped_note or None),
+                )
+            except Exception:
+                logger.debug("%s push-batch row not finalised", self._prefix, exc_info=True)
         _tel.event("FULL_SYNC_DONE", worker=self._tel_wid, reason=reason, ok=sync_ok,
                    dur_ms=round(duration_ms), pushed=result.get("pushed"),
-                   failed=result.get("failed"))
+                   failed=result.get("failed"), skipped_unchanged=skipped_unchanged)
         self._mark_full_sync_finished(reason=reason, ok=sync_ok,
                                       duration_ms=duration_ms, error=sync_error)
         self._notify_full_sync_finished(
@@ -1206,7 +1435,7 @@ class UltraDeviceWorker(threading.Thread):
             if cache is None:
                 logger.warning("%s standalone member sync skipped: no sync cache", self._prefix)
                 return
-            users, templates_by_pin = self._build_standalone_roster(
+            users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(
                 cache, only_member_ids={int(member_id)},
             )
             if not users:
@@ -1214,6 +1443,13 @@ class UltraDeviceWorker(threading.Thread):
                             self._prefix, member_id)
                 return
             result = self._sdk.push_roster(users, templates_by_pin)
+            # Record this pin's outcome. On success the next hash-triggered full
+            # sync sees it as already-synced and skips it -- this is what stops an
+            # enrolment from cascading into a whole-roster push. On failure it is
+            # recorded ok=False so that full sync retries exactly this pin.
+            self._record_standalone_pin_state(
+                users=users, hashes_by_pin=hashes_by_pin, result=result,
+            )
             if not result.get("ok"):
                 _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
                           member_id=member_id, err="push_roster")
@@ -1353,17 +1589,65 @@ class UltraDeviceWorker(threading.Thread):
         # 10) armed — log, delete, keep the write-through content mirror consistent
         _tel.event("MIRROR_PLAN", worker=self._tel_wid,
                    would_delete=len(extras), sample=sample, armed=True)
+
+        # Record the DESTRUCTIVE reconcile durably, before it runs.
+        #
+        # This is the only place the app deletes members off a terminal, and it
+        # used to leave nothing behind but a log line and a telemetry event -- so
+        # nobody could answer "who removed these users, and when?" from any
+        # screen. A push-batch row puts it in "Historique push" next to the
+        # pushes, with policy=MIRROR, and survives a restart.
+        mirror_started = time.monotonic()
+        mirror_batch_id = None
+        try:
+            mirror_batch_id = insert_push_batch(
+                sync_run_id=None,
+                device_id=self._device_id,
+                device_name=self._device_name,
+                policy="MIRROR",
+                status="IN_PROGRESS",
+                created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            )
+        except Exception:
+            logger.debug("%s MIRROR batch row not recorded", self._prefix, exc_info=True)
+
         result = deleter(sorted(extras)) or {}
         for p in extras:
             try:
                 delete_device_mirror_pin(device_id=self._device_id, pin=p)
             except Exception:
                 pass
+            # Also forget the per-pin sync state: if this member is ever re-added,
+            # a stale "synced" row would make the incremental full sync SKIP them
+            # while they are no longer on the terminal.
+            try:
+                from app.core.db import delete_device_sync_state
+                delete_device_sync_state(device_id=self._device_id, pin=str(p))
+            except Exception:
+                pass
         _tel.event("MIRROR_DONE", worker=self._tel_wid,
                    deleted=result.get("deleted"), failed=result.get("failed"),
                    ok=result.get("ok"))
-        logger.warning("%s MIRROR reconcile: deleted %s device users not in roster (failed=%s)",
-                       self._prefix, result.get("deleted"), result.get("failed"))
+        logger.warning("%s MIRROR reconcile: deleted %s device users not in roster "
+                       "(failed=%s, pins: %s)",
+                       self._prefix, result.get("deleted"), result.get("failed"), sample)
+        if mirror_batch_id is not None:
+            try:
+                _deleted = int(result.get("deleted") or 0)
+                _failed = int(result.get("failed") or 0)
+                update_push_batch(
+                    id=mirror_batch_id,
+                    pins_attempted=len(extras),
+                    pins_success=_deleted,
+                    pins_failed=_failed,
+                    status=("SUCCESS" if (result.get("ok") and _failed == 0) else "PARTIAL"),
+                    duration_ms=int((time.monotonic() - mirror_started) * 1000),
+                    # The pins are the WHOLE point of the record -- without them the
+                    # row says "12 users removed" and cannot say which.
+                    error_message=("deleted pins: " + sample) if sample else None,
+                )
+            except Exception:
+                logger.debug("%s MIRROR batch row not finalised", self._prefix, exc_info=True)
 
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
@@ -2021,7 +2305,7 @@ class UltraDeviceWorker(threading.Thread):
         image_source = ""
         user_image_status = ""
         user_profile_image = ""
-        scan_mode = "RFID_CARD"
+        scan_mode = _scan_mode_for_event(raw_row)
 
         if isinstance(user, dict):
             user_name = str(user.get("fullName", user.get("full_name", user.get("name", ""))) or "")
@@ -2061,6 +2345,7 @@ class UltraDeviceWorker(threading.Thread):
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
+            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
             image_source=image_source,
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
@@ -2228,6 +2513,7 @@ class UltraDeviceWorker(threading.Thread):
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
+            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
             image_source=image_source,
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
@@ -2425,7 +2711,7 @@ class UltraDeviceWorker(threading.Thread):
             event_id=event_id,
             allowed=door_opened,
             reason=reason,
-            scan_mode="RFID_CARD",
+            scan_mode=_scan_mode_for_event(raw_row),
             user_full_name=user_name,
             user_image=user_image,
             user_membership_id=user_membership_id,
@@ -2433,6 +2719,7 @@ class UltraDeviceWorker(threading.Thread):
             user_phone=user_phone,
             user_valid_from=user_valid_from,
             user_valid_to=user_valid_to,
+            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
             image_source=image_source,
             user_image_status=user_image_status,
             user_profile_image=user_profile_image,
@@ -2467,7 +2754,7 @@ class UltraDeviceWorker(threading.Thread):
             event_id=event_id,
             allowed=False,
             reason="DEVICE_DENIED",
-            scan_mode="RFID_CARD",
+            scan_mode=_scan_mode_for_event(raw_row),
             user_full_name="",
             user_image="",
             user_membership_id=None,
@@ -2507,6 +2794,11 @@ class UltraDeviceWorker(threading.Thread):
         user_phone: str,
         user_valid_from: str,
         user_valid_to: str,
+        # Drives the popup's birthday screen. ULTRA never populated it, so that
+        # screen could not fire at all on an ULTRA gym -- only the AGENT engine
+        # set it (realtime_agent.py). The value is already in the local user
+        # cache (sync_users.birthday); it just never reached the event.
+        user_birthday: str = "",
         image_source: str = "",
         user_image_status: str = "",
         user_profile_image: str = "",
@@ -2606,6 +2898,7 @@ class UltraDeviceWorker(threading.Thread):
                 user_image=user_image,
                 user_valid_from=user_valid_from,
                 user_valid_to=user_valid_to,
+                user_birthday=user_birthday,
                 user_membership_id=user_membership_id,
                 user_membership_title=user_membership_title,
                 user_members_type=user_members_type,
@@ -3104,6 +3397,26 @@ class UltraDeviceWorker(threading.Thread):
             "rtlog_polling": bool(self._settings.get("ultra_rtlog_enabled", True)),
             "totp_rescue_enabled": bool(self._settings.get("ultra_totp_rescue_enabled", True)),
             "connected": self._connected,
+            # Whether this driver may command the door at all. None = unknown (no
+            # driver built yet) so a UI keeps the control live rather than hiding
+            # one that may work; False is a definite "this cannot open a door".
+            # NOTE: read from the DRIVER, not the protocol -- the standalone
+            # family ships it off behind a hardware gate that an operator can
+            # flip per-machine, so protocol is the wrong thing to gate a UI on.
+            "supports_open_door": (
+                bool(getattr(self._sdk, "supports_open_door", True))
+                if getattr(self, "_sdk", None) is not None else None
+            ),
+            # Whether the door command is actually available on this driver.
+            # None = unknown (no driver built yet) -- the UI must keep the control
+            # LIVE on unknown rather than hiding a command that may well work.
+            # NOT derivable from the protocol: ZK_STANDALONE ships with the door
+            # command gated off, but MONCLUB_ZK_STANDALONE_OPEN_DOOR can enable it
+            # per machine once the relay has been verified on real hardware.
+            "supports_open_door": (
+                bool(getattr(self._sdk, "supports_open_door", True))
+                if getattr(self, "_sdk", None) is not None else None
+            ),
             "events_processed": self._events_processed,
             "totp_rescues": self._totp_rescues,
             "totp_failures": self._totp_failures,
@@ -3686,6 +3999,27 @@ class UltraSyncScheduler:
 # ---------------------------------------------------------------------------
 # UltraEngine (orchestrator)
 # ---------------------------------------------------------------------------
+
+
+def _scan_mode_for_event(raw_row: Any, default: str = "RFID_CARD") -> str:
+    """Popup/history scan_mode for one device event.
+
+    ZK_STANDALONE (zkemkeeper / MB2000) reports the verify modality per punch and
+    the driver publishes it as rawRow["scan_mode_hint"] (app/sdk/zk_standalone.py).
+    PullSDK/C3 rows carry no such key, so C2-400 behaviour is byte-identical.
+
+    CONFIDENT OVERRIDE ONLY: only FINGERPRINT is honoured. PASSWORD/UNKNOWN have no
+    branch in the popup's method mapper and would render as "Carte" anyway, so
+    emitting them buys nothing while leaking unmapped values into the scan_mode
+    space that /door-history also consumes.
+    """
+    try:
+        if isinstance(raw_row, dict):
+            if str(raw_row.get("scan_mode_hint") or "").strip().upper() == "FINGERPRINT":
+                return "FINGERPRINT"
+    except Exception:
+        pass
+    return default
 
 
 def _uid_for_alert(user: Any) -> Optional[int]:

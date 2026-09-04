@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -102,11 +103,21 @@ def _normalize_datetime_text(value: Any, fallback: str | None = None) -> str:
         return dt_value.strftime("%Y-%m-%dT%H:%M:%S")
     txt = _safe_str(value, "").strip()
     if txt:
-        # Preserve ISO 8601 T separator; strip trailing Z (naive local time)
-        return txt.replace("Z", "").replace(" ", "T")
+        # Reached only when _dt_from_any could NOT parse the text (every valid ISO /
+        # common form is handled above), i.e. the value is junk -- e.g. a month or
+        # day of 00 from a terminal record. Until 2026-09-02 it was forwarded
+        # verbatim and the backend's LocalDateTime mapping then rejected the WHOLE
+        # batch with HTTP 400. Use the fallback (the PC's own receive time) and say
+        # so, rather than send something no parser can accept. Hardening of a
+        # proven gap; not asserted to be the cause of any specific field 400.
+        logging.getLogger("zkapp").warning(
+            "[DeviceAttendance] unparseable event time %r -- using fallback %r", txt[:40], fallback,
+        )
     fb = _safe_str(fallback, "").strip()
     if fb:
-        return _normalize_datetime_text(fb)
+        fb_dt = _dt_from_any(fb)
+        if fb_dt is not None:
+            return fb_dt.strftime("%Y-%m-%dT%H:%M:%S")
     from app.core.utils import now_iso
     return now_iso().replace(" ", "T")
 
@@ -158,6 +169,23 @@ def _credential_type_from_raw(lowered: Dict[str, Any]) -> str:
     scan_mode = _safe_str(_pick_ci(lowered, "scanmode", "scan_mode"), "").upper()
     if "QR" in scan_mode or "TOTP" in scan_mode:
         return "QR_CODE"
+
+    # ZK_STANDALONE (zkemkeeper / MB2000) publishes an explicit TEXTUAL modality tag
+    # per punch as rawRow["scan_mode_hint"] (app/sdk/zk_standalone.py). Trust it
+    # BEFORE the numeric heuristic below.
+    #
+    # It MUST be read as text, never fed through that digit table: the table is the
+    # PullSDK/C3 verify namespace, where "2" means fingerprint -- but in the zkem
+    # namespace 2 means CARD (zk_standalone._VERIFY_METHOD_SCAN_MODE, corroborated by
+    # tools/mb2000_scripts/8_live_monitor.ps1). Routing the zkem integer through it
+    # would relabel every MB2000 card scan as a fingerprint: a worse bug than the one
+    # this fixes. PullSDK rows carry no scan_mode_hint, so C2-400 output is unchanged.
+    hint = _safe_str(_pick_ci(lowered, "scan_mode_hint", "scanmodehint"), "").strip().upper()
+    if hint in ("FINGERPRINT", "FINGER_PRINT"):
+        return "FINGER_PRINT"
+    if hint in ("RFID_CARD", "CARD"):
+        return "CARD"
+
     verify = _safe_str(
         _pick_ci(lowered, "verifytype", "verified", "verifymode", "verify_mode", "credentialtype", "type"),
         "",
@@ -539,6 +567,24 @@ class DeviceAttendanceMaintenanceEngine:
         # -> PullSDKDevice, so this is a pure indirection for existing gyms.
         sdk_device = get_driver(self._prepare_pullsdk_payload(device_payload, device_settings), logger=self.logger)
 
+        # Drivers whose SDK exposes no PullSDK-style "transaction" table can be
+        # neither read nor purged here. Skip loudly and BEFORE any call, because:
+        #   * calling delete_all_transaction_rows() on such a driver used to raise
+        #     AttributeError (seen in the field on the MB2000), and
+        #   * the purge bookkeeping below would otherwise record a purge that never
+        #     happened -- get_table_count() returns 0, so it writes a success state
+        #     for work no device ever did.
+        # No disconnect() here: construction has not opened anything, and on
+        # ZK_STANDALONE the live ULTRA worker owns the real COM connection.
+        # getattr default True keeps every PullSDK gym on exactly its old path.
+        if not getattr(sdk_device, "supports_transaction_table", True):
+            self.logger.info(
+                "[DeviceAttendance] device=%s name=%r skipped: driver %s exposes no transaction "
+                "table (events arrive through its own event source instead)",
+                device_id, device_name, type(sdk_device).__name__,
+            )
+            return summary
+
         try:
             if read_due:
                 started_at = now_iso()
@@ -740,6 +786,143 @@ class DeviceAttendanceMaintenanceEngine:
 
         return item
 
+    @staticmethod
+    def _item_summary(item: Dict[str, Any]) -> str:
+        """Compact, secret-free description of one upload item for the log."""
+        keys = ("localRowId", "eventId", "date", "type", "direction", "deviceId",
+                "doorId", "activeMembership", "allowed", "reason")
+        return " ".join(f"{k}={item.get(k)!r}" for k in keys if k in item)
+
+    def _isolate_rejected_rows(
+        self,
+        *,
+        api: Any,
+        token: str,
+        items: List[Dict[str, Any]],
+        attempted_ids: List[int],
+        row_ids_by_event: Dict[str, int],
+        row_ids_by_local: Dict[str, int],
+        attempted_at: str,
+        batch_error: str,
+    ) -> Dict[str, Any]:
+        """After a batch HTTP 400, post each row alone to find the one(s) the backend
+        cannot map.
+
+        - A row that succeeds alone is marked synced.
+        - A row that is 400'd alone IS a poison row: it is marked TERMINAL (it leaves
+          the retry queue for good) and logged in full so the cause is visible. The
+          backend's reason -- which names the offending field since 2026-09-02 -- is
+          stored on the row.
+        - Any other failure mid-way (network, 5xx) is not the rows' fault: that row
+          and every row not yet attempted are marked retryable and the loop stops,
+          so a flapping backend is never hammered with N requests.
+
+        Sequential and bounded by the batch size (UPLOAD_BATCH_SIZE), and it only runs
+        for a batch that has already been rejected, so the extra requests are a
+        one-time cost per poisoned batch.
+        """
+        if len(items) == 1:
+            # The batch IS the row: the verdict already applies to it. Quarantine
+            # without re-posting the same payload a second time.
+            only = items[0]
+            only_id = int(only.get("localRowId") or 0)
+            self.logger.error(
+                "[DeviceAttendance] access history row REJECTED by backend (quarantined, "
+                "will not be retried): %s | backend=%s",
+                self._item_summary(only), batch_error,
+            )
+            failed = mark_access_history_sync_failure(
+                row_ids=[only_id] if only_id > 0 else attempted_ids,
+                error=f"rejected by backend (HTTP 400): {batch_error}",
+                retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                terminal=True,
+                attempted_at=attempted_at,
+            )
+            return {"uploaded": 0, "failed": failed}
+        self.logger.warning(
+            "[DeviceAttendance] batch of %d rejected with HTTP 400 -- isolating the poison row(s): %s",
+            len(items), batch_error,
+        )
+        uploaded = 0
+        failed = 0
+        pending_ids = list(attempted_ids)
+        for item in items:
+            row_id = int(item.get("localRowId") or 0)
+            if row_id <= 0:
+                continue
+            if row_id in pending_ids:
+                pending_ids.remove(row_id)
+            try:
+                response = api.sync_access_history(token=token, payload=[item], timeout=15)
+            except MonClubApiHttpError as row_exc:
+                if getattr(row_exc, "status_code", None) == 400:
+                    # This row alone is refused: quarantine it and say exactly what it was.
+                    self.logger.error(
+                        "[DeviceAttendance] access history row REJECTED by backend (quarantined, "
+                        "will not be retried): %s | backend=%s",
+                        self._item_summary(item), row_exc,
+                    )
+                    failed += mark_access_history_sync_failure(
+                        row_ids=[row_id],
+                        error=f"rejected by backend (HTTP 400): {row_exc}",
+                        retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                        terminal=True,
+                        attempted_at=attempted_at,
+                    )
+                    continue
+                # Not a payload verdict -- stop and leave the rest for the next cycle.
+                remaining = [row_id] + pending_ids
+                failed += mark_access_history_sync_failure(
+                    row_ids=remaining, error=str(row_exc),
+                    retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                    terminal=False, attempted_at=attempted_at,
+                )
+                self.logger.warning(
+                    "[DeviceAttendance] isolation stopped on HTTP %s; %d row(s) left retryable: %s",
+                    getattr(row_exc, "status_code", "?"), len(remaining), row_exc,
+                )
+                return {"uploaded": uploaded, "failed": failed}
+            except Exception as row_exc:  # network / unexpected: same rule as above
+                remaining = [row_id] + pending_ids
+                failed += mark_access_history_sync_failure(
+                    row_ids=remaining, error=str(row_exc),
+                    retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                    terminal=False, attempted_at=attempted_at,
+                )
+                self.logger.warning(
+                    "[DeviceAttendance] isolation stopped (%s); %d row(s) left retryable: %s",
+                    type(row_exc).__name__, len(remaining), row_exc,
+                )
+                return {"uploaded": uploaded, "failed": failed}
+
+            success_ids, retryable_ids, terminal_ids = self._parse_upload_response(
+                response=response,
+                row_ids_by_event=row_ids_by_event,
+                row_ids_by_local=row_ids_by_local,
+                attempted_ids=[row_id],
+            )
+            if success_ids:
+                uploaded += mark_access_history_synced(row_ids=success_ids, synced_at=attempted_at)
+            if retryable_ids:
+                failed += mark_access_history_sync_failure(
+                    row_ids=retryable_ids,
+                    error="syncAccessHistory response reported retryable failures",
+                    retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                    terminal=False, attempted_at=attempted_at,
+                )
+            if terminal_ids:
+                failed += mark_access_history_sync_failure(
+                    row_ids=terminal_ids,
+                    error="syncAccessHistory response reported terminal failures",
+                    retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                    terminal=True, attempted_at=attempted_at,
+                )
+        self.logger.info(
+            "[DeviceAttendance] isolation done: uploaded=%d quarantined_or_failed=%d",
+            uploaded, failed,
+        )
+        return {"uploaded": uploaded, "failed": failed}
+
     def _sync_pending_history(self, *, token: str | None, sync_online: bool) -> Dict[str, Any]:
         token_value = _safe_str(token, "").strip()
         if not token_value:
@@ -791,6 +974,21 @@ class DeviceAttendanceMaintenanceEngine:
                 timeout=15,
             )
         except MonClubApiHttpError as exc:
+            # HTTP 400 = the backend REJECTED THE PAYLOAD. That verdict applies to the
+            # batch as a whole, yet the cause is (almost always) one row Jackson could
+            # not map. Marking every row retryable here -- the previous behaviour --
+            # meant the same poisoned batch was re-sent, and re-rejected, every 300s,
+            # so one bad row silenced the gym's entire door history indefinitely
+            # (OXYGENE_FIT, 2026-08-30: upload_failed=28, recurring). Isolate instead.
+            #
+            # Any OTHER status (401/403/5xx) is not the rows' fault: keep the old
+            # whole-batch retry.
+            if getattr(exc, "status_code", None) == 400:
+                return self._isolate_rejected_rows(
+                    api=api, token=token_value, items=items, attempted_ids=attempted_ids,
+                    row_ids_by_event=row_ids_by_event, row_ids_by_local=row_ids_by_local,
+                    attempted_at=attempted_at, batch_error=str(exc),
+                )
             mark_access_history_sync_failure(
                 row_ids=attempted_ids,
                 error=str(exc),

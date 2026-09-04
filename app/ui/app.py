@@ -2166,6 +2166,12 @@ class MainApp:
             members_total = 0
             members_changed = 0
             devices_dispatched = 0
+            # Set by EVERY path that asks the ULTRA workers to push, so the
+            # sync-run row can report "Appareils" honestly. The delta path used to
+            # request a push without recording it, which is the common
+            # steady-state case -- so a standalone gym still saw "Appareils 0"
+            # even though its roster really was dispatched.
+            ultra_push_requested = False
             refresh = {
                 "members": False,
                 "devices": False,
@@ -2446,6 +2452,7 @@ class MainApp:
                         changed_ids=_delta_changed_ids,
                         reason=trigger_context.trigger_source,
                     )
+                    ultra_push_requested = True
                 sync_online = True
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = True
@@ -2493,14 +2500,29 @@ class MainApp:
                     else:
                         summary = self.get_access_mode_summary()
                         if summary.get("DEVICE", 0) <= 0:
-                            self.logger.info("[DeviceSync] Skipped: no DEVICE-mode devices.")
+                            # DeviceSyncEngine drives DEVICE-mode devices only. On an
+                            # ULTRA gym the roster IS pushed -- by the ULTRA workers,
+                            # further down -- so record how many exist instead of
+                            # leaving a bare "NO_DEVICE_MODE_DEVICES", which reads as
+                            # "nothing was pushed at all". A standalone terminal can
+                            # only ever be ULTRA, so that gym saw this every run.
+                            ultra_count = int(summary.get("ULTRA", 0) or 0)
+                            self.logger.info(
+                                "[DeviceSync] Skipped: no DEVICE-mode devices (ULTRA devices=%d "
+                                "are pushed by their workers).", ultra_count,
+                            )
                             if sync_response_summary is not None:
                                 sync_response_summary["devicePush"] = {
                                     "enabled": True,
                                     "started": False,
-                                        "devicesDispatched": 0,
-                                        "skippedReason": "NO_DEVICE_MODE_DEVICES",
-                                    }
+                                    "devicesDispatched": 0,
+                                    "skippedReason": "NO_DEVICE_MODE_DEVICES",
+                                    "ultraDevices": ultra_count,
+                                    "note": (
+                                        "ULTRA devices are pushed by their live workers, "
+                                        "not by DeviceSyncEngine"
+                                    ) if ultra_count else "",
+                                }
                         elif (
                             refresh.get("members")
                             and not refresh.get("devices")
@@ -2703,6 +2725,35 @@ class MainApp:
                     changed_ids=None,
                     reason=trigger_context.trigger_source,
                 )
+                # Record the ULTRA dispatch so the sync-run row stops reporting
+                # "Appareils 0" on a gym whose roster genuinely was pushed.
+                #
+                # DISPATCH, NOT COMPLETION: request_sync_now only queues the work
+                # on the live workers, and this runs immediately afterwards. The
+                # history dialog already words this column "Appareils dispatchés",
+                # which is exactly -- and only -- what this number means.
+                ultra_push_requested = True
+
+            # Count the ULTRA dispatch ONCE, for whichever path requested it.
+            #
+            # DISPATCH, NOT COMPLETION: request_sync_now only queues the work on the
+            # live workers. The history dialog words this column "Appareils
+            # dispatches", which is exactly -- and only -- what this number means.
+            if ultra_push_requested:
+                try:
+                    _ultra_eng = getattr(self, "_ultra_engine", None)
+                    _ultra_dispatched = len(getattr(_ultra_eng, "_workers", {}) or {}) if _ultra_eng else 0
+                except Exception:
+                    _ultra_dispatched = 0
+                if _ultra_dispatched:
+                    devices_dispatched = max(int(devices_dispatched or 0), _ultra_dispatched)
+                    if sync_response_summary is not None:
+                        sync_response_summary["ultraPush"] = {
+                            "requested": True,
+                            "workersDispatched": _ultra_dispatched,
+                            "reason": str(trigger_context.trigger_source),
+                            "note": "dispatch only - completion is reported by each worker",
+                        }
 
             try:
                 self.maybe_run_offline_retry(sync_online=sync_online, source="hourly")
@@ -2979,8 +3030,17 @@ class MainApp:
 
     # ======================= Remote enroll (API-driven, no Tkinter popup) =======================
     def begin_remote_enroll(
-        self, *, user_id: str, finger_id: str, full_name: str = "", device: str = "zk9500"
+        self, *, user_id: str, finger_id: str, full_name: str = "", device: str = "zk9500",
+        active_membership_id: str = "",
     ) -> Dict[str, Any]:
+        """Start a dashboard-driven enrolment.
+
+        ``active_membership_id`` is OPTIONAL and preferred when supplied. The caller
+        (the dashboard's per-membership fingerprint screen) already knows exactly which
+        membership it is enrolling for; re-deriving it here from ``user_id`` is what
+        makes a multi-membership member ambiguous (see _find_user_membership). Passing
+        it through removes that whole class of error. Omitted -> old behaviour.
+        """
         dev = (device or "zk9500").strip().lower()
         if dev not in ("zk9500", "zkfinger", "zkfp"):
             return {"ok": False, "status": 400, "error": f"Unsupported device='{device}'. Use device=zk9500"}
@@ -2989,6 +3049,15 @@ class MainApp:
             uid = int(str(user_id).strip())
         except Exception:
             return {"ok": False, "status": 400, "error": "Invalid user id. Use ?id=<number>"}
+
+        am_override: Optional[int] = None
+        _am_raw = str(active_membership_id or "").strip()
+        if _am_raw:
+            try:
+                am_override = int(_am_raw)
+            except (TypeError, ValueError):
+                return {"ok": False, "status": 400,
+                        "error": f"Invalid activeMembershipId={_am_raw!r}; expected a number"}
 
         try:
             fid = int(str(finger_id).strip())
@@ -3006,7 +3075,7 @@ class MainApp:
 
         t = threading.Thread(
             target=self._remote_enroll_worker,
-            args=(uid, fid, full_name, dev),
+            args=(uid, fid, full_name, dev, am_override),
             daemon=True,
         )
         t.start()
@@ -3017,26 +3086,88 @@ class MainApp:
         self._enroll_cancel_event.set()
 
     def _find_user_membership(self, user_id: int) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+        """Resolve a userId to its activeMembershipId from the local sync cache.
+
+        TWO THINGS THIS DELIBERATELY DOES NOT DO — both caused real field failures:
+
+        1. It never falls back to ``membershipId``. That is the membership PLAN id, a
+           different id space entirely: in the OXYGENE_FIT cache (2026-08-30) the plan
+           ids span 30-396 (71 distinct) while activeMembershipId spans 7-34418 (934
+           distinct) and the two sets have **zero overlap**. Sending a plan id where the
+           backend expects an activeMembershipId can only ever name the wrong row, and
+           the backend answers HTTP 403 "You can only manage fingerprints for
+           memberships in your own gym" -- which reads like a permissions problem and
+           is not one. Returning None instead produces an honest, actionable error.
+
+        2. It no longer silently returns the FIRST match. One person can hold several
+           memberships in the same gym: in that same cache ``userId=35`` maps to BOTH
+           activeMembershipId 29849 and 30008. Picking the first would attach the
+           fingerprint to an arbitrary one of them and report success -- a silent wrong
+           write. Ambiguity is now reported to the caller instead.
+        """
         cache = load_sync_cache()
         if not cache:
             return None, None
         users = getattr(cache, "users", []) or []
+
+        matches: List[Tuple[int, Dict[str, Any]]] = []
         for u in users:
             try:
                 if not (isinstance(u, dict) and int(u.get("userId") or u.get("user_id") or -1) == int(user_id)):
                     continue
             except Exception:
                 continue
-            am_id = u.get("activeMembershipId") or u.get("active_membership_id")
-            if am_id is None or str(am_id).strip() == "":
-                am_id = u.get("membershipId") or u.get("membership_id")
+            am_raw = u.get("activeMembershipId") or u.get("active_membership_id")
+            if am_raw is None or str(am_raw).strip() == "":
+                # No usable id on this row. Do NOT substitute membershipId (see above).
+                continue
             try:
-                return int(am_id) if am_id is not None and str(am_id).strip() != "" else None, u
-            except Exception:
-                return None, u
-        return None, None
+                matches.append((int(am_raw), u))
+            except (TypeError, ValueError):
+                continue
 
-    def _remote_enroll_worker(self, user_id: int, finger_id: int, full_name: str, device: str):
+        if not matches:
+            return None, None
+        # Ambiguity is about DISTINCT memberships. A cache that holds the same row twice
+        # is not a conflict, and blocking on it would refuse a perfectly valid enrolment.
+        distinct = sorted({m[0] for m in matches})
+        if len(distinct) > 1:
+            # Pick the NEWEST (highest activeMembershipId) rather than refusing.
+            #
+            # Refusing was wrong: measured on the OXYGENE_FIT payload (2026-08-31),
+            # 20 of 914 members carry two activeMembershipIds, and BOTH rows are
+            # date-valid for all 20 -- so a block hits real members with no way out
+            # until the dashboard is updated.
+            #
+            # Why two rows exist (backend, verified in code): the Access roster is
+            # ActiveMembershipRepository.findAllValidForAccessByGymId, which returns
+            # EVERY membership with available=true, status=ACTIVE, membership
+            # available, startDate<=today and end>=today -- with no one-per-user
+            # dedup. A member with two such memberships (e.g. a Staff plan AND a paid
+            # plan) legitimately appears twice. Which of them the dashboard means is
+            # not derivable here; that is why the explicit activeMembershipId from
+            # the caller always wins over this heuristic.
+            #
+            # Why "highest id" and not a date: 18 of those 20 pairs share an IDENTICAL
+            # validFrom, so dates cannot break the tie, while the id is an ascending
+            # backend key -- the newest row is the current one. On the one case that
+            # can be cross-checked against the dashboard (userId=35 -> 29849 / 30008)
+            # the dashboard shows 30008, which is what this rule picks.
+            # [UNVERIFIED] the payload carries no field marking which row is current,
+            # so this is an inference from ordering, not a documented contract. An
+            # explicit activeMembershipId from the caller always wins over it.
+            chosen = max(distinct)
+            chosen_obj = next(m[1] for m in matches if m[0] == chosen)
+            self.logger.warning(
+                "[Enroll] userId=%s has %d active memberships (%s); using the newest "
+                "(%s). Pass an explicit activeMembershipId to override this choice.",
+                user_id, len(distinct), ", ".join(str(d) for d in distinct), chosen,
+            )
+            return chosen, chosen_obj
+        return matches[0][0], matches[0][1]
+
+    def _remote_enroll_worker(self, user_id: int, finger_id: int, full_name: str, device: str,
+                              active_membership_id_override: Optional[int] = None):
         """Enroll worker ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â uses SSE state functions instead of Tkinter popup."""
         from access.api import (
             _enroll_set_step, _enroll_add_log, _enroll_set_result, _enroll_reset,
@@ -3080,6 +3211,23 @@ class MainApp:
 
             step("Resolving active membership...")
             active_membership_id, user_obj = self._find_user_membership(user_id)
+            if active_membership_id_override is not None:
+                # The caller told us exactly which membership this enrolment is for.
+                # Trust it over our own lookup, but say so, and say loudly when the two
+                # disagree -- that mismatch is the signal that the local cache is stale
+                # or that the member holds several memberships.
+                if active_membership_id is not None and active_membership_id != active_membership_id_override:
+                    self.logger.warning(
+                        "[Enroll] activeMembershipId mismatch for userId=%s: caller sent %s, "
+                        "local cache resolved %s. Using the caller's value.",
+                        user_id, active_membership_id_override, active_membership_id,
+                    )
+                    _enroll_add_log(
+                        f"Note: dashboard specified membership {active_membership_id_override}; "
+                        f"local cache had {active_membership_id}. Using the dashboard's value."
+                    )
+                active_membership_id = active_membership_id_override
+                _enroll_add_log(f"Using activeMembershipId={active_membership_id} (from dashboard).")
             if active_membership_id is None:
                 _enroll_add_log("User not found in cache or missing activeMembershipId. Trying to sync now...")
                 try:
@@ -3093,8 +3241,36 @@ class MainApp:
                 active_membership_id, user_obj = self._find_user_membership(user_id)
 
             if active_membership_id is None:
-                fail("User has no activeMembershipId. Cannot save fingerprint.")
+                _who = ""
+                if isinstance(user_obj, dict):
+                    _who = str(user_obj.get("fullName") or user_obj.get("full_name") or "").strip()
+                fail(
+                    f"No activeMembershipId found for userId={user_id}"
+                    f"{f' ({_who})' if _who else ''}. The member may be missing from this PC's "
+                    f"sync cache, or may have no active membership."
+                )
                 return
+
+            # When the member holds several memberships we chose the newest rather than
+            # blocking (see _find_user_membership). Say so in the enrolment log: the
+            # operator must be able to see WHICH membership received the fingerprint,
+            # otherwise a wrong pick is invisible.
+            if active_membership_id_override is None:
+                try:
+                    _ids = sorted({
+                        int(_u.get("activeMembershipId") or _u.get("active_membership_id"))
+                        for _u in (getattr(load_sync_cache(), "users", []) or [])
+                        if isinstance(_u, dict)
+                        and str(_u.get("userId") or _u.get("user_id") or "") == str(user_id)
+                        and (_u.get("activeMembershipId") or _u.get("active_membership_id"))
+                    })
+                except Exception:
+                    _ids = []
+                if len(_ids) > 1:
+                    _enroll_add_log(
+                        f"This member has {len(_ids)} memberships ({', '.join(str(i) for i in _ids)}). "
+                        f"Using the most recent one: {active_membership_id}."
+                    )
 
             if user_obj and not full_name:
                 full_name = str(user_obj.get("fullName") or user_obj.get("full_name") or "").strip()
@@ -3182,10 +3358,42 @@ class MainApp:
                 "enabled": True,
             }
 
+            # Log WHAT we are about to send. Without this a backend rejection
+            # (e.g. HTTP 403 "You can only manage fingerprints for memberships in your
+            # own gym") is undiagnosable after the fact: the log recorded only the URL,
+            # never the id that was refused, so there was no way to tell a wrong id from
+            # a real permission problem. Template bytes are deliberately NOT logged.
+            self.logger.info(
+                "[Enroll] createUserFingerprint payload: activeMembershipId=%s fingerId=%s "
+                "templateVersion=%s encoding=%s templateChars=%d source=%s userId=%s account=%s",
+                payload["activeMembershipId"], payload["fingerId"], payload["templateVersion"],
+                payload["templateEncoding"], len(tpl_text),
+                "dashboard" if active_membership_id_override is not None else "local-cache",
+                user_id, getattr(auth, "email", "") or getattr(self.cfg, "login_email", ""),
+            )
+
             api = self._api()
             resp = api.create_user_fingerprint(token=auth.token, payload=payload)
             _enroll_clear_tpl()  # push succeeded — clear stored template
             self.logger.info("createUserFingerprint OK -> %s", resp)
+
+            # The template now exists on the BACKEND but on no terminal. Nothing
+            # here used to move it: the roster push only happened on the ULTRA
+            # scheduler's own timer (ultra_sync_interval_minutes, default 30), so
+            # the member could be refused for half an hour while every screen said
+            # the enrolment succeeded. Ask for a targeted member sync instead.
+            #
+            # Best-effort by design: the backend save really did happen, so a
+            # failure here must never flip the enrolment result.
+            try:
+                if isinstance(active_membership_id, int) and active_membership_id > 0:
+                    self._request_running_ultra_sync(
+                        refresh={"members": True, "devices": False},
+                        changed_ids={int(active_membership_id)},
+                        reason="FINGERPRINT_ENROLLED",
+                    )
+            except Exception:
+                self.logger.debug("[Enroll] ULTRA member-sync request failed", exc_info=True)
 
             success("ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ Done. Fingerprint saved to backend.")
 

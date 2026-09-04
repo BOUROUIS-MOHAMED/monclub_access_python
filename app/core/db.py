@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
-from app.core.utils import ensure_dirs, now_iso
+from app.core.utils import ensure_dirs, format_ts, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
 # Test-only override: set _DB_PATH to a temp path in tests via monkeypatch.
@@ -1304,6 +1304,25 @@ def init_db() -> None:
         conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
         conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
         conn.execute("UPDATE access_history SET backend_failure_count=0 WHERE backend_failure_count IS NULL")
+        # One-time normalisation of backend_next_retry_at.
+        # mark_access_history_sync_failure() used to persist this column with
+        # datetime.isoformat() ("2026-09-03T17:02:50") while
+        # list_pending_access_history_for_sync() compares it -- as TEXT, bytewise --
+        # against now_iso() ("2026-09-03 17:02:50"). 'T' (0x54) > ' ' (0x20) at
+        # index 10, so a T-separated value never satisfied `<= now` on the same
+        # day and the row stayed invisible to the uploader until the date rolled
+        # over. Rows written by the old build are stuck in that shape, so rewrite
+        # them here rather than teaching the SELECT to accept both formats --
+        # a replace() in the predicate would defeat idx_access_history_backend_sync
+        # on every poll. Truncates to second precision, which is exactly what
+        # now_iso() carries; NULL, '' and already-canonical values are untouched.
+        conn.execute(
+            "UPDATE access_history "
+            "SET backend_next_retry_at = substr(backend_next_retry_at, 1, 10) || ' ' || substr(backend_next_retry_at, 12, 8) "
+            "WHERE backend_next_retry_at IS NOT NULL "
+            "AND length(backend_next_retry_at) >= 19 "
+            "AND substr(backend_next_retry_at, 11, 1) = 'T'"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_access_history_device_time ON access_history(device_id, event_time);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_access_history_created_at ON access_history(created_at);")
         conn.execute(
@@ -5290,13 +5309,41 @@ def load_sync_device_mode_summary() -> Dict[str, int]:
 
 
 @_tel.timed("DB_READ_list_sync_users_page", slow_ms=50, warn_ms=1000)
-def list_sync_users_page(*, limit: int = 0, offset: int = 0) -> tuple[List[Dict[str, Any]], int]:
-    """Paged direct query for UI endpoints that should not hydrate the full sync cache."""
+def list_sync_users_page(
+    *, limit: int = 0, offset: int = 0, include_templates: bool = True
+) -> tuple[List[Dict[str, Any]], int]:
+    """Paged direct query for UI endpoints that should not hydrate the full sync cache.
+
+    ``include_templates=False`` omits the ``fingerprints_json`` COLUMN from the SELECT.
+
+    WHY IT EXISTS: on the OXYGENE_FIT PC (v1.4.26, 934 members carrying 999 base64
+    templates) this query ran up to 8.8 s, and the DB_READ_users_split telemetry showed
+    the cost is almost entirely disk I/O, not parsing -- e.g. ``select_ms=6828
+    coerce_ms=47``. The templates are the bulk of every row and most callers never look
+    at them, so not reading the column is what actually removes the time.
+
+    CAUTION: with ``include_templates=False`` every returned user has
+    ``fingerprints == []``. That is INDISTINGUISHABLE from "this member really has no
+    fingerprints", so pass False ONLY from a caller that never inspects them. Callers
+    that count or push templates MUST use the default.
+    """
     normalized_limit = max(0, int(limit or 0))
     normalized_offset = max(0, int(offset or 0))
     with get_conn() as conn:
         total = int(conn.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0] or 0)
-        sql = "SELECT * FROM sync_users ORDER BY COALESCE(active_membership_id, membership_id, user_id)"
+        if include_templates:
+            projection = "*"
+        else:
+            # Introspect rather than hardcode: the column set has changed repeatedly
+            # (see _ensure_column migrations) and a stale literal list would silently
+            # drop real fields.
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users)").fetchall()]
+            keep = [c for c in cols if c != "fingerprints_json"]
+            projection = ", ".join(f'"{c}"' for c in keep) if keep else "*"
+        sql = (
+            f"SELECT {projection} FROM sync_users "
+            "ORDER BY COALESCE(active_membership_id, membership_id, user_id)"
+        )
         params: List[Any] = []
         if normalized_limit > 0:
             sql += " LIMIT ? OFFSET ?"
@@ -6938,9 +6985,15 @@ def mark_access_history_sync_failure(
     retry_after = max(30, int(retry_after_seconds or 300))
     try:
         retry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")) + timedelta(seconds=retry_after)
-        retry_at = retry_dt.isoformat()
     except Exception:
-        retry_at = now_iso()
+        # Unparseable attempted_at: still honour the backoff rather than
+        # rearming the row for the very next poll cycle.
+        retry_dt = datetime.now() + timedelta(seconds=retry_after)
+    # MUST be format_ts(), never retry_dt.isoformat(): this value is
+    # string-compared against now_iso() by list_pending_access_history_for_sync()
+    # and a 'T' at index 10 sorts above every same-day ' ', which hid retryable
+    # rows from the uploader until the next local midnight.
+    retry_at = format_ts(retry_dt)
     state = ACCESS_HISTORY_SYNC_FAILED_TERMINAL if terminal else ACCESS_HISTORY_SYNC_FAILED_RETRYABLE
     next_retry = None if terminal else retry_at
     placeholders = ",".join("?" for _ in ids)

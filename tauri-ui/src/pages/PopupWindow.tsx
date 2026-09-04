@@ -748,22 +748,42 @@ function ABreathDot({ color }: { color: string }) {
   );
 }
 
-function AIdle({ place, now, linkUp, todayCount }: { place: string; now: Date; linkUp: boolean; todayCount: number }) {
+type ACreds = { rfid?: boolean; fingerprint?: boolean; qr?: boolean; face?: boolean } | null;
+
+/** What the readers in THIS gym actually accept. Falls back to the historical
+ *  card wording only when nothing is known -- never name a credential family the
+ *  hardware does not have (the standalone terminal has no card reader at all). */
+function aIdlePrompt(creds: ACreds): { glyph: "card" | "fingerprint" | "qr"; text: string } {
+  if (!creds) return { glyph: "card", text: "Présentez votre carte" };
+  const on = [
+    creds.rfid ? "card" : null,
+    creds.fingerprint ? "fingerprint" : null,
+    creds.qr ? "qr" : null,
+  ].filter(Boolean) as ("card" | "fingerprint" | "qr")[];
+  if (on.length === 0) return { glyph: "card", text: "Présentez-vous au lecteur" };
+  if (on.length > 1) return { glyph: on[0], text: "Présentez-vous au lecteur" };
+  if (on[0] === "fingerprint") return { glyph: "fingerprint", text: "Posez votre doigt" };
+  if (on[0] === "qr") return { glyph: "qr", text: "Présentez votre QR code" };
+  return { glyph: "card", text: "Présentez votre carte" };
+}
+
+function AIdle({ place, now, linkUp, todayCount, readersUp, readersTotal, creds }: { place: string; now: Date; linkUp: boolean; todayCount: number; readersUp: number | null; readersTotal: number | null; creds: ACreds }) {
+  const prompt = aIdlePrompt(creds);
   return (
     <div style={{ position: "absolute", inset: 0, background: A_DARK, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
       <div style={{ position: "absolute", inset: 0, backgroundImage: A_TOPO_URL, backgroundSize: "cover", backgroundPosition: "center", opacity: 0.06 }} />
       <div style={{ position: "absolute", top: "30px", left: "36px" }}><AWordmark size={20} color="#fff" opacity={0.5} /></div>
       <div style={{ position: "absolute", top: "30px", right: "36px", display: "inline-flex", alignItems: "center", gap: "11px", height: "38px", padding: "0 16px", borderRadius: "12px", background: "rgba(255,255,255,.08)" }}>
-        <ABreathDot color={linkUp ? A_GREEN : A_RED} />
-        <span style={{ fontSize: "16px", fontWeight: 600, color: A_DARK_SUB }}>{linkUp ? "Lecteur actif" : "Lecteur hors ligne"}</span>
+        <ABreathDot color={aReaderTone(linkUp, readersUp, readersTotal)} />
+        <span style={{ fontSize: "16px", fontWeight: 600, color: A_DARK_SUB }}>{aReaderLabel(linkUp, readersUp, readersTotal)}</span>
       </div>
 
       <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center" }}>
         <div style={{ ...A_TABULAR, fontSize: "152px", lineHeight: 1, letterSpacing: "-.05em", color: "#fff", marginBottom: "12px" }}>{aClock(now)}</div>
         <div style={{ fontSize: "26px", fontWeight: 500, color: A_DARK_SUB, marginBottom: "54px" }}>{aLongDate(now)}</div>
         <div style={{ display: "flex", alignItems: "center", gap: "18px", padding: "20px 34px", borderRadius: "999px", background: A_RED, color: "#fff" }}>
-          <AGlyph name="card" size={34} />
-          <span style={{ fontSize: "28px", fontWeight: 700, letterSpacing: "-.01em" }}>Présentez votre carte</span>
+          <AGlyph name={prompt.glyph} size={34} />
+          <span style={{ fontSize: "28px", fontWeight: 700, letterSpacing: "-.01em" }}>{prompt.text}</span>
         </div>
       </div>
 
@@ -875,7 +895,7 @@ function EntryScreen({ lanes, idle, gymName, linkUp, todayCount, onImageError }:
   return (
     <AStage background={stageBg}>
       <div key={sceneKey} style={{ position: "absolute", inset: 0, animation: "aScene 420ms cubic-bezier(.16,.84,.3,1) both" }}>
-        {idle && <AIdle place={lastDevice || gymName || "MonClub Access"} now={now} linkUp={linkUp} todayCount={todayCount} />}
+        {idle && <AIdle place={lastDevice || gymName || "MonClub Access"} now={now} linkUp={linkUp} todayCount={todayCount} readersUp={readersUp} readersTotal={readersTotal} creds={creds} />}
         {single && <AVerdict scan={scans[0]} now={now} onImageError={onImageError} />}
         {multi && <AMulti scans={scans} now={now} onImageError={onImageError} />}
       </div>
@@ -891,6 +911,20 @@ function EntryScreen({ lanes, idle, gymName, linkUp, todayCount, onImageError }:
 // FREEZE is visible in the backend log: if these stop arriving the webview is
 // hung; if they keep arriving while no popup shows, it's the data/render path.
 // Hits an auth-exempt loopback endpoint; best-effort (never throws).
+// Reader badge for the idle screen. Reports what is actually known:
+// a partly-down fleet is amber with a count, never a single green light.
+function aReaderTone(linkUp: boolean, up: number | null, total: number | null): string {
+  if (total === null || up === null) return linkUp ? A_GREEN : A_RED;
+  if (up === 0) return A_RED;
+  return up < total ? A_GOLD : A_GREEN;
+}
+function aReaderLabel(linkUp: boolean, up: number | null, total: number | null): string {
+  if (total === null || up === null) return linkUp ? "Lecteur actif" : "Lecteur hors ligne";
+  if (up === 0) return total > 1 ? "Lecteurs hors ligne" : "Lecteur hors ligne";
+  if (up < total) return `${up}/${total} lecteurs actifs`;
+  return total > 1 ? `${total} lecteurs actifs` : "Lecteur actif";
+}
+
 function postPopupTelemetry(body: Record<string, unknown>): void {
   try {
     void fetch(`${getApiBaseUrl()}${LOCAL_API_PREFIX}/popup/telemetry`, {
@@ -910,6 +944,10 @@ export default function PopupWindow() {
   // Standby-screen chrome. `linkUp` starts optimistic so opening the window
   // never flashes "hors ligne" before the first poll lands.
   const [linkUp, setLinkUp] = useState<boolean>(true);
+  // Counts so a partly-down fleet is not hidden behind one green light.
+  const [readersUp, setReadersUp] = useState<number | null>(null);
+  const [readersTotal, setReadersTotal] = useState<number | null>(null);
+  const [creds, setCreds] = useState<ACreds>(null);
   const [todayCount, setTodayCount] = useState<number>(0);
 
   const lanesRef = useRef<ActiveLane[]>([]);
@@ -1230,8 +1268,22 @@ export default function PopupWindow() {
         // indicator. Both setState calls are no-ops when the value is
         // unchanged, so the 1.5s cadence costs no re-renders.
         misses = 0;
-        setLinkUp(true);
+        // readersUp/readersTotal are the REAL per-device link state from the ULTRA
+        // worker. HTTP success only proves the local server answered -- on a
+        // standalone terminal the reader link lives inside the worker, so a dead
+        // MB2000 used to breathe green here all day. Absent (AGENT gyms, older
+        // backend) => keep the previous optimistic behaviour rather than lie red.
+        if (typeof res?.readersTotal === "number" && res.readersTotal > 0) {
+          setReadersUp(typeof res?.readersUp === "number" ? res.readersUp : null);
+          setReadersTotal(res.readersTotal);
+          setLinkUp((res.readersUp ?? 0) > 0);
+        } else {
+          setReadersUp(null);
+          setReadersTotal(null);
+          setLinkUp(true);
+        }
         if (typeof res?.todayCount === "number") setTodayCount(res.todayCount);
+        setCreds(res?.credentials && typeof res.credentials === "object" ? res.credentials : null);
         if (typeof res?.seqAgent === "number") sinceAgent = res.seqAgent;
         if (typeof res?.seqUltra === "number") sinceUltra = res.seqUltra;
         const evs = Array.isArray(res?.events) ? res.events : [];

@@ -61,6 +61,8 @@ def _patch_db(monkeypatch):
     monkeypatch.setattr("app.core.db.mirror_reconcile_is_armed", lambda **kw: True)
     monkeypatch.setattr("app.core.db.mirror_reconcile_record_plan", lambda **kw: None)
     monkeypatch.setattr("app.core.db.delete_device_mirror_pin", lambda **kw: None)
+    # The reconcile also forgets per-pin sync state for deleted pins; keep it hermetic.
+    monkeypatch.setattr("app.core.db.delete_device_sync_state", lambda **kw: None)
 
 
 # --------------------------------------------------------------------------- #
