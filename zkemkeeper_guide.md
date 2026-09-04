@@ -351,8 +351,9 @@ repo settles which. `[UNVERIFIED]` Resolve on the MB2000 by reading indices 1–
 comparing against the terminal's own on-screen counts. Until then the driver's `4` and
 the scripts' `6`/`8` labels are both suspect, and neither should be quoted to an
 operator as fact. The scripts' index→label *pairing* is at least mechanically correct
-as of 2026-09-04 — it was not before; see the `[ordered]`-indexed-by-integer note in
-§"PowerShell lab" below.
+as of 2026-09-04 — before that, both scripts indexed an `[ordered]` hashtable with an
+integer, which returns by **position, not key**, and silently printed each count under
+the wrong heading. `[TEST: fake-COM harness under 32-bit Windows PowerShell 5.1]`
 
 ---
 
