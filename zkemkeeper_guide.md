@@ -403,6 +403,12 @@ to 0 after any successful chunk.
 Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedged`,
 `errors`, **`failed_pins`**. `[CODE]`
 
+Each *chunk* result additionally carries `failed_reasons`, `tpl_attempted`, `tpl_ok`
+and `chunk_ms` (added 2026-09-04). These are **telemetry only** — `push_roster` folds
+them into `ZKEM_PUSH_CHUNK` / `ZKEM_PUSH_FAILED_PINS` and **nothing decides on them**.
+They are not present on the aggregate `push_roster` return. `[CODE]`
+`[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`
+
 - **`failed_pins`** (added 2026-08-31) — every pin **not confirmed** on the terminal:
   a refused `SSR_SetUserInfo`, a refused template (`SetUserTmpExStr` → `False`), an
   exception mid-member, and **every member of a wedged chunk** (nothing in a wedged
@@ -670,6 +676,46 @@ Found by verification. Trust the code, not these. `[CODE — each checked]`
 
 ---
 
+## 9.1 Telemetry emitted by this driver
+
+The canonical index of every `[T]` event, its fields and the rules for adding one is
+`guide_for_agents_and_dev.md` §10; the operator-facing greps are
+`docs/field/fingerprint_telemetry_cheatsheet.md`. **Update both in the same change.**
+
+From this file: `ZKEM_PUSH_DONE`, `ZKEM_PUSH_CHUNK`, `ZKEM_PUSH_FAILED_PINS`,
+`ZKEM_PUSH_TPL_REFUSED`, `ZKEM_TPL_VERSION_MISMATCH`, `ZKEM_PUSH_WEDGED`,
+`ZKEM_PUSH_RECONNECT`, `ZKEM_PUSH_ABANDONED`, `ZKEM_DEVICE_COUNTERS`,
+`ZKEM_DELETE_DONE`, `ZKEM_PIN_UNMAPPED`, `ZKEM_STA_WEDGED`, `ZKEM_EVT_SINK_DOWN`,
+`DOOR_OPEN`, `DOOR_OPEN_SWITCH`. All keyed `worker=ZKEM:<device id>`. `[CODE]`
+
+**The push loop must not gain a per-member or per-finger telemetry line.** §2 is the
+reason: the STA loop services **one command with no COM pump for its duration**, and
+the logging handler writes synchronously inline on the calling thread. A line per
+member on a 928-member roster widens that no-pump window — that is a behaviour change,
+not instrumentation. Per-pin outcomes are accumulated **in memory** and emitted at
+**chunk** boundaries (~93 lines for a full roster). The rare failure paths (a refused
+template, a wedge) may write inline. The capped `_PUSH_TRACE_MEMBERS` /
+`_PUSH_TRACE_TEMPLATES` lines remain the only per-call visibility, and remain
+pre-call. `[CODE]` `[TEST: ::test_no_per_pin_event_inside_the_member_loop]`
+
+`ZKEM_DEVICE_COUNTERS` is emitted **inside `_do_connect`**, from the `_read_fp_version`
+/ `_read_device_status` values that connect already read — it adds **no device
+round-trip**. Its `c_<name>` labels come from `_STATUS_FIELDS`, which §4 records as
+**contradicted** by scripts 3 and 12; the event therefore ships `label_source=` so the
+provenance travels with the numbers. Treat the names as unproven, the values as real.
+`[UNVERIFIED]`
+
+`ZKEM_VERIFY_OK` / `ZKEM_VERIFY_INVALID` are emitted by the **engine**
+(`ultra_engine._process_event`), not here, but they are built from this file's
+`normalize_att_event` output. The name reflects the `eventType` this driver stamps
+(`"zkem_invalid"` when `IsInValid` is non-zero) — a routing fact. It is **not** a claim
+about why the terminal refused: per §8, `IsInValid` and `AttState` semantics are
+`[UNVERIFIED]` and `verifyMethod` is `[UNKNOWN]`. The event carries `verify_method`,
+`att_state` and `scan_mode_hint` **raw and side by side**; never collapse them into one
+decoded reason. `[CODE]`
+
+---
+
 ## 10. Test coverage
 
 **Covered.** `[TEST — `tests/test_zk_standalone_driver.py` and
@@ -690,6 +736,11 @@ Found by verification. Trust the code, not these. `[CODE — each checked]`
   payload projection, and a regression pin that the PullSDK door path is unchanged
 - protocol conformance via `isinstance` (a conformance check only — exercises no
   behaviour)
+- the fingerprint-chain telemetry `[TEST — tests/test_fingerprint_telemetry.py]`:
+  per-chunk aggregation, `failed_pins` reasons for all four causes, template-refusal
+  and version-mismatch events, wedge / reconnect / abandon events, device counters,
+  both verify events with event age, that a template byte **never** reaches a log
+  line, and that no per-pin event is emitted inside the member loop
 
 **NOT covered.** `[UNVERIFIED]`
 > Every test drives a **fake COM object**. No test has ever talked to an MB2000. Nothing
@@ -704,10 +755,18 @@ Found by verification. Trust the code, not these. `[CODE — each checked]`
 python -m pytest tests/ -q --ignore=tests/_pydeps
 ```
 `--ignore=tests/_pydeps` is **required** (vendored packages break collection; there is
-no `pytest.ini`). Last run: **968 passed**, 2026-09-04.
+no `pytest.ini`). Last run: **1071 passed**, 2026-09-04 (after the fingerprint-telemetry
+session; add `--ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*'` when stale
+permission-denied temp folders exist under `tests/`).
 
 ```bash
-python -m pytest tests/test_zk_standalone_driver.py tests/test_device_sync_protocol_guard.py tests/test_mb2000_force_open.py -q
+python -m pytest tests/test_zk_standalone_driver.py tests/test_device_sync_protocol_guard.py tests/test_mb2000_force_open.py tests/test_fingerprint_telemetry.py -q
+```
+
+List every `[T]` event this driver emits, and check §9.1 against it:
+
+```bash
+python tools/list_telemetry_events.py --where
 ```
 
 Confirm §3 — the must-not-call — still holds. Match **calls** (`zk.`-prefixed), not the

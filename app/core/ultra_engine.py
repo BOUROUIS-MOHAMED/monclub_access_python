@@ -80,6 +80,13 @@ _ULTRA_STAFF_CODE_TTL_SEC = 120.0
 # (and letting PC-verified QR/TOTP members through) within ~a second.
 _ULTRA_SYNC_RTLOG_YIELD_MIN_INTERVAL_SEC = 0.75
 
+# The eventType the standalone driver stamps on a verify the TERMINAL refused.
+# Produced by zk_standalone.normalize_att_event (`evtype = "0" if not invalid else
+# "zkem_invalid"`), which is a [CODE] fact about which branch fired. It says
+# NOTHING about why the terminal refused — IsInValid / AttState semantics on the
+# MB2000 are [UNVERIFIED] (guide_for_agents_and_dev.md §7).
+_ZKEM_INVALID_EVENT_TYPE = "zkem_invalid"
+
 # ---- MIRROR pushing policy (per-device, ZK_STANDALONE) ----------------------
 # The destructive reconcile that deletes device users NOT in the app roster.
 # Guardrails (see _maybe_mirror_reconcile):
@@ -2081,9 +2088,15 @@ class UltraDeviceWorker(threading.Thread):
             event_type_int = int(event_type_raw)
         except (ValueError, TypeError):
             event_type_int = -1
-            logger.warning(
-                f"{self._prefix} unrecognised eventType={event_type_raw!r} for event_id={event_id}"
-            )
+            # `zkem_invalid` is NOT an unrecognised type — it is the standalone
+            # driver's own marker for "the terminal refused this verify"
+            # (zk_standalone.normalize_att_event sets the literal string). It gets
+            # its own named event below, once scan_epoch is known, so the generic
+            # warning here would only be noise that hides real parse failures.
+            if event_type_raw != _ZKEM_INVALID_EVENT_TYPE:
+                logger.warning(
+                    f"{self._prefix} unrecognised eventType={event_type_raw!r} for event_id={event_id}"
+                )
 
         is_allow = (event_type_int == 0)
 
@@ -2100,6 +2113,47 @@ class UltraDeviceWorker(threading.Thread):
         # feeds both the TOTP rescue clock (fix #1) and skew telemetry (fix #2a).
         scan_epoch = parse_event_time_to_epoch(event_time, self._device_tz_offset_sec)
         self._record_event_age(scan_epoch)
+
+        # ── Standalone verify outcome (telemetry only — no behaviour change) ──
+        #
+        # One line per scan the TERMINAL decided, so a field test can answer "did
+        # the terminal accept this finger?" with a single grep instead of inferring
+        # it from the popup. Only standalone rows carry scan_mode_hint, so PullSDK
+        # traffic is untouched.
+        #
+        # age_s is the whole point of the OK line as much as the INVALID one: on
+        # 2026-08-30 the terminal replayed a backlog of events ~3500 s old at 13:51,
+        # which is indistinguishable from live scans without it.
+        #
+        # is_invalid / att_state / verify_method are logged RAW and side by side.
+        # Their MB2000 semantics are [UNVERIFIED] (guide §7, zkemkeeper_guide §8:
+        # verifyMethod's value space shifts between normal and multi-verify modes,
+        # so 0 is genuinely ambiguous). The event NAME mirrors which branch fired —
+        # a [CODE] fact — not a claim about why the terminal refused.
+        try:
+            if isinstance(raw_row, dict) and "scan_mode_hint" in raw_row:
+                _age_s = (
+                    round(max(0.0, time.time() - scan_epoch), 1)
+                    if scan_epoch is not None else None
+                )
+                _vfields = dict(
+                    worker=self._tel_wid,
+                    pin=raw_row.get("pin"),
+                    verify_method=raw_row.get("verifyMethod"),
+                    scan_mode_hint=raw_row.get("scan_mode_hint"),
+                    age_s=_age_s,
+                    event_id=event_id,
+                )
+                if event_type_raw == _ZKEM_INVALID_EVENT_TYPE:
+                    _tel.warn(
+                        "ZKEM_VERIFY_INVALID",
+                        att_state=raw_row.get("attState"),
+                        **_vfields,
+                    )
+                elif is_allow:
+                    _tel.event("ZKEM_VERIFY_OK", **_vfields)
+        except Exception:
+            pass
 
         # ── Re-entry / punch-interval (DoorNIntertime) diagnostics ──
         # Only meaningful when the re-entry block (Door{N}Intertime=N) is enabled on

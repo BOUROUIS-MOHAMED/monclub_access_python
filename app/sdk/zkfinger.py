@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 
+from app.core import telemetry as _tel
+
 # default module logger (used if no logger injected)
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,20 @@ _ERROR_MAP = {
     -23: "Opening the file failed",
     -24: "Image processing failed",
 }
+
+
+def _enroll_tel(name: str, enroll_id: str, *, warn: bool = False, **fields: Any) -> None:
+    """One `[T]` enrolment line, correlated by enroll_id. Never raises.
+
+    enroll_id is minted per enrolment by the caller (app/ui/app.py) and threaded
+    through so every line of one enrolment -- scanner, samples, merge, backend,
+    the targeted member sync and the terminal ENROLL_DONE -- shares one grep key.
+    Template BYTES are never a field here: sizes and hashes only.
+    """
+    try:
+        (_tel.warn if warn else _tel.event)(name, enroll_id=enroll_id or None, **fields)
+    except Exception:
+        pass
 
 
 def _rc_explain(rc: int) -> str:
@@ -277,6 +293,9 @@ class ZKFinger:
         self._preloaded: Dict[str, ctypes.WinDLL] = {}
 
         self._log = logger or log
+        # Correlation key for telemetry, set by the caller before init().
+        # Empty for non-enrolment uses (diagnostic tools), which simply omit it.
+        self.enroll_id: str = ""
 
         self.device_handle: Optional[ctypes.c_void_p] = None
         self.db_handle: Optional[ctypes.c_void_p] = None
@@ -640,6 +659,18 @@ class ZKFinger:
 
         rc = int(self._dll.ZKFPM_Init())
         self._log.info("ZKFPM_Init rc=%s", rc)
+        # The DLL PATH is the diagnostic here, not just the rc: rc=-1 is almost
+        # always a runtime-loaded dependency that could not be resolved from
+        # dll_dir (the bare-name LoadLibrary chain documented below), so the
+        # folder that was actually used has to be in the log.
+        _rt0 = self._runtime
+        _enroll_tel(
+            "ENROLL_SCANNER", self.enroll_id, phase="init", rc=rc,
+            ok=bool(rc in (0, 1)),
+            dll_path=(str(_rt0.dll_path) if _rt0 else None),
+            dll_dir=(str(_rt0.dll_dir) if _rt0 else None),
+            warn=bool(rc not in (0, 1)),
+        )
 
         if rc in (0, 1):
             return
@@ -884,6 +915,7 @@ class ZKFinger:
         progress_cb: Optional[Callable[[str], None]] = None,
         phase_cb: Optional[Callable[[dict], None]] = None,
         cancel_event: Optional[Any] = None,
+        enroll_id: str = "",
     ) -> bytes:
         """
         Capture 3 templates then merge them into one registered template.
@@ -946,12 +978,23 @@ class ZKFinger:
                         if score < match_threshold:
                             phase_report({"phase": "sample_rejected", "sampleNum": i + 1, "score": score})
                             report(f"Enroll: sample {i+1}/3 rejected (different finger?) score={score}. Try same finger.")
+                            _enroll_tel("ENROLL_SAMPLE", enroll_id, sample=i + 1,
+                                        result="rejected", size=got_len, score=score,
+                                        dur_ms=round((time.time() - start) * 1000.0))
                             time.sleep(0.6)
                             continue
 
                     templates.append(tpl)
                     phase_report({"phase": "sample_captured", "sampleNum": i + 1})
                     report(f"Enroll: sample {i+1}/3 captured ✅ (tpl={len(tpl)} bytes)")
+                    # Size only, never bytes. NOTE: this SDK exposes no image-quality
+                    # value -- ZKFPM_AcquireFingerprint returns (rc, template_length)
+                    # and nothing else -- so "quality" is genuinely unavailable here.
+                    # `score` is a db_match score against the previous sample and is
+                    # only defined on the rejection path above. [UNVERIFIED]
+                    _enroll_tel("ENROLL_SAMPLE", enroll_id, sample=i + 1,
+                                result="captured", size=got_len,
+                                dur_ms=round((time.time() - start) * 1000.0))
                     time.sleep(0.35)
                     break
 
@@ -962,8 +1005,18 @@ class ZKFinger:
 
         phase_report({"phase": "processing"})
         report("Enroll: merging 3 samples ...")
-        reg = self.db_merge(templates[0], templates[1], templates[2])
+        _t_merge = time.time()
+        try:
+            reg = self.db_merge(templates[0], templates[1], templates[2])
+        except Exception as exc:
+            _enroll_tel("ENROLL_MERGE", enroll_id, ok=False,
+                        err=f"{type(exc).__name__}: {exc}"[:120],
+                        dur_ms=round((time.time() - _t_merge) * 1000.0), warn=True)
+            raise
         report(f"Enroll: merged ✅ (reg={len(reg)} bytes)")
+        _enroll_tel("ENROLL_MERGE", enroll_id, ok=True, size=len(reg),
+                    samples=len(templates),
+                    dur_ms=round((time.time() - _t_merge) * 1000.0))
         return reg
 
     def diagnostics(self) -> str:

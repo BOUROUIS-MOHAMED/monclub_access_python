@@ -4307,6 +4307,64 @@ def _apply_full_users_refresh(cur: sqlite3.Cursor, users: List[Any]) -> Dict[str
     }
 
 
+# Above this many members carrying templates, the per-member id list is dropped
+# and only the counts are kept. A delta names exactly who changed (that is the
+# point of a delta); a FULL refresh carries every member and the list would be
+# both enormous and meaningless.
+_FP_ARRIVAL_ID_LIMIT = 32
+
+
+def _log_incoming_templates(users: Any, delta_mode: bool) -> None:
+    """One `[T]` line saying how many fingerprint templates just arrived.
+
+    This is the "did the backend actually send it?" checkpoint between the
+    enrolment and the push. It is ONE summary line, not one line per member, on
+    purpose: this runs inside the sync DB write, and on the gym PC (4 GB, heavy
+    swapping) even a plain 934-row SELECT has taken 6.8 s -- a per-row logging
+    loop there is a latency change, not instrumentation.
+
+    In delta mode every user in the payload is by definition a CHANGED user, so
+    the am_id list is both small and exactly the answer. On a full refresh the
+    count is all this can honestly report; per-pin template changes are named by
+    the FP_DELTA family instead (ultra_engine._log_fingerprint_delta, `tplh`).
+
+    Never raises. Never logs template bytes -- counts and sizes only.
+    """
+    try:
+        if not isinstance(users, list):
+            return
+        members_with_tpl = 0
+        templates_total = 0
+        bytes_total = 0
+        am_ids: List[str] = []
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            fps = u.get("fingerprints") or []
+            if not isinstance(fps, list) or not fps:
+                continue
+            members_with_tpl += 1
+            templates_total += len(fps)
+            for f in fps:
+                if isinstance(f, dict):
+                    bytes_total += len(str(f.get("templateData") or ""))
+            if len(am_ids) < _FP_ARRIVAL_ID_LIMIT:
+                _am = u.get("activeMembershipId") or u.get("membershipId")
+                if _am is not None:
+                    am_ids.append(str(_am))
+        if not members_with_tpl:
+            return
+        _tel.event(
+            "FP_ARRIVED", delta_mode=delta_mode, incoming_users=len(users),
+            members_with_tpl=members_with_tpl, templates=templates_total,
+            tpl_chars_total=bytes_total,
+            am_ids=(";".join(am_ids) if delta_mode and members_with_tpl <= _FP_ARRIVAL_ID_LIMIT else None),
+            ids_omitted=(True if not (delta_mode and members_with_tpl <= _FP_ARRIVAL_ID_LIMIT) else None),
+        )
+    except Exception:
+        pass
+
+
 def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
@@ -4367,6 +4425,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
             with _profile_write_step(profile, "members_ms"):
                 users = data.get("users") or []
                 delta_mode = bool(data.get("membersDeltaMode", False))
+                _log_incoming_templates(users, delta_mode)
                 valid_ids = data.get("validMemberIds")
                 profile["members_delta_mode"] = delta_mode
                 profile["incoming_users"] = len(users) if isinstance(users, list) else 0

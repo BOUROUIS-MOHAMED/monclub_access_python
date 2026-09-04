@@ -36,6 +36,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Which engine services which `accessDataMode` | §3 The three modes |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
+| A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -450,7 +451,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Last run:
-**1009 passed** (2026-09-04). `[TEST]`
+**1071 passed** (2026-09-04, after the fingerprint-telemetry session). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py
@@ -487,3 +488,107 @@ To regenerate the door-open table in §3.1:
 ```bash
 grep -rn "\.open_door(" app/ --include=*.py
 ```
+
+---
+
+## 10. Telemetry events (`[T]`)
+
+`app/core/telemetry.py` emits one grepable line per event on the `zkapp.telemetry`
+logger: `… | INFO | [T] NAME k=v k=v`. The field guide for an operator is
+[`docs/field/fingerprint_telemetry_cheatsheet.md`](docs/field/fingerprint_telemetry_cheatsheet.md)
+— **update it in the same change as this table.**
+
+There is **no runtime registry** of event names: no `EVENT_NAMES` symbol, no test over
+the whole set. This table is the only index, so an event missing from it is invisible.
+
+### 10.1 Correlation keys — there is no single global one
+
+A grep on the wrong key finds nothing. `[CODE]`
+
+| Layer | Key |
+|---|---|
+| Enrolment (UI + ZK9500 capture) | `enroll_id=` |
+| Backend API | `am_id=` + `finger_id=` (shared surface — no `enroll_id`) |
+| Member / sync | `am_id=`, `pin=` |
+| `ZKStandaloneDevice` | `worker=ZKEM:<device id>` |
+| `UltraDeviceWorker` | `worker=ULTRA:<device id>` |
+| Local API | `device_id=` |
+
+`DOOR_OPEN` is emitted at **two** layers with **two different `result` vocabularies**
+(§7). Grep only one key and you see half the presses.
+
+### 10.2 The fingerprint chain (added 2026-09-04)
+
+`[TEST: tests/test_fingerprint_telemetry.py, tests/test_fingerprint_telemetry_enrol.py]`
+
+| Event | Where | Carries |
+|---|---|---|
+| `ENROLL_START` | `app/ui/app.py` | `user_id finger_id device am_id am_source candidates candidate_ids` |
+| `ENROLL_SCANNER` | `zkfinger.py` (`phase=init`), `app.py` (`phase=open`) | `rc ok dll_path dll_dir` / `ok err dur_ms` |
+| `ENROLL_SAMPLE` | `zkfinger.py` | `sample result size` (+ `score` when `result=rejected`) |
+| `ENROLL_MERGE` | `zkfinger.py` | `ok size samples dur_ms` |
+| `ENROLL_BACKEND_REQ` | `app.py` | `am_id finger_id template_version encoding tpl_chars tpl_sha1` |
+| `ENROLL_BACKEND` | `monclub_api.py` | `am_id finger_id status result body dur_ms` |
+| `ENROLL_BACKEND_ERR` | `app.py` | `am_id finger_id err dur_ms` |
+| `ENROLL_MEMBER_SYNC` | `app.py` | `am_id requested ok err` |
+| `ENROLL_DONE` | `app.py` | `outcome user_id finger_id am_id total_ms` + per-phase `*_ms` |
+| `FP_ARRIVED` | `db.py` | `delta_mode incoming_users members_with_tpl templates am_ids ids_omitted` |
+| `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok dur_ms ok` |
+| `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
+| `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
+| `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |
+| `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
+| `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
+| `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |
+| `ZKEM_DEVICE_COUNTERS` | `zk_standalone.py` | `device_fp_version label_source c_<name>=<value>` |
+| `ZKEM_VERIFY_OK` | `ultra_engine.py` | `pin verify_method scan_mode_hint age_s event_id` |
+| `ZKEM_VERIFY_INVALID` | `ultra_engine.py` | the same, plus `att_state` |
+
+`ENROLL_DONE outcome` is a closed set: `ok`, `ok_deferred_offline`, `capture_failed`,
+`backend_rejected`, `sync_failed` (the **pre-flight** sync, not the targeted one),
+`no_membership`, `restricted`, `not_logged_in`, `cancelled`, `no_pending_record`,
+`error`. Every exit path reaches it. `[CODE: _remote_enroll_worker's finally]`
+
+`ZKEM_PUSH_FAILED_PINS` reasons: `set_user_info_false`, `template_refused_f<N>`,
+`exception:<Type>`, `chunk_wedged_or_unconfirmed`. `[CODE: _do_push_roster]`
+
+### 10.3 Three rules this instrumentation follows — keep them
+
+1. **Never log template bytes.** Sizes, `sha1[:8]`, `templateVersion`, encoding only.
+   Pinned by a test per layer (`test_never_logs_template_bytes`).
+2. **No per-item event inside the STA push loop.** The STA loop services one command
+   with **no COM pump for its duration** (`zkemkeeper_guide.md` §2), and the log handler
+   writes synchronously inline, so a line per member on a 928-member push widens that
+   window — a behaviour change, not instrumentation. Per-pin detail is accumulated in
+   memory and emitted at **chunk** boundaries. The rare failure paths may write inline.
+   The same reasoning caps `FP_ARRIVED` at one line per sync rather than one per member:
+   it runs inside the sync DB write, where a plain 934-row `SELECT` has taken 6.8 s on
+   the gym PC. `[FIELD]`
+3. **`ZKEM_VERIFY_INVALID` names the branch, not the cause.** The driver stamps the
+   literal `eventType="zkem_invalid"` whenever `IsInValid` is non-zero — that routing is
+   `[CODE]`. What any `IsInValid`, `AttState` or `verifyMethod` value *means* on the
+   MB2000 is `[UNVERIFIED]`/`[UNKNOWN]` (§7). The raw values are logged **side by side**
+   and must never be collapsed into a single decoded "reason".
+
+### 10.4 Two traps when adding an event
+
+- **Do not put `SSR_DeleteEnrollData`, `zk.SSR_DelUserTmpExt`, `.push_roster(` or
+  `.open_door(` into an event name, message or field *value*.** §9 and
+  `zkemkeeper_guide.md` §11 mandate greps with **expected match counts**; a literal in a
+  log string inflates them and raises a false MUST-NOT-CALL alarm for the next agent.
+  Use a non-matching spelling such as `op=del_user_tmp_ext`.
+- **Do not add a third spelling of the STA timeout text.** The existing two differ only
+  by a leading `zkemkeeper ` and that difference is load-bearing for log matching
+  (`zkemkeeper_guide.md` §2). Reuse one.
+
+To list every event name actually emitted (and check §10.2 against it):
+
+```bash
+python tools/list_telemetry_events.py
+```
+
+`--where` adds the `file:line` of every emit site. **Do not use a plain
+`grep '_tel.event("NAME"'` for this** — it silently misses most events, because a
+call with more than about three fields is wrapped onto the next line, and because
+`zkfinger.py` emits through the `_enroll_tel(...)` helper that stamps `enroll_id`.
+A single-line grep finds 63 of the 134 names. `[CODE]`
