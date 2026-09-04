@@ -29,8 +29,10 @@ docs/plans/mb2000_zk_standalone_driver_plan.md, in short:
   the existing attendance uploader carries it with zero changes.
 
 HARDWARE-GATED (unverified until on-site day — see the plan's GATE table): in-process
-COM viability, event field semantics, ACUnlock support (supports_open_door stays False
-until GATE 4), template portability, card number space.
+COM viability, event field semantics, ACUnlock support (the door command IS issued —
+the switch is ON for the family by operator decision, 2026-09-04 — but whether the
+MB2000's relay physically releases the turnstile stays UNVERIFIED until script 12/9
+passes on site), template portability, card number space.
 """
 
 from __future__ import annotations
@@ -102,28 +104,94 @@ def _digits_only(v: Any) -> str:
 
 
 _OPEN_DOOR_ENV_VAR = "MONCLUB_ZK_STANDALONE_OPEN_DOOR"
+# Key under which the persisted per-device switch (db.device_local_settings, projected
+# by db.list_sync_devices_payload / get_sync_device_payload) travels in the device
+# payload. None/absent = "not set" -> family default.
+_OPEN_DOOR_PAYLOAD_KEY = "openDoorEnabled"
+# Operator decision 2026-09-04: the door command is ON for the whole standalone
+# family unless switched OFF per device (Devices page control panel) or forced by
+# the env var. Field 2026-08-30: the desk pressed "open" 13x in ten seconds and was
+# refused every time (DOOR_OPEN result=409_unsupported) while this shipped OFF.
+# Whether ACUnlock physically releases THIS turnstile is still UNVERIFIED -- the
+# software must be correct and loud; the proof stays on site (script 12/9).
+_OPEN_DOOR_FAMILY_DEFAULT = True
+# ACUnlock takes DECISECONDS. 1..600 ds == 0.1..60 s is the app's own ceiling -- the
+# same 1-60 s the local API clamps pulseSeconds to and PullSDKDevice clamps its
+# seconds to. The firmware's true maximum is UNKNOWN (not in the guide, not in any
+# vendor document in this repo); nothing here claims one.
+_ACUNLOCK_DELAY_DS_MIN = 1
+_ACUNLOCK_DELAY_DS_MAX = 600
+# Closed vocabulary of the DOOR_OPEN telemetry results this driver emits.
+_DOOR_OPEN_RESULTS = frozenset({"ok", "false", "exception", "timeout", "unsupported"})
+_ENV_TRUE_WORDS = ("1", "true", "yes", "on", "all")
+_ENV_FALSE_WORDS = ("0", "false", "no", "off", "none")
 
 
-def _open_door_override(device_id: int) -> bool:
-    """Whether ACUnlock is enabled for this device (GATE 4 escape hatch).
+def _open_door_env_override(device_id: int) -> Optional[bool]:
+    """Per-machine override of the door switch, or None when the env var is unset.
 
     MONCLUB_ZK_STANDALONE_OPEN_DOOR accepts:
-      "1" / "true" / "yes" / "all"  -> enable for every standalone terminal
-      "8" or "8,12"                 -> enable only for those device ids
-    Anything else (or unset) leaves it OFF. Parsed per call: this is a rare,
-    bring-up-time path, and reading it live means an operator can flip it without
-    restarting mid-session.
+      "1" / "true" / "yes" / "on" / "all"   -> force ON for every standalone terminal
+      "0" / "false" / "no" / "off" / "none" -> force OFF for every standalone terminal
+      "8" or "8,12"                         -> allowlist: ON for those ids, OFF for the rest
+    Unset/blank -> no override. Anything else is logged and IGNORED (never read as
+    ON or OFF). Parsed per call so an operator can flip it without restarting.
     """
     raw = str(os.environ.get(_OPEN_DOOR_ENV_VAR, "") or "").strip().lower()
     if not raw:
-        return False
-    if raw in ("1", "true", "yes", "on", "all"):
+        return None
+    if raw in _ENV_TRUE_WORDS:
         return True
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if part.isdigit() and int(part) == int(device_id):
-            return True
-    return False
+    if raw in _ENV_FALSE_WORDS:
+        return False
+    parts = [p.strip() for p in raw.replace(";", ",").split(",") if p.strip()]
+    if parts and all(p.isdigit() for p in parts):
+        return any(int(p) == int(device_id) for p in parts)
+    logger.warning(
+        "%s=%r not understood -- ignored (expected on/off or a device-id list)",
+        _OPEN_DOOR_ENV_VAR, raw,
+    )
+    return None
+
+
+def _coerce_switch(v: Any) -> Optional[bool]:
+    """Persisted switch value (bool / 0-1 / 'true'-'false') -> bool, or None when unset."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    if s in _ENV_TRUE_WORDS:
+        return True
+    if s in _ENV_FALSE_WORDS:
+        return False
+    return None
+
+
+def resolve_open_door_switch(device_id: int, payload: Dict[str, Any] | None) -> tuple[bool, str]:
+    """Effective door switch for one device -> (enabled, source).
+
+    source: "env"     -> MONCLUB_ZK_STANDALONE_OPEN_DOOR decided (wins over everything)
+            "local"   -> the persisted per-device switch (payload["openDoorEnabled"])
+            "default" -> nothing set: _OPEN_DOOR_FAMILY_DEFAULT
+    """
+    env = _open_door_env_override(device_id)
+    if env is not None:
+        return bool(env), "env"
+    local = _coerce_switch((payload or {}).get(_OPEN_DOOR_PAYLOAD_KEY))
+    if local is not None:
+        return bool(local), "local"
+    return bool(_OPEN_DOOR_FAMILY_DEFAULT), "default"
+
+
+def _pulse_ms_to_delay_ds(pulse_time_ms: Any) -> tuple[int, bool]:
+    """Pulse (ms) -> ACUnlock deciseconds clamped to the app ceiling; (ds, clamped)."""
+    try:
+        raw = int(round(int(pulse_time_ms) / 100.0))
+    except (TypeError, ValueError):
+        raw = 0
+    ds = max(_ACUNLOCK_DELAY_DS_MIN, min(_ACUNLOCK_DELAY_DS_MAX, raw))
+    return ds, ds != raw
 
 
 def verify_method_to_scan_mode(verify_method: Any) -> str:
@@ -239,17 +307,17 @@ class ZKStandaloneDevice:
     # ---- capability flags (D8) ----
     owns_event_source = True
     supports_device_params = False
-    # ACUnlock is documented SDK-wide but UNVERIFIED on MB2000 (GATE 4), so it
-    # ships OFF: a door command that silently does nothing is worse than one that
-    # reports it cannot. _do_open_door already implements the real call
-    # (zk.ACUnlock) -- this flag only decides whether we are allowed to make it.
-    #
-    # Flip it per-machine, without a rebuild, via MONCLUB_ZK_STANDALONE_OPEN_DOOR
-    # (see _open_door_override). Verify FIRST with the on-site script pack:
-    # tools/mb2000_scripts/9_unlock_door.ps1 fires the identical ACUnlock(1, ds)
-    # call -- listen for the relay AND confirm the turnstile physically releases.
-    # ACUnlock returning True with no physical release is a wiring fault, not SDK.
-    supports_open_door = False
+    # Whether this driver may issue ACUnlock. _do_open_door implements the real
+    # call; the flag only decides whether the app is ALLOWED to make it. The class
+    # default is the family default (operator decision 2026-09-04: ON). Every
+    # instance re-resolves it in __init__ via resolve_open_door_switch():
+    #   env MONCLUB_ZK_STANDALONE_OPEN_DOOR  >  persisted per-device switch
+    #   (payload["openDoorEnabled"], Devices page control panel)  >  this default
+    # and the operator can flip it live through apply_open_door_switch(). Whether
+    # the MB2000's relay physically releases the turnstile on ACUnlock stays
+    # UNVERIFIED until tools/mb2000_scripts 12/9 pass on site -- so every call is
+    # logged and emits a DOOR_OPEN telemetry result; a silent no-op is impossible.
+    supports_open_door = _OPEN_DOOR_FAMILY_DEFAULT
     # The PullSDK "transaction" table has no analogue here: this driver reads
     # events through the COM event sink, not a table. read_transaction_rows /
     # get_table_count / delete_all_transaction_rows are all inert, so callers
@@ -288,16 +356,11 @@ class ZKStandaloneDevice:
         self._prefix = f"[ZKEM:{self.device_id}]"
         self._tel_wid = f"ZKEM:{self.device_id}"
 
-        # Instance attribute shadows the class default when GATE 4 has been passed
-        # on this machine. Logged loudly: enabling an unverified door command is an
-        # operational decision that must be visible in the log afterwards.
-        if _open_door_override(self.device_id):
-            self.supports_open_door = True
-            self.logger.warning(
-                "%s open_door ENABLED via %s -- ACUnlock will be issued. Confirm "
-                "9_unlock_door.ps1 passed on this hardware.",
-                self._prefix, _OPEN_DOOR_ENV_VAR,
-            )
+        # Effective door switch for THIS device (env > persisted local > family
+        # default), announced at construction -- i.e. at every worker connect -- so
+        # the log always shows which value was in force and what decided it.
+        self._open_door_source = "default"
+        self.apply_open_door_switch(self.payload.get(_OPEN_DOOR_PAYLOAD_KEY))
 
         # Whole-device lane direction from the synced door preset (D7).
         self._direction = self._direction_from_presets(self.payload)
@@ -441,21 +504,107 @@ class ZKStandaloneDevice:
     # DeviceDriver surface — commands (all funneled to the STA thread, D5)
     # ------------------------------------------------------------------ #
 
-    def open_door(self, *, door_id: int, pulse_time_ms: int, timeout_ms: int = 4000) -> bool:
-        if not self.supports_open_door:
-            # UNVERIFIED on MB2000 until GATE 4; the worker already surfaces
-            # "open_door returned False" so this fails loud, not silent.
-            self.logger.warning("%s open_door unsupported (GATE 4 pending)", self._prefix)
-            return False
+    def apply_open_door_switch(self, local_value: Any) -> tuple[bool, str]:
+        """Re-resolve the door switch (env > local > default) and apply it live.
+
+        Called at construction with the payload's persisted value, and by the
+        local API when the operator flips the switch -- no reconnect needed.
+        Returns (enabled, source); logs and emits DOOR_OPEN_SWITCH telemetry.
+        """
+        enabled, source = resolve_open_door_switch(
+            self.device_id, {_OPEN_DOOR_PAYLOAD_KEY: local_value},
+        )
+        self.supports_open_door = bool(enabled)
+        self._open_door_source = source
+        self.logger.log(
+            logging.WARNING if (enabled and source == "env") else logging.INFO,
+            "%s open_door switch: enabled=%s source=%s -- ACUnlock(1, ds) %s; relay "
+            "release on this hardware is UNVERIFIED until script 12/9 passes on site",
+            self._prefix, enabled, source,
+            "will be issued" if enabled else "will be refused (HTTP 409)",
+        )
         try:
-            delay_ds = max(1, int(round(pulse_time_ms / 100.0)))  # ACUnlock takes deciseconds
-            return bool(self._call(
+            _tel.event("DOOR_OPEN_SWITCH", worker=self._tel_wid, enabled=bool(enabled), source=source)
+        except Exception:
+            pass
+        return bool(enabled), source
+
+    def _door_open_event(self, result: str, *, door_id: Any, delay_ds: int, dur_ms: float,
+                         clamped: bool, err: str | None = None) -> None:
+        """One DOOR_OPEN telemetry line per attempt; result is from _DOOR_OPEN_RESULTS."""
+        assert result in _DOOR_OPEN_RESULTS, result
+        fields = dict(
+            worker=self._tel_wid, door=door_id, result=result, delay_ds=int(delay_ds),
+            dur_ms=round(float(dur_ms)), clamped=True if clamped else None,
+            source=getattr(self, "_open_door_source", None), err=err,
+        )
+        try:
+            (_tel.event if result == "ok" else _tel.warn)("DOOR_OPEN", **fields)
+        except Exception:
+            pass
+
+    def open_door(self, *, door_id: int, pulse_time_ms: int, timeout_ms: int = 4000) -> bool:
+        """ACUnlock(1, deciseconds) on the STA thread. Never raises; never silent.
+
+        Every outcome is logged AND emitted as DOOR_OPEN telemetry with a result in
+        _DOOR_OPEN_RESULTS plus delay_ds and dur_ms. The command goes through _call()
+        like every other STA command, so the generation fence and wedge recovery
+        apply unchanged: a COM call that never returns is abandoned after the
+        deadline (result=timeout, ZKEM_STA_WEDGED) and the next connect rebuilds the
+        thread. door_id is informational -- the MB2000 has one lock relay and the
+        machine number is always 1.
+        """
+        delay_ds, clamped = _pulse_ms_to_delay_ds(pulse_time_ms)
+        if clamped:
+            self.logger.warning(
+                "%s open_door: pulse %sms is outside %d..%d ds -> clamped to %d ds",
+                self._prefix, pulse_time_ms,
+                _ACUNLOCK_DELAY_DS_MIN, _ACUNLOCK_DELAY_DS_MAX, delay_ds,
+            )
+        if not self.supports_open_door:
+            self.logger.warning(
+                "%s open_door REFUSED: switch OFF (source=%s) -- no ACUnlock issued",
+                self._prefix, getattr(self, "_open_door_source", "?"),
+            )
+            self._door_open_event("unsupported", door_id=door_id, delay_ds=delay_ds,
+                                  dur_ms=0.0, clamped=clamped)
+            return False
+        t0 = time.monotonic()
+        try:
+            ok = bool(self._call(
                 "open_door", args={"delay_ds": delay_ds},
                 timeout=max(2.0, timeout_ms / 1000.0),
             ))
-        except Exception as exc:
-            self.logger.warning("%s open_door failed: %s", self._prefix, exc)
+        except TimeoutError as exc:
+            dur_ms = (time.monotonic() - t0) * 1000.0
+            self.logger.error(
+                "%s open_door TIMEOUT after %.0f ms: %s -- STA thread abandoned (gen=%d), "
+                "the next connect rebuilds it", self._prefix, dur_ms, exc, self._sta_gen,
+            )
+            self._door_open_event("timeout", door_id=door_id, delay_ds=delay_ds,
+                                  dur_ms=dur_ms, clamped=clamped, err=type(exc).__name__)
             return False
+        except Exception as exc:
+            dur_ms = (time.monotonic() - t0) * 1000.0
+            self.logger.warning("%s open_door EXCEPTION after %.0f ms: %s", self._prefix, dur_ms, exc)
+            self._door_open_event("exception", door_id=door_id, delay_ds=delay_ds,
+                                  dur_ms=dur_ms, clamped=clamped, err=type(exc).__name__)
+            return False
+        dur_ms = (time.monotonic() - t0) * 1000.0
+        if ok:
+            self.logger.info("%s ACUnlock(1, %d) -> True in %.0f ms (door=%s)",
+                             self._prefix, delay_ds, dur_ms, door_id)
+            self._door_open_event("ok", door_id=door_id, delay_ds=delay_ds,
+                                  dur_ms=dur_ms, clamped=clamped)
+        else:
+            self.logger.warning(
+                "%s ACUnlock(1, %d) -> False in %.0f ms (door=%s) -- the terminal refused "
+                "the door command, or the driver is not connected",
+                self._prefix, delay_ds, dur_ms, door_id,
+            )
+            self._door_open_event("false", door_id=door_id, delay_ds=delay_ds,
+                                  dur_ms=dur_ms, clamped=clamped)
+        return ok
 
     def get_device_time(self) -> Optional[float]:
         try:

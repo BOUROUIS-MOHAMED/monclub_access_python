@@ -195,6 +195,11 @@ export function usePullSdk() {
     getClock: (deviceId: number) => get<any>(`/devices/${deviceId}/clock`),
     syncClock: (deviceId: number) =>
       post<any>(`/devices/${deviceId}/clock/sync`, { confirm: true }),
+    // ── Standalone-family door switch (may the driver issue ACUnlock?) ──
+    // 409 + unsupported on the PullSDK family, which has no switch and always opens.
+    getOpenDoorSwitch: (deviceId: number) => get<any>(`/devices/${deviceId}/open-door-switch`),
+    setOpenDoorSwitch: (deviceId: number, enabled: boolean | null) =>
+      post<any>(`/devices/${deviceId}/open-door-switch`, { enabled }),
     // ── MIRROR pushing-policy review (dry-run plan + arm/disarm) ──
     getMirrorPlan: (deviceId: number) => get<any>(`/devices/${deviceId}/mirror-plan`),
     armMirror: (deviceId: number) =>

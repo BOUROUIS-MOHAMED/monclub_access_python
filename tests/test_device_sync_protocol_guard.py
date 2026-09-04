@@ -226,45 +226,66 @@ class TestCredentialTypeFromModalityTag:
 
 
 class TestOpenDoorGate:
-    """ACUnlock ships OFF (GATE 4) but must be flippable without a rebuild."""
+    """The door switch on the standalone family: env override > persisted local
+    switch > family default (ON, operator decision 2026-09-04). Whether ACUnlock
+    releases the MB2000 turnstile stays UNVERIFIED until script 12/9 passes on site."""
 
-    def test_default_is_off(self, monkeypatch):
-        from app.sdk.zk_standalone import ZKStandaloneDevice
+    def test_family_default_is_on(self, monkeypatch):
+        from app.sdk import zk_standalone as zs
 
         monkeypatch.delenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", raising=False)
-        assert ZKStandaloneDevice.supports_open_door is False
+        assert zs.ZKStandaloneDevice.supports_open_door is True
+        assert zs.resolve_open_door_switch(8, {}) == (True, "default")
 
-    def test_global_enable(self, monkeypatch):
-        from app.sdk.zk_standalone import _open_door_override
+    def test_env_forces_on(self, monkeypatch):
+        from app.sdk.zk_standalone import _open_door_env_override, resolve_open_door_switch
 
         for val in ("1", "true", "yes", "on", "all"):
             monkeypatch.setenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", val)
-            assert _open_door_override(8) is True, val
+            assert _open_door_env_override(8) is True, val
+            assert resolve_open_door_switch(8, {"openDoorEnabled": False}) == (True, "env"), val
 
-    def test_per_device_enable(self, monkeypatch):
-        from app.sdk.zk_standalone import _open_door_override
+    def test_env_forces_off(self, monkeypatch):
+        from app.sdk.zk_standalone import _open_door_env_override, resolve_open_door_switch
+
+        for val in ("0", "false", "no", "off", "none"):
+            monkeypatch.setenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", val)
+            assert _open_door_env_override(8) is False, val
+            assert resolve_open_door_switch(8, {"openDoorEnabled": True}) == (False, "env"), val
+
+    def test_env_id_list_is_an_allowlist(self, monkeypatch):
+        from app.sdk.zk_standalone import _open_door_env_override
 
         monkeypatch.setenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", "8,12")
-        assert _open_door_override(8) is True
-        assert _open_door_override(12) is True
-        assert _open_door_override(9) is False
+        assert _open_door_env_override(8) is True
+        assert _open_door_env_override(12) is True
+        assert _open_door_env_override(9) is False
 
-    def test_garbage_leaves_it_off(self, monkeypatch):
-        from app.sdk.zk_standalone import _open_door_override
+    def test_garbage_env_is_ignored(self, monkeypatch):
+        from app.sdk.zk_standalone import _open_door_env_override, resolve_open_door_switch
 
         monkeypatch.setenv("MONCLUB_ZK_STANDALONE_OPEN_DOOR", "nope")
-        assert _open_door_override(8) is False
+        assert _open_door_env_override(8) is None
+        assert resolve_open_door_switch(8, {"openDoorEnabled": False}) == (False, "local")
 
-    def test_open_door_refuses_while_gated(self, monkeypatch):
-        """The refusal must be loud, not a silent False."""
-        import logging
+    def test_open_door_refuses_while_switched_off(self, monkeypatch):
+        """The refusal must be loud (log + DOOR_OPEN result=unsupported), not a silent False."""
+        from unittest.mock import MagicMock
 
-        from app.sdk.zk_standalone import ZKStandaloneDevice
+        from app.sdk import zk_standalone as zs
 
-        drv = ZKStandaloneDevice.__new__(ZKStandaloneDevice)
-        drv.logger = logging.getLogger("gate4")
+        tel = MagicMock()
+        monkeypatch.setattr(zs, "_tel", tel)
+        drv = zs.ZKStandaloneDevice.__new__(zs.ZKStandaloneDevice)
+        drv.logger = MagicMock()
         drv._prefix = "[ZKEM:8]"
+        drv._tel_wid = "ZKEM:8"
+        drv.supports_open_door = False
+        drv._open_door_source = "local"
         assert drv.open_door(door_id=1, pulse_time_ms=3000) is False
+        assert drv.logger.warning.called
+        assert tel.warn.call_args.args[0] == "DOOR_OPEN"
+        assert tel.warn.call_args.kwargs["result"] == "unsupported"
 
 
 class TestRosterPushIsBoundedAndRecoverable:

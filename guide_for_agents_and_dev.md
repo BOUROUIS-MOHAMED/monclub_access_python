@@ -254,7 +254,7 @@ itself:
 | Flag | `PullSDKDevice` | `ZKStandaloneDevice` | Meaning |
 |---|---|---|---|
 | `supports_transaction_table` | `True` `[CODE]` | `False` `[CODE]` | Device has a readable/pruneable transaction table. When `False`, `read_transaction_rows` / `get_table_count` / `delete_all_transaction_rows` are **inert** — callers must skip the device, not act on their return values. |
-| `supports_open_door` | absent ⇒ callers default `True` | `False` `[CODE]` | Whether the driver may issue a door-open. See §7. |
+| `supports_open_door` | absent ⇒ callers default `True` | **per-device switch**, family default `True` `[CODE]` | Whether the driver may issue a door-open. On the standalone family it is resolved per instance: env `MONCLUB_ZK_STANDALONE_OPEN_DOOR` > persisted local switch (`db.device_local_settings`, projected as `openDoorEnabled`) > family default. See §5.1 and §7. |
 | `owns_event_source` | — | `True` `[CODE]` | Driver owns its own event delivery (push) rather than being polled. |
 | `supports_device_params` | — | `False` `[CODE]` | `get_device_param` / `set_device_param` are meaningful. |
 
@@ -264,8 +264,35 @@ local_access_api_v2.py]`
 `[TEST: test_device_sync_protocol_guard.py::TestTransactionTableCapability]`
 
 **A flag being `False` does not mean "unimplemented".** `ZKStandaloneDevice._do_open_door`
-implements the real `ACUnlock` call; `supports_open_door = False` only decides whether
-the app is *allowed* to make it. See §7.
+implements the real `ACUnlock` call; `supports_open_door` only decides whether the app
+is *allowed* to make it. See §7.
+
+### 5.1 The standalone door switch — how `supports_open_door` is set (2026-09-04)
+
+`[CODE: zk_standalone.py::resolve_open_door_switch, ::apply_open_door_switch]`
+`[TEST: test_mb2000_force_open.py::TestOpenDoorSwitchResolution]`
+
+| Priority | Source | Value | Where it comes from |
+|---|---|---|---|
+| 1 | `env` | `MONCLUB_ZK_STANDALONE_OPEN_DOOR` | `1/true/yes/on/all` ⇒ ON for every standalone terminal; `0/false/no/off/none` ⇒ OFF for every one; a device-id list (`8,12`) ⇒ ON for those ids, OFF for the rest. Blank ⇒ no override. Anything else is **logged and ignored**, never read as ON or OFF. Parsed per call. |
+| 2 | `local` | `db.device_local_settings.open_door_enabled` | The operator's per-device switch: Devices page → control panel → « Commande d'ouverture », or `GET/POST /api/v2/devices/{id}/open-door-switch` (`{enabled: true|false|null}`, null clears). Persisted **outside** the `sync_*` tables, so it survives every sync replace and logout. Projected into the device payload as `openDoorEnabled` by `db.list_sync_devices_payload` / `get_sync_device_payload`, which is how it reaches `get_driver(device_payload)`. |
+| 3 | `default` | `_OPEN_DOOR_FAMILY_DEFAULT = True` | **Operator decision 2026-09-04**: ON for the whole standalone family. Before this the flag shipped OFF and the desk was refused on every press `[FIELD: 2026-08-30, 13× DOOR_OPEN result=409_unsupported + 8× 429_cooldown in ten seconds]`. |
+
+- The effective value is resolved at driver construction — i.e. at every worker
+  connect — and announced as `[T] DOOR_OPEN_SWITCH worker=ZKEM:<id> enabled=… source=…`.
+  `[CODE: ZKStandaloneDevice.__init__ → apply_open_door_switch]`
+- The POST endpoint applies the new value to the **running** driver without a
+  reconnect and stamps the worker's device snapshot, so a reconnect before the next
+  sync refresh re-resolves the same value. `[CODE: local_access_api_v2.py::
+  _handle_device_open_door_switch_set]` `[TEST: TestLocalApiOpenDoorSwitch]`
+- Both endpoints refuse non-standalone protocols with `409 + unsupported: true` — the
+  PullSDK family has no such flag and always opens. The switch endpoints are the one
+  place that branches on protocol; every consumer of the *result* still gates on the
+  flag. `[CODE]`
+- The worker snapshot exposes `supports_open_door` **and** `open_door_source`
+  (`env|local|default`, `None` on drivers without the switch). `[CODE: get_snapshot]`
+- The switch says nothing about hardware: `ACUnlock` releasing the MB2000 turnstile is
+  still **`[UNVERIFIED]`** — see §7.
 
 ---
 
@@ -317,17 +344,48 @@ and ::TestSyncOneDeviceRefusesNonPullSDK]`
 Recorded so nobody assumes an answer exists. Proving one is a real result; update this
 section when you do.
 
-### `supports_open_door = False` on ZK_STANDALONE `[UNVERIFIED — HARDWARE-GATED]`
+### `ACUnlock` on the MB2000 — the command is issued, the relay is `[UNVERIFIED — HARDWARE-GATED]`
 
-`ACUnlock` is documented SDK-wide but has never been confirmed on MB2000 hardware. It
-ships **off**: a door command that silently does nothing is worse than one that reports
-it cannot. `[CODE]`
+`ACUnlock` is documented SDK-wide but has **never been confirmed on MB2000 hardware**:
+no PASS of script 9 or 12 has been reported from the site. Since 2026-09-04 the command
+is nevertheless **issued** — the switch is ON for the family by operator decision (§5.1)
+— because a refused desk button with no way to turn it on was the worse failure
+`[FIELD: 2026-08-30, 13× 409_unsupported in ten seconds]`. What replaces "ships off" is
+*loudness*: `[CODE]` `[TEST: test_mb2000_force_open.py::TestDriverDoorCommand,
+::TestLocalApiDoorOpenChain]`
 
-Enable per-machine without a rebuild via **`MONCLUB_ZK_STANDALONE_OPEN_DOOR`** — but
-verify first with `tools/mb2000_scripts/9_unlock_door.ps1`, which fires the identical
-`ACUnlock(1, ds)` call. Listen for the relay **and** confirm the turnstile physically
-releases: `ACUnlock` returning `True` with no release is a wiring fault, not an SDK one.
-Enabling it logs a loud warning, deliberately. `[CODE: _open_door_override]`
+- every attempt logs and emits `[T] DOOR_OPEN worker=ZKEM:<id> result=… delay_ds=… dur_ms=…`
+  with `result ∈ {ok, false, exception, timeout, unsupported}` (`clamped=True` when the
+  pulse was clamped, `source=` which switch level decided);
+- a `False` from the terminal reaches the desk as HTTP 500 with a French message naming
+  the FALSE return (`detail` keeps the raw string) — never as a silent success;
+- the local API additionally logs `DOOR_OPEN result ∈ {200_ok, 409_unsupported,
+  429_cooldown, 503_timeout, 500_failed}` keyed by `device_id`, so one grep shows the
+  press, the refusal or the SDK answer;
+- the door command goes through the driver's `_call()` like every other STA command, so
+  the generation fence and wedge recovery are not bypassed — a hung `ACUnlock` is
+  abandoned at the deadline (`result=timeout`, `ZKEM_STA_WEDGED`) and the next connect
+  rebuilds the thread. `[TEST: ::test_wedged_acunlock_times_out_abandons_sta_and_reports_timeout]`
+
+Verify with the script pack: `tools/mb2000_scripts/9_unlock_door.ps1` (minimal
+one-shot) or `12_force_open_door.ps1` (sustained: repeat/interval, device info
+before/after, `-Auto`, and a `logs/force_open_*.log` the operator can send back). Both
+fire the identical `ACUnlock(mn, ds)` call. Listen for the relay **and** confirm the
+turnstile physically releases: `ACUnlock` returning `True` with no release is a wiring
+fault, not an SDK one.
+
+**What stays unproven until the operator reports script 12 (or 9) PASS on site:**
+whether `ACUnlock(1, ds)` returning `True` makes *this* turnstile release. This section
+stays `[UNVERIFIED]` until then. Do **not** promote it on the strength of a `result=ok`
+line in the app log — that proves the COM call returned `True`, nothing more. See
+`zkemkeeper_guide.md` §8 for what script 12 does and does **not** establish (no
+documented SDK maximum for the delay, no reason available on a `False` return, elapsed
+ms is the COM call).
+
+The pulse is converted `ms → deciseconds` and clamped to **1…600 ds (0.1…60 s)** — the
+app's own ceiling, identical to the local API's `pulseSeconds` 1–60 and the PullSDK
+driver's 1–60 s. The **firmware's true maximum is `[UNKNOWN]`**; no vendor document in
+this repo states one, so none is claimed. `[CODE: _pulse_ms_to_delay_ds]`
 
 ### Which `verifyMethod` integer means what on MB2000 `[UNKNOWN]`
 
@@ -372,10 +430,10 @@ Until a connect line settles it, **do not state either as the cause.**
   outage; registering it on the client PC was part of the remedy]`
 - **Backend base URL** is a single constant, `app/core/app_const.py::MONCLUB_BASE_URL`.
   Not runtime-configurable and not editable from the UI. `[CODE]`
-- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 11 scripts — COM
+- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 12 scripts — COM
   registration, device info, ZK9500 enrol, push, live monitor, unlock, backup/restore,
-  portability test). Use these to establish ground truth on hardware **before** changing
-  driver code. `[CODE]`
+  portability test, force-open). Use these to establish ground truth on hardware
+  **before** changing driver code. `[CODE]`
 
 ---
 
@@ -390,8 +448,9 @@ python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*
 `--ignore=tests/_pydeps` is **required** — that directory holds vendored third-party
 packages whose own tests break collection. There is no `pytest.ini`, so the flag is not
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
-`tests/.tmp_pytest*` scratch directories present in some working copies; they are not
-part of the suite. Last run: **955 passed** (2026-09-04). `[TEST]`
+`tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
+under `tests/` in some working copies; they are not part of the suite. Last run:
+**1009 passed** (2026-09-04). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py
@@ -406,7 +465,7 @@ protocols**. `[CODE]`
 Targeted checks for the rules in this guide:
 
 ```bash
-python -m pytest tests/test_device_sync_protocol_guard.py tests/test_device_driver_factory.py tests/test_zk_standalone_driver.py -q
+python -m pytest tests/test_device_sync_protocol_guard.py tests/test_device_driver_factory.py tests/test_zk_standalone_driver.py tests/test_mb2000_force_open.py -q
 ```
 
 To confirm §3.2 (the roster rule) still holds:

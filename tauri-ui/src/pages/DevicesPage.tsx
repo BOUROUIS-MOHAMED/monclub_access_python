@@ -52,6 +52,18 @@ interface ControlState {
   reentrySeconds: string;
   reentry: VerifyState;
   clock: VerifyState;
+  /** Standalone-family door switch (may the driver issue ACUnlock?). supported=false
+   *  on the PullSDK family (the endpoint answers 409) -> the block is not rendered. */
+  openDoor: {
+    supported: boolean;
+    enabled: boolean;        // effective value
+    source: string;          // env | local | default
+    local: boolean | null;   // persisted per-device switch, null = not set
+    envOverride: boolean | null;
+    live: boolean | null;
+    pending: boolean;        // the position the operator chose, before « Appliquer »
+    status: VerifyState;
+  };
   // MIRROR pushing-policy review (only meaningful when policy === "MIRROR")
   policy: string;
   mirror: {
@@ -193,6 +205,8 @@ export default function DevicesPage() {
       doors: [], driftSec: null, supportsDeviceParams: true,
       reentryEnabled: false, reentrySeconds: "30",
       reentry: { status: "idle" }, clock: { status: "idle" },
+      openDoor: { supported: false, enabled: true, source: "", local: null, envOverride: null,
+        live: null, pending: true, status: { status: "idle" } },
       policy: "", mirror: { armed: false, count: null, sample: [], at: null, status: "idle" },
       errorPopup: null,
     });
@@ -216,6 +230,16 @@ export default function DevicesPage() {
             sample: m.lastPlanSample || [], at: m.lastPlanAt ?? null, status: "idle" },
         } : p);
       } catch { /* endpoint absent / non-standalone — leave policy blank */ }
+      // Door switch (standalone family only; 409 elsewhere -> block stays hidden)
+      try {
+        const sw = await pullsdk.getOpenDoorSwitch(deviceId);
+        setControl((p) => p && p.deviceId === deviceId ? {
+          ...p, openDoor: { ...p.openDoor, supported: true, enabled: !!sw.enabled,
+            source: String(sw.source || ""), local: sw.local ?? null,
+            envOverride: sw.envOverride ?? null, live: sw.live ?? null,
+            pending: !!sw.enabled, status: { status: "idle" } },
+        } : p);
+      } catch { /* PullSDK family: no switch, the door always opens */ }
     } catch (e) {
       setControl((p) => p && p.deviceId === deviceId ? { ...p, loading: false, loadError: String(e) } : p);
     }
@@ -266,6 +290,25 @@ export default function DevicesPage() {
       } : p);
     } catch (e) {
       setControl((p) => p && p.deviceId === deviceId ? { ...p, clock: { status: "err", error: String(e) } } : p);
+    }
+  }, [control, pullsdk]);
+
+  // Standalone door switch: persist + apply to the running driver (no reconnect).
+  // null = clear the per-device value and fall back to the family default.
+  const applyOpenDoorSwitch = useCallback(async (value: boolean | null) => {
+    if (!control) return;
+    const { deviceId } = control;
+    setControl((p) => p ? { ...p, openDoor: { ...p.openDoor, status: { status: "saving" } } } : p);
+    try {
+      const res = await pullsdk.setOpenDoorSwitch(deviceId, value);
+      setControl((p) => p && p.deviceId === deviceId ? {
+        ...p, openDoor: { ...p.openDoor, enabled: !!res.enabled, source: String(res.source || ""),
+          local: res.local ?? null, envOverride: res.envOverride ?? null, live: res.live ?? null,
+          pending: !!res.enabled, status: { status: "ok" } },
+      } : p);
+      setToast(res.enabled ? "Commande d'ouverture activée (ACUnlock sera émis)" : "Commande d'ouverture désactivée");
+    } catch (e) {
+      setControl((p) => p && p.deviceId === deviceId ? { ...p, openDoor: { ...p.openDoor, status: { status: "err", error: String(e) } } } : p);
     }
   }, [control, pullsdk]);
 
@@ -1000,6 +1043,63 @@ export default function DevicesPage() {
                   </p>
                 )}
               </div>
+
+              {control.openDoor.supported ? (
+                <>
+                  {/* Standalone-family door switch. ON by default since 2026-09-04
+                      (operator decision); the relay is still unverified on this
+                      hardware, so the block says so rather than implying the door
+                      will open. Hidden on the PullSDK family (no switch). */}
+                  <div className="space-y-2.5">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-medium">Commande d'ouverture (ACUnlock)</p>
+                        <p className="text-xs text-muted-foreground">
+                          Autorise le bouton « Ouvrir » et les secours QR/staff à émettre la commande sur ce terminal
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Switch checked={control.openDoor.pending} disabled={control.openDoor.envOverride !== null}
+                          onCheckedChange={(v: boolean) => setControl((p) => p ? { ...p, openDoor: { ...p.openDoor, pending: v } } : p)} />
+                      </div>
+                    </div>
+                    {control.openDoor.envOverride !== null ? (
+                      <Alert><AlertCircle className="h-4 w-4" /><AlertDescription className="text-xs">
+                        Forcé {control.openDoor.envOverride ? "ACTIVÉ" : "DÉSACTIVÉ"} par la variable d'environnement
+                        MONCLUB_ZK_STANDALONE_OPEN_DOOR sur ce PC&nbsp;: l'interrupteur est ignoré tant qu'elle est définie.
+                      </AlertDescription></Alert>
+                    ) : null}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <Button size="sm" onClick={() => applyOpenDoorSwitch(control.openDoor.pending)}
+                        disabled={control.openDoor.status.status === "saving" || control.openDoor.envOverride !== null}>
+                        {control.openDoor.status.status === "saving" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null} Appliquer
+                      </Button>
+                      <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => applyOpenDoorSwitch(null)}
+                        disabled={control.openDoor.local === null || control.openDoor.status.status === "saving"}>
+                        Valeur par défaut
+                      </Button>
+                      <Badge variant="secondary" className="text-xs">
+                        {control.openDoor.enabled ? "activée" : "désactivée"} · source {control.openDoor.source || "?"}
+                      </Badge>
+                      {control.openDoor.status.status === "ok" && (
+                        <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600"><CheckCircle2 className="h-3.5 w-3.5" /> Appliqué</span>
+                      )}
+                      {control.openDoor.status.status === "err" && (
+                        <Button size="sm" variant="ghost" className="h-6 text-xs text-destructive"
+                          onClick={() => showControlError("Erreur — commande d'ouverture", control.openDoor.status.error || "")}>
+                          <XCircle className="h-3.5 w-3.5" /> Échec — voir
+                        </Button>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-muted-foreground">
+                      Relais non validé sur ce matériel tant que le script 12/9 n'a pas réussi sur site&nbsp;:
+                      un retour TRUE sans ouverture physique = câblage, pas SDK.
+                    </p>
+                  </div>
+
+                  <div className="border-t" />
+                </>
+              ) : null}
 
               <div className="border-t" />
 

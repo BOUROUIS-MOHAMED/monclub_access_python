@@ -53,6 +53,7 @@ re-run **[1]** (registration records the DLL's path).
 | 9 | `9_unlock_door.ps1` | ACUnlock relay test (SDK **and** wiring) |
 | 10 | `10_backup_restore_device.ps1` | dump ALL users+templates to `backups\*.json` / restore (clone terminals, pre-wipe safety) |
 | 11 | `11_portability_test.ps1` | **the decisive gate**: push a ZK9500 desk template then auto-watch the log 90s for a live finger match -> prints **PASS / FAIL** |
+| 12 | `12_force_open_door.ps1` | **the door gate**: sustained force-open - ACUnlock repeated N times with a chosen duration/interval, device info before+after, every attempt written to `logs\force_open_*.log`. `-Auto` = no prompts (desk / scripted) |
 
 ## Local template store
 
@@ -64,6 +65,13 @@ re-run **[1]** (registration records the DLL's path).
                  "capturedAt": "2026-07-09T10:00:00", "source": "zk9500" } ] }
 ```
 
+## Run logs
+
+`logs\force_open_<yyyyMMdd_HHmmss>.log` - one file per script-12 run (created on
+first use). Plain text, safe to email: device identity/counts, every `ACUnlock`
+attempt with its return value and call duration, and the operator's answer about
+the physical release.
+
 ## Typical workflows
 
 - **Template portability test (do this before enrolling members!):**
@@ -74,6 +82,38 @@ re-run **[1]** (registration records the DLL's path).
   against B and C.
 - **Verify-method table for the app driver:** run `8`, punch finger then card,
   note the printed verify values.
+- **Door force-open / relay gate (GATE 4):** `9` fires one pulse (1 s by default)
+  and asks whether the relay clicked; `12` is the one to run when the desk needs
+  the door **held** open, or when a single pulse was inconclusive and you want a
+  repeated, timed, logged run you can send back. See below.
+
+## Door force-open (script 12) - reading the result
+
+`12_force_open_door.ps1` fires `ACUnlock(machineNumber, delayDeciseconds)` - the same
+call script 9 makes and the same one `app/sdk/zk_standalone.py` makes - `-Repeat`
+times, `-IntervalSeconds` apart, and writes every attempt (return value, elapsed ms,
+device info before and after) to a timestamped file in `logs\`. Send that file back.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `ACUnlock -> TRUE` **and** the turnstile releases | **PASS** for the SDK call on this device | send the log - the guides stay `[UNVERIFIED]` on the relay until that report is in |
+| `ACUnlock -> TRUE` **and nothing moves** | **wiring problem, not SDK** - the firmware accepted the command | check the relay output -> turnstile input wiring; no software change fixes this |
+| `ACUnlock -> FALSE` | the firmware refused the call. This SDK reports **no reason** | send the log, and switch the door command OFF for this device (Devices page, or `MONCLUB_ZK_STANDALONE_OPEN_DOOR=0`) |
+| `ACUnlock THREW` | COM/transport error, not a refusal | send the log with the exception text |
+
+Exit codes for `-Auto`: `0` all TRUE, `1` setup/connect failure, `2` some FALSE,
+`3` some call threw.
+
+> What the script does **not** know, and does not pretend to: there is **no documented
+> SDK maximum** for the delay (the `-MaxDeciseconds` ceiling of 600 is the MonClub
+> Access `pulseSeconds 1..60` limit, not an SDK one); whether the delay really holds
+> the relay that long; and what a second `ACUnlock` arriving before the first expires
+> does. The script header spells each one out. The elapsed ms is the **COM call**, not
+> the relay.
+
+> Since 2026-09-04 MonClub Access **issues** this call by default on MB2000-class
+> terminals (per-device switch on the Devices page). That is a software decision, not
+> proof - this script is still what settles whether the relay releases.
 
 ## Troubleshooting
 
