@@ -2245,19 +2245,31 @@ class DeviceSyncEngine:
             ok_synced = 0
             failed_synced = 0
 
-            # Expose live progress for the frontend banner.
-            _maybe_set_progress(
-                deviceName=dev_name or "",
-                deviceId=did,
-                current=0,
-                total=len(pins_to_sync),
-            )
-
             # ── Batch push: user + authorize rows in chunks of 50 ──────────
             # In nuke mode the device is clear — no pre-delete needed.
             # In normal mode we pre-delete pins individually before batch push.
             use_batch = nuke_mode or len(pins_to_sync) > 5
             pins_sorted = sorted(pins_to_sync)
+
+            # Expose live progress for the frontend banner.
+            # Phase C pushes templates in a SECOND pass over the same pins, so the
+            # bar must budget for it too. With `total` covering only the user push,
+            # `current` reached `total` the moment that push ended and the bar sat
+            # pinned at 100% for the entire fingerprint phase - on screen that is
+            # indistinguishable from a frozen sync.
+            # Counted from `pins_sorted` (the set Phase C actually walks), not from
+            # `templates_for_sync`, which is also populated for desired pins outside
+            # `pins_to_sync`.
+            _template_pins = (
+                sum(1 for _p in pins_sorted if templates_for_sync.get(_p))
+                if use_batch else 0
+            )
+            _maybe_set_progress(
+                deviceName=dev_name or "",
+                deviceId=did,
+                current=0,
+                total=len(pins_to_sync) + _template_pins,
+            )
 
             if use_batch and pins_sorted:
                 # P0-bulk: strategy-driven pre-delete.
@@ -2519,6 +2531,7 @@ class DeviceSyncEngine:
 
                 # Phase C: Push templates individually (binary data — too large to batch)
                 with _tel.span("SYNC_PHASE_C_TEMPLATES", device_id=dev_id, pins=len(pins_sorted)):
+                    _tpl_done = 0
                     for pin in pins_sorted:
                         templates = templates_for_sync.get(pin) or []
                         if templates:
@@ -2536,6 +2549,16 @@ class DeviceSyncEngine:
                             except Exception as ex:
                                 warn_templates_users += 1
                                 self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
+                            # Phase C is a second pass over the same pins: keep the bar moving
+                            # through it instead of leaving it pinned at the user-push total.
+                            _tpl_done += 1
+                            _maybe_set_progress(current=len(pins_sorted) + _tpl_done)
+                        # ULTRA runs this sync INLINE on the live worker, so release it between
+                        # pins: open doors queued mid-push and poll RTLog. Both helpers are
+                        # no-ops when no hook is installed (DEVICE mode) and are throttled by
+                        # the worker, so this costs a clock compare per pin.
+                        self._maybe_yield_doors()
+                        self._maybe_yield_rtlog()
 
                 # Phase D: Save device sync state + write-through mirror for all pushed pins.
                 # Build all state + mirror rows first (pure Python), then flush each to DB in
@@ -2597,7 +2620,9 @@ class DeviceSyncEngine:
                                 "[DeviceSync] Device id=%s upsert_device_mirror_batch failed "
                                 "(%d rows): %s", dev_id, len(_batch_mirror_rows), _mirror_err
                             )
-                _maybe_set_progress(current=ok_synced)
+                # Terminal tick for the batch branch: include the Phase C templates so
+                # the bar finishes full against the widened `total`.
+                _maybe_set_progress(current=ok_synced + _tpl_done)
                 self.logger.info(
                     "[DeviceSync] Device id=%s batch push complete: users=%d auth=%d templates=%d",
                     dev_id, pushed_users, len(pins_sorted), pushed_templates,

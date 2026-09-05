@@ -451,7 +451,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Last run:
-**1071 passed** (2026-09-04, after the fingerprint-telemetry session). `[TEST]`
+**1074 passed** (2026-09-05, after the Phase C progress/yield fix). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py
