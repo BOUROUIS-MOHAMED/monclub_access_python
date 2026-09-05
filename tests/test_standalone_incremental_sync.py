@@ -96,7 +96,11 @@ class FakeState:
     def save_batch(self, *, device_id, rows):
         rows = list(rows)
         self.save_calls.append(rows)
-        for pin, h, ok, _err in rows:
+        for row in rows:
+            # Rows carry an optional 5th element (pushed_finger_ids) since the
+            # finger-slot removal work; this fake only tracks (hash, ok), but it
+            # must accept the wider tuple exactly as the real writer does.
+            pin, h, ok = row[0], row[1], row[2]
             prev = self.rows.get(pin, ("", False))
             self.rows[pin] = ((h if ok else prev[0]), bool(ok))
         return len(rows)

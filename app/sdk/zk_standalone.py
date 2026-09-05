@@ -624,6 +624,7 @@ class ZKStandaloneDevice:
         users: List[Dict[str, Any]],
         templates_by_pin: Dict[str, List[Dict[str, Any]]] | None = None,
         *,
+        remove_fingers_by_pin: Dict[str, List[int]] | None = None,
         bracket_enable_device: bool = False,
         timeout_sec: float = 600.0,
     ) -> Dict[str, Any]:
@@ -638,6 +639,7 @@ class ZKStandaloneDevice:
         """
         users = list(users or [])
         templates_by_pin = templates_by_pin or {}
+        remove_fingers_by_pin = remove_fingers_by_pin or {}
 
         # The bracketed full reconcile must hold EnableDevice(False) across the
         # WHOLE roster, so it stays a single command (its own deliberate window).
@@ -655,6 +657,10 @@ class ZKStandaloneDevice:
 
         agg: Dict[str, Any] = {"ok": True, "pushed": 0, "failed": 0,
                                "templates_failed": 0, "skipped_pin": 0,
+                               # Slot clears issued vs confirmed by the terminal.
+                               # A revocation that did not land shows up here as a
+                               # gap, and nowhere else.
+                               "del_attempted": 0, "del_ok": 0,
                                "chunks_wedged": 0, "errors": [],
                                # Every pin NOT confirmed on the terminal: per-member
                                # failures reported by the chunk, plus every member of
@@ -664,6 +670,8 @@ class ZKStandaloneDevice:
         agg_failed_reasons: Dict[str, str] = {}
         agg_tpl_attempted = 0
         agg_tpl_ok = 0
+        agg_del_attempted = 0
+        agg_del_ok = 0
         consecutive_wedges = 0
         total = len(users)
         # Trace budgets span the WHOLE roster, not one chunk.
@@ -692,6 +700,7 @@ class ZKStandaloneDevice:
                     args={
                         "users": part,
                         "templates_by_pin": templates_by_pin,
+                        "remove_fingers_by_pin": remove_fingers_by_pin,
                         "bracket": bool(bracket_enable_device),
                         "trace_members": trace_members_left,
                         "trace_templates": trace_templates_left,
@@ -786,6 +795,8 @@ class ZKStandaloneDevice:
             agg["failed"] += int(res.get("failed") or 0)
             agg["skipped_pin"] += int(res.get("skipped_pin") or 0)
             agg["templates_failed"] += int(res.get("templates_failed") or 0)
+            agg["del_attempted"] += int(res.get("del_attempted") or 0)
+            agg["del_ok"] += int(res.get("del_ok") or 0)
             _chunk_failed = res.get("failed_pins")
             if _chunk_failed is None and not res.get("ok", True):
                 # A failed chunk that cannot say WHICH pins failed confirmed none of
@@ -804,6 +815,8 @@ class ZKStandaloneDevice:
                     agg_failed_reasons.setdefault(str(_fp), str(_fr))
                 agg_tpl_attempted += int(res.get("tpl_attempted") or 0)
                 agg_tpl_ok += int(res.get("tpl_ok") or 0)
+                agg_del_attempted += int(res.get("del_attempted") or 0)
+                agg_del_ok += int(res.get("del_ok") or 0)
                 _tel.event(
                     "ZKEM_PUSH_CHUNK", worker=self._tel_wid, chunk=idx, chunks=len(chunks),
                     members=len(part),
@@ -812,6 +825,11 @@ class ZKStandaloneDevice:
                     pushed=res.get("pushed"), failed=res.get("failed"),
                     templates_failed=res.get("templates_failed"),
                     tpl_attempted=res.get("tpl_attempted"), tpl_ok=res.get("tpl_ok"),
+                    # op= spelling, never the literal SDK symbol: §10.4 mandates
+                    # greps with expected match counts and a literal in a log value
+                    # would inflate them into a false MUST-NOT-CALL alarm.
+                    op="del_user_tmp_ext",
+                    del_attempted=res.get("del_attempted"), del_ok=res.get("del_ok"),
                     dur_ms=res.get("chunk_ms"), ok=bool(res.get("ok", True)),
                 )
             except Exception:
@@ -855,7 +873,9 @@ class ZKStandaloneDevice:
                        failed=agg["failed"], skipped_pin=agg["skipped_pin"],
                        ok=bool(agg["ok"]), chunks=len(chunks),
                        tpl_attempted=agg_tpl_attempted, tpl_ok=agg_tpl_ok,
-                       tpl_failed=agg["templates_failed"])
+                       tpl_failed=agg["templates_failed"],
+                       op="del_user_tmp_ext",
+                       del_attempted=agg_del_attempted, del_ok=agg_del_ok)
             # WHICH pins did not land, and WHY. One line, so "was pin X pushed?"
             # is a single grep. A pin with no recorded reason came from a WEDGED
             # chunk -- nothing in that chunk was confirmed -- which is itself the
@@ -1074,6 +1094,7 @@ class ZKStandaloneDevice:
                                     zk,
                                     users=cmd.args["users"],
                                     templates_by_pin=cmd.args["templates_by_pin"],
+                                    remove_fingers_by_pin=cmd.args.get("remove_fingers_by_pin"),
                                     bracket=cmd.args["bracket"],
                                     trace_members=int(cmd.args.get("trace_members") or 0),
                                     trace_templates=int(cmd.args.get("trace_templates") or 0),
@@ -1362,9 +1383,14 @@ class ZKStandaloneDevice:
     def _do_push_roster(self, zk: Any, *, users: List[Dict[str, Any]],
                         templates_by_pin: Dict[str, List[Dict[str, Any]]],
                         bracket: bool,
+                        remove_fingers_by_pin: Dict[str, List[int]] | None = None,
                         trace_members: int = 0, trace_templates: int = 0) -> Dict[str, Any]:
-        """Per-member: SetStrCardNumber -> SSR_SetUserInfo -> per finger
-        (delete-if-occupied -> SetUserTmpExStr Flag=1). See plan D6.
+        """Per-member: SetStrCardNumber -> SSR_SetUserInfo -> clear vacated slots ->
+        per desired finger (delete-if-occupied -> SetUserTmpExStr Flag=1). See plan D6.
+
+        remove_fingers_by_pin: finger slots this member USED to have and no longer
+        does. Supplied by the engine from persisted per-pin state; omitting it keeps
+        the old additive behaviour exactly (no extra COM calls).
         """
         pushed = 0
         failed = 0
@@ -1395,6 +1421,12 @@ class ZKStandaloneDevice:
         # widens the no-pump window -- a behaviour change, not instrumentation.
         tpl_attempted = 0
         tpl_ok = 0
+        # Slot-clear counters, same chunk-boundary rule as the template ones above.
+        # `del_attempted` counts every SSR_DelUserTmpExt issued (delete-before-write
+        # AND vacated-slot removal); `del_ok` counts the ones the terminal confirmed.
+        # A gap between them is the only signal that a revocation did not land.
+        del_attempted = 0
+        del_ok = 0
 
         def _mark_failed(p: str, reason: str = "") -> None:
             if p and p not in _failed_seen:
@@ -1474,6 +1506,36 @@ class ZKStandaloneDevice:
                         if len(errors) < 5:
                             errors.append(f"SSR_SetUserInfo pin={pin}")
                         continue
+                    # Slots this member USED to have and no longer does.
+                    #
+                    # The field bug this closes: the clear below used to exist ONLY
+                    # inside the template loop, so a member whose fingerprints were
+                    # all deleted had an empty desired set, the loop body never ran,
+                    # and no COM call was ever issued for the vacated slot. The
+                    # terminal kept verifying a revoked finger (Oxyfit, 2026-09-05).
+                    #
+                    # Done BEFORE the template loop on purpose: if a caller ever
+                    # hands us a removal set that contradicts the desired set, the
+                    # write below wins and the member keeps working. The opposite
+                    # order would delete a template we had just installed.
+                    desired_fingers = {
+                        int(t.get("fingerId") or 0)
+                        for t in ((templates_by_pin or {}).get(pin, []) or [])
+                        if str(t.get("templateData") or "")
+                    }
+                    for finger_idx in sorted(
+                        {int(f) for f in ((remove_fingers_by_pin or {}).get(pin, []) or [])}
+                        - desired_fingers
+                    ):
+                        # USE SSR_DelUserTmpExt, NOT SSR_DeleteEnrollData -- see the
+                        # note in the template loop below.
+                        del_attempted += 1
+                        try:
+                            if bool(zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))):
+                                del_ok += 1
+                        except Exception:
+                            pass
+
                     for tpl in (templates_by_pin or {}).get(pin, []) or []:
                         finger_idx = int(tpl.get("fingerId") or 0)
                         tmp = str(tpl.get("templateData") or "")
@@ -1499,7 +1561,15 @@ class ZKStandaloneDevice:
                             # returned normally. That hang is what stalled the roster.
                             if traced or templates_left > 0:
                                 self.logger.info("%s push trace pin=%s -> SSR_DelUserTmpExt(f=%s)", self._prefix, pin, finger_idx)
-                            zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))
+                            # The result used to be discarded here, so the driver
+                            # could not tell "slot cleared" from "firmware refused"
+                            # from "call threw" -- which made every removal claim
+                            # unverifiable. Counted, never decided on: a refused
+                            # clear is immediately followed by the write, whose own
+                            # result still drives ok/failed.
+                            del_attempted += 1
+                            if bool(zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))):
+                                del_ok += 1
                         except Exception:
                             pass
                         if traced or templates_left > 0:
@@ -1619,6 +1689,8 @@ class ZKStandaloneDevice:
                 "failed_reasons": failed_reasons,
                 "tpl_attempted": tpl_attempted,
                 "tpl_ok": tpl_ok,
+                "del_attempted": del_attempted,
+                "del_ok": del_ok,
                 "chunk_ms": round((time.monotonic() - t_start) * 1000.0),
                 "trace_members_left": members_left,
                 "trace_templates_left": templates_left}

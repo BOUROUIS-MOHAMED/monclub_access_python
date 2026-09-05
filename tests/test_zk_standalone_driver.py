@@ -44,6 +44,9 @@ class FakeZkem:
         self.unlock_ok = True
         self.setuserinfo_ok = True
         self.settmp_ok = True
+        # The real SSR_DelUserTmpExt returns a bool. Modelling it as None hid the
+        # fact that the driver discarded the result of every slot clear.
+        self.delusertmp_ok = True
         # device-user enumeration (list_device_users / MIRROR)
         self.device_users: List[Dict[str, Any]] = []  # {pin,name,card,enabled}
         self.readall_ok = True
@@ -101,6 +104,7 @@ class FakeZkem:
         # that firmware (12 of 19 field STA wedges had it as the last call).
         self._rec("SSR_DelUserTmpExt", machine, pin, finger_id)
         self.deleted.append((str(pin), int(finger_id)))
+        return self.delusertmp_ok
 
     def SSR_DeleteEnrollData(self, machine, pin, backup):
         # 3-arg SSR_ form (mn, pin, backupNumber). Retained ONLY for the

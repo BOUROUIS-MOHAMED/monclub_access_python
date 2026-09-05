@@ -175,6 +175,25 @@ comment.** Resolve it with hardware evidence, then update this section.
 That backup number 12 means the whole user (fingerprints + card + password) is
 `[COMMENT]` — docstring and inline comment only.
 
+### `SSR_DelUserTmpExt` against an ALREADY-EMPTY slot — measured
+
+It **returns normally**, in **~71–171 ms**. `[FIELD: Oxyfit MB2000, 2026-09-05]`
+
+Evidence, from the field log — finger 2 had never been written for pin 34439 (both
+earlier enrolments were finger 0), so the slot was empty when the clear was issued:
+
+```
+13:42:57,248 [ZKEM:9] push trace pin=34439 -> SSR_DelUserTmpExt(f=2)
+13:42:57,329 [ZKEM:9] push trace pin=34439 -> SetUserTmpExStr(f=2 len=1504)   # +81 ms
+   -> ZKEM_PUSH_CHUNK ... tpl_attempted=2 tpl_ok=2 dur_ms=859 ok=True, chunks_wedged=0
+```
+Device 8 the same, +71 ms. A second instance at 12:58:02 (finger 0, the member's
+first-ever fingerprint) took +108 ms / +169 ms.
+
+This is what makes slot removal shippable: the clear is safe on an empty slot, so a
+removal set computed from stored state cannot wedge the STA thread if it is slightly
+stale. It does **not** license a blanket 0..9 sweep — see §5.
+
 ---
 
 ## 4. The COM call layer — verbatim
@@ -361,6 +380,7 @@ the wrong heading. `[TEST: fake-COM harness under 32-bit Windows PowerShell 5.1]
 
 ```python
 def push_roster(self, users, templates_by_pin=None, *,
+                remove_fingers_by_pin=None,
                 bracket_enable_device: bool = False,
                 timeout_sec: float = 600.0) -> Dict[str, Any]        # [SIG]
 ```
@@ -369,6 +389,44 @@ def push_roster(self, users, templates_by_pin=None, *,
   ≤ 9 digits; violations are **skipped and counted**, never pushed.
   `[TEST: test_zk_standalone_driver.py::TestPushRoster::test_pin_over_9_digits_is_skipped]`
 - `templates_by_pin`: `pin -> [{fingerId, templateVersion, templateData, templateSize}]`
+- `remove_fingers_by_pin`: `pin -> [fingerId, ...]` — slots this member **used to**
+  have and no longer does. Omitting it keeps the old additive behaviour exactly
+  (zero extra COM calls). `[CODE]`
+
+### ⛔ The mirror WAS write-only — what that cost, and what fixed it
+
+> Until 2026-09-05 the only slot clear sat **inside** the loop over the templates a
+> member still had, so an empty desired set meant the loop body never ran and **no COM
+> call was ever issued for a vacated slot**. A fingerprint deleted in the dashboard
+> kept opening the turnstile.
+> `[FIELD: Oxyfit, 2026-09-05 — pin 34439. 12:58 push `templates_for=1` issued
+> `SSR_DelUserTmpExt(f=0)` + `SetUserTmpExStr`; the 13:14 push after the deletion was
+> `templates_for=0` and issued only `SetStrCardNumber('')` + `SSR_SetUserInfo`, then
+> reported `pushed=1 failed=0 tpl_attempted=0 ok=True`. The revoked finger still
+> produced `ZKEM_VERIFY_OK` / rtlog ALLOW at 13:34–13:37.]`
+
+Two properties of the old code made it invisible:
+- the clear's return value was a **bare expression** inside `except Exception: pass`,
+  so the driver could not tell *cleared* from *refused* from *threw*;
+- `ok = failed == 0 and templates_failed == 0` was True, so `device_sync_state` was
+  stamped with the post-deletion hash and the pin was **skipped forever after**.
+
+The removal set is computed by the engine from `device_sync_state.pushed_finger_ids`
+(**NULL = UNKNOWN, `''` = known-empty** — the distinction is load-bearing) and applied
+**before** the template loop, so a stale removal set can never delete a template that
+was just written. `[CODE]`
+`[TEST: test_zk_standalone_template_removal.py, test_standalone_finger_removal_state.py,
+test_db_pushed_finger_ids.py]`
+
+**Do not "simplify" this into a blanket 0..9 sweep.** At the measured ~100 ms/call
+(§3) that is ~9 000 extra COM calls on a ~900-pin bracketed roster ≈ **+15 min** on a
+push already taking 416 s, against a 600 s single-command deadline — while
+`EnableDevice(False)` is held, i.e. with the gym's sole verifier dead.
+
+**Still open:** whole-user removals (member deleted, membership expired or frozen, PIN
+changed by a renewal) do **not** reach the terminal under the default `PRESERVE`
+policy. Those all funnel into `SSR_DeleteEnrollData(1, pin, 12)`, whose hang status is
+`[UNKNOWN]` (§3), so they are **not** fixed by this work.
 
 ### Chunking
 
@@ -401,7 +459,15 @@ to 0 after any successful chunk.
 ### Result dict
 
 Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedged`,
-`errors`, **`failed_pins`**. `[CODE]`
+`errors`, **`failed_pins`**, and **`del_attempted` / `del_ok`** (added 2026-09-05).
+`[CODE]`
+
+`del_attempted` counts every `SSR_DelUserTmpExt` issued — both the delete-before-write
+of a desired slot and the removal of a vacated one. `del_ok` counts the ones the
+terminal **confirmed**. A gap between them is the only signal that a revocation did
+not land; before this existed the call's result was discarded entirely. Unlike the
+other counters below, these two **are** on the aggregate return, because the removal
+tests assert on them. Nothing decides on them. `[CODE]`
 
 Each *chunk* result additionally carries `failed_reasons`, `tpl_attempted`, `tpl_ok`
 and `chunk_ms` (added 2026-09-04). These are **telemetry only** — `push_roster` folds
@@ -776,10 +842,13 @@ bare words, which also appear in the explanatory comments:
 grep -rn "zk\.SSR_DeleteEnrollData\|zk\.SSR_DelUserTmpExt" app/ --include=*.py
 ```
 
-**Expected, exactly two lines:** `zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))` in the
-push slot-clear, and `zk.SSR_DeleteEnrollData(1, pin, 12)` — backup number **12**, the
-whole-user delete — in `_do_delete_users`. **Any `SSR_DeleteEnrollData` call with a
-finger index is the v1.4.25 hang being re-introduced.**
+**Expected, exactly three lines** (was two before the 2026-09-05 removal work):
+`zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))` **twice** in `_do_push_roster` — once
+clearing a **vacated** slot (before the template loop) and once as the
+delete-before-write of a **desired** slot (inside it) — and
+`zk.SSR_DeleteEnrollData(1, pin, 12)` — backup number **12**, the whole-user delete —
+in `_do_delete_users`. **Any `SSR_DeleteEnrollData` call with a finger index is the
+v1.4.25 hang being re-introduced.**
 
 Confirm the roster rule of the main guide (§3.2 there) — every call site must be in
 `ultra_engine.py`:

@@ -1396,6 +1396,19 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_device_sync_state_device ON device_sync_state(device_id);")
 
+        # Which finger slots we last pushed to THIS device for THIS pin.
+        # desired_hash is a one-way sha1 over the template bytes, so the finger ids
+        # cannot be recovered from it -- without this column the engine can never
+        # name the slot a revoked fingerprint used to occupy, and the standalone
+        # template mirror stays write-only (Oxyfit field bug, 2026-09-05).
+        # NULL = UNKNOWN (legacy row, never yet recorded). '' = known-empty.
+        # The distinction is load-bearing: see list_device_pushed_fingers.
+        #
+        # MUST stay AFTER the CREATE TABLE above: _ensure_column is a no-op for a
+        # table that does not exist yet, so placing it up in the migration block
+        # silently skipped it on a fresh database.
+        _ensure_column(conn, "device_sync_state", "pushed_finger_ids", "pushed_finger_ids TEXT")
+
         # -----------------------------
         # offline creation queue (access-only)
         # -----------------------------
@@ -6213,6 +6226,57 @@ def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
         return out
 
 
+@_tel.timed("DB_READ_list_device_pushed_fingers", slow_ms=50, warn_ms=1000)
+def list_device_pushed_fingers(*, device_id: int) -> Dict[str, "set[int] | None"]:
+    """Return {pin: finger ids last pushed to this device}.
+
+    ``None`` means UNKNOWN -- a row written before this column existed, or one
+    whose push failed. It is deliberately NOT the empty set: reading unknown as
+    "nothing was pushed" would make every legacy pin's removal set empty and
+    silently preserve the write-only-mirror bug. Callers must treat None as
+    "clear nothing, and do not pretend otherwise".
+
+    An empty set is a real, known state ("this pin has no fingers on the device")
+    and is stored as ''.
+    """
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, pushed_finger_ids FROM device_sync_state WHERE device_id=?",
+            (did,),
+        ).fetchall()
+        out: Dict[str, "set[int] | None"] = {}
+        for r in rows:
+            p = str(r["pin"] or "")
+            if not p:
+                continue
+            raw = r["pushed_finger_ids"]
+            if raw is None:
+                out[p] = None
+                continue
+            ids: set[int] = set()
+            for part in str(raw).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    ids.add(int(part))
+                except ValueError:
+                    continue
+            out[p] = ids
+        return out
+
+
+def encode_pushed_finger_ids(finger_ids: "Iterable[int] | None") -> "str | None":
+    """Serialise a finger-id set for device_sync_state.pushed_finger_ids.
+
+    None (unknown) round-trips as NULL; an empty set as '' (known-empty).
+    """
+    if finger_ids is None:
+        return None
+    return ",".join(str(int(f)) for f in sorted(set(finger_ids)))
+
+
 @_tel.timed("DB_READ_device_sync_hash_for_pin", slow_ms=200, warn_ms=2000)
 def get_device_sync_hash_for_pin(*, device_id: int, pin: str) -> tuple:
     """Return (desired_hash, last_ok) for ONE (device, pin) via an indexed lookup.
@@ -6264,7 +6328,12 @@ def save_device_sync_state_batch(
     updated_at = now_iso()
 
     params_list: list[tuple] = []
-    for pin, desired_hash, ok, error in (rows or []):
+    for row in (rows or []):
+        # 4-tuples (pin, desired_hash, ok, error) are the long-standing shape and
+        # still the only one the PullSDK caller uses. A 5th element carries the
+        # pushed finger ids (already encoded, or None for "leave unknown as-is").
+        pin, desired_hash, ok, error = row[0], row[1], row[2], row[3]
+        fingers = row[4] if len(row) > 4 else None
         p = str(pin or "").strip()
         if not p:
             continue
@@ -6275,6 +6344,7 @@ def save_device_sync_state_batch(
             1 if bool(ok) else 0,
             (str(error or "")[:1000]) if error else None,
             updated_at,
+            fingers,
         ))
 
     if not params_list:
@@ -6283,8 +6353,8 @@ def save_device_sync_state_batch(
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         conn.executemany(
             """
-            INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at, pushed_finger_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, pin) DO UPDATE SET
                 desired_hash = CASE
                     WHEN excluded.last_ok = 1 THEN excluded.desired_hash
@@ -6292,7 +6362,16 @@ def save_device_sync_state_batch(
                 END,
                 last_ok = excluded.last_ok,
                 last_error = excluded.last_error,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                -- Same guard as desired_hash, for the same reason: a FAILED push
+                -- must not destroy the only record of what is actually resident on
+                -- the terminal. NULL from the caller means "no opinion", which also
+                -- leaves the stored value alone.
+                pushed_finger_ids = CASE
+                    WHEN excluded.last_ok = 1 AND excluded.pushed_finger_ids IS NOT NULL
+                        THEN excluded.pushed_finger_ids
+                    ELSE device_sync_state.pushed_finger_ids
+                END
             """,
             params_list,
         )

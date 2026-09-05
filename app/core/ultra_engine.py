@@ -102,6 +102,16 @@ _MIRROR_RESERVED_PIN_FLOOR = 90000
 _MIRROR_ENROLL_GRACE_SEC = 600.0
 
 
+def _encode_fingers(finger_ids: Any) -> str:
+    """Serialise a finger-id set for device_sync_state.pushed_finger_ids.
+
+    Always returns a string, never None: callers use None to mean "no opinion,
+    leave the stored value alone", so an empty set MUST encode as '' (known-empty)
+    to stay distinguishable from UNKNOWN.
+    """
+    return ",".join(str(int(f)) for f in sorted(set(finger_ids or ())))
+
+
 def _standalone_pin_hash(entry: Dict[str, Any], templates: Any) -> str:
     """Change-detection hash of EXACTLY what push_roster hands the terminal for one pin.
 
@@ -1241,9 +1251,102 @@ class UltraDeviceWorker(threading.Thread):
             to_push.append(u)
         return to_push, len(users) - len(to_push)
 
+    # ---------------------------------------------------------------- #
+    # Finger-slot removal: which slots this device holds for each pin
+    # ---------------------------------------------------------------- #
+    @staticmethod
+    def _desired_fingers(templates: Any) -> set[int]:
+        """Finger ids push_roster will actually WRITE for one pin.
+
+        Mirrors the driver's own skip of empty templateData, so a template row
+        that will never be written cannot make us believe a slot is occupied.
+        """
+        out: set[int] = set()
+        for t in templates or []:
+            if not isinstance(t, dict):
+                continue
+            if not str(t.get("templateData") or ""):
+                continue
+            try:
+                out.add(int(t.get("fingerId")))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _load_pushed_fingers(self) -> Dict[str, Any]:
+        """{pin: set[int] | None} — None is UNKNOWN, never empty. See db.py."""
+        try:
+            from app.core.db import list_device_pushed_fingers
+            return dict(list_device_pushed_fingers(device_id=self._device_id) or {})
+        except Exception:
+            # Fail SAFE, not fail-open: with no state we cannot name a vacated
+            # slot, so we clear nothing. Never guess a removal set.
+            logger.warning(
+                "%s pushed-finger state unreadable -- no slot removals this cycle",
+                self._prefix, exc_info=True,
+            )
+            return {}
+
+    def _standalone_removals(
+        self, *, to_push: list[Dict[str, Any]],
+        templates_by_pin: Dict[str, list], pushed_fingers: Dict[str, Any],
+    ) -> Dict[str, list[int]]:
+        """Slots that were pushed before and are no longer desired.
+
+        UNKNOWN (None) yields NO removals. It must not be read as the empty set
+        (that keeps the original bug) and must not trigger a blanket 0..9 sweep
+        (~9000 extra COM calls on a full roster would blow the 600 s bracketed
+        deadline while EnableDevice(False) is held -- turnstile dead).
+        """
+        out: Dict[str, list[int]] = {}
+        for u in to_push:
+            pin = str(u.get("pin") or "").strip()
+            if not pin:
+                continue
+            prev = pushed_fingers.get(pin)
+            if prev is None:
+                continue
+            gone = sorted(set(prev) - self._desired_fingers((templates_by_pin or {}).get(pin)))
+            if gone:
+                out[pin] = gone
+        return out
+
+    def _backfill_pushed_fingers(
+        self, *, skipped_pins: list[str], templates_by_pin: Dict[str, list],
+        hashes_by_pin: Dict[str, str], pushed_fingers: Dict[str, Any],
+    ) -> None:
+        """Record finger ids for pins we did NOT push because they are unchanged.
+
+        Safe without touching the device: being skipped means last_ok=1 AND the
+        stored desired_hash equals the freshly computed one, which is the system's
+        own assertion that the terminal already holds exactly this state.
+
+        This is what gives the installed base a baseline. A pin is only pushed when
+        it changes, so without the backfill every pre-upgrade member would still be
+        UNKNOWN at the moment their first fingerprint is revoked -- i.e. the bug
+        would persist for exactly the members who already have fingerprints.
+        """
+        rows: list[tuple] = []
+        for pin in skipped_pins:
+            if pushed_fingers.get(pin) is not None:
+                continue  # already known; never overwrite
+            fingers = self._desired_fingers((templates_by_pin or {}).get(pin))
+            rows.append((pin, hashes_by_pin.get(pin, ""), True, None,
+                         _encode_fingers(fingers)))
+        if not rows:
+            return
+        try:
+            from app.core.db import save_device_sync_state_batch
+            save_device_sync_state_batch(device_id=self._device_id, rows=rows)
+            logger.info("%s recorded finger slots for %d unchanged pin(s) (no device I/O)",
+                        self._prefix, len(rows))
+        except Exception:
+            logger.debug("%s pushed-finger backfill skipped", self._prefix, exc_info=True)
+
     def _record_standalone_pin_state(
         self, *, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str],
         result: Dict[str, Any],
+        templates_by_pin: Dict[str, list] | None = None,
     ) -> None:
         """Persist per-pin outcome of one push_roster call.
 
@@ -1267,13 +1370,21 @@ class UltraDeviceWorker(threading.Thread):
         if failed_set:
             errs = result.get("errors") or []
             err = str(errs[0]) if errs else str(result.get("error") or "push_roster failed")
-        rows: list[tuple[str, str | None, bool, str | None]] = []
+        rows: list[tuple] = []
         for u in users:
             pin = str(u.get("pin") or "").strip()
             if not pin:
                 continue
             ok = pin not in failed_set
-            rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err))
+            # On success the terminal now holds exactly the desired finger set --
+            # including the EMPTY set, which is what makes a later re-enrol/revoke
+            # cycle computable instead of falling back to UNKNOWN. On failure we
+            # pass None ("no opinion"); the SQL guard keeps the previous value.
+            fingers = (
+                _encode_fingers(self._desired_fingers((templates_by_pin or {}).get(pin)))
+                if (ok and templates_by_pin is not None) else None
+            )
+            rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err, fingers))
         try:
             from app.core.db import save_device_sync_state_batch
             save_device_sync_state_batch(device_id=self._device_id, rows=rows)
@@ -1324,6 +1435,17 @@ class UltraDeviceWorker(threading.Thread):
                 to_push = list(users)
             else:
                 to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
+            # Which finger slots this terminal currently holds per pin. Read ONCE
+            # per sync; used both to name vacated slots below and to give unchanged
+            # pins a baseline they would otherwise never get.
+            pushed_fingers = self._load_pushed_fingers()
+            _to_push_pins = {str(u.get("pin") or "").strip() for u in to_push}
+            self._backfill_pushed_fingers(
+                skipped_pins=[p for p in desired_pins if p and p not in _to_push_pins],
+                templates_by_pin=templates_by_pin,
+                hashes_by_pin=hashes_by_pin,
+                pushed_fingers=pushed_fingers,
+            )
             batch_attempted = len(to_push)
             try:
                 batch_id = insert_push_batch(
@@ -1367,7 +1489,19 @@ class UltraDeviceWorker(threading.Thread):
                 to_push_pins = {str(u.get("pin") or "").strip() for u in to_push}
                 templates_to_push = {p: t for p, t in (templates_by_pin or {}).items()
                                      if p in to_push_pins}
+                # Slots this member used to have and no longer does. Without this
+                # the mirror is write-only and a revoked fingerprint keeps opening
+                # the turnstile (Oxyfit, 2026-09-05).
+                removals = self._standalone_removals(
+                    to_push=to_push, templates_by_pin=templates_to_push,
+                    pushed_fingers=pushed_fingers,
+                )
+                if removals:
+                    logger.info("%s clearing %d vacated finger slot(s) across %d pin(s)",
+                                self._prefix, sum(len(v) for v in removals.values()),
+                                len(removals))
                 result = self._sdk.push_roster(to_push, templates_to_push,
+                                               remove_fingers_by_pin=removals,
                                                bracket_enable_device=bracket)
                 sync_ok = bool(result.get("ok"))
                 sync_error = "" if sync_ok else str(
@@ -1377,6 +1511,7 @@ class UltraDeviceWorker(threading.Thread):
                 # remembered as failed even if a later step raises.
                 self._record_standalone_pin_state(
                     users=to_push, hashes_by_pin=hashes_by_pin, result=result,
+                    templates_by_pin=templates_to_push,
                 )
             # MIRROR pushing policy: after a SUCCESSFUL full push, optionally delete
             # device users not in the app roster. Heavily guarded + dry-run by default;
@@ -1449,13 +1584,26 @@ class UltraDeviceWorker(threading.Thread):
                 logger.info("%s standalone member sync: member %s not in device roster",
                             self._prefix, member_id)
                 return
-            result = self._sdk.push_roster(users, templates_by_pin)
+            # Same vacated-slot removal as the full sync. This path runs seconds
+            # after a dashboard change, so without it a revoked finger stays live
+            # until the next full sync happens to pick the pin up.
+            removals = self._standalone_removals(
+                to_push=users, templates_by_pin=templates_by_pin,
+                pushed_fingers=self._load_pushed_fingers(),
+            )
+            if removals:
+                logger.info("%s member sync: clearing %d vacated finger slot(s) for pin(s) %s",
+                            self._prefix, sum(len(v) for v in removals.values()),
+                            ",".join(sorted(removals)))
+            result = self._sdk.push_roster(users, templates_by_pin,
+                                           remove_fingers_by_pin=removals)
             # Record this pin's outcome. On success the next hash-triggered full
             # sync sees it as already-synced and skips it -- this is what stops an
             # enrolment from cascading into a whole-roster push. On failure it is
             # recorded ok=False so that full sync retries exactly this pin.
             self._record_standalone_pin_state(
                 users=users, hashes_by_pin=hashes_by_pin, result=result,
+                templates_by_pin=templates_by_pin,
             )
             if not result.get("ok"):
                 _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
