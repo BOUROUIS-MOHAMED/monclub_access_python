@@ -2244,6 +2244,10 @@ class DeviceSyncEngine:
             warn_templates_users = 0
             ok_synced = 0
             failed_synced = 0
+            # Bound here, not inside the Phase C span: the terminal batch tick
+            # reads it, and an early return added between the two later would
+            # otherwise NameError on a live sync.
+            _tpl_done = 0
 
             # ── Batch push: user + authorize rows in chunks of 50 ──────────
             # In nuke mode the device is clear — no pre-delete needed.
@@ -2531,7 +2535,6 @@ class DeviceSyncEngine:
 
                 # Phase C: Push templates individually (binary data — too large to batch)
                 with _tel.span("SYNC_PHASE_C_TEMPLATES", device_id=dev_id, pins=len(pins_sorted)):
-                    _tpl_done = 0
                     for pin in pins_sorted:
                         templates = templates_for_sync.get(pin) or []
                         if templates:
