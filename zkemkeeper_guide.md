@@ -555,6 +555,18 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   every pin — their semantics are unchanged.
 - A member sync records its pin as synced, so the post-enrolment cascade becomes a
   no-op reconcile.
+- **A targeted member sync reads that member from `sync_users` DIRECTLY, not from the
+  shared sync cache.** `_load_member_roster` calls
+  `list_sync_users_by_active_membership_ids([member_id])` first; the cache is only the
+  FALLBACK, kept because a member created offline has no `sync_users` row and is visible
+  only through the cache's projected-offline merge.
+  `[FIELD: Oxyfit 2026-09-06 16:29:20 — a member sync running off a snapshot taken
+  BEFORE a revocation re-pushed the deleted fingerprint to the terminal
+  (templates_for=1 tpl_ok=1) and then stamped device_sync_state with the hash of that
+  pre-deletion roster, so no later sync ever saw a difference and the revoked finger
+  kept opening the door]` The snapshot is shared, has a 5 s TTL, is served STALE while a
+  background refresh runs, and a full scan of it cost **7 s on the live worker** that
+  day. An indexed single-member lookup is both faster and truthful.
 - **A member sync that cannot SEE its member defers; it never reports success.**
   `load_sync_cache` has a 5 s TTL and is rebuilt right after a delta write, while a
   targeted member sync is routed within seconds of that same write — so an empty
@@ -573,7 +585,13 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   and device_sync_state still read pushed_finger_ids='0,1,2' against a real {0,1}]`
   **Still open:** *why* a just-upserted member vanishes from the cache at all. The
   same window also blanks the popup user (`rtlog ALLOW … user NOT found in local
-  cache`). `[UNKNOWN]` — the deferral makes it harmless, it does not explain it.
+  cache`). **Answered 2026-09-06:** the backend normalised "delete this fingerprint"
+  into "delete this membership", so a fast-patch bundle ran
+  `DELETE FROM sync_users WHERE active_membership_id = ?` and the row was genuinely
+  gone for ~39 s (client row counts 911 → **910** → 911). Fixed in
+  `monclub_backend` `a933338d`. `MEMBER_SYNC_DEFERRED` now carries **`in_db`** so the
+  two cases can never again be confused in a log: `in_db=False` means the row is gone,
+  `in_db=True` means it exists and a filter rejected it.
 - **Safety direction:** a state *read* failure ⇒ push everything; a state *write*
   failure ⇒ logged and ignored. MIRROR always receives the **full desired roster**,
   never the incremental subset (passing the subset would delete every unchanged

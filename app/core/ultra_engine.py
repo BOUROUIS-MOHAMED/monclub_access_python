@@ -1568,14 +1568,45 @@ class UltraDeviceWorker(threading.Thread):
             duration_ms=duration_ms, error=sync_error,
         )
 
-    def _load_member_roster(self, member_id: int, *, fresh: bool = False):
-        """Build the single-member roster. ``fresh`` bypasses the sync-cache TTL.
+    def _member_row_in_db(self, member_id: int) -> list[Dict[str, Any]] | None:
+        """The member's own row, read straight from sync_users. None = read failed.
 
-        clear_cached=True is what forces the next load to read INLINE from the DB:
-        with a snapshot still held, load_sync_cache would hand back the stale one
-        and refresh in the background, which is the very thing we are trying to
-        step past here.
+        Deliberately NOT the process-wide sync cache. That snapshot is shared, has a
+        5 s TTL, is served STALE while a background refresh runs, and a full scan of
+        it cost 7 s on the live worker in the field. For a decision about ONE member
+        it is both slower and less truthful than an indexed lookup.
         """
+        try:
+            from app.core.db import list_sync_users_by_active_membership_ids
+            return list(list_sync_users_by_active_membership_ids([int(member_id)]) or [])
+        except Exception:
+            logger.debug("%s targeted member read failed", self._prefix, exc_info=True)
+            return None
+
+    def _load_member_roster(self, member_id: int, *, fresh: bool = False):
+        """Build the single-member roster, preferring a targeted DB read.
+
+        WHY THE DB AND NOT THE SNAPSHOT. Field incident 2026-09-06 16:29:20: a member
+        sync ran off a snapshot taken BEFORE a revocation and re-pushed the deleted
+        fingerprint to the terminal, then stamped device_sync_state with the hash of
+        that pre-deletion roster -- so no later sync ever saw a difference and the
+        revoked finger kept opening the door. A targeted read is taken after the
+        write commits and cannot reproduce that.
+
+        The cache remains the FALLBACK, not dead code: a member created offline has
+        no sync_users row at all and is only visible through the cache's
+        projected-offline merge. Dropping to it costs a snapshot load, which is why
+        it is second and not first.
+
+        ``fresh`` still bypasses the cache TTL for that fallback -- clear_cached=True
+        forces an INLINE load, because with a snapshot held load_sync_cache returns
+        the stale one and refreshes in the background.
+        """
+        rows = self._member_row_in_db(member_id)
+        if rows:
+            return self._build_standalone_roster(
+                SimpleNamespace(users=rows), only_member_ids={int(member_id)},
+            )
         if fresh:
             try:
                 invalidate_sync_cache(clear_cached=True)
@@ -1602,14 +1633,26 @@ class UltraDeviceWorker(threading.Thread):
         deliberately removed, and each stray sync request would re-add them.
         """
         pin = str(member_id or "").strip()
+        # WHY the roster was empty, not just THAT it was. Reading the field log of
+        # 2026-09-06 there was no way to tell "the row was deleted" from "a filter
+        # rejected it" -- two completely different bugs behind one message. It cost
+        # hours. in_db is that discriminator, and it is one indexed lookup:
+        #   in_db=False -> the sync_users row is GONE (the signature of the backend
+        #                  emitting an ACTIVE_MEMBERSHIP delete for a credential
+        #                  deletion, fixed in monclub_backend a933338d)
+        #   in_db=True  -> the row exists and something FILTERED it out
+        #                  (allowedMemberships, validity, pin derivation)
+        _rows = self._member_row_in_db(member_id)
+        in_db = None if _rows is None else bool(_rows)
         logger.warning(
-            "%s member sync deferred: member %s -- %s. Flagged for the next full sync "
-            "rather than reported as synced.",
+            "%s member sync deferred: member %s -- %s (row in sync_users: %s). "
+            "Flagged for the next full sync rather than reported as synced.",
             self._prefix, member_id, reason,
+            "yes" if in_db else ("unknown" if in_db is None else "NO"),
         )
         try:
             _tel.warn("MEMBER_SYNC_DEFERRED", worker=self._tel_wid,
-                      member_id=member_id, reason=reason)
+                      member_id=member_id, reason=reason, in_db=in_db)
         except Exception:
             pass
         if not pin:

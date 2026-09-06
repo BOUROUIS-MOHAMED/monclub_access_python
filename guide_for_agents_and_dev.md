@@ -534,7 +534,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ENROLL_DONE` | `app.py` | `outcome user_id finger_id am_id total_ms` + per-phase `*_ms` |
 | `FP_ARRIVED` | `db.py` | `delta_mode incoming_users members_with_tpl templates am_ids ids_omitted` |
 | `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok op del_attempted del_ok dur_ms ok` |
-| `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason` |
+| `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason in_db` |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
 | `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |

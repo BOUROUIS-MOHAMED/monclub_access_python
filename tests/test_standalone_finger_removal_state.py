@@ -123,6 +123,16 @@ def fstate(monkeypatch) -> FingerState:
     monkeypatch.setattr(dbmod, "save_device_sync_state_batch", st.save_batch)
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)
+    # The targeted member read must be stubbed too, or _load_member_roster reaches
+    # the REAL C:\ProgramData\MonClub Access\access\access.db and these tests start
+    # asserting against a live gym's data. Empty here means "no sync_users row", so
+    # the engine falls back to the sync cache these tests already control -- the
+    # behaviour they were written against. Tests that specifically exercise the
+    # targeted path override this (see test_standalone_member_sync_targeted_read).
+    monkeypatch.setattr(
+        dbmod, "list_sync_users_by_active_membership_ids",
+        lambda active_membership_ids: [], raising=False,
+    )
     return st
 
 
