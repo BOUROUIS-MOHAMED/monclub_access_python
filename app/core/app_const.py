@@ -29,6 +29,13 @@ API_SYNC_ACCESS_HISTORY_URL: str = f"{_API_V1}/manager/gym/access/v1/users/bulk_
 API_LATEST_RELEASE_URL: str = f"{_API_V1}/manager/access/getLatestAccessSoftwareRelease"
 API_OPTIONAL_CONTENT_SYNC_URL: str = f"{_API_V1}/manager/gym/access/v1/content/sync"
 
+# Per-installation identity. The gym JWT is used only for the manager endpoints;
+# the separately-minted PC JWT is used only for the heartbeat endpoint.
+API_ACCESS_PCS_URL: str = f"{_API_V1}/manager/gym/access/v1/pcs"
+API_ACCESS_PC_REGISTER_URL: str = f"{API_ACCESS_PCS_URL}/register"
+API_ACCESS_PC_TOKEN_URL: str = f"{_API_V1}/public/access/v1/pc/token"
+API_ACCESS_PC_HEARTBEAT_URL: str = f"{_API_V1}/public/access/v1/pc/heartbeat"
+
 # ── TV endpoints ──────────────────────────────────────────────────────────────
 # Template placeholders use {screenId} / {snapshotId} / {taskId} —
 # they are substituted at call-time inside MonClubApi._format_url_template().
