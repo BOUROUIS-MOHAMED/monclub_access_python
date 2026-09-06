@@ -592,6 +592,36 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   `monclub_backend` `a933338d`. `MEMBER_SYNC_DEFERRED` now carries **`in_db`** so the
   two cases can never again be confused in a log: `in_db=False` means the row is gone,
   `in_db=True` means it exists and a filter rejected it.
+- **A member who LEAVES the roster is NEUTRALISED on the terminal.** After a
+  successful full push, `_neutralise_revoked_pins` takes the pins in
+  `device_sync_state` that are no longer desired and rewrites each one with a blank
+  card, an empty name and **`enabled=False`**, clearing its recorded finger slots via
+  `SSR_DelUserTmpExt`. It runs BEFORE `prune_device_sync_state`, which would
+  otherwise delete the very record of what those pins hold.
+  `[FIELD: Oxyfit 2026-09-06 — a membership set to CANCELED, then COMPLETED,
+  INACTIVE, PENDING and EXPIRED in turn, and the member kept opening the turnstile
+  every time. The backend correctly stopped exposing them
+  (AccessPatchBundleService::shouldExposeMembership) and the client simply never
+  told the device.]`
+  On a standalone terminal **the device decides and opens** — the PC only observes
+  the resulting rtlog. There is no PC-side veto, so a credential left on the
+  terminal *is* access.
+  **Neutralise, not delete:** removing the row needs `SSR_DeleteEnrollData(pin, 12)`,
+  whose hang status is `[UNKNOWN]` (§3). Every call used here is field-proven.
+  **Ownership is the safety property:** candidates come only from `device_sync_state`
+  — pins THIS app pushed — so a terminal shared with another access system can never
+  be touched. That is exactly what makes this safe where MIRROR is not.
+  **Rails:** empty roster ⇒ skip (`REVOKE_SKIP_EMPTY_ROSTER`); more than
+  `max(_REVOKE_ABSOLUTE_FLOOR=10, roster × 0.25)` pins ⇒ abort and KEEP the state
+  (`REVOKE_ABORT_FLOOR`); the MIRROR enrolment grace window and protected-pin
+  allowlist are honoured; a failed push keeps the state for retry.
+  A percentage alone was wrong here — one departure on a 3-member rig is 33 % and
+  would abort forever — hence the absolute floor underneath it.
+  `[TEST: tests/test_standalone_revoked_pin_neutralise.py]`
+- **`SSR_SetUserInfo` now honours a caller-supplied `enabled`.** It was hardcoded
+  `True`, so the driver could write a member but never a DISABLED one, which left
+  revocation with only the unproven whole-user delete. Absent key ⇒ `True`, so every
+  existing caller is unchanged. `[CODE]`
 - **Safety direction:** a state *read* failure ⇒ push everything; a state *write*
   failure ⇒ logged and ignored. MIRROR always receives the **full desired roster**,
   never the incremental subset (passing the subset would delete every unchanged

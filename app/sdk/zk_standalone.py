@@ -1508,9 +1508,17 @@ class ZKStandaloneDevice:
                         if traced:
                             self.logger.info("%s push trace pin=%s -> SetStrCardNumber('')", self._prefix, pin)
                         zk.SetStrCardNumber("")
+                    # `enabled` was hardcoded True, so the driver could write a member
+                    # but never write a DISABLED one. That left revocation with only
+                    # one instrument -- deleting the whole row via the unproven
+                    # SSR_DeleteEnrollData(pin, 12). Honouring the caller's flag lets
+                    # a departed member be neutralised with proven calls instead.
+                    # Absent key => True, so every existing caller is unchanged.
+                    enabled = bool(u.get("enabled", True))
                     if traced:
-                        self.logger.info("%s push trace pin=%s -> SSR_SetUserInfo", self._prefix, pin)
-                    ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, True))
+                        self.logger.info("%s push trace pin=%s -> SSR_SetUserInfo(enabled=%s)",
+                                         self._prefix, pin, enabled)
+                    ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, enabled))
                     if not ok:
                         failed += 1
                         _mark_failed(pin, "set_user_info_false")

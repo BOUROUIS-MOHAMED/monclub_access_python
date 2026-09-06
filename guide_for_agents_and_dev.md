@@ -535,6 +535,9 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `FP_ARRIVED` | `db.py` | `delta_mode incoming_users members_with_tpl templates am_ids ids_omitted` |
 | `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok op del_attempted del_ok dur_ms ok` |
 | `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason in_db` |
+| `REVOKE_DONE` | `ultra_engine.py` | `pins slots ok del_attempted del_ok` |
+| `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
+| `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
 | `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |
