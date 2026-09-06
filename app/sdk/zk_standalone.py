@@ -1162,14 +1162,25 @@ class ZKStandaloneDevice:
 
     # ---- STA-side operations (zk = the COM object; never called elsewhere) ----
 
-    # GetDeviceStatus indices, standard ZKTeco standalone SDK. Reported raw as well
-    # as named, because index meanings vary a little across firmware -- never state
-    # a capacity we did not actually read.
+    # GetDeviceStatus indices, standard ZKTeco standalone SDK.
+    #
+    # CORRECTED 2026-09-06 against the vendor manual and confirmed by arithmetic on
+    # the Oxyfit MB2000. Indices 4 and 5 were previously WRONG here: 4 is passwords
+    # (not attendance) and 5 is the operation log (not passwords). The device made
+    # that obvious -- it reported 7004 for "passwords" against 1838 users, and the
+    # two doors disagreed (7004 vs 243), which is operation-log behaviour, not
+    # credential behaviour. Attendance is 6, and 100000 - 99930 = 70 = index 6
+    # confirmed it on the live device.
+    #
+    # 21/22 (faces) were missing entirely, so a multi-bio terminal's face enrolments
+    # were invisible to us -- which matters, because nothing in this app backs up or
+    # restores a face template.
     _STATUS_FIELDS = {
-        1: "admins", 2: "users", 3: "fingerprints", 4: "attendance_records",
-        5: "passwords", 7: "fingerprint_capacity", 8: "user_capacity",
-        9: "attendance_capacity", 10: "fingerprints_free", 11: "users_free",
-        12: "attendance_free",
+        1: "admins", 2: "users", 3: "fingerprints", 4: "passwords",
+        5: "operation_records", 6: "attendance_records",
+        7: "fingerprint_capacity", 8: "user_capacity", 9: "attendance_capacity",
+        10: "fingerprints_free", 11: "users_free", 12: "attendance_free",
+        21: "faces", 22: "face_capacity",
     }
 
     def _read_device_status(self, zk: Any) -> Dict[str, int]:

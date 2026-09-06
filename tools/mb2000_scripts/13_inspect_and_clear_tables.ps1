@@ -58,24 +58,35 @@ function Write-Log {
 # returns the entry at that POSITION, not the entry with that KEY - the trap that
 # already mislabelled the counters in script 3.
 #
-# The index -> label mapping is [UNVERIFIED] and the repo contradicts itself:
-# 3_get_device_info.ps1 reads 6 = attendance and 8 = face, while the driver's
-# _STATUS_FIELDS reads 4 = attendance and 8 = user capacity. So EVERY index is shown
-# with its raw number and the label is printed as a guess. Trust the number, and use
-# the arithmetic check below (used + free == capacity) to decide which labels hold.
+# Index -> meaning, per the ZKTeco standalone SDK manual (GetDeviceStatus), and
+# confirmed on the Oxyfit MB2000 2026-09-06 by the used + free == capacity checks
+# printed below.
+#
+# Both earlier sources in this repo were wrong: 3_get_device_info.ps1 read 8 as
+# "face", and the driver's _STATUS_FIELDS read 4 as attendance and 5 as passwords.
+# The live device exposed it - 7004 "passwords" for 1838 users is impossible, and
+# the two doors disagreed (7004 vs 243). 5 is the OPERATION LOG, which accumulates
+# with admin actions and so legitimately differs per door. Passwords are index 4,
+# and on that device the real answer was 0.
+#
+# 21/22 are faces. Nothing in this pack or the app reads them, so a multi-bio
+# terminal's face enrolments have been invisible - and NOTHING here can back one
+# up or restore it. If 21 is non-zero, a whole-user delete destroys faces for good.
 $StatusIdx = @(
-    @(1, 'admins            (guess)'),
-    @(2, 'users             (guess)'),
-    @(3, 'fingerprints      (guess)'),
-    @(4, 'attendance recs   (guess)'),
-    @(5, 'passwords         (guess)'),
-    @(6, 'att logs / face   (guess - the two sources disagree)'),
-    @(7, 'fingerprint cap   (guess)'),
-    @(8, 'user cap / face   (guess - the two sources disagree)'),
-    @(9, 'attendance cap    (guess)'),
-    @(10, 'fingerprints free (guess)'),
-    @(11, 'users free        (guess)'),
-    @(12, 'attendance free   (guess)')
+    @(1, 'admins'),
+    @(2, 'users'),
+    @(3, 'fingerprints'),
+    @(4, 'passwords'),
+    @(5, 'operation log records'),
+    @(6, 'attendance records'),
+    @(7, 'fingerprint capacity'),
+    @(8, 'user capacity'),
+    @(9, 'attendance capacity'),
+    @(10, 'fingerprints free'),
+    @(11, 'users free'),
+    @(12, 'attendance free'),
+    @(21, 'FACES'),
+    @(22, 'face capacity')
 )
 
 function Get-Counts {
@@ -330,6 +341,17 @@ try {
         default { $null }
     }
     if (-not $label) { Write-Warn "unknown choice '$target'"; Pause-End; exit 0 }
+
+    # Faces are the one credential nothing here can save. 10_backup_restore_device.ps1
+    # reads finger slots only, so a face enrolment has no backup and no restore path.
+    if ($target -eq 'U' -and $before.ContainsKey(21) -and [int]$before[21] -gt 0) {
+        Write-Host ""
+        Write-Err "THIS DEVICE HOLDS $($before[21]) FACE TEMPLATE(S)."
+        Write-Err "Nothing in this script pack can back up or restore a face. A whole-user"
+        Write-Err "delete destroys them permanently. Use [F] fingerprints instead unless you"
+        Write-Err "are certain those faces are disposable."
+        if ((Ask-Default "Continue anyway? (y/n)" 'n') -ne 'y') { Write-Info "cancelled"; Pause-End; exit 0 }
+    }
 
     if ($target -eq 'U') {
         Write-Warn "SSR_DeleteEnrollData(pin, 12) has never been confirmed on this firmware."

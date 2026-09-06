@@ -371,29 +371,50 @@ Both try **two win32com shapes** (`VARIANT` ByRef, then a returned tuple) becaus
 mapping differs across builds, and give up quietly. Best-effort diagnostics, never
 gates. `[CODE]`
 
-`_STATUS_FIELDS` has **ELEVEN** entries — indices **1–5 and 7–12**; **index 6 is
-absent**, and the highest index is 12. `[CODE]`
+`_STATUS_FIELDS` has **FOURTEEN** entries — indices **1–12 and 21–22**. `[CODE]`
 
 | idx | name | idx | name |
 |---|---|---|---|
-| 1 | `admins` | 8 | `user_capacity` |
-| 2 | `users` | 9 | `attendance_capacity` |
-| 3 | `fingerprints` | 10 | `fingerprints_free` |
-| 4 | `attendance_records` | 11 | `users_free` |
-| 5 | `passwords` | 12 | `attendance_free` |
+| 1 | `admins` | 9 | `attendance_capacity` |
+| 2 | `users` | 10 | `fingerprints_free` |
+| 3 | `fingerprints` | 11 | `users_free` |
+| 4 | `passwords` | 12 | `attendance_free` |
+| 5 | `operation_records` | 21 | `faces` |
+| 6 | `attendance_records` | 22 | `face_capacity` |
 | 7 | `fingerprint_capacity` | | |
+| 8 | `user_capacity` | | |
 
 Any index that will not read is simply **omitted** — an unreadable status must never
 invent a capacity. `[CODE]` `[TEST]`
 
-**The `.ps1` lab contradicts this table on two indices.** `tools/mb2000_scripts/`
-scripts `3_get_device_info.ps1` and `12_force_open_door.ps1` label **6 = att logs** and
-**8 = face templates**, but `_STATUS_FIELDS` has **no index 6 at all** and maps
-**4 = `attendance_records`**, **8 = `user_capacity`**. One side is wrong; nothing in the
-repo settles which. `[UNVERIFIED]` Resolve on the MB2000 by reading indices 1–12 and
-comparing against the terminal's own on-screen counts. Until then the driver's `4` and
-the scripts' `6`/`8` labels are both suspect, and neither should be quoted to an
-operator as fact. The scripts' index→label *pairing* is at least mechanically correct
+> **Corrected 2026-09-06.** This table previously carried `4 = attendance_records`,
+> `5 = passwords`, no index 6, and no faces, while `3_get_device_info.ps1` claimed
+> `6 = att logs` and `8 = face templates`. **Both were wrong**, and the guide recorded
+> the disagreement as `[UNVERIFIED]` pending a real device. The device settled it.
+>
+> Live MB2000 at 192.168.1.247, 2026-09-06:
+> `admins=0 users=1838 fingerprints=2023 idx4=0 idx5=7004 idx6=70 idx7=3000 idx8=3000`
+> `idx9=100000 idx10=977 idx11=1162 idx12=99930`
+>
+> Three independent checks:
+> * `1838 + 1162 = 3000` ⇒ 2 users, 11 users-free, **8 user capacity** (so 8 is NOT face).
+> * `2023 + 977 = 3000` ⇒ 3 fingerprints, 10 free, 7 fingerprint capacity.
+> * `100000 − 99930 = 70 = idx6` ⇒ **6 is attendance records**, and index 4 is not.
+>
+> And `idx5 = 7004` cannot be passwords for 1838 users. The two doors disagree on it
+> (7004 at the entrance, 243 at the exit) — that is **operation-log** behaviour, a
+> monotonically growing record of admin actions, not a credential count. The vendor
+> manual agrees: 4 = passwords, 5 = operation records, 6 = attendance records,
+> **21 = faces, 22 = face capacity**. `[FIELD]` + vendor SDK manual.
+>
+> Indices **21/22 had never been read by anything in this repo**, so a multi-bio
+> terminal's face enrolments were invisible. That matters: `10_backup_restore_device.ps1`
+> captures finger slots only, so **a face template has no backup and no restore path**.
+> `13_inspect_and_clear_tables.ps1` now reads 21 and refuses a whole-user delete
+> without an explicit extra confirmation when it is non-zero.
+>
+> On that device the honest reading is: **0 passwords**, 70 attendance records, and a
+> 7004-entry operation log
 as of 2026-09-04 — before that, both scripts indexed an `[ordered]` hashtable with an
 integer, which returns by **position, not key**, and silently printed each count under
 the wrong heading. `[TEST: fake-COM harness under 32-bit Windows PowerShell 5.1]`

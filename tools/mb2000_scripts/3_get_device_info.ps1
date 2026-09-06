@@ -4,7 +4,8 @@
 # SIGNATURES USED:
 #   GetFirmwareVersion(1,[ref]s)  GetSerialNumber(1,[ref]s)  GetDeviceMAC(1,[ref]s)
 #   GetPlatform(1,[ref]s)         GetDeviceIP(1,[ref]s)      GetVendor([ref]s)
-#   GetDeviceStatus(1,idx,[ref]n)   idx: 1=admins 2=users 3=fingerprints 6=att logs
+#   GetDeviceStatus(1,idx,[ref]n)   idx: 1=admins 2=users 3=fingerprints 4=passwords
+#                                   5=operation log 6=attendance 21=faces (SDK manual)
 #   GetDeviceTime(1,[ref]y,[ref]mo,[ref]d,[ref]h,[ref]mi,[ref]s)
 . "$PSScriptRoot\_common.ps1"
 Assert-32Bit $PSCommandPath $args
@@ -38,10 +39,14 @@ try {
     # that KEY - so $map[6] is out of range and $map[1] is the SECOND entry. Written
     # with a hashtable this loop silently mislabels the counters (the admin count
     # printed as "users", and no label at all for indexes 6 and 8). Verified in 5.1.
-    # GetDeviceStatus index: 1=admins 2=users 3=fingerprints 6=att logs 8=face.
+    # GetDeviceStatus index, per the ZKTeco standalone SDK manual and confirmed on
+    # the Oxyfit MB2000 2026-09-06. '8 = face' was WRONG - 8 is user capacity and
+    # faces are 21/22. Passwords are 4; 5 is the operation log, which is why it
+    # reads in the thousands and differs per door.
     $statusFields = @(
-        @(1, 'Admins'), @(2, 'Users'), @(3, 'Fingerprints'),
-        @(6, 'Attendance logs'), @(8, 'Face templates')
+        @(1, 'Admins'), @(2, 'Users'), @(3, 'Fingerprints'), @(4, 'Passwords'),
+        @(5, 'Operation log'), @(6, 'Attendance logs'),
+        @(21, 'Face templates'), @(22, 'Face capacity')
     )
     foreach ($sf in $statusFields) {
         $idx = [int]$sf[0]
