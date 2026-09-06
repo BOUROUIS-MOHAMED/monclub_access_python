@@ -4378,6 +4378,16 @@ def _log_incoming_templates(users: Any, delta_mode: bool) -> None:
         pass
 
 
+# H-006 threshold. A members response that would empty a local cache larger than this is
+# treated as a backend error, not as a gym that genuinely lost every member: sync_users IS
+# the door decision (access_verification.verify_card admits a card because its row is
+# present, with no date or status logic), so a wrongly emptied table locks the gym out
+# until a successful full refresh. Both members branches of save_sync_cache_delta read it
+# -- the full branch on `users == []`, the delta branch on `validMemberIds == []`. The
+# pre-delta writer save_sync_cache still carries its own literal 10.
+_H006_MIN_CACHE_ROWS = 10
+
+
 def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
@@ -4390,7 +4400,10 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
         "settings":    True/False,
     }
 
-    H-006 guard only applies when refreshMembers=True AND backend returns 0 users.
+    H-006 guard (_H006_MIN_CACHE_ROWS) applies to both members branches when
+    refreshMembers=True: the full branch refuses `users == []`, the delta branch refuses
+    `validMemberIds == []`. The delta branch skips ONLY its delete and lets the rest of
+    the transaction commit.
     """
     if not data:
         return
@@ -4451,6 +4464,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                     members_cached_fetch_ms = 0.0
                     members_delete_ms = 0.0
                     deleted_count = 0
+                    delete_refused = False
+                    delete_refused_count = 0
                     if users:
                         t_upsert = time.perf_counter()
                         for u in users:
@@ -4500,6 +4515,36 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         members_cached_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
                         ids_to_remove = {r[0] for r in cached_rows} - valid_set
                         ids_list = list(ids_to_remove)
+                        # H-006 mirror of the full branch below. `valid_ids is not None`
+                        # is TRUE for an empty list, so a response carrying
+                        # membersDeltaMode=true + validMemberIds=[] made ids_list the
+                        # entire local roster and deleted it -- a total door lockout from
+                        # one malformed or transient backend response. Refuse the delete
+                        # on the same blast radius the full branch uses, and skip ONLY
+                        # the delete. Not the shape the full branch uses: it returns out
+                        # of _write, and _db_writer_loop commits on a normal return, so
+                        # it silently skips the devices / credentials / infrastructures
+                        # sections further down (pre-existing since 40ff255, 2026-04-13
+                        # -- flagged, not copied). This transaction still owes them.
+                        # No ratio guard on a NON-empty validMemberIds: a legitimate mass
+                        # revocation refused would keep ex-members' cards admitted, which
+                        # is fail-open. [TEST: tests/test_delta_user_cache.py]
+                        if not valid_set and len(ids_list) > _H006_MIN_CACHE_ROWS:
+                            delete_refused = True
+                            delete_refused_count = len(ids_list)
+                            ids_list = []
+                            _logger.error(
+                                "[DB] save_sync_cache_delta: backend returned 0 validMemberIds "
+                                "(membersDeltaMode=True) but local cache has %d members. "
+                                "Refusing to clear -- likely backend error.",
+                                delete_refused_count,
+                            )
+                        elif not valid_set and ids_list:
+                            _logger.warning(
+                                "[SYNC-DEBUG] H-006 NOT triggered (delta, roster=%d <= %d). "
+                                "Will DELETE all %d cached members with 0 replacements!",
+                                len(ids_list), _H006_MIN_CACHE_ROWS, len(ids_list),
+                            )
                         deleted_count = len(ids_list)
                         t_delete = time.perf_counter()
                         for i in range(0, len(ids_list), 500):
@@ -4512,6 +4557,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         members_delete_ms = (time.perf_counter() - t_delete) * 1000.0
                     profile["members_upserted"] = upserted_count
                     profile["members_deleted"] = deleted_count
+                    profile["members_delete_refused"] = delete_refused
+                    profile["members_delete_refused_count"] = delete_refused_count
                     profile["members_upsert_ms"] = round(members_upsert_ms, 3)
                     profile["members_validset_ms"] = round(members_validset_ms, 3)
                     profile["members_cached_fetch_ms"] = round(members_cached_fetch_ms, 3)
@@ -4525,16 +4572,16 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         len(users), old_count,
                     )
                     if not users:
-                        if old_count > 10:
+                        if old_count > _H006_MIN_CACHE_ROWS:
                             _logger.error(
                                 f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
                                 f"but local cache has {old_count}. Refusing to clear — likely backend error."
                             )
                             return {"credentials": None}
                         _logger.warning(
-                            "[SYNC-DEBUG] H-006 NOT triggered (old_count=%d <= 10). "
+                            "[SYNC-DEBUG] H-006 NOT triggered (full, old_count=%d <= %d). "
                             "Will DELETE all sync_users with 0 replacements!",
-                            old_count,
+                            old_count, _H006_MIN_CACHE_ROWS,
                         )
 
                     # Per-row diff (2026-09-04). Until then this branch hashed the whole

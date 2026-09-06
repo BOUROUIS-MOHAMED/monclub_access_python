@@ -284,3 +284,146 @@ def test_apply_member_shadow_delta_updates_and_deletes_in_one_pass(db):
 
     assert deleted == [2]
     assert [tuple(row) for row in rows] == [(1, "Alice Updated")]
+
+
+# ── delta-mode empty-validMemberIds guard (H-006 mirror) ─────────────────
+#
+# WHY THIS BLOCK EXISTS
+# ---------------------
+# The delta branch deleted every cached member whenever the backend sent
+# `membersDeltaMode: true` with `validMemberIds: []` -- `valid_ids is not None`
+# is true for an empty list, so `ids_to_remove` became the whole local roster.
+# `access_verification.verify_card` admits a card purely because its row is
+# present in `sync_users`, so an emptied table is a total door lockout at the
+# gym until a successful full refresh. The full-replace branch has refused this
+# shape since H-006 (`users == []` against a cache of > 10 rows); the delta
+# branch never got the same guard. These tests pin the mirrored policy.
+
+def _seed(db, count, first=1):
+    ids = list(range(first, first + count))
+    db.upsert_delta_users([_make_user(am_id=i, user_id=i + 100) for i in ids])
+    return set(ids)
+
+
+_MEMBERS_ONLY = {"members": True, "devices": False, "credentials": False, "settings": False}
+
+
+def test_delta_empty_valid_ids_refuses_to_clear_a_populated_roster(db):
+    """membersDeltaMode=True + validMemberIds=[] against > 10 cached rows is a backend
+    error, not a gym that lost every member. Refuse the delete."""
+    seeded = _seed(db, 11)
+
+    data = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    db.save_sync_cache_delta(data, _MEMBERS_ONLY)
+
+    assert set(db.get_all_cached_user_am_ids()) == seeded
+
+
+def test_delta_empty_valid_ids_refusal_reports_zero_deleted_in_the_profile(db):
+    """The refusal must not lie in the write profile: members_deleted is what was
+    actually removed (0), and the would-have-been count lands in its own key."""
+    _seed(db, 11)
+
+    db.save_sync_cache_delta(_make_sync_data(users=[], delta_mode=True, valid_ids=[]), _MEMBERS_ONLY)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert profile["members_deleted"] == 0
+    assert profile["members_delete_refused"] is True
+    assert profile["members_delete_refused_count"] == 11
+
+
+def test_delta_empty_valid_ids_still_clears_a_roster_at_the_threshold(db):
+    """A gym can legitimately have no members. The full branch draws that line at
+    `> 10`; exactly 10 rows still clears, so the two branches read as one policy."""
+    _seed(db, 10)
+
+    db.save_sync_cache_delta(_make_sync_data(users=[], delta_mode=True, valid_ids=[]), _MEMBERS_ONLY)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert set(db.get_all_cached_user_am_ids()) == set()
+    assert profile["members_deleted"] == 10
+    assert profile["members_delete_refused"] is False
+    assert profile["members_delete_refused_count"] == 0
+
+
+def test_delta_non_empty_valid_ids_deletes_exactly_the_absent_ids(db):
+    """The healthy path is untouched: the guard only reads `valid_set` emptiness."""
+    _seed(db, 12)
+
+    data = _make_sync_data(users=[], delta_mode=True, valid_ids=[2, 4, 6, 8, 10, 12])
+    db.save_sync_cache_delta(data, _MEMBERS_ONLY)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert set(db.get_all_cached_user_am_ids()) == {2, 4, 6, 8, 10, 12}
+    assert profile["members_deleted"] == 6
+    assert profile["members_delete_refused"] is False
+
+
+def test_delta_non_empty_valid_ids_mass_delete_is_not_refused(db):
+    """No ratio guard: 1 valid id against 12 cached rows still deletes 11. Refusing a
+    legitimate mass revocation would keep ex-members' cards admitted (verify_card
+    allows on table presence alone) -- fail-open, the wrong direction."""
+    _seed(db, 12)
+
+    db.save_sync_cache_delta(_make_sync_data(users=[], delta_mode=True, valid_ids=[7]), _MEMBERS_ONLY)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert set(db.get_all_cached_user_am_ids()) == {7}
+    assert profile["members_deleted"] == 11
+    assert profile["members_delete_refused"] is False
+
+
+def test_delta_empty_valid_ids_refusal_still_commits_the_rest_of_the_write(db):
+    """Refusing the delete must skip ONLY the delete. Unlike the full branch (which has
+    nothing left to do and returns early), the delta branch still owes devices,
+    credentials, settings, memberships and infrastructures the same transaction."""
+    seeded = _seed(db, 11)
+
+    data = _make_sync_data(users=[], delta_mode=True, valid_ids=[])
+    data["devices"] = [{"id": 9, "name": "Turnstile A"}]
+    data["gymAccessCredentials"] = [_make_credential(cred_id=1, account_id=10)]
+    data["infrastructures"] = [{"id": 3, "name": "Main", "gymAgent": {}}]
+    data["membership"] = [{"id": 7, "title": "Gold", "description": "d", "price": 99.0,
+                           "durationInDays": 30}]
+    data["accessSoftwareSettings"] = {
+        "gymId": 58, "accessServerHost": "10.0.0.5", "accessServerPort": 8080,
+        "accessServerEnabled": True, "createdAt": "2026-09-06T00:00:00Z",
+        "updatedAt": "2026-09-06T00:00:00Z",
+    }
+    db.save_sync_cache_delta(
+        data, {"members": True, "devices": True, "credentials": True, "settings": True}
+    )
+
+    assert set(db.get_all_cached_user_am_ids()) == seeded  # delete refused
+    with db.get_conn() as conn:
+        def _count(table):
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+        assert _count("sync_devices") == 1
+        assert _count("sync_gym_access_credentials") == 1
+        assert _count("sync_infrastructures") == 1
+        assert _count("sync_memberships") == 1
+        host = conn.execute(
+            "SELECT access_server_host FROM sync_access_software_settings WHERE id=1"
+        ).fetchone()[0]
+    assert host == "10.0.0.5"
+
+
+def test_delta_empty_valid_ids_refusal_keeps_upserted_members(db):
+    """A payload that upserts members AND sends validMemberIds=[] contradicts itself.
+    The guard must not let the just-written rows be deleted either."""
+    _seed(db, 11)
+
+    data = _make_sync_data(
+        users=[_make_user(am_id=99, user_id=199, full_name="New Member")],
+        delta_mode=True,
+        valid_ids=[],
+    )
+    db.save_sync_cache_delta(data, _MEMBERS_ONLY)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    ids = set(db.get_all_cached_user_am_ids())
+    assert 99 in ids
+    assert len(ids) == 12
+    assert profile["members_upserted"] == 1
+    assert profile["members_delete_refused"] is True
