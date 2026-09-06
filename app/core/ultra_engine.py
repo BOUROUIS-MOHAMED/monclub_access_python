@@ -25,6 +25,7 @@ from app.core.db import (
     insert_access_history,
     count_recent_for_user_door,
     load_sync_cache,
+    invalidate_sync_cache,
     get_local_state_generation,
     get_membership_brief_index,
     get_membership_brief_index_cached,
@@ -1567,22 +1568,92 @@ class UltraDeviceWorker(threading.Thread):
             duration_ms=duration_ms, error=sync_error,
         )
 
+    def _load_member_roster(self, member_id: int, *, fresh: bool = False):
+        """Build the single-member roster. ``fresh`` bypasses the sync-cache TTL.
+
+        clear_cached=True is what forces the next load to read INLINE from the DB:
+        with a snapshot still held, load_sync_cache would hand back the stale one
+        and refresh in the background, which is the very thing we are trying to
+        step past here.
+        """
+        if fresh:
+            try:
+                invalidate_sync_cache(clear_cached=True)
+            except Exception:
+                logger.debug("%s could not force a fresh sync cache", self._prefix, exc_info=True)
+        cache = load_sync_cache()
+        if cache is None:
+            return [], {}, {}
+        return self._build_standalone_roster(cache, only_member_ids={int(member_id)})
+
+    def _defer_member_sync(self, member_id: int, *, reason: str) -> None:
+        """Flag the pin so the periodic full sync is guaranteed to re-evaluate it.
+
+        Returning quietly here is precisely what lost a revocation in the field:
+        the caller treats a plain return as success, and _standalone_pins_needing_push
+        then skips the pin forever because its stored row still reads last_ok=1.
+        Marking it NOT-ok routes it back through the existing, proven retry channel.
+        The CASE WHEN excluded.last_ok = 1 guard in the upsert preserves both
+        desired_hash and pushed_finger_ids, so flagging costs us no knowledge of
+        what is actually resident on the terminal.
+
+        Only a pin we have ALREADY pushed is flagged. Inventing a row for a member
+        we have never seen would resurrect pins that prune_device_sync_state
+        deliberately removed, and each stray sync request would re-add them.
+        """
+        pin = str(member_id or "").strip()
+        logger.warning(
+            "%s member sync deferred: member %s -- %s. Flagged for the next full sync "
+            "rather than reported as synced.",
+            self._prefix, member_id, reason,
+        )
+        try:
+            _tel.warn("MEMBER_SYNC_DEFERRED", worker=self._tel_wid,
+                      member_id=member_id, reason=reason)
+        except Exception:
+            pass
+        if not pin:
+            return
+        try:
+            from app.core.db import (
+                list_device_sync_hashes_and_status,
+                save_device_sync_state_batch,
+            )
+            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+            if pin not in state:
+                return
+            # hash="" and fingers=None are both ignored by the ok=0 branch of the
+            # upsert; only last_ok/last_error actually change.
+            save_device_sync_state_batch(
+                device_id=self._device_id,
+                rows=[(pin, "", False, reason, None)],
+            )
+        except Exception:
+            logger.debug("%s could not flag pin %s for retry", self._prefix, pin, exc_info=True)
+
     def _run_standalone_member_sync(self, member_id: int) -> None:
         """Targeted single-member push for a push driver. Failure logs + telemetry
         (no endless re-queue — the periodic full sync is the safety net)."""
         _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
         _ms_t0 = time.monotonic()
         try:
-            cache = load_sync_cache()
-            if cache is None:
-                logger.warning("%s standalone member sync skipped: no sync cache", self._prefix)
-                return
-            users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(
-                cache, only_member_ids={int(member_id)},
-            )
+            users, templates_by_pin, hashes_by_pin = self._load_member_roster(member_id)
             if not users:
-                logger.info("%s standalone member sync: member %s not in device roster",
-                            self._prefix, member_id)
+                # The member may be only TRANSIENTLY absent. load_sync_cache has a
+                # 5 s TTL and is rebuilt right after a delta write, while a targeted
+                # member sync is routed within seconds of that same write -- so this
+                # path runs exactly when the snapshot is most likely to be in flux.
+                # Field trace 2026-09-06: the delete of finger 2 landed at 14:19:57,
+                # the member sync read an empty roster at 14:20:01, and the member
+                # was visible again at 14:20:13. Re-read ONCE, bypassing the TTL,
+                # before concluding anything about this member.
+                users, templates_by_pin, hashes_by_pin = self._load_member_roster(
+                    member_id, fresh=True,
+                )
+            if not users:
+                self._defer_member_sync(
+                    member_id, reason="member not visible in the sync cache",
+                )
                 return
             # Same vacated-slot removal as the full sync. This path runs seconds
             # after a dashboard change, so without it a revoked finger stays live

@@ -177,22 +177,46 @@ That backup number 12 means the whole user (fingerprints + card + password) is
 
 ### `SSR_DelUserTmpExt` against an ALREADY-EMPTY slot — measured
 
-It **returns normally**, in **~71–171 ms**. `[FIELD: Oxyfit MB2000, 2026-09-05]`
+It **does not hang** — it returns in **~71–171 ms** — but it returns **`False`**.
+`[FIELD: Oxyfit MB2000, 2026-09-05 latency, 2026-09-06 return value]`
 
-Evidence, from the field log — finger 2 had never been written for pin 34439 (both
-earlier enrolments were finger 0), so the slot was empty when the clear was issued:
+> **Correction, 2026-09-06.** This section previously read "it returns normally".
+> That was wrong, and wrong in an instructive way: the 2026-09-05 evidence was a
+> *latency* measurement taken while `zk_standalone.py` still discarded the call's
+> result, so the return value was literally unobservable. Timing was graded
+> `[FIELD]`; success was inferred and should have been graded `[UNVERIFIED]`.
+> Capturing the result (same commit as the removal fix) settled it the next day.
+
+Evidence — every single-member push, both terminals, deterministic:
 
 ```
-13:42:57,248 [ZKEM:9] push trace pin=34439 -> SSR_DelUserTmpExt(f=2)
-13:42:57,329 [ZKEM:9] push trace pin=34439 -> SetUserTmpExStr(f=2 len=1504)   # +81 ms
-   -> ZKEM_PUSH_CHUNK ... tpl_attempted=2 tpl_ok=2 dur_ms=859 ok=True, chunks_wedged=0
+tpl_attempted=1 tpl_ok=1  del_attempted=1 del_ok=0     (6 occurrences)
+tpl_attempted=2 tpl_ok=2  del_attempted=2 del_ok=1     (6 occurrences)
+tpl_attempted=3 tpl_ok=3  del_attempted=3 del_ok=2     (4 occurrences)
 ```
-Device 8 the same, +71 ms. A second instance at 12:58:02 (finger 0, the member's
-first-ever fingerprint) took +108 ms / +169 ms.
 
-This is what makes slot removal shippable: the clear is safe on an empty slot, so a
-removal set computed from stored state cannot wedge the STA thread if it is slightly
-stale. It does **not** license a blanket 0..9 sweep — see §5.
+Exactly one clear fails in each, and it is the freshly-enrolled slot — the only one
+that was empty. The control is the same day's full roster push over slots the
+terminal already held:
+
+```
+ZKEM_PUSH_DONE ... tpl_attempted=943 tpl_ok=943 del_attempted=943 del_ok=943
+```
+
+943/943 on occupied slots, `n-1/n` whenever one slot is new. That rules out both
+"the first clear in a push fails" and "the last one fails" — bulk chunks would show
+one failure each and they show none (11/11, 10/10, 13/13 …).
+
+**Consequences.**
+1. The clear is still **safe** on an empty slot: no hang, no wedge. Slot removal
+   computed from stored state remains shippable, and a slightly stale removal set
+   cannot hurt. It does **not** license a blanket 0..9 sweep — see §5.
+2. `del_ok < del_attempted` is **expected** right after an enrolment and is not an
+   alarm. Only a gap on a slot known to be occupied indicates a real refusal, and
+   the chunk-level counters cannot currently tell those apart — per-finger clear
+   results are `[UNKNOWN]` and would need a driver change to observe.
+3. Do not gate anything on this return value. The driver counts it and never
+   decides on it, deliberately.
 
 ---
 
@@ -510,6 +534,25 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   every pin — their semantics are unchanged.
 - A member sync records its pin as synced, so the post-enrolment cascade becomes a
   no-op reconcile.
+- **A member sync that cannot SEE its member defers; it never reports success.**
+  `load_sync_cache` has a 5 s TTL and is rebuilt right after a delta write, while a
+  targeted member sync is routed within seconds of that same write — so an empty
+  roster here usually means "the snapshot is in flux", not "this member is gone".
+  The engine therefore re-reads once with `invalidate_sync_cache(clear_cached=True)`
+  (which forces an inline load; without it `load_sync_cache` hands back the stale
+  snapshot and refreshes in the background), and only if the member is *still*
+  invisible does it flag the pin `last_ok=0` and emit `MEMBER_SYNC_DEFERRED`.
+  Flagging routes the pin back through the full sync's existing retry channel; the
+  `CASE WHEN excluded.last_ok = 1` guard preserves `desired_hash` **and**
+  `pushed_finger_ids`, so deferring costs no knowledge of what is resident.
+  Only a pin that already has a row is flagged — inventing one would resurrect pins
+  `prune_device_sync_state` deliberately removed.
+  `[FIELD: Oxyfit dev rig 2026-09-06 — a finger-2 revocation was silently dropped
+  at 14:20:01 because the member was transiently absent; it reappeared at 14:20:13,
+  and device_sync_state still read pushed_finger_ids='0,1,2' against a real {0,1}]`
+  **Still open:** *why* a just-upserted member vanishes from the cache at all. The
+  same window also blanks the popup user (`rtlog ALLOW … user NOT found in local
+  cache`). `[UNKNOWN]` — the deferral makes it harmless, it does not explain it.
 - **Safety direction:** a state *read* failure ⇒ push everything; a state *write*
   failure ⇒ logged and ignored. MIRROR always receives the **full desired roster**,
   never the incremental subset (passing the subset would delete every unchanged
