@@ -19,6 +19,7 @@ import { useApp } from "@/context/AppContext";
 import { useTrayIntegration } from "@/hooks/useTrayIntegration";
 import { usePageChromeValue } from "@/context/PageChromeContext";
 import { ThemeToggle } from "@/components/theme-toggle";
+import PcIdentityBanner from "@/components/PcIdentityBanner";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -406,6 +407,8 @@ export default function MainLayout() {
           </div>
           <div className="flex shrink-0 items-center gap-[9px]">{actions}</div>
         </header>
+
+        <PcIdentityBanner />
 
         <main className={cn("min-h-0 flex-1 bg-background", fill ? "overflow-hidden" : "overflow-auto")}>
           <div className={cn("px-6 py-5", fill && "h-full")}>

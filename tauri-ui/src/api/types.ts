@@ -165,6 +165,50 @@ export interface DashboardOverview extends ApiOk {
 export interface LoginRequest { email: string; password: string }
 export interface LoginResponse extends ApiOk { token: string }
 
+// ─── B-bis) Per-PC identity ───
+export type PcIdentityState =
+  | "first_run"
+  | "active"
+  | "revoked"
+  | "invalid_credentials"
+  | "invalid_token";
+
+export interface PcIdentityStatusResponse extends ApiOk {
+  registered: boolean;
+  state: PcIdentityState;
+  pcUuid: string | null;
+  tokenReady: boolean;
+  tokenExpiresAt: string | null;
+  lastHeartbeatAt: string | null;
+  lastError: string | null;
+}
+
+export interface AccessPcListItem {
+  id: number;
+  name: string;
+  status: string;
+  lastSeenAt?: string | null;
+  lastSeen?: string | null;
+  lastHeartbeatAt?: string | null;
+  stale?: boolean;
+  isStale?: boolean;
+}
+
+export interface AccessPcListResponse extends ApiOk {
+  pcs: AccessPcListItem[];
+  cap: number;
+  activeCount: number;
+  stalenessWindowDays: number;
+}
+
+export interface PcRegistrationResponse extends ApiOk {
+  id: number;
+  pcUuid: string;
+  name: string;
+  status: string;
+  tokenReady: boolean;
+}
+
 // ─── C) Config (GET /api/v2/config) ───
 export interface AppConfig {
   selected_device_id: number | null;
