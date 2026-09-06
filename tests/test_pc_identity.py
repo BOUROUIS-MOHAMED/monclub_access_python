@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+import threading
 
 import pytest
 
@@ -145,6 +147,7 @@ def test_api_client_uses_the_pc_contract_urls_and_credentials() -> None:
     }
     assert session.calls[3][2]["json"] == {"pcUuid": "uuid-b", "pcSecret": "secret-b"}
     assert "Authorization" not in session.calls[3][2]["headers"]
+    assert all(call[2]["timeout"] == 10 for call in session.calls)
 
 
 def test_api_client_preserves_cap_reached_details() -> None:
@@ -235,6 +238,26 @@ def test_registration_stores_credentials_and_mints_first_token() -> None:
     assert service.status()["state"] == "active"
 
 
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows DPAPI integration")
+def test_registration_round_trips_through_the_real_secure_store(tmp_path: Path) -> None:
+    identity = _identity_module()
+    destination = tmp_path / "pc_identity.dat"
+    api = _ServiceApi()
+    service = identity.PcIdentityService(
+        credential_store=identity.PcCredentialStore(destination),
+        api_client=api,
+        gym_token_provider=lambda: "gym-token",
+    )
+
+    service.register(name="Accueil")
+
+    assert identity.PcCredentialStore(destination).load() == identity.PcCredentials(
+        "registered-uuid",
+        "registered-secret",
+    )
+    assert b"registered-secret" not in destination.read_bytes()
+
+
 def test_takeover_replaces_stored_credentials_and_mints_for_the_new_pair() -> None:
     identity = _identity_module()
     old = identity.PcCredentials("old-uuid", "old-secret")
@@ -293,3 +316,155 @@ def test_no_credentials_is_a_first_run_state() -> None:
         "lastHeartbeatAt": None,
         "lastError": None,
     }
+
+
+class _HeartbeatApi(_ServiceApi):
+    def __init__(self, heartbeat_results) -> None:
+        super().__init__()
+        self.heartbeat_results = list(heartbeat_results)
+        self.heartbeats = []
+
+    def send_heartbeat(self, *, pc_token, payload):
+        self.heartbeats.append((pc_token, payload))
+        result = self.heartbeat_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _api_error(identity, *, status=401, code, retry_after=None):
+    return identity.PcIdentityApiError(
+        status_code=status,
+        code=code,
+        message=code,
+        retry_after_seconds=retry_after,
+    )
+
+
+def test_revoked_pc_stops_heartbeating() -> None:
+    identity = _identity_module()
+    api = _HeartbeatApi([_api_error(identity, code="ACCESS_PC_REVOKED")])
+    service = identity.PcIdentityService(
+        credential_store=_MemoryStore(identity.PcCredentials("uuid-a", "secret-a")),
+        api_client=api,
+        gym_token_provider=lambda: "gym-token",
+        heartbeat_payload_provider=lambda: {"appVersion": "1.4.32", "turnstiles": []},
+    )
+
+    assert service.heartbeat_once() is False
+    assert service.status()["state"] == "revoked"
+    assert service.heartbeat_once() is False
+    assert len(api.heartbeats) == 1
+
+
+def test_two_consecutive_invalid_pc_tokens_stop_heartbeating() -> None:
+    identity = _identity_module()
+    invalid = lambda: _api_error(identity, code="ACCESS_PC_TOKEN_INVALID")
+    api = _HeartbeatApi([invalid(), invalid()])
+    service = identity.PcIdentityService(
+        credential_store=_MemoryStore(identity.PcCredentials("uuid-a", "secret-a")),
+        api_client=api,
+        gym_token_provider=lambda: "gym-token",
+        heartbeat_payload_provider=lambda: {"appVersion": "1.4.32", "turnstiles": []},
+    )
+
+    assert service.heartbeat_once() is False
+    assert service.status()["state"] == "active"
+    assert service.heartbeat_once() is False
+    assert service.status()["state"] == "invalid_token"
+    assert service.heartbeat_once() is False
+    assert len(api.heartbeats) == 2
+    assert len(api.minted) == 2
+
+
+def test_heartbeat_respects_retry_after_without_raising() -> None:
+    identity = _identity_module()
+    now = [1_000.0]
+    api = _HeartbeatApi(
+        [
+            _api_error(identity, status=429, code="RATE_LIMITED", retry_after=120),
+            {"turnstilesStored": False},
+        ]
+    )
+    service = identity.PcIdentityService(
+        credential_store=_MemoryStore(identity.PcCredentials("uuid-a", "secret-a")),
+        api_client=api,
+        gym_token_provider=lambda: "gym-token",
+        heartbeat_payload_provider=lambda: {"appVersion": "1.4.32", "turnstiles": []},
+        clock=lambda: now[0],
+    )
+
+    assert service.heartbeat_once() is False
+    now[0] += 119
+    assert service.heartbeat_once() is False
+    assert len(api.heartbeats) == 1
+    now[0] += 1
+    assert service.heartbeat_once() is True
+    assert len(api.heartbeats) == 2
+
+
+def test_network_failure_is_swallowed_and_retried_later() -> None:
+    identity = _identity_module()
+    api = _HeartbeatApi([OSError("offline"), {"turnstilesStored": False}])
+    service = identity.PcIdentityService(
+        credential_store=_MemoryStore(identity.PcCredentials("uuid-a", "secret-a")),
+        api_client=api,
+        gym_token_provider=lambda: "gym-token",
+        heartbeat_payload_provider=lambda: {"appVersion": "1.4.32", "turnstiles": []},
+    )
+
+    assert service.heartbeat_once() is False
+    assert service.status()["state"] == "active"
+    assert service.heartbeat_once() is True
+
+
+def test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots(monkeypatch) -> None:
+    identity = _identity_module()
+    cached = SimpleNamespace(
+        devices=[
+            {"id": 1, "accessDataMode": "AGENT"},
+            {"id": 2, "accessDataMode": "ULTRA"},
+            {"id": 3, "accessDataMode": "DEVICE"},
+        ]
+    )
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: cached)
+    app = SimpleNamespace(
+        _last_sync_at="2026-09-06T10:00:00Z",
+        _last_sync_ok=True,
+        _update_manager=SimpleNamespace(get_current_version=lambda: "1.4.32"),
+        _agent_engine=SimpleNamespace(
+            get_status_snapshot=lambda: {1: {"connected": True}}
+        ),
+        _ultra_engine=SimpleNamespace(
+            get_status=lambda: {
+                "devices": {"2": {"connected": False, "failed_pins": ["4", "9"]}}
+            }
+        ),
+    )
+
+    assert identity.build_heartbeat_payload(app) == {
+        "appVersion": "1.4.32",
+        "lastSyncAt": "2026-09-06T10:00:00Z",
+        "lastSyncOk": True,
+        "turnstiles": [
+            {"gymDeviceId": 1, "reachable": True, "failedPins": 0, "mode": "AGENT"},
+            {"gymDeviceId": 2, "reachable": False, "failedPins": 2, "mode": "ULTRA"},
+            {"gymDeviceId": 3, "reachable": False, "failedPins": 0, "mode": "DEVICE"},
+        ],
+    }
+
+
+def test_heartbeat_worker_is_a_dedicated_daemon_with_five_minute_default() -> None:
+    identity = _identity_module()
+    called = threading.Event()
+    service = SimpleNamespace(heartbeat_once=lambda: called.set())
+    worker = identity.PcHeartbeatWorker(service=service)
+
+    worker.start()
+    try:
+        assert called.wait(timeout=1)
+        assert worker.interval_seconds == 300
+        assert worker.thread_name == "pc-heartbeat"
+        assert worker.is_daemon is True
+    finally:
+        worker.stop(timeout=1)

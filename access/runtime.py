@@ -22,6 +22,20 @@ def _start_optional_content_sync_scheduler(_app: Any) -> None:
         )
 
 
+def _start_pc_identity_runtime(app: Any) -> None:
+    try:
+        from access.pc_identity import start_pc_identity_runtime
+
+        start_pc_identity_runtime(app)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[runtime] PC identity heartbeat did not start; access remains available: %s",
+            exc,
+        )
+
+
 def schedule_access_shell_startup(app: Any) -> None:
     """Schedule Access-owned startup work for the current combined shell."""
 
@@ -33,6 +47,7 @@ def schedule_access_shell_startup(app: Any) -> None:
     app.after(1500, app._launch_tauri_ui)
     app.after(5000, app.start_expiry_warning_scheduler)
     app.after(10000, lambda: _start_optional_content_sync_scheduler(app))
+    app.after(11000, lambda: _start_pc_identity_runtime(app))
 
 __all__ = [
     "AgentRealtimeEngine",
