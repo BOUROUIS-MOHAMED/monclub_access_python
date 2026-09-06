@@ -190,11 +190,21 @@ try {
         Write-Host "  [3] list ADMINS only      (privilege > 0)"
         Write-Host "  [4] list users WITH a card"
         Write-Host "  [5] re-read the counts"
+        Write-Host "  [6] EXPORT all users to CSV   (1838 rows do not fit on a screen)"
         Write-Host "  [N] done inspecting - go to step 3"
         $c = (Read-Host "Choice").Trim().ToUpper()
 
         if ($c -eq 'N') { break }
         elseif ($c -eq '5') { $before = Show-Counts $zk $mn }
+        elseif ($c -eq '6') {
+            if (-not $users) { $users = Read-Users $zk $mn }
+            if (-not $users) { Write-Err "could not read users"; continue }
+            $csv = Join-Path $logDir ("users_{0}_{1}.csv" -f ($cfg.deviceIp -replace '\W', '-'), (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            $users | Select-Object pin, name, card, priv, enabled, haspwd,
+                @{n = 'fingers'; e = { ($_.fingers -join ' ') } } |
+                Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
+            Write-Ok "exported $($users.Count) users -> $csv"
+        }
         elseif ($c -in @('1', '2', '3', '4')) {
             if ($c -eq '2') {
                 Write-Warn "reading all 10 finger slots for every user - on ~1800 users this is ~18000 calls (many minutes)."
@@ -261,6 +271,45 @@ try {
     $admins = @($users | Where-Object { $_.priv -gt 0 })
     $victims = @($users | Where-Object { $_.priv -le 0 })
 
+    # ----------------------------------------------------------------------- #
+    # SCOPE - all non-admin users, or only the pins named in a file.
+    #
+    # The file form is the surgical one. At Oxyfit the real problem is not "too
+    # many users" but DUPLICATES: 353 members were imported from another system
+    # that still drives the same turnstile, so the same finger is enrolled twice -
+    # once under the old system's pin, once under MonClub's activeMembershipId.
+    # Deleting the old copy fixes the double match and costs those members nothing,
+    # because MonClub's pin still carries them. Clearing everything would also
+    # delete ~577 users that ONLY the other system knows about.
+    # ----------------------------------------------------------------------- #
+    Write-Host ""
+    Write-Host "SCOPE" -ForegroundColor Cyan
+    Write-Host "  [A] ALL non-admin users on the device  ($($victims.Count))"
+    Write-Host "  [S] ONLY the pins listed in a file     (one pin per line, # = comment)"
+    $scope = (Read-Host "Choice").Trim().ToUpper()
+
+    if ($scope -eq 'S') {
+        $listPath = (Read-Host "Path to the pin list").Trim().Trim('"')
+        if (-not (Test-Path $listPath)) { Write-Err "no such file: $listPath"; Pause-End; exit 1 }
+        $wanted = @{}
+        foreach ($line in (Get-Content $listPath)) {
+            $p = "$line".Trim()
+            if ($p -eq '' -or $p.StartsWith('#')) { continue }
+            $wanted[$p] = $true
+        }
+        if ($wanted.Count -eq 0) { Write-Err "the list is empty"; Pause-End; exit 1 }
+        $matched = @($victims | Where-Object { $wanted.ContainsKey("$($_.pin)") })
+        $missing = $wanted.Count - $matched.Count
+        Write-Info "list has $($wanted.Count) pin(s); $($matched.Count) found on this device, $missing not present here"
+        if ($matched.Count -eq 0) { Write-Err "none of those pins are on this device - nothing to do"; Pause-End; exit 0 }
+        $victims = $matched
+        Write-Log "SCOPE=file '$listPath' listed=$($wanted.Count) matched=$($matched.Count) missing=$missing"
+    } elseif ($scope -ne 'A') {
+        Write-Warn "unknown scope '$scope' - nothing done"; Pause-End; exit 0
+    } else {
+        Write-Log "SCOPE=all non-admin victims=$($victims.Count)"
+    }
+
     Write-Host ""
     if ($admins.Count) {
         Write-Ok "PRESERVING $($admins.Count) administrator(s): $(($admins | ForEach-Object { "$($_.pin) ($($_.name))" }) -join ', ')"
@@ -268,11 +317,12 @@ try {
         Write-Warn "no administrator on this device - none to preserve"
     }
 
+    $who = if ($scope -eq 'S') { "the $($victims.Count) listed pin(s)" } else { "ALL $($victims.Count) non-admin users" }
     $label = switch ($target) {
-        'F' { 'ALL FINGERPRINTS of non-admin users' }
-        'C' { 'ALL CARDS of non-admin users' }
-        'P' { 'ALL PASSWORDS of non-admin users' }
-        'U' { 'ALL NON-ADMIN USERS (fingers + card + password)' }
+        'F' { "FINGERPRINTS of $who" }
+        'C' { "CARDS of $who" }
+        'P' { "PASSWORDS of $who" }
+        'U' { "WHOLE USER ROWS (fingers + card + password) of $who" }
         default { $null }
     }
     if (-not $label) { Write-Warn "unknown choice '$target'"; Pause-End; exit 0 }
