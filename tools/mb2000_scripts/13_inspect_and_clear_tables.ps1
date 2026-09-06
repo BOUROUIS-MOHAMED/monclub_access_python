@@ -254,17 +254,66 @@ try {
     # ----------------------------------------------------------------------- #
     # STEP 3 - clear ONE table
     # ----------------------------------------------------------------------- #
+    # Offer only what THIS device actually reports.
+    #
+    # The menu is built from the counts read in step 1, not from a hardcoded list of
+    # what an MB2000 happens to have. A firmware that does not answer for a table, or
+    # answers 0, gets that option greyed out and refused - so the same script is
+    # honest on a C3-400, a SpeedFace or anything else, instead of offering to clear
+    # something that is not there. It also stops the operator wasting a run on, say,
+    # passwords when the device holds none (this gym's terminal reports idx4 = 0).
+    $cnt = { param([int]$i) if ($before.ContainsKey($i)) { [int]$before[$i] } else { -1 } }
+    $nFp = & $cnt 3
+    $nPw = & $cnt 4
+    $nAtt = & $cnt 6
+    $nUsr = & $cnt 2
+    $nFace = & $cnt 21
+
     Write-Host ""
     Write-Host "STEP 3 - clear ONE table" -ForegroundColor Cyan
-    Write-Host "  [F] FINGERPRINTS   all templates, keeps users + cards      [proven on this hardware]"
-    Write-Host "  [C] CARDS          blanks the card, keeps users + fingers  [proven on this hardware]"
-    Write-Host "  [P] PASSWORDS      user passwords only                     [UNVERIFIED api]"
-    Write-Host "  [U] USERS          whole rows: fingers + card + password   [UNVERIFIED api]"
-    Write-Host "  [L] ATTENDANCE LOG no credentials touched                  [UNVERIFIED api]"
+    Write-Host "  Only tables this device reports are selectable." -ForegroundColor Gray
+    Write-Host ""
+
+    $offer = @{}
+    $rows = @(
+        @('F', 'FINGERPRINTS   templates only, keeps users + cards', $nFp,
+            'proven on this hardware'),
+        @('C', 'CARDS          blanks the card column of the user row', $nUsr,
+            'proven on this hardware - no card counter exists, so this is the USER count'),
+        @('P', 'PASSWORDS      user passwords only', $nPw, 'UNVERIFIED api'),
+        @('U', 'USERS          whole rows: fingers + card + password', $nUsr, 'UNVERIFIED api'),
+        @('L', 'ATTENDANCE LOG no credentials touched', $nAtt, 'UNVERIFIED api')
+    )
+    foreach ($r in $rows) {
+        $k = [string]$r[0]; $txt = [string]$r[1]; $n = [int]$r[2]; $note = [string]$r[3]
+        if ($n -lt 0) {
+            Write-Host ("  [{0}] {1}" -f $k, $txt) -ForegroundColor DarkGray
+            Write-Host ("       not supported by this firmware - hidden") -ForegroundColor DarkGray
+        } elseif ($n -eq 0) {
+            Write-Host ("  [{0}] {1}" -f $k, $txt) -ForegroundColor DarkGray
+            Write-Host ("       count is 0 - nothing to clear") -ForegroundColor DarkGray
+        } else {
+            $offer[$k] = $true
+            Write-Host ("  [{0}] {1}" -f $k, $txt)
+            Write-Host ("       {0} row(s)   [{1}]" -f $n, $note) -ForegroundColor Gray
+        }
+    }
     Write-Host "  [Q] quit without deleting anything"
     Write-Host ""
+    if ($nFace -gt 0) {
+        Write-Err "  This device holds $nFace FACE template(s). Nothing here can back one up."
+    } elseif ($nFace -eq 0) {
+        Write-Host "  faces: 0" -ForegroundColor Gray
+    } else {
+        Write-Host "  faces: firmware does not report index 21" -ForegroundColor DarkGray
+    }
     Write-Host "  Administrators (privilege > 0) are skipped by F, C, P and U." -ForegroundColor Gray
     $target = (Read-Host "Choice").Trim().ToUpper()
+
+    if ($target -ne 'Q' -and $target -ne '' -and -not $offer.ContainsKey($target)) {
+        Write-Warn "'$target' is not available on this device - nothing done"
+        Pause-End; exit 0
+    }
 
     if ($target -eq 'Q' -or $target -eq '') { Write-Info "nothing deleted"; Pause-End; exit 0 }
 
