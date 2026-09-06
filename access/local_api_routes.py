@@ -19,6 +19,10 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/auth/status", "_handle_auth_status"),
     ("POST", "/api/v2/auth/logout", "_handle_auth_logout"),
     ("POST", "/api/v2/auth/verify-admin-password", "_handle_auth_verify_admin_password"),
+    ("GET", "/api/v2/pc-identity/status", "_handle_pc_identity_status"),
+    ("GET", "/api/v2/pc-identity/pcs", "_handle_pc_identity_list"),
+    ("POST", "/api/v2/pc-identity/register", "_handle_pc_identity_register"),
+    ("POST", "/api/v2/pc-identity/pcs/{pcId}/adopt", "_handle_pc_identity_adopt"),
     ("GET", "/api/v2/config", "_handle_config_get"),
     ("PATCH", "/api/v2/config", "_handle_config_patch"),
     ("POST", "/api/v2/config/restart-local-api", "_handle_config_restart_api"),
@@ -147,10 +151,12 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
 
 
 def register_access_local_api_routes(router) -> None:
+    from access import pc_identity_routes
     from app.api import local_access_api_v2 as legacy
 
     for method, pattern, handler_name in ACCESS_LOCAL_ROUTE_SPECS:
-        router.add(method, pattern, getattr(legacy, handler_name))
+        owner = pc_identity_routes if handler_name.startswith("_handle_pc_identity_") else legacy
+        router.add(method, pattern, getattr(owner, handler_name))
 
 
 def get_access_local_api_route_specs() -> tuple[RouteSpec, ...]:
