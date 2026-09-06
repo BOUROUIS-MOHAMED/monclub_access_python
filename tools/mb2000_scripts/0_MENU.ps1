@@ -20,6 +20,7 @@ while ($true) {
     Write-Host "  [10] Backup / restore ALL device users + templates"
     Write-Host "  [11] Portability test: ZK9500 desk capture -> live match (GATE 3) ***" -ForegroundColor Yellow
     Write-Host "  [12] FORCE-OPEN door: sustained ACUnlock + log file (GATE 4) ***" -ForegroundColor Yellow
+    Write-Host "  [13] Inspect device tables, then clear ONE (admins preserved) ***" -ForegroundColor Red
     Write-Host ""
     Write-Host "  [C]  Edit config (IP / port / comm key)"
     Write-Host "  [Q]  Quit"
@@ -41,6 +42,7 @@ while ($true) {
                 '7' = '7_delete_device_fingerprint.ps1'; '8' = '8_live_monitor.ps1'
                 '9' = '9_unlock_door.ps1';          '10' = '10_backup_restore_device.ps1'
                 '11' = '11_portability_test.ps1';   '12' = '12_force_open_door.ps1'
+                '13' = '13_inspect_and_clear_tables.ps1'
             }
             if ($map.ContainsKey($c)) {
                 & (Join-Path $PSScriptRoot $map[$c])
