@@ -139,10 +139,14 @@ function Read-Users {
                 if ($ok -and "$tmp" -ne '') { $fingers += $fid }
             }
         }
+        # The password VALUE is kept, not just a has/hasn't flag: clearing a card
+        # means rewriting the whole user row via SSR_SetUserInfo, and that call
+        # takes the password as a parameter. Passing '' there would silently wipe
+        # the password of every user whose card we cleared.
         $users += [pscustomobject]@{
             pin = "$pin"; name = "$name"; card = "$card"
             priv = [int]$priv; enabled = [bool]$enabled
-            haspwd = ("$pwd" -ne ''); fingers = $fingers
+            pwd = "$pwd"; haspwd = ("$pwd" -ne ''); fingers = $fingers
         }
         if ($users.Count % 100 -eq 0) { Write-Info "... $($users.Count) users read" }
     }
@@ -356,10 +360,16 @@ try {
                 $done++
             }
             'C' {
-                Write-Log "SetStrCardNumber('') + SSR_SetUserInfo pin=$pin"
+                # There is no card TABLE on this firmware - the card is a column of
+                # the user row, written by SetStrCardNumber immediately before
+                # SSR_SetUserInfo. So clearing a card means rewriting the row, and
+                # every other field must be passed back UNCHANGED: name, password,
+                # privilege and enabled. Passing '' for the password here would wipe
+                # it, and passing 0 for privilege would demote an administrator.
+                Write-Log "SetStrCardNumber('') + SSR_SetUserInfo pin=$pin (name/pwd/priv/enabled preserved)"
                 try {
                     [void]$zk.SetStrCardNumber('')
-                    if ($zk.SSR_SetUserInfo($mn, $pin, "$($u.name)", '', [int]$u.priv, $u.enabled)) { $done++ } else { $failed++ }
+                    if ($zk.SSR_SetUserInfo($mn, $pin, "$($u.name)", "$($u.pwd)", [int]$u.priv, $u.enabled)) { $done++ } else { $failed++ }
                 } catch { $failed++ }
             }
             'P' {
