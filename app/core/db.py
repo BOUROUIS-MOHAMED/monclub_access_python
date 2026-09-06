@@ -4402,8 +4402,10 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
 
     H-006 guard (_H006_MIN_CACHE_ROWS) applies to both members branches when
     refreshMembers=True: the full branch refuses `users == []`, the delta branch refuses
-    `validMemberIds == []`. The delta branch skips ONLY its delete and lets the rest of
-    the transaction commit.
+    `validMemberIds == []`. Either refusal skips ONLY the members write it declined and
+    lets the rest of the transaction (devices, credentials, settings, infrastructures)
+    commit -- a refused members section must not cost the other three, which arrive on
+    independent refresh flags.
     """
     if not data:
         return
@@ -4521,11 +4523,11 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         # entire local roster and deleted it -- a total door lockout from
                         # one malformed or transient backend response. Refuse the delete
                         # on the same blast radius the full branch uses, and skip ONLY
-                        # the delete. Not the shape the full branch uses: it returns out
-                        # of _write, and _db_writer_loop commits on a normal return, so
-                        # it silently skips the devices / credentials / infrastructures
-                        # sections further down (pre-existing since 40ff255, 2026-04-13
-                        # -- flagged, not copied). This transaction still owes them.
+                        # the delete. The full branch below now does the same; until this
+                        # one landed it returned out of _write, and _db_writer_loop
+                        # commits on a normal return, so it silently skipped the devices
+                        # / credentials / infrastructures sections further down. This
+                        # transaction still owes them.
                         # No ratio guard on a NON-empty validMemberIds: a legitimate mass
                         # revocation refused would keep ex-members' cards admitted, which
                         # is fail-open. [TEST: tests/test_delta_user_cache.py]
@@ -4571,56 +4573,79 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                         "incoming_users=%d, old_db_count=%d",
                         len(users), old_count,
                     )
+                    # H-006. The refusal skips ONLY the members refresh and falls through
+                    # to devices / credentials / settings, mirroring the delta branch
+                    # above (a0b527a). It used to `return {"credentials": None}` -- a
+                    # return out of the whole `_write` callable, and _db_writer_loop
+                    # commits on a NORMAL return (only a raised exception rolls back), so
+                    # the refusal committed what had already run and silently skipped
+                    # every section AFTER this one: devices (+ door presets),
+                    # gymAccessCredentials and infrastructures. The four refresh flags are
+                    # independent booleans off the backend response, so refreshMembers can
+                    # be True alongside the other three; those updates were dropped while
+                    # app.py advanced the version tokens regardless (save_sync_cache_delta
+                    # returns None on every path), so the backend never resent them.
+                    # `settings` was half-applied: it gates the settings row + memberships
+                    # BEFORE this block and infrastructures AFTER it.
+                    # (Pre-existing since 40ff255, 2026-04-13.)
+                    # [TEST: tests/test_full_replace_row_diff.py]
+                    full_refresh_refused = False
+                    full_refresh_refused_count = 0
                     if not users:
                         if old_count > _H006_MIN_CACHE_ROWS:
+                            full_refresh_refused = True
+                            full_refresh_refused_count = old_count
                             _logger.error(
                                 f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
                                 f"but local cache has {old_count}. Refusing to clear — likely backend error."
                             )
-                            return {"credentials": None}
-                        _logger.warning(
-                            "[SYNC-DEBUG] H-006 NOT triggered (full, old_count=%d <= %d). "
-                            "Will DELETE all sync_users with 0 replacements!",
-                            old_count, _H006_MIN_CACHE_ROWS,
-                        )
+                        else:
+                            _logger.warning(
+                                "[SYNC-DEBUG] H-006 NOT triggered (full, old_count=%d <= %d). "
+                                "Will DELETE all sync_users with 0 replacements!",
+                                old_count, _H006_MIN_CACHE_ROWS,
+                            )
+                    profile["members_full_refresh_refused"] = full_refresh_refused
+                    profile["members_full_refresh_refused_count"] = full_refresh_refused_count
 
-                    # Per-row diff (2026-09-04). Until then this branch hashed the whole
-                    # table and, when the hash differed, ran DELETE FROM sync_users + a
-                    # re-INSERT of every row: 4765 ms for 934 rows on the gym PC, most of
-                    # it re-writing ~2 MB of unchanged templates -- and the hash compared
-                    # a missing userProfileImage as '' against the stored NULL, so it
-                    # rarely matched at all. The diff writes only rows that differ and
-                    # deletes only keys absent from the payload; an unchanged payload
-                    # does zero writes, which is what the hash guard was for
-                    # (member_shadow / device_sync_state hashes stay valid either way).
-                    # Keyed on the (user_id, active_membership_id) pair -- see
-                    # _apply_full_users_refresh. [TEST: tests/test_full_replace_row_diff.py]
-                    full_stats = _apply_full_users_refresh(cur, users)
-                    profile.update(full_stats)
-                    _logger.info(
-                        "[SYNC-DEBUG] save_sync_cache_delta: full refresh diff "
-                        "inserted=%d updated=%d unchanged=%d deleted=%d null_key=%d "
-                        "(fetch=%.0fms diff=%.0fms write=%.0fms delete=%.0fms)",
-                        full_stats["members_inserted"], full_stats["members_updated"],
-                        full_stats["members_unchanged"], full_stats["members_deleted"],
-                        full_stats["members_null_key_rows"],
-                        full_stats["members_existing_fetch_ms"], full_stats["members_diff_ms"],
-                        full_stats["members_write_ms"], full_stats["members_delete_ms"],
-                    )
-                    if not (
-                        full_stats["members_inserted"] or full_stats["members_updated"]
-                        or full_stats["members_deleted"] or full_stats["members_null_key_rows"]
-                    ):
+                    if not full_refresh_refused:
+                        # Per-row diff (2026-09-04). Until then this branch hashed the whole
+                        # table and, when the hash differed, ran DELETE FROM sync_users + a
+                        # re-INSERT of every row: 4765 ms for 934 rows on the gym PC, most of
+                        # it re-writing ~2 MB of unchanged templates -- and the hash compared
+                        # a missing userProfileImage as '' against the stored NULL, so it
+                        # rarely matched at all. The diff writes only rows that differ and
+                        # deletes only keys absent from the payload; an unchanged payload
+                        # does zero writes, which is what the hash guard was for
+                        # (member_shadow / device_sync_state hashes stay valid either way).
+                        # Keyed on the (user_id, active_membership_id) pair -- see
+                        # _apply_full_users_refresh. [TEST: tests/test_full_replace_row_diff.py]
+                        full_stats = _apply_full_users_refresh(cur, users)
+                        profile.update(full_stats)
                         _logger.info(
-                            "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED, "
-                            "%d rows untouched (no DELETE/INSERT)",
-                            full_stats["members_unchanged"],
+                            "[SYNC-DEBUG] save_sync_cache_delta: full refresh diff "
+                            "inserted=%d updated=%d unchanged=%d deleted=%d null_key=%d "
+                            "(fetch=%.0fms diff=%.0fms write=%.0fms delete=%.0fms)",
+                            full_stats["members_inserted"], full_stats["members_updated"],
+                            full_stats["members_unchanged"], full_stats["members_deleted"],
+                            full_stats["members_null_key_rows"],
+                            full_stats["members_existing_fetch_ms"], full_stats["members_diff_ms"],
+                            full_stats["members_write_ms"], full_stats["members_delete_ms"],
                         )
-                    new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
-                    _logger.info(
-                        "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
-                        new_count,
-                    )
+                        if not (
+                            full_stats["members_inserted"] or full_stats["members_updated"]
+                            or full_stats["members_deleted"] or full_stats["members_null_key_rows"]
+                        ):
+                            _logger.info(
+                                "[SYNC-DEBUG] save_sync_cache_delta: users UNCHANGED, "
+                                "%d rows untouched (no DELETE/INSERT)",
+                                full_stats["members_unchanged"],
+                            )
+                        new_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                        _logger.info(
+                            "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
+                            new_count,
+                        )
         else:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 

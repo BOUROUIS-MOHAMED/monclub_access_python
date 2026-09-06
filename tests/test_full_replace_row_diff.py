@@ -428,3 +428,170 @@ def test_numeric_text_ids_do_not_break_the_diff(db):
 
     assert _rows(db) == before
     assert _counters(profile)["members_unchanged"] == 1
+
+
+# ── the H-006 refusal must skip ONLY the members section ────────────────────
+#
+# WHY THIS BLOCK EXISTS
+# ---------------------
+# The H-006 guard above refuses `users == []` against a cache of > 10 rows by
+# `return {"credentials": None}` -- a return out of the whole `_write` callable.
+# `_db_writer_loop` commits on a NORMAL return (only a raised exception rolls
+# back), so the refusal committed everything that had already run and silently
+# skipped every section that sits AFTER the members block in the same function:
+# devices (+ door presets), gymAccessCredentials, and infrastructures.
+#
+# The caller cannot see it: `save_sync_cache_delta` returns None on every path,
+# and `app/ui/app.py` runs `if new_tokens: save_version_tokens(new_tokens)`
+# unconditionally afterwards. The four refresh flags are independent booleans off
+# the backend response, so refreshMembers=True can legitimately arrive alongside
+# refreshDevices / refreshCredentials / refreshSettings = True. One response with
+# `users: []` therefore preserved the roster (correct) while dropping that same
+# response's device, credential and infrastructure updates -- and advanced the
+# version tokens, so the backend never resends them. Lost until a full
+# token-clearing resync.
+#
+# `settings` is the sharpest case: it gates TWO sections that sit on opposite
+# sides of the members block (settings row + memberships before, infrastructures
+# after), so one boolean was half-applied.
+#
+# Mirrors the delta branch's policy from a0b527a -- skip only the refused
+# operation, let the rest of the transaction commit, report the refusal in the
+# write profile.
+
+_ALL_SECTIONS = {"members": True, "devices": True, "credentials": True, "settings": True}
+
+_SETTINGS_ROW = {
+    "gymId": 58, "accessServerHost": "10.0.0.5", "accessServerPort": 8080,
+    "accessServerEnabled": True, "createdAt": "2026-09-06T00:00:00Z",
+    "updatedAt": "2026-09-06T00:00:00Z",
+}
+
+
+def _credential(cred_id=1, account_id=10):
+    return {
+        "id": cred_id, "gymId": 58, "accountId": account_id, "secretHex": "abc123",
+        "enabled": True, "rotatedAt": "2026-04-01T00:00:00",
+        "createdAt": "2026-04-01T00:00:00", "updatedAt": "2026-04-01T00:00:00",
+        "grantedActiveMembershipIds": [account_id],
+    }
+
+
+def _loaded_payload(users):
+    """A full-mode payload that also carries every non-members section, as a response
+    with all four refresh flags set does."""
+    payload = _full_payload(users)
+    payload["devices"] = [{"id": 9, "name": "Turnstile A"}]
+    payload["gymAccessCredentials"] = [_credential()]
+    payload["infrastructures"] = [{"id": 3, "name": "Main", "gymAgent": {}}]
+    payload["membership"] = [{"id": 7, "title": "Gold", "description": "d",
+                              "price": 99.0, "durationInDays": 30}]
+    payload["accessSoftwareSettings"] = dict(_SETTINGS_ROW)
+    return payload
+
+
+def _seed_11(db):
+    """11 cached members -- one over _H006_MIN_CACHE_ROWS, so the guard fires. Seeded
+    with a members-ONLY refresh, so the other tables are still empty."""
+    _refresh(db, [_user(i, 100 + i) for i in range(1, 12)])
+    return _rows(db)
+
+
+def _section_counts(db):
+    with db.get_conn() as conn:
+        def _n(table):
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        return {
+            "sync_devices": _n("sync_devices"),
+            "sync_gym_access_credentials": _n("sync_gym_access_credentials"),
+            "sync_infrastructures": _n("sync_infrastructures"),
+            "sync_memberships": _n("sync_memberships"),
+        }
+
+
+def test_zero_users_refusal_still_commits_devices_credentials_infrastructures(db):
+    """The refusal must cost the members section and nothing else. Before the fix the
+    early return dropped devices, credentials and infrastructures on the floor while
+    the same response's version tokens advanced."""
+    before = _seed_11(db)
+
+    db.save_sync_cache_delta(_loaded_payload([]), _ALL_SECTIONS)
+
+    assert _rows(db) == before  # the refusal itself still holds
+    assert _section_counts(db) == {
+        "sync_devices": 1,
+        "sync_gym_access_credentials": 1,
+        "sync_infrastructures": 1,
+        "sync_memberships": 1,
+    }
+
+
+def test_zero_users_refusal_does_not_half_apply_the_settings_refresh(db):
+    """`settings` writes the settings row + memberships BEFORE the members block and
+    infrastructures AFTER it. The early return committed the first half and skipped
+    the second, from a single refreshSettings=True."""
+    _seed_11(db)
+
+    db.save_sync_cache_delta(_loaded_payload([]), _ALL_SECTIONS)
+
+    with db.get_conn() as conn:
+        host = conn.execute(
+            "SELECT access_server_host FROM sync_access_software_settings WHERE id=1"
+        ).fetchone()[0]
+        infrastructures = conn.execute("SELECT COUNT(*) FROM sync_infrastructures").fetchone()[0]
+    assert host == "10.0.0.5"    # committed even before the fix
+    assert infrastructures == 1  # skipped before the fix -- the other half of one flag
+
+
+def test_zero_users_refusal_is_reported_in_the_write_profile(db):
+    """The refusal must be visible to whoever reads the profile -- it is the only
+    signal that a section of an otherwise-successful sync was declined."""
+    _seed_11(db)
+
+    db.save_sync_cache_delta(_loaded_payload([]), _ALL_SECTIONS)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert profile["members_full_refresh_refused"] is True
+    assert profile["members_full_refresh_refused_count"] == 11
+    # The per-row diff never ran. Its counters must be ABSENT, not synthesised as
+    # zeros: "members_unchanged: 0" would be false -- 11 rows were left untouched.
+    assert "members_unchanged" not in profile
+    assert "members_deleted" not in profile
+    # The sections that DID run still report theirs.
+    assert profile["credentials_upserted"] == 1
+
+
+def test_healthy_full_refresh_reports_no_refusal(db):
+    """The flag is written on every full-mode call, so a reader never has to tell
+    'not refused' apart from 'key missing'."""
+    profile = _refresh(db, [_user(1, 100)])
+
+    assert profile["members_full_refresh_refused"] is False
+    assert profile["members_full_refresh_refused_count"] == 0
+
+
+def test_zero_users_below_the_threshold_clears_and_reports_no_refusal(db):
+    """The documented 'H-006 NOT triggered' path (<= 10 rows) is untouched: it clears
+    the roster, and it is not a refusal."""
+    _refresh(db, [_user(i, 100 + i) for i in range(1, 11)])  # exactly 10
+
+    db.save_sync_cache_delta(_loaded_payload([]), _ALL_SECTIONS)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert _rows(db) == {}
+    assert profile["members_full_refresh_refused"] is False
+    assert profile["members_full_refresh_refused_count"] == 0
+    assert _counters(profile)["members_deleted"] == 10
+    assert _section_counts(db)["sync_devices"] == 1
+
+
+def test_zero_users_refusal_leaves_the_delta_branch_keys_alone(db):
+    """The two branches report separately: a full-mode refusal must not masquerade as
+    the delta branch's members_delete_refused, and vice versa."""
+    _seed_11(db)
+
+    db.save_sync_cache_delta(_loaded_payload([]), _ALL_SECTIONS)
+    profile = db.get_last_db_write_profile("save_sync_cache_delta")
+
+    assert profile["members_delta_mode"] is False
+    assert "members_delete_refused" not in profile
