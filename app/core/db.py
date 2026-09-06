@@ -2300,6 +2300,10 @@ def apply_member_shadow_delta(
 
     This keeps the sync hot path from paying separate SQLite lock waits for
     read -> upsert -> delete when only a handful of members changed.
+
+    Carries the same H-006 guard (_H006_MIN_CACHE_ROWS) as save_sync_cache_delta's
+    delta branch: an empty `valid_member_ids` against a larger shadow skips ONLY the
+    delete. Both mirrors therefore refuse on the same response.
     """
     normalized_valid_ids: set[int] | None = None
     if valid_member_ids is not None:
@@ -2314,6 +2318,8 @@ def apply_member_shadow_delta(
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> List[int]:
+        delete_refused = False
+        delete_refused_count = 0
         if normalized_valid_ids is not None:
             rows = conn.execute(
                 "SELECT active_membership_id FROM member_shadow"
@@ -2325,6 +2331,40 @@ def apply_member_shadow_delta(
                     continue
                 if amid not in normalized_valid_ids:
                     deleted_ids.append(amid)
+
+            # H-006 mirror of save_sync_cache_delta's delta branch (a0b527a). The test
+            # above is `is not None`, which is TRUE for an empty set, so a response
+            # carrying membersDeltaMode=true + validMemberIds=[] collected every shadow
+            # row and emptied the table. Unlike sync_users this is NOT a door decision --
+            # member_shadow is a change-detection cache read only by this module and
+            # app.py -- so the cost is that the next FULL member refresh re-flags the
+            # whole roster as `new`, not a lockout. The guard exists so the two mirrors
+            # refuse on the SAME input: after a0b527a a malformed response left sync_users
+            # intact and still emptied this table. Skip ONLY the delete; the incoming
+            # users still owe their upsert in this transaction.
+            # `deleted_ids.clear()` and not `= []`: the list is a closure variable from
+            # the enclosing scope and is the return value, so rebinding it here would
+            # make the name local for all of _write and break the .append above.
+            # No ratio guard on a NON-empty valid set, mirroring save_sync_cache_delta:
+            # a refused mass revocation would leave stale hashes claiming ex-members are
+            # already synced, so the device push would skip removing them.
+            # [TEST: tests/test_delta_user_cache.py]
+            if not normalized_valid_ids and len(deleted_ids) > _H006_MIN_CACHE_ROWS:
+                delete_refused = True
+                delete_refused_count = len(deleted_ids)
+                deleted_ids.clear()
+                logging.getLogger(__name__).error(
+                    "[DB] apply_member_shadow_delta: backend returned 0 validMemberIds "
+                    "but member_shadow has %d rows. Refusing to clear -- likely backend "
+                    "error. sync_users is guarded separately (H-006).",
+                    delete_refused_count,
+                )
+            elif not normalized_valid_ids and deleted_ids:
+                logging.getLogger(__name__).warning(
+                    "[SYNC-DEBUG] H-006 NOT triggered (shadow, rows=%d <= %d). "
+                    "Will DELETE all %d shadow rows with 0 replacements!",
+                    len(deleted_ids), _H006_MIN_CACHE_ROWS, len(deleted_ids),
+                )
 
         for u in users or []:
             amid = u.get("activeMembershipId") or u.get("active_membership_id")
@@ -2382,6 +2422,10 @@ def apply_member_shadow_delta(
                 f"DELETE FROM member_shadow WHERE active_membership_id IN ({placeholders})",
                 deleted_ids,
             )
+        # Same key names as save_sync_cache_delta's profile so one grep covers both
+        # mirrors. Different label, so the two profiles never collide.
+        profile["members_delete_refused"] = delete_refused
+        profile["members_delete_refused_count"] = delete_refused_count
         return deleted_ids
 
     return list(_run_db_write_sync("apply_member_shadow_delta", _write))
@@ -4385,6 +4429,11 @@ def _log_incoming_templates(users: Any, delta_mode: bool) -> None:
 # until a successful full refresh. Both members branches of save_sync_cache_delta read it
 # -- the full branch on `users == []`, the delta branch on `validMemberIds == []`. The
 # pre-delta writer save_sync_cache still carries its own literal 10.
+#
+# apply_member_shadow_delta (defined ABOVE this line -- resolved at call time, not at
+# def time) reads it as a third caller, on the same `validMemberIds == []`. member_shadow
+# is NOT a door decision, so that guard is not about lockout: it exists so one malformed
+# response cannot leave the two mirrors in disagreement, one guarded and one emptied.
 _H006_MIN_CACHE_ROWS = 10
 
 
