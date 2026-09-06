@@ -1850,26 +1850,59 @@ class UltraDeviceWorker(threading.Thread):
             )
             return False
 
-        fingers = self._load_pushed_fingers()
-        removals = {p: sorted(fingers.get(p) or ()) for p in revoked if fingers.get(p)}
-        # Blank card + empty name + enabled False. No templates are supplied, so the
-        # driver writes none; `removals` clears the slots we know we put there.
-        users = [{"pin": p, "name": "", "card": "", "enabled": False} for p in revoked]
         logger.warning(
-            "%s revoking %d pin(s) no longer in the roster (clearing %d finger slot(s)): %s",
-            self._prefix, len(revoked),
-            sum(len(v) for v in removals.values()), ",".join(revoked[:20]),
+            "%s revoking %d pin(s) no longer in the roster: %s",
+            self._prefix, len(revoked), ",".join(revoked[:20]),
         )
-        result = self._sdk.push_roster(users, {}, remove_fingers_by_pin=removals) or {}
-        ok = bool(result.get("ok"))
+
+        # 1) DELETE the whole user. backupNumber 12 is "delete the user (including
+        #    all fingerprints, card numbers and passwords)" per the vendor manual,
+        #    and the operator cleared the users + fingerprint tables of the live
+        #    MB2000 with exactly this call on 2026-09-06 via script 13 -- which is
+        #    what retired the [UNKNOWN] that previously forced a neutralise-only
+        #    approach here.
+        deleter = getattr(self._sdk, "delete_users", None)
+        stubborn: list[str] = list(revoked)
+        deleted_ok = 0
+        if callable(deleter):
+            res = deleter(revoked) or {}
+            reported = res.get("failed_pins")
+            if reported is None:
+                # A driver too old to name them: on failure assume none landed, so
+                # the fallback covers everything rather than silently leaving live
+                # credentials behind.
+                stubborn = [] if res.get("ok") else list(revoked)
+            else:
+                stubborn = [str(p) for p in reported if str(p) in set(revoked)]
+            deleted_ok = len(revoked) - len(stubborn)
+        else:
+            logger.warning("%s driver cannot delete users -- neutralising instead",
+                           self._prefix)
+
+        # 2) Anything the delete could not remove still holds live credentials, so
+        #    strip them. TARGETED at the survivors only: SSR_SetUserInfo auto-creates,
+        #    so touching a pin that WAS deleted would resurrect it as an empty row.
+        neutralised_ok = True
+        slots = 0
+        if stubborn:
+            fingers = self._load_pushed_fingers()
+            removals = {p: sorted(fingers.get(p) or ()) for p in stubborn if fingers.get(p)}
+            slots = sum(len(v) for v in removals.values())
+            users_out = [{"pin": p, "name": "", "card": "", "enabled": False} for p in stubborn]
+            logger.warning(
+                "%s %d pin(s) survived the delete -- neutralising (clearing %d slot(s)): %s",
+                self._prefix, len(stubborn), slots, ",".join(stubborn[:20]),
+            )
+            result = self._sdk.push_roster(users_out, {}, remove_fingers_by_pin=removals) or {}
+            neutralised_ok = bool(result.get("ok"))
+
         _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
-                   slots=sum(len(v) for v in removals.values()), ok=ok,
-                   del_attempted=result.get("del_attempted"),
-                   del_ok=result.get("del_ok"))
-        if not ok:
-            # Keep the state so the next sync retries these pins rather than
-            # forgetting that they still hold credentials.
-            logger.warning("%s revoke push failed -- keeping per-pin state for retry",
+                   deleted=deleted_ok, neutralised=len(stubborn), slots=slots,
+                   ok=bool(neutralised_ok))
+        if not neutralised_ok:
+            # Keep the state so the next sync retries rather than forgetting that
+            # these pins still hold credentials.
+            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
                            self._prefix)
             return False
         return True

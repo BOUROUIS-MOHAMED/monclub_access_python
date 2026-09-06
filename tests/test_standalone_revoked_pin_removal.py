@@ -20,13 +20,19 @@ On a ZK_STANDALONE terminal the device decides and opens; the PC only observes
 credential on the terminal IS granting access. A cancelled member kept entering
 indefinitely.
 
-WHY NEUTRALISE RATHER THAN DELETE THE USER
-------------------------------------------
-Deleting the whole row needs SSR_DeleteEnrollData(pin, 12), whose hang status this
-firmware has never confirmed. Clearing the credentials uses only calls proven in
-the field (SSR_DelUserTmpExt 943/943 on 2026-09-06; the SetStrCardNumber +
-SSR_SetUserInfo push path on 898/898 members). A row with no fingerprint, no card
-and enabled=False cannot open the door, and no unproven call is issued.
+DELETE, WITH NEUTRALISE AS THE FALLBACK
+---------------------------------------
+The departed pin is DELETED outright: delete_users -> SSR_DeleteEnrollData(1, pin, 12).
+The vendor manual defines backupNumber 12 as "delete the user (including all
+fingerprints, card numbers and passwords)", and the operator ran exactly that
+against the live MB2000 through tools/mb2000_scripts/13_inspect_and_clear_tables.ps1
+on 2026-09-06 and cleared the users and fingerprint tables successfully — which is
+what finally retired the [UNKNOWN] on backup number 12.
+
+A delete that FAILS for a pin still has to end in no access, so those pins fall
+back to being neutralised (blank card, no fingers, enabled=False). The fallback is
+targeted at the pins that actually failed: SSR_SetUserInfo auto-creates, so
+neutralising a pin that WAS deleted would resurrect it as an empty row.
 
 WHY THIS CANNOT TOUCH THE OTHER SYSTEM'S MEMBERS
 ------------------------------------------------
@@ -49,11 +55,21 @@ from tests.test_standalone_finger_removal_state import FingerState, fstate  # no
 
 
 class RevokeDriver:
-    """Records push_roster AND the neutralise calls."""
+    """Records push_roster and delete_users. `fail_delete` names pins whose
+    SSR_DeleteEnrollData is to be reported as failed."""
     owns_event_source = True
 
-    def __init__(self):
+    def __init__(self, fail_delete: set[str] | None = None):
         self.push_calls: List[dict] = []
+        self.delete_calls: List[List[str]] = []
+        self._fail_delete = set(fail_delete or ())
+
+    def delete_users(self, pins, *, timeout_sec: float = 300.0):
+        pins = [str(p) for p in pins]
+        self.delete_calls.append(list(pins))
+        failed = [p for p in pins if p in self._fail_delete]
+        return {"ok": not failed, "deleted": len(pins) - len(failed),
+                "failed": len(failed), "failed_pins": failed, "errors": []}
 
     def push_roster(self, users, templates_by_pin=None, *, remove_fingers_by_pin=None,
                     bracket_enable_device=False, **kw):
@@ -77,7 +93,7 @@ def _revoked_push(drv: RevokeDriver) -> dict | None:
 
 class TestARevokedMemberLosesTheirCredentials:
 
-    def test_a_member_who_leaves_the_roster_is_neutralised_on_the_device(
+    def test_a_member_who_leaves_the_roster_is_DELETED_from_the_device(
             self, monkeypatch, fstate):
         """The field case: membership set to CANCELED, so the member is gone."""
         drv = RevokeDriver()
@@ -88,11 +104,29 @@ class TestARevokedMemberLosesTheirCredentials:
 
         _full_sync(w)
 
+        assert drv.delete_calls == [["34439"]], "the departed pin must be DELETED"
+        assert _revoked_push(drv) is None, "a clean delete needs no neutralise fallback"
+
+    def test_a_pin_the_delete_could_not_remove_falls_back_to_neutralise(
+            self, monkeypatch, fstate):
+        """A failed delete must still end in no access."""
+        drv = RevokeDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "a", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+        fstate.rows["34440"] = ("old-hash", True, {1})
+
+        _full_sync(w)
+
+        assert drv.delete_calls == [["34439", "34440"]]
         call = _revoked_push(drv)
-        assert call is not None, "the departed pin must be pushed as disabled"
-        assert [u["pin"] for u in call["users"]] == ["34439"]
-        assert call["removals"] == {"34439": [0]}, "its fingerprint slot must be cleared"
-        assert call["users"][0]["card"] == "", "its card must be blanked"
+        assert call is not None, "the pin that survived the delete must be neutralised"
+        assert [u["pin"] for u in call["users"]] == ["34439"], (
+            "only the FAILED pin -- SSR_SetUserInfo auto-creates, so neutralising a "
+            "successfully deleted pin would resurrect it as an empty row"
+        )
+        assert call["removals"] == {"34439": [0]}
+        assert call["users"][0]["card"] == ""
+        assert call["users"][0]["enabled"] is False
 
     def test_pins_we_never_pushed_are_never_touched(self, monkeypatch, fstate):
         """Oxyfit: the terminal holds ~930 users from a SECOND access system. They
@@ -103,7 +137,7 @@ class TestARevokedMemberLosesTheirCredentials:
 
         _full_sync(w)
 
-        assert _revoked_push(drv) is None, "nothing to revoke; the foreign pins are not ours"
+        assert drv.delete_calls == [], "nothing to revoke; the foreign pins are not ours"
 
     def test_a_member_still_in_the_roster_is_never_revoked(self, monkeypatch, fstate):
         drv = RevokeDriver()
@@ -113,19 +147,18 @@ class TestARevokedMemberLosesTheirCredentials:
 
         _full_sync(w)
 
-        assert _revoked_push(drv) is None
+        assert drv.delete_calls == []
 
-    def test_state_is_pruned_only_after_the_neutralise_push(self, monkeypatch, fstate):
+    def test_state_is_pruned_only_after_the_revoke_pass(self, monkeypatch, fstate):
         """prune_device_sync_state deletes the record of what we pushed. If it runs
-        first, the finger ids are gone and the slot can never be cleared."""
+        first, the finger ids are gone and a fallback could never clear the slot."""
         drv = RevokeDriver()
         w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "a", "")])
         fstate.rows["34439"] = ("old-hash", True, {0})
 
         _full_sync(w)
 
-        call = _revoked_push(drv)
-        assert call is not None and call["removals"] == {"34439": [0]}
+        assert drv.delete_calls == [["34439"]]
         assert "34439" not in fstate.rows, "the departed pin's state must then be pruned"
 
 
@@ -140,7 +173,7 @@ class TestSafetyRails:
 
         _full_sync(w)
 
-        assert _revoked_push(drv) is None
+        assert drv.delete_calls == [] and _revoked_push(drv) is None
 
     def test_a_mass_departure_aborts_rather_than_revoking(self, monkeypatch, fstate):
         """Same percent floor MIRROR uses: refuse an implausible bulk revocation."""
@@ -151,7 +184,7 @@ class TestSafetyRails:
 
         _full_sync(w)
 
-        assert _revoked_push(drv) is None, "an implausible bulk revocation must abort"
+        assert drv.delete_calls == [], "an implausible bulk revocation must abort"
         assert "40000" in fstate.rows, "and the state must NOT be pruned after an abort"
 
     def test_a_failed_push_does_not_trigger_revocation(self, monkeypatch, fstate):
@@ -169,4 +202,4 @@ class TestSafetyRails:
 
         _full_sync(w)
 
-        assert _revoked_push(drv) is None
+        assert drv.delete_calls == []
