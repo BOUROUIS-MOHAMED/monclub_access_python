@@ -26,10 +26,27 @@ export const getApiBaseUrl = () => _baseUrl;
 
 export class ApiError extends Error {
   status: number;
-  constructor(msg: string, status: number) {
+  payload: Record<string, unknown> | null;
+  code: string | null;
+  details: Record<string, unknown> | null;
+  takeoverRequired: boolean;
+  cap: number | null;
+  activeCount: number | null;
+
+  constructor(msg: string, status: number, payload?: unknown) {
     super(msg);
     this.name = "ApiError";
     this.status = status;
+    this.payload = payload && typeof payload === "object" ? payload as Record<string, unknown> : null;
+    this.code = typeof this.payload?.code === "string" ? this.payload.code : null;
+    this.details = this.payload?.details && typeof this.payload.details === "object"
+      ? this.payload.details as Record<string, unknown>
+      : null;
+    this.takeoverRequired = this.payload?.takeoverRequired === true;
+    const cap = Number(this.payload?.cap ?? this.details?.cap);
+    const activeCount = Number(this.payload?.activeCount ?? this.details?.activeCount);
+    this.cap = Number.isFinite(cap) ? cap : null;
+    this.activeCount = Number.isFinite(activeCount) ? activeCount : null;
   }
 }
 
@@ -45,8 +62,8 @@ async function parse<T>(res: Response, method: string, path: string, t0: number)
   const elapsed = Date.now() - t0;
   let json: any;
   try { json = JSON.parse(txt); } catch { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms (non-JSON)`); throw new ApiError(txt || `HTTP ${res.status}`, res.status); }
-  if (!res.ok && json.ok === false) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR: ${json.error}`); throw new ApiError(json.error || `HTTP ${res.status}`, res.status); }
-  if (!res.ok) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR`); throw new ApiError(json.error || txt, res.status); }
+  if (!res.ok && json.ok === false) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR: ${json.error}`); throw new ApiError(json.error || `HTTP ${res.status}`, res.status, json); }
+  if (!res.ok) { console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms ERR`); throw new ApiError(json.error || txt, res.status, json); }
   console.debug(`[API] ${method} ${path} ${res.status} ${elapsed}ms OK`);
   return json as T;
 }

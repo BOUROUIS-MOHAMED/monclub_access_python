@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import sys
-from typing import Optional
 
 _IS_WIN = sys.platform.startswith("win")
+
+
+class SecureStoreError(RuntimeError):
+    """Raised when bytes cannot be protected or unprotected with Windows DPAPI."""
 
 
 def protect_bytes(data: bytes) -> bytes:
     if not data:
         return b""
     if not _IS_WIN:
-        return data  # fallback
+        raise SecureStoreError("Windows DPAPI is unavailable")
     try:
         import ctypes
         from ctypes import wintypes
@@ -39,23 +42,24 @@ def protect_bytes(data: bytes) -> bytes:
             CRYPTPROTECT_UI_FORBIDDEN,
             ctypes.byref(out_blob),
         ):
-            raise OSError("CryptProtectData failed")
+            raise SecureStoreError("CryptProtectData failed")
 
         try:
             out = ctypes.string_at(out_blob.pbData, out_blob.cbData)
             return out
         finally:
             kernel32.LocalFree(out_blob.pbData)
-    except Exception:
-        # fallback (not ideal, but avoids crashing)
-        return data
+    except SecureStoreError:
+        raise
+    except Exception as exc:
+        raise SecureStoreError("Windows DPAPI protection failed") from exc
 
 
 def unprotect_bytes(blob: bytes) -> bytes:
     if not blob:
         return b""
     if not _IS_WIN:
-        return blob  # fallback
+        raise SecureStoreError("Windows DPAPI is unavailable")
     try:
         import ctypes
         from ctypes import wintypes
@@ -83,13 +87,14 @@ def unprotect_bytes(blob: bytes) -> bytes:
             CRYPTPROTECT_UI_FORBIDDEN,
             ctypes.byref(out_blob),
         ):
-            raise OSError("CryptUnprotectData failed")
+            raise SecureStoreError("CryptUnprotectData failed")
 
         try:
             out = ctypes.string_at(out_blob.pbData, out_blob.cbData)
             return out
         finally:
             kernel32.LocalFree(out_blob.pbData)
-    except Exception:
-        # fallback
-        return blob
+    except SecureStoreError:
+        raise
+    except Exception as exc:
+        raise SecureStoreError("Windows DPAPI unprotection failed") from exc

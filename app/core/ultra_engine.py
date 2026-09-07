@@ -102,6 +102,17 @@ _MIRROR_MAX_DELETE_FRACTION = 0.25
 _MIRROR_RESERVED_PIN_FLOOR = 90000
 _MIRROR_ENROLL_GRACE_SEC = 600.0
 
+# Revocation (_neutralise_revoked_pins) reuses the 25 % floor, but a percentage
+# ALONE is wrong for it. MIRROR deletes device users wholesale, so a pure fraction
+# suits it. Revocation is ordinary daily churn -- one member cancels -- and on a
+# small roster a fraction blocks that outright: 1 departure against a 20-member gym
+# is 5 %, but against a 3-member test rig it is 33 % and would abort forever.
+# So a small ABSOLUTE number is always allowed, and the fraction only takes over
+# once the roster is big enough for it to be the larger figure (>40 members).
+# Together they still refuse the case that matters: a truncated roster presenting
+# hundreds of members as departed.
+_REVOKE_ABSOLUTE_FLOOR = 10
+
 
 def _encode_fingers(finger_ids: Any) -> str:
     """Serialise a finger-id set for device_sync_state.pushed_finger_ids.
@@ -1527,13 +1538,27 @@ class UltraDeviceWorker(threading.Thread):
                     self._maybe_mirror_reconcile(reason=reason, roster_users=users)
                 except Exception as exc:
                     logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
-                # Forget state for pins no longer desired, so a member who leaves and
-                # later returns is pushed again rather than assumed present.
+                # Strip credentials from pins WE pushed that have left the roster.
+                # Must run BEFORE the prune below, which deletes the very record of
+                # what we pushed to them.
+                safe_to_prune = True
                 try:
-                    from app.core.db import prune_device_sync_state
-                    prune_device_sync_state(device_id=self._device_id, keep_pins=desired_pins)
-                except Exception:
-                    logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
+                    safe_to_prune = self._neutralise_revoked_pins(
+                        desired_pins=desired_pins, roster_count=len(users),
+                    )
+                except Exception as exc:
+                    logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                    safe_to_prune = False
+                # Forget state for pins no longer desired, so a member who leaves and
+                # later returns is pushed again rather than assumed present. Skipped
+                # when the revoke pass aborted: pruning would throw away the finger
+                # ids those pins still need cleared.
+                if safe_to_prune:
+                    try:
+                        from app.core.db import prune_device_sync_state
+                        prune_device_sync_state(device_id=self._device_id, keep_pins=desired_pins)
+                    except Exception:
+                        logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
@@ -1754,6 +1779,133 @@ class UltraDeviceWorker(threading.Thread):
         cutoff = now - _MIRROR_ENROLL_GRACE_SEC
         for k in [k for k, v in m.items() if v < cutoff]:
             m.pop(k, None)
+
+    def _neutralise_revoked_pins(self, *, desired_pins: set[str], roster_count: int) -> bool:
+        """Strip credentials from pins we pushed that are no longer desired.
+
+        WHY THIS EXISTS. On a ZK_STANDALONE terminal the DEVICE decides and opens;
+        the PC only observes the resulting rtlog ("reason=DEVICE_ALLOWED"). There is
+        no PC-side veto. So a credential left on the terminal IS access, and a member
+        whose membership went CANCELED / COMPLETED / INACTIVE / PENDING / EXPIRED,
+        or who was frozen or had their plan withdrawn, kept walking through the
+        turnstile indefinitely. `[FIELD: Oxyfit 2026-09-06 — every one of those
+        statuses was set in turn and the member still entered]` The backend was
+        right to drop them (shouldExposeMembership); the client simply never told
+        the device.
+
+        The only pre-existing removal path, _maybe_mirror_reconcile -> delete_users,
+        returns immediately unless rosterPushingPolicy == "MIRROR" — and PRESERVE is
+        the default every gym runs.
+
+        NEUTRALISE, NOT DELETE. Removing the row needs SSR_DeleteEnrollData(pin, 12),
+        whose hang status on this firmware is [UNKNOWN] (§3). Clearing the slots and
+        rewriting the row disabled with a blank card uses only calls proven in the
+        field. A row with no fingerprint, no card and enabled=False cannot open the
+        door, and no unproven call is issued.
+
+        OWNERSHIP IS THE SAFETY PROPERTY. The candidate set comes from
+        device_sync_state — pins THIS app pushed. A terminal shared with another
+        access system (Oxyfit runs one; ~930 of its users are on that hardware) can
+        never be touched, because those pins were never recorded here. That is
+        precisely what makes this safe where MIRROR is not.
+
+        Returns True when it is safe to prune per-pin state, False when the pass
+        aborted and the state must be kept so a later sync can retry.
+        """
+        if roster_count <= 0:
+            # A failed or half-built roster must never read as "everyone left".
+            _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
+            return False
+        try:
+            from app.core.db import list_device_sync_hashes_and_status
+            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+        except Exception:
+            logger.warning("%s revoke pass: per-pin state unreadable -- skipping",
+                           self._prefix, exc_info=True)
+            return False
+
+        keep = {str(p).strip() for p in (desired_pins or set())}
+        # The enrolment grace window, shared with MIRROR: a pin pushed seconds ago is
+        # mid-flight, not departed.
+        grace = self._mirror_grace_pins() | self._mirror_allowlist_pins()
+        revoked = sorted(p for p in state if p and p not in keep and p not in grace)
+        if not revoked:
+            return True
+
+        # Refuse an implausible bulk revocation rather than strip a gym's worth of
+        # members off a turnstile. See _REVOKE_ABSOLUTE_FLOOR for why a fraction on
+        # its own is not enough here.
+        ceiling = max(_REVOKE_ABSOLUTE_FLOOR, roster_count * _MIRROR_MAX_DELETE_FRACTION)
+        if len(revoked) > ceiling:
+            _tel.warn("REVOKE_ABORT_FLOOR", worker=self._tel_wid,
+                      revoked=len(revoked), roster=roster_count,
+                      ceiling=round(ceiling, 1),
+                      max_frac=_MIRROR_MAX_DELETE_FRACTION,
+                      abs_floor=_REVOKE_ABSOLUTE_FLOOR)
+            logger.warning(
+                "%s revoke pass ABORTED: %d pin(s) would be stripped against a roster "
+                "of %d (ceiling %.0f) -- that is implausible, so nothing was changed "
+                "and the per-pin state is kept for a later retry.",
+                self._prefix, len(revoked), roster_count, ceiling,
+            )
+            return False
+
+        logger.warning(
+            "%s revoking %d pin(s) no longer in the roster: %s",
+            self._prefix, len(revoked), ",".join(revoked[:20]),
+        )
+
+        # 1) DELETE the whole user. backupNumber 12 is "delete the user (including
+        #    all fingerprints, card numbers and passwords)" per the vendor manual,
+        #    and the operator cleared the users + fingerprint tables of the live
+        #    MB2000 with exactly this call on 2026-09-06 via script 13 -- which is
+        #    what retired the [UNKNOWN] that previously forced a neutralise-only
+        #    approach here.
+        deleter = getattr(self._sdk, "delete_users", None)
+        stubborn: list[str] = list(revoked)
+        deleted_ok = 0
+        if callable(deleter):
+            res = deleter(revoked) or {}
+            reported = res.get("failed_pins")
+            if reported is None:
+                # A driver too old to name them: on failure assume none landed, so
+                # the fallback covers everything rather than silently leaving live
+                # credentials behind.
+                stubborn = [] if res.get("ok") else list(revoked)
+            else:
+                stubborn = [str(p) for p in reported if str(p) in set(revoked)]
+            deleted_ok = len(revoked) - len(stubborn)
+        else:
+            logger.warning("%s driver cannot delete users -- neutralising instead",
+                           self._prefix)
+
+        # 2) Anything the delete could not remove still holds live credentials, so
+        #    strip them. TARGETED at the survivors only: SSR_SetUserInfo auto-creates,
+        #    so touching a pin that WAS deleted would resurrect it as an empty row.
+        neutralised_ok = True
+        slots = 0
+        if stubborn:
+            fingers = self._load_pushed_fingers()
+            removals = {p: sorted(fingers.get(p) or ()) for p in stubborn if fingers.get(p)}
+            slots = sum(len(v) for v in removals.values())
+            users_out = [{"pin": p, "name": "", "card": "", "enabled": False} for p in stubborn]
+            logger.warning(
+                "%s %d pin(s) survived the delete -- neutralising (clearing %d slot(s)): %s",
+                self._prefix, len(stubborn), slots, ",".join(stubborn[:20]),
+            )
+            result = self._sdk.push_roster(users_out, {}, remove_fingers_by_pin=removals) or {}
+            neutralised_ok = bool(result.get("ok"))
+
+        _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
+                   deleted=deleted_ok, neutralised=len(stubborn), slots=slots,
+                   ok=bool(neutralised_ok))
+        if not neutralised_ok:
+            # Keep the state so the next sync retries rather than forgetting that
+            # these pins still hold credentials.
+            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
+                           self._prefix)
+            return False
+        return True
 
     def _mirror_grace_pins(self) -> set[str]:
         m = getattr(self, "_recent_member_push", None) or {}

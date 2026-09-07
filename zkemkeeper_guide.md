@@ -161,19 +161,28 @@ This is the sequence proven on this hardware by
 > 5/7". That is wrong for script 5. Script 7 uses it for **whole-user / face / password**
 > backup numbers (11/12/13) — a different operation.
 
-### ⚠️ Unresolved tension — read before touching either path
+### Backup number 12 — RESOLVED 2026-09-06, it is safe
 
-`_do_delete_users` still calls `SSR_DeleteEnrollData(1, pin, 12)` (12 = whole user) for
-MIRROR deletes. `[CODE]`
+The hang is a **finger-index** phenomenon: observed at indices 1 and 2, never at 0.
+Backup number **12 is not a finger index** and was long carried here as `[UNKNOWN]` —
+"neither observed hanging nor proven safe" — which is why every removal design in this
+repo had to route around it.
 
-The hang was observed **only at finger indices 1 and 2**. Whether backup number **12**
-is also affected is **`[UNKNOWN]`** — it has neither been observed hanging nor proven
-safe. The blanket phrasing "backupNumber >= 1 never returns" in the source comment
-would forbid 12, yet the code calls it. **Do not resolve this tension by editing the
-comment.** Resolve it with hardware evidence, then update this section.
+It is now **`[FIELD]`**. The operator ran `13_inspect_and_clear_tables.ps1` against the
+live MB2000 at Oxyfit on 2026-09-06 and **cleared the users and fingerprints tables
+successfully** — that script's whole-user option is exactly
+`SSR_DeleteEnrollData(mn, pin, 12)`, issued per pin over a ~1800-user terminal. No
+wedge, no abandoned STA thread.
 
-That backup number 12 means the whole user (fingerprints + card + password) is
-`[COMMENT]` — docstring and inline comment only.
+The meaning is now vendor-documented too, not inferred: the ZKTeco standalone SDK
+defines backupNumber **12** as *"delete the user (including all fingerprints, card
+numbers and passwords)"*, **11** and **13** as *"delete all fingerprint data of the
+user"*, and **0–9** as one finger. Previously this was `[COMMENT]` — docstring only.
+
+So `_do_delete_users` calling `SSR_DeleteEnrollData(1, pin, 12)` is correct and proven,
+and `_neutralise_revoked_pins` deletes departed pins outright rather than working
+around it. **The finger-index prohibition in §3 is untouched by this** — 0–9 still must
+go through `SSR_DelUserTmpExt`.
 
 ### `SSR_DelUserTmpExt` against an ALREADY-EMPTY slot — measured
 
@@ -592,6 +601,42 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   `monclub_backend` `a933338d`. `MEMBER_SYNC_DEFERRED` now carries **`in_db`** so the
   two cases can never again be confused in a log: `in_db=False` means the row is gone,
   `in_db=True` means it exists and a filter rejected it.
+- **A member who LEAVES the roster is DELETED from the terminal.** After a
+  successful full push, `_neutralise_revoked_pins` takes the pins in
+  `device_sync_state` that are no longer desired and calls
+  `delete_users` → `SSR_DeleteEnrollData(1, pin, 12)` on each. Any pin the delete
+  could **not** remove still holds live credentials, so those — and only those — fall
+  back to being rewritten with a blank card, empty name and **`enabled=False`**, with
+  their recorded finger slots cleared via `SSR_DelUserTmpExt`. The fallback is
+  targeted because `SSR_SetUserInfo` **auto-creates**: touching a pin that WAS deleted
+  would resurrect it as an empty row. The whole pass runs BEFORE
+  `prune_device_sync_state`, which would otherwise delete the very record of what
+  those pins hold.
+  `[FIELD: Oxyfit 2026-09-06 — a membership set to CANCELED, then COMPLETED,
+  INACTIVE, PENDING and EXPIRED in turn, and the member kept opening the turnstile
+  every time. The backend correctly stopped exposing them
+  (AccessPatchBundleService::shouldExposeMembership) and the client simply never
+  told the device.]`
+  On a standalone terminal **the device decides and opens** — the PC only observes
+  the resulting rtlog. There is no PC-side veto, so a credential left on the
+  terminal *is* access.
+  **Delete, with neutralise as the fallback:** backup number 12 is field-proven as of
+  2026-09-06 (§3), so the row goes. `_do_delete_users` returns `failed_pins` so the
+  fallback can target exactly the survivors.
+  **Ownership is the safety property:** candidates come only from `device_sync_state`
+  — pins THIS app pushed — so a terminal shared with another access system can never
+  be touched. That is exactly what makes this safe where MIRROR is not.
+  **Rails:** empty roster ⇒ skip (`REVOKE_SKIP_EMPTY_ROSTER`); more than
+  `max(_REVOKE_ABSOLUTE_FLOOR=10, roster × 0.25)` pins ⇒ abort and KEEP the state
+  (`REVOKE_ABORT_FLOOR`); the MIRROR enrolment grace window and protected-pin
+  allowlist are honoured; a failed push keeps the state for retry.
+  A percentage alone was wrong here — one departure on a 3-member rig is 33 % and
+  would abort forever — hence the absolute floor underneath it.
+  `[TEST: tests/test_standalone_revoked_pin_neutralise.py]`
+- **`SSR_SetUserInfo` now honours a caller-supplied `enabled`.** It was hardcoded
+  `True`, so the driver could write a member but never a DISABLED one, which left
+  revocation with only the unproven whole-user delete. Absent key ⇒ `True`, so every
+  existing caller is unchanged. `[CODE]`
 - **Safety direction:** a state *read* failure ⇒ push everything; a state *write*
   failure ⇒ logged and ignored. MIRROR always receives the **full desired roster**,
   never the incremental subset (passing the subset would delete every unchanged

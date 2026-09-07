@@ -3,6 +3,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AccessFeedbackProvider } from "@/components/AccessFeedbackProvider";
 import { AppProvider, useApp } from "./context/AppContext";
+import { PcIdentityProvider, usePcIdentity } from "./context/PcIdentityContext";
 import { EnrollmentProvider } from "./context/EnrollmentContext";
 import { useEnrollmentListener } from "./hooks/useEnrollmentListener";
 import { Loader2 } from "lucide-react";
@@ -22,6 +23,7 @@ import LocalDbPage from "./pages/LocalDbPage";
 import ProfilePage from "./pages/ProfilePage";
 import UpdatePage from "./pages/UpdatePage";
 import RestrictedPage from "./pages/RestrictedPage";
+import PcSetupPage from "./pages/PcSetupPage";
 import PopupWindow from "./pages/PopupWindow";
 import TrayPanelPage from "./pages/TrayPanelPage";
 import FavoritesOverlayPage from "./pages/FavoritesOverlayPage";
@@ -29,6 +31,7 @@ import ScanResultPage from "./pages/ScanResultPage";
 
 function AppRoutes() {
   const { status, loading, error } = useApp();
+  const { showSetup } = usePcIdentity();
   const loggedIn = status?.session?.loggedIn ?? false;
   const restricted = status?.session?.restricted ?? false;
   useEnrollmentListener();
@@ -60,6 +63,10 @@ function AppRoutes() {
         <Route path="*" element={<Navigate to="/restricted" replace />} />
       </Routes>
     );
+  }
+
+  if (showSetup) {
+    return <PcSetupPage />;
   }
 
   return (
@@ -101,11 +108,13 @@ export default function App() {
               path="*"
               element={(
                 <AppProvider>
-                  <AccessFeedbackProvider>
-                    <EnrollmentProvider>
-                      <AppRoutes />
-                    </EnrollmentProvider>
-                  </AccessFeedbackProvider>
+                  <PcIdentityProvider>
+                    <AccessFeedbackProvider>
+                      <EnrollmentProvider>
+                        <AppRoutes />
+                      </EnrollmentProvider>
+                    </AccessFeedbackProvider>
+                  </PcIdentityProvider>
                 </AppProvider>
               )}
             />

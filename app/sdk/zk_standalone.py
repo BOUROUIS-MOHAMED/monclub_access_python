@@ -1508,9 +1508,17 @@ class ZKStandaloneDevice:
                         if traced:
                             self.logger.info("%s push trace pin=%s -> SetStrCardNumber('')", self._prefix, pin)
                         zk.SetStrCardNumber("")
+                    # `enabled` was hardcoded True, so the driver could write a member
+                    # but never write a DISABLED one. That left revocation with only
+                    # one instrument -- deleting the whole row via the unproven
+                    # SSR_DeleteEnrollData(pin, 12). Honouring the caller's flag lets
+                    # a departed member be neutralised with proven calls instead.
+                    # Absent key => True, so every existing caller is unchanged.
+                    enabled = bool(u.get("enabled", True))
                     if traced:
-                        self.logger.info("%s push trace pin=%s -> SSR_SetUserInfo", self._prefix, pin)
-                    ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, True))
+                        self.logger.info("%s push trace pin=%s -> SSR_SetUserInfo(enabled=%s)",
+                                         self._prefix, pin, enabled)
+                    ok = bool(zk.SSR_SetUserInfo(1, pin, name, "", 0, enabled))
                     if not ok:
                         failed += 1
                         _mark_failed(pin, "set_user_info_false")
@@ -1767,10 +1775,17 @@ class ZKStandaloneDevice:
         deleted = 0
         failed = 0
         errors: List[str] = []
+        # WHICH pins did not go. The aggregate counts cannot say, and the caller
+        # needs to know precisely: a pin that survives the delete still holds live
+        # credentials and has to be neutralised instead, while a pin that WAS
+        # deleted must be left alone -- SSR_SetUserInfo auto-creates, so touching it
+        # again would resurrect it as an empty row. Mirrors push_roster's failed_pins.
+        failed_pins: List[str] = []
         for raw in pins or []:
             pin = str(raw or "").strip()
             if not pin.isdigit() or len(pin) > _MAX_PIN_DIGITS:
                 failed += 1
+                failed_pins.append(pin)
                 if len(errors) < 5:
                     errors.append(f"skip invalid pin={pin!r}")
                 continue
@@ -1779,10 +1794,12 @@ class ZKStandaloneDevice:
                     deleted += 1
                 else:
                     failed += 1
+                    failed_pins.append(pin)
                     if len(errors) < 5:
                         errors.append(f"SSR_DeleteEnrollData(pin={pin}) returned False")
             except Exception as exc:
                 failed += 1
+                failed_pins.append(pin)
                 if len(errors) < 5:
                     errors.append(f"pin={pin}: {exc}")
         try:
@@ -1799,4 +1816,5 @@ class ZKStandaloneDevice:
                        deleted=deleted, failed=failed, ok=ok)
         except Exception:
             pass
-        return {"ok": ok, "deleted": deleted, "failed": failed, "errors": errors}
+        return {"ok": ok, "deleted": deleted, "failed": failed, "errors": errors,
+                "failed_pins": failed_pins}
