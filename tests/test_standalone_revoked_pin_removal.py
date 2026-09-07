@@ -44,6 +44,7 @@ selected. That ownership rule is what makes this safe where MIRROR is not.
 from __future__ import annotations
 
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -83,12 +84,94 @@ class RevokeDriver:
                 "del_attempted": 0, "del_ok": 0}
 
 
+class FailingFallbackDriver(RevokeDriver):
+    """Records the neutralise attempt but reports that it did not land."""
+
+    def push_roster(self, users, templates_by_pin=None, *, remove_fingers_by_pin=None,
+                    bracket_enable_device=False, **kw):
+        super().push_roster(
+            users,
+            templates_by_pin,
+            remove_fingers_by_pin=remove_fingers_by_pin,
+            bracket_enable_device=bracket_enable_device,
+            **kw,
+        )
+        return {"ok": False}
+
+
 def _revoked_push(drv: RevokeDriver) -> dict | None:
     """The push whose users are all disabled -- the neutralise pass."""
     for call in drv.push_calls:
         if call["users"] and all(u.get("enabled") is False for u in call["users"]):
             return call
     return None
+
+
+class TestImmediateAuthoritativeRevoke:
+
+    def test_owned_pin_is_deleted_immediately_and_local_state_is_removed(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        fstate.rows["34439"] = ("old-hash", True, {0, 2})
+        monkeypatch.setattr(dbmod, "delete_device_mirror_pin", MagicMock())
+
+        assert w._run_standalone_member_revoke(34439) is True
+
+        assert drv.delete_calls == [["34439"]]
+        assert _revoked_push(drv) is None
+        assert "34439" not in fstate.rows
+
+    def test_failed_delete_neutralises_only_the_owned_pin_and_removes_local_state(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        fstate.rows["34439"] = ("old-hash", True, {0, 2})
+        monkeypatch.setattr(dbmod, "delete_device_mirror_pin", lambda **_kw: None)
+
+        assert w._run_standalone_member_revoke(34439) is True
+
+        assert drv.delete_calls == [["34439"]]
+        assert _revoked_push(drv) == {
+            "users": [{"pin": "34439", "name": "", "card": "", "enabled": False}],
+            "templates": {},
+            "removals": {"34439": [0, 2]},
+        }
+        assert "34439" not in fstate.rows
+
+    def test_unowned_pin_is_not_touched_and_requests_full_reconciliation(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        full_sync = MagicMock(return_value=True)
+        monkeypatch.setattr(w, "request_full_sync", full_sync)
+        telemetry = MagicMock()
+        monkeypatch.setattr(ue._tel, "warn", telemetry)
+
+        assert w._run_standalone_member_revoke(34439) is False
+
+        assert drv.delete_calls == []
+        assert drv.push_calls == []
+        full_sync.assert_called_once_with(reason="revoke-ownership-missing")
+        assert any(
+            call.args and call.args[0] == "MEMBER_REVOKE_OWNERSHIP_MISSING"
+            for call in telemetry.call_args_list
+        )
+
+    def test_total_failure_keeps_local_state_and_requests_full_reconciliation(
+            self, monkeypatch, fstate):
+        drv = FailingFallbackDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        fstate.rows["34439"] = ("old-hash", True, {0, 2})
+        full_sync = MagicMock(return_value=True)
+        monkeypatch.setattr(w, "request_full_sync", full_sync)
+
+        assert w._run_standalone_member_revoke(34439) is False
+
+        assert drv.delete_calls == [["34439"]]
+        assert _revoked_push(drv) is not None
+        assert "34439" in fstate.rows
+        full_sync.assert_called_once_with(reason="revoke-failed")
 
 
 class TestARevokedMemberLosesTheirCredentials:

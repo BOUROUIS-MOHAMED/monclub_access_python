@@ -1792,6 +1792,175 @@ class UltraDeviceWorker(threading.Thread):
                        dur_ms=round((time.monotonic() - _ms_t0) * 1000),
                        pending=len(self._pending_member_syncs))
 
+    def _remove_standalone_pins(
+        self,
+        *,
+        pins: list[str],
+        pushed_fingers: dict[str, set[int] | None],
+    ) -> tuple[set[str], set[str]]:
+        """Delete owned pins, neutralising only those not confirmed deleted."""
+        requested: list[str] = []
+        seen: set[str] = set()
+        for raw_pin in pins or []:
+            pin = str(raw_pin or "").strip()
+            if pin and pin not in seen:
+                requested.append(pin)
+                seen.add(pin)
+
+        failed = set(requested)
+        deleter = getattr(self._sdk, "delete_users", None)
+        if requested and callable(deleter):
+            try:
+                result = deleter(requested) or {}
+                reported = result.get("failed_pins")
+                if reported is None:
+                    failed = set() if result.get("ok") else set(requested)
+                else:
+                    reported_failed = {
+                        str(pin or "").strip()
+                        for pin in reported
+                        if str(pin or "").strip() in seen
+                    }
+                    # An aggregate failure with no named pins confirms nothing.
+                    failed = (
+                        set(requested)
+                        if not result.get("ok") and not reported_failed
+                        else reported_failed
+                    )
+            except Exception:
+                failed = set(requested)
+                logger.warning(
+                    "%s delete-users call failed -- neutralising requested pins",
+                    self._prefix,
+                    exc_info=True,
+                )
+        elif requested:
+            logger.warning("%s driver cannot delete users -- neutralising instead", self._prefix)
+
+        removed = set(requested) - failed
+        fallback_pins = sorted(failed)
+        removals = {
+            pin: sorted(pushed_fingers.get(pin) or ())
+            for pin in fallback_pins
+            if pushed_fingers.get(pin)
+        }
+        slots = sum(len(finger_ids) for finger_ids in removals.values())
+        if fallback_pins:
+            users = [
+                {"pin": pin, "name": "", "card": "", "enabled": False}
+                for pin in fallback_pins
+            ]
+            logger.warning(
+                "%s %d pin(s) survived the delete -- neutralising "
+                "(clearing %d slot(s)): %s",
+                self._prefix,
+                len(fallback_pins),
+                slots,
+                ",".join(fallback_pins[:20]),
+            )
+            try:
+                fallback = self._sdk.push_roster(
+                    users, {}, remove_fingers_by_pin=removals,
+                ) or {}
+                if fallback.get("ok"):
+                    removed.update(failed)
+                    failed.clear()
+            except Exception:
+                logger.warning(
+                    "%s revoke fallback raised -- keeping per-pin state for retry",
+                    self._prefix,
+                    exc_info=True,
+                )
+
+        # The full-reconcile caller preserves its established REVOKE_DONE fields.
+        # Workers execute these operations serially, so this summary belongs to
+        # the immediately returned result.
+        self._last_standalone_remove_stats = {
+            "deleted": len(requested) - len(fallback_pins),
+            "neutralised": len(fallback_pins),
+            "slots": slots,
+        }
+        return removed, failed
+
+    def _run_standalone_member_revoke(self, member_id: int) -> bool:
+        """Immediately remove one authoritative, MonClub-owned standalone PIN."""
+        pin = str(int(member_id))
+        _tel.event(
+            "MEMBER_REVOKE_REQUESTED",
+            worker=self._tel_wid,
+            member_id=member_id,
+            pin=pin,
+        )
+        try:
+            from app.core.db import list_device_sync_hashes_and_status
+
+            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+        except Exception:
+            logger.warning(
+                "%s member revoke: ownership state unreadable for pin %s",
+                self._prefix,
+                pin,
+                exc_info=True,
+            )
+            _tel.warn(
+                "MEMBER_REVOKE_FAILED",
+                worker=self._tel_wid,
+                member_id=member_id,
+                pin=pin,
+            )
+            self.request_full_sync(reason="revoke-failed")
+            return False
+
+        if pin not in state:
+            logger.critical(
+                "%s member revoke refused: no MonClub ownership proof for pin %s",
+                self._prefix,
+                pin,
+            )
+            _tel.warn(
+                "MEMBER_REVOKE_OWNERSHIP_MISSING",
+                worker=self._tel_wid,
+                member_id=member_id,
+                pin=pin,
+            )
+            self.request_full_sync(reason="revoke-ownership-missing")
+            return False
+
+        removed, failed = self._remove_standalone_pins(
+            pins=[pin],
+            pushed_fingers=self._load_pushed_fingers(),
+        )
+        if pin in removed and pin not in failed:
+            from app.core.db import delete_device_mirror_pin, delete_device_sync_state
+
+            delete_device_sync_state(device_id=self._device_id, pin=pin)
+            try:
+                delete_device_mirror_pin(device_id=self._device_id, pin=pin)
+            except Exception:
+                logger.debug(
+                    "%s could not clear mirror pin %s",
+                    self._prefix,
+                    pin,
+                    exc_info=True,
+                )
+            _tel.event(
+                "MEMBER_REVOKE_DONE",
+                worker=self._tel_wid,
+                member_id=member_id,
+                pin=pin,
+                ok=True,
+            )
+            return True
+
+        _tel.warn(
+            "MEMBER_REVOKE_FAILED",
+            worker=self._tel_wid,
+            member_id=member_id,
+            pin=pin,
+        )
+        self.request_full_sync(reason="revoke-failed")
+        return False
+
     # ------------------------------------------------------------------ #
     # MIRROR pushing policy (destructive reconcile) — helpers + consumer
     # ------------------------------------------------------------------ #
@@ -1828,11 +1997,9 @@ class UltraDeviceWorker(threading.Thread):
         returns immediately unless rosterPushingPolicy == "MIRROR" — and PRESERVE is
         the default every gym runs.
 
-        NEUTRALISE, NOT DELETE. Removing the row needs SSR_DeleteEnrollData(pin, 12),
-        whose hang status on this firmware is [UNKNOWN] (§3). Clearing the slots and
-        rewriting the row disabled with a blank card uses only calls proven in the
-        field. A row with no fingerprint, no card and enabled=False cannot open the
-        door, and no unproven call is issued.
+        DELETE, WITH NEUTRALISE AS FALLBACK. Whole-user deletion is field-proven for
+        backup number 12. A failed or unsupported delete is rewritten disabled with
+        blank card/name while only locally tracked fingerprint slots are cleared.
 
         OWNERSHIP IS THE SAFETY PROPERTY. The candidate set comes from
         device_sync_state — pins THIS app pushed. A terminal shared with another
@@ -1886,57 +2053,21 @@ class UltraDeviceWorker(threading.Thread):
             self._prefix, len(revoked), ",".join(revoked[:20]),
         )
 
-        # 1) DELETE the whole user. backupNumber 12 is "delete the user (including
-        #    all fingerprints, card numbers and passwords)" per the vendor manual,
-        #    and the operator cleared the users + fingerprint tables of the live
-        #    MB2000 with exactly this call on 2026-09-06 via script 13 -- which is
-        #    what retired the [UNKNOWN] that previously forced a neutralise-only
-        #    approach here.
-        deleter = getattr(self._sdk, "delete_users", None)
-        stubborn: list[str] = list(revoked)
-        deleted_ok = 0
-        if callable(deleter):
-            res = deleter(revoked) or {}
-            reported = res.get("failed_pins")
-            if reported is None:
-                # A driver too old to name them: on failure assume none landed, so
-                # the fallback covers everything rather than silently leaving live
-                # credentials behind.
-                stubborn = [] if res.get("ok") else list(revoked)
-            else:
-                stubborn = [str(p) for p in reported if str(p) in set(revoked)]
-            deleted_ok = len(revoked) - len(stubborn)
-        else:
-            logger.warning("%s driver cannot delete users -- neutralising instead",
-                           self._prefix)
-
-        # 2) Anything the delete could not remove still holds live credentials, so
-        #    strip them. TARGETED at the survivors only: SSR_SetUserInfo auto-creates,
-        #    so touching a pin that WAS deleted would resurrect it as an empty row.
-        neutralised_ok = True
-        slots = 0
-        if stubborn:
-            fingers = self._load_pushed_fingers()
-            removals = {p: sorted(fingers.get(p) or ()) for p in stubborn if fingers.get(p)}
-            slots = sum(len(v) for v in removals.values())
-            users_out = [{"pin": p, "name": "", "card": "", "enabled": False} for p in stubborn]
-            logger.warning(
-                "%s %d pin(s) survived the delete -- neutralising (clearing %d slot(s)): %s",
-                self._prefix, len(stubborn), slots, ",".join(stubborn[:20]),
-            )
-            result = self._sdk.push_roster(users_out, {}, remove_fingers_by_pin=removals) or {}
-            neutralised_ok = bool(result.get("ok"))
-
+        removed, failed = self._remove_standalone_pins(
+            pins=revoked,
+            pushed_fingers=self._load_pushed_fingers(),
+        )
+        stats = self._last_standalone_remove_stats
         _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
-                   deleted=deleted_ok, neutralised=len(stubborn), slots=slots,
-                   ok=bool(neutralised_ok))
-        if not neutralised_ok:
+                   deleted=stats["deleted"], neutralised=stats["neutralised"],
+                   slots=stats["slots"], ok=not failed)
+        if failed:
             # Keep the state so the next sync retries rather than forgetting that
             # these pins still hold credentials.
             logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
                            self._prefix)
             return False
-        return True
+        return removed == set(revoked)
 
     def _mirror_grace_pins(self) -> set[str]:
         m = getattr(self, "_recent_member_push", None) or {}
