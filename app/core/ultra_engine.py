@@ -386,6 +386,7 @@ class UltraDeviceWorker(threading.Thread):
         self._member_sync_lock = threading.Lock()
         self._pending_member_syncs: Deque[int] = deque()
         self._pending_member_sync_ids: Set[int] = set()
+        self._pending_member_revoke_ids: Set[int] = set()
         self._full_sync_lock = threading.Lock()
         self._pending_full_sync_request: Dict[str, Any] | None = None
         self._active_sync_lock = threading.Lock()
@@ -912,11 +913,26 @@ class UltraDeviceWorker(threading.Thread):
     def request_member_sync(self, member_id: int) -> bool:
         normalized_member_id = int(member_id)
         with self._member_sync_lock:
-            if normalized_member_id in self._pending_member_sync_ids:
+            if (
+                normalized_member_id in self._pending_member_revoke_ids
+                or normalized_member_id in self._pending_member_sync_ids
+            ):
                 return False
             self._pending_member_sync_ids.add(normalized_member_id)
             self._pending_member_syncs.append(normalized_member_id)
+            self._wake_evt.set()
         return True
+
+    def request_member_revoke(self, member_id: int) -> bool:
+        normalized_member_id = int(member_id)
+        with self._member_sync_lock:
+            is_new_revocation = normalized_member_id not in self._pending_member_revoke_ids
+            self._pending_member_revoke_ids.add(normalized_member_id)
+            if normalized_member_id not in self._pending_member_sync_ids:
+                self._pending_member_sync_ids.add(normalized_member_id)
+                self._pending_member_syncs.append(normalized_member_id)
+            self._wake_evt.set()
+        return is_new_revocation
 
     def request_full_sync(self, reason: str = "manual", fingerprint_hash: str | None = None) -> bool:
         normalized_reason = str(reason or "manual").strip() or "manual"
@@ -1098,22 +1114,33 @@ class UltraDeviceWorker(threading.Thread):
                 if not self._pending_member_syncs:
                     break
                 member_id = int(self._pending_member_syncs.popleft())
+                is_revocation = member_id in self._pending_member_revoke_ids
                 self._pending_member_sync_ids.discard(member_id)
+                self._pending_member_revoke_ids.discard(member_id)
 
             try:
                 if self._sdk is None or not self._connected:
-                    self.request_member_sync(member_id)
+                    if is_revocation:
+                        self.request_member_revoke(member_id)
+                    else:
+                        self.request_member_sync(member_id)
                     break
                 # Push drivers: same livelock hazard as the full-sync drain — a
                 # None raw handle would re-queue this member forever. Use the
                 # driver's targeted roster push instead (always terminates).
                 if getattr(self._sdk, "owns_event_source", False):
-                    self._run_standalone_member_sync(member_id)
+                    if is_revocation:
+                        self._run_standalone_member_revoke(member_id)
+                    else:
+                        self._run_standalone_member_sync(member_id)
                     drained += 1
                     continue
                 raw_sdk = getattr(self._sdk, "_sdk", None)
                 if raw_sdk is None:
-                    self.request_member_sync(member_id)
+                    if is_revocation:
+                        self.request_member_revoke(member_id)
+                    else:
+                        self.request_member_sync(member_id)
                     break
                 from app.core.device_sync import DeviceSyncEngine
 

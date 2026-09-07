@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+from collections import deque
 import threading
 import time
 import types
 import queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+
+def _member_command_worker(ultra_module):
+    worker = object.__new__(ultra_module.UltraDeviceWorker)
+    worker._member_sync_lock = threading.Lock()
+    worker._pending_member_syncs = deque()
+    worker._pending_member_sync_ids = set()
+    worker._pending_member_revoke_ids = set()
+    worker._wake_evt = threading.Event()
+    return worker
 
 
 def test_ultra_sync_scheduler_request_sync_now_wakes_without_waiting_interval(monkeypatch):
@@ -344,6 +355,53 @@ def test_ultra_worker_drains_targeted_member_sync_commands_one_member_at_a_time(
         ("raw-sdk", 11, "ultra_targeted_member_sync"),
         ("raw-sdk", 13, "ultra_targeted_member_sync"),
     ]
+
+
+def test_member_revoke_upgrades_queued_member_sync_without_duplicate():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+
+    assert worker.request_member_sync(41) is True
+    worker._wake_evt.clear()
+    assert worker.request_member_revoke(41) is True
+    assert list(worker._pending_member_syncs) == [41]
+    assert worker._pending_member_sync_ids == {41}
+    assert worker._pending_member_revoke_ids == {41}
+    assert worker._wake_evt.is_set()
+
+
+def test_member_sync_cannot_downgrade_queued_member_revoke():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+
+    assert worker.request_member_revoke(41) is True
+    worker._wake_evt.clear()
+    assert worker.request_member_sync(41) is False
+    assert list(worker._pending_member_syncs) == [41]
+    assert worker._pending_member_sync_ids == {41}
+    assert worker._pending_member_revoke_ids == {41}
+    assert not worker._wake_evt.is_set()
+
+
+def test_standalone_member_command_drain_routes_captured_action():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = True
+    worker._run_standalone_member_sync = MagicMock()
+    worker._run_standalone_member_revoke = MagicMock()
+
+    worker.request_member_sync(41)
+    worker.request_member_revoke(42)
+
+    assert worker._drain_member_sync_commands(limit=2) == 2
+    worker._run_standalone_member_sync.assert_called_once_with(41)
+    worker._run_standalone_member_revoke.assert_called_once_with(42)
+    assert worker._pending_member_sync_ids == set()
+    assert worker._pending_member_revoke_ids == set()
 
 
 def test_ultra_worker_drains_full_sync_commands_using_live_connection(monkeypatch):
