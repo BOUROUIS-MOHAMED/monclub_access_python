@@ -79,13 +79,46 @@ class RevokeDriver:
             "templates": dict(templates_by_pin or {}),
             "removals": {k: sorted(v) for k, v in (remove_fingers_by_pin or {}).items()},
         })
+        removals = sum(len(v) for v in (remove_fingers_by_pin or {}).values())
         return {"ok": True, "pushed": len(users), "failed": 0, "templates_failed": 0,
                 "skipped_pin": 0, "chunks_wedged": 0, "errors": [], "failed_pins": [],
-                "del_attempted": 0, "del_ok": 0}
+                "del_attempted": removals, "del_ok": removals}
 
 
 class FailingFallbackDriver(RevokeDriver):
     """Records the neutralise attempt but reports that it did not land."""
+
+    def push_roster(self, users, templates_by_pin=None, *, remove_fingers_by_pin=None,
+                    bracket_enable_device=False, **kw):
+        success = super().push_roster(
+            users,
+            templates_by_pin,
+            remove_fingers_by_pin=remove_fingers_by_pin,
+            bracket_enable_device=bracket_enable_device,
+            **kw,
+        )
+        if users and all(user.get("enabled") is False for user in users):
+            return {"ok": False}
+        return success
+
+
+class ContractDriver(RevokeDriver):
+    """Returns caller-supplied device contracts while retaining call evidence."""
+
+    def __init__(self, *, delete_result=None, fallback_by_pin=None,
+                 delete_raises=False, fallback_raises_for=None):
+        super().__init__()
+        self.delete_result = delete_result
+        self.fallback_by_pin = dict(fallback_by_pin or {})
+        self.delete_raises = delete_raises
+        self.fallback_raises_for = set(fallback_raises_for or ())
+
+    def delete_users(self, pins, *, timeout_sec: float = 300.0):
+        pins = [str(p) for p in pins]
+        self.delete_calls.append(pins)
+        if self.delete_raises:
+            raise RuntimeError("delete boom")
+        return self.delete_result
 
     def push_roster(self, users, templates_by_pin=None, *, remove_fingers_by_pin=None,
                     bracket_enable_device=False, **kw):
@@ -96,7 +129,10 @@ class FailingFallbackDriver(RevokeDriver):
             bracket_enable_device=bracket_enable_device,
             **kw,
         )
-        return {"ok": False}
+        pin = str(users[0]["pin"])
+        if pin in self.fallback_raises_for:
+            raise RuntimeError("push boom")
+        return self.fallback_by_pin.get(pin, {"ok": False})
 
 
 def _revoked_push(drv: RevokeDriver) -> dict | None:
@@ -107,27 +143,185 @@ def _revoked_push(drv: RevokeDriver) -> dict | None:
     return None
 
 
+def _fallback_success(*, slots: int) -> dict:
+    return {
+        "ok": True,
+        "pushed": 1,
+        "failed": 0,
+        "templates_failed": 0,
+        "skipped_pin": 0,
+        "chunks_wedged": 0,
+        "failed_pins": [],
+        "del_attempted": slots,
+        "del_ok": slots,
+    }
+
+
+@pytest.fixture
+def tracked_revocation_state(monkeypatch, fstate):
+    mirrors = {"34439"}
+
+    def clear_both(*, device_id, pin):
+        fstate.delete(device_id=device_id, pin=pin)
+        mirrors.discard(str(pin))
+
+    # Keep the pre-fix two-call implementation isolated from the real local DB,
+    # while making the new transactional seam observable too.
+    monkeypatch.setattr(dbmod, "delete_device_mirror_pin",
+                        lambda *, device_id, pin: mirrors.discard(str(pin)))
+    monkeypatch.setattr(dbmod, "clear_device_revocation_state", clear_both, raising=False)
+    return mirrors
+
+
+class TestRemovalResultContract:
+
+    @pytest.mark.parametrize("delete_result", [
+        None,
+        {},
+        {"ok": True},
+        {"ok": True, "deleted": 1, "failed": 0},
+        {"ok": True, "deleted": 0, "failed": 1, "failed_pins": []},
+        {"ok": True, "deleted": 1, "failed": 0, "failed_pins": ["34439"]},
+        {"ok": False, "deleted": 1, "failed": 1, "failed_pins": ["34439"]},
+        {"ok": False, "deleted": 0, "failed": 1, "failed_pins": ["foreign"]},
+        {"ok": "yes", "deleted": 1, "failed": 0, "failed_pins": []},
+        {"ok": False, "deleted": 0, "failed": "1", "failed_pins": ["34439"]},
+        {"ok": False, "deleted": 0, "failed": 1, "failed_pins": "34439"},
+    ])
+    def test_ambiguous_delete_result_confirms_no_hard_deletion(self, monkeypatch,
+                                                               delete_result):
+        drv = ContractDriver(delete_result=delete_result)
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439"], pushed_fingers={"34439": {0, 2}},
+        )
+
+        assert outcome.deleted == frozenset()
+        assert outcome.neutralised == frozenset()
+        assert outcome.failed == frozenset({"34439"})
+        assert len(drv.push_calls) == 1, "ambiguous deletion must enter fallback"
+
+    def test_consistent_partial_delete_is_attributed_per_pin(self, monkeypatch):
+        drv = ContractDriver(
+            delete_result={
+                "ok": False,
+                "deleted": 1,
+                "failed": 1,
+                "failed_pins": ["34440"],
+            },
+            fallback_by_pin={"34440": {"ok": False}},
+        )
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439", "34440"],
+            pushed_fingers={"34439": {0}, "34440": {1}},
+        )
+
+        assert outcome.deleted == frozenset({"34439"})
+        assert outcome.neutralised == frozenset()
+        assert outcome.failed == frozenset({"34440"})
+
+    def test_fallback_requires_every_expected_slot_clear_to_be_confirmed(self, monkeypatch):
+        drv = ContractDriver(
+            delete_result={
+                "ok": False, "deleted": 0, "failed": 1,
+                "failed_pins": ["34439"],
+            },
+            fallback_by_pin={"34439": {
+                **_fallback_success(slots=2),
+                "del_ok": 1,
+            }},
+        )
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439"], pushed_fingers={"34439": {0, 2}},
+        )
+
+        assert outcome.neutralised == frozenset()
+        assert outcome.failed == frozenset({"34439"})
+
+    def test_partial_fallback_success_is_attributed_per_pin(self, monkeypatch):
+        drv = ContractDriver(
+            delete_result={
+                "ok": False, "deleted": 0, "failed": 2,
+                "failed_pins": ["34439", "34440"],
+            },
+            fallback_by_pin={
+                "34439": _fallback_success(slots=2),
+                "34440": {**_fallback_success(slots=1), "ok": False,
+                            "failed_pins": ["34440"], "del_ok": 0},
+            },
+        )
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439", "34440"],
+            pushed_fingers={"34439": {0, 2}, "34440": {1}},
+        )
+
+        assert outcome.deleted == frozenset()
+        assert outcome.neutralised == frozenset({"34439"})
+        assert outcome.failed == frozenset({"34440"})
+
+    def test_delete_exception_uses_confirmed_fallback(self, monkeypatch):
+        drv = ContractDriver(
+            delete_raises=True,
+            fallback_by_pin={"34439": _fallback_success(slots=2)},
+        )
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439"], pushed_fingers={"34439": {0, 2}},
+        )
+
+        assert outcome.neutralised == frozenset({"34439"})
+        assert outcome.failed == frozenset()
+
+    def test_delete_and_push_exceptions_confirm_nothing(self, monkeypatch):
+        drv = ContractDriver(delete_raises=True, fallback_raises_for={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+
+        outcome = w._remove_standalone_pins(
+            pins=["34439"], pushed_fingers={"34439": {0, 2}},
+        )
+
+        assert outcome.deleted == frozenset()
+        assert outcome.neutralised == frozenset()
+        assert outcome.failed == frozenset({"34439"})
+
+
 class TestImmediateAuthoritativeRevoke:
 
     def test_owned_pin_is_deleted_immediately_and_local_state_is_removed(
-            self, monkeypatch, fstate):
+            self, monkeypatch, fstate, tracked_revocation_state):
         drv = RevokeDriver()
         w, _c = _worker(monkeypatch, driver=drv, users=[])
         fstate.rows["34439"] = ("old-hash", True, {0, 2})
-        monkeypatch.setattr(dbmod, "delete_device_mirror_pin", MagicMock())
+        telemetry = MagicMock()
+        monkeypatch.setattr(ue._tel, "event", telemetry)
 
         assert w._run_standalone_member_revoke(34439) is True
 
         assert drv.delete_calls == [["34439"]]
         assert _revoked_push(drv) is None
         assert "34439" not in fstate.rows
+        assert "34439" not in tracked_revocation_state
+        done = next(
+            call for call in telemetry.call_args_list
+            if call.args and call.args[0] == "MEMBER_REVOKE_DONE"
+        )
+        assert done.kwargs["mode"] == "deleted"
 
     def test_failed_delete_neutralises_only_the_owned_pin_and_removes_local_state(
-            self, monkeypatch, fstate):
+            self, monkeypatch, fstate, tracked_revocation_state):
         drv = RevokeDriver(fail_delete={"34439"})
         w, _c = _worker(monkeypatch, driver=drv, users=[])
         fstate.rows["34439"] = ("old-hash", True, {0, 2})
-        monkeypatch.setattr(dbmod, "delete_device_mirror_pin", lambda **_kw: None)
+        telemetry = MagicMock()
+        monkeypatch.setattr(ue._tel, "event", telemetry)
 
         assert w._run_standalone_member_revoke(34439) is True
 
@@ -138,6 +332,12 @@ class TestImmediateAuthoritativeRevoke:
             "removals": {"34439": [0, 2]},
         }
         assert "34439" not in fstate.rows
+        assert "34439" not in tracked_revocation_state
+        done = next(
+            call for call in telemetry.call_args_list
+            if call.args and call.args[0] == "MEMBER_REVOKE_DONE"
+        )
+        assert done.kwargs["mode"] == "neutralised"
 
     def test_unowned_pin_is_not_touched_and_requests_full_reconciliation(
             self, monkeypatch, fstate):
@@ -159,7 +359,7 @@ class TestImmediateAuthoritativeRevoke:
         )
 
     def test_total_failure_keeps_local_state_and_requests_full_reconciliation(
-            self, monkeypatch, fstate):
+            self, monkeypatch, fstate, tracked_revocation_state):
         drv = FailingFallbackDriver(fail_delete={"34439"})
         w, _c = _worker(monkeypatch, driver=drv, users=[])
         fstate.rows["34439"] = ("old-hash", True, {0, 2})
@@ -171,7 +371,40 @@ class TestImmediateAuthoritativeRevoke:
         assert drv.delete_calls == [["34439"]]
         assert _revoked_push(drv) is not None
         assert "34439" in fstate.rows
+        assert "34439" in tracked_revocation_state
         full_sync.assert_called_once_with(reason="revoke-failed")
+
+    def test_atomic_local_cleanup_failure_retains_both_records_and_retries(
+            self, monkeypatch, fstate, tracked_revocation_state):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        fstate.rows["34439"] = ("old-hash", True, {0, 2})
+        monkeypatch.setattr(
+            dbmod,
+            "clear_device_revocation_state",
+            MagicMock(side_effect=RuntimeError("db boom")),
+            raising=False,
+        )
+        full_sync = MagicMock(return_value=True)
+        monkeypatch.setattr(w, "request_full_sync", full_sync)
+        telemetry = MagicMock()
+        monkeypatch.setattr(ue._tel, "event", telemetry)
+        warnings = MagicMock()
+        monkeypatch.setattr(ue._tel, "warn", warnings)
+
+        assert w._run_standalone_member_revoke(34439) is False
+
+        assert "34439" in fstate.rows
+        assert "34439" in tracked_revocation_state
+        full_sync.assert_called_once_with(reason="revoke-failed")
+        assert not any(
+            call.args and call.args[0] == "MEMBER_REVOKE_DONE"
+            for call in telemetry.call_args_list
+        )
+        assert any(
+            call.args and call.args[0] == "MEMBER_REVOKE_FAILED"
+            for call in warnings.call_args_list
+        )
 
 
 class TestARevokedMemberLosesTheirCredentials:
@@ -232,7 +465,8 @@ class TestARevokedMemberLosesTheirCredentials:
 
         assert drv.delete_calls == []
 
-    def test_state_is_pruned_only_after_the_revoke_pass(self, monkeypatch, fstate):
+    def test_state_is_pruned_only_after_the_revoke_pass(
+            self, monkeypatch, fstate, tracked_revocation_state):
         """prune_device_sync_state deletes the record of what we pushed. If it runs
         first, the finger ids are gone and a fallback could never clear the slot."""
         drv = RevokeDriver()
@@ -243,6 +477,7 @@ class TestARevokedMemberLosesTheirCredentials:
 
         assert drv.delete_calls == [["34439"]]
         assert "34439" not in fstate.rows, "the departed pin's state must then be pruned"
+        assert "34439" not in tracked_revocation_state
 
 
 class TestSafetyRails:
@@ -286,3 +521,24 @@ class TestSafetyRails:
         _full_sync(w)
 
         assert drv.delete_calls == []
+
+    def test_revoke_telemetry_counts_only_confirmed_outcomes(
+            self, monkeypatch, fstate, tracked_revocation_state):
+        drv = FailingFallbackDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "a", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+        telemetry = MagicMock()
+        monkeypatch.setattr(ue._tel, "event", telemetry)
+
+        _full_sync(w)
+
+        done = next(
+            call for call in telemetry.call_args_list
+            if call.args and call.args[0] == "REVOKE_DONE"
+        )
+        assert done.kwargs["deleted"] == 0
+        assert done.kwargs["neutralised"] == 0
+        assert done.kwargs["slots"] == 0
+        assert done.kwargs["ok"] is False
+        assert "34439" in fstate.rows
+        assert "34439" in tracked_revocation_state

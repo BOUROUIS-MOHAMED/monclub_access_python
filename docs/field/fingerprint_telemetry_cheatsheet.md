@@ -166,6 +166,8 @@ grep -F "[T] ZKEM_PUSH_FAILED_PINS" app-*.log
 |---|---|
 | `set_user_info_false` | the terminal refused the **member row**; no template was even tried |
 | `template_refused_fN` | the member row landed, finger **N** was refused — this member cannot verify |
+| `finger_remove_false_fN` | the terminal refused removal of tracked vacated slot **N**; revocation is unconfirmed |
+| `finger_remove_exception_fN` | removal of tracked vacated slot **N** raised; revocation is unconfirmed |
 | `exception:<Type>` | the push raised part-way through that member |
 | `chunk_wedged_or_unconfirmed` | the whole chunk wedged; nothing in it was confirmed |
 
@@ -227,7 +229,26 @@ bracket a push. `c_fingerprints` is the terminal's fingerprint count.
 
 ---
 
-## 4. Did the terminal reject a finger?
+## 4. Was an authoritative member revocation confirmed?
+
+```bash
+grep -F "[T] MEMBER_REVOKE" app-*.log
+```
+
+`MEMBER_REVOKE_REQUESTED` starts the device action. `MEMBER_REVOKE_DONE mode=deleted`
+means whole-user deletion was consistently confirmed; `mode=neutralised` means the
+disabled blank-card row and every locally tracked finger-slot clear were confirmed.
+`MEMBER_REVOKE_FAILED` keeps local ownership state and schedules full reconciliation.
+`MEMBER_REVOKE_OWNERSHIP_MISSING` makes no destructive device call.
+`[CODE: app/core/ultra_engine.py::_run_standalone_member_revoke]`
+
+For full reconciliation, `REVOKE_DONE deleted= neutralised= slots= ok=` counts only
+confirmed outcomes. `ok=False` means at least one PIN or local-state cleanup remains
+for retry.
+
+---
+
+## 5. Did the terminal reject a finger?
 
 ```bash
 grep -F "[T] ZKEM_VERIFY" app-*.log
@@ -263,7 +284,7 @@ lists the scans that were **not** fresh.
 
 ---
 
-## 5. Was the door command issued, and what did ACUnlock return?
+## 6. Was the door command issued, and what did ACUnlock return?
 
 ```bash
 grep -F "[T] DOOR_OPEN" app-*.log
@@ -293,7 +314,7 @@ grep -F "[T] DOOR_OPEN_SWITCH" app-*.log
 
 ---
 
-## 6. One-liners
+## 7. One-liners
 
 ```bash
 # every telemetry line, one file
@@ -330,7 +351,7 @@ finds nothing `[CODE]`:
 
 ---
 
-## 7. Sending logs back
+## 8. Sending logs back
 
 The current window is still open and has not uploaded yet. To capture it immediately,
 either wait for the window to close or copy the file directly off

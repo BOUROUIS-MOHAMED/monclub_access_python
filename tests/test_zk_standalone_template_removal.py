@@ -106,6 +106,47 @@ class TestVacatedSlotsAreCleared:
         # finger 0 is cleared too, but as part of its normal delete-before-write
         assert ("117", 0) in zk.deleted
 
+    def test_refused_vacated_slot_clear_marks_the_pin_failed(self):
+        zk = FakeZkem()
+        zk.delusertmp_ok = False
+        drv, zk = _make_driver(fake=zk)
+        drv.connect()
+        try:
+            res = drv.push_roster(
+                [{"pin": "117", "name": "", "card": "", "enabled": False}],
+                {},
+                remove_fingers_by_pin={"117": [0]},
+            )
+        finally:
+            drv.disconnect()
+
+        assert res["ok"] is False
+        assert res["failed_pins"] == ["117"]
+        assert res["del_attempted"] == 1
+        assert res["del_ok"] == 0
+
+    def test_raised_vacated_slot_clear_marks_the_pin_failed(self):
+        class RaisingClearZkem(FakeZkem):
+            def SSR_DelUserTmpExt(self, machine, pin, finger_id):
+                self._rec("SSR_DelUserTmpExt", machine, pin, finger_id)
+                raise RuntimeError("clear boom")
+
+        drv, zk = _make_driver(fake=RaisingClearZkem())
+        drv.connect()
+        try:
+            res = drv.push_roster(
+                [{"pin": "117", "name": "", "card": "", "enabled": False}],
+                {},
+                remove_fingers_by_pin={"117": [0]},
+            )
+        finally:
+            drv.disconnect()
+
+        assert res["ok"] is False
+        assert res["failed_pins"] == ["117"]
+        assert res["del_attempted"] == 1
+        assert res["del_ok"] == 0
+
     def test_a_slot_that_is_still_desired_is_never_in_the_removal_set(self):
         """Belt and braces: a caller that wrongly asks to remove a desired finger
         must not end up with the template deleted after it was written."""

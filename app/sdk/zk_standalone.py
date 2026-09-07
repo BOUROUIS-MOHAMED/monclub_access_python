@@ -658,8 +658,8 @@ class ZKStandaloneDevice:
         agg: Dict[str, Any] = {"ok": True, "pushed": 0, "failed": 0,
                                "templates_failed": 0, "skipped_pin": 0,
                                # Slot clears issued vs confirmed by the terminal.
-                               # A revocation that did not land shows up here as a
-                               # gap, and nowhere else.
+                               # A revocation that did not land shows up as a gap;
+                               # failed_pins identifies the affected pin.
                                "del_attempted": 0, "del_ok": 0,
                                "chunks_wedged": 0, "errors": [],
                                # Every pin NOT confirmed on the terminal: per-member
@@ -917,7 +917,8 @@ class ZKStandaloneDevice:
     def delete_users(self, pins: List[str], *, timeout_sec: float = 300.0) -> Dict[str, Any]:
         """Delete whole users (fingers+card+password) from the terminal (MIRROR policy).
 
-        Returns {'ok': bool, 'deleted': int, 'failed': int, 'errors': [str]}.
+        Returns {'ok': bool, 'deleted': int, 'failed': int,
+        'failed_pins': [str], 'errors': [str]}.
         Does NOT bracket EnableDevice — MIRROR runs inside push_roster's bracket window.
         """
         try:
@@ -1435,7 +1436,7 @@ class ZKStandaloneDevice:
         # Slot-clear counters, same chunk-boundary rule as the template ones above.
         # `del_attempted` counts every SSR_DelUserTmpExt issued (delete-before-write
         # AND vacated-slot removal); `del_ok` counts the ones the terminal confirmed.
-        # A gap between them is the only signal that a revocation did not land.
+        # A gap marks a refused clear; failed_pins identifies the affected pin.
         del_attempted = 0
         del_ok = 0
 
@@ -1552,8 +1553,19 @@ class ZKStandaloneDevice:
                         try:
                             if bool(zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))):
                                 del_ok += 1
-                        except Exception:
-                            pass
+                            else:
+                                _mark_failed(pin, f"finger_remove_false_f{finger_idx}")
+                                if len(errors) < 5:
+                                    errors.append(
+                                        f"SSR_DelUserTmpExt pin={pin} finger={finger_idx} "
+                                        "returned False"
+                                    )
+                        except Exception as exc:
+                            _mark_failed(pin, f"finger_remove_exception_f{finger_idx}")
+                            if len(errors) < 5:
+                                errors.append(
+                                    f"SSR_DelUserTmpExt pin={pin} finger={finger_idx}: {exc}"
+                                )
 
                     for tpl in (templates_by_pin or {}).get(pin, []) or []:
                         finger_idx = int(tpl.get("fingerId") or 0)
@@ -1690,7 +1702,7 @@ class ZKStandaloneDevice:
 
         # A refused template is a failed sync. Reporting ok=True here is what let a
         # non-working fingerprint be stamped as "synced" and never retried.
-        ok = failed == 0 and templates_failed == 0
+        ok = failed == 0 and templates_failed == 0 and not failed_pins
         self.logger.debug(
             "%s push chunk done pushed=%d failed=%d templates_failed=%d skipped_pin=%d in %.1fs",
             self._prefix, pushed, failed, templates_failed, skipped_pin,

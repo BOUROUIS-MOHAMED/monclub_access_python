@@ -477,10 +477,10 @@ test_db_pushed_finger_ids.py]`
 push already taking 416 s, against a 600 s single-command deadline — while
 `EnableDevice(False)` is held, i.e. with the gym's sole verifier dead.
 
-**Still open:** whole-user removals (member deleted, membership expired or frozen, PIN
-changed by a renewal) do **not** reach the terminal under the default `PRESERVE`
-policy. Those all funnel into `SSR_DeleteEnrollData(1, pin, 12)`, whose hang status is
-`[UNKNOWN]` (§3), so they are **not** fixed by this work.
+Whole-user removals use the field-proven backup number 12 (§3). An authoritative
+targeted revoke first requires ownership in `device_sync_state`; missing ownership
+makes no device call and schedules full reconciliation. `[CODE]` `[TEST:
+test_standalone_revoked_pin_removal.py]`
 
 ### Chunking
 
@@ -518,10 +518,13 @@ Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedge
 
 `del_attempted` counts every `SSR_DelUserTmpExt` issued — both the delete-before-write
 of a desired slot and the removal of a vacated one. `del_ok` counts the ones the
-terminal **confirmed**. A gap between them is the only signal that a revocation did
-not land; before this existed the call's result was discarded entirely. Unlike the
-other counters below, these two **are** on the aggregate return, because the removal
-tests assert on them. Nothing decides on them. `[CODE]`
+terminal **confirmed**. For a caller-requested vacated-slot removal, a false return or
+exception also places that PIN in `failed_pins` and makes `ok=False`; the revocation
+worker additionally requires `del_attempted == del_ok ==` the expected tracked-slot
+count before accepting neutralisation. A delete-before-write refusal for a desired
+template remains non-gating because the immediately following confirmed template
+write wins. `[CODE]` `[TEST: test_zk_standalone_template_removal.py,
+test_standalone_revoked_pin_removal.py]`
 
 Each *chunk* result additionally carries `failed_reasons`, `tpl_attempted`, `tpl_ok`
 and `chunk_ms` (added 2026-09-04). These are **telemetry only** — `push_roster` folds
@@ -531,9 +534,10 @@ They are not present on the aggregate `push_roster` return. `[CODE]`
 
 - **`failed_pins`** (added 2026-08-31) — every pin **not confirmed** on the terminal:
   a refused `SSR_SetUserInfo`, a refused template (`SetUserTmpExStr` → `False`), an
-  exception mid-member, and **every member of a wedged chunk** (nothing in a wedged
-  chunk came back confirmed). Deduplicated — a member with two refused fingers is one
-  entry. The engine uses it to mark only those pins as needing retry; a driver that
+  exception mid-member, a refused/raised caller-requested vacated-slot clear, and
+  **every member of a wedged chunk** (nothing in a wedged chunk came back confirmed).
+  Deduplicated — a member with two refused fingers is one entry. The engine uses it to
+  mark only those pins as needing retry; a driver that
   omits the key, or reports `ok=False` with an empty list, is read conservatively as
   "every attempted pin unconfirmed". `[CODE]`
   Two more places apply the same rule inside the driver: a chunk answered
@@ -621,18 +625,24 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   the resulting rtlog. There is no PC-side veto, so a credential left on the
   terminal *is* access.
   **Delete, with neutralise as the fallback:** backup number 12 is field-proven as of
-  2026-09-06 (§3), so the row goes. `_do_delete_users` returns `failed_pins` so the
-  fallback can target exactly the survivors.
+  2026-09-06 (§3), so the row goes. The worker accepts a hard deletion only when
+  `ok`, `deleted`, `failed`, and `failed_pins` are present and mutually consistent;
+  any malformed or contradictory result sends every ambiguous PIN through the
+  fallback. Fallback runs per PIN and is confirmed only when its per-pin result and
+  expected tracked-slot counters agree. `[CODE]` `[TEST]`
   **Ownership is the safety property:** candidates come only from `device_sync_state`
   — pins THIS app pushed — so a terminal shared with another access system can never
   be touched. That is exactly what makes this safe where MIRROR is not.
   **Rails:** empty roster ⇒ skip (`REVOKE_SKIP_EMPTY_ROSTER`); more than
   `max(_REVOKE_ABSOLUTE_FLOOR=10, roster × 0.25)` pins ⇒ abort and KEEP the state
   (`REVOKE_ABORT_FLOOR`); the MIRROR enrolment grace window and protected-pin
-  allowlist are honoured; a failed push keeps the state for retry.
+  allowlist are honoured; a failed push keeps the state for retry. Confirmed device
+  removal clears `device_sync_state` and `device_content_mirror` in one SQLite
+  transaction; a cleanup failure rolls both back and keeps the retry record.
   A percentage alone was wrong here — one departure on a 3-member rig is 33 % and
   would abort forever — hence the absolute floor underneath it.
-  `[TEST: tests/test_standalone_revoked_pin_neutralise.py]`
+  `[TEST: tests/test_standalone_revoked_pin_removal.py,
+  tests/test_db_standalone_revocation_state.py]`
 - **`SSR_SetUserInfo` now honours a caller-supplied `enabled`.** It was hardcoded
   `True`, so the driver could write a member but never a DISABLED one, which left
   revocation with only the unproven whole-user delete. Absent key ⇒ `True`, so every

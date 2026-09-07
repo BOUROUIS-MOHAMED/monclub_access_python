@@ -123,6 +123,7 @@ def fstate(monkeypatch) -> FingerState:
     monkeypatch.setattr(dbmod, "save_device_sync_state_batch", st.save_batch)
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)
+    monkeypatch.setattr(dbmod, "clear_device_revocation_state", st.delete, raising=False)
     # The targeted member read must be stubbed too, or _load_member_roster reaches
     # the REAL C:\ProgramData\MonClub Access\access\access.db and these tests start
     # asserting against a live gym's data. Empty here means "no sync_users row", so

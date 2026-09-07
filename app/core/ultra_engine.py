@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Deque, Dict, List, Optional, Set
 
@@ -112,6 +113,19 @@ _MIRROR_ENROLL_GRACE_SEC = 600.0
 # Together they still refuse the case that matters: a truncated roster presenting
 # hundreds of members as departed.
 _REVOKE_ABSOLUTE_FLOOR = 10
+
+
+@dataclass(frozen=True)
+class _StandalonePinRemovalResult:
+    """Affirmatively confirmed outcomes from one standalone removal pass."""
+
+    deleted: frozenset[str]
+    neutralised: frozenset[str]
+    failed: frozenset[str]
+
+    @property
+    def removed(self) -> frozenset[str]:
+        return self.deleted | self.neutralised
 
 
 def _encode_fingers(finger_ids: Any) -> str:
@@ -1797,38 +1811,69 @@ class UltraDeviceWorker(threading.Thread):
         *,
         pins: list[str],
         pushed_fingers: dict[str, set[int] | None],
-    ) -> tuple[set[str], set[str]]:
-        """Delete owned pins, neutralising only those not confirmed deleted."""
+    ) -> _StandalonePinRemovalResult:
+        """Delete owned pins, accepting only internally consistent confirmations."""
         requested: list[str] = []
         seen: set[str] = set()
         for raw_pin in pins or []:
-            pin = str(raw_pin or "").strip()
+            pin = str(raw_pin if raw_pin is not None else "").strip()
             if pin and pin not in seen:
                 requested.append(pin)
                 seen.add(pin)
 
-        failed = set(requested)
+        requested_set = set(requested)
+        deleted: set[str] = set()
+        delete_failed = set(requested)
         deleter = getattr(self._sdk, "delete_users", None)
         if requested and callable(deleter):
             try:
                 result = deleter(requested) or {}
-                reported = result.get("failed_pins")
-                if reported is None:
-                    failed = set() if result.get("ok") else set(requested)
+                if isinstance(result, dict):
+                    ok = result.get("ok")
+                    deleted_count = result.get("deleted")
+                    failed_count = result.get("failed")
+                    reported = result.get("failed_pins")
+                    counts_valid = (
+                        type(deleted_count) is int
+                        and deleted_count >= 0
+                        and type(failed_count) is int
+                        and failed_count >= 0
+                    )
+                    pins_valid = isinstance(reported, list)
+                    reported_list = (
+                        [str(pin if pin is not None else "").strip() for pin in reported]
+                        if pins_valid else []
+                    )
+                    reported_set = set(reported_list)
+                    contract_valid = (
+                        type(ok) is bool
+                        and counts_valid
+                        and pins_valid
+                        and all(reported_list)
+                        and len(reported_list) == len(reported_set)
+                        and reported_set <= requested_set
+                        and deleted_count + failed_count == len(requested)
+                        and deleted_count == len(requested) - len(reported_set)
+                        and failed_count == len(reported_set)
+                        and ok is (failed_count == 0)
+                    )
+                    if contract_valid:
+                        delete_failed = reported_set
+                        deleted = requested_set - delete_failed
+                    else:
+                        logger.warning(
+                            "%s delete-users result was ambiguous -- neutralising all "
+                            "requested pins: %r",
+                            self._prefix,
+                            result,
+                        )
                 else:
-                    reported_failed = {
-                        str(pin or "").strip()
-                        for pin in reported
-                        if str(pin or "").strip() in seen
-                    }
-                    # An aggregate failure with no named pins confirms nothing.
-                    failed = (
-                        set(requested)
-                        if not result.get("ok") and not reported_failed
-                        else reported_failed
+                    logger.warning(
+                        "%s delete-users returned a malformed result -- neutralising all "
+                        "requested pins",
+                        self._prefix,
                     )
             except Exception:
-                failed = set(requested)
                 logger.warning(
                     "%s delete-users call failed -- neutralising requested pins",
                     self._prefix,
@@ -1837,50 +1882,75 @@ class UltraDeviceWorker(threading.Thread):
         elif requested:
             logger.warning("%s driver cannot delete users -- neutralising instead", self._prefix)
 
-        removed = set(requested) - failed
-        fallback_pins = sorted(failed)
-        removals = {
-            pin: sorted(pushed_fingers.get(pin) or ())
-            for pin in fallback_pins
-            if pushed_fingers.get(pin)
-        }
-        slots = sum(len(finger_ids) for finger_ids in removals.values())
-        if fallback_pins:
+        neutralised: set[str] = set()
+        failed: set[str] = set()
+        for pin in sorted(delete_failed):
+            finger_ids = sorted(set(pushed_fingers.get(pin) or ()))
+            removals = {pin: finger_ids} if finger_ids else {}
             users = [
-                {"pin": pin, "name": "", "card": "", "enabled": False}
-                for pin in fallback_pins
+                {"pin": pin, "name": "", "card": "", "enabled": False},
             ]
             logger.warning(
-                "%s %d pin(s) survived the delete -- neutralising "
-                "(clearing %d slot(s)): %s",
+                "%s pin %s survived or had an ambiguous delete -- neutralising "
+                "(clearing %d slot(s))",
                 self._prefix,
-                len(fallback_pins),
-                slots,
-                ",".join(fallback_pins[:20]),
+                pin,
+                len(finger_ids),
             )
             try:
                 fallback = self._sdk.push_roster(
                     users, {}, remove_fingers_by_pin=removals,
                 ) or {}
-                if fallback.get("ok"):
-                    removed.update(failed)
-                    failed.clear()
+                numeric_fields = (
+                    "pushed",
+                    "failed",
+                    "templates_failed",
+                    "skipped_pin",
+                    "chunks_wedged",
+                    "del_attempted",
+                    "del_ok",
+                )
+                counts_valid = isinstance(fallback, dict) and all(
+                    type(fallback.get(field)) is int and fallback[field] >= 0
+                    for field in numeric_fields
+                )
+                fallback_confirmed = (
+                    isinstance(fallback, dict)
+                    and fallback.get("ok") is True
+                    and counts_valid
+                    and fallback.get("pushed") == 1
+                    and fallback.get("failed") == 0
+                    and fallback.get("templates_failed") == 0
+                    and fallback.get("skipped_pin") == 0
+                    and fallback.get("chunks_wedged") == 0
+                    and fallback.get("failed_pins") == []
+                    and fallback.get("del_attempted") == len(finger_ids)
+                    and fallback.get("del_ok") == len(finger_ids)
+                )
+                if fallback_confirmed:
+                    neutralised.add(pin)
+                else:
+                    failed.add(pin)
+                    logger.warning(
+                        "%s revoke fallback for pin %s was unconfirmed -- keeping state: %r",
+                        self._prefix,
+                        pin,
+                        fallback,
+                    )
             except Exception:
+                failed.add(pin)
                 logger.warning(
-                    "%s revoke fallback raised -- keeping per-pin state for retry",
+                    "%s revoke fallback raised for pin %s -- keeping state for retry",
                     self._prefix,
+                    pin,
                     exc_info=True,
                 )
 
-        # The full-reconcile caller preserves its established REVOKE_DONE fields.
-        # Workers execute these operations serially, so this summary belongs to
-        # the immediately returned result.
-        self._last_standalone_remove_stats = {
-            "deleted": len(requested) - len(fallback_pins),
-            "neutralised": len(fallback_pins),
-            "slots": slots,
-        }
-        return removed, failed
+        return _StandalonePinRemovalResult(
+            deleted=frozenset(deleted),
+            neutralised=frozenset(neutralised),
+            failed=frozenset(failed),
+        )
 
     def _run_standalone_member_revoke(self, member_id: int) -> bool:
         """Immediately remove one authoritative, MonClub-owned standalone PIN."""
@@ -1926,28 +1996,37 @@ class UltraDeviceWorker(threading.Thread):
             self.request_full_sync(reason="revoke-ownership-missing")
             return False
 
-        removed, failed = self._remove_standalone_pins(
+        outcome = self._remove_standalone_pins(
             pins=[pin],
             pushed_fingers=self._load_pushed_fingers(),
         )
-        if pin in removed and pin not in failed:
-            from app.core.db import delete_device_mirror_pin, delete_device_sync_state
+        if pin in outcome.removed and pin not in outcome.failed:
+            from app.core.db import clear_device_revocation_state
 
-            delete_device_sync_state(device_id=self._device_id, pin=pin)
             try:
-                delete_device_mirror_pin(device_id=self._device_id, pin=pin)
+                clear_device_revocation_state(device_id=self._device_id, pin=pin)
             except Exception:
-                logger.debug(
-                    "%s could not clear mirror pin %s",
+                logger.warning(
+                    "%s could not atomically clear local revoke state for pin %s",
                     self._prefix,
                     pin,
                     exc_info=True,
                 )
+                _tel.warn(
+                    "MEMBER_REVOKE_FAILED",
+                    worker=self._tel_wid,
+                    member_id=member_id,
+                    pin=pin,
+                )
+                self.request_full_sync(reason="revoke-failed")
+                return False
+            mode = "deleted" if pin in outcome.deleted else "neutralised"
             _tel.event(
                 "MEMBER_REVOKE_DONE",
                 worker=self._tel_wid,
                 member_id=member_id,
                 pin=pin,
+                mode=mode,
                 ok=True,
             )
             return True
@@ -2053,21 +2132,40 @@ class UltraDeviceWorker(threading.Thread):
             self._prefix, len(revoked), ",".join(revoked[:20]),
         )
 
-        removed, failed = self._remove_standalone_pins(
+        pushed_fingers = self._load_pushed_fingers()
+        outcome = self._remove_standalone_pins(
             pins=revoked,
-            pushed_fingers=self._load_pushed_fingers(),
+            pushed_fingers=pushed_fingers,
         )
-        stats = self._last_standalone_remove_stats
+        cleanup_failed: set[str] = set()
+        if outcome.removed:
+            from app.core.db import clear_device_revocation_state
+
+            for pin in sorted(outcome.removed):
+                try:
+                    clear_device_revocation_state(device_id=self._device_id, pin=pin)
+                except Exception:
+                    cleanup_failed.add(pin)
+                    logger.warning(
+                        "%s revoke pass: local state cleanup failed for pin %s",
+                        self._prefix,
+                        pin,
+                        exc_info=True,
+                    )
+        failed = set(outcome.failed) | cleanup_failed
+        confirmed_slots = sum(
+            len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
+        )
         _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
-                   deleted=stats["deleted"], neutralised=stats["neutralised"],
-                   slots=stats["slots"], ok=not failed)
+                   deleted=len(outcome.deleted), neutralised=len(outcome.neutralised),
+                   slots=confirmed_slots, ok=not failed)
         if failed:
             # Keep the state so the next sync retries rather than forgetting that
             # these pins still hold credentials.
             logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
                            self._prefix)
             return False
-        return removed == set(revoked)
+        return outcome.removed == frozenset(revoked)
 
     def _mirror_grace_pins(self) -> set[str]:
         m = getattr(self, "_recent_member_push", None) or {}

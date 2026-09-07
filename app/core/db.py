@@ -6543,6 +6543,28 @@ def delete_device_sync_state(*, device_id: int, pin: str) -> None:
     _run_db_write_sync("delete_device_sync_state", _write)
 
 
+def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
+    """Atomically forget a confirmed device removal from sync state and mirror."""
+    did = int(device_id)
+    p = str(pin or "").strip()
+    if not p:
+        return
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
+        sync_cur = conn.execute(
+            "DELETE FROM device_sync_state WHERE device_id=? AND pin=?",
+            (did, p),
+        )
+        mirror_cur = conn.execute(
+            "DELETE FROM device_content_mirror WHERE device_id=? AND pin=?",
+            (did, p),
+        )
+        profile["sync_rows"] = max(0, int(sync_cur.rowcount or 0))
+        profile["mirror_rows"] = max(0, int(mirror_cur.rowcount or 0))
+
+    _run_db_write_sync("clear_device_revocation_state", _write)
+
+
 def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
     did = int(device_id)
     keep = {str(x).strip() for x in (keep_pins or []) if str(x).strip()}

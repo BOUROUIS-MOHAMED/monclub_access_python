@@ -57,12 +57,16 @@ class FakeDriver:
     def push_roster(self, users, templates_by_pin=None, *, bracket_enable_device=False, **kw):
         self.push_calls.append((list(users), dict(templates_by_pin or {}), bracket_enable_device))
         pins = [str(u["pin"]) for u in users]
+        removals = sum(
+            len(v) for v in (kw.get("remove_fingers_by_pin") or {}).values()
+        )
         if self.failed_pins is not None:
             failed = [p for p in self.failed_pins if p in pins]
             res: Dict[str, Any] = {
                 "ok": not failed, "pushed": len(users), "failed": len(failed),
                 "templates_failed": 0, "skipped_pin": 0, "chunks_wedged": 0,
                 "errors": ["refused"] if failed else [],
+                "del_attempted": removals, "del_ok": removals,
             }
             if self.report_failed_pins:
                 res["failed_pins"] = failed
@@ -71,6 +75,7 @@ class FakeDriver:
             "ok": self.ok, "pushed": len(users), "failed": 0 if self.ok else len(users),
             "templates_failed": 0, "skipped_pin": 0, "chunks_wedged": 0,
             "errors": [] if self.ok else ["boom"],
+            "del_attempted": removals, "del_ok": removals,
         }
         if self.report_failed_pins:
             res["failed_pins"] = [] if self.ok else pins
@@ -132,6 +137,7 @@ def _install_state(monkeypatch, st: FakeState) -> FakeState:
     monkeypatch.setattr(dbmod, "save_device_sync_state_batch", st.save_batch)
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)
+    monkeypatch.setattr(dbmod, "clear_device_revocation_state", st.delete, raising=False)
     return st
 
 

@@ -535,7 +535,11 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `FP_ARRIVED` | `db.py` | `delta_mode incoming_users members_with_tpl templates am_ids ids_omitted` |
 | `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok op del_attempted del_ok dur_ms ok` |
 | `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason in_db` |
-| `REVOKE_DONE` | `ultra_engine.py` | `pins slots ok del_attempted del_ok` |
+| `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
+| `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised`) |
+| `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
+| `MEMBER_REVOKE_OWNERSHIP_MISSING` | `ultra_engine.py` | `member_id pin` |
+| `REVOKE_DONE` | `ultra_engine.py` | `pins deleted neutralised slots ok` (confirmed outcomes only) |
 | `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
 | `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
