@@ -461,6 +461,8 @@ def _make_sync_worker(monkeypatch, driver=None, users=None):
     from collections import deque
     w._pending_member_syncs = deque()
     w._pending_member_sync_ids = set()
+    w._pending_member_revoke_ids = set()
+    w._wake_evt = threading.Event()
     w._active_sync_lock = threading.Lock()
     w._active_sync_engine = None
     w._on_full_sync_started = MagicMock()

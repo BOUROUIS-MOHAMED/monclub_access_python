@@ -121,6 +121,7 @@ def _make_worker(
     worker._member_sync_lock = threading.Lock()
     worker._pending_member_syncs = deque()
     worker._pending_member_sync_ids = set()
+    worker._pending_member_revoke_ids = set()
     worker._full_sync_lock = threading.Lock()
     worker._pending_full_sync_request = None
     worker._active_sync_lock = threading.Lock()

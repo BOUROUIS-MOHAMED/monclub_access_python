@@ -1130,7 +1130,11 @@ class UltraDeviceWorker(threading.Thread):
                 # driver's targeted roster push instead (always terminates).
                 if getattr(self._sdk, "owns_event_source", False):
                     if is_revocation:
-                        self._run_standalone_member_revoke(member_id)
+                        try:
+                            self._run_standalone_member_revoke(member_id)
+                        except Exception:
+                            self.request_full_sync(reason="revoke-handler-failed")
+                            raise
                     else:
                         self._run_standalone_member_sync(member_id)
                     drained += 1

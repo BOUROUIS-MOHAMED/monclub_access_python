@@ -404,6 +404,74 @@ def test_standalone_member_command_drain_routes_captured_action():
     assert worker._pending_member_revoke_ids == set()
 
 
+def test_failed_standalone_revoke_requests_full_reconcile():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = True
+    worker._prefix = "[ULTRA:5]"
+    worker._tel_wid = "ULTRA:5"
+    worker._run_standalone_member_revoke = MagicMock(side_effect=RuntimeError("boom"))
+    worker.request_full_sync = MagicMock(return_value=True)
+
+    worker.request_member_revoke(41)
+
+    assert worker._drain_member_sync_commands(limit=1) == 1
+    worker.request_full_sync.assert_called_once_with(reason="revoke-handler-failed")
+    assert list(worker._pending_member_syncs) == []
+    assert worker._pending_member_revoke_ids == set()
+
+
+def test_disconnected_standalone_revoke_is_requeued_with_revoke_intent():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = False
+
+    worker.request_member_revoke(41)
+    worker._wake_evt.clear()
+
+    assert worker._drain_member_sync_commands(limit=1) == 0
+    assert list(worker._pending_member_syncs) == [41]
+    assert worker._pending_member_sync_ids == {41}
+    assert worker._pending_member_revoke_ids == {41}
+    assert worker._wake_evt.is_set()
+
+
+def test_pullsdk_member_revoke_uses_targeted_member_sync(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    synced_members: list[tuple[object, int, str]] = []
+
+    class _FakeDeviceSyncEngine:
+        def __init__(self, cfg, logger):
+            self.cfg = cfg
+            self.logger = logger
+
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+            synced_members.append((sdk, member_id, source))
+            return True
+
+    monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _FakeDeviceSyncEngine)
+
+    worker = ultra_module.UltraDeviceWorker(
+        device={"id": 5, "name": "Door 1", "ipAddress": "10.0.0.5", "portNumber": 4370},
+        settings={},
+        popup_q=queue.Queue(),
+        history_q=queue.Queue(),
+        stop_event=threading.Event(),
+    )
+    worker._connected = True
+    worker._sdk = SimpleNamespace(_sdk="raw-sdk")
+
+    worker.request_member_revoke(41)
+
+    assert worker._drain_member_sync_commands(limit=1) == 1
+    assert synced_members == [("raw-sdk", 41, "ultra_targeted_member_sync")]
+
+
 def test_ultra_worker_drains_full_sync_commands_using_live_connection(monkeypatch):
     import app.core.ultra_engine as ultra_module
 
