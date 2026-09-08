@@ -28,6 +28,12 @@ both `revoked_ids` (physical work) and `excluded_ids` (snapshot filtering).
 Targeted revocations additionally use `_active_member_revoke_ids` while their
 device I/O is executing. This set is guarded by `_member_sync_lock`.
 
+Worker full-sync requests also carry an explicit `require_full_refresh` intent.
+The engine and scheduler set it only when their authoritative `changed_ids`
+payload is `None`. This intent is separate from `revoked_ids`: the latter says
+which members require physical removal, while the former says a roster refresh
+must still execute even when every physical revocation is already owned.
+
 ## Transitions
 
 All transitions involving both member and full-sync state acquire
@@ -60,6 +66,11 @@ All transitions involving both member and full-sync state acquire
    already covered by `ACTIVE` do not create a second full request. An overlap
    `{A, B}` while `A` is active queues physical `{B}` but exclusions `{A, B}`.
    An ordinary full refresh queued during active `A` carries exclusion `{A}`.
+6. A pure revoke-only duplicate for targeted `ACTIVE` member `A` remains
+   deduplicated. A request with `require_full_refresh=True` instead queues one
+   exclusion-only full request for `A`, because the independently requested
+   roster refresh must not be mistaken for duplicate physical work. It later
+   filters `A` from stale cache without issuing a second removal.
 
 Bare confirmation with no queued, active, retry, or exclusion owner is stale
 generation evidence. It is cleared defensively and never suppresses a later
@@ -88,5 +99,7 @@ Deterministic regressions cover:
 - blocked targeted I/O retaining visible ownership and rejecting ordinary sync;
 - revoke-first/full-second execution in both drain orders;
 - targeted-only success followed by re-enrolment and a new revoke generation;
+- an engine full-refresh-plus-revoke interleaving while targeted removal is
+  active, proving the exclusion-only full remains queued and executes;
 - success cleanup, failure retry ownership, lock-order-safe concurrency, and all
   existing standalone, scheduler, and PullSDK behavior.

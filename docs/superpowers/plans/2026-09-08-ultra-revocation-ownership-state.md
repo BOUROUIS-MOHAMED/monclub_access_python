@@ -10,6 +10,9 @@ Targeted member revokes have their own lock-guarded ACTIVE set during device I/O
 Full requests adopt queued targeted work physically and inherit in-flight
 targeted work as exclusion-only. Confirmation proof is generation-scoped and is
 cleared when no pending or active full exclusion depends on it.
+An explicit `require_full_refresh` flag is propagated from engine/scheduler
+requests whose `changed_ids` is `None`, so a required roster refresh cannot be
+deduplicated as if it were only a repeated revoke delivery.
 
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
@@ -83,7 +86,15 @@ drain calls, proving a single physical removal and a filtered stale roster.
 Finally, complete a targeted-only revoke, perform an ordinary full re-enrolment,
 and prove a second authoritative generation executes another physical removal.
 
-- [ ] **Step 6: Run the new tests and verify RED**
+- [ ] **Step 6: Add explicit full-refresh interleaving regressions**
+
+Block targeted revoke I/O for member 41, then request a full refresh carrying
+the same authoritative revoked ID. At both worker and engine boundaries, assert
+that one pending exclusion-only full request is accepted, physical revocation
+runs once, and the subsequent stale roster excludes 41. Keep the existing
+revoke-only exact-duplicate test unchanged and green.
+
+- [ ] **Step 7: Run the new tests and verify RED**
 
 Run:
 
@@ -121,6 +132,12 @@ critical section. Do not create a request when every requested revoked ID is
 already `ACTIVE`; when new IDs remain, preserve reason/fingerprint/full-refresh
 semantics and queue only those IDs. Make `has_pending_full_sync` compare against
 the union of pending, active, and retry IDs.
+
+Add `require_full_refresh=False` to the worker full-sync API and routing helper.
+Engine and scheduler live-worker routing pass `True` exactly when
+`changed_ids is None`. When all requested physical IDs are already targeted
+`ACTIVE`, this flag creates an exclusion-only pending full; without it, the
+existing duplicate-revoke request remains deduplicated.
 
 - [ ] **Step 4: Track roster exclusions separately from physical revocations**
 
