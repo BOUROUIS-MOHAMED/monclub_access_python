@@ -482,6 +482,7 @@ class UltraDeviceWorker(threading.Thread):
         self._pending_member_syncs: Deque[int] = deque()
         self._pending_member_sync_ids: Set[int] = set()
         self._pending_member_revoke_ids: Set[int] = set()
+        self._active_member_revoke_ids: Set[int] = set()
         # A targeted revoke may complete immediately before a co-requested full
         # sync drains. Retain that proof until the filtered full sync succeeds,
         # so the stale cache cannot re-enrol the member and a retry does not
@@ -1019,6 +1020,7 @@ class UltraDeviceWorker(threading.Thread):
                 if (
                     normalized_member_id in self._pending_member_revoke_ids
                     or normalized_member_id in self._pending_member_sync_ids
+                    or normalized_member_id in self._active_member_revoke_ids
                 ):
                     return False
                 pending_full_revokes = set(
@@ -1066,6 +1068,8 @@ class UltraDeviceWorker(threading.Thread):
                 confirmed = normalized_member_id in getattr(
                     self, "_confirmed_member_revoke_ids", set()
                 )
+                if normalized_member_id in self._active_member_revoke_ids:
+                    return False
                 if phase == _FULL_REVOKE_ACTIVE:
                     return False
                 if phase == _FULL_REVOKE_RETRY and confirmed:
@@ -1077,7 +1081,11 @@ class UltraDeviceWorker(threading.Thread):
                 elif normalized_member_id in pending_full_exclusions or exclusion_phase:
                     return False
                 elif confirmed:
-                    return False
+                    # Confirmation without a live exclusion/full owner is proof
+                    # from an older generation, not pending revocation work.
+                    getattr(self, "_confirmed_member_revoke_ids", set()).discard(
+                        normalized_member_id
+                    )
                 is_new_revocation = normalized_member_id not in self._pending_member_revoke_ids
                 self._pending_member_revoke_ids.add(normalized_member_id)
                 if normalized_member_id not in self._pending_member_sync_ids:
@@ -1109,7 +1117,7 @@ class UltraDeviceWorker(threading.Thread):
                 ) | set(self._full_sync_exclusion_phases_locked())
             return (
                 normalized_member_id in self._pending_member_revoke_ids
-                or normalized_member_id in getattr(self, "_confirmed_member_revoke_ids", set())
+                or normalized_member_id in self._active_member_revoke_ids
                 or normalized_member_id in full_sync_revokes | full_sync_exclusions
             )
 
@@ -1122,6 +1130,40 @@ class UltraDeviceWorker(threading.Thread):
     def _confirmed_member_revokes(self, member_ids: set[int]) -> set[int]:
         with self._member_sync_lock:
             return set(member_ids) & getattr(self, "_confirmed_member_revoke_ids", set())
+
+    def _finalize_targeted_member_revoke(self, member_id: int, *, ok: bool) -> None:
+        """Release targeted ACTIVE ownership or atomically restore queue ownership."""
+        normalized_member_id = int(member_id)
+        with self._member_sync_lock:
+            with self._full_sync_lock:
+                self._active_member_revoke_ids.discard(normalized_member_id)
+                if not ok:
+                    self._pending_member_revoke_ids.add(normalized_member_id)
+                    if normalized_member_id not in self._pending_member_sync_ids:
+                        self._pending_member_sync_ids.add(normalized_member_id)
+                        self._pending_member_syncs.append(normalized_member_id)
+                    if self._pending_full_sync_request is not None:
+                        pending_revoked_ids = self._pending_full_sync_request.setdefault(
+                            "revoked_ids", set()
+                        )
+                        self._pending_full_sync_request.setdefault(
+                            "excluded_ids", set(pending_revoked_ids)
+                        ).add(normalized_member_id)
+                    self._wake_evt.set()
+                    return
+
+                pending = self._pending_full_sync_request or {}
+                dependency_ids = (
+                    set(pending.get("revoked_ids") or set())
+                    | set(pending.get("excluded_ids") or set())
+                    | set(self._full_sync_revocation_phases_locked())
+                    | set(self._full_sync_exclusion_phases_locked())
+                )
+                confirmed_ids = getattr(self, "_confirmed_member_revoke_ids", set())
+                if normalized_member_id in dependency_ids:
+                    confirmed_ids.add(normalized_member_id)
+                else:
+                    confirmed_ids.discard(normalized_member_id)
 
     def _full_sync_revocation_phases_locked(self) -> Dict[int, str]:
         """Return per-ID full-sync ownership while ``_full_sync_lock`` is held."""
@@ -1203,6 +1245,8 @@ class UltraDeviceWorker(threading.Thread):
             confirmed_revoked_ids = set(
                 getattr(self, "_confirmed_member_revoke_ids", set())
             )
+            queued_targeted_revoked_ids = set(self._pending_member_revoke_ids)
+            active_targeted_revoked_ids = set(self._active_member_revoke_ids)
             with self._full_sync_lock:
                 phases = self._full_sync_revocation_phases_locked()
                 exclusion_phases = self._full_sync_exclusion_phases_locked()
@@ -1236,9 +1280,16 @@ class UltraDeviceWorker(threading.Thread):
                 queued_revoked_ids = (
                     normalized_revoked_ids
                     | (retry_revoked_ids - confirmed_revoked_ids)
-                ) - active_revoked_ids - confirmed_exclusion_ids
+                    | queued_targeted_revoked_ids
+                ) - (
+                    active_revoked_ids
+                    | active_targeted_revoked_ids
+                    | confirmed_exclusion_ids
+                )
                 inherited_excluded_ids = (
                     normalized_revoked_ids
+                    | queued_targeted_revoked_ids
+                    | active_targeted_revoked_ids
                     | active_revoked_ids
                     | retry_revoked_ids
                     | active_excluded_ids
@@ -1261,6 +1312,18 @@ class UltraDeviceWorker(threading.Thread):
                         pending["fingerprint_hash"] = (
                             str(fingerprint_hash or "").strip() or None
                         )
+                    if queued_targeted_revoked_ids:
+                        self._pending_member_syncs = deque(
+                            member_id
+                            for member_id in self._pending_member_syncs
+                            if member_id not in queued_targeted_revoked_ids
+                        )
+                        self._pending_member_sync_ids.difference_update(
+                            queued_targeted_revoked_ids
+                        )
+                        self._pending_member_revoke_ids.difference_update(
+                            queued_targeted_revoked_ids
+                        )
                     return False
                 if (
                     normalized_revoked_ids
@@ -1279,6 +1342,18 @@ class UltraDeviceWorker(threading.Thread):
                     "revoked_ids": queued_revoked_ids,
                     "excluded_ids": inherited_excluded_ids | queued_revoked_ids,
                 }
+                if queued_targeted_revoked_ids:
+                    self._pending_member_syncs = deque(
+                        member_id
+                        for member_id in self._pending_member_syncs
+                        if member_id not in queued_targeted_revoked_ids
+                    )
+                    self._pending_member_sync_ids.difference_update(
+                        queued_targeted_revoked_ids
+                    )
+                    self._pending_member_revoke_ids.difference_update(
+                        queued_targeted_revoked_ids
+                    )
         return True
 
     def has_pending_full_sync(self, *, revoked_ids: set[int] | None = None) -> bool:
@@ -1475,13 +1550,15 @@ class UltraDeviceWorker(threading.Thread):
                     break
                 member_id = int(self._pending_member_syncs.popleft())
                 is_revocation = member_id in self._pending_member_revoke_ids
+                if is_revocation:
+                    self._active_member_revoke_ids.add(member_id)
                 self._pending_member_sync_ids.discard(member_id)
                 self._pending_member_revoke_ids.discard(member_id)
 
             try:
                 if self._sdk is None or not self._connected:
                     if is_revocation:
-                        self.request_member_revoke(member_id)
+                        self._finalize_targeted_member_revoke(member_id, ok=False)
                     else:
                         self.request_member_sync(member_id)
                     break
@@ -1492,7 +1569,13 @@ class UltraDeviceWorker(threading.Thread):
                     if is_revocation:
                         revoke_ok = self._run_standalone_member_revoke(member_id)
                         if revoke_ok:
-                            self._mark_member_revoke_confirmed(member_id)
+                            self._finalize_targeted_member_revoke(member_id, ok=True)
+                        else:
+                            self._finalize_targeted_member_revoke(member_id, ok=False)
+                            self.request_full_sync(
+                                reason="revoke-failed",
+                                revoked_ids={member_id},
+                            )
                     else:
                         self._run_standalone_member_sync(member_id)
                     drained += 1
@@ -1500,7 +1583,7 @@ class UltraDeviceWorker(threading.Thread):
                 raw_sdk = getattr(self._sdk, "_sdk", None)
                 if raw_sdk is None:
                     if is_revocation:
-                        self.request_member_revoke(member_id)
+                        self._finalize_targeted_member_revoke(member_id, ok=False)
                     else:
                         self.request_member_sync(member_id)
                     break
@@ -1525,8 +1608,9 @@ class UltraDeviceWorker(threading.Thread):
                     )
                     if is_revocation:
                         if member_sync_ok:
-                            self._mark_member_revoke_confirmed(member_id)
+                            self._finalize_targeted_member_revoke(member_id, ok=True)
                         else:
+                            self._finalize_targeted_member_revoke(member_id, ok=False)
                             self.request_full_sync(
                                 reason="revoke-failed",
                                 revoked_ids={member_id},
@@ -1539,6 +1623,7 @@ class UltraDeviceWorker(threading.Thread):
                     )
             except Exception as exc:
                 if is_revocation:
+                    self._finalize_targeted_member_revoke(member_id, ok=False)
                     self.request_full_sync(
                         reason="revoke-handler-failed",
                         revoked_ids={member_id},

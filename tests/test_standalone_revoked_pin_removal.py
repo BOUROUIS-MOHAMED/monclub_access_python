@@ -548,7 +548,7 @@ class TestAuthoritativeFullSyncRetry:
             fingerprint_hash="retry-hash",
             revoked_ids={34439},
         ) is True
-        assert w._drain_member_sync_commands(limit=1) == 1
+        assert w._drain_member_sync_commands(limit=1) == 0
         assert w._drain_full_sync_commands(limit=1) == 1
 
         assert drv.delete_calls == [["34439"]]
@@ -635,8 +635,8 @@ class TestAuthoritativeFullSyncRetry:
         assert w._drain_full_sync_commands(limit=1) == 1
 
         assert redelivery == {"member": True, "full": True}
-        assert list(w._pending_member_syncs) == [34439]
-        assert w._pending_member_revoke_ids == {34439}
+        assert list(w._pending_member_syncs) == []
+        assert w._pending_member_revoke_ids == set()
         assert w._pending_full_sync_request["revoked_ids"] == {34439}
         assert scheduler._drain_pending_sync_request() is None
 
