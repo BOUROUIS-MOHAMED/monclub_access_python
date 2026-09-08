@@ -4,7 +4,7 @@
 
 **Goal:** Close the remaining ULTRA revocation lifecycle races so an authoritative ID is continuously owned by a queued, active, or retry state until confirmed removal succeeds.
 
-**Architecture:** Replace the active-only set with a lock-guarded per-ID phase map containing `ACTIVE` and `RETRY`. Full-drain atomically transfers matching targeted queue entries into `ACTIVE` under the member-then-full lock order; success removes ownership, while every failure moves it to `RETRY`. Scheduler redelivery transfers `RETRY` into a concrete worker queue without an unprotected window.
+**Architecture:** Keep physical revocation and stale-roster exclusion as separate lock-guarded per-ID phase maps containing `ACTIVE` and `RETRY`. Pending full requests carry `revoked_ids` for destructive work and `excluded_ids` for cache filtering. Full-drain atomically transfers matching targeted queue entries and both retry kinds into `ACTIVE` under the member-then-full lock order; success removes that attempt's ownership, while every failure moves it to `RETRY`.
 
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
@@ -62,7 +62,15 @@ assert list(worker._pending_member_syncs) == [99]
 assert 41 not in worker._pending_member_revoke_ids
 ```
 
-- [ ] **Step 4: Run the new tests and verify RED**
+- [ ] **Step 4: Add dependent full-sync execution regressions**
+
+Execute two full syncs against the same stale snapshot. While physical revoke A
+is active, queue overlap `{A, B}` and separately queue an ordinary full refresh.
+Assert both dependent full rosters exclude A, physical A executes exactly once,
+and the overlap physically revokes only B. Fail a dependent full once and assert
+its exclusion remains protected/retryable until a later success clears it.
+
+- [ ] **Step 5: Run the new tests and verify RED**
 
 Run:
 
@@ -101,14 +109,24 @@ already `ACTIVE`; when new IDs remain, preserve reason/fingerprint/full-refresh
 semantics and queue only those IDs. Make `has_pending_full_sync` compare against
 the union of pending, active, and retry IDs.
 
-- [ ] **Step 4: Atomically adopt equivalent targeted commands at full drain**
+- [ ] **Step 4: Track roster exclusions separately from physical revocations**
+
+Add `excluded_ids` to pending requests and a second ACTIVE/RETRY phase map for
+exclusion ownership. Requests inherit all active/retry exclusions. Exact
+explicit duplicates remain deduped, overlap `{A, B}` queues physical `{B}` with
+exclusions `{A, B}`, and an ordinary full queued during active A carries
+exclusion `{A}`. Member downgrade checks include pending and phased exclusions.
+
+- [ ] **Step 5: Atomically adopt equivalent targeted commands at full drain**
 
 Acquire `_member_sync_lock` and then `_full_sync_lock`, pop the pending full
 request, mark its revoked IDs `ACTIVE`, rebuild `_pending_member_syncs` without
 matching authoritative IDs, and remove only those IDs from the member pending
 sets. Preserve unrelated revokes and ordinary syncs in their original order.
+Move request exclusions to their own `ACTIVE` map and adopt both physical and
+exclusion `RETRY` IDs before the request is popped.
 
-- [ ] **Step 5: Centralize completion transitions**
+- [ ] **Step 6: Centralize completion transitions**
 
 Add one helper which, under the member-then-full lock order, removes `ACTIVE`
 entries on success or changes them to `RETRY` on failure. Move failures to
@@ -118,15 +136,15 @@ completion callback. Apply this ordering to standalone missing-cache/normal and
 PullSDK missing-cache/normal/exception exits. Confirmation evidence is cleared
 only on successful completion.
 
-- [ ] **Step 6: Confirm adopted PullSDK revocations before full roster push**
+- [ ] **Step 7: Confirm adopted PullSDK revocations before full roster push**
 
 Before `run_one_device_on_connected_sdk`, call
 `sync_member_on_connected_sdk` for each unconfirmed active revoked ID in sorted
-order. Mark successful calls confirmed. Filter all revoked IDs from the full
-cache snapshot, and keep the full result unsuccessful if any targeted deletion
-is unconfirmed.
+order. Mark successful calls confirmed. Filter every `excluded_id` from the full
+cache snapshot, but never physically delete an exclusion-only dependency. Keep
+the full result unsuccessful if any physical targeted deletion is unconfirmed.
 
-- [ ] **Step 7: Run new tests and focused suites to verify GREEN**
+- [ ] **Step 8: Run new tests and focused suites to verify GREEN**
 
 Run:
 
