@@ -322,6 +322,37 @@ class TestIncrementalFullSync:
 # --------------------------------------------------------------------------- #
 
 class TestFailureHandling:
+    def test_vacated_finger_clear_failure_is_failed_in_push_batch_history(self, monkeypatch, state):
+        class _SlotRemovalFailure(FakeDriver):
+            def push_roster(self, users, templates_by_pin=None, *, bracket_enable_device=False, **kw):
+                self.push_calls.append((list(users), dict(templates_by_pin or {}), bracket_enable_device))
+                return {
+                    "ok": False,
+                    "pushed": 1,
+                    "failed": 0,
+                    "templates_failed": 0,
+                    "skipped_pin": 0,
+                    "chunks_wedged": 0,
+                    "errors": ["finger removal refused"],
+                    "failed_pins": [" 117 "],
+                    "del_attempted": 1,
+                    "del_ok": 0,
+                }
+
+        w, _ = _worker(
+            monkeypatch,
+            driver=_SlotRemovalFailure(),
+            users=[_user(117, "Bob", "1")],
+        )
+        _full_sync(w)
+
+        last = w._push_batch_updates[-1]
+        assert last["pins_attempted"] == 1
+        assert last["pins_success"] == 0
+        assert last["pins_failed"] == 1
+        assert last["status"] == "FAILED"
+        assert state.rows["117"][1] is False
+
     def test_partial_failure_marks_only_failed_pins_and_retries_just_them(self, monkeypatch, state):
         users = [_user(117, "Bob", "1"), _user(118, "Alice", "2"), _user(119, "Eve", "3")]
         drv = FakeDriver(failed_pins=["118"])

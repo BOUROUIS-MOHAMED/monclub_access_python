@@ -1415,14 +1415,7 @@ class UltraDeviceWorker(threading.Thread):
         if not users:
             return
         result = result or {}
-        failed = result.get("failed_pins")
-        if failed is None or (not failed and not result.get("ok")):
-            failed_set = (
-                {str(u.get("pin") or "").strip() for u in users}
-                if not result.get("ok") else set()
-            )
-        else:
-            failed_set = {str(p or "").strip() for p in failed if str(p or "").strip()}
+        failed_set = self._standalone_failed_pins_from_result(users=users, result=result)
         err: str | None = None
         if failed_set:
             errs = result.get("errors") or []
@@ -1447,6 +1440,51 @@ class UltraDeviceWorker(threading.Thread):
             save_device_sync_state_batch(device_id=self._device_id, rows=rows)
         except Exception:
             logger.debug("%s per-pin sync state not recorded", self._prefix, exc_info=True)
+
+    @staticmethod
+    def _standalone_failed_pins_from_result(
+        *, users: list[Dict[str, Any]], result: Dict[str, Any],
+    ) -> set[str]:
+        """Return unconfirmed attempted pins, failing closed on ambiguous results."""
+        attempted = {
+            str(user.get("pin") or "").strip()
+            for user in users or []
+            if str(user.get("pin") or "").strip()
+        }
+        if not attempted or not isinstance(result, dict):
+            return set(attempted)
+
+        ok = result.get("ok")
+        reported = result.get("failed_pins")
+        if reported is None:
+            if ok is True:
+                failed_count = result.get("failed", 0)
+                templates_failed = result.get("templates_failed", 0)
+                if (
+                    type(failed_count) is int
+                    and failed_count == 0
+                    and type(templates_failed) is int
+                    and templates_failed == 0
+                ):
+                    return set()
+            return set(attempted)
+        if not isinstance(reported, list):
+            return set(attempted)
+
+        normalized = [
+            str(pin if pin is not None else "").strip()
+            for pin in reported
+        ]
+        failed = set(normalized)
+        if (
+            type(ok) is not bool
+            or any(not pin for pin in normalized)
+            or not failed <= attempted
+            or (ok and failed)
+            or (not ok and not failed)
+        ):
+            return set(attempted)
+        return failed
 
     def _run_standalone_full_sync(self, *, reason: str, fingerprint_hash: str | None) -> None:
         """Full roster push for a push driver, with FULL parity on the started/
@@ -1610,10 +1648,16 @@ class UltraDeviceWorker(threading.Thread):
         duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
         if batch_id is not None:
             try:
-                # A refused fingerprint template is a FAILED pin here, not a
-                # success: the member row landed but that member cannot verify.
-                pins_failed = int(result.get("failed") or 0) + int(result.get("templates_failed") or 0)
-                pins_success = max(0, int(result.get("pushed") or 0) - int(result.get("templates_failed") or 0))
+                # A pin named by failed_pins is unconfirmed even when its user row
+                # landed (for example, a tracked fingerprint slot refused removal).
+                # Count per PIN from the same conservative normalization used by
+                # retry state instead of trusting contradictory aggregate counters.
+                failed_pins = self._standalone_failed_pins_from_result(
+                    users=to_push if batch_attempted else [], result=result,
+                )
+                skipped_pins = max(0, int(result.get("skipped_pin") or 0))
+                pins_failed = len(failed_pins)
+                pins_success = max(0, batch_attempted - pins_failed - skipped_pins)
                 update_push_batch(
                     id=batch_id,
                     pins_attempted=batch_attempted,

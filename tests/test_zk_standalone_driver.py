@@ -422,6 +422,16 @@ class TestDeviceUserListAndDelete:
         assert ("40000", 12) in zk.deleted and ("117", 12) in zk.deleted  # 12 = whole user
         assert sum(1 for c in zk.calls if c[0] == "RefreshData") == 1     # once at the end
 
+    def test_delete_users_exception_names_every_requested_pin(self):
+        drv, _ = _make_driver()
+        drv._call = MagicMock(side_effect=RuntimeError("STA command wedged"))
+
+        res = drv.delete_users([" 40000 ", "117"])
+
+        assert res["ok"] is False
+        assert res["deleted"] == 0 and res["failed"] == 2
+        assert res["failed_pins"] == ["40000", "117"]
+
 
 # --------------------------------------------------------------------------- #
 # Engine seams: full-sync + member-sync branches on the worker

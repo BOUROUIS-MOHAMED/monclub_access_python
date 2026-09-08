@@ -921,11 +921,21 @@ class ZKStandaloneDevice:
         'failed_pins': [str], 'errors': [str]}.
         Does NOT bracket EnableDevice — MIRROR runs inside push_roster's bracket window.
         """
+        requested_pins = [
+            str(pin if pin is not None else "").strip()
+            for pin in (pins or [])
+        ]
         try:
-            return self._call("delete_users", args={"pins": list(pins or [])}, timeout=timeout_sec)
+            return self._call("delete_users", args={"pins": requested_pins}, timeout=timeout_sec)
         except Exception as exc:
             self.logger.warning("%s delete_users failed: %s", self._prefix, exc)
-            return {"ok": False, "deleted": 0, "failed": len(pins or []), "errors": [str(exc)]}
+            return {
+                "ok": False,
+                "deleted": 0,
+                "failed": len(requested_pins),
+                "failed_pins": requested_pins,
+                "errors": [str(exc)],
+            }
 
     # ------------------------------------------------------------------ #
     # DeviceDriver surface — PullSDK-shaped members: INERT, never raise (D8)
