@@ -555,6 +555,91 @@ class TestAuthoritativeFullSyncRetry:
         assert scheduler._last_hash[9] == "retry-hash"
         assert scheduler._drain_pending_sync_request() is None
 
+    def test_failed_full_sync_keeps_worker_protection_until_scheduler_redelivery(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(
+            monkeypatch,
+            driver=drv,
+            users=[_user(30001, "active", ""), _user(34439, "revoked", "")],
+        )
+        drv.push_roster = MagicMock(return_value={
+            "ok": False,
+            "pushed": 0,
+            "failed": 1,
+            "templates_failed": 0,
+            "skipped_pin": 0,
+            "chunks_wedged": 0,
+            "errors": ["push failed"],
+            "failed_pins": ["30001"],
+        })
+        scheduler = ue.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+        w._on_full_sync_finished = scheduler._handle_worker_full_sync_finished
+        w._confirmed_member_revoke_ids.add(34439)
+
+        assert w.request_full_sync(
+            reason="fast_patch_bundle",
+            fingerprint_hash="failed-hash",
+            revoked_ids={34439},
+        ) is True
+        assert w._drain_full_sync_commands(limit=1) == 1
+
+        assert scheduler._pending_revoked_ids == {34439}
+        assert w.request_member_sync(34439) is False
+        assert w.has_pending_member_revoke(34439) is True
+        assert w._confirmed_member_revoke_ids == {34439}
+        assert list(w._pending_member_syncs) == []
+
+    def test_scheduler_redelivery_during_failure_callback_adopts_retry_state(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(
+            monkeypatch,
+            driver=drv,
+            users=[_user(30001, "active", ""), _user(34439, "revoked", "")],
+        )
+        drv.push_roster = MagicMock(return_value={
+            "ok": False,
+            "pushed": 0,
+            "failed": 1,
+            "templates_failed": 0,
+            "skipped_pin": 0,
+            "chunks_wedged": 0,
+            "errors": ["push failed"],
+            "failed_pins": ["30001"],
+        })
+        scheduler = ue.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+        redelivery: dict[str, bool] = {}
+
+        def finish_and_redeliver(**kwargs):
+            scheduler._handle_worker_full_sync_finished(**kwargs)
+            changed_ids, revoked_ids, device_ids, reason = (
+                scheduler._drain_pending_sync_request()
+            )
+            assert changed_ids is None
+            assert device_ids == {9}
+            redelivery["member"] = w.request_member_revoke(34439)
+            redelivery["full"] = w.request_full_sync(
+                reason=reason,
+                fingerprint_hash="retry-hash",
+                revoked_ids=revoked_ids,
+            )
+
+        w._on_full_sync_finished = finish_and_redeliver
+        assert w.request_full_sync(
+            reason="fast_patch_bundle",
+            fingerprint_hash="failed-hash",
+            revoked_ids={34439},
+        ) is True
+
+        assert w._drain_full_sync_commands(limit=1) == 1
+
+        assert redelivery == {"member": True, "full": True}
+        assert list(w._pending_member_syncs) == [34439]
+        assert w._pending_member_revoke_ids == {34439}
+        assert w._pending_full_sync_request["revoked_ids"] == {34439}
+        assert scheduler._drain_pending_sync_request() is None
+
 
 class TestARevokedMemberLosesTheirCredentials:
 

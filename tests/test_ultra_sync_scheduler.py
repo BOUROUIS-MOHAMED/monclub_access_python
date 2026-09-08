@@ -18,7 +18,7 @@ def _member_command_worker(ultra_module):
     worker._confirmed_member_revoke_ids = set()
     worker._full_sync_lock = threading.Lock()
     worker._pending_full_sync_request = None
-    worker._active_full_sync_revoked_ids = set()
+    worker._full_sync_revocation_phase = {}
     worker._wake_evt = threading.Event()
     return worker
 
@@ -952,12 +952,16 @@ def test_member_sync_cannot_downgrade_revoke_after_full_sync_request_is_popped()
 
     def active_full_sync(**kwargs):
         observed["pending_request"] = worker._pending_full_sync_request
-        observed["active_revokes"] = set(worker._active_full_sync_revoked_ids)
+        observed["active_revokes"] = {
+            member_id
+            for member_id, phase in worker._full_sync_revocation_phase.items()
+            if phase == ultra_module._FULL_REVOKE_ACTIVE
+        }
         observed["ordinary_accepted"] = worker.request_member_sync(41)
         observed["revoke_pending"] = worker.has_pending_member_revoke(41)
         observed["confirmed_revokes"] = set(worker._confirmed_member_revoke_ids)
         observed["ordinary_queue"] = list(worker._pending_member_syncs)
-        worker._clear_active_full_sync_revokes({41})
+        worker._finalize_full_sync_revokes({41}, ok=True)
 
     worker._run_standalone_full_sync = active_full_sync
     assert worker.request_full_sync(
@@ -975,6 +979,165 @@ def test_member_sync_cannot_downgrade_revoke_after_full_sync_request_is_popped()
         "confirmed_revokes": {41},
         "ordinary_queue": [],
     }
+
+
+def _block_active_full_sync(worker, revoked_ids: set[int]):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_full_sync(**kwargs):
+        entered.set()
+        assert release.wait(1.0)
+
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = True
+    worker._run_standalone_full_sync = blocked_full_sync
+    assert worker.request_full_sync(
+        reason="fast_patch_bundle",
+        revoked_ids=revoked_ids,
+    ) is True
+    thread = threading.Thread(target=worker._drain_full_sync_commands, kwargs={"limit": 1})
+    thread.start()
+    assert entered.wait(1.0)
+    return release, thread
+
+
+def test_active_full_sync_rejects_exact_duplicate_revocation_request():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    release, thread = _block_active_full_sync(worker, {41})
+    try:
+        assert worker.request_full_sync(
+            reason="fast_patch_bundle",
+            revoked_ids={41},
+        ) is False
+        assert worker._pending_full_sync_request is None
+        assert worker.has_pending_full_sync(revoked_ids={41}) is True
+    finally:
+        release.set()
+        thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+
+def test_active_full_sync_queues_only_new_ids_from_overlapping_request():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    release, thread = _block_active_full_sync(worker, {41})
+    try:
+        assert worker.request_full_sync(
+            reason="fast_patch_bundle",
+            revoked_ids={41, 43},
+        ) is True
+        assert worker._pending_full_sync_request["revoked_ids"] == {43}
+        assert worker.has_pending_full_sync(revoked_ids={41, 43}) is True
+    finally:
+        release.set()
+        thread.join(timeout=1.0)
+    assert not thread.is_alive()
+
+
+def test_later_full_sync_adopts_callback_free_retry_revocation():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._full_sync_revocation_phase[41] = ultra_module._FULL_REVOKE_RETRY
+
+    assert worker.request_full_sync(reason="timer") is True
+
+    assert worker._pending_full_sync_request["revoked_ids"] == {41}
+    assert worker._full_sync_revocation_phase == {}
+
+
+def test_full_sync_atomically_adopts_equivalent_targeted_revoke_without_touching_other_work():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = True
+    observed: dict[str, object] = {}
+
+    assert worker.request_member_sync(99) is True
+    assert worker.request_member_revoke(41) is True
+    worker._confirmed_member_revoke_ids.add(41)
+    assert worker.request_full_sync(
+        reason="fast_patch_bundle",
+        revoked_ids={41},
+    ) is True
+
+    def adopted_full_sync(**kwargs):
+        observed["queue"] = list(worker._pending_member_syncs)
+        observed["sync_ids"] = set(worker._pending_member_sync_ids)
+        observed["revoke_ids"] = set(worker._pending_member_revoke_ids)
+        observed["confirmed_ids"] = set(worker._confirmed_member_revoke_ids)
+
+    worker._run_standalone_full_sync = adopted_full_sync
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+    assert observed == {
+        "queue": [99],
+        "sync_ids": {99},
+        "revoke_ids": set(),
+        "confirmed_ids": {41},
+    }
+
+
+def test_pullsdk_full_sync_executes_adopted_revoke_before_filtered_roster(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    events: list[tuple[str, object]] = []
+
+    class _FakeDeviceSyncEngine:
+        def __init__(self, cfg, logger):
+            self._last_single_device_error = ""
+
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+            events.append(("targeted", member_id))
+            return True
+
+        def run_one_device_on_connected_sdk(
+            self, *, sdk, cache, device, source, changed_ids,
+        ):
+            events.append((
+                "full",
+                {int(user["activeMembershipId"]) for user in cache.users},
+            ))
+            return True
+
+    worker = ultra_module.UltraDeviceWorker(
+        device={"id": 5, "name": "Door 1", "ipAddress": "10.0.0.5", "portNumber": 4370},
+        settings={},
+        popup_q=queue.Queue(),
+        history_q=queue.Queue(),
+        stop_event=threading.Event(),
+    )
+    worker._connected = True
+    worker._sdk = SimpleNamespace(owns_event_source=False, _sdk="raw-sdk")
+    worker._on_full_sync_finished = MagicMock()
+    monkeypatch.setattr(
+        ultra_module,
+        "load_sync_cache",
+        lambda: SimpleNamespace(
+            users=[{"activeMembershipId": 41}, {"activeMembershipId": 99}],
+            devices=[],
+        ),
+    )
+    monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _FakeDeviceSyncEngine)
+
+    assert worker.request_member_revoke(41) is True
+    assert worker.request_full_sync(
+        reason="fast_patch_bundle",
+        fingerprint_hash="filtered-hash",
+        revoked_ids={41},
+    ) is True
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+    assert events == [("targeted", 41), ("full", {99})]
+    assert list(worker._pending_member_syncs) == []
+    assert worker._pending_member_revoke_ids == set()
+    assert worker._confirmed_member_revoke_ids == set()
+    assert worker._on_full_sync_finished.call_args.kwargs["ok"] is True
 
 
 def test_standalone_member_command_drain_routes_captured_action():
