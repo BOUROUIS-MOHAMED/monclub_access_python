@@ -558,7 +558,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 `error`. Every exit path reaches it. `[CODE: _remote_enroll_worker's finally]`
 
 `ZKEM_PUSH_FAILED_PINS` reasons: `set_user_info_false`, `template_refused_f<N>`,
-`exception:<Type>`, `chunk_wedged_or_unconfirmed`. `[CODE: _do_push_roster]`
+`finger_remove_false_f<N>`, `finger_remove_exception_f<N>`, `exception:<Type>`,
+`chunk_wedged_or_unconfirmed`. `[CODE: _do_push_roster]`
 
 ### 10.3 Three rules this instrumentation follows — keep them
 
