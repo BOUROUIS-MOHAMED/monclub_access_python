@@ -4261,6 +4261,7 @@ class UltraSyncScheduler:
         self._pending_sync_requested = False
         self._pending_full_sync = False
         self._pending_changed_ids: Set[int] = set()
+        self._pending_revoked_ids: Set[int] = set()
         self._pending_all_devices = False
         self._pending_device_ids: Set[int] = set()
         self._pending_reason = "manual"
@@ -4427,6 +4428,7 @@ class UltraSyncScheduler:
         self,
         *,
         changed_ids: set[int] | None = None,
+        revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "manual",
     ) -> None:
@@ -4438,6 +4440,13 @@ class UltraSyncScheduler:
                 if member_id is not None
             }
         )
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        if normalized_changed_ids is not None:
+            normalized_changed_ids.difference_update(normalized_revoked_ids)
         normalized_device_ids = (
             None if device_ids is None else {
                 int(device_id)
@@ -4445,9 +4454,13 @@ class UltraSyncScheduler:
                 if device_id is not None
             }
         )
-        if normalized_changed_ids is not None and not normalized_changed_ids:
+        if (
+            normalized_changed_ids is not None
+            and not normalized_changed_ids
+            and not normalized_revoked_ids
+        ):
             self._logger.info(
-                "[UltraSyncScheduler] request_sync_now skipped: reason=%s changed_ids=0",
+                "[UltraSyncScheduler] request_sync_now skipped: reason=%s changed_ids=0 revoked_ids=0",
                 normalized_reason,
             )
             return
@@ -4459,33 +4472,40 @@ class UltraSyncScheduler:
                 self._pending_changed_ids.clear()
             elif not self._pending_full_sync:
                 self._pending_changed_ids.update(normalized_changed_ids)
+            self._pending_revoked_ids.update(normalized_revoked_ids)
+            self._pending_changed_ids.difference_update(self._pending_revoked_ids)
             if normalized_device_ids is None:
                 self._pending_all_devices = True
                 self._pending_device_ids.clear()
             elif not self._pending_all_devices:
                 self._pending_device_ids.update(normalized_device_ids)
         self._logger.info(
-            "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s device_ids=%s",
+            "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
             normalized_reason,
             "all" if normalized_changed_ids is None else len(normalized_changed_ids),
+            len(normalized_revoked_ids),
             "all" if normalized_device_ids is None else len(normalized_device_ids),
         )
         self._wake_sync.set()
 
-    def _drain_pending_sync_request(self) -> tuple[set[int] | None, set[int] | None, str] | None:
+    def _drain_pending_sync_request(
+        self,
+    ) -> tuple[set[int] | None, set[int], set[int] | None, str] | None:
         with self._pending_sync_lock:
             if not self._pending_sync_requested:
                 return None
             reason = self._pending_reason
             changed_ids = None if self._pending_full_sync else set(self._pending_changed_ids)
+            revoked_ids = set(self._pending_revoked_ids)
             device_ids = None if self._pending_all_devices else set(self._pending_device_ids)
             self._pending_sync_requested = False
             self._pending_full_sync = False
             self._pending_changed_ids.clear()
+            self._pending_revoked_ids.clear()
             self._pending_all_devices = False
             self._pending_device_ids.clear()
             self._pending_reason = "manual"
-            return changed_ids, device_ids, reason
+            return changed_ids, revoked_ids, device_ids, reason
 
     @staticmethod
     def _manual_sync_mode() -> bool:
@@ -4522,8 +4542,13 @@ class UltraSyncScheduler:
                 pending = self._drain_pending_sync_request()
                 if pending is None:
                     continue
-                changed_ids, device_ids, reason = pending
-                self._sync_all(changed_ids=changed_ids, device_ids=device_ids, reason=reason)
+                changed_ids, revoked_ids, device_ids, reason = pending
+                self._sync_all(
+                    changed_ids=changed_ids,
+                    revoked_ids=revoked_ids,
+                    device_ids=device_ids,
+                    reason=reason,
+                )
                 continue
             # Periodic timer push — suppressed in manual sync mode (auto-push off).
             if not self._manual_sync_mode():
@@ -4538,19 +4563,35 @@ class UltraSyncScheduler:
         self,
         *,
         changed_ids: set[int] | None = None,
+        revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "timer",
     ):
         """Push user data to all ULTRA devices (with hash-based skip)."""
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        normalized_changed_ids = (
+            None
+            if changed_ids is None
+            else {
+                int(member_id)
+                for member_id in changed_ids
+                if member_id is not None
+            } - normalized_revoked_ids
+        )
         devices = self._devices if device_ids is None else [
             device for device in self._devices
             if device.get("id") is not None and int(device.get("id")) in device_ids
         ]
         self._logger.info(
-            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s) reason=%s changed_ids=%s device_ids=%s",
+            "[UltraSyncScheduler] _sync_all: starting cycle for %d device(s) reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
             len(devices),
             reason,
-            "all" if changed_ids is None else len(changed_ids),
+            "all" if normalized_changed_ids is None else len(normalized_changed_ids),
+            len(normalized_revoked_ids),
             "all" if device_ids is None else len(device_ids),
         )
         t0 = time.time()
@@ -4568,11 +4609,25 @@ class UltraSyncScheduler:
                 routed = False
                 did_sync = False
                 worker = self._workers.get(int(device_id)) if device_id is not None else None
-                if worker and changed_ids:
-                    for member_id in sorted(changed_ids):
+                if worker and normalized_changed_ids is not None and (
+                    normalized_changed_ids or normalized_revoked_ids
+                ):
+                    for member_id in sorted(normalized_revoked_ids):
+                        if (
+                            hasattr(worker, "request_member_revoke")
+                            and worker.request_member_revoke(int(member_id))
+                        ):
+                            routed = True
+                    for member_id in sorted(normalized_changed_ids):
                         if worker.request_member_sync(int(member_id)):
                             routed = True
-                elif worker and changed_ids is None:
+                elif worker and normalized_changed_ids is None:
+                    for member_id in sorted(normalized_revoked_ids):
+                        if (
+                            hasattr(worker, "request_member_revoke")
+                            and worker.request_member_revoke(int(member_id))
+                        ):
+                            routed = True
                     from app.core.device_sync import DeviceSyncEngine
 
                     cache = load_sync_cache()
@@ -4627,7 +4682,7 @@ class UltraSyncScheduler:
                                 )
                             did_sync = routed
                 else:
-                    did_sync = self._sync_device(d, changed_ids=changed_ids)
+                    did_sync = self._sync_device(d, changed_ids=normalized_changed_ids)
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 30)
                 ) * 60
@@ -5200,6 +5255,7 @@ class UltraEngine:
         self,
         *,
         changed_ids: set[int] | None = None,
+        revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "manual",
     ) -> bool:
@@ -5214,6 +5270,13 @@ class UltraEngine:
                 if member_id is not None
             }
         )
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        if normalized_changed_ids is not None:
+            normalized_changed_ids.difference_update(normalized_revoked_ids)
         normalized_device_ids = (
             set(self._workers.keys())
             if device_ids is None
@@ -5223,13 +5286,19 @@ class UltraEngine:
                 if device_id is not None
             }
         )
-        if normalized_changed_ids is not None and not normalized_changed_ids:
+        if (
+            normalized_changed_ids is not None
+            and not normalized_changed_ids
+            and not normalized_revoked_ids
+        ):
             self._logger.info(
-                "[ULTRA] skip sync request: empty changed_ids reason=%s",
+                "[ULTRA] skip sync request: empty changed_ids and revoked_ids reason=%s",
                 str(reason or "manual"),
             )
             return False
-        if normalized_changed_ids:
+        if normalized_changed_ids is not None and (
+            normalized_changed_ids or normalized_revoked_ids
+        ):
             matched_workers = [
                 (device_id, worker)
                 for device_id, worker in sorted(self._workers.items())
@@ -5237,13 +5306,17 @@ class UltraEngine:
             ]
             if matched_workers:
                 for _device_id, worker in matched_workers:
+                    for member_id in sorted(normalized_revoked_ids):
+                        if hasattr(worker, "request_member_revoke"):
+                            worker.request_member_revoke(int(member_id))
                     for member_id in sorted(normalized_changed_ids):
                         if hasattr(worker, "request_member_sync"):
                             worker.request_member_sync(int(member_id))
                 self._logger.info(
-                    "[ULTRA] routed targeted member sync to live workers: devices=%d members=%d reason=%s",
+                    "[ULTRA] routed targeted member sync to live workers: devices=%d members=%d revoked=%d reason=%s",
                     len(matched_workers),
                     len(normalized_changed_ids),
+                    len(normalized_revoked_ids),
                     str(reason or "manual"),
                 )
                 return True
@@ -5252,6 +5325,9 @@ class UltraEngine:
             for device_id, worker in sorted(self._workers.items()):
                 if int(device_id) not in normalized_device_ids:
                     continue
+                for member_id in sorted(normalized_revoked_ids):
+                    if hasattr(worker, "request_member_revoke"):
+                        worker.request_member_revoke(int(member_id))
                 if hasattr(worker, "request_full_sync") and worker.request_full_sync(reason=reason):
                     routed_device_ids.add(int(device_id))
             if routed_device_ids:
@@ -5266,6 +5342,7 @@ class UltraEngine:
                 normalized_device_ids = remaining_device_ids
         self._sync_scheduler.request_sync_now(
             changed_ids=normalized_changed_ids,
+            revoked_ids=normalized_revoked_ids,
             device_ids=normalized_device_ids,
             reason=reason,
         )
