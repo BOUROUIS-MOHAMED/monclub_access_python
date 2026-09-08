@@ -38,9 +38,84 @@ from app.core.db import (
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
-from app.sdk.device_driver import get_driver
+from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
 logger = logging.getLogger("zkapp")
+
+
+def _worker_is_usable(worker: Any) -> bool:
+    """Return actual thread liveness while keeping lightweight test doubles usable."""
+    is_alive = getattr(worker, "is_alive", None)
+    if not callable(is_alive):
+        return True
+    try:
+        return bool(is_alive())
+    except Exception:
+        return False
+
+
+def _worker_request_accepted_or_pending(
+    worker: Any,
+    *,
+    request_method: str,
+    pending_method: str,
+    member_id: int,
+) -> bool:
+    request = getattr(worker, request_method, None)
+    if not callable(request):
+        return False
+    accepted = bool(request(int(member_id)))
+    if accepted:
+        return True
+    pending = getattr(worker, pending_method, None)
+    return bool(callable(pending) and pending(int(member_id)))
+
+
+def _worker_full_sync_accepted_or_pending(
+    worker: Any,
+    *,
+    reason: str,
+    fingerprint_hash: str | None = None,
+    revoked_ids: set[int] | None = None,
+) -> bool:
+    request = getattr(worker, "request_full_sync", None)
+    if not callable(request):
+        return False
+    kwargs: Dict[str, Any] = {"reason": reason}
+    if fingerprint_hash is not None:
+        kwargs["fingerprint_hash"] = fingerprint_hash
+    if revoked_ids:
+        kwargs["revoked_ids"] = set(revoked_ids)
+    accepted = bool(request(**kwargs))
+    if accepted:
+        return True
+    pending = getattr(worker, "has_pending_full_sync", None)
+    return bool(
+        callable(pending)
+        and pending(revoked_ids=set(revoked_ids or set()))
+    )
+
+
+def _sync_cache_without_revoked_ids(cache: Any, revoked_ids: set[int] | None) -> Any:
+    """Copy a sync-cache snapshot while excluding authoritative revoked memberships."""
+    normalized_revoked_ids = {int(member_id) for member_id in (revoked_ids or set())}
+    if not normalized_revoked_ids:
+        return cache
+    users = []
+    for user in list(getattr(cache, "users", []) or []):
+        if not isinstance(user, dict):
+            users.append(user)
+            continue
+        raw_member_id = user.get("activeMembershipId")
+        try:
+            if raw_member_id is not None and int(raw_member_id) in normalized_revoked_ids:
+                continue
+        except (TypeError, ValueError):
+            pass
+        users.append(user)
+    filtered_cache_attrs = dict(getattr(cache, "__dict__", {}))
+    filtered_cache_attrs["users"] = users
+    return SimpleNamespace(**filtered_cache_attrs)
 
 
 # Fix #1 / #2a — clock-skew handling for TOTP rescue.
@@ -948,16 +1023,53 @@ class UltraDeviceWorker(threading.Thread):
             self._wake_evt.set()
         return is_new_revocation
 
-    def request_full_sync(self, reason: str = "manual", fingerprint_hash: str | None = None) -> bool:
+    def has_pending_member_sync(self, member_id: int) -> bool:
+        with self._member_sync_lock:
+            return int(member_id) in self._pending_member_sync_ids
+
+    def has_pending_member_revoke(self, member_id: int) -> bool:
+        with self._member_sync_lock:
+            return int(member_id) in self._pending_member_revoke_ids
+
+    def request_full_sync(
+        self,
+        reason: str = "manual",
+        fingerprint_hash: str | None = None,
+        revoked_ids: set[int] | None = None,
+    ) -> bool:
         normalized_reason = str(reason or "manual").strip() or "manual"
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
         with self._full_sync_lock:
             if self._pending_full_sync_request is not None:
+                pending_revoked_ids = self._pending_full_sync_request.setdefault(
+                    "revoked_ids", set()
+                )
+                pending_revoked_ids.update(normalized_revoked_ids)
+                if normalized_revoked_ids:
+                    self._pending_full_sync_request["fingerprint_hash"] = (
+                        str(fingerprint_hash or "").strip() or None
+                    )
                 return False
             self._pending_full_sync_request = {
                 "reason": normalized_reason,
                 "fingerprint_hash": str(fingerprint_hash or "").strip() or None,
+                "revoked_ids": normalized_revoked_ids,
             }
         return True
+
+    def has_pending_full_sync(self, *, revoked_ids: set[int] | None = None) -> bool:
+        normalized_revoked_ids = set(revoked_ids or set())
+        with self._full_sync_lock:
+            if self._pending_full_sync_request is None:
+                return False
+            pending_revoked_ids = set(
+                self._pending_full_sync_request.get("revoked_ids") or set()
+            )
+            return normalized_revoked_ids <= pending_revoked_ids
 
     @_tel.timed("DOOR_DRAIN", slow_ms=500)
     def _drain_commands(self):
@@ -1147,7 +1259,10 @@ class UltraDeviceWorker(threading.Thread):
                         try:
                             self._run_standalone_member_revoke(member_id)
                         except Exception:
-                            self.request_full_sync(reason="revoke-handler-failed")
+                            self.request_full_sync(
+                                reason="revoke-handler-failed",
+                                revoked_ids={member_id},
+                            )
                             raise
                     else:
                         self._run_standalone_member_sync(member_id)
@@ -1494,7 +1609,13 @@ class UltraDeviceWorker(threading.Thread):
             return set(attempted)
         return failed
 
-    def _run_standalone_full_sync(self, *, reason: str, fingerprint_hash: str | None) -> None:
+    def _run_standalone_full_sync(
+        self,
+        *,
+        reason: str,
+        fingerprint_hash: str | None,
+        revoked_ids: set[int] | None = None,
+    ) -> None:
         """Full roster push for a push driver, with FULL parity on the started/
         finished bookkeeping so scheduler skip-hashes and manual-sync pending
         counters keep working. Always terminates (never re-queues itself)."""
@@ -1508,6 +1629,7 @@ class UltraDeviceWorker(threading.Thread):
             self._notify_full_sync_finished(reason=reason, ok=False, fingerprint_hash=None,
                                             duration_ms=0.0, error="no sync cache available")
             return
+        cache = _sync_cache_without_revoked_ids(cache, revoked_ids)
 
         self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
         self._notify_full_sync_started(reason=reason)
@@ -2032,7 +2154,7 @@ class UltraDeviceWorker(threading.Thread):
                 member_id=member_id,
                 pin=pin,
             )
-            self.request_full_sync(reason="revoke-failed")
+            self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
             return False
 
         if pin not in state:
@@ -2047,7 +2169,10 @@ class UltraDeviceWorker(threading.Thread):
                 member_id=member_id,
                 pin=pin,
             )
-            self.request_full_sync(reason="revoke-ownership-missing")
+            self.request_full_sync(
+                reason="revoke-ownership-missing",
+                revoked_ids={member_id},
+            )
             return False
 
         outcome = self._remove_standalone_pins(
@@ -2072,7 +2197,7 @@ class UltraDeviceWorker(threading.Thread):
                     member_id=member_id,
                     pin=pin,
                 )
-                self.request_full_sync(reason="revoke-failed")
+                self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
                 return False
             mode = "deleted" if pin in outcome.deleted else "neutralised"
             _tel.event(
@@ -2091,7 +2216,7 @@ class UltraDeviceWorker(threading.Thread):
             member_id=member_id,
             pin=pin,
         )
-        self.request_full_sync(reason="revoke-failed")
+        self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
         return False
 
     # ------------------------------------------------------------------ #
@@ -2397,10 +2522,19 @@ class UltraDeviceWorker(threading.Thread):
                 break
             reason = str(request.get("reason") or "manual")
             fingerprint_hash = str(request.get("fingerprint_hash") or "").strip() or None
+            revoked_ids = {
+                int(member_id)
+                for member_id in (request.get("revoked_ids") or set())
+                if member_id is not None
+            }
 
             try:
                 if self._sdk is None or not self._connected:
-                    self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
+                    self.request_full_sync(
+                        reason=reason,
+                        fingerprint_hash=fingerprint_hash,
+                        revoked_ids=revoked_ids,
+                    )
                     break
                 # Push drivers (ZK_STANDALONE) have no raw PullSDK handle — the
                 # extraction below would yield None and re-queue this request
@@ -2408,13 +2542,19 @@ class UltraDeviceWorker(threading.Thread):
                 # terminates the request (mark/notify fire on both outcomes).
                 if getattr(self._sdk, "owns_event_source", False):
                     self._run_standalone_full_sync(
-                        reason=reason, fingerprint_hash=fingerprint_hash,
+                        reason=reason,
+                        fingerprint_hash=fingerprint_hash,
+                        revoked_ids=revoked_ids,
                     )
                     drained += 1
                     continue
                 raw_sdk = getattr(self._sdk, "_sdk", None)
                 if raw_sdk is None:
-                    self.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
+                    self.request_full_sync(
+                        reason=reason,
+                        fingerprint_hash=fingerprint_hash,
+                        revoked_ids=revoked_ids,
+                    )
                     break
                 cache = load_sync_cache()
                 if cache is None:
@@ -2434,6 +2574,7 @@ class UltraDeviceWorker(threading.Thread):
                     )
                     drained += 1
                     continue
+                cache = _sync_cache_without_revoked_ids(cache, revoked_ids)
 
                 from app.core.device_sync import DeviceSyncEngine
 
@@ -4269,6 +4410,59 @@ class UltraSyncScheduler:
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
         """Register per-device worker references so sync requests stay worker-owned."""
         self._workers = workers
+        self.wake_pending_sync()
+
+    def wake_pending_sync(self) -> None:
+        with self._pending_sync_lock:
+            pending = self._pending_sync_requested
+        if pending:
+            self._wake_sync.set()
+
+    def _merge_pending_sync_request(
+        self,
+        *,
+        changed_ids: set[int] | None,
+        revoked_ids: set[int],
+        device_ids: set[int] | None,
+        reason: str,
+    ) -> None:
+        with self._pending_sync_lock:
+            self._pending_sync_requested = True
+            self._pending_reason = reason
+            if changed_ids is None:
+                self._pending_full_sync = True
+                self._pending_changed_ids.clear()
+            elif not self._pending_full_sync:
+                self._pending_changed_ids.update(changed_ids)
+            self._pending_revoked_ids.update(revoked_ids)
+            self._pending_changed_ids.difference_update(self._pending_revoked_ids)
+            if device_ids is None:
+                self._pending_all_devices = True
+                self._pending_device_ids.clear()
+            elif not self._pending_all_devices:
+                self._pending_device_ids.update(device_ids)
+
+    def _preserve_sync_request_for_retry(
+        self,
+        *,
+        changed_ids: set[int] | None,
+        revoked_ids: set[int],
+        device_ids: set[int],
+        reason: str,
+    ) -> None:
+        self._merge_pending_sync_request(
+            changed_ids=changed_ids,
+            revoked_ids=revoked_ids,
+            device_ids=device_ids,
+            reason=reason,
+        )
+        self._logger.warning(
+            "[UltraSyncScheduler] preserved sync for worker retry: reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
+            reason,
+            "all" if changed_ids is None else len(changed_ids),
+            len(revoked_ids),
+            sorted(device_ids),
+        )
 
     def _handle_worker_full_sync_started(self, *, device_id: int, reason: str) -> None:
         self._logger.info(
@@ -4464,21 +4658,12 @@ class UltraSyncScheduler:
                 normalized_reason,
             )
             return
-        with self._pending_sync_lock:
-            self._pending_sync_requested = True
-            self._pending_reason = normalized_reason
-            if normalized_changed_ids is None:
-                self._pending_full_sync = True
-                self._pending_changed_ids.clear()
-            elif not self._pending_full_sync:
-                self._pending_changed_ids.update(normalized_changed_ids)
-            self._pending_revoked_ids.update(normalized_revoked_ids)
-            self._pending_changed_ids.difference_update(self._pending_revoked_ids)
-            if normalized_device_ids is None:
-                self._pending_all_devices = True
-                self._pending_device_ids.clear()
-            elif not self._pending_all_devices:
-                self._pending_device_ids.update(normalized_device_ids)
+        self._merge_pending_sync_request(
+            changed_ids=normalized_changed_ids,
+            revoked_ids=normalized_revoked_ids,
+            device_ids=normalized_device_ids,
+            reason=normalized_reason,
+        )
         self._logger.info(
             "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
             normalized_reason,
@@ -4550,8 +4735,20 @@ class UltraSyncScheduler:
                     reason=reason,
                 )
                 continue
-            # Periodic timer push — suppressed in manual sync mode (auto-push off).
-            if not self._manual_sync_mode():
+            # A request preserved for a dead standalone worker must survive until
+            # the watchdog replaces it. Retry it on the normal interval even if
+            # no explicit wake arrived; manual mode suppresses only automatic
+            # timer pushes, never an already-authorized explicit request.
+            pending = self._drain_pending_sync_request()
+            if pending is not None:
+                changed_ids, revoked_ids, device_ids, reason = pending
+                self._sync_all(
+                    changed_ids=changed_ids,
+                    revoked_ids=revoked_ids,
+                    device_ids=device_ids,
+                    reason=reason,
+                )
+            elif not self._manual_sync_mode():
                 self._sync_all(reason="timer")
 
     def _check_worker_health(self):
@@ -4609,80 +4806,124 @@ class UltraSyncScheduler:
                 routed = False
                 did_sync = False
                 worker = self._workers.get(int(device_id)) if device_id is not None else None
-                if worker and normalized_changed_ids is not None and (
-                    normalized_changed_ids or normalized_revoked_ids
-                ):
-                    for member_id in sorted(normalized_revoked_ids):
-                        if (
-                            hasattr(worker, "request_member_revoke")
-                            and worker.request_member_revoke(int(member_id))
-                        ):
-                            routed = True
-                    for member_id in sorted(normalized_changed_ids):
-                        if worker.request_member_sync(int(member_id)):
-                            routed = True
-                elif worker and normalized_changed_ids is None:
-                    for member_id in sorted(normalized_revoked_ids):
-                        if (
-                            hasattr(worker, "request_member_revoke")
-                            and worker.request_member_revoke(int(member_id))
-                        ):
-                            routed = True
-                    from app.core.device_sync import DeviceSyncEngine
-
-                    cache = load_sync_cache()
-                    if cache is None:
-                        self._logger.warning("[ULTRA:%s] sync skip: no sync cache available", device_id)
-                        did_sync = False
-                    else:
-                        users = getattr(cache, "users", []) or []
-                        engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
-                        cur_detail: Dict[str, Any] = {}
-                        current_hash, desired_users = engine.build_device_sync_fingerprint(
-                            device=d,
-                            users=list(users),
-                            detail_out=cur_detail,
-                        )
-                        if self._last_hash.get(device_id) == current_hash:
-                            self._logger.info(
-                                "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
-                                device_id,
-                                desired_users,
-                                current_hash[:12],
+                target_handled = False
+                if worker is not None and _worker_is_usable(worker):
+                    try:
+                        commands_handled = True
+                        for member_id in sorted(normalized_revoked_ids):
+                            commands_handled = (
+                                _worker_request_accepted_or_pending(
+                                    worker,
+                                    request_method="request_member_revoke",
+                                    pending_method="has_pending_member_revoke",
+                                    member_id=member_id,
+                                )
+                                and commands_handled
                             )
-                            # Fingerprint matches the device's last-synced state, so this
-                            # breakdown IS the synced baseline — refresh it for the next diff.
-                            self._last_fp_detail[device_id] = cur_detail
-                            did_sync = False
+                        if normalized_changed_ids is not None:
+                            for member_id in sorted(normalized_changed_ids):
+                                commands_handled = (
+                                    _worker_request_accepted_or_pending(
+                                        worker,
+                                        request_method="request_member_sync",
+                                        pending_method="has_pending_member_sync",
+                                        member_id=member_id,
+                                    )
+                                    and commands_handled
+                                )
+                            target_handled = commands_handled
+                            routed = target_handled
                         else:
-                            # Telemetry: log which user/field flipped the fingerprint so a
-                            # spurious flip (paired with FULL_SYNC_DEVICE to_sync=0) is
-                            # identifiable — that's the unnecessary live-worker freeze.
-                            # NOTE: diff against the last-SYNCED baseline and do NOT overwrite
-                            # it here — if this sync fails, the retry must still show the real
-                            # delta (not an empty one). It's refreshed on the next unchanged cycle.
-                            self._log_fingerprint_delta(
-                                device_id, self._last_fp_detail.get(device_id), cur_detail,
+                            from app.core.device_sync import DeviceSyncEngine
+
+                            cache = load_sync_cache()
+                            if cache is None:
+                                self._logger.warning(
+                                    "[ULTRA:%s] sync skip: no sync cache available",
+                                    device_id,
+                                )
+                            else:
+                                cache = _sync_cache_without_revoked_ids(
+                                    cache, normalized_revoked_ids
+                                )
+                                users = getattr(cache, "users", []) or []
+                                engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
+                                cur_detail: Dict[str, Any] = {}
+                                current_hash, desired_users = engine.build_device_sync_fingerprint(
+                                    device=d,
+                                    users=list(users),
+                                    detail_out=cur_detail,
+                                )
+                                if (
+                                    not normalized_revoked_ids
+                                    and self._last_hash.get(device_id) == current_hash
+                                ):
+                                    self._logger.info(
+                                        "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
+                                        device_id,
+                                        desired_users,
+                                        current_hash[:12],
+                                    )
+                                    self._last_fp_detail[device_id] = cur_detail
+                                    target_handled = commands_handled
+                                else:
+                                    self._log_fingerprint_delta(
+                                        device_id,
+                                        self._last_fp_detail.get(device_id),
+                                        cur_detail,
+                                        reason=str(reason or "manual"),
+                                    )
+                                    full_sync_handled = _worker_full_sync_accepted_or_pending(
+                                        worker,
+                                        reason=reason,
+                                        fingerprint_hash=current_hash,
+                                        revoked_ids=normalized_revoked_ids,
+                                    )
+                                    target_handled = commands_handled and full_sync_handled
+                                    routed = target_handled
+                                    if target_handled:
+                                        self._logger.info(
+                                            "[ULTRA:%s] queued live-worker full sync: desired_users=%d prev_hash=%s new_hash=%s reason=%s",
+                                            device_id,
+                                            desired_users,
+                                            (self._last_hash.get(device_id) or "none")[:12],
+                                            current_hash[:12],
+                                            str(reason or "manual"),
+                                        )
+                                    did_sync = target_handled
+                    except Exception as exc:
+                        self._logger.warning(
+                            "[ULTRA:%s] live-worker sync enqueue failed; using fallback: %s",
+                            device_id,
+                            exc,
+                        )
+                        target_handled = False
+
+                if not target_handled:
+                    is_standalone = (
+                        resolve_device_protocol(d) == DeviceProtocol.ZK_STANDALONE
+                    )
+                    if is_standalone and normalized_revoked_ids:
+                        self._preserve_sync_request_for_retry(
+                            changed_ids=normalized_changed_ids,
+                            revoked_ids=normalized_revoked_ids,
+                            device_ids={int(device_id)},
+                            reason=str(reason or "manual"),
+                        )
+                    else:
+                        sync_kwargs: Dict[str, Any] = {
+                            "changed_ids": normalized_changed_ids,
+                        }
+                        if normalized_revoked_ids:
+                            sync_kwargs["revoked_ids"] = normalized_revoked_ids
+                        did_sync = self._sync_device(d, **sync_kwargs)
+                        if normalized_revoked_ids and not did_sync:
+                            self._preserve_sync_request_for_retry(
+                                changed_ids=normalized_changed_ids,
+                                revoked_ids=normalized_revoked_ids,
+                                device_ids={int(device_id)},
                                 reason=str(reason or "manual"),
                             )
-                            routed = bool(
-                                worker.request_full_sync(
-                                    reason=reason,
-                                    fingerprint_hash=current_hash,
-                                )
-                            )
-                            if routed:
-                                self._logger.info(
-                                    "[ULTRA:%s] queued live-worker full sync: desired_users=%d prev_hash=%s new_hash=%s reason=%s",
-                                    device_id,
-                                    desired_users,
-                                    (self._last_hash.get(device_id) or "none")[:12],
-                                    current_hash[:12],
-                                    str(reason or "manual"),
-                                )
-                            did_sync = routed
-                else:
-                    did_sync = self._sync_device(d, changed_ids=normalized_changed_ids)
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 30)
                 ) * 60
@@ -4713,6 +4954,7 @@ class UltraSyncScheduler:
         device: Dict[str, Any],
         *,
         changed_ids: set[int] | None = None,
+        revoked_ids: set[int] | None = None,
     ) -> bool:
         """Push data to a single device with hash-based change detection.
 
@@ -4727,6 +4969,12 @@ class UltraSyncScheduler:
             self._logger.warning("[ULTRA:%s] sync skip: no sync cache available", device_id)
             return False
 
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        cache = _sync_cache_without_revoked_ids(cache, normalized_revoked_ids)
         users = getattr(cache, "users", []) or []
         engine = DeviceSyncEngine(cfg=self._cfg, logger=self._logger)
         cur_detail: Dict[str, Any] = {}
@@ -4736,7 +4984,7 @@ class UltraSyncScheduler:
             detail_out=cur_detail,
         )
 
-        if self._last_hash.get(device_id) == current_hash:
+        if not normalized_revoked_ids and self._last_hash.get(device_id) == current_hash:
             self._logger.info(
                 "[ULTRA:%s] sync skip: fingerprint unchanged (desired_users=%d hash=%s)",
                 device_id, desired_users, current_hash[:12],
@@ -5169,6 +5417,8 @@ class UltraEngine:
                         )
                         new_worker.start()
                         self._workers[device_id] = new_worker
+                        if self._sync_scheduler is not None:
+                            self._sync_scheduler.wake_pending_sync()
                         self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
                     except Exception as exc:
                         self._logger.error(
@@ -5277,15 +5527,22 @@ class UltraEngine:
         }
         if normalized_changed_ids is not None:
             normalized_changed_ids.difference_update(normalized_revoked_ids)
-        normalized_device_ids = (
-            set(self._workers.keys())
-            if device_ids is None
-            else {
+        broadcast_devices = device_ids is None
+        if broadcast_devices:
+            normalized_device_ids = {int(device_id) for device_id in self._workers}
+            for device in list(getattr(self._sync_scheduler, "_devices", []) or []):
+                if not isinstance(device, dict) or device.get("id") is None:
+                    continue
+                try:
+                    normalized_device_ids.add(int(device["id"]))
+                except (TypeError, ValueError):
+                    continue
+        else:
+            normalized_device_ids = {
                 int(device_id)
                 for device_id in device_ids
                 if device_id is not None
             }
-        )
         if (
             normalized_changed_ids is not None
             and not normalized_changed_ids
@@ -5296,54 +5553,89 @@ class UltraEngine:
                 str(reason or "manual"),
             )
             return False
-        if normalized_changed_ids is not None and (
-            normalized_changed_ids or normalized_revoked_ids
-        ):
-            matched_workers = [
-                (device_id, worker)
-                for device_id, worker in sorted(self._workers.items())
-                if int(device_id) in normalized_device_ids
-            ]
-            if matched_workers:
-                for _device_id, worker in matched_workers:
-                    for member_id in sorted(normalized_revoked_ids):
-                        if hasattr(worker, "request_member_revoke"):
-                            worker.request_member_revoke(int(member_id))
-                    for member_id in sorted(normalized_changed_ids):
-                        if hasattr(worker, "request_member_sync"):
-                            worker.request_member_sync(int(member_id))
-                self._logger.info(
-                    "[ULTRA] routed targeted member sync to live workers: devices=%d members=%d revoked=%d reason=%s",
-                    len(matched_workers),
-                    len(normalized_changed_ids),
-                    len(normalized_revoked_ids),
-                    str(reason or "manual"),
-                )
-                return True
-        if normalized_changed_ids is None:
-            routed_device_ids: set[int] = set()
-            for device_id, worker in sorted(self._workers.items()):
-                if int(device_id) not in normalized_device_ids:
-                    continue
+        handled_device_ids: set[int] = set()
+        for device_id in sorted(normalized_device_ids):
+            worker = self._workers.get(int(device_id))
+            if worker is None or not _worker_is_usable(worker):
+                if worker is not None:
+                    self._logger.warning(
+                        "[ULTRA:%s] sync request found a dead worker; using scheduler fallback",
+                        device_id,
+                    )
+                continue
+            try:
+                commands_handled = True
                 for member_id in sorted(normalized_revoked_ids):
-                    if hasattr(worker, "request_member_revoke"):
-                        worker.request_member_revoke(int(member_id))
-                if hasattr(worker, "request_full_sync") and worker.request_full_sync(reason=reason):
-                    routed_device_ids.add(int(device_id))
-            if routed_device_ids:
-                self._logger.info(
-                    "[ULTRA] routed full refresh to live workers: devices=%d reason=%s",
-                    len(routed_device_ids),
-                    str(reason or "manual"),
+                    commands_handled = (
+                        _worker_request_accepted_or_pending(
+                            worker,
+                            request_method="request_member_revoke",
+                            pending_method="has_pending_member_revoke",
+                            member_id=member_id,
+                        )
+                        and commands_handled
+                    )
+                if normalized_changed_ids is None:
+                    commands_handled = (
+                        _worker_full_sync_accepted_or_pending(
+                            worker,
+                            reason=reason,
+                            revoked_ids=normalized_revoked_ids,
+                        )
+                        and commands_handled
+                    )
+                else:
+                    for member_id in sorted(normalized_changed_ids):
+                        commands_handled = (
+                            _worker_request_accepted_or_pending(
+                                worker,
+                                request_method="request_member_sync",
+                                pending_method="has_pending_member_sync",
+                                member_id=member_id,
+                            )
+                            and commands_handled
+                        )
+                if commands_handled:
+                    handled_device_ids.add(int(device_id))
+                else:
+                    self._logger.warning(
+                        "[ULTRA:%s] worker did not accept the complete sync request; using scheduler fallback",
+                        device_id,
+                    )
+            except Exception as exc:
+                self._logger.warning(
+                    "[ULTRA:%s] worker sync enqueue failed; using scheduler fallback: %s",
+                    device_id,
+                    exc,
                 )
-                remaining_device_ids = set(normalized_device_ids) - routed_device_ids
-                if not remaining_device_ids:
-                    return True
-                normalized_device_ids = remaining_device_ids
-        self._sync_scheduler.request_sync_now(
-            changed_ids=normalized_changed_ids,
-            revoked_ids=normalized_revoked_ids,
-            device_ids=normalized_device_ids,
-            reason=reason,
-        )
-        return True
+
+        unresolved_device_ids = normalized_device_ids - handled_device_ids
+        needs_scheduler = bool(unresolved_device_ids)
+        if broadcast_devices and not normalized_device_ids:
+            needs_scheduler = True
+        scheduled = False
+        if needs_scheduler:
+            fallback_device_ids = None if broadcast_devices else unresolved_device_ids
+            try:
+                self._sync_scheduler.request_sync_now(
+                    changed_ids=normalized_changed_ids,
+                    revoked_ids=normalized_revoked_ids,
+                    device_ids=fallback_device_ids,
+                    reason=reason,
+                )
+                scheduled = True
+            except Exception as exc:
+                self._logger.warning(
+                    "[ULTRA] scheduler fallback rejected sync request: %s",
+                    exc,
+                )
+
+        if handled_device_ids:
+            self._logger.info(
+                "[ULTRA] routed sync to live workers: devices=%d members=%s revoked=%d reason=%s",
+                len(handled_device_ids),
+                "all" if normalized_changed_ids is None else len(normalized_changed_ids),
+                len(normalized_revoked_ids),
+                str(reason or "manual"),
+            )
+        return bool(handled_device_ids or scheduled)

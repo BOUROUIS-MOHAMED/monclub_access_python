@@ -241,6 +241,20 @@ class TestPinHash:
 # --------------------------------------------------------------------------- #
 
 class TestIncrementalFullSync:
+    def test_explicit_revocation_is_never_readded_from_stale_cache(self, monkeypatch, state):
+        w, _ = _worker(
+            monkeypatch,
+            users=[_user(117, "Bob", "1"), _user(118, "Revoked", "2")],
+        )
+
+        assert w.request_full_sync(
+            reason="fast_patch_bundle",
+            revoked_ids={118},
+        ) is True
+        assert w._drain_full_sync_commands(limit=1) == 1
+
+        assert _pins(w._sdk.push_calls[0]) == {"117"}
+
     def test_first_sync_pushes_every_pin_and_records_state(self, monkeypatch, state):
         w, _ = _worker(monkeypatch, users=[_user(117, "Bob", "1"), _user(118, "Alice", "2")])
         _full_sync(w)

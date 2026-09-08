@@ -352,7 +352,10 @@ class TestImmediateAuthoritativeRevoke:
 
         assert drv.delete_calls == []
         assert drv.push_calls == []
-        full_sync.assert_called_once_with(reason="revoke-ownership-missing")
+        full_sync.assert_called_once_with(
+            reason="revoke-ownership-missing",
+            revoked_ids={34439},
+        )
         assert any(
             call.args and call.args[0] == "MEMBER_REVOKE_OWNERSHIP_MISSING"
             for call in telemetry.call_args_list
@@ -372,7 +375,10 @@ class TestImmediateAuthoritativeRevoke:
         assert _revoked_push(drv) is not None
         assert "34439" in fstate.rows
         assert "34439" in tracked_revocation_state
-        full_sync.assert_called_once_with(reason="revoke-failed")
+        full_sync.assert_called_once_with(
+            reason="revoke-failed",
+            revoked_ids={34439},
+        )
 
     def test_atomic_local_cleanup_failure_retains_both_records_and_retries(
             self, monkeypatch, fstate, tracked_revocation_state):
@@ -396,7 +402,10 @@ class TestImmediateAuthoritativeRevoke:
 
         assert "34439" in fstate.rows
         assert "34439" in tracked_revocation_state
-        full_sync.assert_called_once_with(reason="revoke-failed")
+        full_sync.assert_called_once_with(
+            reason="revoke-failed",
+            revoked_ids={34439},
+        )
         assert not any(
             call.args and call.args[0] == "MEMBER_REVOKE_DONE"
             for call in telemetry.call_args_list

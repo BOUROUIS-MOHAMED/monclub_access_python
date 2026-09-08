@@ -162,10 +162,10 @@ def test_ultra_engine_request_sync_now_routes_revocations_first_with_precedence(
     routed: list[tuple[str, int]] = []
     worker = SimpleNamespace(
         request_member_sync=MagicMock(
-            side_effect=lambda member_id: routed.append(("sync", member_id))
+            side_effect=lambda member_id: routed.append(("sync", member_id)) or True
         ),
         request_member_revoke=MagicMock(
-            side_effect=lambda member_id: routed.append(("revoke", member_id))
+            side_effect=lambda member_id: routed.append(("revoke", member_id)) or True
         ),
     )
     scheduler = SimpleNamespace(request_sync_now=MagicMock())
@@ -186,6 +186,194 @@ def test_ultra_engine_request_sync_now_routes_revocations_first_with_precedence(
 
     assert started is True
     assert routed == [("revoke", 13), ("revoke", 17), ("sync", 11)]
+    scheduler.request_sync_now.assert_not_called()
+
+
+def test_ultra_engine_request_sync_now_falls_back_for_registered_dead_worker():
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(
+        is_alive=lambda: False,
+        request_member_sync=MagicMock(return_value=True),
+        request_member_revoke=MagicMock(return_value=True),
+    )
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+    assert started is True
+    worker.request_member_revoke.assert_not_called()
+    worker.request_member_sync.assert_not_called()
+    scheduler.request_sync_now.assert_called_once_with(
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+
+def test_ultra_engine_request_sync_now_falls_back_only_for_unmatched_device_ids():
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(
+        request_member_sync=MagicMock(return_value=True),
+        request_member_revoke=MagicMock(return_value=True),
+    )
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={5, 6},
+        reason="fast_patch_bundle",
+    )
+
+    assert started is True
+    worker.request_member_revoke.assert_called_once_with(17)
+    worker.request_member_sync.assert_called_once_with(11)
+    scheduler.request_sync_now.assert_called_once_with(
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={6},
+        reason="fast_patch_bundle",
+    )
+
+
+def test_ultra_engine_request_sync_now_preserves_broadcast_fallback_without_workers():
+    import app.core.ultra_engine as ultra_module
+
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids=None,
+        reason="fast_patch_bundle",
+    )
+
+    assert started is True
+    scheduler.request_sync_now.assert_called_once_with(
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids=None,
+        reason="fast_patch_bundle",
+    )
+
+
+def test_ultra_engine_request_sync_now_preserves_broadcast_for_partial_workers():
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(request_member_revoke=MagicMock(return_value=True))
+    scheduler = SimpleNamespace(
+        _devices=[{"id": 5}, {"id": 6}],
+        request_sync_now=MagicMock(),
+    )
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    assert ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids=None,
+        reason="fast_patch_bundle",
+    ) is True
+
+    worker.request_member_revoke.assert_called_once_with(17)
+    scheduler.request_sync_now.assert_called_once_with(
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids=None,
+        reason="fast_patch_bundle",
+    )
+
+
+def test_ultra_engine_request_sync_now_falls_back_when_revoke_enqueue_raises():
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(
+        request_member_sync=MagicMock(return_value=True),
+        request_member_revoke=MagicMock(side_effect=RuntimeError("queue unavailable")),
+    )
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+    assert started is True
+    scheduler.request_sync_now.assert_called_once_with(
+        changed_ids={11},
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+    engine._logger.warning.assert_called()
+
+
+def test_ultra_engine_request_sync_now_accepts_revocation_already_safely_pending():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker.is_alive = lambda: True
+    assert worker.request_member_revoke(17) is True
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+    assert started is True
     scheduler.request_sync_now.assert_not_called()
 
 
@@ -272,6 +460,42 @@ def test_ultra_engine_request_sync_now_routes_full_refresh_to_live_workers():
 
     assert started is True
     worker.request_full_sync.assert_called_once_with(reason="device_refresh")
+    scheduler.request_sync_now.assert_not_called()
+
+
+def test_ultra_engine_full_refresh_routes_revocation_before_filtered_full_sync():
+    import app.core.ultra_engine as ultra_module
+
+    routed: list[tuple[str, object]] = []
+    worker = SimpleNamespace(
+        request_member_revoke=MagicMock(
+            side_effect=lambda member_id: routed.append(("revoke", member_id)) or True
+        ),
+        request_full_sync=MagicMock(
+            side_effect=lambda **kwargs: routed.append(("full", kwargs)) or True
+        ),
+    )
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    started = ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=None,
+        revoked_ids={17},
+        device_ids={5},
+        reason="device_refresh",
+    )
+
+    assert started is True
+    assert routed == [
+        ("revoke", 17),
+        ("full", {"reason": "device_refresh", "revoked_ids": {17}}),
+    ]
     scheduler.request_sync_now.assert_not_called()
 
 
@@ -462,6 +686,96 @@ def test_ultra_sync_scheduler_sync_all_routes_revocations_before_ordinary_syncs(
     assert sync_device_calls == []
 
 
+def test_ultra_sync_scheduler_no_worker_filters_stale_revoked_member_and_bypasses_hash_skip(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    seen_fingerprint_users: list[list[int]] = []
+    run_calls: list[tuple[list[int], set[int] | None]] = []
+
+    class _FakeDeviceSyncEngine:
+        def __init__(self, cfg, logger):
+            self.cfg = cfg
+            self.logger = logger
+
+        def build_device_sync_fingerprint(self, *, device, users, local_fp_index=None, detail_out=None):
+            seen_fingerprint_users.append(
+                [int(user["activeMembershipId"]) for user in users]
+            )
+            return ("same-hash", len(users))
+
+        def run_one_device_blocking(
+            self,
+            *,
+            cache,
+            device,
+            source="timer",
+            changed_ids=None,
+            sync_run_id=None,
+        ):
+            run_calls.append((
+                [int(user["activeMembershipId"]) for user in cache.users],
+                None if changed_ids is None else set(changed_ids),
+            ))
+            return True
+
+    scheduler = ultra_module.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    scheduler._devices = [
+        {"id": 5, "name": "Door 1", "accessDataMode": "ULTRA", "_settings": {}},
+    ]
+    scheduler._last_hash[5] = "same-hash"
+    monkeypatch.setattr(
+        ultra_module,
+        "load_sync_cache",
+        lambda: SimpleNamespace(
+            users=[{"activeMembershipId": 11}, {"activeMembershipId": 17}],
+            devices=[],
+        ),
+    )
+    monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _FakeDeviceSyncEngine)
+
+    scheduler._sync_all(
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+    assert seen_fingerprint_users == [[11]]
+    assert run_calls == [([11], set())]
+
+
+def test_ultra_sync_scheduler_preserves_standalone_revocation_until_worker_replacement(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    scheduler = ultra_module.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    scheduler._devices = [
+        {
+            "id": 5,
+            "name": "Standalone Door",
+            "accessDataMode": "ULTRA",
+            "deviceProtocol": "ZK_STANDALONE",
+            "_settings": {},
+        },
+    ]
+    sync_device = MagicMock()
+    monkeypatch.setattr(scheduler, "_sync_device", sync_device)
+
+    scheduler._sync_all(
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    )
+
+    sync_device.assert_not_called()
+    assert scheduler._drain_pending_sync_request() == (
+        set(),
+        {17},
+        {5},
+        "fast_patch_bundle",
+    )
+
+
 def test_ultra_sync_scheduler_sync_all_routes_full_sync_to_live_worker(monkeypatch):
     import app.core.ultra_engine as ultra_module
 
@@ -614,7 +928,10 @@ def test_failed_standalone_revoke_requests_full_reconcile():
     worker.request_member_revoke(41)
 
     assert worker._drain_member_sync_commands(limit=1) == 1
-    worker.request_full_sync.assert_called_once_with(reason="revoke-handler-failed")
+    worker.request_full_sync.assert_called_once_with(
+        reason="revoke-handler-failed",
+        revoked_ids={41},
+    )
     assert list(worker._pending_member_syncs) == []
     assert worker._pending_member_revoke_ids == set()
 
@@ -719,6 +1036,30 @@ def test_ultra_worker_drains_full_sync_commands_using_live_connection(monkeypatc
     assert full_sync_calls == [
         ("raw-sdk", "device_refresh", [{"activeMembershipId": 11}]),
     ]
+
+
+def test_pending_full_sync_is_upgraded_with_revocation_without_stale_fingerprint():
+    import app.core.ultra_engine as ultra_module
+
+    worker = ultra_module.UltraDeviceWorker(
+        device={"id": 5, "name": "Door 1"},
+        settings={},
+        popup_q=queue.Queue(),
+        history_q=queue.Queue(),
+        stop_event=threading.Event(),
+    )
+
+    assert worker.request_full_sync(
+        reason="timer",
+        fingerprint_hash="stale-roster-hash",
+    ) is True
+    assert worker.request_full_sync(
+        reason="fast_patch_bundle",
+        revoked_ids={17},
+    ) is False
+
+    assert worker.has_pending_full_sync(revoked_ids={17}) is True
+    assert worker._pending_full_sync_request["fingerprint_hash"] is None
 
 
 def test_ultra_device_worker_update_device_swaps_dict_in_place():
