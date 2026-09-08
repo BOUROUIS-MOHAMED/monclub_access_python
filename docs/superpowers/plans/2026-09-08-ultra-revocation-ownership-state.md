@@ -115,7 +115,9 @@ Add `excluded_ids` to pending requests and a second ACTIVE/RETRY phase map for
 exclusion ownership. Requests inherit all active/retry exclusions. Exact
 explicit duplicates remain deduped, overlap `{A, B}` queues physical `{B}` with
 exclusions `{A, B}`, and an ordinary full queued during active A carries
-exclusion `{A}`. Member downgrade checks include pending and phased exclusions.
+exclusion `{A}`. A targeted revoke accepted after an ordinary full is already
+pending atomically merges its ID into that request's exclusions. Member
+downgrade checks include pending and phased exclusions.
 
 - [ ] **Step 5: Atomically adopt equivalent targeted commands at full drain**
 

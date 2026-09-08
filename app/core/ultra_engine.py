@@ -1083,6 +1083,13 @@ class UltraDeviceWorker(threading.Thread):
                 if normalized_member_id not in self._pending_member_sync_ids:
                     self._pending_member_sync_ids.add(normalized_member_id)
                     self._pending_member_syncs.append(normalized_member_id)
+                if self._pending_full_sync_request is not None:
+                    pending_revoked_ids = self._pending_full_sync_request.setdefault(
+                        "revoked_ids", set()
+                    )
+                    self._pending_full_sync_request.setdefault(
+                        "excluded_ids", set(pending_revoked_ids)
+                    ).add(normalized_member_id)
             self._wake_evt.set()
         return is_new_revocation
 
@@ -2862,6 +2869,9 @@ class UltraDeviceWorker(threading.Thread):
                             request_revoked_ids
                             | retry_revoked_ids
                             | retry_excluded_ids
+                        )
+                        request_revoked_ids.update(
+                            request_excluded_ids & self._pending_member_revoke_ids
                         )
                         for member_id in retry_revoked_ids:
                             phases.pop(member_id, None)

@@ -31,7 +31,9 @@ both `revoked_ids` (physical work) and `excluded_ids` (snapshot filtering).
 All transitions involving both member and full-sync state acquire
 `_member_sync_lock` before `_full_sync_lock`.
 
-1. When a full request drains, it moves physical `revoked_ids` and roster
+1. A newly accepted targeted revocation atomically adds its ID to any pending
+   full request's `excluded_ids`. When a full request drains, it moves physical
+   `revoked_ids` and roster
    `excluded_ids` to their respective `ACTIVE` phases. It atomically adopts
    matching targeted revocations from the member queue and any retained
    physical/exclusion `RETRY` work. Unrelated member work remains in order.

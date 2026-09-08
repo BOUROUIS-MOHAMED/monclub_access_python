@@ -1140,7 +1140,12 @@ def test_pullsdk_full_sync_executes_adopted_revoke_before_filtered_roster(monkey
     assert worker._on_full_sync_finished.call_args.kwargs["ok"] is True
 
 
-def _blocked_pull_full_sync_worker(monkeypatch, outcomes: list[bool]):
+def _blocked_pull_full_sync_worker(
+    monkeypatch,
+    outcomes: list[bool],
+    *,
+    block_first: bool = True,
+):
     import app.core.ultra_engine as ultra_module
 
     events: list[tuple[str, object]] = []
@@ -1165,7 +1170,7 @@ def _blocked_pull_full_sync_worker(monkeypatch, outcomes: list[bool]):
                 "full",
                 {int(user["activeMembershipId"]) for user in cache.users},
             ))
-            if full_index == 1:
+            if block_first and full_index == 1:
                 entered.set()
                 assert release.wait(1.0)
             return outcomes[full_index - 1]
@@ -1300,6 +1305,41 @@ def test_failed_dependent_full_retains_exclusion_until_eventual_success(monkeypa
     assert worker._confirmed_member_revoke_ids == set()
     assert worker._full_sync_exclusion_phase == {}
     assert worker.request_member_sync(41) is True
+
+
+def test_targeted_revoke_updates_older_full_before_normal_member_first_drain(monkeypatch):
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch, [True], block_first=False,
+    )
+    assert worker.request_full_sync(reason="timer") is True
+
+    assert worker.request_member_revoke(41) is True
+
+    assert worker._pending_full_sync_request["revoked_ids"] == set()
+    assert worker._pending_full_sync_request["excluded_ids"] == {41}
+    assert worker._drain_member_sync_commands(limit=1) == 1
+    assert worker._drain_full_sync_commands(limit=1) == 1
+    assert events == [
+        ("targeted", 41),
+        ("full", {43, 99}),
+    ]
+
+
+def test_older_full_adopts_queued_targeted_revoke_when_full_drains_first(monkeypatch):
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch, [True], block_first=False,
+    )
+    assert worker.request_full_sync(reason="timer") is True
+    assert worker.request_member_revoke(41) is True
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+
+    assert events == [
+        ("targeted", 41),
+        ("full", {43, 99}),
+    ]
+    assert worker._drain_member_sync_commands(limit=1) == 0
+    assert worker._pending_member_revoke_ids == set()
 
 
 def test_standalone_member_command_drain_routes_captured_action():
