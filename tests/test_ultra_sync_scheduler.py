@@ -464,7 +464,10 @@ def test_ultra_engine_request_sync_now_routes_full_refresh_to_live_workers():
     )
 
     assert started is True
-    worker.request_full_sync.assert_called_once_with(reason="device_refresh")
+    worker.request_full_sync.assert_called_once_with(
+        reason="device_refresh",
+        require_full_refresh=True,
+    )
     scheduler.request_sync_now.assert_not_called()
 
 
@@ -499,7 +502,14 @@ def test_ultra_engine_full_refresh_routes_revocation_before_filtered_full_sync()
     assert started is True
     assert routed == [
         ("revoke", 17),
-        ("full", {"reason": "device_refresh", "revoked_ids": {17}}),
+        (
+            "full",
+            {
+                "reason": "device_refresh",
+                "revoked_ids": {17},
+                "require_full_refresh": True,
+            },
+        ),
     ]
     scheduler.request_sync_now.assert_not_called()
 
@@ -856,6 +866,7 @@ def test_ultra_sync_scheduler_sync_all_routes_full_sync_to_live_worker(monkeypat
     worker.request_full_sync.assert_called_once_with(
         reason="startup",
         fingerprint_hash="hash-live-worker",
+        require_full_refresh=True,
     )
     worker.request_member_sync.assert_not_called()
     assert sync_device_calls == []
@@ -1343,8 +1354,7 @@ def test_older_full_adopts_queued_targeted_revoke_when_full_drains_first(monkeyp
     assert worker._pending_member_revoke_ids == set()
 
 
-def test_blocked_targeted_revoke_keeps_active_ownership_and_rejects_ordinary_sync(
-        monkeypatch):
+def _blocked_pull_targeted_revoke_worker(monkeypatch):
     import app.core.ultra_engine as ultra_module
 
     events: list[tuple[str, object]] = []
@@ -1391,6 +1401,12 @@ def test_blocked_targeted_revoke_keeps_active_ownership_and_rejects_ordinary_syn
         ),
     )
     monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _FakeDeviceSyncEngine)
+    return worker, events, entered, release
+
+
+def test_required_full_refresh_during_active_targeted_revoke_is_exclusion_only(
+        monkeypatch):
+    worker, events, entered, release = _blocked_pull_targeted_revoke_worker(monkeypatch)
 
     assert worker.request_member_revoke(41) is True
     thread = threading.Thread(target=worker._drain_member_sync_commands, kwargs={"limit": 1})
@@ -1402,9 +1418,19 @@ def test_blocked_targeted_revoke_keeps_active_ownership_and_rejects_ordinary_syn
         assert worker.has_pending_member_revoke(41) is True
         assert worker._active_member_revoke_ids == {41}
         assert list(worker._pending_member_syncs) == []
-        assert worker.request_full_sync(reason="timer") is True
+        assert worker.request_full_sync(
+            reason="retry",
+            revoked_ids={41},
+        ) is False
+        assert worker._pending_full_sync_request is None
+        assert worker.request_full_sync(
+            reason="device_refresh",
+            revoked_ids={41},
+            require_full_refresh=True,
+        ) is True
         assert worker._pending_full_sync_request["revoked_ids"] == set()
         assert worker._pending_full_sync_request["excluded_ids"] == {41}
+        assert worker._pending_full_sync_request["require_full_refresh"] is True
     finally:
         release.set()
         thread.join(timeout=1.0)
@@ -1417,6 +1443,65 @@ def test_blocked_targeted_revoke_keeps_active_ownership_and_rejects_ordinary_syn
         ("targeted", 41),
         ("full", {43}),
     ]
+
+
+def test_engine_preserves_full_refresh_when_targeted_revoke_becomes_active(monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    worker, events, entered, release = _blocked_pull_targeted_revoke_worker(monkeypatch)
+    request_member_revoke = worker.request_member_revoke
+    drain_threads: list[threading.Thread] = []
+
+    def request_and_activate(member_id):
+        accepted = request_member_revoke(member_id)
+        thread = threading.Thread(
+            target=worker._drain_member_sync_commands,
+            kwargs={"limit": 1},
+        )
+        drain_threads.append(thread)
+        thread.start()
+        assert entered.wait(1.0)
+        return accepted
+
+    worker.request_member_revoke = request_and_activate
+    worker.is_alive = lambda: True
+    scheduler = SimpleNamespace(
+        _devices=[worker._device],
+        request_sync_now=MagicMock(),
+    )
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    try:
+        assert ultra_module.UltraEngine.request_sync_now(
+            engine,
+            changed_ids=None,
+            revoked_ids={41},
+            device_ids={5},
+            reason="device_refresh",
+        ) is True
+        assert worker._active_member_revoke_ids == {41}
+        assert worker._pending_full_sync_request["revoked_ids"] == set()
+        assert worker._pending_full_sync_request["excluded_ids"] == {41}
+        assert worker._pending_full_sync_request["require_full_refresh"] is True
+        scheduler.request_sync_now.assert_not_called()
+    finally:
+        release.set()
+        for thread in drain_threads:
+            thread.join(timeout=1.0)
+            assert not thread.is_alive()
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+    assert events == [
+        ("targeted", 41),
+        ("full", {43}),
+    ]
+    assert worker.has_pending_member_revoke(41) is False
+    assert worker._confirmed_member_revoke_ids == set()
 
 
 def test_revoke_first_full_second_adopts_targeted_before_member_drain(monkeypatch):

@@ -77,6 +77,7 @@ def _worker_full_sync_accepted_or_pending(
     reason: str,
     fingerprint_hash: str | None = None,
     revoked_ids: set[int] | None = None,
+    require_full_refresh: bool = False,
 ) -> bool:
     request = getattr(worker, "request_full_sync", None)
     if not callable(request):
@@ -86,14 +87,20 @@ def _worker_full_sync_accepted_or_pending(
         kwargs["fingerprint_hash"] = fingerprint_hash
     if revoked_ids:
         kwargs["revoked_ids"] = set(revoked_ids)
+    if require_full_refresh:
+        kwargs["require_full_refresh"] = True
     accepted = bool(request(**kwargs))
     if accepted:
         return True
     pending = getattr(worker, "has_pending_full_sync", None)
-    return bool(
-        callable(pending)
-        and pending(revoked_ids=set(revoked_ids or set()))
-    )
+    if not callable(pending):
+        return False
+    pending_kwargs: Dict[str, Any] = {
+        "revoked_ids": set(revoked_ids or set()),
+    }
+    if require_full_refresh:
+        pending_kwargs["require_full_refresh"] = True
+    return bool(pending(**pending_kwargs))
 
 
 def _sync_cache_without_revoked_ids(cache: Any, revoked_ids: set[int] | None) -> Any:
@@ -1234,6 +1241,7 @@ class UltraDeviceWorker(threading.Thread):
         reason: str = "manual",
         fingerprint_hash: str | None = None,
         revoked_ids: set[int] | None = None,
+        require_full_refresh: bool = False,
     ) -> bool:
         normalized_reason = str(reason or "manual").strip() or "manual"
         normalized_revoked_ids = {
@@ -1304,6 +1312,8 @@ class UltraDeviceWorker(threading.Thread):
                     pending_exclusions.update(
                         inherited_excluded_ids | queued_revoked_ids
                     )
+                    if require_full_refresh:
+                        pending["require_full_refresh"] = True
                     for member_id in retry_revoked_ids:
                         phases.pop(member_id, None)
                     for member_id in retry_excluded_ids:
@@ -1330,6 +1340,7 @@ class UltraDeviceWorker(threading.Thread):
                     and not queued_revoked_ids
                     and not retry_revoked_ids
                     and not retry_excluded_ids
+                    and not require_full_refresh
                 ):
                     return False
                 for member_id in retry_revoked_ids:
@@ -1341,6 +1352,7 @@ class UltraDeviceWorker(threading.Thread):
                     "fingerprint_hash": str(fingerprint_hash or "").strip() or None,
                     "revoked_ids": queued_revoked_ids,
                     "excluded_ids": inherited_excluded_ids | queued_revoked_ids,
+                    "require_full_refresh": bool(require_full_refresh),
                 }
                 if queued_targeted_revoked_ids:
                     self._pending_member_syncs = deque(
@@ -1356,7 +1368,12 @@ class UltraDeviceWorker(threading.Thread):
                     )
         return True
 
-    def has_pending_full_sync(self, *, revoked_ids: set[int] | None = None) -> bool:
+    def has_pending_full_sync(
+        self,
+        *,
+        revoked_ids: set[int] | None = None,
+        require_full_refresh: bool = False,
+    ) -> bool:
         normalized_revoked_ids = set(revoked_ids or set())
         with self._full_sync_lock:
             phases = self._full_sync_revocation_phases_locked()
@@ -1366,6 +1383,8 @@ class UltraDeviceWorker(threading.Thread):
                 and not phases
                 and not exclusion_phases
             ):
+                return False
+            if require_full_refresh and self._pending_full_sync_request is None:
                 return False
             pending_revoked_ids = set(
                 (self._pending_full_sync_request or {}).get("revoked_ids") or set()
@@ -5401,6 +5420,7 @@ class UltraSyncScheduler:
                                         reason=reason,
                                         fingerprint_hash=current_hash,
                                         revoked_ids=normalized_revoked_ids,
+                                        require_full_refresh=True,
                                     )
                                     target_handled = commands_handled and full_sync_handled
                                     routed = target_handled
@@ -6096,6 +6116,7 @@ class UltraEngine:
                             worker,
                             reason=reason,
                             revoked_ids=normalized_revoked_ids,
+                            require_full_refresh=True,
                         )
                         and commands_handled
                     )
