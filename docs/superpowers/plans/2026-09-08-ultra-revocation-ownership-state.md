@@ -13,6 +13,9 @@ cleared when no pending or active full exclusion depends on it.
 An explicit `require_full_refresh` flag is propagated from engine/scheduler
 requests whose `changed_ids` is `None`, so a required roster refresh cannot be
 deduplicated as if it were only a repeated revoke delivery.
+The worker full-sync boolean is an atomic acceptance result: newly queued,
+merged, and already safely covered requests all return `True`. Routing does not
+perform a separate pending-state check after releasing the worker locks.
 
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
@@ -47,7 +50,7 @@ pending request. In a separate test, request `{41, 43}` and assert only 43 is in
 the new pending request while `has_pending_full_sync(revoked_ids={41, 43})` is true.
 
 ```python
-assert worker.request_full_sync(revoked_ids={41}) is False
+assert worker.request_full_sync(revoked_ids={41}) is True
 assert worker._pending_full_sync_request is None
 
 assert worker.request_full_sync(revoked_ids={41, 43}) is True
@@ -105,6 +108,15 @@ python -m pytest tests/test_standalone_revoked_pin_removal.py -k "handoff" -q
 
 Expected: failures showing ordinary acceptance after handoff, duplicate pending
 full requests, leftover targeted revokes, and missing PullSDK targeted deletion.
+
+- [ ] **Step 8: Add an atomic-acceptance TOCTOU regression**
+
+Force a pending full request to drain and complete immediately after a second
+request merges into it. Assert the worker request still returns handled, the
+engine does not fall back to the scheduler, and physical revocation executes
+exactly once. Then change `request_full_sync` to return acceptance/safe coverage
+for new, merged, and duplicate-owned work, and remove the helper's separate
+pending-state query.
 
 ### Task 2: Implement one per-ID ownership transition
 

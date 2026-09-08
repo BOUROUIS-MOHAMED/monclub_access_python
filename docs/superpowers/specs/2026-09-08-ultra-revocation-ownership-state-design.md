@@ -33,6 +33,10 @@ The engine and scheduler set it only when their authoritative `changed_ids`
 payload is `None`. This intent is separate from `revoked_ids`: the latter says
 which members require physical removal, while the former says a roster refresh
 must still execute even when every physical revocation is already owned.
+`request_full_sync()` returns an acceptance result, not a queue-newness result:
+`True` means the request was newly queued, merged into pending work, or already
+covered by active/retry ownership. A caller therefore never needs a second
+`has_pending_full_sync()` check after the request lock is released.
 
 ## Transitions
 
@@ -67,7 +71,8 @@ All transitions involving both member and full-sync state acquire
    `{A, B}` while `A` is active queues physical `{B}` but exclusions `{A, B}`.
    An ordinary full refresh queued during active `A` carries exclusion `{A}`.
 6. A pure revoke-only duplicate for targeted `ACTIVE` member `A` remains
-   deduplicated. A request with `require_full_refresh=True` instead queues one
+   deduplicated and returns handled without creating queue state. A request with
+   `require_full_refresh=True` instead queues one
    exclusion-only full request for `A`, because the independently requested
    roster refresh must not be mistaken for duplicate physical work. It later
    filters `A` from stale cache without issuing a second removal.
@@ -101,5 +106,7 @@ Deterministic regressions cover:
 - targeted-only success followed by re-enrolment and a new revoke generation;
 - an engine full-refresh-plus-revoke interleaving while targeted removal is
   active, proving the exclusion-only full remains queued and executes;
+- drain/completion immediately after a merge, proving atomic acceptance avoids
+  a scheduler fallback or second physical deletion;
 - success cleanup, failure retry ownership, lock-order-safe concurrency, and all
   existing standalone, scheduler, and PullSDK behavior.
