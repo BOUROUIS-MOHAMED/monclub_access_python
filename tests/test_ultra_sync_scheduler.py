@@ -18,6 +18,7 @@ def _member_command_worker(ultra_module):
     worker._confirmed_member_revoke_ids = set()
     worker._full_sync_lock = threading.Lock()
     worker._pending_full_sync_request = None
+    worker._active_full_sync_revoked_ids = set()
     worker._wake_evt = threading.Event()
     return worker
 
@@ -938,6 +939,42 @@ def test_member_sync_cannot_downgrade_confirmed_revoke_while_filtered_full_sync_
     assert worker.request_member_sync(41) is False
     assert worker.has_pending_member_revoke(41) is True
     assert list(worker._pending_member_syncs) == []
+
+
+def test_member_sync_cannot_downgrade_revoke_after_full_sync_request_is_popped():
+    import app.core.ultra_engine as ultra_module
+
+    worker = _member_command_worker(ultra_module)
+    worker._sdk = SimpleNamespace(owns_event_source=True)
+    worker._connected = True
+    worker._confirmed_member_revoke_ids.add(41)
+    observed: dict[str, object] = {}
+
+    def active_full_sync(**kwargs):
+        observed["pending_request"] = worker._pending_full_sync_request
+        observed["active_revokes"] = set(worker._active_full_sync_revoked_ids)
+        observed["ordinary_accepted"] = worker.request_member_sync(41)
+        observed["revoke_pending"] = worker.has_pending_member_revoke(41)
+        observed["confirmed_revokes"] = set(worker._confirmed_member_revoke_ids)
+        observed["ordinary_queue"] = list(worker._pending_member_syncs)
+        worker._clear_active_full_sync_revokes({41})
+
+    worker._run_standalone_full_sync = active_full_sync
+    assert worker.request_full_sync(
+        reason="fast_patch_bundle",
+        revoked_ids={41},
+    ) is True
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+
+    assert observed == {
+        "pending_request": None,
+        "active_revokes": {41},
+        "ordinary_accepted": False,
+        "revoke_pending": True,
+        "confirmed_revokes": {41},
+        "ordinary_queue": [],
+    }
 
 
 def test_standalone_member_command_drain_routes_captured_action():
