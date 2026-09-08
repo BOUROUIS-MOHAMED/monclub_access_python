@@ -25,33 +25,45 @@ Each map uses the same phases:
 `_confirmed_member_revoke_ids` remains evidence that physical removal already
 succeeded. It is not the owner of retry scheduling. Pending full requests carry
 both `revoked_ids` (physical work) and `excluded_ids` (snapshot filtering).
+Targeted revocations additionally use `_active_member_revoke_ids` while their
+device I/O is executing. This set is guarded by `_member_sync_lock`.
 
 ## Transitions
 
 All transitions involving both member and full-sync state acquire
 `_member_sync_lock` before `_full_sync_lock`.
 
-1. A newly accepted targeted revocation atomically adds its ID to any pending
-   full request's `excluded_ids`. When a full request drains, it moves physical
-   `revoked_ids` and roster
-   `excluded_ids` to their respective `ACTIVE` phases. It atomically adopts
+1. Targeted drain atomically moves an ID from the member queue to targeted
+   `ACTIVE` ownership before device I/O. Success clears `ACTIVE` and retains
+   confirmation proof only while a real pending/active full exclusion depends
+   on it. Failure atomically restores queued ownership before full handoff.
+2. A newly accepted targeted revocation atomically adds its ID to any pending
+   full request's `excluded_ids`. A newly requested full sync adopts queued
+   targeted revocations as physical plus exclusion work, while targeted
+   `ACTIVE` IDs are exclusion-only dependencies. When a full request drains, it
+   moves physical `revoked_ids` and roster `excluded_ids` to their respective
+   `ACTIVE` phases. It atomically adopts
    matching targeted revocations from the member queue and any retained
    physical/exclusion `RETRY` work. Unrelated member work remains in order.
-2. A successful full sync removes that attempt's physical and exclusion IDs
+3. A successful full sync removes that attempt's physical and exclusion IDs
    from `ACTIVE` and clears physical confirmation evidence after completion is
    finalized. A queued dependent request continues protecting the same ID via
    its pending `excluded_ids` until that request drains and completes.
-3. A failed or exceptional full sync atomically moves its physical and exclusion
+4. A failed or exceptional full sync atomically moves its physical and exclusion
    IDs from `ACTIVE` to `RETRY` before the synchronous scheduler callback,
    without holding worker locks during that callback. Ordinary syncs are
    rejected throughout the callback-to-redelivery window, while concurrent
    redelivery can adopt `RETRY`. A missing or failing callback still leaves
    recoverable `RETRY` ownership and does not wake a loop.
-4. Scheduler redelivery or a later full request transfers `RETRY` ownership
+5. Scheduler redelivery or a later full request transfers `RETRY` ownership
    atomically into a pending full request. Exact explicit revoke duplicates
    already covered by `ACTIVE` do not create a second full request. An overlap
    `{A, B}` while `A` is active queues physical `{B}` but exclusions `{A, B}`.
    An ordinary full refresh queued during active `A` carries exclusion `{A}`.
+
+Bare confirmation with no queued, active, retry, or exclusion owner is stale
+generation evidence. It is cleared defensively and never suppresses a later
+authoritative revoke.
 
 ## Protocol behavior
 
@@ -73,5 +85,8 @@ Deterministic regressions cover:
 - overlapping and ordinary dependent full syncs filtering active revocations
   across the same stale cache snapshot without duplicate physical deletion;
 - dependent-full failure retaining exclusion ownership through eventual success;
+- blocked targeted I/O retaining visible ownership and rejecting ordinary sync;
+- revoke-first/full-second execution in both drain orders;
+- targeted-only success followed by re-enrolment and a new revoke generation;
 - success cleanup, failure retry ownership, lock-order-safe concurrency, and all
   existing standalone, scheduler, and PullSDK behavior.

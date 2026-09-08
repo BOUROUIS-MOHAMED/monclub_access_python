@@ -6,6 +6,11 @@
 
 **Architecture:** Keep physical revocation and stale-roster exclusion as separate lock-guarded per-ID phase maps containing `ACTIVE` and `RETRY`. Pending full requests carry `revoked_ids` for destructive work and `excluded_ids` for cache filtering. Full-drain atomically transfers matching targeted queue entries and both retry kinds into `ACTIVE` under the member-then-full lock order; success removes that attempt's ownership, while every failure moves it to `RETRY`.
 
+Targeted member revokes have their own lock-guarded ACTIVE set during device I/O.
+Full requests adopt queued targeted work physically and inherit in-flight
+targeted work as exclusion-only. Confirmation proof is generation-scoped and is
+cleared when no pending or active full exclusion depends on it.
+
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
 ---
@@ -70,7 +75,15 @@ Assert both dependent full rosters exclude A, physical A executes exactly once,
 and the overlap physically revokes only B. Fail a dependent full once and assert
 its exclusion remains protected/retryable until a later success clears it.
 
-- [ ] **Step 5: Run the new tests and verify RED**
+- [ ] **Step 5: Add targeted lifecycle regressions**
+
+Block targeted device I/O and assert ordinary sync cannot overtake the active
+revocation. Exercise revoke-first/full-second with member-first and full-first
+drain calls, proving a single physical removal and a filtered stale roster.
+Finally, complete a targeted-only revoke, perform an ordinary full re-enrolment,
+and prove a second authoritative generation executes another physical removal.
+
+- [ ] **Step 6: Run the new tests and verify RED**
 
 Run:
 
@@ -128,7 +141,16 @@ sets. Preserve unrelated revokes and ordinary syncs in their original order.
 Move request exclusions to their own `ACTIVE` map and adopt both physical and
 exclusion `RETRY` IDs before the request is popped.
 
-- [ ] **Step 6: Centralize completion transitions**
+- [ ] **Step 6: Protect targeted device I/O and scope confirmation**
+
+Add `_active_member_revoke_ids` under `_member_sync_lock`. Member drain moves
+queued revokes to ACTIVE atomically, keeps ACTIVE through I/O, and on failure
+restores queue ownership before requesting a full handoff. On success, clear
+ACTIVE and keep confirmation only when pending/full exclusion state depends on
+it. Full requests adopt queued targeted revokes as physical+exclusion and add
+targeted ACTIVE IDs as exclusion-only. Ignore and clear bare stale confirmation.
+
+- [ ] **Step 7: Centralize completion transitions**
 
 Add one helper which, under the member-then-full lock order, removes `ACTIVE`
 entries on success or changes them to `RETRY` on failure. Move failures to
@@ -138,7 +160,7 @@ completion callback. Apply this ordering to standalone missing-cache/normal and
 PullSDK missing-cache/normal/exception exits. Confirmation evidence is cleared
 only on successful completion.
 
-- [ ] **Step 7: Confirm adopted PullSDK revocations before full roster push**
+- [ ] **Step 8: Confirm adopted PullSDK revocations before full roster push**
 
 Before `run_one_device_on_connected_sdk`, call
 `sync_member_on_connected_sdk` for each unconfirmed active revoked ID in sorted
@@ -146,7 +168,7 @@ order. Mark successful calls confirmed. Filter every `excluded_id` from the full
 cache snapshot, but never physically delete an exclusion-only dependency. Keep
 the full result unsuccessful if any physical targeted deletion is unconfirmed.
 
-- [ ] **Step 8: Run new tests and focused suites to verify GREEN**
+- [ ] **Step 9: Run new tests and focused suites to verify GREEN**
 
 Run:
 
