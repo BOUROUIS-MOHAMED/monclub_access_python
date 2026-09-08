@@ -110,10 +110,12 @@ sets. Preserve unrelated revokes and ordinary syncs in their original order.
 
 - [ ] **Step 5: Centralize completion transitions**
 
-Add one helper which, under `_full_sync_lock`, removes `ACTIVE` entries on success
-or changes them to `RETRY` on failure. Call it from standalone missing-cache,
-normal, PullSDK missing-cache, normal, and exception exits after notification,
-without holding either lock during callbacks. Confirmation evidence is cleared
+Add one helper which, under the member-then-full lock order, removes `ACTIVE`
+entries on success or changes them to `RETRY` on failure. Move failures to
+`RETRY` before notification; then invoke callbacks without either worker lock so
+concurrent scheduler redelivery can adopt `RETRY`. Finalize success after its
+completion callback. Apply this ordering to standalone missing-cache/normal and
+PullSDK missing-cache/normal/exception exits. Confirmation evidence is cleared
 only on successful completion.
 
 - [ ] **Step 6: Confirm adopted PullSDK revocations before full roster push**

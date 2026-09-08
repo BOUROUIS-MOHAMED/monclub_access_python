@@ -31,10 +31,12 @@ All transitions involving both member and full-sync state acquire
    work remains in order.
 2. A successful full sync removes the IDs from `ACTIVE` and clears their
    confirmation evidence after completion is finalized.
-3. A failed or exceptional full sync moves the IDs from `ACTIVE` to `RETRY`.
-   This happens after the synchronous scheduler callback, so ordinary syncs are
-   rejected throughout the callback-to-redelivery window. A missing or failing
-   callback still leaves recoverable `RETRY` ownership and does not wake a loop.
+3. A failed or exceptional full sync atomically moves the IDs from `ACTIVE` to
+   `RETRY` before the synchronous scheduler callback, without holding worker
+   locks during that callback. Ordinary syncs are rejected throughout the
+   callback-to-redelivery window, while concurrent redelivery can adopt `RETRY`.
+   A missing or failing callback still leaves recoverable `RETRY` ownership and
+   does not wake a loop.
 4. Scheduler redelivery transfers `RETRY` ownership atomically into the targeted
    queue and/or pending full request. Exact duplicates already covered by
    `ACTIVE` do not create a second full request. An overlapping request queues
