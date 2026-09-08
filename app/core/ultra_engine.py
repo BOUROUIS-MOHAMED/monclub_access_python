@@ -1455,6 +1455,15 @@ class UltraDeviceWorker(threading.Thread):
             return set(attempted)
 
         ok = result.get("ok")
+        if type(ok) is not bool:
+            return set(attempted)
+        if ok:
+            for field in ("failed", "templates_failed", "chunks_wedged"):
+                if field not in result:
+                    continue
+                value = result[field]
+                if type(value) is not int or value != 0:
+                    return set(attempted)
         reported = result.get("failed_pins")
         if reported is None:
             if ok is True:
@@ -1477,8 +1486,7 @@ class UltraDeviceWorker(threading.Thread):
         ]
         failed = set(normalized)
         if (
-            type(ok) is not bool
-            or any(not pin for pin in normalized)
+            any(not pin for pin in normalized)
             or not failed <= attempted
             or (ok and failed)
             or (not ok and not failed)
@@ -1598,7 +1606,9 @@ class UltraDeviceWorker(threading.Thread):
                 result = self._sdk.push_roster(to_push, templates_to_push,
                                                remove_fingers_by_pin=removals,
                                                bracket_enable_device=bracket)
-                sync_ok = bool(result.get("ok"))
+                sync_ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
+                    users=to_push, result=result,
+                )
                 sync_error = "" if sync_ok else str(
                     (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
                 )

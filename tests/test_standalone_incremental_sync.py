@@ -322,6 +322,34 @@ class TestIncrementalFullSync:
 # --------------------------------------------------------------------------- #
 
 class TestFailureHandling:
+    def test_ok_true_with_nonzero_failure_counter_confirms_no_pins(self, monkeypatch, state):
+        class _ContradictorySuccess(FakeDriver):
+            def push_roster(self, users, templates_by_pin=None, *, bracket_enable_device=False, **kw):
+                self.push_calls.append((list(users), dict(templates_by_pin or {}), bracket_enable_device))
+                return {
+                    "ok": True,
+                    "pushed": 1,
+                    "failed": 1,
+                    "templates_failed": 0,
+                    "chunks_wedged": 0,
+                    "skipped_pin": 0,
+                    "failed_pins": [],
+                }
+
+        w, _ = _worker(
+            monkeypatch,
+            driver=_ContradictorySuccess(),
+            users=[_user(117, "Bob", "1")],
+        )
+        _full_sync(w)
+
+        assert state.rows["117"][1] is False
+        assert _finished_kwargs(w)["ok"] is False
+        assert _finished_kwargs(w)["fingerprint_hash"] is None
+        last = w._push_batch_updates[-1]
+        assert last["pins_success"] == 0 and last["pins_failed"] == 1
+        assert last["status"] == "FAILED"
+
     def test_vacated_finger_clear_failure_is_failed_in_push_batch_history(self, monkeypatch, state):
         class _SlotRemovalFailure(FakeDriver):
             def push_roster(self, users, templates_by_pin=None, *, bracket_enable_device=False, **kw):
