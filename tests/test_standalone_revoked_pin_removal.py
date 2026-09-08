@@ -43,6 +43,7 @@ selected. That ownership rule is what makes this safe where MIRROR is not.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
@@ -155,6 +156,17 @@ def _fallback_success(*, slots: int) -> dict:
         "del_attempted": slots,
         "del_ok": slots,
     }
+
+
+def _authoritative_full_sync(w, member_id: int, *, fingerprint_hash: str = "revoked-hash") -> dict:
+    assert w.request_full_sync(
+        reason="fast_patch_bundle",
+        fingerprint_hash=fingerprint_hash,
+        revoked_ids={member_id},
+    ) is True
+    assert w._drain_full_sync_commands(limit=1) == 1
+    assert w._pending_full_sync_request is None
+    return w._on_full_sync_finished.call_args.kwargs
 
 
 @pytest.fixture
@@ -414,6 +426,134 @@ class TestImmediateAuthoritativeRevoke:
             call.args and call.args[0] == "MEMBER_REVOKE_FAILED"
             for call in warnings.call_args_list
         )
+
+
+class TestAuthoritativeFullSyncRetry:
+
+    @staticmethod
+    def _assert_unconfirmed(result: dict, member_id: int) -> None:
+        assert result["ok"] is False
+        assert result["fingerprint_hash"] is None
+        assert result["revoked_ids"] == {member_id}
+
+    def test_empty_roster_guard_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(34439, "revoked", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert drv.delete_calls == []
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_unreadable_ownership_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
+        monkeypatch.setattr(
+            dbmod,
+            "list_device_sync_hashes_and_status",
+            MagicMock(side_effect=RuntimeError("db unavailable")),
+        )
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert drv.delete_calls == []
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_bulk_safety_refusal_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
+        for i in range(50):
+            fstate.rows[str(40000 + i)] = ("old-hash", True, {0})
+
+        result = _authoritative_full_sync(w, 40000)
+
+        self._assert_unconfirmed(result, 40000)
+        assert drv.delete_calls == []
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_removal_failure_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate):
+        drv = FailingFallbackDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert "34439" in fstate.rows
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_local_cleanup_failure_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate, tracked_revocation_state):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+        monkeypatch.setattr(
+            dbmod,
+            "clear_device_revocation_state",
+            MagicMock(side_effect=RuntimeError("db unavailable")),
+            raising=False,
+        )
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert "34439" in fstate.rows
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_missing_cache_requeues_explicit_revocation_without_advancing_hash(
+            self, monkeypatch, fstate):
+        w, _c = _worker(monkeypatch, driver=RevokeDriver(), users=[])
+        monkeypatch.setattr(ue, "load_sync_cache", lambda: None)
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert w._on_full_sync_finished.call_count == 1
+
+    def test_scheduler_retry_eventually_succeeds_after_ownership_becomes_available(
+            self, monkeypatch, fstate, tracked_revocation_state):
+        drv = RevokeDriver()
+        w, _c = _worker(
+            monkeypatch,
+            driver=drv,
+            users=[_user(30001, "active", ""), _user(34439, "revoked", "")],
+        )
+        scheduler = ue.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+        w._on_full_sync_finished = scheduler._handle_worker_full_sync_finished
+
+        assert w.request_full_sync(
+            reason="fast_patch_bundle",
+            fingerprint_hash="blocked-hash",
+            revoked_ids={34439},
+        ) is True
+        assert w._drain_full_sync_commands(limit=1) == 1
+        assert scheduler._drain_pending_sync_request() == (
+            None,
+            {34439},
+            {9},
+            "fast_patch_bundle",
+        )
+
+        fstate.rows["34439"] = ("old-hash", True, {0})
+        assert w.request_member_revoke(34439) is True
+        assert w.request_full_sync(
+            reason="fast_patch_bundle",
+            fingerprint_hash="retry-hash",
+            revoked_ids={34439},
+        ) is True
+        assert w._drain_member_sync_commands(limit=1) == 1
+        assert w._drain_full_sync_commands(limit=1) == 1
+
+        assert drv.delete_calls == [["34439"]]
+        assert scheduler._last_hash[9] == "retry-hash"
+        assert scheduler._drain_pending_sync_request() is None
 
 
 class TestARevokedMemberLosesTheirCredentials:

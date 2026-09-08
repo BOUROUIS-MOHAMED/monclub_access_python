@@ -476,6 +476,11 @@ class UltraDeviceWorker(threading.Thread):
         self._pending_member_syncs: Deque[int] = deque()
         self._pending_member_sync_ids: Set[int] = set()
         self._pending_member_revoke_ids: Set[int] = set()
+        # A targeted revoke may complete immediately before a co-requested full
+        # sync drains. Retain that proof until the filtered full sync succeeds,
+        # so the stale cache cannot re-enrol the member and a retry does not
+        # mistake the now-absent ownership row for an unhandled revocation.
+        self._confirmed_member_revoke_ids: Set[int] = set()
         self._full_sync_lock = threading.Lock()
         self._pending_full_sync_request: Dict[str, Any] | None = None
         self._active_sync_lock = threading.Lock()
@@ -1007,6 +1012,15 @@ class UltraDeviceWorker(threading.Thread):
                 or normalized_member_id in self._pending_member_sync_ids
             ):
                 return False
+            confirmed_revokes = getattr(self, "_confirmed_member_revoke_ids", set())
+            if normalized_member_id in confirmed_revokes:
+                with self._full_sync_lock:
+                    pending_full_revokes = set(
+                        (self._pending_full_sync_request or {}).get("revoked_ids") or set()
+                    )
+                if normalized_member_id in pending_full_revokes:
+                    return False
+                confirmed_revokes.discard(normalized_member_id)
             self._pending_member_sync_ids.add(normalized_member_id)
             self._pending_member_syncs.append(normalized_member_id)
             self._wake_evt.set()
@@ -1015,6 +1029,8 @@ class UltraDeviceWorker(threading.Thread):
     def request_member_revoke(self, member_id: int) -> bool:
         normalized_member_id = int(member_id)
         with self._member_sync_lock:
+            if normalized_member_id in getattr(self, "_confirmed_member_revoke_ids", set()):
+                return False
             is_new_revocation = normalized_member_id not in self._pending_member_revoke_ids
             self._pending_member_revoke_ids.add(normalized_member_id)
             if normalized_member_id not in self._pending_member_sync_ids:
@@ -1029,7 +1045,25 @@ class UltraDeviceWorker(threading.Thread):
 
     def has_pending_member_revoke(self, member_id: int) -> bool:
         with self._member_sync_lock:
-            return int(member_id) in self._pending_member_revoke_ids
+            normalized_member_id = int(member_id)
+            return (
+                normalized_member_id in self._pending_member_revoke_ids
+                or normalized_member_id in getattr(self, "_confirmed_member_revoke_ids", set())
+            )
+
+    def _mark_member_revoke_confirmed(self, member_id: int) -> None:
+        with self._member_sync_lock:
+            if not hasattr(self, "_confirmed_member_revoke_ids"):
+                self._confirmed_member_revoke_ids = set()
+            self._confirmed_member_revoke_ids.add(int(member_id))
+
+    def _confirmed_member_revokes(self, member_ids: set[int]) -> set[int]:
+        with self._member_sync_lock:
+            return set(member_ids) & getattr(self, "_confirmed_member_revoke_ids", set())
+
+    def _clear_confirmed_member_revokes(self, member_ids: set[int]) -> None:
+        with self._member_sync_lock:
+            getattr(self, "_confirmed_member_revoke_ids", set()).difference_update(member_ids)
 
     def request_full_sync(
         self,
@@ -1256,14 +1290,9 @@ class UltraDeviceWorker(threading.Thread):
                 # driver's targeted roster push instead (always terminates).
                 if getattr(self._sdk, "owns_event_source", False):
                     if is_revocation:
-                        try:
-                            self._run_standalone_member_revoke(member_id)
-                        except Exception:
-                            self.request_full_sync(
-                                reason="revoke-handler-failed",
-                                revoked_ids={member_id},
-                            )
-                            raise
+                        revoke_ok = self._run_standalone_member_revoke(member_id)
+                        if revoke_ok:
+                            self._mark_member_revoke_confirmed(member_id)
                     else:
                         self._run_standalone_member_sync(member_id)
                     drained += 1
@@ -1288,12 +1317,20 @@ class UltraDeviceWorker(threading.Thread):
                 _tel.set_state(self._tel_wid, "member_sync", f"member={member_id}")
                 _ms_t0 = time.monotonic()
                 try:
-                    engine.sync_member_on_connected_sdk(
+                    member_sync_ok = engine.sync_member_on_connected_sdk(
                         sdk=raw_sdk,
                         device=self._device,
                         member_id=member_id,
                         source="ultra_targeted_member_sync",
                     )
+                    if is_revocation:
+                        if member_sync_ok:
+                            self._mark_member_revoke_confirmed(member_id)
+                        else:
+                            self.request_full_sync(
+                                reason="revoke-failed",
+                                revoked_ids={member_id},
+                            )
                 finally:
                     _tel.event(
                         "MEMBER_SYNC_DONE", worker=self._tel_wid, member_id=member_id,
@@ -1301,6 +1338,11 @@ class UltraDeviceWorker(threading.Thread):
                         pending=len(self._pending_member_syncs),
                     )
             except Exception as exc:
+                if is_revocation:
+                    self.request_full_sync(
+                        reason="revoke-handler-failed",
+                        revoked_ids={member_id},
+                    )
                 logger.warning(
                     "%s targeted member sync failed: member_id=%s err=%s",
                     self._prefix,
@@ -1619,6 +1661,13 @@ class UltraDeviceWorker(threading.Thread):
         """Full roster push for a push driver, with FULL parity on the started/
         finished bookkeeping so scheduler skip-hashes and manual-sync pending
         counters keep working. Always terminates (never re-queues itself)."""
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        confirmed_revoked_ids = self._confirmed_member_revokes(normalized_revoked_ids)
+        unconfirmed_revoked_ids = normalized_revoked_ids - confirmed_revoked_ids
         started_at = time.time()
         started_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at))
         cache = load_sync_cache()
@@ -1627,9 +1676,10 @@ class UltraDeviceWorker(threading.Thread):
             self._mark_full_sync_finished(reason=reason, ok=False, duration_ms=0.0,
                                           error="no sync cache available")
             self._notify_full_sync_finished(reason=reason, ok=False, fingerprint_hash=None,
-                                            duration_ms=0.0, error="no sync cache available")
+                                            duration_ms=0.0, error="no sync cache available",
+                                            revoked_ids=normalized_revoked_ids)
             return
-        cache = _sync_cache_without_revoked_ids(cache, revoked_ids)
+        cache = _sync_cache_without_revoked_ids(cache, normalized_revoked_ids)
 
         self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
         self._notify_full_sync_started(reason=reason)
@@ -1759,11 +1809,16 @@ class UltraDeviceWorker(threading.Thread):
                 safe_to_prune = True
                 try:
                     safe_to_prune = self._neutralise_revoked_pins(
-                        desired_pins=desired_pins, roster_count=len(users),
+                        desired_pins=desired_pins,
+                        roster_count=len(users),
+                        required_pins={str(member_id) for member_id in unconfirmed_revoked_ids},
                     )
                 except Exception as exc:
                     logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
                     safe_to_prune = False
+                if unconfirmed_revoked_ids and not safe_to_prune:
+                    sync_ok = False
+                    sync_error = "authoritative revocation unconfirmed"
                 # Forget state for pins no longer desired, so a member who leaves and
                 # later returns is pushed again rather than assumed present. Skipped
                 # when the revoke pass aborted: pruning would throw away the finger
@@ -1808,10 +1863,13 @@ class UltraDeviceWorker(threading.Thread):
                    failed=result.get("failed"), skipped_unchanged=skipped_unchanged)
         self._mark_full_sync_finished(reason=reason, ok=sync_ok,
                                       duration_ms=duration_ms, error=sync_error)
+        if sync_ok:
+            self._clear_confirmed_member_revokes(normalized_revoked_ids)
         self._notify_full_sync_finished(
             reason=reason, ok=sync_ok,
             fingerprint_hash=fingerprint_hash if sync_ok else None,
             duration_ms=duration_ms, error=sync_error,
+            revoked_ids=normalized_revoked_ids if not sync_ok else set(),
         )
 
     def _member_row_in_db(self, member_id: int) -> list[Dict[str, Any]] | None:
@@ -2238,7 +2296,13 @@ class UltraDeviceWorker(threading.Thread):
         for k in [k for k, v in m.items() if v < cutoff]:
             m.pop(k, None)
 
-    def _neutralise_revoked_pins(self, *, desired_pins: set[str], roster_count: int) -> bool:
+    def _neutralise_revoked_pins(
+        self,
+        *,
+        desired_pins: set[str],
+        roster_count: int,
+        required_pins: set[str] | None = None,
+    ) -> bool:
         """Strip credentials from pins we pushed that are no longer desired.
 
         WHY THIS EXISTS. On a ZK_STANDALONE terminal the DEVICE decides and opens;
@@ -2281,10 +2345,33 @@ class UltraDeviceWorker(threading.Thread):
             return False
 
         keep = {str(p).strip() for p in (desired_pins or set())}
+        required = {str(p).strip() for p in (required_pins or set()) if str(p).strip()}
+        owned = {str(p).strip() for p in state if str(p).strip()}
+        if not required <= owned:
+            logger.warning(
+                "%s revoke pass: ownership proof missing for explicit pin(s) %s",
+                self._prefix,
+                ",".join(sorted(required - owned)),
+            )
+            return False
+        if required & keep:
+            logger.warning(
+                "%s revoke pass: explicit pin(s) still present in desired roster: %s",
+                self._prefix,
+                ",".join(sorted(required & keep)),
+            )
+            return False
         # The enrolment grace window, shared with MIRROR: a pin pushed seconds ago is
         # mid-flight, not departed.
         grace = self._mirror_grace_pins() | self._mirror_allowlist_pins()
-        revoked = sorted(p for p in state if p and p not in keep and p not in grace)
+        if required & grace:
+            logger.warning(
+                "%s revoke pass: explicit pin(s) blocked by safety protection: %s",
+                self._prefix,
+                ",".join(sorted(required & grace)),
+            )
+            return False
+        revoked = sorted(p for p in owned if p not in keep and p not in grace)
         if not revoked:
             return True
 
@@ -2571,6 +2658,7 @@ class UltraDeviceWorker(threading.Thread):
                         fingerprint_hash=None,
                         duration_ms=0.0,
                         error="no sync cache available",
+                        revoked_ids=revoked_ids,
                     )
                     drained += 1
                     continue
@@ -2604,22 +2692,28 @@ class UltraDeviceWorker(threading.Thread):
                     "FULL_SYNC_START", worker=self._tel_wid, reason=reason,
                     users=len(getattr(filtered_cache, "users", []) or []),
                 )
-                sync_ok = engine.run_one_device_on_connected_sdk(
+                sync_ok = bool(engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
                     device=device_copy,
                     source=reason,
                     changed_ids=None,
+                ))
+                unconfirmed_revoked_ids = (
+                    revoked_ids - self._confirmed_member_revokes(revoked_ids)
                 )
+                if sync_ok and unconfirmed_revoked_ids:
+                    sync_ok = False
+                    sync_error = "authoritative revocation unconfirmed"
+                else:
+                    sync_error = "" if sync_ok else (
+                        getattr(engine, "_last_single_device_error", "")
+                        or "device sync failed"
+                    )
                 duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
                 _tel.event(
                     "FULL_SYNC_DONE", worker=self._tel_wid, reason=reason,
                     ok=sync_ok, dur_ms=round(duration_ms),
-                )
-                # P9: surface the underlying sync error (e.g. PullSDKError on
-                # the user table) instead of silently treating it as success.
-                sync_error = "" if sync_ok else (
-                    getattr(engine, "_last_single_device_error", "") or "device sync failed"
                 )
                 self._mark_full_sync_finished(
                     reason=reason,
@@ -2627,12 +2721,15 @@ class UltraDeviceWorker(threading.Thread):
                     duration_ms=duration_ms,
                     error=sync_error,
                 )
+                if sync_ok:
+                    self._clear_confirmed_member_revokes(revoked_ids)
                 self._notify_full_sync_finished(
                     reason=reason,
                     ok=sync_ok,
                     fingerprint_hash=fingerprint_hash if sync_ok else None,
                     duration_ms=duration_ms,
                     error=sync_error,
+                    revoked_ids=revoked_ids if not sync_ok else set(),
                 )
             except Exception as exc:
                 logger.warning(
@@ -2653,6 +2750,7 @@ class UltraDeviceWorker(threading.Thread):
                     fingerprint_hash=None,
                     duration_ms=0.0,
                     error=str(exc),
+                    revoked_ids=revoked_ids,
                 )
             drained += 1
         return drained
@@ -2699,12 +2797,13 @@ class UltraDeviceWorker(threading.Thread):
         fingerprint_hash: str | None,
         duration_ms: float,
         error: str,
+        revoked_ids: set[int] | None = None,
     ) -> None:
         cb = self._on_full_sync_finished
         if cb is None:
             return
         try:
-            cb(
+            kwargs: Dict[str, Any] = dict(
                 device_id=self._device_id,
                 reason=str(reason or "manual"),
                 ok=bool(ok),
@@ -2712,6 +2811,14 @@ class UltraDeviceWorker(threading.Thread):
                 duration_ms=max(0.0, float(duration_ms or 0.0)),
                 error=str(error or ""),
             )
+            normalized_revoked_ids = {
+                int(member_id)
+                for member_id in (revoked_ids or set())
+                if member_id is not None
+            }
+            if normalized_revoked_ids:
+                kwargs["revoked_ids"] = normalized_revoked_ids
+            cb(**kwargs)
         except Exception:
             logger.debug("%s full sync finished callback failed", self._prefix, exc_info=True)
 
@@ -4480,6 +4587,7 @@ class UltraSyncScheduler:
         fingerprint_hash: str | None,
         duration_ms: float,
         error: str,
+        revoked_ids: set[int] | None = None,
     ) -> None:
         if ok and fingerprint_hash:
             self._last_hash[int(device_id)] = str(fingerprint_hash)
@@ -4498,6 +4606,18 @@ class UltraSyncScheduler:
             str(reason or "manual"),
             str(error or "sync failed"),
         )
+        normalized_revoked_ids = {
+            int(member_id)
+            for member_id in (revoked_ids or set())
+            if member_id is not None
+        }
+        if normalized_revoked_ids:
+            self._preserve_sync_request_for_retry(
+                changed_ids=None,
+                revoked_ids=normalized_revoked_ids,
+                device_ids={int(device_id)},
+                reason=str(reason or "manual"),
+            )
 
     def force_resync(self, device_id: int):
         """F-015: Clear in-memory hash for a device to force re-push on next cycle."""
@@ -4900,10 +5020,11 @@ class UltraSyncScheduler:
                         target_handled = False
 
                 if not target_handled:
-                    is_standalone = (
-                        resolve_device_protocol(d) == DeviceProtocol.ZK_STANDALONE
-                    )
-                    if is_standalone and normalized_revoked_ids:
+                    # A roster push can add/update data, but under additive policy
+                    # it cannot prove deletion (and an untracked PIN is invisible
+                    # to stale-record cleanup). Only a live worker's targeted
+                    # absent-member path can confirm an authoritative revoke.
+                    if normalized_revoked_ids:
                         self._preserve_sync_request_for_retry(
                             changed_ids=normalized_changed_ids,
                             revoked_ids=normalized_revoked_ids,
@@ -4914,16 +5035,7 @@ class UltraSyncScheduler:
                         sync_kwargs: Dict[str, Any] = {
                             "changed_ids": normalized_changed_ids,
                         }
-                        if normalized_revoked_ids:
-                            sync_kwargs["revoked_ids"] = normalized_revoked_ids
                         did_sync = self._sync_device(d, **sync_kwargs)
-                        if normalized_revoked_ids and not did_sync:
-                            self._preserve_sync_request_for_retry(
-                                changed_ids=normalized_changed_ids,
-                                revoked_ids=normalized_revoked_ids,
-                                device_ids={int(device_id)},
-                                reason=str(reason or "manual"),
-                            )
                 interval = int(
                     d.get("_settings", {}).get("ultra_sync_interval_minutes", 30)
                 ) * 60

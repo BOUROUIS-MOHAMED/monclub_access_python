@@ -164,6 +164,7 @@ def _worker(monkeypatch, *, driver=None, users=None):
     w._pending_member_syncs = deque()
     w._pending_member_sync_ids = set()
     w._pending_member_revoke_ids = set()
+    w._confirmed_member_revoke_ids = set()
     w._wake_evt = threading.Event()
     w._active_sync_lock = threading.Lock()
     w._active_sync_engine = None
