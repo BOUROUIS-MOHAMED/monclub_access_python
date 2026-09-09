@@ -98,6 +98,11 @@ class FakeState:
             raise RuntimeError("db unavailable")
         return dict(self.rows)
 
+    def list_owned(self, *, device_id):
+        if self.raise_on_read:
+            raise RuntimeError("db unavailable")
+        return {pin for pin, (_hash, ok) in self.rows.items() if ok}
+
     def save_batch(self, *, device_id, rows):
         rows = list(rows)
         self.save_calls.append(rows)
@@ -134,6 +139,7 @@ def _user(am_id: int, name: str, card: str, fps: list | None = None) -> dict:
 
 def _install_state(monkeypatch, st: FakeState) -> FakeState:
     monkeypatch.setattr(dbmod, "list_device_sync_hashes_and_status", st.list)
+    monkeypatch.setattr(dbmod, "list_confirmed_device_sync_pins", st.list_owned)
     monkeypatch.setattr(dbmod, "save_device_sync_state_batch", st.save_batch)
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)

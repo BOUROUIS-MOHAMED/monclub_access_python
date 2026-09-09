@@ -70,6 +70,7 @@ class FingerState:
     def __init__(self):
         self.rows: Dict[str, tuple] = {}
         self.save_calls: List[list] = []
+        self.owned: set[str] = set()
 
     @staticmethod
     def _decode(raw):
@@ -87,6 +88,10 @@ class FingerState:
     def list_fingers(self, *, device_id):
         return {p: (None if f is None else set(f)) for p, (_h, _ok, f) in self.rows.items()}
 
+    def list_owned(self, *, device_id):
+        # Direct test seeds with last_ok=True model installed confirmed rows.
+        return set(self.owned) | {p for p, (_h, ok, _f) in self.rows.items() if ok}
+
     # --- the writer ---------------------------------------------------------
     def save_batch(self, *, device_id, rows):
         rows = list(rows)
@@ -103,6 +108,8 @@ class FingerState:
                 # Decoded on write so the stored value is what a read would return.
                 (self._decode(fingers) if (ok and fingers is not None) else prev[2]),
             )
+            if ok:
+                self.owned.add(pin)
         return len(rows)
 
     def prune(self, *, device_id, keep_pins):
@@ -113,6 +120,7 @@ class FingerState:
 
     def delete(self, *, device_id, pin):
         self.rows.pop(str(pin), None)
+        self.owned.discard(str(pin))
 
 
 @pytest.fixture
@@ -120,6 +128,7 @@ def fstate(monkeypatch) -> FingerState:
     st = FingerState()
     monkeypatch.setattr(dbmod, "list_device_sync_hashes_and_status", st.list_hashes)
     monkeypatch.setattr(dbmod, "list_device_pushed_fingers", st.list_fingers, raising=False)
+    monkeypatch.setattr(dbmod, "list_confirmed_device_sync_pins", st.list_owned, raising=False)
     monkeypatch.setattr(dbmod, "save_device_sync_state_batch", st.save_batch)
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)

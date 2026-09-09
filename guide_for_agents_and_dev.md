@@ -252,11 +252,21 @@ Only confirmed deletion or complete neutralisation atomically clears that PIN's
 ::TestRemovalResultContract; test_db_standalone_revocation_state.py;
 test_zk_standalone_template_removal.py]`
 
-Ownership is a safety boundary. Without a readable MonClub ownership row for that
-device/PIN, the worker makes **no destructive SDK call**, writes a critical log for
-`MEMBER_REVOKE_OWNERSHIP_MISSING`, emits warning-level telemetry with the same event
-name, and schedules full reconciliation. Such an
-unowned PIN is intentionally left untouched for alert/reconciliation investigation.
+Ownership is a safety boundary. A `device_sync_state` row alone is **not** ownership
+proof: ownership requires the durable `ownership_confirmed=1` bit, set only after an
+affirmatively successful MonClub push and sticky across later failed updates. On
+installed databases, `last_ok=1` or a recorded `pushed_finger_ids` set is conservative
+migration evidence; ambiguous legacy rows remain unconfirmed. A failed first push
+therefore cannot authorize deletion or neutralisation of a colliding manually managed
+user on a shared MB2000. Without this affirmative proof, the worker makes **no
+destructive SDK call**, writes a critical log for `MEMBER_REVOKE_OWNERSHIP_MISSING`,
+emits warning-level telemetry with the same event name, and schedules full
+reconciliation. Full reconciliation also fails closed before ordinary roster I/O when
+an explicit revoke has a recorded but unconfirmed attempt. Such an unowned PIN is
+intentionally left untouched for alert/reconciliation investigation.
+Force-resync commands invalidate content hashes and retry status without deleting
+ownership or pushed-finger evidence, so a later full pass can still reconcile stale
+revoked credentials.
 `[CODE: ultra_engine.py::_run_standalone_member_revoke]`
 `[TEST: test_standalone_revoked_pin_removal.py::
 TestImmediateAuthoritativeRevoke::test_unowned_pin_is_not_touched_and_requests_full_reconciliation]`
@@ -547,8 +557,9 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1316 passed, no
-warnings** (2026-09-09, after the immediate authoritative revocation work; exit code
+background-thread exceptions are promoted to failures. Last run: **1321 passed, no
+warnings** (2026-09-09, after the durable ownership correction for immediate
+authoritative revocation; exit code
 0). `[TEST]`
 
 ```bash

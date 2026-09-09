@@ -1408,6 +1408,26 @@ def init_db() -> None:
         # table that does not exist yet, so placing it up in the migration block
         # silently skipped it on a fresh database.
         _ensure_column(conn, "device_sync_state", "pushed_finger_ids", "pushed_finger_ids TEXT")
+        # Retry bookkeeping is not ownership proof: a failed first push creates a
+        # state row even though the terminal may still contain another system's
+        # user at that PIN.  This bit becomes true only after an affirmative push
+        # and never falls back to false on later retry failures.
+        _ensure_column(
+            conn,
+            "device_sync_state",
+            "ownership_confirmed",
+            "ownership_confirmed INTEGER NOT NULL DEFAULT 0",
+        )
+        # Safe installed-base migration. Successful rows are affirmative proof;
+        # a recorded finger set also proves an earlier successful standalone push.
+        conn.execute(
+            """
+            UPDATE device_sync_state
+            SET ownership_confirmed=1
+            WHERE ownership_confirmed=0
+              AND (last_ok=1 OR pushed_finger_ids IS NOT NULL)
+            """
+        )
 
         # -----------------------------
         # offline creation queue (access-only)
@@ -6521,6 +6541,25 @@ def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
         return out
 
 
+@_tel.timed("DB_READ_list_confirmed_device_sync_pins", slow_ms=50, warn_ms=1000)
+def list_confirmed_device_sync_pins(*, device_id: int) -> "set[str]":
+    """Return PINs affirmatively written by MonClub to this device.
+
+    A mere device_sync_state row can represent a failed first attempt and must
+    never authorize destructive cleanup on a shared terminal.
+    """
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT pin FROM device_sync_state
+            WHERE device_id=? AND ownership_confirmed=1
+            """,
+            (did,),
+        ).fetchall()
+    return {str(r["pin"] or "").strip() for r in rows if str(r["pin"] or "").strip()}
+
+
 @_tel.timed("DB_READ_list_device_pushed_fingers", slow_ms=50, warn_ms=1000)
 def list_device_pushed_fingers(*, device_id: int) -> Dict[str, "set[int] | None"]:
     """Return {pin: finger ids last pushed to this device}.
@@ -6632,14 +6671,16 @@ def save_device_sync_state_batch(
         p = str(pin or "").strip()
         if not p:
             continue
+        ok_i = 1 if bool(ok) else 0
         params_list.append((
             did,
             p,
             str(desired_hash or "").strip() if desired_hash else "",
-            1 if bool(ok) else 0,
+            ok_i,
             (str(error or "")[:1000]) if error else None,
             updated_at,
             fingers,
+            ok_i,
         ))
 
     if not params_list:
@@ -6648,8 +6689,10 @@ def save_device_sync_state_batch(
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         conn.executemany(
             """
-            INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at, pushed_finger_ids)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO device_sync_state
+                (device_id, pin, desired_hash, last_ok, last_error, updated_at,
+                 pushed_finger_ids, ownership_confirmed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, pin) DO UPDATE SET
                 desired_hash = CASE
                     WHEN excluded.last_ok = 1 THEN excluded.desired_hash
@@ -6666,6 +6709,11 @@ def save_device_sync_state_batch(
                     WHEN excluded.last_ok = 1 AND excluded.pushed_finger_ids IS NOT NULL
                         THEN excluded.pushed_finger_ids
                     ELSE device_sync_state.pushed_finger_ids
+                END,
+                ownership_confirmed = CASE
+                    WHEN device_sync_state.ownership_confirmed = 1
+                         OR excluded.ownership_confirmed = 1 THEN 1
+                    ELSE 0
                 END
             """,
             params_list,
@@ -6689,8 +6737,10 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
-            INSERT INTO device_sync_state (device_id, pin, desired_hash, last_ok, last_error, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO device_sync_state
+                (device_id, pin, desired_hash, last_ok, last_error, updated_at,
+                 ownership_confirmed)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, pin) DO UPDATE SET
                 desired_hash = CASE
                     WHEN excluded.last_ok = 1 THEN excluded.desired_hash
@@ -6698,9 +6748,14 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
                 END,
                 last_ok = excluded.last_ok,
                 last_error = excluded.last_error,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                ownership_confirmed = CASE
+                    WHEN device_sync_state.ownership_confirmed = 1
+                         OR excluded.ownership_confirmed = 1 THEN 1
+                    ELSE 0
+                END
             """,
-            (did, p, dh, ok_i, err, now_iso()),
+            (did, p, dh, ok_i, err, now_iso(), ok_i),
         )
 
     _run_db_write_sync("save_device_sync_state", _write)
@@ -6765,19 +6820,31 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
 
 # -----------------------------
 def clear_device_sync_hashes(*, device_id: int) -> int:
-    """F-015: Clear all sync hashes for a device to force full re-sync on next cycle."""
+    """Invalidate content hashes without discarding ownership or removal evidence."""
     did = int(device_id)
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
-        cursor = conn.execute("DELETE FROM device_sync_state WHERE device_id=?", (did,))
+        cursor = conn.execute(
+            """
+            UPDATE device_sync_state
+            SET desired_hash=NULL, last_ok=0, last_error='forced resync'
+            WHERE device_id=?
+            """,
+            (did,),
+        )
         return int(cursor.rowcount or 0)
 
     return int(_run_db_write_sync("clear_device_sync_hashes", _write))
 
 
 def clear_all_device_sync_hashes() -> int:
-    """Hard-reset: clear sync hashes for ALL devices so next sync re-pushes every user."""
+    """Invalidate all content hashes while preserving ownership/removal evidence."""
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
-        cursor = conn.execute("DELETE FROM device_sync_state")
+        cursor = conn.execute(
+            """
+            UPDATE device_sync_state
+            SET desired_hash=NULL, last_ok=0, last_error='forced resync'
+            """
+        )
         return int(cursor.rowcount or 0)
 
     return int(_run_db_write_sync("clear_all_device_sync_hashes", _write))

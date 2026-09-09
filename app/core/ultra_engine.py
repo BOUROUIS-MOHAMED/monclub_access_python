@@ -1993,6 +1993,67 @@ class UltraDeviceWorker(threading.Thread):
                 revoked_ids=normalized_revoked_ids,
             )
             return
+        if unconfirmed_revoked_ids:
+            try:
+                from app.core.db import list_device_sync_hashes_and_status
+                from app.core.db import list_confirmed_device_sync_pins
+                sync_state = list_device_sync_hashes_and_status(
+                    device_id=self._device_id,
+                ) or {}
+                confirmed_pins = list_confirmed_device_sync_pins(
+                    device_id=self._device_id,
+                ) or set()
+            except Exception:
+                sync_state = None
+                confirmed_pins = None
+                logger.warning(
+                    "%s standalone full sync skipped: ownership state unreadable "
+                    "for explicit revocation(s)",
+                    self._prefix,
+                    exc_info=True,
+                )
+            confirmed = (
+                {str(pin).strip() for pin in confirmed_pins}
+                if confirmed_pins is not None
+                else set()
+            )
+            missing_pins = {
+                str(member_id)
+                for member_id in unconfirmed_revoked_ids
+                if (
+                    sync_state is None
+                    or str(member_id) in sync_state
+                )
+                and str(member_id) not in confirmed
+            }
+            if missing_pins:
+                logger.warning(
+                    "%s standalone full sync skipped: no MonClub ownership proof "
+                    "for explicit pin(s) %s",
+                    self._prefix,
+                    ",".join(sorted(missing_pins)),
+                )
+                error = "authoritative revocation ownership unconfirmed"
+                self._mark_full_sync_finished(
+                    reason=reason,
+                    ok=False,
+                    duration_ms=0.0,
+                    error=error,
+                )
+                self._finalize_full_sync_revokes(
+                    normalized_revoked_ids,
+                    ok=False,
+                    excluded_ids=normalized_excluded_ids,
+                )
+                self._notify_full_sync_finished(
+                    reason=reason,
+                    ok=False,
+                    fingerprint_hash=None,
+                    duration_ms=0.0,
+                    error=error,
+                    revoked_ids=normalized_revoked_ids,
+                )
+                return
         cache = _sync_cache_without_revoked_ids(cache, normalized_excluded_ids)
 
         self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
@@ -2357,6 +2418,10 @@ class UltraDeviceWorker(threading.Thread):
         except Exception as exc:
             logger.warning("%s standalone member sync failed: member_id=%s err=%s",
                            self._prefix, member_id, exc)
+            self._defer_member_sync(
+                member_id,
+                reason=f"targeted push exception: {type(exc).__name__}",
+            )
             _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
                       member_id=member_id, err=type(exc).__name__)
         finally:
@@ -2520,9 +2585,9 @@ class UltraDeviceWorker(threading.Thread):
             pin=pin,
         )
         try:
-            from app.core.db import list_device_sync_hashes_and_status
+            from app.core.db import list_confirmed_device_sync_pins
 
-            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+            owned = list_confirmed_device_sync_pins(device_id=self._device_id) or set()
         except Exception:
             logger.warning(
                 "%s member revoke: ownership state unreadable for pin %s",
@@ -2539,7 +2604,7 @@ class UltraDeviceWorker(threading.Thread):
             self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
             return False
 
-        if pin not in state:
+        if pin not in owned:
             logger.critical(
                 "%s member revoke refused: no MonClub ownership proof for pin %s",
                 self._prefix,
@@ -2661,8 +2726,8 @@ class UltraDeviceWorker(threading.Thread):
             _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
             return False
         try:
-            from app.core.db import list_device_sync_hashes_and_status
-            state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
+            from app.core.db import list_confirmed_device_sync_pins
+            owned = list_confirmed_device_sync_pins(device_id=self._device_id) or set()
         except Exception:
             logger.warning("%s revoke pass: per-pin state unreadable -- skipping",
                            self._prefix, exc_info=True)
@@ -2670,7 +2735,7 @@ class UltraDeviceWorker(threading.Thread):
 
         keep = {str(p).strip() for p in (desired_pins or set())}
         required = {str(p).strip() for p in (required_pins or set()) if str(p).strip()}
-        owned = {str(p).strip() for p in state if str(p).strip()}
+        owned = {str(p).strip() for p in owned if str(p).strip()}
         if not required <= owned:
             logger.warning(
                 "%s revoke pass: ownership proof missing for explicit pin(s) %s",
@@ -2883,7 +2948,47 @@ class UltraDeviceWorker(threading.Thread):
             logger.debug("%s MIRROR batch row not recorded", self._prefix, exc_info=True)
 
         result = deleter(sorted(extras)) or {}
-        for p in extras:
+        failed_pins = result.get("failed_pins")
+        failed_count = result.get("failed")
+        deleted_count = result.get("deleted")
+        if isinstance(failed_pins, list):
+            normalized_failed = [
+                str(pin if pin is not None else "").strip()
+                for pin in failed_pins
+            ]
+            failed = set(normalized_failed)
+            consistent = (
+                type(result.get("ok")) is bool
+                and type(failed_count) is int
+                and type(deleted_count) is int
+                and failed_count == len(failed_pins)
+                and deleted_count == len(extras) - len(failed)
+                and len(failed) == len(failed_pins)
+                and all(pin in extras for pin in normalized_failed)
+                and failed_count + deleted_count == len(extras)
+                and (
+                    (
+                        result.get("ok") is True
+                        and not failed
+                    )
+                    or result.get("ok") is False
+                )
+            )
+            confirmed_deleted = extras - failed if consistent else set()
+        else:
+            confirmed_deleted = (
+                set(extras)
+                if (
+                    type(result.get("ok")) is bool
+                    and result.get("ok") is True
+                    and type(failed_count) is int
+                    and failed_count == 0
+                    and type(deleted_count) is int
+                    and deleted_count >= len(extras)
+                )
+                else set()
+            )
+        for p in confirmed_deleted:
             try:
                 delete_device_mirror_pin(device_id=self._device_id, pin=p)
             except Exception:
@@ -2897,15 +3002,16 @@ class UltraDeviceWorker(threading.Thread):
             except Exception:
                 pass
         _tel.event("MIRROR_DONE", worker=self._tel_wid,
-                   deleted=result.get("deleted"), failed=result.get("failed"),
+                   deleted=len(confirmed_deleted), failed=len(extras) - len(confirmed_deleted),
                    ok=result.get("ok"))
         logger.warning("%s MIRROR reconcile: deleted %s device users not in roster "
                        "(failed=%s, pins: %s)",
-                       self._prefix, result.get("deleted"), result.get("failed"), sample)
+                       self._prefix, len(confirmed_deleted),
+                       len(extras) - len(confirmed_deleted), sample)
         if mirror_batch_id is not None:
             try:
-                _deleted = int(result.get("deleted") or 0)
-                _failed = int(result.get("failed") or 0)
+                _deleted = len(confirmed_deleted)
+                _failed = len(extras) - _deleted
                 update_push_batch(
                     id=mirror_batch_id,
                     pins_attempted=len(extras),

@@ -373,6 +373,26 @@ class TestImmediateAuthoritativeRevoke:
             for call in telemetry.call_args_list
         )
 
+    def test_failed_first_push_is_not_ownership_and_cannot_delete_colliding_user(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        # Retry bookkeeping exists, but MonClub never confirmed a write. The same
+        # PIN may already belong to a manually managed user on a shared terminal.
+        fstate.rows["34439"] = ("attempted-hash", False, None)
+        full_sync = MagicMock(return_value=True)
+        monkeypatch.setattr(w, "request_full_sync", full_sync)
+
+        assert w._run_standalone_member_revoke(34439) is False
+
+        assert drv.delete_calls == []
+        assert drv.push_calls == []
+        assert "34439" in fstate.rows
+        full_sync.assert_called_once_with(
+            reason="revoke-ownership-missing",
+            revoked_ids={34439},
+        )
+
     def test_total_failure_keeps_local_state_and_requests_full_reconciliation(
             self, monkeypatch, fstate, tracked_revocation_state):
         drv = FailingFallbackDriver(fail_delete={"34439"})
@@ -463,6 +483,19 @@ class TestAuthoritativeFullSyncRetry:
         self._assert_unconfirmed(result, 34439)
         assert drv.delete_calls == []
         assert w._on_full_sync_finished.call_count == 1
+
+    def test_full_reconcile_does_not_delete_pin_from_failed_first_push(
+            self, monkeypatch, fstate):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
+        fstate.rows["34439"] = ("attempted-hash", False, None)
+
+        result = _authoritative_full_sync(w, 34439)
+
+        self._assert_unconfirmed(result, 34439)
+        assert drv.delete_calls == []
+        assert drv.push_calls == []
+        assert "34439" in fstate.rows
 
     def test_bulk_safety_refusal_requeues_explicit_revocation_without_advancing_hash(
             self, monkeypatch, fstate):
