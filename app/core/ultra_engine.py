@@ -89,18 +89,7 @@ def _worker_full_sync_accepted_or_pending(
         kwargs["revoked_ids"] = set(revoked_ids)
     if require_full_refresh:
         kwargs["require_full_refresh"] = True
-    accepted = bool(request(**kwargs))
-    if accepted:
-        return True
-    pending = getattr(worker, "has_pending_full_sync", None)
-    if not callable(pending):
-        return False
-    pending_kwargs: Dict[str, Any] = {
-        "revoked_ids": set(revoked_ids or set()),
-    }
-    if require_full_refresh:
-        pending_kwargs["require_full_refresh"] = True
-    return bool(pending(**pending_kwargs))
+    return bool(request(**kwargs))
 
 
 def _sync_cache_without_revoked_ids(cache: Any, revoked_ids: set[int] | None) -> Any:
@@ -1334,7 +1323,7 @@ class UltraDeviceWorker(threading.Thread):
                         self._pending_member_revoke_ids.difference_update(
                             queued_targeted_revoked_ids
                         )
-                    return False
+                    return True
                 if (
                     normalized_revoked_ids
                     and not queued_revoked_ids
@@ -1342,7 +1331,7 @@ class UltraDeviceWorker(threading.Thread):
                     and not retry_excluded_ids
                     and not require_full_refresh
                 ):
-                    return False
+                    return True
                 for member_id in retry_revoked_ids:
                     phases.pop(member_id, None)
                 for member_id in retry_excluded_ids:

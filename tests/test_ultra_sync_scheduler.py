@@ -1014,7 +1014,7 @@ def _block_active_full_sync(worker, revoked_ids: set[int]):
     return release, thread
 
 
-def test_active_full_sync_rejects_exact_duplicate_revocation_request():
+def test_active_full_sync_handles_exact_duplicate_without_new_work():
     import app.core.ultra_engine as ultra_module
 
     worker = _member_command_worker(ultra_module)
@@ -1023,7 +1023,7 @@ def test_active_full_sync_rejects_exact_duplicate_revocation_request():
         assert worker.request_full_sync(
             reason="fast_patch_bundle",
             revoked_ids={41},
-        ) is False
+        ) is True
         assert worker._pending_full_sync_request is None
         assert worker.has_pending_full_sync(revoked_ids={41}) is True
     finally:
@@ -1421,7 +1421,7 @@ def test_required_full_refresh_during_active_targeted_revoke_is_exclusion_only(
         assert worker.request_full_sync(
             reason="retry",
             revoked_ids={41},
-        ) is False
+        ) is True
         assert worker._pending_full_sync_request is None
         assert worker.request_full_sync(
             reason="device_refresh",
@@ -1502,6 +1502,59 @@ def test_engine_preserves_full_refresh_when_targeted_revoke_becomes_active(monke
     ]
     assert worker.has_pending_member_revoke(41) is False
     assert worker._confirmed_member_revoke_ids == set()
+
+
+def test_engine_full_merge_remains_handled_when_worker_drains_before_return_check(
+        monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch,
+        [True],
+        block_first=False,
+    )
+    assert worker.request_full_sync(
+        reason="initial_refresh",
+        revoked_ids={41},
+        require_full_refresh=True,
+    ) is True
+    request_full_sync = worker.request_full_sync
+    has_pending_full_sync = worker.has_pending_full_sync
+    worker.has_pending_full_sync = MagicMock(wraps=has_pending_full_sync)
+
+    def merge_then_complete(**kwargs):
+        handled = request_full_sync(**kwargs)
+        assert worker._drain_full_sync_commands(limit=1) == 1
+        return handled
+
+    worker.request_full_sync = merge_then_complete
+    worker.is_alive = lambda: True
+    scheduler = SimpleNamespace(
+        _devices=[worker._device],
+        request_sync_now=MagicMock(),
+    )
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    assert ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=None,
+        revoked_ids={41},
+        device_ids={5},
+        reason="device_refresh",
+    ) is True
+
+    scheduler.request_sync_now.assert_not_called()
+    worker.has_pending_full_sync.assert_not_called()
+    assert events == [
+        ("targeted", 41),
+        ("full", {43, 99}),
+    ]
+    assert worker.has_pending_member_revoke(41) is False
 
 
 def test_revoke_first_full_second_adopts_targeted_before_member_drain(monkeypatch):
@@ -1695,7 +1748,7 @@ def test_ultra_worker_drains_full_sync_commands_using_live_connection(monkeypatc
     worker._sdk = SimpleNamespace(_sdk="raw-sdk")
 
     assert worker.request_full_sync(reason="device_refresh") is True
-    assert worker.request_full_sync(reason="device_refresh") is False
+    assert worker.request_full_sync(reason="device_refresh") is True
 
     drained = worker._drain_full_sync_commands(limit=1)
 
@@ -1723,7 +1776,7 @@ def test_pending_full_sync_is_upgraded_with_revocation_without_stale_fingerprint
     assert worker.request_full_sync(
         reason="fast_patch_bundle",
         revoked_ids={17},
-    ) is False
+    ) is True
 
     assert worker.has_pending_full_sync(revoked_ids={17}) is True
     assert worker._pending_full_sync_request["fingerprint_hash"] is None
