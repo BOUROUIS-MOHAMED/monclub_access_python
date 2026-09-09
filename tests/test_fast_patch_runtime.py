@@ -612,6 +612,49 @@ def test_legacy_mixed_result_without_item_identity_uses_full_reconcile(monkeypat
     assert any("ambiguous" in str(call).lower() for call in app.logger.warning.call_args_list)
 
 
+@pytest.mark.parametrize(
+    "db_result",
+    [
+        {"applied": True, "skipped": 1, "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": 1.0, "skipped": 1, "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": "1", "skipped": 1, "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": 1, "skipped": "1", "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": None, "skipped": 2, "ignored": None, "appliedItemIndexes": []},
+        {"applied": -1, "skipped": 3, "ignored": None, "appliedItemIndexes": []},
+        {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": 2, "skipped": 0, "ignored": None, "appliedItemIndexes": [0, 0]},
+        {"applied": 1, "skipped": 1, "ignored": None, "appliedItemIndexes": [True]},
+        {"applied": 1, "skipped": 1, "ignored": None, "appliedItemIndexes": [3]},
+    ],
+)
+def test_corrupt_applied_item_metadata_uses_full_reconcile(monkeypatch, db_result):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr("app.core.db.apply_fast_patch_bundle", lambda bundle: db_result)
+    app = _runtime_app()
+    app_module.MainApp.apply_fast_patch_bundle(app, {
+        "requiresReconcile": False,
+        "items": [
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9,
+                "impact": {"affectedMemberIds": [9]},
+            },
+            {
+                "kind": "ENTITY_UPSERT",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 10,
+                "impact": {"affectedMemberIds": [10]},
+            },
+        ],
+    })
+
+    app._request_running_ultra_sync.assert_not_called()
+    app.request_sync_now.assert_called_once()
+    assert any("ambiguous" in str(call).lower() for call in app.logger.warning.call_args_list)
+
+
 def test_apply_fast_patch_bundle_duplicate_short_circuits_runtime_actions(monkeypatch):
     import app.ui.app as app_module
 

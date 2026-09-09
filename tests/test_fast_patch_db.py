@@ -461,3 +461,35 @@ def test_apply_fast_patch_bundle_reports_only_transactionally_applied_item_index
         "appliedItemIndexes": [1],
     }
     assert [row["activeMembershipId"] for row in db.list_sync_users()] == [11, 12]
+
+
+def test_apply_fast_patch_bundle_rolls_back_earlier_items_when_later_item_fails(db):
+    bundle = _bundle(
+        _item(
+            kind="ENTITY_UPSERT",
+            entity_type="ACTIVE_MEMBERSHIP",
+            entity_id=21,
+            revision="2026-04-12T12:20:00Z",
+            payload={"member": _member(21)},
+        ),
+        _item(
+            kind="UNSUPPORTED_KIND",
+            entity_type="ACTIVE_MEMBERSHIP",
+            entity_id=22,
+            revision="2026-04-12T12:20:01Z",
+        ),
+        bundle_id="bundle-rollback-late-failure",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported fast patch item"):
+        db.apply_fast_patch_bundle(bundle)
+
+    assert db.list_sync_users() == []
+    with db.get_conn() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM fast_patch_bundles WHERE bundle_id = ?",
+            ("bundle-rollback-late-failure",),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM fast_patch_revisions"
+        ).fetchone()[0] == 0

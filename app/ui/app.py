@@ -1460,14 +1460,26 @@ class MainApp:
                 for item_index, item in enumerate(raw_items)
                 if isinstance(item, dict)
             }
-            applied_count = int(db_result.get("applied") or 0)
-            skipped_count = int(db_result.get("skipped") or 0)
+            raw_applied_count = db_result.get("applied")
+            raw_skipped_count = db_result.get("skipped")
+            counts_valid = (
+                isinstance(raw_applied_count, int)
+                and not isinstance(raw_applied_count, bool)
+                and raw_applied_count >= 0
+                and isinstance(raw_skipped_count, int)
+                and not isinstance(raw_skipped_count, bool)
+                and raw_skipped_count >= 0
+                and raw_applied_count + raw_skipped_count == len(indexed_items)
+            )
+            applied_count = raw_applied_count if counts_valid else 0
+            skipped_count = raw_skipped_count if counts_valid else 0
             accepted_indexes = db_result.get("appliedItemIndexes")
             identity_ambiguous = False
 
             if "appliedItemIndexes" in db_result:
                 valid_indexes = (
-                    isinstance(accepted_indexes, list)
+                    counts_valid
+                    and isinstance(accepted_indexes, list)
                     and all(
                         isinstance(item_index, int)
                         and not isinstance(item_index, bool)
@@ -1486,7 +1498,8 @@ class MainApp:
                     accepted_items = []
                     identity_ambiguous = True
             elif (
-                skipped_count == 0
+                counts_valid
+                and skipped_count == 0
                 and applied_count == len(indexed_items)
                 and len(indexed_items) == len(raw_items)
             ):
@@ -1498,8 +1511,8 @@ class MainApp:
             if identity_ambiguous:
                 self.logger.warning(
                     "[FastPatch] ambiguous applied item identity: applied=%s skipped=%s",
-                    applied_count,
-                    skipped_count,
+                    raw_applied_count,
+                    raw_skipped_count,
                 )
                 _schedule_full_reconcile("ambiguous_applied_item_identity")
 
