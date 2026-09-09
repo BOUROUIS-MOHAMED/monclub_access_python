@@ -531,6 +531,8 @@ Until a connect line settles it, **do not state either as the cause.**
 ## 9. Verifying this guide
 
 These are runnable, so "is this still true" is a command rather than a judgement.
+Run them after completing the README setup and activating the project `.venv`; the
+system Python is not expected to carry the application's test dependencies.
 
 ```bash
 python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*'
@@ -541,7 +543,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Last run:
-**1311 passed, 473 warnings** (2026-09-09, after the immediate authoritative revocation
+**1313 passed, 1 warning** (2026-09-09, after the immediate authoritative revocation
 work; exit code 0). `[TEST]`
 
 ```bash

@@ -28,11 +28,30 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import Protocol
 
 import pytest
 
 from app.core.device_sync import DeviceSyncEngine
 from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
+
+
+def _declared_protocol_members(protocol: type[Protocol]) -> set[str]:
+    """Return the public structural contract on supported Python versions."""
+    try:
+        from typing import get_protocol_members
+    except ImportError:  # Python 3.10/3.11, which this application supports.
+        get_protocol_members = None
+
+    if get_protocol_members is not None:
+        return set(get_protocol_members(protocol))
+    return {name for name in vars(protocol) if not name.startswith("_")}
+
+
+def _missing_protocol_members(protocol: type[Protocol], implementation: type) -> list[str]:
+    return sorted(
+        name for name in _declared_protocol_members(protocol) if not hasattr(implementation, name)
+    )
 
 
 def _engine() -> DeviceSyncEngine:
@@ -179,15 +198,41 @@ class TestTransactionTableCapability:
         drv = ZKStandaloneDevice.__new__(ZKStandaloneDevice)
         assert drv.delete_all_transaction_rows() == 0
 
+    def test_protocol_member_discovery_finds_the_declared_public_contract(self):
+        class _Contract(Protocol):
+            @property
+            def is_connected(self) -> bool: ...
+
+            def connect(self) -> bool: ...
+
+        assert _declared_protocol_members(_Contract) == {"connect", "is_connected"}
+
+    def test_missing_member_check_detects_each_incomplete_driver(self):
+        class _Contract(Protocol):
+            def connect(self) -> bool: ...
+
+            def disconnect(self) -> None: ...
+
+        class _ConnectOnly:
+            def connect(self) -> bool:
+                return True
+
+        class _DisconnectOnly:
+            def disconnect(self) -> None:
+                return None
+
+        assert _missing_protocol_members(_Contract, _ConnectOnly) == ["disconnect"]
+        assert _missing_protocol_members(_Contract, _DisconnectOnly) == ["connect"]
+
     def test_both_drivers_satisfy_the_declared_protocol(self):
         from app.sdk.device_driver import DeviceDriver
         from app.sdk.pullsdk import PullSDKDevice
         from app.sdk.zk_standalone import ZKStandaloneDevice
 
-        members = list(getattr(DeviceDriver, "__protocol_attrs__", []))
+        members = sorted(_declared_protocol_members(DeviceDriver))
         assert members, "DeviceDriver exposes no protocol members to check"
         for cls in (PullSDKDevice, ZKStandaloneDevice):
-            missing = [m for m in members if not hasattr(cls, m)]
+            missing = _missing_protocol_members(DeviceDriver, cls)
             assert not missing, f"{cls.__name__} is missing {missing}"
 
 
