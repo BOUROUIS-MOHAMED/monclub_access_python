@@ -5346,14 +5346,14 @@ class UltraSyncScheduler:
                 if worker is not None and _worker_is_usable(worker):
                     try:
                         commands_handled = True
-                        for member_id in sorted(normalized_revoked_ids):
-                            commands_handled = (
-                                _worker_member_revoke_accepted_or_covered(
-                                    worker, member_id
-                                )
-                                and commands_handled
-                            )
                         if normalized_changed_ids is not None:
+                            for member_id in sorted(normalized_revoked_ids):
+                                commands_handled = (
+                                    _worker_member_revoke_accepted_or_covered(
+                                        worker, member_id
+                                    )
+                                    and commands_handled
+                                )
                             for member_id in sorted(normalized_changed_ids):
                                 commands_handled = (
                                     _worker_request_accepted_or_pending(
@@ -6091,13 +6091,6 @@ class UltraEngine:
                 continue
             try:
                 commands_handled = True
-                for member_id in sorted(normalized_revoked_ids):
-                    commands_handled = (
-                        _worker_member_revoke_accepted_or_covered(
-                            worker, member_id
-                        )
-                        and commands_handled
-                    )
                 if normalized_changed_ids is None:
                     commands_handled = (
                         _worker_full_sync_accepted_or_pending(
@@ -6109,6 +6102,13 @@ class UltraEngine:
                         and commands_handled
                     )
                 else:
+                    for member_id in sorted(normalized_revoked_ids):
+                        commands_handled = (
+                            _worker_member_revoke_accepted_or_covered(
+                                worker, member_id
+                            )
+                            and commands_handled
+                        )
                     for member_id in sorted(normalized_changed_ids):
                         commands_handled = (
                             _worker_request_accepted_or_pending(

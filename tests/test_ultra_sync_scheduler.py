@@ -471,7 +471,7 @@ def test_ultra_engine_request_sync_now_routes_full_refresh_to_live_workers():
     scheduler.request_sync_now.assert_not_called()
 
 
-def test_ultra_engine_full_refresh_routes_revocation_before_filtered_full_sync():
+def test_ultra_engine_full_refresh_routes_revocation_as_one_full_command():
     import app.core.ultra_engine as ultra_module
 
     routed: list[tuple[str, object]] = []
@@ -501,7 +501,6 @@ def test_ultra_engine_full_refresh_routes_revocation_before_filtered_full_sync()
 
     assert started is True
     assert routed == [
-        ("revoke", 17),
         (
             "full",
             {
@@ -511,6 +510,34 @@ def test_ultra_engine_full_refresh_routes_revocation_before_filtered_full_sync()
             },
         ),
     ]
+    scheduler.request_sync_now.assert_not_called()
+
+
+def test_ultra_engine_revoke_only_still_routes_immediate_member_command():
+    import app.core.ultra_engine as ultra_module
+
+    worker = SimpleNamespace(
+        request_member_revoke=MagicMock(return_value=True),
+        request_full_sync=MagicMock(return_value=True),
+    )
+    scheduler = SimpleNamespace(request_sync_now=MagicMock())
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    assert ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=set(),
+        revoked_ids={17},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    ) is True
+
+    worker.request_member_revoke.assert_called_once_with(17)
+    worker.request_full_sync.assert_not_called()
     scheduler.request_sync_now.assert_not_called()
 
 
@@ -1169,6 +1196,11 @@ def _blocked_pull_full_sync_worker(
         def __init__(self, cfg, logger):
             self._last_single_device_error = "planned failure"
 
+        def build_device_sync_fingerprint(
+            self, *, device, users, local_fp_index=None, detail_out=None,
+        ):
+            return "compound-full-hash", len(users)
+
         def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
             events.append(("targeted", member_id))
             return True
@@ -1445,25 +1477,22 @@ def test_required_full_refresh_during_active_targeted_revoke_is_exclusion_only(
     ]
 
 
-def test_engine_preserves_full_refresh_when_targeted_revoke_becomes_active(monkeypatch):
+def test_engine_compound_full_refresh_revokes_once_and_filters_stale_roster(monkeypatch):
     import app.core.ultra_engine as ultra_module
 
-    worker, events, entered, release = _blocked_pull_targeted_revoke_worker(monkeypatch)
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch,
+        [True],
+        block_first=False,
+    )
     request_member_revoke = worker.request_member_revoke
-    drain_threads: list[threading.Thread] = []
 
-    def request_and_activate(member_id):
-        accepted = request_member_revoke(member_id)
-        thread = threading.Thread(
-            target=worker._drain_member_sync_commands,
-            kwargs={"limit": 1},
-        )
-        drain_threads.append(thread)
-        thread.start()
-        assert entered.wait(1.0)
-        return accepted
+    def revoke_then_complete(member_id):
+        handled = request_member_revoke(member_id)
+        assert worker._drain_member_sync_commands(limit=1) == 1
+        return handled
 
-    worker.request_member_revoke = request_and_activate
+    worker.request_member_revoke = MagicMock(side_effect=revoke_then_complete)
     worker.is_alive = lambda: True
     scheduler = SimpleNamespace(
         _devices=[worker._device],
@@ -1476,29 +1505,71 @@ def test_engine_preserves_full_refresh_when_targeted_revoke_becomes_active(monke
         _logger=MagicMock(),
     )
 
-    try:
-        assert ultra_module.UltraEngine.request_sync_now(
-            engine,
-            changed_ids=None,
-            revoked_ids={41},
-            device_ids={5},
-            reason="device_refresh",
-        ) is True
-        assert worker._active_member_revoke_ids == {41}
-        assert worker._pending_full_sync_request["revoked_ids"] == set()
-        assert worker._pending_full_sync_request["excluded_ids"] == {41}
-        assert worker._pending_full_sync_request["require_full_refresh"] is True
-        scheduler.request_sync_now.assert_not_called()
-    finally:
-        release.set()
-        for thread in drain_threads:
-            thread.join(timeout=1.0)
-            assert not thread.is_alive()
+    assert ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=None,
+        revoked_ids={41},
+        device_ids={5},
+        reason="device_refresh",
+    ) is True
+    worker.request_member_revoke.assert_not_called()
+    assert worker._pending_full_sync_request["revoked_ids"] == {41}
+    assert worker._pending_full_sync_request["excluded_ids"] == {41}
+    assert worker._pending_full_sync_request["require_full_refresh"] is True
+    scheduler.request_sync_now.assert_not_called()
 
     assert worker._drain_full_sync_commands(limit=1) == 1
     assert events == [
         ("targeted", 41),
-        ("full", {43}),
+        ("full", {43, 99}),
+    ]
+    assert worker.has_pending_member_revoke(41) is False
+    assert worker._confirmed_member_revoke_ids == set()
+
+
+def test_scheduler_compound_full_refresh_revokes_once_and_filters_stale_roster(
+        monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch,
+        [True],
+        block_first=False,
+    )
+    request_member_revoke = worker.request_member_revoke
+
+    def revoke_then_complete(member_id):
+        handled = request_member_revoke(member_id)
+        assert worker._drain_member_sync_commands(limit=1) == 1
+        return handled
+
+    worker.request_member_revoke = MagicMock(side_effect=revoke_then_complete)
+    worker.is_alive = lambda: True
+    scheduler = ultra_module.UltraSyncScheduler(
+        cfg=SimpleNamespace(),
+        logger_inst=MagicMock(),
+    )
+    scheduler.set_workers({5: worker})
+    scheduler._devices = [worker._device]
+    scheduler._sync_device = MagicMock(return_value=True)
+
+    scheduler._sync_all(
+        changed_ids=None,
+        revoked_ids={41},
+        device_ids={5},
+        reason="device_refresh",
+    )
+
+    worker.request_member_revoke.assert_not_called()
+    assert worker._pending_full_sync_request["revoked_ids"] == {41}
+    assert worker._pending_full_sync_request["excluded_ids"] == {41}
+    assert worker._pending_full_sync_request["require_full_refresh"] is True
+    scheduler._sync_device.assert_not_called()
+
+    assert worker._drain_full_sync_commands(limit=1) == 1
+    assert events == [
+        ("targeted", 41),
+        ("full", {43, 99}),
     ]
     assert worker.has_pending_member_revoke(41) is False
     assert worker._confirmed_member_revoke_ids == set()
