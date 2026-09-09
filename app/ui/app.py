@@ -807,6 +807,8 @@ class MainApp:
         refresh: Dict[str, Any],
         delta_changed_ids: set[int] | None,
         cache_members_delete_refused: bool = False,
+        authoritative_member_ids: list[int] | None = None,
+        authoritative_member_ids_valid: bool | None = None,
     ) -> tuple[set[int] | None, set[int]]:
         original_changed_ids = (
             None
@@ -817,7 +819,26 @@ class MainApp:
         if not refresh.get("members"):
             return original_changed_ids, revoked_ids
 
+        if authoritative_member_ids_valid is None:
+            from app.core.db import _resolve_authoritative_member_ids
+
+            (
+                authoritative_member_ids,
+                authoritative_member_ids_valid,
+                _authority_error,
+            ) = _resolve_authoritative_member_ids(data)
+        if not authoritative_member_ids_valid:
+            cache_members_delete_refused = True
+
         if cache_members_delete_refused and not data.get("membersDeltaMode"):
+            try:
+                from app.core.db import upsert_member_shadow
+
+                upsert_member_shadow(users=data.get("users") or [])
+            except Exception as _shadow_exc:
+                self.logger.warning(
+                    "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
+                )
             self.logger.warning(
                 "[ShadowDiff] full member deletion refused by authoritative cache write; "
                 "preserving shadow"
@@ -825,7 +846,6 @@ class MainApp:
             return original_changed_ids, revoked_ids
 
         _incoming_users = data.get("users") or []
-        _valid_ids_raw = data.get("validMemberIds")
         try:
             from app.core.db import (
                 apply_member_shadow_delta,
@@ -834,10 +854,7 @@ class MainApp:
                 upsert_member_shadow,
             )
 
-            _valid_ids = (
-                list(_normalize_positive_member_ids(_valid_ids_raw))
-                if _valid_ids_raw is not None else None
-            )
+            _valid_ids = authoritative_member_ids
 
             if data.get("membersDeltaMode"):
                 _shadow_valid_ids = _valid_ids
@@ -2647,6 +2664,12 @@ class MainApp:
                         cache_members_delete_refused=bool(
                             _cache_write_outcome.get("members_delete_refused")
                         ),
+                        authoritative_member_ids=_cache_write_outcome.get(
+                            "authoritative_member_ids"
+                        ),
+                        authoritative_member_ids_valid=bool(
+                            _cache_write_outcome.get("authoritative_member_ids_valid", True)
+                        ),
                     )
                     _shadow_ms = int((time.perf_counter() - _shadow_started) * 1000)
                     if _shadow_ms >= 250:
@@ -2666,6 +2689,16 @@ class MainApp:
                     changed_ids=_delta_changed_ids,
                     revoked_ids=_delta_revoked_ids,
                 )
+
+                if _cache_write_outcome.get("members_delete_refused"):
+                    new_tokens = strip_all_member_version_tokens(new_tokens)
+                    from app.core.db import delete_version_tokens
+
+                    delete_version_tokens({"membersVersion", "membersUpdatedAfter"})
+                    self.logger.warning(
+                        "[SYNC-DEBUG] refused member deletion; cleared member progress "
+                        "tokens for an authoritative retry"
+                    )
 
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they

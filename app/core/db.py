@@ -1877,6 +1877,22 @@ def clear_version_tokens() -> None:
     _run_db_write_sync("clear_version_tokens", _write)
 
 
+def delete_version_tokens(keys: set[str]) -> None:
+    """Delete selected sync progress markers while preserving unrelated sections."""
+    normalized = {str(key) for key in keys or set() if str(key)}
+    if not normalized:
+        return
+    placeholders = ",".join("?" * len(normalized))
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
+        conn.execute(
+            f"DELETE FROM sync_version_tokens WHERE key IN ({placeholders})",
+            sorted(normalized),
+        )
+
+    _run_db_write_sync("delete_version_tokens", _write)
+
+
 # -----------------------------
 # Phase 2: Firmware profile cache
 # -----------------------------
@@ -4247,7 +4263,12 @@ def _sqlite_affinity_norm(value: Any, *, integer: bool) -> Any:
     return str(value)
 
 
-def _apply_full_users_refresh(cur: sqlite3.Cursor, users: List[Any]) -> Dict[str, Any]:
+def _apply_full_users_refresh(
+    cur: sqlite3.Cursor,
+    users: List[Any],
+    *,
+    allow_deletions: bool = True,
+) -> Dict[str, Any]:
     """FULL member refresh as a per-row diff of sync_users against the incoming payload.
 
     Replaces ``DELETE FROM sync_users`` + a re-INSERT of every row (2026-08-30 gym log:
@@ -4360,7 +4381,10 @@ def _apply_full_users_refresh(cur: sqlite3.Cursor, users: List[Any]) -> Dict[str
 
     t_del = time.perf_counter()
     absent = [rowid for key, (rowid, _vals) in current.items() if key not in seen]
-    to_delete = doomed + absent
+    # NULL-key rows cannot be matched by the partial unique index and are replaced
+    # by the incoming NULL-key rows even when authoritative absent-row deletions are
+    # suppressed. Stored keyed members remain untouched in that mode.
+    to_delete = doomed + absent if allow_deletions else doomed
     for i in range(0, len(to_delete), 500):
         chunk = to_delete[i:i + 500]
         placeholders = ",".join("?" * len(chunk))
@@ -4453,6 +4477,50 @@ def _log_incoming_templates(users: Any, delta_mode: bool) -> None:
 _H006_MIN_CACHE_ROWS = 10
 
 
+def _canonical_positive_member_id(raw_value: Any) -> int | None:
+    if isinstance(raw_value, bool):
+        return None
+    if isinstance(raw_value, int):
+        return raw_value if raw_value > 0 else None
+    if (
+        isinstance(raw_value, str)
+        and raw_value.isascii()
+        and raw_value.isdecimal()
+        and not raw_value.startswith("0")
+    ):
+        return int(raw_value)
+    return None
+
+
+def _resolve_authoritative_member_ids(
+    data: Dict[str, Any],
+) -> tuple[List[int] | None, bool, str | None]:
+    delta_mode = bool(data.get("membersDeltaMode", False))
+    if "validMemberIds" in data and data.get("validMemberIds") is not None:
+        raw_ids = data.get("validMemberIds")
+        if not isinstance(raw_ids, list):
+            return None, False, "malformed_valid_member_ids"
+    elif delta_mode:
+        return None, True, None
+    else:
+        users = data.get("users")
+        if not isinstance(users, list):
+            return None, False, "malformed_full_users"
+        raw_ids = []
+        for user in users:
+            if not isinstance(user, dict) or "activeMembershipId" not in user:
+                return None, False, "malformed_full_member_id"
+            raw_ids.append(user.get("activeMembershipId"))
+
+    normalized: set[int] = set()
+    for raw_id in raw_ids:
+        member_id = _canonical_positive_member_id(raw_id)
+        if member_id is None:
+            return None, False, "malformed_member_id"
+        normalized.add(member_id)
+    return sorted(normalized), True, None
+
+
 def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
@@ -4483,6 +4551,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     contract_end_date = (data.get("contractEndDate") or "").strip()
     access_settings = data.get("accessSoftwareSettings") or data.get("access_software_settings") or None
     memberships = data.get("membership") or data.get("memberships") or []
+    authoritative_ids, authoritative_ids_valid, authoritative_ids_error = (
+        _resolve_authoritative_member_ids(data)
+    )
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, Any]:
         cur = conn.cursor()
         profile["members_refresh"] = bool(refresh.get("members", True))
@@ -4519,7 +4590,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                 users = data.get("users") or []
                 delta_mode = bool(data.get("membersDeltaMode", False))
                 _log_incoming_templates(users, delta_mode)
-                valid_ids = data.get("validMemberIds")
+                valid_ids = authoritative_ids
                 profile["members_delta_mode"] = delta_mode
                 profile["incoming_users"] = len(users) if isinstance(users, list) else 0
 
@@ -4571,7 +4642,13 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                             )
                             upserted_count += 1
                         members_upsert_ms = (time.perf_counter() - t_upsert) * 1000.0
-                    if valid_ids is not None:
+                    if not authoritative_ids_valid:
+                        delete_refused = True
+                        _logger.error(
+                            "[DB] save_sync_cache_delta: refusing member deletions: %s",
+                            authoritative_ids_error,
+                        )
+                    elif valid_ids is not None:
                         t_valid = time.perf_counter()
                         valid_set = set(valid_ids)
                         members_validset_ms = (time.perf_counter() - t_valid) * 1000.0
@@ -4656,7 +4733,14 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                     # [TEST: tests/test_full_replace_row_diff.py]
                     full_refresh_refused = False
                     full_refresh_refused_count = 0
-                    if not users:
+                    if not authoritative_ids_valid:
+                        full_refresh_refused = True
+                        full_refresh_refused_count = old_count
+                        _logger.error(
+                            "[DB] save_sync_cache_delta: refusing full member deletions: %s",
+                            authoritative_ids_error,
+                        )
+                    elif not authoritative_ids:
                         if old_count > _H006_MIN_CACHE_ROWS:
                             full_refresh_refused = True
                             full_refresh_refused_count = old_count
@@ -4673,6 +4757,11 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                     profile["members_full_refresh_refused"] = full_refresh_refused
                     profile["members_full_refresh_refused_count"] = full_refresh_refused_count
 
+                    if full_refresh_refused and users:
+                        # Malformed authority blocks removals, not safe row upserts.
+                        profile.update(
+                            _apply_full_users_refresh(cur, users, allow_deletions=False)
+                        )
                     if not full_refresh_refused:
                         # Per-row diff (2026-09-04). Until then this branch hashed the whole
                         # table and, when the hash differed, ran DELETE FROM sync_users + a
@@ -4685,7 +4774,11 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                         # (member_shadow / device_sync_state hashes stay valid either way).
                         # Keyed on the (user_id, active_membership_id) pair -- see
                         # _apply_full_users_refresh. [TEST: tests/test_full_replace_row_diff.py]
-                        full_stats = _apply_full_users_refresh(cur, users)
+                        full_stats = _apply_full_users_refresh(
+                            cur,
+                            users,
+                            allow_deletions=not full_refresh_refused,
+                        )
                         profile.update(full_stats)
                         _logger.info(
                             "[SYNC-DEBUG] save_sync_cache_delta: full refresh diff "
@@ -4756,6 +4849,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                 profile.get("members_delete_refused")
                 or profile.get("members_full_refresh_refused")
             ),
+            "authoritative_member_ids": authoritative_ids,
+            "authoritative_member_ids_valid": authoritative_ids_valid,
+            "authoritative_member_ids_error": authoritative_ids_error,
         }
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}

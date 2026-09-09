@@ -102,6 +102,79 @@ def test_full_authoritative_deletion_is_returned_only_as_revocation(db):
     assert _shadow_ids(db) == {1}
 
 
+def test_full_without_valid_ids_derives_authority_from_incoming_roster(db):
+    from app.ui.app import MainApp
+
+    users = [_make_user(1), _make_user(2)]
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    db.save_sync_cache_delta(
+        {"users": users, "membersDeltaMode": False, "contractStatus": True}, refresh
+    )
+    db.upsert_member_shadow(users=users)
+    response = {"users": [_make_user(1)], "membersDeltaMode": False, "contractStatus": True}
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(),
+        data=response,
+        refresh=refresh,
+        delta_changed_ids=None,
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+    )
+
+    assert changed is None
+    assert revoked == {2}
+    assert set(db.get_all_cached_user_am_ids()) == {1}
+    assert _shadow_ids(db) == {1}
+
+
+@pytest.mark.parametrize(
+    ("raw_valid_ids", "refused", "remaining"),
+    [
+        (["1"], False, {1}),
+        ([True], True, {1, 2}),
+        ([1.5], True, {1, 2}),
+        (["1.5"], True, {1, 2}),
+    ],
+)
+def test_cache_and_shadow_share_one_authoritative_id_contract(
+    db, raw_valid_ids, refused, remaining
+):
+    from app.ui.app import MainApp
+
+    users = [_make_user(1), _make_user(2)]
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    db.save_sync_cache_delta(
+        {"users": users, "membersDeltaMode": False, "contractStatus": True}, refresh
+    )
+    db.upsert_member_shadow(users=users)
+    response = {
+        "users": [],
+        "membersDeltaMode": True,
+        "validMemberIds": raw_valid_ids,
+        "contractStatus": True,
+    }
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(),
+        data=response,
+        refresh=refresh,
+        delta_changed_ids=set(),
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+    )
+
+    assert outcome["members_delete_refused"] is refused
+    assert set(db.get_all_cached_user_am_ids()) == remaining
+    assert _shadow_ids(db) == remaining
+    assert revoked == (set() if refused else {2})
+    assert changed == set()
+
+
 def test_full_h006_cache_refusal_preserves_shadow_and_emits_no_revocations(db):
     from app.ui.app import MainApp
 
@@ -118,6 +191,9 @@ def test_full_h006_cache_refusal_preserves_shadow_and_emits_no_revocations(db):
         "validMemberIds": list(range(1, 12)),
         "contractStatus": True,
         "contractEndDate": "2026-12-31",
+        "currentMembersVersion": "new-members",
+        "currentMembersRefreshedAt": "new-watermark",
+        "currentDevicesVersion": "new-devices",
     }
     db.save_sync_cache_delta(seed, refresh)
     db.upsert_member_shadow(users=users)
@@ -339,6 +415,7 @@ def _run_main_sync_dispatch(
     changed_ids,
     revoked_ids,
     cache_members_delete_refused=False,
+    use_real_tokens=False,
 ):
     import app.ui.app as app_module
 
@@ -352,6 +429,9 @@ def _run_main_sync_dispatch(
         "validMemberIds": sorted((changed_ids or set()) | revoked_ids),
         "contractStatus": True,
         "contractEndDate": "2026-12-31",
+        "currentMembersVersion": "new-members",
+        "currentMembersRefreshedAt": "new-watermark",
+        "currentDevicesVersion": "new-devices",
     }
     api = SimpleNamespace(
         do_proactive_refresh=MagicMock(return_value=False),
@@ -360,6 +440,8 @@ def _run_main_sync_dispatch(
     ultra_request = MagicMock(return_value=True)
     device_run = MagicMock(return_value=True)
     shadow_sync = MagicMock(return_value=(changed_ids, revoked_ids))
+    token_save = MagicMock()
+    token_delete = MagicMock()
     ultra_device = {"id": 2, "accessDataMode": "ULTRA"}
     cache = SimpleNamespace(devices=[ultra_device], users=[])
     ultra_engine = SimpleNamespace(
@@ -426,7 +508,9 @@ def _run_main_sync_dispatch(
             }
         ),
     )
-    monkeypatch.setattr(app_module, "save_version_tokens", MagicMock())
+    if not use_real_tokens:
+        monkeypatch.setattr(app_module, "save_version_tokens", token_save)
+        monkeypatch.setattr("app.core.db.delete_version_tokens", token_delete)
     monkeypatch.setattr(app_module, "member_cache_is_stale", lambda *_args: False)
     monkeypatch.setattr("app.core.db.insert_sync_run", lambda **_kwargs: None)
     monkeypatch.setattr("app.core.db.invalidate_sync_cache", lambda: None)
@@ -438,7 +522,7 @@ def _run_main_sync_dispatch(
     )
 
     app_module.MainApp._sync_tick(app)
-    return ultra_request, device_run, shadow_sync
+    return ultra_request, device_run, shadow_sync, token_save, token_delete
 
 
 @pytest.mark.parametrize(
@@ -451,7 +535,7 @@ def _run_main_sync_dispatch(
 def test_main_sync_dispatches_separate_ultra_ids_and_legacy_device_union(
     monkeypatch, changed_ids, revoked_ids, expected_device_ids
 ):
-    ultra_request, device_run, _shadow_sync = _run_main_sync_dispatch(
+    ultra_request, device_run, _shadow_sync, _token_save, _token_delete = _run_main_sync_dispatch(
         monkeypatch,
         changed_ids=changed_ids,
         revoked_ids=revoked_ids,
@@ -466,12 +550,23 @@ def test_main_sync_dispatches_separate_ultra_ids_and_legacy_device_union(
     assert device_run.call_args.kwargs["changed_ids"] == expected_device_ids
 
 
-def test_main_sync_h006_refusal_dispatches_no_revocations(monkeypatch):
-    ultra_request, device_run, shadow_sync = _run_main_sync_dispatch(
+def test_main_sync_h006_refusal_dispatches_no_revocations_and_clears_member_tokens(
+    db, monkeypatch
+):
+    db.save_version_tokens(
+        {
+            "membersVersion": "old-members",
+            "membersUpdatedAfter": "old-watermark",
+            "devicesVersion": "old-devices",
+            "credentialsVersion": "old-credentials",
+        }
+    )
+    ultra_request, device_run, shadow_sync, token_save, token_delete = _run_main_sync_dispatch(
         monkeypatch,
         changed_ids=None,
         revoked_ids=set(),
         cache_members_delete_refused=True,
+        use_real_tokens=True,
     )
 
     assert shadow_sync.call_args.kwargs["cache_members_delete_refused"] is True
@@ -482,6 +577,10 @@ def test_main_sync_h006_refusal_dispatches_no_revocations(monkeypatch):
         reason="timer",
     )
     assert device_run.call_args.kwargs["changed_ids"] is None
+    assert db.load_version_tokens() == {
+        "devicesVersion": "new-devices",
+        "credentialsVersion": "old-credentials",
+    }
 
 
 @pytest.mark.parametrize(
@@ -507,5 +606,5 @@ def test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids(
     )
 
     assert changed == set()
-    assert revoked == {2}
-    assert _shadow_ids(db) == set()
+    assert revoked == set()
+    assert _shadow_ids(db) == {2}
