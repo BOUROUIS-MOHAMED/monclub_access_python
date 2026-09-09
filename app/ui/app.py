@@ -179,23 +179,26 @@ def _shadow_am_id(u: Any) -> int | None:
         return None
 
 
+def _positive_integral_id_or_none(raw_value: Any) -> int | None:
+    if isinstance(raw_value, bool):
+        return None
+    if isinstance(raw_value, int):
+        return raw_value if raw_value > 0 else None
+    if (
+        isinstance(raw_value, str)
+        and raw_value.isascii()
+        and raw_value.isdecimal()
+        and not raw_value.startswith("0")
+    ):
+        return int(raw_value)
+    return None
+
+
 def _normalize_positive_member_ids(values: Any) -> set[int]:
     normalized = set()
     for raw_value in values or ():
-        if isinstance(raw_value, bool):
-            continue
-        if isinstance(raw_value, int):
-            member_id = raw_value
-        elif (
-            isinstance(raw_value, str)
-            and raw_value.isascii()
-            and raw_value.isdecimal()
-            and not raw_value.startswith("0")
-        ):
-            member_id = int(raw_value)
-        else:
-            continue
-        if member_id > 0:
+        member_id = _positive_integral_id_or_none(raw_value)
+        if member_id is not None:
             normalized.add(member_id)
     return normalized
 
@@ -941,9 +944,10 @@ class MainApp:
 
         if started:
             self.logger.info(
-                "[ULTRA] immediate sync requested: reason=%s changed_ids=%s device_ids=%s",
+                "[ULTRA] immediate sync requested: reason=%s changed_ids=%s revoked_ids=%s device_ids=%s",
                 normalized_reason,
                 "all" if requested_changed_ids is None else len(requested_changed_ids),
+                len(requested_revoked_ids),
                 "all" if requested_device_ids is None else len(requested_device_ids),
             )
         return started
@@ -1423,74 +1427,205 @@ class MainApp:
         if db_result.get("ignored") == "duplicate_bundle":
             return {"ok": True, "duplicate": True, **db_result}
 
-        invalidate_sync_cache()
-        refresh_sync_cache_async()
-        self.reset_runtime_fast_patch_caches()
+        fallback_requested = False
 
-        items = [item for item in list((bundle or {}).get("items") or []) if isinstance(item, dict)]
-        affected_member_ids = {
-            int(member_id)
-            for item in items
-            for member_id in list(((item.get("impact") or {}).get("affectedMemberIds") or []))
-            if member_id is not None
-        }
-        affected_device_ids = {
-            int(device_id)
-            for item in items
-            for device_id in list(((item.get("impact") or {}).get("affectedDeviceIds") or []))
-            if device_id is not None
-        }
-        revoked_member_ids = set()
-        for item in items:
-            if (
-                str(item.get("kind") or "").strip().upper() != "ENTITY_DELETE"
-                or str(item.get("entityType") or "").strip().upper()
-                != "ACTIVE_MEMBERSHIP"
+        def _schedule_full_reconcile(reason: str) -> None:
+            nonlocal fallback_requested
+            if fallback_requested:
+                return
+            fallback_requested = True
+            self.logger.warning(
+                "[FastPatch] scheduling full reconcile fallback: reason=%s",
+                reason,
+            )
+            try:
+                self.request_sync_now(
+                    trigger_source="FAST_PATCH_BUNDLE",
+                    run_type="TRIGGERED",
+                    trigger_hint={"reason": "fast_patch_bundle"},
+                )
+            except Exception:
+                self.logger.exception(
+                    "[FastPatch] failed to schedule full reconcile fallback"
+                )
+
+        try:
+            invalidate_sync_cache()
+            refresh_sync_cache_async()
+            self.reset_runtime_fast_patch_caches()
+
+            raw_items = list((bundle or {}).get("items") or [])
+            indexed_items = {
+                item_index: item
+                for item_index, item in enumerate(raw_items)
+                if isinstance(item, dict)
+            }
+            applied_count = int(db_result.get("applied") or 0)
+            skipped_count = int(db_result.get("skipped") or 0)
+            accepted_indexes = db_result.get("appliedItemIndexes")
+            identity_ambiguous = False
+
+            if "appliedItemIndexes" in db_result:
+                valid_indexes = (
+                    isinstance(accepted_indexes, list)
+                    and all(
+                        isinstance(item_index, int)
+                        and not isinstance(item_index, bool)
+                        and item_index in indexed_items
+                        for item_index in accepted_indexes
+                    )
+                    and len(set(accepted_indexes)) == len(accepted_indexes)
+                    and len(accepted_indexes) == applied_count
+                )
+                if valid_indexes:
+                    accepted_items = [
+                        (item_index, indexed_items[item_index])
+                        for item_index in accepted_indexes
+                    ]
+                else:
+                    accepted_items = []
+                    identity_ambiguous = True
+            elif (
+                skipped_count == 0
+                and applied_count == len(indexed_items)
+                and len(indexed_items) == len(raw_items)
             ):
-                continue
-            revoked_member_ids.update(
-                _normalize_positive_member_ids((item.get("entityId"),))
-            )
-        affected_member_ids.difference_update(revoked_member_ids)
-        normalized_types = {
-            str(item.get("entityType") or "").strip().upper()
-            for item in items
-            if item.get("entityType") is not None
-        }
-        needs_member_refresh = bool(affected_member_ids) or any(
-            str(item.get("entityType") or "").strip().upper() == "ACTIVE_MEMBERSHIP"
-            for item in items
-        )
-        needs_device_refresh = any(
-            str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
-            or bool((item.get("impact") or {}).get("requiresDeviceRescope"))
-            for item in items
-        )
-        is_fast_member_bundle = bool(items) and all(
-            (
-                str(item.get("entityType") or "").strip().upper() == "ACTIVE_MEMBERSHIP"
-            ) or (
-                str(item.get("entityType") or "").strip().upper() == "CREDENTIALS"
-                and str(((item.get("payload") or {}).get("mergeMode") or "")).strip().upper() == "UPSERT_ONLY"
-            )
-            for item in items
-        ) and normalized_types.issubset({"ACTIVE_MEMBERSHIP", "CREDENTIALS"})
+                accepted_items = list(indexed_items.items())
+            else:
+                accepted_items = []
+                identity_ambiguous = True
 
-        if needs_member_refresh or needs_device_refresh:
-            self._request_running_ultra_sync(
-                refresh={"members": needs_member_refresh, "devices": needs_device_refresh},
-                changed_ids=None if needs_device_refresh else affected_member_ids,
-                revoked_ids=revoked_member_ids,
-                device_ids=affected_device_ids or None,
-                reason="FAST_PATCH_BUNDLE",
-            )
+            if identity_ambiguous:
+                self.logger.warning(
+                    "[FastPatch] ambiguous applied item identity: applied=%s skipped=%s",
+                    applied_count,
+                    skipped_count,
+                )
+                _schedule_full_reconcile("ambiguous_applied_item_identity")
 
-        if bool((bundle or {}).get("requiresReconcile", True)) and not is_fast_member_bundle:
-            self.request_sync_now(
-                trigger_source="FAST_PATCH_BUNDLE",
-                run_type="TRIGGERED",
-                trigger_hint={"reason": "fast_patch_bundle"},
+            affected_member_ids: set[int] = set()
+            affected_device_ids: set[int] = set()
+            revoked_member_ids: set[int] = set()
+            targeting_uncertain = identity_ambiguous
+
+            for item_index, item in accepted_items:
+                kind = str(item.get("kind") or "").strip().upper()
+                entity_type = str(item.get("entityType") or "").strip().upper()
+                if kind == "ENTITY_DELETE" and entity_type == "ACTIVE_MEMBERSHIP":
+                    revoked_member_ids.update(
+                        _normalize_positive_member_ids((item.get("entityId"),))
+                    )
+
+                impact = item.get("impact")
+                if not isinstance(impact, dict):
+                    targeting_uncertain = True
+                    self.logger.warning(
+                        "[FastPatch] malformed impact: item_index=%s type=%s",
+                        item_index,
+                        type(impact).__name__,
+                    )
+                    continue
+
+                for field_name, destination in (
+                    ("affectedMemberIds", affected_member_ids),
+                    ("affectedDeviceIds", affected_device_ids),
+                ):
+                    raw_ids = impact.get(field_name, [])
+                    if raw_ids is None:
+                        raw_ids = []
+                    if not isinstance(raw_ids, (list, tuple, set, frozenset)):
+                        targeting_uncertain = True
+                        self.logger.warning(
+                            "[FastPatch] malformed impact field: item_index=%s field=%s type=%s",
+                            item_index,
+                            field_name,
+                            type(raw_ids).__name__,
+                        )
+                        continue
+                    for raw_id in raw_ids:
+                        normalized_id = _positive_integral_id_or_none(raw_id)
+                        if normalized_id is None:
+                            targeting_uncertain = True
+                            self.logger.warning(
+                                "[FastPatch] rejected impact id: item_index=%s field=%s value=%r",
+                                item_index,
+                                field_name,
+                                raw_id,
+                            )
+                            continue
+                        destination.add(normalized_id)
+
+            affected_member_ids.difference_update(revoked_member_ids)
+            items = [item for _, item in accepted_items]
+            normalized_types = {
+                str(item.get("entityType") or "").strip().upper()
+                for item in items
+                if item.get("entityType") is not None
+            }
+            needs_member_refresh = bool(affected_member_ids) or any(
+                str(item.get("entityType") or "").strip().upper()
+                == "ACTIVE_MEMBERSHIP"
+                for item in items
             )
+            needs_device_refresh = any(
+                str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
+                or bool((item.get("impact") or {}).get("requiresDeviceRescope"))
+                for item in items
+                if isinstance(item.get("impact"), dict)
+            )
+            is_fast_member_bundle = bool(items) and all(
+                (
+                    str(item.get("entityType") or "").strip().upper()
+                    == "ACTIVE_MEMBERSHIP"
+                )
+                or (
+                    str(item.get("entityType") or "").strip().upper()
+                    == "CREDENTIALS"
+                    and str(
+                        ((item.get("payload") or {}).get("mergeMode") or "")
+                    ).strip().upper()
+                    == "UPSERT_ONLY"
+                )
+                for item in items
+            ) and normalized_types.issubset({"ACTIVE_MEMBERSHIP", "CREDENTIALS"})
+
+            if targeting_uncertain:
+                _schedule_full_reconcile("malformed_or_uncertain_impact")
+                if revoked_member_ids:
+                    self._request_running_ultra_sync(
+                        refresh={"members": True, "devices": False},
+                        changed_ids=set(),
+                        revoked_ids=revoked_member_ids,
+                        device_ids=None,
+                        reason="FAST_PATCH_BUNDLE",
+                    )
+            elif needs_member_refresh or needs_device_refresh:
+                self._request_running_ultra_sync(
+                    refresh={
+                        "members": needs_member_refresh,
+                        "devices": needs_device_refresh,
+                    },
+                    changed_ids=None if needs_device_refresh else affected_member_ids,
+                    revoked_ids=revoked_member_ids,
+                    device_ids=affected_device_ids or None,
+                    reason="FAST_PATCH_BUNDLE",
+                )
+
+            if (
+                bool((bundle or {}).get("requiresReconcile", True))
+                and not is_fast_member_bundle
+                and not fallback_requested
+            ):
+                self.request_sync_now(
+                    trigger_source="FAST_PATCH_BUNDLE",
+                    run_type="TRIGGERED",
+                    trigger_hint={"reason": "fast_patch_bundle"},
+                )
+        except Exception:
+            self.logger.exception(
+                "[FastPatch] post-commit runtime dispatch failed; using full reconcile"
+            )
+            _schedule_full_reconcile("post_commit_runtime_exception")
 
         return {"ok": True, **db_result}
 

@@ -1,15 +1,50 @@
 from __future__ import annotations
 
+import importlib
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.fixture
+def runtime_db(tmp_path, monkeypatch):
+    import app.core.db as db_module
+
+    importlib.reload(db_module)
+    monkeypatch.setattr(db_module, "_DB_PATH", str(tmp_path / "fast_patch_runtime.db"), raising=False)
+    db_module.init_db()
+    db_module.invalidate_sync_cache()
+    monkeypatch.setattr(db_module, "refresh_sync_cache_async", MagicMock())
+    return db_module
+
+
+def _runtime_app():
+    return SimpleNamespace(
+        logger=MagicMock(),
+        reset_runtime_fast_patch_caches=MagicMock(),
+        _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
+        request_sync_now=MagicMock(),
+    )
+
+
+def _runtime_member(member_id: int, name: str) -> dict:
+    return {
+        "userId": 1000 + member_id,
+        "activeMembershipId": member_id,
+        "membershipId": 7,
+        "fullName": name,
+        "fingerprints": [],
+    }
 
 
 def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member_ultra_sync_without_immediate_reconcile(monkeypatch):
     import app.ui.app as app_module
 
     invalidate = MagicMock()
-    monkeypatch.setattr("app.core.db.apply_fast_patch_bundle", lambda bundle: {"applied": 1, "skipped": 0, "ignored": None})
+    monkeypatch.setattr("app.core.db.apply_fast_patch_bundle", lambda bundle: {"applied": 2, "skipped": 0, "ignored": None})
     monkeypatch.setattr("app.core.db.invalidate_sync_cache", invalidate)
 
     app = SimpleNamespace(
@@ -54,7 +89,7 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member
 
     result = app_module.MainApp.apply_fast_patch_bundle(app, bundle)
 
-    assert result == {"ok": True, "applied": 1, "skipped": 0, "ignored": None}
+    assert result == {"ok": True, "applied": 2, "skipped": 0, "ignored": None}
     invalidate.assert_called_once()
     app.reset_runtime_fast_patch_caches.assert_called_once()
     app._request_running_ultra_sync.assert_called_once_with(
@@ -357,6 +392,224 @@ def test_request_running_ultra_sync_rejects_noncanonical_member_ids():
         device_ids=None,
         reason="fast_patch_bundle",
     )
+
+
+def test_runtime_stale_membership_delete_does_not_revoke_newer_local_member(runtime_db):
+    import app.ui.app as app_module
+
+    runtime_db.apply_fast_patch_bundle({
+        "bundleId": "seed-newer-member",
+        "generatedAt": "2026-04-12T12:10:00Z",
+        "items": [{
+            "kind": "ENTITY_UPSERT",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "revision": "2026-04-12T12:10:00Z",
+            "payload": {"member": _runtime_member(9, "Still Active")},
+        }],
+    })
+    app = _runtime_app()
+    result = app_module.MainApp.apply_fast_patch_bundle(app, {
+        "bundleId": "stale-delete",
+        "generatedAt": "2026-04-12T12:09:00Z",
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "ENTITY_DELETE",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "revision": "2026-04-12T12:09:00Z",
+            "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+        }],
+    })
+
+    assert result["appliedItemIndexes"] == []
+    assert runtime_db.list_sync_users()[0]["fullName"] == "Still Active"
+    app._request_running_ultra_sync.assert_not_called()
+
+
+def test_runtime_applied_membership_delete_routes_revocation(runtime_db):
+    import app.ui.app as app_module
+
+    runtime_db.apply_fast_patch_bundle({
+        "bundleId": "seed-delete-member",
+        "generatedAt": "2026-04-12T12:00:00Z",
+        "items": [{
+            "kind": "ENTITY_UPSERT",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "revision": "2026-04-12T12:00:00Z",
+            "payload": {"member": _runtime_member(9, "Delete Me")},
+        }],
+    })
+    app = _runtime_app()
+    result = app_module.MainApp.apply_fast_patch_bundle(app, {
+        "bundleId": "accepted-delete",
+        "generatedAt": "2026-04-12T12:01:00Z",
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "ENTITY_DELETE",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "revision": "2026-04-12T12:01:00Z",
+            "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+        }],
+    })
+
+    assert result["appliedItemIndexes"] == [0]
+    assert runtime_db.list_sync_users() == []
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        revoked_ids={9},
+        device_ids={7},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_runtime_mixed_bundle_routes_only_transactionally_applied_item(runtime_db):
+    import app.ui.app as app_module
+
+    runtime_db.apply_fast_patch_bundle({
+        "bundleId": "seed-mixed-member",
+        "generatedAt": "2026-04-12T12:10:00Z",
+        "items": [{
+            "kind": "ENTITY_UPSERT",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "revision": "2026-04-12T12:10:00Z",
+            "payload": {"member": _runtime_member(9, "Keep Me")},
+        }],
+    })
+    app = _runtime_app()
+    result = app_module.MainApp.apply_fast_patch_bundle(app, {
+        "bundleId": "mixed-runtime",
+        "generatedAt": "2026-04-12T12:11:00Z",
+        "requiresReconcile": False,
+        "items": [
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9,
+                "revision": "2026-04-12T12:09:00Z",
+                "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+            },
+            {
+                "kind": "ENTITY_UPSERT",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 10,
+                "revision": "2026-04-12T12:11:00Z",
+                "payload": {"member": _runtime_member(10, "Apply Me")},
+                "impact": {"affectedMemberIds": [10], "affectedDeviceIds": [8]},
+            },
+        ],
+    })
+
+    assert result["appliedItemIndexes"] == [1]
+    assert [row["activeMembershipId"] for row in runtime_db.list_sync_users()] == [9, 10]
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids={10},
+        revoked_ids=set(),
+        device_ids={8},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_malformed_accepted_delete_impact_revokes_globally_and_schedules_fallback(monkeypatch):
+    import app.ui.app as app_module
+
+    results = [
+        {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]},
+        {"applied": 0, "skipped": 0, "ignored": "duplicate_bundle", "appliedItemIndexes": []},
+    ]
+    monkeypatch.setattr("app.core.db.apply_fast_patch_bundle", MagicMock(side_effect=results))
+    app = _runtime_app()
+    bundle = {
+        "bundleId": "malformed-delete-impact",
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "ENTITY_DELETE",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "impact": "not-an-object",
+        }],
+    }
+
+    first = app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+    second = app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+
+    assert first["ok"] is True
+    assert second["duplicate"] is True
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        revoked_ids={9},
+        device_ids=None,
+        reason="FAST_PATCH_BUNDLE",
+    )
+    app.request_sync_now.assert_called_once_with(
+        trigger_source="FAST_PATCH_BUNDLE",
+        run_type="TRIGGERED",
+        trigger_hint={"reason": "fast_patch_bundle"},
+    )
+    assert any("malformed" in str(call).lower() for call in app.logger.warning.call_args_list)
+
+
+def test_malformed_accepted_impact_ids_use_full_reconcile_without_partial_sync(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]},
+    )
+    app = _runtime_app()
+    app_module.MainApp.apply_fast_patch_bundle(app, {
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "ENTITY_UPSERT",
+            "entityType": "ACTIVE_MEMBERSHIP",
+            "entityId": 9,
+            "impact": {
+                "affectedMemberIds": [9.5, True, "bad"],
+                "affectedDeviceIds": "not-a-list",
+            },
+        }],
+    })
+
+    app._request_running_ultra_sync.assert_not_called()
+    app.request_sync_now.assert_called_once()
+    assert any("rejected" in str(call).lower() for call in app.logger.warning.call_args_list)
+
+
+def test_legacy_mixed_result_without_item_identity_uses_full_reconcile(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 1, "skipped": 1, "ignored": None},
+    )
+    app = _runtime_app()
+    app_module.MainApp.apply_fast_patch_bundle(app, {
+        "requiresReconcile": False,
+        "items": [
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9,
+                "impact": {"affectedMemberIds": [9]},
+            },
+            {
+                "kind": "ENTITY_UPSERT",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 10,
+                "impact": {"affectedMemberIds": [10]},
+            },
+        ],
+    })
+
+    app._request_running_ultra_sync.assert_not_called()
+    app.request_sync_now.assert_called_once()
+    assert any("ambiguous" in str(call).lower() for call in app.logger.warning.call_args_list)
 
 
 def test_apply_fast_patch_bundle_duplicate_short_circuits_runtime_actions(monkeypatch):

@@ -214,12 +214,12 @@ def test_apply_fast_patch_bundle_upserts_member_and_ignores_duplicate_and_stale_
 
     result = db.apply_fast_patch_bundle(bundle)
 
-    assert result == {"applied": 1, "skipped": 0, "ignored": None}
+    assert result == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert db.list_sync_users()[0]["fullName"] == "Mohamed Fresh"
 
     duplicate = db.apply_fast_patch_bundle(bundle)
 
-    assert duplicate == {"applied": 0, "skipped": 0, "ignored": "duplicate_bundle"}
+    assert duplicate == {"applied": 0, "skipped": 0, "ignored": "duplicate_bundle", "appliedItemIndexes": []}
 
     stale = db.apply_fast_patch_bundle(
         _bundle(
@@ -234,7 +234,7 @@ def test_apply_fast_patch_bundle_upserts_member_and_ignores_duplicate_and_stale_
         )
     )
 
-    assert stale == {"applied": 0, "skipped": 1, "ignored": None}
+    assert stale == {"applied": 0, "skipped": 1, "ignored": None, "appliedItemIndexes": []}
     assert db.list_sync_users()[0]["fullName"] == "Mohamed Fresh"
 
 
@@ -263,7 +263,7 @@ def test_apply_fast_patch_bundle_deletes_member(db):
         )
     )
 
-    assert result == {"applied": 1, "skipped": 0, "ignored": None}
+    assert result == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert db.list_sync_users() == []
 
 
@@ -282,7 +282,7 @@ def test_apply_fast_patch_bundle_upserts_and_deletes_device(db):
     )
 
     devices = db.list_sync_devices_payload()
-    assert upsert == {"applied": 1, "skipped": 0, "ignored": None}
+    assert upsert == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert devices[0]["id"] == 77
     assert devices[0]["doorPresets"][0]["doorNumber"] == 1
 
@@ -298,7 +298,7 @@ def test_apply_fast_patch_bundle_upserts_and_deletes_device(db):
         )
     )
 
-    assert deleted == {"applied": 1, "skipped": 0, "ignored": None}
+    assert deleted == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert db.list_sync_devices_payload() == []
 
 
@@ -315,7 +315,7 @@ def test_apply_fast_patch_bundle_replaces_settings_and_contract_snapshot(db):
         )
     )
 
-    assert result == {"applied": 1, "skipped": 0, "ignored": None}
+    assert result == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert db.load_sync_access_software_settings()["accessServerPort"] == 8765
     assert db.load_sync_access_software_settings()["totpValidation"] is False
     assert db.load_sync_contract_meta() == {
@@ -369,7 +369,7 @@ def test_apply_fast_patch_bundle_replaces_credentials_infrastructures_and_member
     infra = db.list_sync_infrastructures()
     memberships = db.list_sync_memberships()
 
-    assert result == {"applied": 3, "skipped": 0, "ignored": None}
+    assert result == {"applied": 3, "skipped": 0, "ignored": None, "appliedItemIndexes": [0, 1, 2]}
     assert [row["accountId"] for row in creds] == [3, 4]
     assert [row["name"] for row in infra] == ["Main Hall", "VIP Room"]
     assert [row["title"] for row in memberships] == ["Gold", "VIP"]
@@ -415,8 +415,49 @@ def test_apply_fast_patch_bundle_merges_targeted_credentials_without_deleting_ot
 
     creds = db.list_sync_gym_access_credentials()
 
-    assert result == {"applied": 1, "skipped": 0, "ignored": None}
+    assert result == {"applied": 1, "skipped": 0, "ignored": None, "appliedItemIndexes": [0]}
     assert [row["accountId"] for row in creds] == [3, 4]
     assert creds[0]["secretHex"] == "updated999"
     assert creds[0]["grantedActiveMembershipIds"] == [11]
     assert creds[1]["secretHex"] == "def456"
+
+
+def test_apply_fast_patch_bundle_reports_only_transactionally_applied_item_indexes(db):
+    db.apply_fast_patch_bundle(
+        _bundle(
+            _item(
+                kind="ENTITY_UPSERT",
+                entity_type="ACTIVE_MEMBERSHIP",
+                entity_id=11,
+                revision="2026-04-12T12:10:00Z",
+                payload={"member": _member(11, full_name="Newest")},
+            ),
+            bundle_id="bundle-index-seed",
+        )
+    )
+    result = db.apply_fast_patch_bundle(
+        _bundle(
+            _item(
+                kind="ENTITY_DELETE",
+                entity_type="ACTIVE_MEMBERSHIP",
+                entity_id=11,
+                revision="2026-04-12T12:09:00Z",
+            ),
+            _item(
+                kind="ENTITY_UPSERT",
+                entity_type="ACTIVE_MEMBERSHIP",
+                entity_id=12,
+                revision="2026-04-12T12:11:00Z",
+                payload={"member": _member(12)},
+            ),
+            bundle_id="bundle-index-mixed",
+        )
+    )
+
+    assert result == {
+        "applied": 1,
+        "skipped": 1,
+        "ignored": None,
+        "appliedItemIndexes": [1],
+    }
+    assert [row["activeMembershipId"] for row in db.list_sync_users()] == [11, 12]

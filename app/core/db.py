@@ -4086,10 +4086,15 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
 
     bundle_id = str(bundle.get("bundleId") or "").strip() or str(uuid.uuid4())
     generated_at = str(bundle.get("generatedAt") or now_iso())
-    items = [item for item in list(bundle.get("items") or []) if isinstance(item, dict)]
+    items = [
+        (item_index, item)
+        for item_index, item in enumerate(list(bundle.get("items") or []))
+        if isinstance(item, dict)
+    ]
 
     applied = 0
     skipped = 0
+    applied_item_indexes: List[int] = []
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -4098,7 +4103,12 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
             (bundle_id,),
         ).fetchone()
         if duplicate:
-            return {"applied": 0, "skipped": 0, "ignored": "duplicate_bundle"}
+            return {
+                "applied": 0,
+                "skipped": 0,
+                "ignored": "duplicate_bundle",
+                "appliedItemIndexes": [],
+            }
 
         cur.execute(
             """
@@ -4108,7 +4118,7 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
             (bundle_id, generated_at, now_iso()),
         )
 
-        for item in items:
+        for item_index, item in items:
             key = patch_key(item.get("entityType"), item.get("entityId"))
             revision = str(item.get("revision") or generated_at)
             existing = cur.execute(
@@ -4131,10 +4141,16 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
                 (key, revision, now_iso()),
             )
             applied += 1
+            applied_item_indexes.append(item_index)
 
         conn.commit()
 
-    return {"applied": applied, "skipped": skipped, "ignored": None}
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "ignored": None,
+        "appliedItemIndexes": applied_item_indexes,
+    }
 
 
 # ---------------------------------------------------------------------------
