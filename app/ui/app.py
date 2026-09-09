@@ -179,6 +179,27 @@ def _shadow_am_id(u: Any) -> int | None:
         return None
 
 
+def _normalize_positive_member_ids(values: Any) -> set[int]:
+    normalized = set()
+    for raw_value in values or ():
+        if isinstance(raw_value, bool):
+            continue
+        if isinstance(raw_value, int):
+            member_id = raw_value
+        elif (
+            isinstance(raw_value, str)
+            and raw_value.isascii()
+            and raw_value.isdecimal()
+            and not raw_value.startswith("0")
+        ):
+            member_id = int(raw_value)
+        else:
+            continue
+        if member_id > 0:
+            normalized.add(member_id)
+    return normalized
+
+
 def _log_sync_cache_write_profile(logger: Any, elapsed_ms: int) -> None:
     if int(elapsed_ms or 0) < 250:
         return
@@ -884,26 +905,12 @@ class MainApp:
             return False
 
         normalized_reason = str(reason or "manual").strip().lower() or "manual"
-        requested_revoked_ids = set()
-        for member_id in revoked_ids or set():
-            if member_id is None:
-                continue
-            try:
-                requested_revoked_ids.add(int(member_id))
-            except (TypeError, ValueError):
-                continue
+        requested_revoked_ids = _normalize_positive_member_ids(revoked_ids)
         requested_changed_ids = None
         if refresh.get("devices"):
             requested_changed_ids = None
         elif changed_ids is not None:
-            requested_changed_ids = set()
-            for member_id in changed_ids:
-                if member_id is None:
-                    continue
-                try:
-                    requested_changed_ids.add(int(member_id))
-                except (TypeError, ValueError):
-                    continue
+            requested_changed_ids = _normalize_positive_member_ids(changed_ids)
             requested_changed_ids.difference_update(requested_revoked_ids)
             if not requested_changed_ids and not requested_revoked_ids:
                 self.logger.info(
@@ -924,11 +931,10 @@ class MainApp:
                 return False
             sync_kwargs = {
                 "changed_ids": requested_changed_ids,
+                "revoked_ids": requested_revoked_ids,
                 "device_ids": requested_device_ids,
                 "reason": normalized_reason,
             }
-            if revoked_ids is not None:
-                sync_kwargs["revoked_ids"] = requested_revoked_ids
             started = bool(
                 self._ultra_engine.request_sync_now(**sync_kwargs)
             )
@@ -1442,15 +1448,9 @@ class MainApp:
                 != "ACTIVE_MEMBERSHIP"
             ):
                 continue
-            entity_id = item.get("entityId")
-            if entity_id is None or isinstance(entity_id, bool):
-                continue
-            if isinstance(entity_id, float) and not entity_id.is_integer():
-                continue
-            try:
-                revoked_member_ids.add(int(entity_id))
-            except (TypeError, ValueError):
-                continue
+            revoked_member_ids.update(
+                _normalize_positive_member_ids((item.get("entityId"),))
+            )
         affected_member_ids.difference_update(revoked_member_ids)
         normalized_types = {
             str(item.get("entityType") or "").strip().upper()

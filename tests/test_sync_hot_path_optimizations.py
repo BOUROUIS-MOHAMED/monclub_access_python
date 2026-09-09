@@ -369,7 +369,12 @@ def test_request_running_ultra_sync_delegates_delta_ids():
     )
 
     assert started is True
-    request_sync_now.assert_called_once_with(changed_ids={42}, device_ids=None, reason="sync_now_api")
+    request_sync_now.assert_called_once_with(
+        changed_ids={42},
+        revoked_ids=set(),
+        device_ids=None,
+        reason="sync_now_api",
+    )
 
 
 def test_request_running_ultra_sync_skips_empty_member_delta():

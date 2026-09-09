@@ -332,6 +332,33 @@ def test_request_running_ultra_sync_does_not_skip_revoke_only_request():
     )
 
 
+def test_request_running_ultra_sync_rejects_noncanonical_member_ids():
+    import app.ui.app as app_module
+
+    request_sync_now = MagicMock(return_value=True)
+    app = SimpleNamespace(
+        _ultra_lock=threading.Lock(),
+        _ultra_engine=SimpleNamespace(running=True, request_sync_now=request_sync_now),
+        logger=MagicMock(),
+    )
+
+    started = app_module.MainApp._request_running_ultra_sync(
+        app,
+        refresh={"members": True, "devices": False},
+        changed_ids={True, 9.5, 10.0, "9.5", "bad", " 11 ", "012", 0, -2, 42, "43"},
+        revoked_ids={False, 19.5, 20.0, "19.5", "nope", " 21 ", "022", 0, -3, 44, "45"},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+    assert started is True
+    request_sync_now.assert_called_once_with(
+        changed_ids={42, 43},
+        revoked_ids={44, 45},
+        device_ids=None,
+        reason="fast_patch_bundle",
+    )
+
+
 def test_apply_fast_patch_bundle_duplicate_short_circuits_runtime_actions(monkeypatch):
     import app.ui.app as app_module
 
