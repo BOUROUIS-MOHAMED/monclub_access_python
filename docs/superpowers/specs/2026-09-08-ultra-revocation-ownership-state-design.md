@@ -44,6 +44,14 @@ Revocation routing uses that one result and never re-reads pending state after
 the revoke may have completed. Ordinary `request_member_sync()` retains its
 existing accepted-versus-already-queued behavior and separate pending check.
 
+At the engine/scheduler boundary, a request with `changed_ids is None` and
+nonempty `revoked_ids` is one compound full-sync command. Routing does not first
+enqueue the same IDs through `request_member_revoke()`: the full-sync worker
+already performs each physical revocation before applying its roster filtered
+by those IDs. This removes the completion gap between two worker commands.
+Targeted requests whose `changed_ids` is an actual set, including `set()`, keep
+the immediate member-revoke path.
+
 ## Transitions
 
 All transitions involving both member and full-sync state acquire
@@ -110,11 +118,12 @@ Deterministic regressions cover:
 - blocked targeted I/O retaining visible ownership and rejecting ordinary sync;
 - revoke-first/full-second execution in both drain orders;
 - targeted-only success followed by re-enrolment and a new revoke generation;
-- an engine full-refresh-plus-revoke interleaving while targeted removal is
-  active, proving the exclusion-only full remains queued and executes;
+- engine and scheduler compound full-refresh-plus-revoke routing as one worker
+  full command, proving one physical removal and a filtered stale roster;
 - drain/completion immediately after a merge, proving atomic acceptance avoids
   a scheduler fallback or second physical deletion;
 - targeted revoke completion immediately after a duplicate request, proving
   revoke routing also avoids a scheduler fallback or second physical deletion;
+- revoke-only routing continuing through the immediate targeted command;
 - success cleanup, failure retry ownership, lock-order-safe concurrency, and all
   existing standalone, scheduler, and PullSDK behavior.

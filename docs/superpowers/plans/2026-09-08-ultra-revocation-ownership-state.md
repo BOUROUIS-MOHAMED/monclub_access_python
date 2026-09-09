@@ -20,6 +20,10 @@ Authoritative `request_member_revoke` has the same atomic acceptance meaning,
 while ordinary `request_member_sync` keeps its original queue-newness contract.
 Dedicated revoke routing trusts the single request result; the generic ordinary
 member-sync helper may still check whether an ordinary command is pending.
+Engine and scheduler routing send `changed_ids is None` plus revocations as one
+compound full-sync request. The worker performs physical removal before its
+filtered roster push. Only requests with an actual changed-ID set use the
+separate immediate member-revoke command.
 
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
@@ -96,10 +100,11 @@ and prove a second authoritative generation executes another physical removal.
 - [ ] **Step 6: Add explicit full-refresh interleaving regressions**
 
 Block targeted revoke I/O for member 41, then request a full refresh carrying
-the same authoritative revoked ID. At both worker and engine boundaries, assert
+the same authoritative revoked ID directly at the worker API boundary. Assert
 that one pending exclusion-only full request is accepted, physical revocation
-runs once, and the subsequent stale roster excludes 41. Keep the existing
-revoke-only exact-duplicate test unchanged and green.
+runs once, and the subsequent stale roster excludes 41. Engine/scheduler
+compound routing is replaced by Step 10. Keep the existing revoke-only
+exact-duplicate test unchanged and green.
 
 - [ ] **Step 7: Run the new tests and verify RED**
 
@@ -130,6 +135,16 @@ handled without scheduler fallback or a second physical deletion. Make
 `request_member_revoke` return handled for queued/ACTIVE/full-owned duplicates,
 route revokes through a dedicated one-call helper, and leave ordinary member
 sync return and pending behavior unchanged.
+
+- [ ] **Step 10: Route compound full refresh atomically**
+
+At engine and scheduler boundaries, exercise `changed_ids=None` with revoked
+member 41 against a stale roster. Assert routing sends one full-sync request and
+never calls `request_member_revoke` for that compound payload; execute the full
+and assert one targeted physical removal precedes a roster without 41. Add a
+revoke-only assertion using `changed_ids=set()` to keep immediate targeted
+routing pinned. Then gate both live-routing loops so only non-full requests
+iterate `request_member_revoke` before ordinary member syncs.
 
 ### Task 2: Implement one per-ID ownership transition
 
