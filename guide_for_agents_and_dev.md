@@ -204,6 +204,96 @@ If you are ever tracing why a device is being synced in a mode it is not in, thi
 why. The protocol guard still fires inside that reused engine — which is exactly why
 the standalone path uses `_run_standalone_full_sync` → `push_roster` instead.
 
+### 3.4 ULTRA authoritative revocation — source of truth and delivery semantics
+
+An **authoritative revocation** is not an ordinary member change. It travels as a
+separate `revoked_ids` set from the accepted backend change through `MainApp`,
+`UltraEngine`, `UltraSyncScheduler`, and the worker; where the same ID is also changed,
+revocation wins. `[CODE: app/ui/app.py::_member_sync_dispatch_ids,
+::apply_fast_patch_bundle; app/core/ultra_engine.py::request_sync_now]`
+`[TEST: test_fast_patch_runtime.py::test_request_running_ultra_sync_gives_revocation_precedence;
+test_authoritative_revocation_pipeline.py::test_revocation_takes_precedence_over_incoming_changed_id]`
+
+There are only two authoritative sources:
+
+- A fast-patch `ACTIVE_MEMBERSHIP` `ENTITY_DELETE`, but only when its item index is in
+  the patch result actually committed by the local DB transaction. Rejected stale
+  deletes, duplicate bundles, and rolled-back items cannot reach a device. Ambiguous
+  result accounting schedules reconciliation rather than guessing which item applied.
+  `[CODE: db.py::apply_fast_patch_bundle; app.py::apply_fast_patch_bundle]`
+  `[TEST: test_fast_patch_db.py::test_apply_fast_patch_bundle_reports_only_transactionally_applied_item_indexes,
+  ::test_apply_fast_patch_bundle_rolls_back_earlier_items_when_later_item_fails;
+  test_fast_patch_runtime.py::test_runtime_stale_membership_delete_does_not_revoke_newer_local_member,
+  ::test_runtime_mixed_bundle_routes_only_transactionally_applied_item]`
+- A successful delta/full roster response whose authoritative member IDs prove that a
+  previously shadowed member is absent. Cache deletion and shadow diff consume the
+  **same validated authoritative-ID outcome**. Malformed authority, an inconsistent
+  delta, or the H-006 empty-roster guard refuses cache/shadow deletion and physical
+  revocation, then clears `membersVersion` and `membersUpdatedAfter` so the next request
+  retries with a full member refresh. Safe, validated upserts may still be applied.
+  `[CODE: db.py::_resolve_authoritative_member_ids, ::save_sync_cache_delta;
+  app.py::_apply_member_shadow_sync, ::_run_sync_once]`
+  `[TEST: test_authoritative_revocation_pipeline.py::test_cache_and_shadow_share_one_authoritative_id_contract,
+  ::test_full_h006_cache_refusal_preserves_shadow_and_emits_no_revocations,
+  ::test_main_sync_h006_refusal_dispatches_no_revocations_and_clears_member_tokens,
+  ::test_main_sync_inconsistent_delta_dispatches_only_accepted_safe_upsert]`
+
+For a connected, usable `ZK_STANDALONE` ULTRA worker, an accepted targeted request is
+put on the worker queue immediately after the sync/fast-patch DB work succeeds. When
+the worker drains it, an owned PIN is deleted first. If whole-user delete is unsupported,
+fails, or is not affirmatively confirmed, the worker neutralises the user with
+`enabled=false`, blank card and name, and confirmed removal of every fingerprint slot
+tracked in `device_sync_state`. Ambiguous or contradictory SDK results confirm nothing.
+Only confirmed deletion or complete neutralisation atomically clears that PIN's
+`device_sync_state` and `device_content_mirror` rows; failure retains both for retry.
+`[CODE: ultra_engine.py::_run_standalone_member_revoke,
+::_remove_standalone_pins; db.py::clear_device_revocation_state]`
+`[TEST: test_standalone_revoked_pin_removal.py::TestImmediateAuthoritativeRevoke,
+::TestRemovalResultContract; test_db_standalone_revocation_state.py;
+test_zk_standalone_template_removal.py]`
+
+Ownership is a safety boundary. Without a readable MonClub ownership row for that
+device/PIN, the worker makes **no destructive SDK call**, emits the critical
+`MEMBER_REVOKE_OWNERSHIP_MISSING` event, and schedules full reconciliation. Such an
+unowned PIN is intentionally left untouched for alert/reconciliation investigation.
+`[CODE: ultra_engine.py::_run_standalone_member_revoke]`
+`[TEST: test_standalone_revoked_pin_removal.py::
+TestImmediateAuthoritativeRevoke::test_unowned_pin_is_not_touched_and_requests_full_reconciliation]`
+
+Full reconciliation is the recovery route, not the primary revoke route. Separate
+physical-revocation and roster-exclusion ownership, with lock-guarded `ACTIVE` and
+`RETRY` phases, keeps a revoked member out of stale roster snapshots while avoiding
+duplicate deletion and preserving work across targeted/full-sync and dead-worker races.
+A compound full-refresh-plus-revocation request is one worker full-sync command; a
+revoke-only change remains an immediate targeted command. PullSDK and standalone paths
+retain authoritative revocation ownership across missing, dead, disconnected, or
+otherwise unusable workers until physical removal is confirmed.
+`[CODE: UltraDeviceWorker.request_member_revoke, ::request_full_sync,
+::_drain_pending_full_sync; UltraEngine.request_sync_now;
+UltraSyncScheduler._sync_all]`
+`[TEST: test_ultra_sync_scheduler.py::test_ultra_engine_full_refresh_routes_revocation_as_one_full_command,
+::test_ultra_engine_revoke_only_still_routes_immediate_member_command,
+::test_failed_dependent_full_retains_exclusion_until_eventual_success,
+::test_ultra_sync_scheduler_no_worker_additive_pull_device_keeps_revocation_pending,
+::test_ultra_sync_scheduler_preserves_standalone_revocation_until_worker_replacement,
+::test_disconnected_standalone_revoke_is_requeued_with_revoke_intent]`
+
+**Latency and acknowledgement boundary.** A local HTTP/IPC dispatch acknowledgement
+confirms only that dispatch was accepted/queued; it does **not** mean the turnstile has
+already mutated. Physical latency depends on worker wake-up, SDK/device round trips,
+delete-to-neutralise fallback, retries, and network/serial conditions. No production
+SLA is established. Disconnected/unusable devices retain retry ownership for recovery.
+`[CODE: app.py::apply_fast_patch_bundle; UltraEngine.request_sync_now;
+UltraDeviceWorker._run_standalone_member_revoke]`
+`[TEST: test_fast_patch_runtime.py::test_runtime_applied_membership_delete_routes_revocation;
+test_ultra_sync_scheduler.py::test_disconnected_standalone_revoke_is_requeued_with_revoke_intent]`
+
+The command and retry path is proven in source and automated tests, but physical delete,
+neutralisation, retry timing, and end-to-end latency have not been exercised on Gym T's
+installed MB2000/standalone firmware and wiring. They remain
+`[UNVERIFIED — HARDWARE-GATED]`; there is deliberately **no `[FIELD]` claim** until that
+site validation is recorded.
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver
@@ -451,7 +541,8 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Last run:
-**1074 passed** (2026-09-05, after the Phase C progress/yield fix). `[TEST]`
+**1311 passed, 473 warnings** (2026-09-09, after the immediate authoritative revocation
+work; exit code 0). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py
