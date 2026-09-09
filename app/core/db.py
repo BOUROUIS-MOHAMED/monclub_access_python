@@ -4494,7 +4494,7 @@ def _canonical_positive_member_id(raw_value: Any) -> int | None:
 
 def _resolve_authoritative_member_ids(
     data: Dict[str, Any],
-) -> tuple[List[int] | None, bool, str | None, List[int]]:
+) -> tuple[List[int] | None, bool, str | None, List[int], List[int]]:
     delta_mode = bool(data.get("membersDeltaMode", False))
     users = data.get("users")
     accepted_indexes: List[int] = []
@@ -4529,13 +4529,14 @@ def _resolve_authoritative_member_ids(
     if "validMemberIds" in data and data.get("validMemberIds") is not None:
         raw_ids = data.get("validMemberIds")
         if not isinstance(raw_ids, list):
-            return None, False, "malformed_valid_member_ids", accepted_indexes
+            return None, False, "malformed_valid_member_ids", accepted_indexes, accepted_user_ids
     elif delta_mode:
         return (
             None,
             users_valid,
             None if users_valid else "malformed_member_id",
             accepted_indexes,
+            accepted_user_ids,
         )
     else:
         return (
@@ -4543,17 +4544,26 @@ def _resolve_authoritative_member_ids(
             users_valid,
             None if users_valid else "malformed_full_member_id",
             accepted_indexes,
+            accepted_user_ids,
         )
 
     normalized: set[int] = set()
     for raw_id in raw_ids:
         member_id = _canonical_positive_member_id(raw_id)
         if member_id is None:
-            return None, False, "malformed_member_id", accepted_indexes
+            return None, False, "malformed_member_id", accepted_indexes, accepted_user_ids
         normalized.add(member_id)
     if not users_valid:
-        return sorted(normalized), False, "malformed_member_id", accepted_indexes
-    return sorted(normalized), True, None, accepted_indexes
+        return sorted(normalized), False, "malformed_member_id", accepted_indexes, accepted_user_ids
+    if delta_mode and not set(accepted_user_ids).issubset(normalized):
+        return (
+            sorted(normalized),
+            False,
+            "incoming_member_missing_from_valid_ids",
+            accepted_indexes,
+            accepted_user_ids,
+        )
+    return sorted(normalized), True, None, accepted_indexes, accepted_user_ids
 
 
 def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
@@ -4591,6 +4601,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
         authoritative_ids_valid,
         authoritative_ids_error,
         accepted_member_user_indexes,
+        accepted_member_ids,
     ) = (
         _resolve_authoritative_member_ids(data)
     )
@@ -4895,6 +4906,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
             "authoritative_member_ids_valid": authoritative_ids_valid,
             "authoritative_member_ids_error": authoritative_ids_error,
             "accepted_member_user_indexes": accepted_member_user_indexes,
+            "accepted_member_ids": accepted_member_ids,
         }
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}

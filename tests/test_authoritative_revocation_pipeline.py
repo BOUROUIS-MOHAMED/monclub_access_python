@@ -268,6 +268,75 @@ def test_canonical_string_user_id_upserts_in_cache_and_shadow(db):
     assert revoked == set()
 
 
+def test_inconsistent_delta_refuses_deletes_and_keeps_cache_shadow_aligned(db):
+    from app.ui.app import MainApp
+
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    original = _make_user(1)
+    db.save_sync_cache_delta({"users": [original], "membersDeltaMode": False}, refresh)
+    db.upsert_member_shadow(users=[original])
+    incoming = _make_user(2)
+    response = {
+        "users": [incoming],
+        "membersDeltaMode": True,
+        "validMemberIds": [1],
+    }
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(), data=response, refresh=refresh,
+        delta_changed_ids=set(outcome["accepted_member_ids"]),
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+        accepted_member_user_indexes=outcome["accepted_member_user_indexes"],
+        accepted_member_ids=outcome["accepted_member_ids"],
+    )
+
+    assert outcome["members_delete_refused"] is True
+    assert outcome["accepted_member_ids"] == [2]
+    assert set(db.get_all_cached_user_am_ids()) == {1, 2}
+    assert _shadow_ids(db) == {1, 2}
+    assert changed == {2}
+    assert revoked == set()
+
+
+def test_conflicting_duplicate_member_rows_are_not_written_or_dispatched(db):
+    from app.ui.app import MainApp
+
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    original = _make_user(1)
+    db.save_sync_cache_delta({"users": [original], "membersDeltaMode": False}, refresh)
+    db.upsert_member_shadow(users=[original])
+    first = _make_user(2)
+    second = _make_user(2)
+    second["userId"] = 999
+    response = {
+        "users": [first, second],
+        "membersDeltaMode": True,
+        "validMemberIds": [1, 2],
+    }
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(), data=response, refresh=refresh,
+        delta_changed_ids=set(outcome["accepted_member_ids"]),
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+        accepted_member_user_indexes=outcome["accepted_member_user_indexes"],
+        accepted_member_ids=outcome["accepted_member_ids"],
+    )
+
+    assert outcome["accepted_member_user_indexes"] == []
+    assert outcome["accepted_member_ids"] == []
+    assert outcome["members_delete_refused"] is True
+    assert set(db.get_all_cached_user_am_ids()) == {1}
+    assert _shadow_ids(db) == {1}
+    assert changed == set()
+    assert revoked == set()
+
+
 def test_full_h006_cache_refusal_preserves_shadow_and_emits_no_revocations(db):
     from app.ui.app import MainApp
 
@@ -509,6 +578,7 @@ def _run_main_sync_dispatch(
     revoked_ids,
     cache_members_delete_refused=False,
     use_real_tokens=False,
+    accepted_member_ids=None,
 ):
     import app.ui.app as app_module
 
@@ -526,6 +596,8 @@ def _run_main_sync_dispatch(
         "currentMembersRefreshedAt": "new-watermark",
         "currentDevicesVersion": "new-devices",
     }
+    if accepted_member_ids is None:
+        accepted_member_ids = sorted(changed_ids or set())
     api = SimpleNamespace(
         do_proactive_refresh=MagicMock(return_value=False),
         get_sync_data=MagicMock(return_value=response),
@@ -598,6 +670,10 @@ def _run_main_sync_dispatch(
         MagicMock(
             return_value={
                 "members_delete_refused": cache_members_delete_refused,
+                "accepted_member_ids": accepted_member_ids,
+                "accepted_member_user_indexes": list(range(len(response["users"]))),
+                "authoritative_member_ids": response["validMemberIds"],
+                "authoritative_member_ids_valid": not cache_members_delete_refused,
             }
         ),
     )
@@ -674,6 +750,25 @@ def test_main_sync_h006_refusal_dispatches_no_revocations_and_clears_member_toke
         "devicesVersion": "new-devices",
         "credentialsVersion": "old-credentials",
     }
+
+
+def test_main_sync_inconsistent_delta_dispatches_only_accepted_safe_upsert(monkeypatch):
+    ultra_request, device_run, shadow_sync, _token_save, token_delete = (
+        _run_main_sync_dispatch(
+            monkeypatch,
+            changed_ids={2},
+            revoked_ids=set(),
+            cache_members_delete_refused=True,
+            accepted_member_ids=[2],
+        )
+    )
+
+    assert shadow_sync.call_args.kwargs["delta_changed_ids"] == {2}
+    ultra_request.assert_called_once_with(
+        changed_ids={2}, revoked_ids=set(), device_ids=None, reason="timer"
+    )
+    assert device_run.call_args.kwargs["changed_ids"] == {2}
+    token_delete.assert_called_once_with({"membersVersion", "membersUpdatedAfter"})
 
 
 @pytest.mark.parametrize(

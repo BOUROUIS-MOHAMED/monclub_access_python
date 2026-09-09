@@ -810,7 +810,10 @@ class MainApp:
         authoritative_member_ids: list[int] | None = None,
         authoritative_member_ids_valid: bool | None = None,
         accepted_member_user_indexes: list[int] | None = None,
+        accepted_member_ids: list[int] | None = None,
     ) -> tuple[set[int] | None, set[int]]:
+        if data.get("membersDeltaMode") and accepted_member_ids is not None:
+            delta_changed_ids = set(accepted_member_ids)
         original_changed_ids = (
             None
             if delta_changed_ids is None
@@ -828,6 +831,7 @@ class MainApp:
                 authoritative_member_ids_valid,
                 _authority_error,
                 accepted_member_user_indexes,
+                accepted_member_ids,
             ) = _resolve_authoritative_member_ids(data)
         if not authoritative_member_ids_valid:
             cache_members_delete_refused = True
@@ -2656,10 +2660,8 @@ class MainApp:
 
                 # Compute delta hints for device push optimization
                 if data.get("membersDeltaMode") and refresh.get("members"):
-                    _delta_changed_ids = _normalize_positive_member_ids(
-                        u.get("activeMembershipId")
-                        for u in (data.get("users") or [])
-                        if isinstance(u, dict)
+                    _delta_changed_ids = set(
+                        _cache_write_outcome.get("accepted_member_ids") or []
                     )
 
                 # P6: Member shadow diff — detect actual field changes and update shadow.
@@ -2682,6 +2684,9 @@ class MainApp:
                         ),
                         accepted_member_user_indexes=_cache_write_outcome.get(
                             "accepted_member_user_indexes"
+                        ),
+                        accepted_member_ids=_cache_write_outcome.get(
+                            "accepted_member_ids"
                         ),
                     )
                     _shadow_ms = int((time.perf_counter() - _shadow_started) * 1000)
