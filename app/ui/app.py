@@ -840,9 +840,16 @@ class MainApp:
             )
 
             if data.get("membersDeltaMode"):
+                _shadow_valid_ids = _valid_ids
+                if cache_members_delete_refused:
+                    _shadow_valid_ids = None
+                    self.logger.warning(
+                        "[ShadowDiff] delta member deletion refused by authoritative "
+                        "cache write; applying upserts without shadow removals"
+                    )
                 _shadow_deleted = apply_member_shadow_delta(
                     users=_incoming_users,
-                    valid_member_ids=_valid_ids,
+                    valid_member_ids=_shadow_valid_ids,
                 )
                 revoked_ids = _normalize_positive_member_ids(_shadow_deleted)
                 if delta_changed_ids is not None and revoked_ids:

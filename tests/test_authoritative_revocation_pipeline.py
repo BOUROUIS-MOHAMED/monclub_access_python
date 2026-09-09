@@ -168,6 +168,61 @@ def test_h006_refusal_emits_no_revocations_and_preserves_shadow(db):
     assert _shadow_ids(db) == set(range(1, 12))
 
 
+def test_delta_cache_refusal_suppresses_shadow_deletes_but_keeps_upserts(db):
+    from app.ui.app import MainApp
+
+    cache_users = [_make_user(member_id) for member_id in range(1, 12)]
+    shadow_users = [_make_user(member_id) for member_id in range(1, 11)]
+    refresh = {
+        "members": True,
+        "devices": False,
+        "credentials": False,
+        "settings": False,
+    }
+    db.save_sync_cache_delta(
+        {
+            "users": cache_users,
+            "membersDeltaMode": False,
+            "validMemberIds": list(range(1, 12)),
+            "contractStatus": True,
+            "contractEndDate": "2026-12-31",
+        },
+        refresh,
+    )
+    db.upsert_member_shadow(users=shadow_users)
+
+    updated = _make_user(3)
+    updated["fullName"] = "Safely Updated"
+    added = _make_user(12)
+    refused_delta = {
+        "users": [updated, added],
+        "membersDeltaMode": True,
+        "validMemberIds": [],
+        "contractStatus": True,
+        "contractEndDate": "2026-12-31",
+    }
+    cache_write_outcome = db.save_sync_cache_delta(refused_delta, refresh)
+
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(),
+        data=refused_delta,
+        refresh=refresh,
+        delta_changed_ids={3, 12},
+        cache_members_delete_refused=cache_write_outcome["members_delete_refused"],
+    )
+
+    assert cache_write_outcome["members_delete_refused"] is True
+    assert set(db.get_all_cached_user_am_ids()) == set(range(1, 13))
+    assert _shadow_ids(db) == set(range(1, 11)) | {12}
+    with db.get_conn() as conn:
+        name = conn.execute(
+            "SELECT full_name FROM member_shadow WHERE active_membership_id=3"
+        ).fetchone()["full_name"]
+    assert name == "Safely Updated"
+    assert changed == {3, 12}
+    assert revoked == set()
+
+
 def test_shadow_error_emits_no_revocations_and_preserves_changed_ids(db, monkeypatch):
     from app.ui.app import MainApp
 
