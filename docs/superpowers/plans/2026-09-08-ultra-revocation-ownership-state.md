@@ -16,6 +16,10 @@ deduplicated as if it were only a repeated revoke delivery.
 The worker full-sync boolean is an atomic acceptance result: newly queued,
 merged, and already safely covered requests all return `True`. Routing does not
 perform a separate pending-state check after releasing the worker locks.
+Authoritative `request_member_revoke` has the same atomic acceptance meaning,
+while ordinary `request_member_sync` keeps its original queue-newness contract.
+Dedicated revoke routing trusts the single request result; the generic ordinary
+member-sync helper may still check whether an ordinary command is pending.
 
 **Tech Stack:** Python 3.13, `threading.Lock`, `collections.deque`, pytest, `unittest.mock`
 
@@ -118,6 +122,15 @@ exactly once. Then change `request_full_sync` to return acceptance/safe coverage
 for new, merged, and duplicate-owned work, and remove the helper's separate
 pending-state query.
 
+- [ ] **Step 9: Mirror atomic acceptance for targeted revoke routing**
+
+Queue a targeted revoke, then make a duplicate request complete that physical
+work before the old helper can inspect pending state. Assert engine routing is
+handled without scheduler fallback or a second physical deletion. Make
+`request_member_revoke` return handled for queued/ACTIVE/full-owned duplicates,
+route revokes through a dedicated one-call helper, and leave ordinary member
+sync return and pending behavior unchanged.
+
 ### Task 2: Implement one per-ID ownership transition
 
 **Files:**
@@ -132,9 +145,10 @@ Replace `_active_full_sync_revoked_ids` with
 - [ ] **Step 2: Make request and pending checks phase-aware**
 
 Under `_member_sync_lock` then `_full_sync_lock`, reject ordinary member sync for
-IDs in pending-full, `ACTIVE`, or `RETRY`. `request_member_revoke` returns false
-for `ACTIVE`, but atomically transfers `RETRY` to the targeted member queue.
-`has_pending_member_revoke` treats either phase as protected.
+IDs in pending-full, `ACTIVE`, or `RETRY`. `request_member_revoke` returns handled
+for safely covered `ACTIVE` or confirmed `RETRY` work, but atomically transfers
+an unconfirmed `RETRY` to the targeted member queue. `has_pending_member_revoke`
+treats either phase as protected.
 
 - [ ] **Step 3: Deduplicate full requests and adopt RETRY state**
 

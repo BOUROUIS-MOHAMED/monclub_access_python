@@ -37,6 +37,12 @@ must still execute even when every physical revocation is already owned.
 `True` means the request was newly queued, merged into pending work, or already
 covered by active/retry ownership. A caller therefore never needs a second
 `has_pending_full_sync()` check after the request lock is released.
+`request_member_revoke()` uses the same acceptance contract for authoritative
+revocations. Queued targeted work, targeted `ACTIVE`, and pending/active/retry
+full ownership all return handled from the original lock-protected request.
+Revocation routing uses that one result and never re-reads pending state after
+the revoke may have completed. Ordinary `request_member_sync()` retains its
+existing accepted-versus-already-queued behavior and separate pending check.
 
 ## Transitions
 
@@ -108,5 +114,7 @@ Deterministic regressions cover:
   active, proving the exclusion-only full remains queued and executes;
 - drain/completion immediately after a merge, proving atomic acceptance avoids
   a scheduler fallback or second physical deletion;
+- targeted revoke completion immediately after a duplicate request, proving
+  revoke routing also avoids a scheduler fallback or second physical deletion;
 - success cleanup, failure retry ownership, lock-order-safe concurrency, and all
   existing standalone, scheduler, and PullSDK behavior.
