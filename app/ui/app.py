@@ -876,6 +876,7 @@ class MainApp:
         *,
         refresh: Dict[str, Any],
         changed_ids: set[int] | None,
+        revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str,
     ) -> bool:
@@ -883,16 +884,28 @@ class MainApp:
             return False
 
         normalized_reason = str(reason or "manual").strip().lower() or "manual"
+        requested_revoked_ids = set()
+        for member_id in revoked_ids or set():
+            if member_id is None:
+                continue
+            try:
+                requested_revoked_ids.add(int(member_id))
+            except (TypeError, ValueError):
+                continue
         requested_changed_ids = None
         if refresh.get("devices"):
             requested_changed_ids = None
         elif changed_ids is not None:
-            requested_changed_ids = {
-                int(member_id)
-                for member_id in changed_ids
-                if member_id is not None
-            }
-            if not requested_changed_ids:
+            requested_changed_ids = set()
+            for member_id in changed_ids:
+                if member_id is None:
+                    continue
+                try:
+                    requested_changed_ids.add(int(member_id))
+                except (TypeError, ValueError):
+                    continue
+            requested_changed_ids.difference_update(requested_revoked_ids)
+            if not requested_changed_ids and not requested_revoked_ids:
                 self.logger.info(
                     "[ULTRA] immediate sync skipped: reason=%s changed_ids=0",
                     normalized_reason,
@@ -909,12 +922,15 @@ class MainApp:
         with self._ultra_lock:
             if not self._ultra_engine.running:
                 return False
+            sync_kwargs = {
+                "changed_ids": requested_changed_ids,
+                "device_ids": requested_device_ids,
+                "reason": normalized_reason,
+            }
+            if revoked_ids is not None:
+                sync_kwargs["revoked_ids"] = requested_revoked_ids
             started = bool(
-                self._ultra_engine.request_sync_now(
-                    changed_ids=requested_changed_ids,
-                    device_ids=requested_device_ids,
-                    reason=normalized_reason,
-                )
+                self._ultra_engine.request_sync_now(**sync_kwargs)
             )
 
         if started:
@@ -1418,6 +1434,24 @@ class MainApp:
             for device_id in list(((item.get("impact") or {}).get("affectedDeviceIds") or []))
             if device_id is not None
         }
+        revoked_member_ids = set()
+        for item in items:
+            if (
+                str(item.get("kind") or "").strip().upper() != "ENTITY_DELETE"
+                or str(item.get("entityType") or "").strip().upper()
+                != "ACTIVE_MEMBERSHIP"
+            ):
+                continue
+            entity_id = item.get("entityId")
+            if entity_id is None or isinstance(entity_id, bool):
+                continue
+            if isinstance(entity_id, float) and not entity_id.is_integer():
+                continue
+            try:
+                revoked_member_ids.add(int(entity_id))
+            except (TypeError, ValueError):
+                continue
+        affected_member_ids.difference_update(revoked_member_ids)
         normalized_types = {
             str(item.get("entityType") or "").strip().upper()
             for item in items
@@ -1446,6 +1480,7 @@ class MainApp:
             self._request_running_ultra_sync(
                 refresh={"members": needs_member_refresh, "devices": needs_device_refresh},
                 changed_ids=None if needs_device_refresh else affected_member_ids,
+                revoked_ids=revoked_member_ids,
                 device_ids=affected_device_ids or None,
                 reason="FAST_PATCH_BUNDLE",
             )

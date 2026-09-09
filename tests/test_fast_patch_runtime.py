@@ -60,6 +60,7 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member
     app._request_running_ultra_sync.assert_called_once_with(
         refresh={"members": True, "devices": False},
         changed_ids={9},
+        revoked_ids=set(),
         device_ids={7},
         reason="FAST_PATCH_BUNDLE",
     )
@@ -102,8 +103,232 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
     app._request_running_ultra_sync.assert_called_once_with(
         refresh={"members": False, "devices": True},
         changed_ids=None,
+        revoked_ids=set(),
         device_ids={7},
         reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_apply_fast_patch_bundle_routes_membership_delete_as_authoritative_revoke(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 2, "skipped": 0, "ignored": None},
+    )
+    app = SimpleNamespace(
+        logger=MagicMock(),
+        reset_runtime_fast_patch_caches=MagicMock(),
+        _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
+        request_sync_now=MagicMock(),
+    )
+    bundle = {
+        "bundleId": "bundle-delete",
+        "requiresReconcile": False,
+        "items": [
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9,
+                "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+            },
+            {
+                "kind": "ENTITY_UPSERT",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9,
+                "impact": {"affectedMemberIds": [9], "affectedDeviceIds": []},
+            },
+        ],
+    }
+
+    app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        revoked_ids={9},
+        device_ids={7},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_apply_fast_patch_bundle_normalizes_delete_classifier(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 1, "skipped": 0, "ignored": None},
+    )
+    app = SimpleNamespace(
+        logger=MagicMock(),
+        reset_runtime_fast_patch_caches=MagicMock(),
+        _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
+        request_sync_now=MagicMock(),
+    )
+    bundle = {
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "  entity_delete ",
+            "entityType": " active_membership  ",
+            "entityId": "13",
+            "impact": {"affectedMemberIds": [13], "affectedDeviceIds": []},
+        }],
+    }
+
+    app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        revoked_ids={13},
+        device_ids=None,
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_apply_fast_patch_bundle_ignores_malformed_delete_entity_ids(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 4, "skipped": 0, "ignored": None},
+    )
+    app = SimpleNamespace(
+        logger=MagicMock(),
+        reset_runtime_fast_patch_caches=MagicMock(),
+        _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
+        request_sync_now=MagicMock(),
+    )
+    bundle = {
+        "requiresReconcile": False,
+        "items": [
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": None,
+                "impact": {"affectedMemberIds": [9]},
+            },
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "impact": {"affectedMemberIds": [10]},
+            },
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": "not-an-id",
+                "impact": {"affectedMemberIds": [11]},
+            },
+            {
+                "kind": "ENTITY_DELETE",
+                "entityType": "ACTIVE_MEMBERSHIP",
+                "entityId": 9.5,
+                "impact": {"affectedMemberIds": [12]},
+            },
+        ],
+    }
+
+    app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids={9, 10, 11, 12},
+        revoked_ids=set(),
+        device_ids=None,
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_apply_fast_patch_bundle_keeps_unrelated_delete_as_ordinary_change(monkeypatch):
+    import app.ui.app as app_module
+
+    monkeypatch.setattr(
+        "app.core.db.apply_fast_patch_bundle",
+        lambda bundle: {"applied": 1, "skipped": 0, "ignored": None},
+    )
+    app = SimpleNamespace(
+        logger=MagicMock(),
+        reset_runtime_fast_patch_caches=MagicMock(),
+        _request_running_ultra_sync=MagicMock(return_value=True),
+        _defer_ultra_reconnects=MagicMock(),
+        request_sync_now=MagicMock(),
+    )
+    bundle = {
+        "requiresReconcile": False,
+        "items": [{
+            "kind": "ENTITY_DELETE",
+            "entityType": "CREDENTIALS",
+            "entityId": 21,
+            "impact": {"affectedMemberIds": [9], "affectedDeviceIds": [7]},
+        }],
+    }
+
+    app_module.MainApp.apply_fast_patch_bundle(app, bundle)
+
+    app._request_running_ultra_sync.assert_called_once_with(
+        refresh={"members": True, "devices": False},
+        changed_ids={9},
+        revoked_ids=set(),
+        device_ids={7},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+
+def test_request_running_ultra_sync_gives_revocation_precedence():
+    import app.ui.app as app_module
+
+    request_sync_now = MagicMock(return_value=True)
+    app = SimpleNamespace(
+        _ultra_lock=threading.Lock(),
+        _ultra_engine=SimpleNamespace(running=True, request_sync_now=request_sync_now),
+        logger=MagicMock(),
+    )
+
+    started = app_module.MainApp._request_running_ultra_sync(
+        app,
+        refresh={"members": True, "devices": False},
+        changed_ids={9, 10},
+        revoked_ids={"9"},
+        device_ids={"7"},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+    assert started is True
+    request_sync_now.assert_called_once_with(
+        changed_ids={10},
+        revoked_ids={9},
+        device_ids={7},
+        reason="fast_patch_bundle",
+    )
+
+
+def test_request_running_ultra_sync_does_not_skip_revoke_only_request():
+    import app.ui.app as app_module
+
+    request_sync_now = MagicMock(return_value=True)
+    app = SimpleNamespace(
+        _ultra_lock=threading.Lock(),
+        _ultra_engine=SimpleNamespace(running=True, request_sync_now=request_sync_now),
+        logger=MagicMock(),
+    )
+
+    started = app_module.MainApp._request_running_ultra_sync(
+        app,
+        refresh={"members": True, "devices": False},
+        changed_ids=set(),
+        revoked_ids={9},
+        reason="FAST_PATCH_BUNDLE",
+    )
+
+    assert started is True
+    request_sync_now.assert_called_once_with(
+        changed_ids=set(),
+        revoked_ids={9},
+        device_ids=None,
+        reason="fast_patch_bundle",
     )
 
 
