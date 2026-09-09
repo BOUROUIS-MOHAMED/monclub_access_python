@@ -809,6 +809,7 @@ class MainApp:
         cache_members_delete_refused: bool = False,
         authoritative_member_ids: list[int] | None = None,
         authoritative_member_ids_valid: bool | None = None,
+        accepted_member_user_indexes: list[int] | None = None,
     ) -> tuple[set[int] | None, set[int]]:
         original_changed_ids = (
             None
@@ -826,15 +827,25 @@ class MainApp:
                 authoritative_member_ids,
                 authoritative_member_ids_valid,
                 _authority_error,
+                accepted_member_user_indexes,
             ) = _resolve_authoritative_member_ids(data)
         if not authoritative_member_ids_valid:
             cache_members_delete_refused = True
+
+        _raw_users = data.get("users") if isinstance(data.get("users"), list) else []
+        _accepted_indexes = accepted_member_user_indexes or []
+        _incoming_users = [
+            _raw_users[index]
+            for index in _accepted_indexes
+            if isinstance(index, int) and not isinstance(index, bool)
+            and 0 <= index < len(_raw_users)
+        ]
 
         if cache_members_delete_refused and not data.get("membersDeltaMode"):
             try:
                 from app.core.db import upsert_member_shadow
 
-                upsert_member_shadow(users=data.get("users") or [])
+                upsert_member_shadow(users=_incoming_users)
             except Exception as _shadow_exc:
                 self.logger.warning(
                     "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
@@ -845,7 +856,6 @@ class MainApp:
             )
             return original_changed_ids, revoked_ids
 
-        _incoming_users = data.get("users") or []
         try:
             from app.core.db import (
                 apply_member_shadow_delta,
@@ -2669,6 +2679,9 @@ class MainApp:
                         ),
                         authoritative_member_ids_valid=bool(
                             _cache_write_outcome.get("authoritative_member_ids_valid", True)
+                        ),
+                        accepted_member_user_indexes=_cache_write_outcome.get(
+                            "accepted_member_user_indexes"
                         ),
                     )
                     _shadow_ms = int((time.perf_counter() - _shadow_started) * 1000)

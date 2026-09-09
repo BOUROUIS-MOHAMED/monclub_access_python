@@ -4494,31 +4494,66 @@ def _canonical_positive_member_id(raw_value: Any) -> int | None:
 
 def _resolve_authoritative_member_ids(
     data: Dict[str, Any],
-) -> tuple[List[int] | None, bool, str | None]:
+) -> tuple[List[int] | None, bool, str | None, List[int]]:
     delta_mode = bool(data.get("membersDeltaMode", False))
+    users = data.get("users")
+    accepted_indexes: List[int] = []
+    accepted_user_ids: List[int] = []
+    candidate_rows: List[tuple[int, int]] = []
+    users_valid = isinstance(users, list)
+    if users_valid:
+        for index, user in enumerate(users):
+            member_id = (
+                _canonical_positive_member_id(user.get("activeMembershipId"))
+                if isinstance(user, dict)
+                else None
+            )
+            if member_id is None:
+                users_valid = False
+                continue
+            candidate_rows.append((index, member_id))
+        rows_by_member_id: Dict[int, List[int]] = {}
+        for index, member_id in candidate_rows:
+            rows_by_member_id.setdefault(member_id, []).append(index)
+        for member_id, indexes in rows_by_member_id.items():
+            identities = {repr(users[index].get("userId")) for index in indexes}
+            if len(identities) > 1:
+                users_valid = False
+                continue
+            # Preserve the historical deterministic last-row-wins behavior when
+            # the same member record is repeated verbatim in one payload.
+            accepted_indexes.append(indexes[-1])
+            accepted_user_ids.append(member_id)
+        accepted_indexes.sort()
+
     if "validMemberIds" in data and data.get("validMemberIds") is not None:
         raw_ids = data.get("validMemberIds")
         if not isinstance(raw_ids, list):
-            return None, False, "malformed_valid_member_ids"
+            return None, False, "malformed_valid_member_ids", accepted_indexes
     elif delta_mode:
-        return None, True, None
+        return (
+            None,
+            users_valid,
+            None if users_valid else "malformed_member_id",
+            accepted_indexes,
+        )
     else:
-        users = data.get("users")
-        if not isinstance(users, list):
-            return None, False, "malformed_full_users"
-        raw_ids = []
-        for user in users:
-            if not isinstance(user, dict) or "activeMembershipId" not in user:
-                return None, False, "malformed_full_member_id"
-            raw_ids.append(user.get("activeMembershipId"))
+        return (
+            sorted(set(accepted_user_ids)) if users_valid else None,
+            users_valid,
+            None if users_valid else "malformed_full_member_id",
+            accepted_indexes,
+        )
 
     normalized: set[int] = set()
     for raw_id in raw_ids:
         member_id = _canonical_positive_member_id(raw_id)
         if member_id is None:
-            return None, False, "malformed_member_id"
+            return None, False, "malformed_member_id", accepted_indexes
         normalized.add(member_id)
-    return sorted(normalized), True, None
+    if not users_valid:
+        return sorted(normalized), False, "malformed_member_id", accepted_indexes
+    return sorted(normalized), True, None, accepted_indexes
 
 
 def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
@@ -4551,9 +4586,16 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     contract_end_date = (data.get("contractEndDate") or "").strip()
     access_settings = data.get("accessSoftwareSettings") or data.get("access_software_settings") or None
     memberships = data.get("membership") or data.get("memberships") or []
-    authoritative_ids, authoritative_ids_valid, authoritative_ids_error = (
+    (
+        authoritative_ids,
+        authoritative_ids_valid,
+        authoritative_ids_error,
+        accepted_member_user_indexes,
+    ) = (
         _resolve_authoritative_member_ids(data)
     )
+    raw_users = data.get("users") if isinstance(data.get("users"), list) else []
+    safe_users = [raw_users[index] for index in accepted_member_user_indexes]
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, Any]:
         cur = conn.cursor()
         profile["members_refresh"] = bool(refresh.get("members", True))
@@ -4587,7 +4629,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
         # Conditional: members (users + fingerprints)
         if refresh.get("members", True):
             with _profile_write_step(profile, "members_ms"):
-                users = data.get("users") or []
+                users = safe_users
                 delta_mode = bool(data.get("membersDeltaMode", False))
                 _log_incoming_templates(users, delta_mode)
                 valid_ids = authoritative_ids
@@ -4852,6 +4894,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
             "authoritative_member_ids": authoritative_ids,
             "authoritative_member_ids_valid": authoritative_ids_valid,
             "authoritative_member_ids_error": authoritative_ids_error,
+            "accepted_member_user_indexes": accepted_member_user_indexes,
         }
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}

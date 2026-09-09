@@ -175,6 +175,99 @@ def test_cache_and_shadow_share_one_authoritative_id_contract(
     assert changed == set()
 
 
+@pytest.mark.parametrize("invalid_id", [True, 1.5])
+def test_full_invalid_user_id_cannot_overwrite_existing_member(db, invalid_id):
+    from app.ui.app import MainApp
+
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    original = _make_user(1)
+    original["firstCardId"] = "CARD-A"
+    db.save_sync_cache_delta({"users": [original], "membersDeltaMode": False}, refresh)
+    db.upsert_member_shadow(users=[original])
+    invalid = _make_user(1)
+    invalid["activeMembershipId"] = invalid_id
+    invalid["firstCardId"] = "CARD-B"
+    response = {"users": [invalid], "membersDeltaMode": False}
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(), data=response, refresh=refresh, delta_changed_ids=None,
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+        accepted_member_user_indexes=outcome["accepted_member_user_indexes"],
+    )
+
+    assert outcome["members_delete_refused"] is True
+    assert db.list_sync_users()[0]["firstCardId"] == "CARD-A"
+    assert db.get_member_shadow_cards() == {1: "CARD-A"}
+    assert changed is None
+    assert revoked == set()
+
+
+def test_mixed_valid_and_invalid_users_only_apply_safe_rows(db):
+    from app.ui.app import MainApp
+
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    original = _make_user(1)
+    original["firstCardId"] = "CARD-A"
+    db.save_sync_cache_delta({"users": [original], "membersDeltaMode": False}, refresh)
+    db.upsert_member_shadow(users=[original])
+    valid = _make_user(2)
+    invalid_bool = _make_user(1)
+    invalid_bool["activeMembershipId"] = True
+    invalid_bool["firstCardId"] = "BAD-BOOL"
+    invalid_float = _make_user(1)
+    invalid_float["activeMembershipId"] = 1.5
+    invalid_float["firstCardId"] = "BAD-FLOAT"
+    response = {
+        "users": [valid, invalid_bool, invalid_float],
+        "membersDeltaMode": True,
+        "validMemberIds": [1, 2],
+    }
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(), data=response, refresh=refresh, delta_changed_ids={2},
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+        accepted_member_user_indexes=outcome["accepted_member_user_indexes"],
+    )
+
+    assert outcome["accepted_member_user_indexes"] == [0]
+    assert outcome["members_delete_refused"] is True
+    assert {row["activeMembershipId"]: row["firstCardId"] for row in db.list_sync_users()} == {
+        1: "CARD-A", 2: "CARD-2",
+    }
+    assert db.get_member_shadow_cards() == {1: "CARD-A", 2: "CARD-2"}
+    assert changed == {2}
+    assert revoked == set()
+
+
+def test_canonical_string_user_id_upserts_in_cache_and_shadow(db):
+    from app.ui.app import MainApp
+
+    refresh = {"members": True, "devices": False, "credentials": False, "settings": False}
+    user = _make_user(2)
+    user["activeMembershipId"] = "2"
+    response = {"users": [user], "membersDeltaMode": False}
+
+    outcome = db.save_sync_cache_delta(response, refresh)
+    _changed, revoked = MainApp._apply_member_shadow_sync(
+        _app(), data=response, refresh=refresh, delta_changed_ids=None,
+        cache_members_delete_refused=outcome["members_delete_refused"],
+        authoritative_member_ids=outcome["authoritative_member_ids"],
+        authoritative_member_ids_valid=outcome["authoritative_member_ids_valid"],
+        accepted_member_user_indexes=outcome["accepted_member_user_indexes"],
+    )
+
+    assert outcome["accepted_member_user_indexes"] == [0]
+    assert [row["activeMembershipId"] for row in db.list_sync_users()] == [2]
+    assert _shadow_ids(db) == {2}
+    assert revoked == set()
+
+
 def test_full_h006_cache_refusal_preserves_shadow_and_emits_no_revocations(db):
     from app.ui.app import MainApp
 

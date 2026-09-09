@@ -226,19 +226,12 @@ def test_user_with_superseded_and_current_membership_keeps_both_rows(db):
     assert _one(after, (100, 2))["rowid"] == _one(before, (100, 2))["rowid"]
 
 
-def test_membership_id_fallback_is_part_of_the_key(db):
-    """A member without activeMembershipId is stored with membershipId in that column
-    (the INSERT fallback). The diff must key on the STORED value or every refresh would
-    insert a duplicate and delete the previous row."""
-    _refresh(db, [_user(None, 100, membership_id=50)])
-    before = _rows(db)
-    assert set(before) == {(100, 50)}
-
+def test_membership_id_never_substitutes_for_missing_active_membership_id(db):
+    """Deletion authority and safe upserts require an explicit canonical AM id."""
     profile = _refresh(db, [_user(None, 100, membership_id=50)])
 
-    after = _rows(db)
-    assert after == before
-    assert _counters(profile)["members_unchanged"] == 1
+    assert _rows(db) == {}
+    assert profile["members_full_refresh_refused"] is True
 
 
 # --------------------------------------------------------------------------- NULL keys
@@ -254,14 +247,14 @@ def test_null_key_rows_are_not_duplicated_across_refreshes(db):
     _refresh(db, payload)
 
     rows = _rows(db)
-    assert len(rows[(100, None)]) == 1
+    assert (100, None) not in rows
     assert len(rows[(None, 7)]) == 1
     assert len(rows[(200, 2)]) == 1
     with db.get_conn() as conn:
-        assert int(conn.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]) == 3
+        assert int(conn.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]) == 2
     # NULL-key rows sit outside the unique index and cannot be diffed: they are
     # rewritten (deleted + re-inserted) on every full refresh, and reported as such.
-    assert _counters(profile)["members_null_key_rows"] == 2
+    assert _counters(profile)["members_null_key_rows"] == 1
     assert _counters(profile)["members_unchanged"] == 1
 
 
