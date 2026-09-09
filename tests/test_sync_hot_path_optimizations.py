@@ -332,7 +332,7 @@ def test_member_shadow_delta_path_skips_full_diff(monkeypatch):
         lambda *, users, valid_member_ids: [77],
     )
 
-    changed_ids = app_module.MainApp._apply_member_shadow_sync(
+    changed_ids, revoked_ids = app_module.MainApp._apply_member_shadow_sync(
         app,
         data={
             "membersDeltaMode": True,
@@ -343,7 +343,8 @@ def test_member_shadow_delta_path_skips_full_diff(monkeypatch):
         delta_changed_ids={5},
     )
 
-    assert changed_ids == {5, 77}
+    assert changed_ids == {5}
+    assert revoked_ids == {77}
     app.logger.info.assert_called_once_with(
         "[ShadowDiff] delta fast-path: changed=%d deleted=%d",
         1,

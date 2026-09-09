@@ -85,12 +85,13 @@ def _run_full_sync(incoming, valid_ids, delta_changed_ids=None):
     import app.ui.app as app_module
 
     app = SimpleNamespace(logger=MagicMock())
-    return app_module.MainApp._apply_member_shadow_sync(
+    changed_ids, _revoked_ids = app_module.MainApp._apply_member_shadow_sync(
         app,
         data={"membersDeltaMode": False, "users": incoming, "validMemberIds": valid_ids},
         refresh={"members": True},
         delta_changed_ids=delta_changed_ids,
     )
+    return changed_ids
 
 
 # --------------------------------------------------------------------------- diff

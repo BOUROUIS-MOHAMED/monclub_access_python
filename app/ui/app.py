@@ -806,9 +806,10 @@ class MainApp:
         data: Dict[str, Any],
         refresh: Dict[str, Any],
         delta_changed_ids: set[int] | None,
-    ) -> set[int] | None:
+    ) -> tuple[set[int] | None, set[int]]:
+        revoked_ids: set[int] = set()
         if not refresh.get("members"):
-            return delta_changed_ids
+            return delta_changed_ids, revoked_ids
 
         _incoming_users = data.get("users") or []
         _valid_ids_raw = data.get("validMemberIds")
@@ -821,7 +822,7 @@ class MainApp:
             )
 
             _valid_ids = (
-                [int(x) for x in _valid_ids_raw if x is not None]
+                list(_normalize_positive_member_ids(_valid_ids_raw))
                 if _valid_ids_raw is not None else None
             )
 
@@ -830,20 +831,15 @@ class MainApp:
                     users=_incoming_users,
                     valid_member_ids=_valid_ids,
                 )
-                deleted_ids = {
-                    int(member_id)
-                    for member_id in (_shadow_deleted or [])
-                    if member_id is not None
-                }
-                if deleted_ids:
-                    merged_ids = set(delta_changed_ids or set())
-                    merged_ids.update(deleted_ids)
-                    delta_changed_ids = merged_ids
+                revoked_ids = _normalize_positive_member_ids(_shadow_deleted)
+                if delta_changed_ids is not None and revoked_ids:
+                    delta_changed_ids = set(delta_changed_ids)
+                    delta_changed_ids.difference_update(revoked_ids)
                 self.logger.info(
                     "[ShadowDiff] delta fast-path: changed=%d deleted=%d",
                     len(_incoming_users), len(_shadow_deleted),
                 )
-                return delta_changed_ids
+                return delta_changed_ids, revoked_ids
 
             _diff = diff_member_shadow(
                 incoming_users=_incoming_users,
@@ -851,6 +847,7 @@ class MainApp:
             )
             _shadow_changed = set(_diff["new"] + _diff["modified"])
             _shadow_deleted = _diff["deleted"]
+            revoked_ids = _normalize_positive_member_ids(_shadow_deleted)
             self.logger.info(
                 "[ShadowDiff] new=%d modified=%d deleted=%d",
                 len(_diff["new"]), len(_diff["modified"]), len(_shadow_deleted),
@@ -888,12 +885,34 @@ class MainApp:
             upsert_member_shadow(users=_shadow_rows_to_write)
             if _shadow_deleted:
                 delete_member_shadow(active_membership_ids=_shadow_deleted)
-            return delta_changed_ids
+            if delta_changed_ids is not None and revoked_ids:
+                delta_changed_ids = set(delta_changed_ids)
+                delta_changed_ids.difference_update(revoked_ids)
+            return delta_changed_ids, revoked_ids
         except Exception as _shadow_exc:
             self.logger.warning(
                 "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
             )
-            return delta_changed_ids
+            return delta_changed_ids, set()
+
+    @staticmethod
+    def _member_sync_dispatch_ids(
+        *,
+        changed_ids: set[int] | None,
+        revoked_ids: set[int] | None,
+    ) -> tuple[set[int] | None, set[int], set[int] | None]:
+        normalized_revoked_ids = _normalize_positive_member_ids(revoked_ids)
+        normalized_changed_ids = None
+        if changed_ids is not None:
+            normalized_changed_ids = _normalize_positive_member_ids(changed_ids)
+            normalized_changed_ids.difference_update(normalized_revoked_ids)
+
+        device_changed_ids = None
+        if normalized_changed_ids is not None:
+            device_changed_ids = set(normalized_changed_ids)
+            device_changed_ids.update(normalized_revoked_ids)
+
+        return normalized_changed_ids, normalized_revoked_ids, device_changed_ids
 
     def _request_running_ultra_sync(
         self,
@@ -2370,6 +2389,8 @@ class MainApp:
                 "settings": False,
             }
             _delta_changed_ids = None  # set when backend returns membersDeltaMode=True
+            _delta_revoked_ids: set[int] = set()
+            _device_changed_ids = None
 
             # --- Manual sync mode gate ------------------------------------------------
             # When the gym enabled manual sync, AUTOMATIC ticks (periodic TIMER / CHANGE_DETECTOR
@@ -2588,18 +2609,18 @@ class MainApp:
 
                 # Compute delta hints for device push optimization
                 if data.get("membersDeltaMode") and refresh.get("members"):
-                    _delta_changed_ids = {
-                        int(u["activeMembershipId"])
+                    _delta_changed_ids = _normalize_positive_member_ids(
+                        u.get("activeMembershipId")
                         for u in (data.get("users") or [])
-                        if isinstance(u, dict) and u.get("activeMembershipId") is not None
-                    }
+                        if isinstance(u, dict)
+                    )
 
                 # P6: Member shadow diff — detect actual field changes and update shadow.
                 # For full member refreshes this can narrow _delta_changed_ids to only
                 # members whose access-relevant fields actually changed (card, name, fps, dates).
                 if refresh.get("members"):
                     _shadow_started = time.perf_counter()
-                    _delta_changed_ids = self._apply_member_shadow_sync(
+                    _delta_changed_ids, _delta_revoked_ids = self._apply_member_shadow_sync(
                         data=data,
                         refresh=refresh,
                         delta_changed_ids=_delta_changed_ids,
@@ -2613,6 +2634,15 @@ class MainApp:
                 # is pushed (the device engine still only writes pins that actually differ).
                 if _manual_sync_mode and _is_user_initiated_sync:
                     _delta_changed_ids = None
+
+                (
+                    _delta_changed_ids,
+                    _delta_revoked_ids,
+                    _device_changed_ids,
+                ) = self._member_sync_dispatch_ids(
+                    changed_ids=_delta_changed_ids,
+                    revoked_ids=_delta_revoked_ids,
+                )
 
                 # Save new version tokens ONLY after successful cache write.
                 # Keys must match the Java @RequestParam names exactly so they
@@ -2641,6 +2671,7 @@ class MainApp:
                     self._request_running_ultra_sync(
                         refresh=refresh,
                         changed_ids=_delta_changed_ids,
+                        revoked_ids=_delta_revoked_ids,
                         reason=trigger_context.trigger_source,
                     )
                     ultra_push_requested = True
@@ -2717,8 +2748,8 @@ class MainApp:
                         elif (
                             refresh.get("members")
                             and not refresh.get("devices")
-                            and _delta_changed_ids is not None
-                            and len(_delta_changed_ids) == 0
+                            and _device_changed_ids is not None
+                            and len(_device_changed_ids) == 0
                         ):
                             self.logger.info("[DeviceSync] Skipped: no member delta to push.")
                             if sync_response_summary is not None:
@@ -2733,7 +2764,7 @@ class MainApp:
                             if cache:
                                 started = self._device_sync_engine.run_blocking(
                                     cache=cache, source=trigger_context.trigger_source.lower(),
-                                    changed_ids=_delta_changed_ids,
+                                    changed_ids=_device_changed_ids,
                                     sync_run_id=sync_run_id,
                                 )
                                 if started:
@@ -2914,6 +2945,7 @@ class MainApp:
                 self._request_running_ultra_sync(
                     refresh=refresh,
                     changed_ids=None,
+                    revoked_ids=_delta_revoked_ids,
                     reason=trigger_context.trigger_source,
                 )
                 # Record the ULTRA dispatch so the sync-run row stops reporting
