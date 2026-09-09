@@ -531,8 +531,9 @@ Until a connect line settles it, **do not state either as the cause.**
 ## 9. Verifying this guide
 
 These are runnable, so "is this still true" is a command rather than a judgement.
-Run them after completing the README setup and activating the project `.venv`; the
-system Python is not expected to carry the application's test dependencies.
+Run them after completing the README development/test setup (`pip install -r
+requirements-dev.txt`) and activating the project `.venv`; the system Python is not
+expected to carry the application's test dependencies.
 
 ```bash
 python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*'

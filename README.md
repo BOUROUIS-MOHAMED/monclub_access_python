@@ -28,6 +28,7 @@ This is a Windows desktop app (Tkinter) that:
    - python -m venv .venv
    - .venv\Scripts\activate
    - pip install -r requirements.txt
+   - For development/testing, install the test dependencies too: `pip install -r requirements-dev.txt`
 5) Run:
    - run_app.bat
 
