@@ -71,6 +71,12 @@ def _worker_request_accepted_or_pending(
     return bool(callable(pending) and pending(int(member_id)))
 
 
+def _worker_member_revoke_accepted_or_covered(worker: Any, member_id: int) -> bool:
+    """Atomically accept a revoke or confirm that worker-owned work covers it."""
+    request = getattr(worker, "request_member_revoke", None)
+    return bool(callable(request) and request(int(member_id)))
+
+
 def _worker_full_sync_accepted_or_pending(
     worker: Any,
     *,
@@ -1065,24 +1071,23 @@ class UltraDeviceWorker(threading.Thread):
                     self, "_confirmed_member_revoke_ids", set()
                 )
                 if normalized_member_id in self._active_member_revoke_ids:
-                    return False
+                    return True
                 if phase == _FULL_REVOKE_ACTIVE:
-                    return False
+                    return True
                 if phase == _FULL_REVOKE_RETRY and confirmed:
-                    return False
+                    return True
                 if normalized_member_id in pending_full_revokes:
-                    return False
+                    return True
                 if phase == _FULL_REVOKE_RETRY:
                     phases.pop(normalized_member_id, None)
                 elif normalized_member_id in pending_full_exclusions or exclusion_phase:
-                    return False
+                    return True
                 elif confirmed:
                     # Confirmation without a live exclusion/full owner is proof
                     # from an older generation, not pending revocation work.
                     getattr(self, "_confirmed_member_revoke_ids", set()).discard(
                         normalized_member_id
                     )
-                is_new_revocation = normalized_member_id not in self._pending_member_revoke_ids
                 self._pending_member_revoke_ids.add(normalized_member_id)
                 if normalized_member_id not in self._pending_member_sync_ids:
                     self._pending_member_sync_ids.add(normalized_member_id)
@@ -1095,7 +1100,7 @@ class UltraDeviceWorker(threading.Thread):
                         "excluded_ids", set(pending_revoked_ids)
                     ).add(normalized_member_id)
             self._wake_evt.set()
-        return is_new_revocation
+        return True
 
     def has_pending_member_sync(self, member_id: int) -> bool:
         with self._member_sync_lock:
@@ -5343,11 +5348,8 @@ class UltraSyncScheduler:
                         commands_handled = True
                         for member_id in sorted(normalized_revoked_ids):
                             commands_handled = (
-                                _worker_request_accepted_or_pending(
-                                    worker,
-                                    request_method="request_member_revoke",
-                                    pending_method="has_pending_member_revoke",
-                                    member_id=member_id,
+                                _worker_member_revoke_accepted_or_covered(
+                                    worker, member_id
                                 )
                                 and commands_handled
                             )
@@ -6091,11 +6093,8 @@ class UltraEngine:
                 commands_handled = True
                 for member_id in sorted(normalized_revoked_ids):
                     commands_handled = (
-                        _worker_request_accepted_or_pending(
-                            worker,
-                            request_method="request_member_revoke",
-                            pending_method="has_pending_member_revoke",
-                            member_id=member_id,
+                        _worker_member_revoke_accepted_or_covered(
+                            worker, member_id
                         )
                         and commands_handled
                     )

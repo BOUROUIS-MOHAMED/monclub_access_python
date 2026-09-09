@@ -1414,7 +1414,7 @@ def test_required_full_refresh_during_active_targeted_revoke_is_exclusion_only(
     assert entered.wait(1.0)
     try:
         assert worker.request_member_sync(41) is False
-        assert worker.request_member_revoke(41) is False
+        assert worker.request_member_revoke(41) is True
         assert worker.has_pending_member_revoke(41) is True
         assert worker._active_member_revoke_ids == {41}
         assert list(worker._pending_member_syncs) == []
@@ -1555,6 +1555,52 @@ def test_engine_full_merge_remains_handled_when_worker_drains_before_return_chec
         ("full", {43, 99}),
     ]
     assert worker.has_pending_member_revoke(41) is False
+
+
+def test_engine_revoke_duplicate_remains_handled_when_worker_completes_before_check(
+        monkeypatch):
+    import app.core.ultra_engine as ultra_module
+
+    worker, events, _entered, _release = _blocked_pull_full_sync_worker(
+        monkeypatch,
+        [True],
+        block_first=False,
+    )
+    assert worker.request_member_revoke(41) is True
+    request_member_revoke = worker.request_member_revoke
+    has_pending_member_revoke = worker.has_pending_member_revoke
+    worker.has_pending_member_revoke = MagicMock(wraps=has_pending_member_revoke)
+
+    def duplicate_then_complete(member_id):
+        handled = request_member_revoke(member_id)
+        assert worker._drain_member_sync_commands(limit=1) == 1
+        return handled
+
+    worker.request_member_revoke = duplicate_then_complete
+    worker.is_alive = lambda: True
+    scheduler = SimpleNamespace(
+        _devices=[worker._device],
+        request_sync_now=MagicMock(),
+    )
+    engine = SimpleNamespace(
+        _running=True,
+        _sync_scheduler=scheduler,
+        _workers={5: worker},
+        _logger=MagicMock(),
+    )
+
+    assert ultra_module.UltraEngine.request_sync_now(
+        engine,
+        changed_ids=set(),
+        revoked_ids={41},
+        device_ids={5},
+        reason="fast_patch_bundle",
+    ) is True
+
+    scheduler.request_sync_now.assert_not_called()
+    worker.has_pending_member_revoke.assert_not_called()
+    assert events == [("targeted", 41)]
+    assert has_pending_member_revoke(41) is False
 
 
 def test_revoke_first_full_second_adopts_targeted_before_member_drain(monkeypatch):
