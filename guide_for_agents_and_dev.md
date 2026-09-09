@@ -253,8 +253,9 @@ Only confirmed deletion or complete neutralisation atomically clears that PIN's
 test_zk_standalone_template_removal.py]`
 
 Ownership is a safety boundary. Without a readable MonClub ownership row for that
-device/PIN, the worker makes **no destructive SDK call**, emits the critical
-`MEMBER_REVOKE_OWNERSHIP_MISSING` event, and schedules full reconciliation. Such an
+device/PIN, the worker makes **no destructive SDK call**, writes a critical log for
+`MEMBER_REVOKE_OWNERSHIP_MISSING`, emits warning-level telemetry with the same event
+name, and schedules full reconciliation. Such an
 unowned PIN is intentionally left untouched for alert/reconciliation investigation.
 `[CODE: ultra_engine.py::_run_standalone_member_revoke]`
 `[TEST: test_standalone_revoked_pin_removal.py::
@@ -534,18 +535,21 @@ These are runnable, so "is this still true" is a command rather than a judgement
 Run them after completing the README development/test setup (`pip install -r
 requirements-dev.txt`) and activating the project `.venv`; the system Python is not
 expected to carry the application's test dependencies.
+The snippets below use PowerShell/bash quoting; replace single quotes with double
+quotes when running them from cmd.exe.
 
 ```bash
-python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*'
+python -m pytest tests/ -q --ignore=tests/_pydeps --ignore-glob='**/pytest_tmp_*' --ignore-glob='**/.tmp_pytest*' -W error::pytest.PytestUnhandledThreadExceptionWarning
 ```
 
 `--ignore=tests/_pydeps` is **required** — that directory holds vendored third-party
 packages whose own tests break collection. There is no `pytest.ini`, so the flag is not
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
-under `tests/` in some working copies; they are not part of the suite. Last run:
-**1313 passed, 1 warning** (2026-09-09, after the immediate authoritative revocation
-work; exit code 0). `[TEST]`
+under `tests/` in some working copies; they are not part of the suite. Unhandled
+background-thread exceptions are promoted to failures. Last run: **1316 passed, no
+warnings** (2026-09-09, after the immediate authoritative revocation work; exit code
+0). `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py

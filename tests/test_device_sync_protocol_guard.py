@@ -37,7 +37,12 @@ from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
 
 
 def _declared_protocol_members(protocol: type[Protocol]) -> set[str]:
-    """Return the public structural contract on supported Python versions."""
+    """Return the structural contract on supported Python versions.
+
+    Python 3.13 added ``typing.get_protocol_members``.  The supported 3.10/3.11
+    runtimes need the same MRO- and annotation-aware behaviour without relying
+    on the version-specific ``__protocol_attrs__`` implementation detail.
+    """
     try:
         from typing import get_protocol_members
     except ImportError:  # Python 3.10/3.11, which this application supports.
@@ -45,7 +50,41 @@ def _declared_protocol_members(protocol: type[Protocol]) -> set[str]:
 
     if get_protocol_members is not None:
         return set(get_protocol_members(protocol))
-    return {name for name in vars(protocol) if not name.startswith("_")}
+
+    protocol_bookkeeping = {
+        "__abstractmethods__",
+        "__annotations__",
+        "__class_getitem__",
+        "__dict__",
+        "__doc__",
+        "__firstlineno__",
+        "__init__",
+        "__match_args__",
+        "__module__",
+        "__new__",
+        "__non_callable_proto_members__",
+        "__orig_bases__",
+        "__orig_class__",
+        "__parameters__",
+        "__protocol_attrs__",
+        "__slots__",
+        "__static_attributes__",
+        "__subclasshook__",
+        "__type_params__",
+        "__weakref__",
+        "_MutableMapping__marker",
+        "_is_protocol",
+        "_is_runtime_protocol",
+    }
+    members: set[str] = set()
+    for base in protocol.__mro__[:-1]:  # omit object
+        if base.__name__ in {"Protocol", "Generic"}:
+            continue
+        annotations = vars(base).get("__annotations__", {})
+        for name in (*vars(base), *annotations):
+            if not name.startswith("_abc_") and name not in protocol_bookkeeping:
+                members.add(name)
+    return members
 
 
 def _missing_protocol_members(protocol: type[Protocol], implementation: type) -> list[str]:
@@ -206,6 +245,27 @@ class TestTransactionTableCapability:
             def connect(self) -> bool: ...
 
         assert _declared_protocol_members(_Contract) == {"connect", "is_connected"}
+
+    def test_protocol_member_discovery_includes_inherited_members(self):
+        class _BaseContract(Protocol):
+            def connect(self) -> bool: ...
+
+        class _ChildContract(_BaseContract, Protocol):
+            def disconnect(self) -> None: ...
+
+        assert _declared_protocol_members(_ChildContract) == {"connect", "disconnect"}
+
+    def test_protocol_member_discovery_includes_annotation_only_attributes(self):
+        class _Contract(Protocol):
+            supports_transaction_table: bool
+
+        assert _declared_protocol_members(_Contract) == {"supports_transaction_table"}
+
+    def test_protocol_member_discovery_includes_callable_contract(self):
+        class _Contract(Protocol):
+            def __call__(self, pin: str) -> bool: ...
+
+        assert _declared_protocol_members(_Contract) == {"__call__"}
 
     def test_missing_member_check_detects_each_incomplete_driver(self):
         class _Contract(Protocol):

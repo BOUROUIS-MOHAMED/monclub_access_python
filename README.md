@@ -24,11 +24,12 @@ This is a Windows desktop app (Tkinter) that:
 1) Install Python 3.10/3.11 (32-bit) on Windows
 2) Put plcommpro.dll (and required PullSDK DLL dependencies) in a known folder.
 3) Put ZKFinger SDK DLL (often zkfp.dll) in a known folder.
-4) Open PowerShell/cmd in this folder and run:
+4) Open PowerShell or cmd.exe in this folder and run:
    - python -m venv .venv
-   - .venv\Scripts\activate
-   - pip install -r requirements.txt
-   - For development/testing, install the test dependencies too: `pip install -r requirements-dev.txt`
+   - PowerShell: `.\.venv\Scripts\Activate.ps1`
+   - cmd.exe: `.venv\Scripts\activate.bat`
+   - Runtime only: `pip install -r requirements.txt`
+   - Development/testing (instead of the runtime-only command): `pip install -r requirements-dev.txt`
 5) Run:
    - run_app.bat
 

@@ -297,6 +297,7 @@ def test_main_app_initializes_scheduler_before_first_after(monkeypatch):
         plcomm_dll_path="C:/sdk/plcommpro.dll",
         zkfp_dll_path="C:/sdk/libzkfp.dll",
         log_level="INFO",
+        log_presign_url="",
     )
     logger = MagicMock()
 
