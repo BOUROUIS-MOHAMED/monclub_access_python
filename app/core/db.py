@@ -4453,7 +4453,7 @@ def _log_incoming_templates(users: Any, delta_mode: bool) -> None:
 _H006_MIN_CACHE_ROWS = 10
 
 
-def save_sync_cache_delta(data: dict, refresh: dict) -> None:
+def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     """
     Delta-aware cache update. Only replaces sections where refresh[section] is True.
     Sections with refresh=False are left untouched in the local cache.
@@ -4473,7 +4473,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
     independent refresh flags.
     """
     if not data:
-        return
+        return {"members_delete_refused": False}
 
     import logging as _log
     _logger = _log.getLogger(__name__)
@@ -4750,7 +4750,13 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
                     (data.get("infrastructures") or data.get("infrastructure") or []),
                 )
 
-        return {"credentials": creds_summary}
+        return {
+            "credentials": creds_summary,
+            "members_delete_refused": bool(
+                profile.get("members_delete_refused")
+                or profile.get("members_full_refresh_refused")
+            ),
+        }
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}
     # A settings refresh changes the global settings; drop the settings_reader
@@ -4790,6 +4796,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> None:
             total_ms=profile.get("total_ms"),
             queue_wait_ms=profile.get("queue_wait_ms"),
         )
+    return result
 
 
 def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:

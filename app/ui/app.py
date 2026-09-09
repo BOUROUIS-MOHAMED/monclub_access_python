@@ -806,10 +806,23 @@ class MainApp:
         data: Dict[str, Any],
         refresh: Dict[str, Any],
         delta_changed_ids: set[int] | None,
+        cache_members_delete_refused: bool = False,
     ) -> tuple[set[int] | None, set[int]]:
+        original_changed_ids = (
+            None
+            if delta_changed_ids is None
+            else _normalize_positive_member_ids(delta_changed_ids)
+        )
         revoked_ids: set[int] = set()
         if not refresh.get("members"):
-            return delta_changed_ids, revoked_ids
+            return original_changed_ids, revoked_ids
+
+        if cache_members_delete_refused and not data.get("membersDeltaMode"):
+            self.logger.warning(
+                "[ShadowDiff] full member deletion refused by authoritative cache write; "
+                "preserving shadow"
+            )
+            return original_changed_ids, revoked_ids
 
         _incoming_users = data.get("users") or []
         _valid_ids_raw = data.get("validMemberIds")
@@ -893,7 +906,7 @@ class MainApp:
             self.logger.warning(
                 "[ShadowDiff] Error: %s — proceeding with full sync", _shadow_exc
             )
-            return delta_changed_ids, set()
+            return original_changed_ids, set()
 
     @staticmethod
     def _member_sync_dispatch_ids(
@@ -2543,7 +2556,7 @@ class MainApp:
                     duration_sec=20.0,
                 )
                 _cache_write_started = time.perf_counter()
-                save_sync_cache_delta(data, refresh)
+                _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
                 _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
                 _log_sync_cache_write_profile(self.logger, _cache_write_ms)
                 from app.core.db import invalidate_sync_cache, refresh_sync_cache_async
@@ -2576,7 +2589,7 @@ class MainApp:
                             trigger_source=trigger_context.trigger_source,
                             duration_sec=20.0,
                         )
-                        save_sync_cache_delta(data, refresh)
+                        _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
                         invalidate_sync_cache()
                         refresh_sync_cache_async()
                         if not refresh.get("members"):
@@ -2624,6 +2637,9 @@ class MainApp:
                         data=data,
                         refresh=refresh,
                         delta_changed_ids=_delta_changed_ids,
+                        cache_members_delete_refused=bool(
+                            _cache_write_outcome.get("members_delete_refused")
+                        ),
                     )
                     _shadow_ms = int((time.perf_counter() - _shadow_started) * 1000)
                     if _shadow_ms >= 250:
