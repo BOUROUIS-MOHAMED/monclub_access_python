@@ -187,6 +187,40 @@ The same ordering is what makes an **abandoned** thread (§2, the wedge fence) s
 zombie eventually unblocks and runs this identical `finally`, so it would otherwise be a
 second crash site with the same signature.
 
+#### The ordering is necessary but not sufficient — exceptions leak the object too
+
+Nulling `zk` only covers references reachable from `_sta_main`'s own frame. A failing op
+can hand the COM proxy to **another thread** entirely: `[CODE]`
+
+```
+cmd.error = exc            # dispatch loop, in _sta_main
+raise cmd.error            # _call(), on the CALLING thread
+```
+
+An exception carries its frames on `__traceback__`. A `_do_*` that takes `zk` and lets an
+error escape therefore keeps the proxy alive through
+`cmd → cmd.error → __traceback__ → the op's frame → zk`, on the caller's stack, for as
+long as that thread holds the exception — while logging it, for instance. `gc.collect()`
+cannot free an object that still has a live non-cyclic referrer on another thread, and the
+`finally` never checks, so `CoUninitialize()` runs anyway and the final `Release` lands on
+the wrong thread after the apartment is gone. **Same 0xc0000005, reached through a failed
+door-unlock instead of the ordinary refresh.**
+
+The dispatch loop now formats the traceback to a **string** on the STA thread and clears
+`exc.__traceback__` before storing it. Type and message survive, which is all the callers
+use — `open_door` records `type(exc).__name__`. `[CODE]`
+
+> Format to a string; do **not** log with `exc_info=True`. That hands the same traceback
+> to the log-upload queue, which keeps it alive just as long.
+
+Every `_do_*` except `_do_open_door` already wrapped its own COM calls and stringified the
+error, which is why this stayed latent — `_do_open_door` is a bare
+`return bool(zk.ACUnlock(1, int(delay_ds)))`. The guard belongs to the dispatch loop
+rather than to that one method, so it covers every op including ones added later.
+`[TEST: test_zk_standalone_com_teardown.py::test_a_failed_op_does_not_export_the_com_object_to_the_caller
+— holds the caller's exception across teardown and asserts the object still dies; fails
+against the pre-fix source.]`
+
 ---
 
 #### ⛔ `Template=` is BASE64 ASCII — a HEX-stored row must be converted

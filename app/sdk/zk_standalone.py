@@ -1124,6 +1124,37 @@ class ZKStandaloneDevice:
                         else:
                             cmd.error = ValueError(f"unknown op {cmd.op!r}")
                     except BaseException as exc:  # noqa: BLE001 - captured for the caller
+                        # Strip the traceback before handing this across a thread
+                        # boundary. exc.__traceback__ -> the failing _do_* frame ->
+                        # its `zk` parameter, so a raw exception object keeps the
+                        # COM proxy alive on the CALLER's stack. _call() re-raises
+                        # it there, which defeats this thread's `zk = None;
+                        # gc.collect()` teardown: gc cannot free an object that
+                        # still has a live referrer on another thread, and the
+                        # finally block does not check, so CoUninitialize() runs
+                        # anyway and the final Release() lands on the wrong thread
+                        # after the apartment is gone -- the same 0xc0000005 class
+                        # the teardown was written to remove. _do_connect already
+                        # documents this hazard for its own logging; it applies to
+                        # every op that reaches here, and _do_open_door is the one
+                        # _do_* with no try/except of its own.
+                        #
+                        # Format to a STRING here, on the thread that owns the
+                        # apartment -- not exc_info=True, which would hand the same
+                        # traceback to the log-upload queue and keep it alive just
+                        # as long. Type and message survive the strip, which is all
+                        # the callers use (open_door records type(exc).__name__).
+                        try:
+                            import traceback as _tb
+                            _detail = "".join(
+                                _tb.format_exception(type(exc), exc, exc.__traceback__)
+                            )
+                            self.logger.debug(
+                                "%s op %r failed:\n%s", self._prefix, cmd.op, _detail
+                            )
+                        except Exception:
+                            pass
+                        exc.__traceback__ = None
                         cmd.error = exc
                     finally:
                         cmd.done.set()

@@ -89,6 +89,13 @@ def _make_recording_driver(payload_extra: Dict[str, Any] | None = None):
     return drv, zk, trace
 
 
+def _walk_tb(tb):
+    """Yield every traceback entry in a chain (empty when it has been stripped)."""
+    while tb is not None:
+        yield tb
+        tb = tb.tb_next
+
+
 def _assert_teardown_order(trace: List[str], *, expect_connected: bool = True) -> None:
     """The whole point of this module: close() strictly before CoUninitialize."""
     assert "CoUninitialize" in trace, f"apartment was never torn down: {trace}"
@@ -212,6 +219,62 @@ class TestComTeardownOrdering:
         t.join(timeout=5.0)
         assert not t.is_alive(), "STA thread survived a BaseException"
 
+        _assert_teardown_order(trace)
+
+    def test_a_failed_op_does_not_export_the_com_object_to_the_caller(self):
+        """A raising op must not hand its ``zk``-bound frame across the thread boundary.
+
+        The dispatch loop stores ``cmd.error = exc`` and ``_call`` re-raises that
+        SAME object on the CALLING thread. An exception carries its frames on
+        ``__traceback__``, so a ``_do_*`` that takes ``zk`` and lets an error escape
+        keeps the COM proxy alive on the caller's stack -- for exactly as long as
+        that thread holds the exception, e.g. while logging it.
+
+        ``zk = None; gc.collect()`` in the STA teardown cannot free an object that
+        still has a live referrer on another thread, and the finally block never
+        checks: CoUninitialize runs regardless, and the final Release lands on the
+        wrong thread after the apartment is gone. That is the 0xc0000005 this file
+        exists to prevent, reached through a failed door-unlock instead of the
+        ordinary refresh.
+
+        ``_do_open_door`` is the real instance -- the one ``_do_*`` with no
+        try/except of its own -- but the guard belongs to the dispatch loop, so
+        this pins it there and covers every op.
+        """
+        drv, zk, trace = _make_recording_driver()
+        assert drv.connect() is True
+
+        def _boom(zk, delay_ds):           # noqa: ARG001 - zk bound ON PURPOSE
+            raise RuntimeError("simulated ACUnlock COM failure")
+
+        drv._do_open_door = _boom          # type: ignore[method-assign]
+
+        held: List[BaseException] = []
+        try:
+            drv._call("open_door", args={"delay_ds": 5}, timeout=5.0)
+        except Exception as exc:           # what open_door's own handler does
+            held.append(exc)
+
+        assert held, "the failing op did not surface an error to the caller"
+
+        ref = weakref.ref(zk)
+        drv._com_factory = lambda: None
+        del zk
+
+        # The caller is STILL holding the exception here -- that is the whole
+        # point. Teardown must survive it.
+        drv.disconnect()
+        gc.collect()
+
+        assert ref() is None, (
+            "the caller's exception still reaches the COM object (via "
+            "__traceback__ -> the failing op's frame -> zk), so its final Release "
+            "would run on the wrong thread after CoUninitialize"
+        )
+        assert held[0].__traceback__ is None or not any(
+            "zk" in (tb.tb_frame.f_locals or {})
+            for tb in _walk_tb(held[0].__traceback__)
+        ), "a frame holding `zk` is still reachable from the caller's exception"
         _assert_teardown_order(trace)
 
     def test_com_object_reference_is_dropped_before_couninitialize(self):
