@@ -15,6 +15,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.core.utils import encode_ansi, parse_device_text
 
 
+# rc codes that SetDeviceData embeds as "rc=<code>" when the PAYLOAD SHAPE itself
+# is wrong for this table/firmware (table missing, field missing, field layout
+# mismatch) rather than a transient or connection failure.
+#
+# `[UNVERIFIED]` -- not from published ZKTeco documentation. Derived from observed
+# firmware behaviour, which set_device_data_batch's structural short-circuit has
+# already relied on. Shared with device_sync's firmware-profile cache-clear
+# decision: keep both in sync if this set ever changes.
+STRUCTURAL_ERROR_CODES = ("rc=-100", "rc=-101", "rc=-102", "rc=-103")
+
+
 class PullSDKError(RuntimeError):
     pass
 
@@ -693,7 +704,7 @@ class PullSDK:
             return (0, [])
 
         # Structural errors — the payload shape is wrong; row-by-row won't help.
-        _FATAL_CODES = ("rc=-100", "rc=-101", "rc=-102", "rc=-103")
+        _FATAL_CODES = STRUCTURAL_ERROR_CODES
 
         ok = 0
         failed: list = []

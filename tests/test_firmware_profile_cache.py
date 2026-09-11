@@ -2,6 +2,32 @@
 import pytest
 from unittest.mock import MagicMock, patch, call
 
+from app.sdk.pullsdk import PullSDKError
+
+# A structural rejection carries an rc code; anything else is treated as transient.
+# rc=-101 == "field missing", one of STRUCTURAL_ERROR_CODES.
+STRUCTURAL = PullSDKError("SetDeviceData FAILED table=templatev10 rc=-101 PullLastError=-101")
+TRANSIENT = PullSDKError("SetDeviceData FAILED table=templatev10 rc=-2 PullLastError=-2")
+
+
+def _spy_clear(monkeypatch, db_module):
+    """Record every clear_firmware_profile call.
+
+    The END-STATE profile cannot distinguish the structural path from the transient
+    one -- the L2 probe runs either way and re-saves the winner, so the final row is
+    identical. Whether the cache was CLEARED is the only observable difference, and
+    it is the whole point of F8.
+    """
+    calls = []
+    real = db_module.clear_firmware_profile
+
+    def _spy(*, device_id):
+        calls.append(device_id)
+        return real(device_id=device_id)
+
+    monkeypatch.setattr(db_module, "clear_firmware_profile", _spy)
+    return calls
+
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
@@ -119,15 +145,20 @@ def test_push_userauthorize_clears_cache_on_cached_pattern_failure(tmp_path, mon
     db_module.save_firmware_profile(device_id=3, template_table="templatev10",
                                     template_body_index=0, authorize_body_index=0)
 
+    cleared = _spy_clear(monkeypatch, db_module)
+
     sdk = MagicMock()
-    # Cached pattern (index=0) fails, then index=0 fails again, index=1 fails, index=2 succeeds
-    sdk.set_device_data.side_effect = [Exception("cached fail"), Exception("fail"),
+    # The cached pattern must fail STRUCTURALLY (rc=-101) for the cache to be cleared;
+    # a bare Exception is now classified transient and would KEEP the cache, making
+    # this test silently assert the opposite of its name.
+    sdk.set_device_data.side_effect = [STRUCTURAL, Exception("fail"),
                                        Exception("fail"), None]
 
     ok, err = svc._push_userauthorize(sdk, pin="42", door_bitmask=15,
                                       authorize_timezone_id=1, device_id=3)
 
     assert ok == 1
+    assert cleared == [3], "a STRUCTURAL rejection must clear the learned pattern"
     # New winning profile should be index=2
     profile = db_module.load_firmware_profile(device_id=3)
     assert profile["authorize_body_index"] == 2
@@ -183,8 +214,9 @@ def test_push_templates_clears_cache_on_cached_combo_failure(tmp_path, monkeypat
     sdk = MagicMock()
     # Cached combo (templatev10, index=0) fails; then all 5 templatev10 bodies fail,
     # then template[0] succeeds
+    cleared = _spy_clear(monkeypatch, db_module)
     sdk.set_device_data.side_effect = [
-        Exception("cached fail"),           # cached combo fails
+        STRUCTURAL,                         # cached combo REJECTED (rc=-101) -> clear
         Exception("fail"), Exception("fail"), Exception("fail"),  # templatev10[0..2]
         Exception("fail"), Exception("fail"),                     # templatev10[3..4]
         None,                               # template[0] succeeds
@@ -193,6 +225,7 @@ def test_push_templates_clears_cache_on_cached_combo_failure(tmp_path, monkeypat
     ok, errs = svc._push_templates(sdk, pin="1", templates=[make_template()], device_id=15)
 
     assert ok == 1
+    assert cleared == [15], "a STRUCTURAL rejection must clear the learned combo"
     profile = db_module.load_firmware_profile(device_id=15)
     assert profile["template_table"] == "template"
 
@@ -266,4 +299,82 @@ def test_push_templates_reports_every_invalid_record(tmp_path, monkeypatch):
 
     assert ok == 1
     assert len(errs) == 2
+
+
+# ---------------------------------------------------------------------------
+# F8: a TRANSIENT failure must not destroy an expensively-learned profile.
+#
+# try_set swallowed every exception identically, so a network blip, a timeout or
+# an auth error looked exactly like "this firmware does not have that table" --
+# and the code responded by clearing the cached combo and re-probing 10 SDK calls
+# per finger, on a device that had been answering correctly a moment earlier.
+# ---------------------------------------------------------------------------
+
+def test_is_structural_sdk_error_classifies_by_rc_code():
+    from app.core.device_sync import _is_structural_sdk_error
+
+    for code in ("rc=-100", "rc=-101", "rc=-102", "rc=-103"):
+        assert _is_structural_sdk_error(PullSDKError(f"boom {code} x")) is True
+
+    # transient / unknown -> NOT structural. The default matters: keeping a stale
+    # cache costs one wasted call, clearing a good one costs every later push.
+    for ex in (PullSDKError("rc=-2"), Exception("timed out"),
+               OSError("connection reset"), PullSDKError("no rc at all")):
+        assert _is_structural_sdk_error(ex) is False
+
+
+def test_push_templates_KEEPS_cache_on_a_transient_cached_combo_failure(tmp_path, monkeypatch):
+    """The blip case: the cached combo is still correct, so it must survive."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    db_module.save_firmware_profile(device_id=91, template_table="templatev10",
+                                    template_body_index=0, authorize_body_index=0)
+
+    cleared = _spy_clear(monkeypatch, db_module)
+    sdk = MagicMock()
+    # cached combo blips, then the probe's first combo succeeds
+    sdk.set_device_data.side_effect = [TRANSIENT, None]
+
+    ok, errs = svc._push_templates(sdk, pin="1", templates=[make_template()], device_id=91)
+
+    assert ok == 1
+    assert cleared == [], "a transient blip must NOT clear the learned combo"
+    profile = db_module.load_firmware_profile(device_id=91)
+    assert profile is not None, "a transient blip must not delete the profile"
+    assert profile["template_table"] == "templatev10"
+    assert profile["template_body_index"] == 0
+
+
+def test_push_userauthorize_KEEPS_cache_on_a_transient_cached_pattern_failure(tmp_path, monkeypatch):
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    db_module.save_firmware_profile(device_id=92, template_table="templatev10",
+                                    template_body_index=0, authorize_body_index=1)
+
+    cleared = _spy_clear(monkeypatch, db_module)
+    sdk = MagicMock()
+    # cached pattern blips; the probe then succeeds on pattern 0
+    sdk.set_device_data.side_effect = [TRANSIENT, None]
+
+    ok, err = svc._push_userauthorize(sdk, pin="42", door_bitmask=15,
+                                      authorize_timezone_id=1, device_id=92)
+
+    assert ok == 1
+    assert cleared == [], "a transient blip must NOT clear the learned pattern"
+    profile = db_module.load_firmware_profile(device_id=92)
+    assert profile is not None, "a transient blip must not delete the profile"
+
+
+def test_a_transient_failure_still_falls_through_to_the_probe(tmp_path, monkeypatch):
+    """Keeping the cache must not mean giving up on the push."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    db_module.save_firmware_profile(device_id=93, template_table="templatev10",
+                                    template_body_index=0, authorize_body_index=0)
+
+    sdk = MagicMock()
+    sdk.set_device_data.side_effect = [TRANSIENT, None]
+
+    ok, errs = svc._push_templates(sdk, pin="1", templates=[make_template()], device_id=93)
+
+    assert ok == 1, "the template must still land via the probe"
+    assert errs == []
+    assert sdk.set_device_data.call_count == 2
 

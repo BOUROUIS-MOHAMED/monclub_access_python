@@ -34,6 +34,7 @@ from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLi
 )
 from app.core import telemetry as _tel
 from app.core.utils import from_b64, from_hex, to_b64
+from app.sdk.pullsdk import STRUCTURAL_ERROR_CODES
 from app.sdk.pullsdk import PullSDK, PullSDKError
 from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
 
@@ -156,6 +157,25 @@ def _safe_template_text(s: str) -> str:
     if not s:
         return ""
     return str(s).replace("\r", "").replace("\n", "").replace("\t", "").strip()
+
+
+def _is_structural_sdk_error(ex: BaseException) -> bool:
+    """True when a PullSDK write failure is a genuine schema/table REJECTION.
+
+    Distinguishes "this firmware does not have that table/field layout" (rc=-100..
+    -103) from a transient or connection failure. Only the former justifies
+    discarding a learned firmware profile: clearing the cache on a network blip
+    throws away an expensively-probed combination and forces ten more SDK calls per
+    finger, on a device that was answering correctly a second ago.
+
+    `[UNVERIFIED heuristic]` -- the rc-code set is observed, not documented, and a
+    driver that failed to embed "rc=" at all is treated as TRANSIENT. That default
+    is deliberate: keeping a stale cache costs one wasted call and a fall-through to
+    the full probe, whereas clearing a good one costs every subsequent push.
+    [TEST: tests/test_firmware_profile_cache.py]
+    """
+    msg = str(ex)
+    return any(code in msg for code in STRUCTURAL_ERROR_CODES)
 
 
 def _decoded_template_len(text: str) -> int:
@@ -1502,15 +1522,23 @@ class DeviceSyncEngine:
                                   pin, profile.authorize_body_index)
                 return 1, None
             except Exception as ex:
-                # Cached pattern failed — firmware may have been upgraded. Clear and fall through.
-                self.logger.warning(
-                    "[DeviceSync] Pin=%s userauthorize cached pattern=%d FAILED (%s), "
-                    "clearing cache for device_id=%d",
-                    pin, profile.authorize_body_index, ex, device_id,
-                )
-                profile.authorize_body_index = None
-                from app.core.db import clear_firmware_profile
-                clear_firmware_profile(device_id=device_id)
+                if _is_structural_sdk_error(ex):
+                    # Firmware rejected the payload shape (upgraded?). Clear and probe.
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s userauthorize cached pattern=%d REJECTED "
+                        "(structural: %s), clearing cache for device_id=%d",
+                        pin, profile.authorize_body_index, ex, device_id,
+                    )
+                    profile.authorize_body_index = None
+                    from app.core.db import clear_firmware_profile
+                    clear_firmware_profile(device_id=device_id)
+                else:
+                    # Transient: keep the learned pattern, fall through and retry.
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s userauthorize cached pattern=%d failed "
+                        "non-structurally (transient?: %s), KEEPING cache for device_id=%d",
+                        pin, profile.authorize_body_index, ex, device_id,
+                    )
 
         # L2: retry loop — discover working pattern and cache it
         last_err = None
@@ -1560,13 +1588,19 @@ class DeviceSyncEngine:
         failed_fp_errs: List[str] = []
         ok = 0
 
-        def try_set(table: str, body: str) -> bool:
-            """Attempt SDK call. Returns True on success, False on any exception."""
+        def try_set(table: str, body: str) -> "Tuple[bool, bool]":
+            """Attempt the SDK call.
+
+            Returns (success, is_structural_failure). The second element is only
+            meaningful when success is False: it says whether the firmware REJECTED
+            the payload shape (so a cached combo is genuinely wrong) or whether the
+            call failed for some other reason (so the cache is probably still good).
+            """
             try:
                 sdk.set_device_data(table=table, data=body + "\r\n", options="")
-                return True
-            except Exception:
-                return False
+                return True, False
+            except Exception as ex:
+                return False, _is_structural_sdk_error(ex)
 
         profile = self._get_firmware_profile(device_id)
 
@@ -1620,26 +1654,38 @@ class DeviceSyncEngine:
             # L1: try cached combo (1 SDK call)
             if profile.template_table is not None and profile.template_body_index is not None:
                 cached_body = bodies[profile.template_body_index]()
-                if try_set(profile.template_table, cached_body):
+                _set_ok, _structural = try_set(profile.template_table, cached_body)
+                if _set_ok:
                     ok += 1
                     pushed = True
-                else:
-                    # Cached combo failed — clear and fall through to retry loop
+                elif _structural:
+                    # The firmware REJECTED this payload shape, so the cached combo is
+                    # genuinely wrong. Clear it and fall through to the probe.
                     self.logger.warning(
-                        "[DeviceSync] Pin=%s FingerID=%d cached template combo (%s, idx=%d) failed — "
-                        "clearing firmware cache for device_id=%d",
+                        "[DeviceSync] Pin=%s FingerID=%d cached template combo (%s, idx=%d) "
+                        "REJECTED (structural) — clearing firmware cache for device_id=%d",
                         pin, fid, profile.template_table, profile.template_body_index, device_id,
                     )
                     profile.template_table = None
                     profile.template_body_index = None
                     from app.core.db import clear_firmware_profile
                     clear_firmware_profile(device_id=device_id)
+                else:
+                    # Transient (network/timeout/auth). KEEP the cache: it was learned
+                    # over ten probe calls and the device was answering a moment ago.
+                    # The probe below still runs, so this costs nothing but a retry.
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s FingerID=%d cached template combo (%s, idx=%d) "
+                        "failed non-structurally (transient?) — KEEPING firmware cache "
+                        "for device_id=%d",
+                        pin, fid, profile.template_table, profile.template_body_index, device_id,
+                    )
 
             # L2: retry loop (runs on cache miss or after cache clear)
             if not pushed:
                 for table in preferred_tables:
                     for i, bfn in enumerate(bodies):
-                        if try_set(table, bfn()):
+                        if try_set(table, bfn())[0]:
                             pushed = True
                             ok += 1
                             # Cache winning combo

@@ -459,6 +459,41 @@ the **first** row of a chunk fails with a *structural* error — `rc=-100`, `-10
 marked failed without being attempted. `[CODE]` A progress callback fires after every
 chunk, successful or fallback. `[CODE]`
 
+#### Structural vs transient, and why the firmware cache depends on it
+
+**Added 2026-09-11.** Those four rc codes are now a shared constant,
+`pullsdk.STRUCTURAL_ERROR_CODES`, because a SECOND decision depends on them: the
+firmware-profile cache in `device_sync`.
+
+`_push_templates` / `_push_userauthorize` learn a working (table, body) combination
+over up to ten probe calls and cache it. When the cached combination later fails,
+the driver used to clear that cache unconditionally -- `try_set` swallowed every
+exception identically, so a network blip, a timeout or an auth error was
+indistinguishable from "this firmware has no such table". A single blip therefore
+discarded an expensively-learned profile and forced ten more SDK calls per finger,
+on a device that had been answering correctly a moment earlier. `[CODE]`
+
+`device_sync._is_structural_sdk_error` now splits the two:
+
+- **structural** (`rc=-100`/`-101`/`-102`/`-103`) -- the firmware genuinely rejected
+  the payload shape, so the cached combination is wrong. Clear it and re-probe.
+- **anything else** -- keep the cache. The probe still runs, so the push is not
+  abandoned; only the learned state survives.
+
+> The default is deliberately "transient": keeping a stale cache costs one wasted
+> call plus a fall-through to the probe, whereas clearing a good one costs every
+> later push. An error that embeds no `rc=` at all is therefore treated as transient.
+
+`[UNVERIFIED]` The rc-code set is observed firmware behaviour, not published ZKTeco
+documentation. `set_device_data_batch`'s structural short-circuit already relied on
+it; this change only gave it a name and a second consumer. If the set changes, both
+consumers change together.
+
+`[TEST: tests/test_firmware_profile_cache.py -- the clearing tests assert
+`clear_firmware_profile` WAS called and the transient tests assert it was NOT.
+Asserting the end-state profile cannot tell them apart: the probe re-saves a winner
+either way.]`
+
 Multi-row `DeleteDeviceData` is called the documented bulk pattern, citing *ZKTeco
 PullSDK User Guide V2.0*. `[COMMENT — a documentation citation, not a device
 measurement]`
