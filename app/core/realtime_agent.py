@@ -43,6 +43,13 @@ from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 _RECONNECT_BACKOFF_BASE_SEC: float = 0.25
 _RECONNECT_BACKOFF_MAX_SEC: float = 30.0
 
+# A poll thread wedged inside plcommpro.dll cannot be killed, and each one pins a
+# native session that PullSDK.disconnect() must now defer freeing (freeing it
+# under the thread was a use-after-free). Bound how many we accumulate before
+# declaring the device unrecoverable. Mirrors
+# UltraDeviceWorker._MAX_ORPHAN_POLL_THREADS.
+_MAX_ORPHAN_POLL_THREADS: int = 3
+
 
 # ===================== generic helpers =====================
 
@@ -731,14 +738,41 @@ class DeviceWorker(threading.Thread):
                     except Exception as _e:
                         _exc_holder.append(_e)
 
+                # Orphaned poll threads are unkillable and each one holds a
+                # plcommpro session lease, so they must be COUNTED. This loop used
+                # to drop the thread into a local and forget it: on the next
+                # iteration it started another on top of the stuck one, without
+                # limit. Track them across iterations and stop once too many are
+                # stuck, the same way ultra_engine does.
+                self._orphan_poll_threads = [
+                    _t for _t in getattr(self, "_orphan_poll_threads", []) if _t.is_alive()
+                ]
+                if len(self._orphan_poll_threads) >= _MAX_ORPHAN_POLL_THREADS:
+                    self.logger.error(
+                        f"[RT][device={self.device_id}] {len(self._orphan_poll_threads)} orphaned "
+                        f"poll thread(s) still stuck in the SDK — refusing to start another"
+                    )
+                    raise RuntimeError(
+                        f"poll_rtlog_once: {len(self._orphan_poll_threads)} orphaned poll "
+                        f"threads stuck in the SDK"
+                    )
+
                 _poll_thread = threading.Thread(target=_poll_fn, daemon=True)
                 _poll_thread.start()
                 _poll_thread.join(timeout=_poll_timeout_sec)
 
                 if _poll_thread.is_alive():
+                    self._orphan_poll_threads.append(_poll_thread)
                     self.logger.warning(
-                        f"[RT][device={self.device_id}] poll_rtlog_once blocked >{_poll_timeout_sec}s — forcing reconnect"
+                        f"[RT][device={self.device_id}] poll_rtlog_once blocked >{_poll_timeout_sec}s — "
+                        f"forcing reconnect (orphan {len(self._orphan_poll_threads)}/"
+                        f"{_MAX_ORPHAN_POLL_THREADS})"
                     )
+                    # disconnect() no longer frees the native session while that
+                    # thread is inside the DLL -- doing so was a use-after-free.
+                    # It invalidates the handle and defers the free until the
+                    # orphan returns; progress comes from the fresh connection
+                    # below, not from unblocking this one.
                     try:
                         self._device.disconnect()
                     except Exception:

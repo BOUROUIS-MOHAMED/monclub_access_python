@@ -3348,20 +3348,69 @@ class UltraDeviceWorker(threading.Thread):
     # RTLog polling with watchdog (15s timeout)
     # ------------------------------------------------------------------ #
 
+    # A wedged poll thread is unkillable, so the only question is how many we
+    # tolerate before declaring the device unrecoverable. Each one costs a thread
+    # and a leaked plcommpro session; three is enough to ride out transient
+    # wedges without letting a permanently sick device leak without bound.
+    _MAX_ORPHAN_POLL_THREADS = 3
+
     def _poll_with_watchdog(self) -> Optional[List[Dict[str, Any]]]:
         """Poll RTLog with thread-based watchdog. Returns events or None on timeout."""
-        # If the previous watchdog thread is still alive, the inner SDK call is
-        # hung. Spawning a new one would orphan the previous — that's a thread
-        # leak. Skip this cycle and force the caller to reconnect; the SDK
-        # disconnect should unblock the orphan thread.
+        # Retire orphans that have since come back; each one that returns also
+        # releases its PullSDK handle lease, which is what lets the deferred
+        # Disconnect finally run (see PullSDK._exit_handle_use).
+        orphans: List[threading.Thread] = [
+            t for t in getattr(self, "_orphan_poll_threads", []) if t.is_alive()
+        ]
+
         prev_t: Optional[threading.Thread] = getattr(self, "_watchdog_thread", None)
         if prev_t is not None and prev_t.is_alive():
+            # The previous poll is still inside the DLL.
+            #
+            # This used to `return None` every cycle until that thread came back,
+            # on the stated assumption that "the SDK disconnect should unblock the
+            # orphan thread" -- which was only ever true because disconnect() freed
+            # the session out from under it. That free was a use-after-free, and
+            # PullSDK.disconnect() no longer does it: while a call is in flight the
+            # native free is deferred. Nothing will unblock this thread now, so
+            # waiting for it would mean the device NEVER polls again -- a silently
+            # dead turnstile, which is worse than the crash we removed.
+            #
+            # So stop waiting on it. Retire it as an orphan and poll on the fresh
+            # connection the run loop has already rebuilt. If it ever returns, its
+            # lease drops and the old session is freed properly.
+            if prev_t not in orphans:
+                orphans.append(prev_t)
             logger.error(
                 f"{self._prefix} poll_rtlog WATCHDOG STILL HUNG from previous cycle — "
-                f"skipping poll, forcing reconnect"
+                f"retiring it as an orphan ({len(orphans)}/{self._MAX_ORPHAN_POLL_THREADS}) "
+                f"and polling on the new connection"
             )
-            _tel.warn("POLL_WATCHDOG_STILL_HUNG", worker=f"ULTRA:{self._device_id}")
+            _tel.warn(
+                "POLL_WATCHDOG_STILL_HUNG",
+                worker=f"ULTRA:{self._device_id}",
+                orphans=len(orphans),
+            )
+            self._watchdog_thread = None
+
+        if len(orphans) >= self._MAX_ORPHAN_POLL_THREADS:
+            # Every retry so far has wedged. Stop manufacturing threads and
+            # sessions we can never reclaim; the device needs a human or a
+            # process restart.
+            self._orphan_poll_threads = orphans
+            logger.error(
+                f"{self._prefix} poll_rtlog: {len(orphans)} orphaned poll threads are still "
+                f"stuck in the SDK — refusing to start another. This device is not "
+                f"recovering on its own."
+            )
+            _tel.warn(
+                "POLL_WATCHDOG_ORPHAN_LIMIT",
+                worker=f"ULTRA:{self._device_id}",
+                orphans=len(orphans),
+            )
             return None
+
+        self._orphan_poll_threads = orphans
 
         result: List[Optional[List[Dict[str, Any]]]] = [None]
         error: List[Optional[Exception]] = [None]
@@ -3409,8 +3458,10 @@ class UltraDeviceWorker(threading.Thread):
                 elapsed_ms=round(elapsed_ms),
                 timeout_s=self._poll_timeout_sec,
             )
-            # Leave _watchdog_thread set; next call will detect it's still alive
-            # and skip rather than orphan another thread.
+            # Leave _watchdog_thread set. The next call detects it is still alive
+            # and retires it as a bounded orphan so polling can continue on the
+            # fresh connection — it no longer waits for a thread that, since the
+            # deferred-free fix, nothing will unblock.
             return None
         # Thread finished — clear the reference so the next cycle can spawn fresh.
         self._watchdog_thread = None
