@@ -344,8 +344,12 @@ class TestPushRoster:
         assert "SSR_DeleteEnrollData" not in names
         tmp_calls = [c for c in zk.calls if c[0] == "SetUserTmpExStr"]
         assert tmp_calls == [("SetUserTmpExStr", 1, "117", 6, 1, "QUJD")]
-        # daytime push: NEVER EnableDevice-locks the terminal
-        assert all(c[0] != "EnableDevice" for c in zk.calls)
+        # Daytime push: NEVER *locks* the terminal. Re-specified for F13 -- connect
+        # now issues EnableDevice(1, True) unconditionally as a recovery net for a
+        # bracket that died mid-flight, so "no EnableDevice at all" is no longer the
+        # invariant. The invariant that matters is unchanged and asserted here: a
+        # non-bracketed push never disables the gym's sole verifier.
+        assert ("EnableDevice", 1, False) not in zk.calls
 
     def test_bracketed_push_enables_around_batch(self, driver):
         drv, zk = driver
@@ -353,8 +357,12 @@ class TestPushRoster:
         drv.push_roster([{"pin": "117", "name": "Bob", "card": "1"}],
                         {}, bracket_enable_device=True)
         enables = [c for c in zk.calls if c[0] == "EnableDevice"]
-        assert enables[0] == ("EnableDevice", 1, False)
-        assert enables[-1] == ("EnableDevice", 1, True)
+        # F13: connect() issues the recovery unlock first, so the bracket is no
+        # longer the first EnableDevice. Assert the full expected sequence rather
+        # than just the ends -- that pins the recovery net AND the bracket together.
+        assert enables[0] == ("EnableDevice", 1, True), "connect clears a stuck lock"
+        assert enables[1] == ("EnableDevice", 1, False), "then the bracket locks"
+        assert enables[-1] == ("EnableDevice", 1, True), "and the bracket releases"
 
     def test_pin_over_9_digits_is_skipped(self, driver):
         drv, zk = driver

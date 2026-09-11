@@ -659,6 +659,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |
+| `ZKEM_DEVICE_LEFT_LOCKED` | `zk_standalone.py` | `worker err` |
 | `ZKEM_DEVICE_COUNTERS` | `zk_standalone.py` | `device_fp_version label_source c_<name>=<value>` |
 | `ZKEM_VERIFY_OK` | `ultra_engine.py` | `pin verify_method scan_mode_hint age_s event_id` |
 | `ZKEM_VERIFY_INVALID` | `ultra_engine.py` | the same, plus `att_state` |

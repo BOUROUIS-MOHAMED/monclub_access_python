@@ -1339,6 +1339,41 @@ class ZKStandaloneDevice:
                 zk.RegEvent(1, _REGEVENT_ATT_TRANSACTION)
             except Exception as exc:
                 self.logger.warning("%s RegEvent failed: %s", self._prefix, exc)
+
+            # ---- Release a lock a previous run may have left behind. ----
+            #
+            # The bracketed full reconcile holds EnableDevice(1, False) across the
+            # WHOLE roster, and its re-enable lives in a `finally`. A `finally`
+            # covers an exception -- it does NOT cover the two failure modes this
+            # driver actually has: the STA thread WEDGING on a COM call inside the
+            # bracket (the zombie never reaches it -- see _PUSH_MAX_CONSECUTIVE_WEDGES,
+            # which exists because wedging is observed, not hypothetical), or the
+            # process crashing. Either way the terminal stays locked, and it is the
+            # gym's sole verifier.
+            #
+            # EnableDevice(1, True) is idempotent -- enabling an enabled terminal is
+            # a no-op -- so issuing it on every successful connect is free and turns
+            # EVERY reconnection into a recovery: the 1800s CONN_REFRESH, the
+            # wedge-recovery reconnect inside push_roster, and a worker restart.
+            # That drops the bound on a lockout from "until the next nightly
+            # bracket" to "until the next reconnect".
+            #
+            # Best-effort on purpose: failing the connect over this would stop the
+            # worker coming up at all, and the worker is what retries.
+            # [TEST: tests/test_standalone_enable_device_recovery.py]
+            try:
+                zk.EnableDevice(1, True)
+            except Exception as exc:
+                # str(exc), NOT exc: handing the exception OBJECT to a logger keeps
+                # exc.__traceback__ -> this frame -> the COM object alive. That
+                # breaks the teardown invariant that no strong reference survives
+                # into CoUninitialize.
+                # [TEST: tests/test_zk_standalone_com_teardown.py]
+                self.logger.warning(
+                    "%s EnableDevice(True) on connect failed: %s "
+                    "(if a previous push died mid-bracket the terminal may still be locked)",
+                    self._prefix, str(exc),
+                )
             self._device_fp_version = self._read_fp_version(zk)
             self._device_status = self._read_device_status(zk)
             self.logger.info(
@@ -1746,7 +1781,23 @@ class ZKStandaloneDevice:
                 try:
                     zk.EnableDevice(1, True)
                 except Exception as exc:
+                    # NOT just an entry in a 5-capped errors list. This leaves the
+                    # gym's sole verifier locked, which is far more serious than the
+                    # roster outcome this function otherwise reports -- and nobody
+                    # would find it there. The next connect re-enables (see
+                    # _do_connect), so this is an alarm, not the recovery.
                     errors.append(f"EnableDevice(True): {exc}")
+                    self.logger.error(
+                        "%s TERMINAL MAY BE LEFT LOCKED: EnableDevice(True) failed "
+                        "after a bracketed push (%s). The device UI stays disabled "
+                        "until the next successful connect re-enables it.",
+                        self._prefix, exc,
+                    )
+                    try:
+                        _tel.warn("ZKEM_DEVICE_LEFT_LOCKED", worker=self._tel_wid,
+                                  err=str(exc)[:120])
+                    except Exception:
+                        pass
             try:
                 zk.RefreshData(1)
             except Exception:

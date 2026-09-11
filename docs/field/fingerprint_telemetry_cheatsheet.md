@@ -252,6 +252,23 @@ the roster. `ZKEM_STA_WEDGED` is the driver abandoning the STA thread.
 > chars) and `zkemkeeper command '<op>' timed out after <n>s` (the raised error). Grep for
 > the wrong one and you find nothing. `[CODE: zkemkeeper_guide.md §2]`
 
+**The terminal is locked and nobody can badge in:**
+
+```bash
+grep -F "[T] ZKEM_DEVICE_LEFT_LOCKED" app-*.log
+```
+
+The 22:00 / manual full reconcile locks the terminal UI for the whole roster
+(`EnableDevice(False)`) and releases it at the end. If the release fails — or the
+push wedges or the process dies before reaching it — the terminal stays locked, and
+on most sites it is the only thing on the door.
+
+**It recovers by itself on the next connect**: since 2026-09-11 every successful
+connect issues `EnableDevice(True)`, so the 1800 s `CONN_REFRESH`, a wedge-recovery
+reconnect, or restarting MonClub Access all clear it. Restarting the app is the
+fastest manual fix. Before that change the lock survived until the next nightly
+reconcile.
+
 **Terminal occupancy, before and after:**
 
 ```bash

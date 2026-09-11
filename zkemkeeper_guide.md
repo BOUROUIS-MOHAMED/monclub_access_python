@@ -440,7 +440,40 @@ zk.RefreshData(1)           # in the same finally, AFTER the re-enable, UNCONDIT
 
 > `EnableDevice(False)` **locks the terminal UI**, and it is the gym's sole verifier.
 > Only the 22:00 / manual full reconcile may set `bracket_enable_device=True`. A default
-> daytime push issues no `EnableDevice` call at all. `[CODE]` `[TEST]`
+> daytime push never *locks* the terminal. `[CODE]` `[TEST]`
+
+#### ⛔ Every connect releases a lock a dead bracket may have left
+
+**Added 2026-09-11.** `_do_connect` issues `EnableDevice(1, True)` unconditionally
+after a successful `Connect_Net`. `[CODE]` `[TEST:
+test_standalone_enable_device_recovery.py]`
+
+The bracket's re-enable lives in a `finally`, which covers an **exception**. It does
+not cover the two failure modes this driver actually has:
+
+- the STA thread **wedges** on a COM call inside the bracket — the zombie never
+  reaches the `finally` (`_PUSH_MAX_CONSECUTIVE_WEDGES` exists because wedging is
+  observed, not hypothetical), or
+- the **process crashes** mid-bracket.
+
+Either way the terminal stayed locked, and a failed re-enable was only appended to a
+5-entry capped `errors` list — it did not affect `ok`, and there was no
+ERROR-level alarm. The lockout therefore persisted until the **next** bracketed push
+completed end to end: the following night, or a manual trigger. On a site whose
+MB2000 is the only thing on the door, that is the whole day.
+
+`EnableDevice(1, True)` is idempotent, so issuing it on every connect is free and
+turns every reconnection into a recovery — the 1800 s `CONN_REFRESH`, the
+wedge-recovery reconnect inside `push_roster`, and a worker restart. **The bound on a
+lockout drops from "until the next nightly bracket" to "until the next reconnect".**
+
+It is best-effort: failing the connect over it would stop the worker coming up at
+all, and the worker is what retries. A failed release inside the bracket now also
+logs at ERROR and emits `ZKEM_DEVICE_LEFT_LOCKED`.
+
+> The handler logs `str(exc)`, never the exception object: handing a logger the
+> exception keeps `__traceback__` → frame → the COM object alive, which breaks the
+> teardown invariant in §2. `[TEST: test_zk_standalone_com_teardown.py]`
 
 ### Enumerate users
 
@@ -1025,7 +1058,8 @@ decoded reason. `[CODE]`
 - push sequence: card **before** userinfo; slot-clear **before** template
 - `SSR_DeleteEnrollData` **absent** from the slot-clear path
 - chunking, wedge recovery, consecutive-wedge cap, cross-chunk trace budgets
-- `EnableDevice` bracket order (first `False`, last `True`); unbracketed issues none
+- `EnableDevice`: the connect-time recovery unlock, then bracket order
+  (`False` … `True`); an unbracketed push never issues `False`
 - pin guard (> 9 digits skipped)
 - `list_users` fail-closed (three cases — but see §4 for what each asserts)
 - device occupancy reporting, including that an unreadable status invents no capacity
