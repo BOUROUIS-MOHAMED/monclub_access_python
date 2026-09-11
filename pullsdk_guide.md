@@ -248,6 +248,65 @@ discards `Disconnect`'s return code entirely and always clears the handle. `[COD
 
 `PullSDKError` subclasses `RuntimeError`, so `except RuntimeError` catches it. `[CODE]`
 
+#### ⛔ The handle must not be freed under an in-flight call
+
+**Added 2026-09-11.** `_h` is a **raw native pointer**, and every wrapper captures it
+into a local *before* entering the DLL:
+
+```python
+h = self._require_handle()                                  # captured here
+rc = int(self._dll.GetRTLogExt(c_void_p(h), buf, sz))       # used here
+```
+
+So clearing `_h` fences nothing that is already inside plcommpro.dll. `[CODE]`
+
+That matters because **`disconnect()` is called from a thread that is not the one
+using the handle, by design.** Both poll watchdogs — `ultra_engine._poll_with_watchdog`
+and the inline one in `realtime_agent` — abandon a blocked poll, leave that thread
+running, and then disconnect, on the stated reasoning that *"the SDK disconnect should
+unblock the orphan thread"*. `[COMMENT: ultra_engine.py, at the top of
+_poll_with_watchdog — never graded, and not verifiable without the hardware]`
+
+Freeing the session there is a **use-after-free in native code**: the orphan is still
+inside `GetRTLog`/`GetRTLogExt` and the DLL goes on to write the RTLog payload through a
+released context. Same class of defect, and the same delayed-access-violation
+signature, as the zkemkeeper apartment teardown (`zkemkeeper_guide.md` §2).
+
+`disconnect()` therefore now: `[CODE]`
+
+1. takes `_h_lock` (a short bookkeeping lock, **never** held across a native call),
+2. clears `_h` immediately, so no NEW call can take it,
+3. frees natively **only if** `_inflight == 0`,
+4. otherwise records `_pending_free` and returns — the last caller out runs the free
+   in `_exit_handle_use`.
+
+Every method that reaches the DLL holding the handle is marked `@_holds_handle`, which
+takes the lease for the whole call. All ten are decorated, and a test asserts that any
+future `_require_handle` user is too.
+`[TEST: test_pullsdk_handle_lifetime.py — 3 of its 8 cases fail against the pre-fix
+source, including the core "no Disconnect while a call is in flight"]`
+
+> **Why not just put `disconnect()` under `_sdk_lock`?** It was the only SDK method
+> that skipped it, so that looks like the obvious fix. It is not: `_sdk_lock` is held
+> across the blocked native call, so the watchdog would block forever behind the very
+> call it is trying to escape — deadlocking the worker or agent thread instead of
+> corrupting the heap. See §6 *Locking*.
+
+**The deliberate trade.** If the orphan never returns, its session and socket leak
+until the process restarts. That is accepted: a bounded leak we log beats memory
+corruption we cannot see. It does mean the callers can no longer rely on `disconnect()`
+unblocking anything, so progress has to come from a fresh connection instead — which is
+why `_poll_with_watchdog` now retires a hung poll thread as a **bounded orphan**
+(`_MAX_ORPHAN_POLL_THREADS = 3`) and polls on the new connection, rather than returning
+`None` forever. `[CODE]` Before that change, deferring the free would have left the
+device permanently unpolled — a silently dead turnstile, strictly worse than the crash.
+
+> `[UNVERIFIED]` Whether `Disconnect(h)` actually unblocks a concurrent
+> `GetRTLogExt(h, …)` on this DLL is **unknown** and cannot be settled without a C3
+> panel. The design above is safe either way: if the orphan returns, the deferred free
+> runs; if it never does, the orphan fence keeps the device polling regardless.
+> **This change has not been exercised against real PullSDK hardware.**
+
 ### Error reporting
 
 ```python
@@ -391,6 +450,12 @@ non-reentrant `_sdk_lock` (`threading.Lock`, not `RLock`). `[CODE]`
 > This does not self-deadlock **only because** `ensure_connected` / `connect` /
 > `disconnect` / `is_connected` never take that lock themselves. If you add a lock
 > acquisition to any of those four, every one of the nine methods above deadlocks.
+
+`PullSDKDevice.disconnect()` skipping `_sdk_lock` therefore is **not** an oversight to
+be tidied up — the lock is held across blocked native calls, so taking it here would
+wedge the poll watchdogs behind the exact call they exist to escape. The real hazard
+that skipping it creates (freeing the session under an in-flight call) is handled one
+layer down, in `PullSDK.disconnect()`'s deferred free — see §5 *Connection*. `[CODE]`
 
 ### Door
 

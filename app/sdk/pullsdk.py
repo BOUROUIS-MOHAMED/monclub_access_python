@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import logging
 import math
 import os
@@ -42,6 +43,30 @@ def _decode_sdk_bytes(data: bytes) -> str:
 _GLOBAL_SDK_LOCK = threading.Lock()  # serialize DLL load + connect across all devices
 
 
+def _holds_handle(fn):
+    """Mark a PullSDK method as one that enters the DLL holding the session handle.
+
+    Every such method captures ``self._h`` into a local and passes it to
+    plcommpro.dll, so the handle must not be freed for as long as the method is
+    running. The decorator takes a lease for exactly that window; disconnect()
+    then defers the native free while any lease is outstanding.
+
+    Applied as a decorator rather than by rewriting each body as a ``with``
+    block: the lease has to span the WHOLE method (``_call_with_growing_buffer``
+    can re-enter the DLL several times with the same handle), and a uniform
+    wrapper cannot be defeated by an early ``return`` on one of the ten call
+    sites.
+    """
+    @functools.wraps(fn)
+    def _wrapped(self, *args, **kwargs):
+        self._enter_handle_use()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._exit_handle_use()
+    return _wrapped
+
+
 class PullSDK:
     """
     ctypes wrapper for plcommpro.dll (Pull SDK).
@@ -65,6 +90,53 @@ class PullSDK:
         # inherently connection-scoped — a reconnect / rebooted controller starts
         # empty and gets a full one-time re-apply, so a param is never left stale.
         self._applied_params: Dict[str, str] = {}
+
+        # ---- handle lifetime: in-flight tracking + deferred free (see disconnect) ----
+        #
+        # `_h` is a RAW native pointer. Every call captures it into a local before
+        # entering plcommpro.dll, so setting `_h = None` does NOT fence a call
+        # that is already inside the DLL. Freeing the session while another
+        # thread is inside GetRTLogExt(h, ...) is a use-after-free: the DLL
+        # writes the RTLog payload through a context we just released.
+        #
+        # `_h_lock` guards ONLY this bookkeeping and is never held across a
+        # native call, so it cannot deadlock behind a wedged SDK call -- which
+        # is exactly why disconnect() must not simply take `_sdk_lock`.
+        self._h_lock = threading.Lock()
+        self._inflight = 0
+        self._pending_free: Optional[int] = None
+
+    # ------------------------------------------------------------------ #
+    # Handle leasing
+    # ------------------------------------------------------------------ #
+
+    def _enter_handle_use(self) -> None:
+        with self._h_lock:
+            self._inflight += 1
+
+    def _exit_handle_use(self) -> None:
+        """Release a lease and, if we were the last one out, do a deferred free."""
+        pend: Optional[int] = None
+        with self._h_lock:
+            if self._inflight > 0:
+                self._inflight -= 1
+            if self._pending_free is not None and self._inflight == 0:
+                pend, self._pending_free = self._pending_free, None
+        if pend is not None:
+            # The thread that asked to disconnect had to leave the session open
+            # because we were inside the DLL. We are the last one out, so the
+            # free is now safe -- and it happens here, on this thread.
+            try:
+                self.logger.info("PullSDK deferred Disconnect (last in-flight call returned).")
+                if self._dll is not None:
+                    self._dll.Disconnect(c_void_p(pend))
+            except Exception as exc:
+                self.logger.warning(f"PullSDK deferred Disconnect failed (non-fatal): {exc}")
+
+    def has_inflight_calls(self) -> bool:
+        """True while a thread is inside the DLL holding this session's handle."""
+        with self._h_lock:
+            return self._inflight > 0
 
     def load(self) -> None:
         if self._dll is not None:
@@ -204,13 +276,56 @@ class PullSDK:
         self.logger.info(f"Connected OK. Handle={self._h}")
 
     def disconnect(self) -> None:
-        if self._dll is None or not self._h:
+        """Close the session -- but NEVER while another thread is inside the DLL.
+
+        This is called from a thread that is not the one using the handle. The
+        ULTRA poll watchdog (ultra_engine._poll_with_watchdog) and the AGENT poll
+        watchdog (realtime_agent) both give up on a blocked poll, leave that
+        thread running, and then disconnect -- deliberately, per the comment
+        "the SDK disconnect should unblock the orphan thread".
+
+        Freeing the session under that thread is a use-after-free in native code:
+        it is still inside GetRTLog/GetRTLogExt with a captured copy of the raw
+        pointer, and plcommpro.dll will write the RTLog payload through a context
+        that no longer exists. Same class of bug, and the same delayed
+        access-violation signature, as the zkemkeeper apartment teardown.
+
+        So: invalidate the handle immediately (no NEW call can take it), and free
+        it only when nobody is inside. If someone is, the free is handed to
+        whoever exits last (_exit_handle_use).
+
+        If that thread never returns -- the wedge case -- the session and its
+        socket leak for the life of the process. That is the deliberate trade:
+        a bounded leak we log, instead of memory corruption we cannot see. The
+        callers are responsible for still making progress in that case; they do
+        it by starting a fresh poll on a fresh connection rather than by waiting
+        for this one (see the orphan fences in ultra_engine / realtime_agent).
+        """
+        with self._h_lock:
+            h, self._h = self._h, None
+            if self._dll is None or not h:
+                return
+            if self._inflight > 0:
+                self._pending_free = h
+                inflight = self._inflight
+            else:
+                self._pending_free = None
+                inflight = 0
+
+        if inflight > 0:
+            self.logger.warning(
+                "PullSDK Disconnect DEFERRED: %d call(s) still inside the DLL on this "
+                "handle. Freeing it now would be a use-after-free. The session will be "
+                "released when the last one returns; if it never does, it leaks until "
+                "the app restarts.",
+                inflight,
+            )
             return
+
         try:
             self.logger.info("PullSDK Disconnect...")
-            self._dll.Disconnect(c_void_p(self._h))
+            self._dll.Disconnect(c_void_p(h))
         finally:
-            self._h = None
             self.logger.info("Disconnected.")
 
     def pull_last_error(self) -> int:
@@ -305,6 +420,7 @@ class PullSDK:
         self.load()
         return self._dll is not None and hasattr(self._dll, "GetRTLogExt")
 
+    @_holds_handle
     def get_rtlog_text(self, *, initial_size: int | None = None) -> Tuple[int, str]:
         h = self._require_handle()
         self.load()
@@ -325,6 +441,7 @@ class PullSDK:
             debug_label="",
         )
 
+    @_holds_handle
     def get_rtlog_ext_text(self, *, initial_size: int | None = None) -> Tuple[int, str]:
         h = self._require_handle()
         self.load()
@@ -385,6 +502,7 @@ class PullSDK:
 
     # -------------------- GetDeviceData --------------------
 
+    @_holds_handle
     def get_device_data_text(
             self,
             *,
@@ -469,6 +587,7 @@ class PullSDK:
         self.logger.debug(f"get_device_data_rows: table={table} rc={rc} rows={len(rows)} {_el:.0f}ms")
         return rows
 
+    @_holds_handle
     def get_device_data_count(self, *, table: str, filter_expr: str = "", options: str = "") -> int:
         h = self._require_handle()
         if self._dll is None or not hasattr(self._dll, "GetDeviceDataCount"):
@@ -480,6 +599,7 @@ class PullSDK:
         self.logger.debug(f"GetDeviceDataCount(table={table}, filter={filter_n}) => {rc}")
         return rc
 
+    @_holds_handle
     def set_device_data(self, *, table: str, data: str, options: str = "") -> int:
         h = self._require_handle()
         if self._dll is None:
@@ -581,6 +701,7 @@ class PullSDK:
                     pass
         return (ok, failed)
 
+    @_holds_handle
     def clear_device_table(self, *, table: str) -> int:
         """
         Delete ALL records from a device table by passing an empty filter.
@@ -604,6 +725,7 @@ class PullSDK:
         self.load()
         return self._dll is not None and hasattr(self._dll, "DeleteDeviceData")
 
+    @_holds_handle
     def delete_device_data(self, *, table: str, data: str, options: str = "") -> int:
         h = self._require_handle()
         self.load()
@@ -683,6 +805,7 @@ class PullSDK:
         self.load()
         return self._dll is not None and hasattr(self._dll, "ControlDevice")
 
+    @_holds_handle
     def control_device(
             self,
             *,
@@ -744,6 +867,7 @@ class PullSDK:
         self.load()
         return self._dll is not None and hasattr(self._dll, "GetDeviceParam")
 
+    @_holds_handle
     def get_device_param(self, *, items: str, initial_size: int | None = None) -> str:
         h = self._require_handle()
         self.load()
@@ -793,6 +917,7 @@ class PullSDK:
         self.load()
         return self._dll is not None and hasattr(self._dll, "SetDeviceParam")
 
+    @_holds_handle
     def set_device_param(self, *, items: str) -> int:
         it = (items or "").strip()
         if not it:
