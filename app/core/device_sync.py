@@ -1467,8 +1467,32 @@ class DeviceSyncEngine:
         profile = self._get_firmware_profile(device_id)
 
         for t in templates:
-            fid = int(t.get("fingerId"))
-            tv = int(t.get("templateVersion") or 10)
+            # A malformed record must not abort the OTHER templates for this pin.
+            # These two were bare int() calls: a None fingerId raises TypeError and
+            # a truthy non-numeric templateVersion raises ValueError (`or 10` does
+            # NOT guard that -- a non-empty string is truthy). Either one escaped
+            # _push_templates entirely, so every VALID template later in the list
+            # was never attempted. Matches the guard ultra_engine and
+            # _compute_desired_hash already had for the same fields.
+            try:
+                fid = int(t.get("fingerId"))
+            except (TypeError, ValueError):
+                # Reported, not silently dropped: fingerId is the slot to write, so
+                # there is nothing sane to default to. Goes through the SAME errs
+                # list as a real push failure, which is what lets the caller count
+                # it as a failed sync instead of stamping the pin SUCCESS.
+                # Never log template bytes -- only the malformed id itself.
+                failed_fp_errs.append(
+                    f"FingerID={t.get('fingerId')!r}: invalid fingerId - skipped"
+                )
+                continue
+            try:
+                tv = int(t.get("templateVersion") or 10)
+            except (TypeError, ValueError):
+                # NOT fatal: tv only biases which table is probed FIRST, and the
+                # retry loop tries both tables anyway. Dropping the fingerprint
+                # over it would be an over-reaction. Same fallback as ultra_engine.
+                tv = 10
             if template_version_override in (9, 10):
                 tv = int(template_version_override)
             size = int(t.get("templateSize") or 0)

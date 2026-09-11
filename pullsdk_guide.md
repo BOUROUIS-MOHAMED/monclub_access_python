@@ -357,6 +357,49 @@ def delete_device_data(self, *, table, data, options="") -> int
 "", "")` — an empty data string. `[CODE]` Used by nuke-and-repave. Be certain before
 calling it.
 
+#### ⛔ `set_device_data` redacts `Template=` before logging
+
+**Added 2026-09-11.** `data` for `table="template"` / `"templatev10"` carries a full
+base64 **fingerprint template**. It used to be written to `app.log` verbatim at INFO
+— a 512-byte template rendered a 771-character line containing the whole biometric.
+
+`app.log` is **not local**. Three sinks consume that line:
+
+- the rotated log file on the gym PC,
+- `log_uploader.py`, which ships finalized logs **off-site** (Cloudinary
+  `POST_MULTIPART` / R2),
+- `log_buffer.py`'s ring, which the dashboard's live-log view reads.
+
+So every roster sync exported one biometric per finger to a third-party CDN. `[CODE]`
+
+Both emit sites now route through `_redact_template_field`, which rewrites only the
+`Template=` value as `Template=<redacted:len=N:sha1=XXXXXXXX>`:
+
+- `set_device_data`'s INFO log. `[CODE]`
+- `set_device_data_batch`'s row-by-row fallback warning — which **redacts before
+  slicing**. The old `row[:80]` sliced first, and since `Template=` begins around
+  offset 33 of a typical row, it published ~31 characters of the template. That was a
+  second, independent leak. `[CODE]`
+
+**The wire is unchanged.** `encode_ansi(data)` still hands the real, unredacted string
+to `plcommpro.dll`; this is a log-only transform. `[TEST]`
+
+**Everything else is logged byte-for-byte** — `Pin`, `FingerID`, `Valid`, `Size`, the
+table name, the rc code, and every non-template table (`user`, `userauthorize`). The
+structural-error diagnosis above (`rc=-100`/`-101`/`-102`/`-103`) still sees exactly
+what was sent. A logging-handler filter was rejected because it would have had to
+re-enumerate all three sinks; fixing the two emit sites closes them at once. `[CODE]`
+
+> **Deliberate diagnostic loss.** Raw template base64 can no longer be eyeballed in
+> the log for corruption (bad padding, truncation, embedded control characters). The
+> `len` + `sha1[:8]` tag replaces it, and matches the shape the enrol path already
+> emits (`ENROLL_BACKEND_REQ`), so the same template can be correlated across enrol
+> and push lines. `[CODE]`
+
+`[TEST: tests/test_pullsdk_setdevicedata_template_redaction.py — 6 cases; asserts the
+template reaches the DLL but never the log, that non-template tables are untouched,
+and that the batch fallback leaks no fragment.]`
+
 ### Batched writes
 
 ```python

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import hashlib
 import logging
 import math
 import os
@@ -41,6 +42,49 @@ def _decode_sdk_bytes(data: bytes) -> str:
 
 
 _GLOBAL_SDK_LOCK = threading.Lock()  # serialize DLL load + connect across all devices
+
+
+def _redact_template_field(data: str) -> str:
+    """Mask ``Template=`` values before a SetDeviceData payload is logged.
+
+    ``Template=`` is the ONLY biometric-bearing key SetDeviceData ever carries
+    `[CODE: every writer -- app/api/local_access_api_v2.py and
+    app/core/device_sync.py::_push_templates -- spells it exactly "Template=",
+    tab-delimited]`. Every other field (Pin, FingerID, Valid, Size, Name,
+    CardNo, AuthorizeTimezoneId, ...) and every non-template table ("user",
+    "userauthorize") pass through byte-for-byte, so structural-error diagnosis
+    (rc=-100/-101/-102/-103) still sees exactly what was sent.
+
+    The replacement carries ``len`` and ``sha1[:8]`` -- the SAME shape the
+    enrol path already emits for ENROLL_BACKEND_REQ -- so one template can be
+    correlated across enrol and push log lines without any part of the
+    biometric ever being written to disk.
+
+    WHY THIS EXISTS: app.log is not local. log_uploader.py ships finalized log
+    files OFF-SITE (Cloudinary POST_MULTIPART / R2), log_buffer.py serves the
+    dashboard's live-log view, and the default level is DEBUG -- so a full
+    base64 fingerprint template in this line left the building on every roster
+    sync. Redacting at the two emit sites closes all three sinks at once; a
+    logging-handler filter would have had to re-enumerate them.
+
+    This is a LOG-ONLY transform. The caller still hands the real, unredacted
+    string to ``plcommpro.dll``.
+    `[TEST: tests/test_pullsdk_setdevicedata_template_redaction.py]`
+    """
+    if "Template=" not in data:
+        return data
+    out_rows = []
+    for row in data.split("\r\n"):
+        fields = []
+        for f in row.split("\t"):
+            if f.startswith("Template="):
+                val = f[len("Template="):]
+                digest = hashlib.sha1(val.encode("utf-8", "ignore")).hexdigest()[:8]
+                fields.append(f"Template=<redacted:len={len(val)}:sha1={digest}>")
+            else:
+                fields.append(f)
+        out_rows.append("\t".join(fields))
+    return "\r\n".join(out_rows)
 
 
 def _holds_handle(fn):
@@ -605,7 +649,10 @@ class PullSDK:
         if self._dll is None:
             raise PullSDKError("PullSDK not loaded")
 
-        self.logger.info(f"SetDeviceData(table={table}) data={data}")
+        # Log-only redaction: the biometric must not reach app.log, which
+        # log_uploader.py ships OFF-SITE. The DLL call below still sends the
+        # real `data`. [TEST: tests/test_pullsdk_setdevicedata_template_redaction.py]
+        self.logger.info(f"SetDeviceData(table={table}) data={_redact_template_field(data)}")
         rc = int(self._dll.SetDeviceData(c_void_p(h), encode_ansi(table), encode_ansi(data), encode_ansi(options)))
         if rc < 0:
             err = self.pull_last_error()
@@ -673,7 +720,8 @@ class PullSDK:
                         self.set_device_data(table=table, data=row + "\r\n", options="")
                         ok += 1
                     except PullSDKError as ex:
-                        self.logger.warning("set_device_data_batch row-by-row failed: %s | row=%s", ex, row[:80])
+                        self.logger.warning("set_device_data_batch row-by-row failed: %s | row=%s",
+                                            ex, _redact_template_field(row)[:120])
                         failed.append(row)
                         # Short-circuit on the FIRST row if it's a structural error:
                         # subsequent rows in the same and later chunks will all fail

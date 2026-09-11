@@ -195,3 +195,75 @@ def test_push_templates_clears_cache_on_cached_combo_failure(tmp_path, monkeypat
     assert ok == 1
     profile = db_module.load_firmware_profile(device_id=15)
     assert profile["template_table"] == "template"
+
+
+# ---------------------------------------------------------------------------
+# F9: a malformed record must not abort the OTHER templates for the same pin.
+#
+# The loop head used to be a bare `int(t.get("fingerId"))` / 
+# `int(t.get("templateVersion") or 10)`. A None fingerId raises TypeError and a
+# truthy non-numeric templateVersion raises ValueError -- note `or 10` does NOT
+# guard the latter, because a non-empty string is truthy. Either exception
+# escaped _push_templates entirely, so every VALID template later in the same
+# list was silently never attempted.
+#
+# _compute_desired_hash (same file) and ultra_engine already guarded this field;
+# _push_templates was the odd one out.
+# ---------------------------------------------------------------------------
+
+def test_push_templates_skips_invalid_fingerprint_and_continues_others(tmp_path, monkeypatch):
+    """A bad fingerId is skipped AND reported -- it must not vanish, and must not
+    take the pin's other fingers down with it."""
+    svc, _db = make_engine(tmp_path, monkeypatch)
+
+    sdk = MagicMock()
+    sdk.set_device_data.return_value = None
+
+    bad = {"fingerId": None, "templateVersion": 10, "templateSize": 500,
+           "templateData": "AABBCC"}
+    ok, errs = svc._push_templates(sdk, pin="1", templates=[bad, make_template(fid=1)],
+                                   device_id=50)
+
+    # the valid record still got pushed
+    assert ok == 1
+    assert sdk.set_device_data.call_count == 1
+
+    # and the bad one is REPORTED, not silently dropped -- this is what lets F0
+    # count it as a failed sync rather than stamping the pin SUCCESS.
+    assert len(errs) == 1
+    assert "invalid fingerId" in errs[0]
+
+
+def test_push_templates_defaults_non_numeric_template_version_to_10(tmp_path, monkeypatch):
+    """templateVersion only biases which table is tried FIRST; the probe loop tries
+    both regardless. So a junk version must not cost the member their fingerprint."""
+    svc, _db = make_engine(tmp_path, monkeypatch)
+
+    sdk = MagicMock()
+    sdk.set_device_data.return_value = None
+
+    junk = {"fingerId": 2, "templateVersion": "v10", "templateSize": 500,
+            "templateData": "AABBCC"}
+    ok, errs = svc._push_templates(sdk, pin="1", templates=[junk], device_id=51)
+
+    assert ok == 1
+    assert errs == []
+
+
+def test_push_templates_reports_every_invalid_record(tmp_path, monkeypatch):
+    """Two bad records produce two error entries -- the count must not collapse."""
+    svc, _db = make_engine(tmp_path, monkeypatch)
+
+    sdk = MagicMock()
+    sdk.set_device_data.return_value = None
+
+    templates = [
+        {"fingerId": None, "templateVersion": 10, "templateSize": 5, "templateData": "AA"},
+        {"fingerId": "finger-three", "templateVersion": 10, "templateSize": 5, "templateData": "AA"},
+        make_template(fid=4),
+    ]
+    ok, errs = svc._push_templates(sdk, pin="1", templates=templates, device_id=52)
+
+    assert ok == 1
+    assert len(errs) == 2
+
