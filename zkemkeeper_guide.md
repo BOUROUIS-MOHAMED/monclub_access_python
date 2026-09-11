@@ -134,6 +134,59 @@ the event pump is treated as a **disconnect** — it clears the connected state 
 Because the loop is sequential, **one command is a window in which no COM message is
 pumped and no device event is drained.** That is why the roster push is chunked (§5).
 
+### ⛔ Teardown ordering — the apartment must outlive the COM object
+
+**Added 2026-09-11 — this ordering is why the Oxyfit PC died every ~30 minutes.**
+
+`_sta_main`'s `finally` must release the COM object **completely** before
+`CoUninitialize()`. The exact required order is: `[CODE]`
+
+```python
+zk.Disconnect()     # 1. device-level close
+zk.close()          # 2. connection-point Unadvise (EventsProxy -> generated close())
+zk = None           # 3. drop the last strong reference -> final IDispatch Release
+gc.collect()        # 4. the sink is reachable from itself through server.util.wrap()
+self._co_uninit()   # 5. only now may the apartment go away
+```
+
+Why every step is load-bearing:
+
+- `DispatchWithEvents` returns a pywin32 **`EventsProxy`**, whose `__del__` calls
+  `_obj_.close()`; the makepy-generated `close()` runs `cp.Unadvise(cookie)` and then
+  the final `Release` follows. `[CODE: win32com/client/__init__.py::EventsProxy,
+  win32com/client/genpy.py ~L394]`
+- If `zk` is still a live local at `CoUninitialize()`, that `Unadvise` + `Release` run
+  **in an apartment that no longer exists** — and possibly against a zkemkeeper that COM
+  has already unloaded via `DllCanUnloadNow`. That corrupts the heap.
+- The fault does **not** surface at the corrupting call. ntdll raises it at the next
+  significant alloc/free, which in practice is the *next* STA thread's
+  `CoInitialize` / `DispatchWithEvents` / `_do_connect`, seconds later.
+  `[FIELD: 2026-09-10 Oxyfit — MonClubAccess.exe crashed at 19:58 and 20:33:50,
+  each within ~20 s of the `CONN_REFRESH` / "persistent connection: safety refresh
+  after 1800s" line, faulting module ntdll.dll, code 0xc0000005, offset 0x000400d5.
+  Neither crash had a roster push in flight (`sync skip: fingerprint unchanged`) and
+  `PROC_HB` showed 39 MB RSS / 617 handles, so it was neither the push path nor
+  resource exhaustion.]`
+- `close()` is **idempotent** — the generated body nulls `_olecp` before calling
+  `Unadvise` — so the later `__del__` is a no-op, not a double-Unadvise. `[CODE]`
+- `zk.close()` alone is **not** sufficient: it unadvises the sink but still leaves the
+  `IDispatch` `Release` owed until the reference dies. Hence steps 3 and 4.
+- Relying on `__del__` alone is **never** sufficient: it moves the same work a few
+  instructions earlier, still after `CoUninitialize`.
+
+> This applies to **every** exit path out of `_sta_main` — clean stop, superseded
+> generation (top-of-loop), handed-back command (post-dequeue), and an exception
+> escaping the loop. They all share the one `finally`, so they are all covered — but an
+> edit that adds a `return` inside the loop would not be.
+> `[TEST: test_zk_standalone_com_teardown.py::TestComTeardownOrdering — asserts the
+> recorded call order on each of those four paths, plus that no strong reference to the
+> COM object survives into `CoUninitialize`. 5 of its 6 cases fail against the pre-fix
+> source.]`
+
+The same ordering is what makes an **abandoned** thread (§2, the wedge fence) safe: the
+zombie eventually unblocks and runs this identical `finally`, so it would otherwise be a
+second crash site with the same signature.
+
 ---
 
 ## 3. ⛔ `SSR_DeleteEnrollData` — MUST NOT be called for finger slots

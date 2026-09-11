@@ -1154,9 +1154,51 @@ class ZKStandaloneDevice:
                     pass
         finally:
             try:
+                # ---- Tear the COM object down INSIDE its own apartment. ----
+                #
+                # This ordering is the whole ballgame; getting it wrong crashed the
+                # gym PC every ~30 minutes (Application Error, ntdll.dll,
+                # 0xc0000005, on the 1800s CONN_REFRESH).
+                #
+                # DispatchWithEvents hands back a pywin32 EventsProxy. Its __del__
+                # calls _obj_.close(), and the makepy-generated close() does
+                #     cp.Unadvise(cookie)
+                # on the connection point, after which the last IDispatch Release
+                # runs. If `zk` is still a live local when CoUninitialize() fires,
+                # BOTH of those happen after the apartment is gone (and possibly
+                # after COM has unloaded zkemkeeper via DllCanUnloadNow) -> heap
+                # corruption -> an access violation raised from ntdll at the next
+                # significant alloc/free, which in practice is the NEXT STA
+                # thread's CoInitialize/DispatchWithEvents/_do_connect a few
+                # seconds later. That delay is why the crash never pointed here.
+                #
+                # So: Disconnect, then Unadvise, then drop the last reference,
+                # then collect -- and only THEN CoUninitialize.
                 if zk is not None:
                     try:
                         zk.Disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        # Explicit, and idempotent: the generated close() nulls
+                        # _olecp before calling Unadvise, so the later __del__ is a
+                        # no-op rather than a double-Unadvise. Relying on __del__
+                        # alone is NOT enough -- it would still run after
+                        # CoUninitialize.
+                        zk.close()
+                    except Exception:
+                        pass
+                    zk = None
+                    try:
+                        # The sink is reachable from itself through
+                        # win32com.server.util.wrap(), so the final release can be
+                        # owed to the cyclic collector rather than to refcounting.
+                        # Force it here, on this thread, while the apartment is
+                        # still alive -- otherwise the collector may run it later on
+                        # some ARBITRARY thread. Once per teardown (~30 min/device),
+                        # so the cost is irrelevant.
+                        import gc
+                        gc.collect()
                     except Exception:
                         pass
             finally:
