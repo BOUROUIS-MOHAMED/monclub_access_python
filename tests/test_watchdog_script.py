@@ -41,6 +41,57 @@ pytestmark = [
 ]
 
 
+def _installer_match(process_name: str) -> bool:
+    """Ask the SHIPPED Test-InstallerRunning whether *process_name* is our installer.
+
+    Deliberately not a copy of the regex. These tests used to inline the pattern
+    and -match it directly, which proved only that the literal in the test file
+    matched itself: editing the real pattern in the .ps1 left them green. The
+    narrowing they exist to protect lives in the script, so the script is what
+    has to be executed.
+
+    Test-InstallerRunning calls Get-Process with no seam, so lift just that
+    function out of the file via the PowerShell AST -- running the script itself
+    would execute a whole tick -- and shadow Get-Process in the same scope with a
+    stub returning one object of the requested name. A function definition beats
+    a cmdlet in name resolution, so the real body runs against fake input.
+    """
+    # as_posix(): a Python repr of a Windows path doubles its backslashes, and a
+    # PowerShell single-quoted string takes those literally -> wrong path.
+    # PowerShell accepts forward slashes everywhere a path is expected.
+    ps = f"""
+$ErrorActionPreference = 'Stop'
+$src = Get-Content -Raw -LiteralPath '{SCRIPT.as_posix()}'
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+$fn = $ast.Find({{
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'Test-InstallerRunning'
+}}, $true)
+if (-not $fn) {{ Write-Output 'NOFUNC'; exit 0 }}
+Invoke-Expression $fn.Extent.Text
+function Get-Process {{
+    param([string] $Name, $ErrorAction)
+    [pscustomobject]@{{ ProcessName = {process_name!r} }}
+}}
+if (Test-InstallerRunning) {{ Write-Output 'MATCH' }} else {{ Write-Output 'no' }}
+"""
+    out = subprocess.run(
+        [pwsh, "-NoProfile", "-Command", ps],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    stdout = out.stdout.strip()
+    assert "NOFUNC" not in stdout, (
+        "Test-InstallerRunning no longer exists in the shipped watchdog script; "
+        "this test can no longer verify the real detection logic"
+    )
+    assert stdout in ("MATCH", "no"), (
+        f"could not evaluate the shipped Test-InstallerRunning: "
+        f"stdout={out.stdout!r} stderr={out.stderr!r}"
+    )
+    return stdout == "MATCH"
+
+
 def _run(root: Path, *extra: str) -> str:
     """Run one watchdog tick against *root*; return everything it logged THIS tick.
 
@@ -117,26 +168,14 @@ class TestInstallerDetectionIsNarrow:
         "MonClubAccessUpdater",           # handled by its own guard, not this one
     ])
     def test_unrelated_processes_are_not_mistaken_for_our_installer(self, name: str):
-        out = subprocess.run(
-            [pwsh, "-NoProfile", "-Command",
-             f'if ("{name}" -match "^monclub_access(_[0-9][0-9a-zA-Z.\\-]*)?$")'
-             f' {{ "MATCH" }} else {{ "no" }}'],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-        assert "MATCH" not in out.stdout, (
+        assert _installer_match(name) is False, (
             f"{name!r} would be mistaken for the MonClub installer, standing the "
             f"watchdog down while the app is dead"
         )
 
     @pytest.mark.parametrize("name", ["monclub_access", "monclub_access_1.4.33"])
     def test_our_own_installer_is_still_detected(self, name: str):
-        out = subprocess.run(
-            [pwsh, "-NoProfile", "-Command",
-             f'if ("{name}" -match "^monclub_access(_[0-9][0-9a-zA-Z.\\-]*)?$")'
-             f' {{ "MATCH" }} else {{ "no" }}'],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-        assert "MATCH" in out.stdout
+        assert _installer_match(name) is True
 
 
 class TestCrashLoopCap:
