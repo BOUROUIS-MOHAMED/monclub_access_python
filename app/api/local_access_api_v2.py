@@ -4655,28 +4655,92 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         except Exception as ex:
             auth_result = str(ex)
 
-        # Push templates
-        tpl_ok = 0
-        tpl_errors: List[str] = []
-        for t in templates:
-            fid = _safe_int(t.get("fingerId"), 0)
-            ver = _safe_int(t.get("templateVersion"), 10)
-            size = _safe_int(t.get("templateSize"), 0)
-            tpl_data = _safe_str(t.get("templateData"), "").strip()
-            if not tpl_data:
-                continue
-            table = "templatev10" if ver >= 10 else "template"
-            tpl_line = f"Pin={pin}\tFingerID={fid}\tValid=1\tSize={size}\tTemplate={tpl_data}\r\n"
-            try:
-                sdk.set_device_data(table=table, data=tpl_line, options="")
-                tpl_ok += 1
-            except Exception as ex:
-                tpl_errors.append(f"FingerID={fid}: {ex}")
+        # Push templates -- DELEGATED to the same DeviceSyncEngine._push_templates the
+        # full and ULTRA sync paths use.
+        #
+        # This handler used to be a second, weaker implementation of the same job: ONE
+        # table and ONE body format (vs the shared method's 10 probed combinations plus
+        # the firmware-profile fast path), no deviceCapabilities bias, no pre-delete,
+        # Size=0 sent verbatim, and `ok: true` returned even when it pushed nothing.
+        # A member could be "pushed" here and still not open the door.
+        from app.core.device_sync import (
+            DeviceSyncEngine,
+            _decoded_template_len,
+            _template_wire,
+        )
+        from app.core.settings_reader import parse_fingerprint_template_version
+        from app.core.db import get_sync_device_payload
 
+        engine = DeviceSyncEngine(cfg=ctx.app.cfg, logger=_logger)
+
+        # Same table-order bias the main sync applies.
+        template_version_override = None
+        try:
+            template_version_override = parse_fingerprint_template_version(
+                (get_sync_device_payload(did) or {}).get("deviceCapabilities")
+            )
+        except Exception:
+            pass
+
+        # Conditional pre-delete, matching the main sync: only a device whose firmware
+        # profile recorded delete_then_insert/one_by_one (an observed silent-upsert
+        # failure) needs old rows cleared first. The default is a no-op -- exactly what
+        # this handler did before.
+        try:
+            profile = engine._get_firmware_profile(did)
+            if profile.insert_strategy in ("delete_then_insert", "one_by_one"):
+                engine._delete_auth_and_templates_best_effort(
+                    sdk=sdk, pin=pin, fingerprint_enabled=True,
+                )
+        except Exception:
+            pass
+
+        # This is the one template path that does NOT flow through
+        # _collect_templates_for_pin, so it is where a HEX templateData can still
+        # arrive (straight off an HTTP body). Normalise it here too, or the device is
+        # written a template it can never match.
+        tpl_errors: List[str] = []
+        wire_templates: List[Dict[str, Any]] = []
+        for t in (templates or []):
+            if not isinstance(t, dict):
+                continue
+            td = _safe_str(t.get("templateData"), "").strip()
+            if not td:
+                continue
+            try:
+                td, _nbytes = _template_wire(td, t.get("templateEncoding"))
+            except Exception as ex:
+                tpl_errors.append(
+                    f"FingerID={t.get('fingerId')!r}: templateEncoding=HEX but "
+                    f"templateData is not decodable hex ({ex})"
+                )
+                continue
+            # _push_templates falls back to Size=0 for a missing templateSize,
+            # because its normal caller (_collect_templates_for_pin) has already
+            # normalised it. This handler is the untrusted-input boundary, so it
+            # does that job here -- Size must be the DECODED byte count, never the
+            # encoded text length and never 0.
+            ts = _safe_int(t.get("templateSize"), 0)
+            if ts <= 0:
+                ts = _nbytes if _nbytes is not None else _decoded_template_len(td)
+            wire_templates.append({**t, "templateData": td, "templateSize": ts})
+
+        # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
+        # an unusable fingerId; coercing a missing one to slot 0 would write a
+        # biometric to a finger the caller never named.
+        pushed, push_errs = engine._push_templates(
+            sdk, pin=pin, templates=wire_templates, device_id=did,
+            template_version_override=template_version_override,
+        )
+        tpl_errors.extend(push_errs)
+
+        # `ok` now means what it says. Reporting true on a failed template push is the
+        # same defect F0 fixed on the sync paths.
+        ok = (auth_result == "OK") and not tpl_errors
         ctx.send_json(200, {
-            "ok": True,
+            "ok": ok,
             "authResult": auth_result,
-            "templateResult": f"{tpl_ok}/{len(templates)} pushed",
+            "templateResult": f"{pushed}/{len(templates)} pushed",
             "errors": tpl_errors,
         })
     except Exception as e:

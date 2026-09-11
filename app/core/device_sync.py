@@ -33,6 +33,7 @@ from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLi
     parse_fingerprint_template_version,
 )
 from app.core import telemetry as _tel
+from app.core.utils import from_b64, from_hex, to_b64
 from app.sdk.pullsdk import PullSDK, PullSDKError
 from app.sdk.device_driver import DeviceProtocol, resolve_device_protocol
 
@@ -155,6 +156,64 @@ def _safe_template_text(s: str) -> str:
     if not s:
         return ""
     return str(s).replace("\r", "").replace("\n", "").replace("\t", "").strip()
+
+
+def _decoded_template_len(text: str) -> int:
+    """Byte length of an encoded template, for the rare row that omits templateSize.
+
+    ``len(text)`` is the ENCODED length -- roughly 1.33x for base64 and exactly 2x
+    for hex -- and it used to be sent to the device as ``Size=``, describing a
+    payload it disagreed with. A 512-byte template reported 684.
+
+    Decoded LAZILY, only when ``templateSize`` is genuinely absent: backend rows
+    carry a NOT NULL templateSize, so this is near-unreachable, and the caller runs
+    inside the hash loop over the FULL roster on every sync.
+
+    Falls back to ``len(text)`` when the text will not decode at all -- a wrong Size
+    beats dropping a template that might otherwise work.
+    [TEST: tests/test_template_wire_encoding.py]
+    """
+    try:
+        return len(from_b64(text))
+    except Exception:
+        return len(text)
+
+
+def _template_wire(text: str, encoding: Any) -> "Tuple[str, int | None]":
+    """Return (BASE64-ASCII template, decoded byte count or None).
+
+    BOTH device wires take base64 ASCII: PullSDK ``Template=`` in
+    templatev10/template, and zkemkeeper ``SetUserTmpExStr``. The backend may STORE
+    a row as TemplateEncoding.HEX (the GMS legacy migration writes those) and,
+    before the matching backend release, delivers it as hex TEXT. Pushing that
+    unconverted writes a template the terminal can never match: the member is
+    refused at the door while Access reports the push as done -- and the standalone
+    driver misdiagnoses it as "store full" or "version mismatch", never encoding.
+
+    Anything that is not HEX is returned untouched. That is the historical contract
+    for every already-deployed row and for templates carrying no encoding at all,
+    and it is why deployment order is free: once the backend emits
+    templateEncoding="BASE64", this passes the data straight through, so double
+    conversion cannot happen.
+
+    The decode is deliberately as tolerant as the BACKEND's own hex decoder, which
+    accepts a "0x" prefix and embedded whitespace
+    (GmsMigrationService.decodeFingerprintTemplate, pinned by its
+    GmsFingerprintDecodeTest). ``bytes.fromhex`` accepts neither, and rejecting
+    what the backend accepted would drop a template it considered valid.
+
+    Raises when encoding is HEX but the text will not decode; the caller drops that
+    template rather than occupying a finger slot with something unmatchable.
+    [TEST: tests/test_template_wire_encoding.py]
+    """
+    enc = str(encoding or "").strip().upper()
+    if enc != "HEX":
+        return text, None
+    cleaned = "".join(str(text).split())
+    if cleaned[:2].lower() == "0x":
+        cleaned = cleaned[2:]
+    raw = from_hex(cleaned)
+    return to_b64(raw), len(raw)
 
 
 def _batch_row_field(row: str, key: str) -> str:
@@ -1305,10 +1364,34 @@ class DeviceSyncEngine:
         local_fp_index: Dict[str, List[Any]],
         fingerprint_enabled: bool = True,
     ) -> List[Dict[str, Any]]:
-        """
-        Priority:
-          1) user['fingerprints'] from cache
-          2) local SQLite fingerprints table (newest per finger_id)
+        """The sync cache is the SOLE authority for a member's templates.
+
+        ``user['fingerprints']`` is the whole answer. What it does not list --
+        because the gym deleted the finger, because the backend sent
+        ``enabled: false``, or because the member never enrolled -- must NOT reach
+        the device. An empty result is a real answer ("this member has no
+        templates"), never a cue to look elsewhere.
+
+        SECURITY (F12): this used to read the local SQLite ``fingerprints`` table
+        whenever the collected list came out empty, so a revoked or DISABLED finger
+        re-pushed its stale local copy and restored access the gym believed it had
+        removed. The emptiness produced by the ``enabled is False`` filter below was
+        itself the trigger.
+
+        Nothing justified the fallback: ``db.insert_fingerprint`` has no caller,
+        local enrol is refused (``local_access_api_v2._handle_enroll_start``),
+        dashboard enrol POSTs to the backend and returns through the roster, and
+        offline enrolment defers into ``offline_creation_queue`` -- a different
+        table. Rows can only exist on a PC upgraded from a pre-split install
+        (``shared/storage_migration`` ACCESS_OWNED_TABLES), and are enumerable
+        out-of-band via ``db.list_unconfirmed_fingerprints()`` / ``GET /fingerprints``.
+
+        ``local_fp_index`` stays in the signature -- callers and tests bind it by
+        keyword -- but is deliberately NOT read.
+        [TEST: tests/test_device_sync_template_authority.py]
+
+        Shared with the standalone path (``ultra_engine._build_standalone_roster``),
+        so this covers both device families.
 
         Output items:
           { fingerId:int, templateVersion:int, templateData:str, templateSize:int }
@@ -1323,7 +1406,14 @@ class DeviceSyncEngine:
             for fp in fps:
                 if not isinstance(fp, dict):
                     continue
-                if fp.get("enabled") is False:
+                # `is False` matched ONLY the bool singleton, so enabled=0,
+                # "false", "0" and "off" all sailed through as ENABLED. Java
+                # serialises a real bool today, so this is defence in depth --
+                # but the client is the ONLY enforcement point: no backend path
+                # filters disabled templates out of the outgoing payload.
+                # default=True is deliberate: most payloads omit the key, and an
+                # absent flag means enabled.
+                if not _boolish(fp.get("enabled"), default=True):
                     continue
                 fid = _to_int(fp.get("fingerId"), default=None)
                 if fid is None:
@@ -1332,9 +1422,25 @@ class DeviceSyncEngine:
                 td = _safe_template_text(fp.get("templateData") or "")
                 if not td:
                     continue
+                try:
+                    td, td_bytes = _template_wire(td, fp.get("templateEncoding"))
+                except Exception as ex:
+                    # Dropped, not pushed: occupying the slot with something the
+                    # terminal can never match is worse than having no template.
+                    # Never log template bytes -- only the failure reason.
+                    self.logger.warning(
+                        "[DeviceSync] Pin=%s FingerID=%s template DROPPED: "
+                        "templateEncoding=HEX but templateData is not decodable hex (%s)",
+                        pin, fid, ex,
+                    )
+                    continue
                 ts = _to_int(fp.get("templateSize"), default=None)
                 if ts is None:
-                    ts = len(td)
+                    # len(td) would be the ENCODED length -- ~1.33x for base64 and
+                    # 2x for hex. The device's Size field wants the byte count.
+                    # td_bytes is already the decoded count on the HEX path; the
+                    # base64 path decodes lazily, only when we get here.
+                    ts = td_bytes if td_bytes is not None else _decoded_template_len(td)
 
                 out.append(
                     {
@@ -1345,38 +1451,12 @@ class DeviceSyncEngine:
                     }
                 )
 
-        if out:
-            best: Dict[int, Dict[str, Any]] = {}
-            for x in out:
-                best[int(x["fingerId"])] = x
-            return [best[k] for k in sorted(best.keys())]
-
-        recs = local_fp_index.get(pin) or []
-        best_local: Dict[int, Dict[str, Any]] = {}
-        for r in recs:
-            try:
-                fid_i = int(getattr(r, "finger_id"))
-            except Exception:
-                continue
-            td = _safe_template_text(getattr(r, "template_data", "") or "")
-            if not td:
-                continue
-            try:
-                tmpl_version_i = int(getattr(r, "template_version"))
-            except Exception:
-                tmpl_version_i = 10
-            try:
-                ts_i = int(getattr(r, "template_size"))
-            except Exception:
-                ts_i = len(td)
-            best_local[fid_i] = {
-                "fingerId": fid_i,
-                "templateVersion": tmpl_version_i,
-                "templateData": td,
-                "templateSize": ts_i,
-            }
-
-        return [best_local[k] for k in sorted(best_local.keys())]
+        # No `if out:` guard: an empty list is the ANSWER, not a fallback cue.
+        # Deleting the local-SQLite fallback here is the whole of F12.
+        best: Dict[int, Dict[str, Any]] = {}
+        for x in out:
+            best[int(x["fingerId"])] = x
+        return [best[k] for k in sorted(best.keys())]
 
     def _push_userauthorize(
         self,

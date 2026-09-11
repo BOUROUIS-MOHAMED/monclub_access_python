@@ -400,6 +400,52 @@ re-enumerate all three sinks; fixing the two emit sites closes them at once. `[C
 template reaches the DLL but never the log, that non-template tables are untouched,
 and that the batch fallback leaks no fragment.]`
 
+#### ⛔ `Template=` is BASE64 ASCII — a HEX-stored row must be converted
+
+**Added 2026-09-11.** The backend stores each fingerprint's `TemplateEncoding`
+per row (`BASE64` or `HEX`) and used to deliver a HEX row as **hex text**. The
+Access client dropped the encoding entirely — `_collect_templates_for_pin` emitted
+only `{fingerId, templateVersion, templateData, templateSize}` — and copied that
+text straight onto the device wire, which accepts nothing but base64.
+
+The terminal then holds a template it can never match: **the member is refused at
+the door while Access reports the push as done.** `[CODE]`
+
+HEX is reachable in production through the GMS legacy migration
+(`CsvLegacySourceAdapter` accepts HEX, `GmsMigrationService` persists
+`TemplateEncoding.HEX`) — i.e. exactly the migrated gyms.
+
+Fixed on both sides, and the two halves are independent:
+
+- **Client** — `device_sync._template_wire(text, encoding)` converts HEX to base64
+  and returns the decoded byte count (so `Size=` is the byte count, not the text
+  length). Anything that is not HEX passes through untouched. `[CODE]`
+- **Backend** — the two Access-facing emitters
+  (`UserFingerprintController.toFingerprintDto`,
+  `AccessPatchBundleService.toFingerprintDto`) now always emit BASE64 and report
+  `templateEncoding="BASE64"`, describing the WIRE rather than the stored row.
+  `toFull` still reports the STORED encoding: the dashboard round-trips
+  `templateData` back through `update()`. `[CODE]`
+
+**Deployment order is free and double conversion is impossible:** once the backend
+sends `BASE64`, `_template_wire` passes the data through. The client half is *not*
+redundant — the backend delta keys on `updatedAt`, and changing an encoder bumps no
+timestamp, so an already-delivered HEX row is never re-sent. The client conversion
+is what repairs an existing poisoned cache.
+
+The decode is deliberately as tolerant as the backend's own (`0x` prefix and
+embedded whitespace accepted); an undecodable HEX template is **dropped with a
+warning** rather than pushed, so a finger slot is never occupied by something
+unmatchable.
+
+> **Known gap.** A dropped template is logged but is **not** attributed to the pin
+> as a failed sync — `_collect_templates_for_pin` has no access to `pin_outcomes`.
+> Grep `template DROPPED` to find them. `[UNVERIFIED: never observed in the field;
+> it needs a HEX row whose text is corrupt, which the backend's own decoder would
+> also have rejected.]`
+
+`[TEST: tests/test_template_wire_encoding.py]`
+
 ### Batched writes
 
 ```python

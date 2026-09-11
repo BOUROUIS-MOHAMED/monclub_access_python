@@ -464,7 +464,13 @@ class AppConfig:
         except Exception:
             cfg.template_version = 10
 
-        if cfg.template_encoding not in ("base64", "hex"):
+        # HEX enrolment is retired: both device wires are base64 ASCII, and the
+        # push path (device_sync._template_wire) normalises HEX inbound anyway.
+        # COERCE, do not reject and do not remove the field -- settings files in the
+        # field still carry "hex", and the key is part of the shared config contract
+        # (shared/config.py ACCESS_CONFIG_FIELDS, tauri-ui/src/api/types.ts), so
+        # dropping it would make those files unloadable.
+        if cfg.template_encoding != "base64":
             cfg.template_encoding = "base64"
 
         # log level
