@@ -5285,7 +5285,12 @@ class UltraSyncScheduler:
                 cf = cur_users.get(pin) or {}
                 if pf.get("h") == cf.get("h"):
                     continue
-                diff_fields = [k for k in ("name", "card", "doors", "tz", "tplh") if pf.get(k) != cf.get(k)]
+                # "tvo" is the per-device template-version override. Without it the
+                # one-time re-push after that dropdown changes logs as
+                # field_change_counts={'tplh': N}, which a field engineer reads as
+                # "N members' fingerprints changed" -- false, and alarming.
+                diff_fields = [k for k in ("name", "card", "doors", "tz", "tplh", "tvo")
+                               if pf.get(k) != cf.get(k)]
                 changed.append((pin, diff_fields, pf, cf))
                 for k in diff_fields:
                     field_counts[k] = field_counts.get(k, 0) + 1

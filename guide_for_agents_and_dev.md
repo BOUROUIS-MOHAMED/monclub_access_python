@@ -398,6 +398,52 @@ is *allowed* to make it. See §7.
 
 ---
 
+### 5.x `deviceCapabilities.fingerprintTemplateVersion` — live since 2026-09-11
+
+The dashboard dropdown (Device settings → **Fingerprint template** → AUTO / ZKFinger 9
+/ ZKFinger 10) writes `{"fingerprintTemplateVersion": 9|10}` into the device's opaque
+`deviceCapabilities` JSON.
+
+**It was inert from the day it shipped**, for two compounding reasons `[CODE]`:
+
+1. the per-pin desired hash hashed the RECORD's `templateVersion`, never the effective
+   one — so flipping the dropdown moved no pin's stored hash, `device_sync` reported
+   `sync skip: fingerprint unchanged`, and **nothing was pushed at all**;
+2. even when a push did happen, the warm L1 firmware-profile cache reused its learned
+   `(template_table, body_index)` combo without consulting the override — and that
+   cached table is precisely what the setting is meant to choose.
+
+Both are fixed:
+
+- `DeviceSyncEngine._resolve_template_version_override` is the **single** source, used
+  by the push path and by BOTH desired-hash paths. They must agree: a divergence at any
+  one site makes the stored hash permanently disagree with what the push produced, and
+  the pin is then re-pushed every cycle forever. `[TEST:
+  test_template_version_override_activation.py::TestTheResolverIsTheSingleSource]`
+- the effective version enters `_compute_desired_hash`, which propagates into the
+  device checksum automatically. **The checksum HEADER was deliberately NOT widened** —
+  doing both would force a full roster re-push on every device carrying the setting,
+  including ones where no member's effective version changed. `[TEST:
+  ...::test_the_header_itself_was_not_widened]`
+- a CHANGE of bias drops the cached combo **once** (`reset_firmware_template_combo`),
+  and the winning combo is persisted with the bias it was learned under, so this
+  cannot re-probe on every sync. `[TEST: ...::test_bias_re_probe_happens_only_once]`
+
+The probe fallback is unchanged: it still tries both tables, so a wrong setting costs
+one extra SDK call, never a member who cannot badge in.
+
+> **Release gate.** This retroactively activates a setting that has been inert since it
+> shipped, so every stored value in the field is configuration nobody has ever seen take
+> effect on real hardware. Before rollout: inventory which devices carry a non-null
+> value and what it is, then pilot ONE device and verify with a REAL FINGER at a door.
+> SDK success is not evidence the finger will match. `[UNVERIFIED]`
+
+> **Expected on first sync after upgrade:** members on a device whose dropdown disagrees
+> with their stored `templateVersion` get one re-push, logged by `FP_DELTA` as
+> `field_change_counts={'tvo': N}`. Devices set to AUTO are untouched.
+
+---
+
 ## 6. Two traps that have each cost a production release
 
 ### 6.1 The two-layer trap — `PullSDK` is not `PullSDKDevice`
@@ -660,6 +706,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |
 | `ZKEM_DEVICE_LEFT_LOCKED` | `zk_standalone.py` | `worker err` |
+| `FP_DELTA` | `ultra_engine.py` | `device_id reason header_changed added removed changed fields` |
 | `ZKEM_DEVICE_COUNTERS` | `zk_standalone.py` | `device_fp_version label_source c_<name>=<value>` |
 | `ZKEM_VERIFY_OK` | `ultra_engine.py` | `pin verify_method scan_mode_hint age_s event_id` |
 | `ZKEM_VERIFY_INVALID` | `ultra_engine.py` | the same, plus `att_state` |

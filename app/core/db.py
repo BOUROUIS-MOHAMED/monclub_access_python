@@ -844,6 +844,20 @@ def init_db() -> None:
                 _mig_exc,
             )
 
+        # The bias under which the cached (template_table, body_index) combo was
+        # learned. 0 = no override.
+        #
+        # PLACED AFTER _relax_firmware_profiles_not_null ON PURPOSE, and this is not
+        # cosmetic: that function REBUILDS sync_firmware_profiles from a HARDCODED
+        # CREATE TABLE and a HARDCODED INSERT...SELECT column list. A column added
+        # before it survives on a fresh database (so every test would pass) and is
+        # SILENTLY DROPPED on an upgraded field DB that still carries the old NOT
+        # NULL constraints -- which is the only kind of database this matters on.
+        # [TEST: tests/test_device_capabilities_template_version.py::
+        #        TestBiasColumnSurvivesTheRebuildMigration]
+        _ensure_column(conn, "sync_firmware_profiles", "template_version_bias",
+                       "template_version_bias INTEGER DEFAULT 0")
+
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
@@ -1744,6 +1758,12 @@ def init_db() -> None:
                 name_supported       INTEGER DEFAULT NULL,
                 insert_strategy      TEXT    DEFAULT NULL,
                 delete_strategy      TEXT    DEFAULT NULL,
+                -- Bias the cached (template_table, body_index) combo was learned
+                -- under. 0 = no override. Declared HERE as well as in the
+                -- migration block, because this CREATE TABLE runs AFTER it: on a
+                -- fresh database _ensure_column is a no-op (no table yet), so the
+                -- migration alone would never give a new install the column.
+                template_version_bias INTEGER DEFAULT 0,
                 updated_at           TEXT    NOT NULL
             );
             """
@@ -1977,6 +1997,7 @@ def save_firmware_profile(
     name_supported: bool | None = None,
     insert_strategy: str | None = None,
     delete_strategy: str | None = None,
+    template_version_bias: int | None = None,
 ) -> None:
     """
     Upsert the firmware profile for a ZKTeco device.
@@ -1991,8 +2012,9 @@ def save_firmware_profile(
             """
             INSERT INTO sync_firmware_profiles
                 (device_id, template_table, template_body_index, authorize_body_index,
-                 name_supported, insert_strategy, delete_strategy, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 name_supported, insert_strategy, delete_strategy, template_version_bias,
+                 updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 template_table       = COALESCE(excluded.template_table,       sync_firmware_profiles.template_table),
                 template_body_index  = COALESCE(excluded.template_body_index,  sync_firmware_profiles.template_body_index),
@@ -2000,6 +2022,7 @@ def save_firmware_profile(
                 name_supported       = COALESCE(excluded.name_supported,       sync_firmware_profiles.name_supported),
                 insert_strategy      = COALESCE(excluded.insert_strategy,      sync_firmware_profiles.insert_strategy),
                 delete_strategy      = COALESCE(excluded.delete_strategy,      sync_firmware_profiles.delete_strategy),
+                template_version_bias = COALESCE(excluded.template_version_bias, sync_firmware_profiles.template_version_bias),
                 updated_at           = excluded.updated_at
             """,
             (
@@ -2010,6 +2033,7 @@ def save_firmware_profile(
                 name_val,
                 insert_strategy,
                 delete_strategy,
+                template_version_bias,
                 now_iso(),
             ),
         )
@@ -2020,12 +2044,12 @@ def load_firmware_profile(*, device_id: int) -> dict | None:
     """
     Load the cached firmware profile for a device, or None if not cached.
     Returns dict with keys: template_table, template_body_index, authorize_body_index,
-    name_supported, insert_strategy, delete_strategy.
+    name_supported, insert_strategy, delete_strategy, template_version_bias.
     """
     with get_conn() as conn:
         row = conn.execute(
             "SELECT template_table, template_body_index, authorize_body_index, "
-            "name_supported, insert_strategy, delete_strategy "
+            "name_supported, insert_strategy, delete_strategy, template_version_bias "
             "FROM sync_firmware_profiles WHERE device_id = ?",
             (device_id,),
         ).fetchone()
@@ -2039,7 +2063,38 @@ def load_firmware_profile(*, device_id: int) -> dict | None:
         "name_supported": None if ns is None else bool(ns),
         "insert_strategy": row[4],
         "delete_strategy": row[5],
+        "template_version_bias": int(row[6] or 0),
     }
+
+
+def reset_firmware_template_combo(*, device_id: int, template_version_bias: int) -> None:
+    """Drop ONLY the cached template (table, body_index) and record the bias it is
+    being re-learned under.
+
+    Separate from save_firmware_profile because that one COALESCEs every column, so
+    it can never write a NULL -- and clearing the combo is exactly writing NULLs.
+    That COALESCE is also why 0, not NULL, means "no override": a bias of NULL could
+    never overwrite a stored 9 or 10.
+
+    Deliberately leaves authorize_body_index / name_supported / the strategies alone:
+    none of them depend on which template TABLE the device wants, so re-probing them
+    would be pure cost.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO sync_firmware_profiles
+                (device_id, template_table, template_body_index, template_version_bias, updated_at)
+            VALUES (?, NULL, NULL, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                template_table        = NULL,
+                template_body_index   = NULL,
+                template_version_bias = excluded.template_version_bias,
+                updated_at            = excluded.updated_at
+            """,
+            (device_id, int(template_version_bias or 0), now_iso()),
+        )
+        conn.commit()
 
 
 def clear_firmware_profile(*, device_id: int) -> None:

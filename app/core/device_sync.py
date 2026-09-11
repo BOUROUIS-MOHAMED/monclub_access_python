@@ -63,6 +63,10 @@ class FirmwareProfile:
     name_supported: bool | None = None
     insert_strategy: str | None = None
     delete_strategy: str | None = None
+    # The template-version bias the cached (template_table, body_index) combo was
+    # learned under. 0 = no override. Appended last: every field has a default, so
+    # this stays a safe addition for any positional construction.
+    template_version_bias: int = 0
 
 
 # Strategy constants (P0)
@@ -480,6 +484,26 @@ class DeviceSyncEngine:
         except Exception:
             self.logger.debug("[DeviceSync] feedback callback failed for %s", event_type, exc_info=True)
 
+    def _resolve_template_version_override(self, device: Dict[str, Any]) -> "int | None":
+        """The per-device fingerprint template-version bias (9 or 10), else None.
+
+        SINGLE source of truth, used by the push path AND by both desired-hash
+        paths. They must agree: if the push applies an override the hash does not,
+        the stored device_sync_state hash never matches what the push produced, and
+        the pin thrashes -- re-pushed on every cycle, forever.
+
+        Reads the already-parsed key that _normalize_device puts on the dict, and
+        falls back to re-parsing the raw capabilities JSON (belt and braces for
+        callers that hand over an unnormalised device).
+        """
+        v = (device or {}).get("fingerprintTemplateVersion")
+        if v is None:
+            v = parse_fingerprint_template_version(
+                (device or {}).get("deviceCapabilities")
+                or (device or {}).get("device_capabilities")
+            )
+        return v if v in (9, 10) else None
+
     def _get_firmware_profile(self, device_id: int) -> FirmwareProfile:
         """
         Returns the FirmwareProfile for this device, loading from SQLite if not in session cache.
@@ -497,6 +521,7 @@ class DeviceSyncEngine:
                     name_supported=persisted.get("name_supported"),
                     insert_strategy=persisted.get("insert_strategy"),
                     delete_strategy=persisted.get("delete_strategy"),
+                    template_version_bias=int(persisted.get("template_version_bias") or 0),
                 )
             else:
                 self._firmware_profiles[device_id] = FirmwareProfile()
@@ -513,6 +538,7 @@ class DeviceSyncEngine:
             name_supported=profile.name_supported,
             insert_strategy=profile.insert_strategy,
             delete_strategy=profile.delete_strategy,
+            template_version_bias=profile.template_version_bias,
         )
 
     def _set_progress(self, **changes: Any) -> None:
@@ -1084,6 +1110,7 @@ class DeviceSyncEngine:
             door_bitmask=door_bitmask,
             templates=templates,
             authorize_timezone_id=authorize_timezone_id,
+            template_version_override=self._resolve_template_version_override(normalized_device),
         )
 
         # Targeted: fetch ONLY this pin's stored hash (PK lookup ~ms) instead of
@@ -1111,7 +1138,7 @@ class DeviceSyncEngine:
             authorize_timezone_id=authorize_timezone_id,
             templates=templates,
             fingerprint_enabled=fingerprint_enabled,
-            template_version_override=normalized_device.get("fingerprintTemplateVersion"),
+            template_version_override=self._resolve_template_version_override(normalized_device),
         )
 
     def _global_defaults(self) -> Dict[str, Any]:
@@ -1606,6 +1633,30 @@ class DeviceSyncEngine:
 
         profile = self._get_firmware_profile(device_id)
 
+        # The cached (table, body_index) combo was learned under ONE bias, and that
+        # cached table is precisely what made a changed
+        # deviceCapabilities.fingerprintTemplateVersion inert: L1 below reuses it
+        # without ever consulting the override. So drop the combo ONCE when the bias
+        # moves, and let the probe re-learn under the new preference.
+        #
+        # This cannot re-probe every sync: the reset persists the new bias, and the
+        # winning combo is saved with it, so the next call compares equal. A device
+        # with no override has bias 0 on both sides and is untouched.
+        bias = int(template_version_override) if template_version_override in (9, 10) else 0
+        if int(profile.template_version_bias or 0) != bias:
+            if profile.template_table is not None or profile.template_body_index is not None:
+                self.logger.info(
+                    "[DeviceSync] device_id=%d template-version bias %s -> %s: dropping "
+                    "cached template combo (%s, idx=%s) for one re-probe",
+                    device_id, profile.template_version_bias, bias,
+                    profile.template_table, profile.template_body_index,
+                )
+            profile.template_table = None
+            profile.template_body_index = None
+            profile.template_version_bias = bias
+            from app.core.db import reset_firmware_template_combo
+            reset_firmware_template_combo(device_id=device_id, template_version_bias=bias)
+
         for t in templates:
             # A malformed record must not abort the OTHER templates for this pin.
             # These two were bare int() calls: a None fingerId raises TypeError and
@@ -1700,6 +1751,9 @@ class DeviceSyncEngine:
                                 template_body_index=i,
                                 authorize_body_index=profile.authorize_body_index
                                     if profile.authorize_body_index is not None else 0,
+                                # Record WHICH bias this combo was learned under, so
+                                # the check above compares equal next time.
+                                template_version_bias=bias,
                             )
                             break
                     if pushed:
@@ -1992,6 +2046,7 @@ class DeviceSyncEngine:
         door_bitmask: int,
         templates: List[Dict[str, Any]],
         authorize_timezone_id: int,
+        template_version_override: "int | None" = None,
         fields_out: Dict[str, Any] | None = None,
     ) -> str:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
@@ -2008,7 +2063,17 @@ class DeviceSyncEngine:
                 fid = int(t.get("fingerId"))
             except Exception:
                 continue
-            tv = int(t.get("templateVersion") or 10)
+            # EFFECTIVE version -- must mirror _push_templates exactly, including
+            # its guard form. Hashing the RECORD version alone is what made
+            # deviceCapabilities.fingerprintTemplateVersion inert: flipping the
+            # dropdown never moved any pin's stored hash, so no pin was ever
+            # selected for re-push and the setting did nothing at all.
+            try:
+                tv = int(t.get("templateVersion") or 10)
+            except (TypeError, ValueError):
+                tv = 10
+            if template_version_override in (9, 10):
+                tv = int(template_version_override)
             ts = int(t.get("templateSize") or 0)
             td = _safe_template_text(str(t.get("templateData") or ""))
             if not td:
@@ -2030,6 +2095,10 @@ class DeviceSyncEngine:
             fields_out["tz"] = str(tz)
             fields_out["tplh"] = _sha1_hex(tpl_blob)[:12] if tpl_blob else ""
             fields_out["tpln"] = len(tpl_parts)
+            # Read by ultra_engine's FP_DELTA diff_fields. Without it the one-time
+            # re-push logs as {'tplh': N}, which a field engineer reads as
+            # "N members' fingerprints changed" -- false, and alarming.
+            fields_out["tvo"] = str(template_version_override or "")
         return _sha1_hex(payload)
 
     def build_device_sync_fingerprint(
@@ -2066,6 +2135,12 @@ class DeviceSyncEngine:
 
         policy = str(normalized_device.get("pushingToDevicePolicy") or "").strip().upper()
         allowed_memberships = _norm_int_list(normalized_device.get("allowedMemberships") or [])
+        # Resolved once, outside the per-user loop. NOT added to fingerprint_parts:
+        # the header must not change, or every device with the setting would take a
+        # full roster re-push even where nothing behavioural moved. The override
+        # reaches the checksum through the per-user hashes instead, which is also
+        # exactly the set of pins that genuinely need re-pushing.
+        _tv_override = self._resolve_template_version_override(normalized_device)
         fingerprint_parts = [
             f"allowedMemberships={','.join(str(v) for v in allowed_memberships)}",
             f"doorIds={','.join(str(v) for v in door_ids)}",
@@ -2097,6 +2172,7 @@ class DeviceSyncEngine:
                 door_bitmask=door_bitmask,
                 templates=templates,
                 authorize_timezone_id=authorize_timezone_id,
+                template_version_override=_tv_override,
                 fields_out=_fo,
             )
             fingerprint_parts.append(comp)
@@ -2143,11 +2219,10 @@ class DeviceSyncEngine:
         # Per-device template-table bias (deviceCapabilities.fingerprintTemplateVersion).
         # Both callers pass a _normalize_device() dict (which carries the parsed key);
         # the raw-capabilities re-parse is a belt-and-braces fallback.
-        template_version_override = device.get("fingerprintTemplateVersion")
-        if template_version_override is None:
-            template_version_override = parse_fingerprint_template_version(
-                device.get("deviceCapabilities") or device.get("device_capabilities")
-            )
+        # One resolver for the push AND both hash paths -- a divergence at any site
+        # makes the stored per-pin hash disagree with what the push produced, and
+        # the pin is then re-pushed on every cycle forever.
+        template_version_override = self._resolve_template_version_override(device)
 
         if dev_id is None:
             self.logger.warning(f"[DeviceSync] Skip device name={dev_name!r}: missing id")
@@ -2248,6 +2323,7 @@ class DeviceSyncEngine:
                     door_bitmask=door_bitmask,
                     templates=templates,
                     authorize_timezone_id=authorize_timezone_id,
+                    template_version_override=template_version_override,
                 )
                 desired_hashes[pin] = dh
                 prev_hash, prev_ok, prev_streak, prev_attempt_hash, prev_seen = \

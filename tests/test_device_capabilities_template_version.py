@@ -5,9 +5,25 @@ opaque deviceCapabilities TEXT column. The desktop must:
   1. persist it through the sync_devices ingest and project it back as a parsed
      dict (db.py) — same survival family as the deviceProtocol chain;
   2. normalize it to fingerprint_template_version (settings_reader);
-  3. use it in device_sync._push_templates to BIAS the preferred template-table
-     order only — the firmware-profile cache and the probe fallback that tries
-     BOTH tables stay exactly as they are.
+  3. actually TAKE EFFECT on a device.
+
+Point 3 used to read "BIAS the preferred template-table order only -- the
+firmware-profile cache and the probe fallback stay exactly as they are." That was an
+accurate description of the code and a description of a setting that did nothing,
+for two compounding reasons:
+
+  a. the per-pin desired hash ignored the override, so flipping the dropdown moved
+     no pin's stored hash -- the sync reported "unchanged" and pushed NOTHING; and
+  b. even when a push did happen for some other reason, the L1 firmware-profile
+     cache reused the combo it had already learned, without consulting the override.
+
+So on any device that had ever pushed a fingerprint, the dropdown was inert. Both
+are fixed: the override is part of the effective template version the hash is built
+from, and a CHANGE of bias drops the cached combo once so the probe re-learns under
+the new preference.
+
+The probe fallback itself is unchanged -- it still tries both tables, so a wrong
+setting degrades to one extra probe, never to a member who cannot badge in.
 """
 from __future__ import annotations
 
@@ -234,9 +250,15 @@ def test_override_does_not_disable_probe_fallback(tmp_path, monkeypatch):
     assert profile["template_table"] == "templatev10"
 
 
-def test_override_leaves_cached_combo_fast_path_alone(tmp_path, monkeypatch):
-    """The firmware-profile L1 cache still wins: a cached templatev10 combo is
-    used as-is (1 SDK call) even when the override says 9."""
+def test_bias_change_invalidates_cached_combo_once(tmp_path, monkeypatch):
+    """INVERTED DELIBERATELY (F1). This test previously asserted that a cached
+    templatev10 combo was used as-is even when the override said 9 -- i.e. it pinned
+    the exact behaviour that made the dropdown inert on every device that had ever
+    pushed a fingerprint. That was the bug, described as a contract.
+
+    The cached combo is now dropped ONCE when the bias moves, so the probe re-learns
+    under the new preference and the override finally reaches the device.
+    """
     svc, db_module = make_engine(tmp_path, monkeypatch)
     db_module.save_firmware_profile(device_id=33, template_table="templatev10",
                                     template_body_index=0, authorize_body_index=0)
@@ -251,7 +273,54 @@ def test_override_leaves_cached_combo_fast_path_alone(tmp_path, monkeypatch):
 
     assert ok == 1
     assert errs == []
-    assert sdk.set_device_data.call_count == 1
+    # the cached templatev10 combo was NOT reused; the probe ran with 9 preferred
+    assert sdk.set_device_data.call_args_list[0].kwargs["table"] == "template"
+
+
+def test_bias_re_probe_happens_only_once(tmp_path, monkeypatch):
+    """The invalidation must not fire on every sync -- that would be a permanent
+    10-call-per-finger regression. The winning combo is saved WITH its bias, so the
+    second push is back on the 1-call fast path."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    db_module.save_firmware_profile(device_id=34, template_table="templatev10",
+                                    template_body_index=0, authorize_body_index=0)
+
+    sdk = MagicMock()
+    sdk.set_device_data.return_value = None
+
+    svc._push_templates(sdk, pin="1", templates=[make_template(version=10)],
+                        device_id=34, template_version_override=9)
+    first = sdk.set_device_data.call_count
+
+    # a fresh engine, so the in-memory profile cache cannot mask a persistence bug
+    svc2, _ = make_engine(tmp_path, monkeypatch)
+    sdk2 = MagicMock()
+    sdk2.set_device_data.return_value = None
+    svc2._push_templates(sdk2, pin="1", templates=[make_template(version=10)],
+                         device_id=34, template_version_override=9)
+
+    assert first >= 1
+    assert sdk2.set_device_data.call_count == 1, (
+        "the second push under the SAME bias must use the cached combo"
+    )
+    assert sdk2.set_device_data.call_args_list[0].kwargs["table"] == "template"
+
+
+def test_no_override_never_touches_the_cache(tmp_path, monkeypatch):
+    """A device with no dropdown value must be completely unaffected: bias 0 on
+    both sides, so nothing is invalidated and nothing re-probes."""
+    svc, db_module = make_engine(tmp_path, monkeypatch)
+    db_module.save_firmware_profile(device_id=35, template_table="templatev10",
+                                    template_body_index=0, authorize_body_index=0)
+
+    sdk = MagicMock()
+    sdk.set_device_data.return_value = None
+
+    ok, errs = svc._push_templates(sdk, pin="1", templates=[make_template(version=10)],
+                                   device_id=35, template_version_override=None)
+
+    assert ok == 1
+    assert sdk.set_device_data.call_count == 1, "cached fast path must survive"
     assert sdk.set_device_data.call_args_list[0].kwargs["table"] == "templatev10"
 
 
