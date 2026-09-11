@@ -14,6 +14,7 @@ from app.core.db import (
     list_sync_users_by_active_membership_ids,
     list_device_sync_hashes,
     list_device_sync_hashes_and_status,
+    list_device_sync_retry_state,
     get_device_sync_hash_for_pin,
     save_device_sync_state,
     save_device_sync_state_batch,
@@ -81,6 +82,22 @@ DEFAULT_AUTHORIZE_DOOR_ID_FALLBACK = 15
 _PUSH_POLICY_INCREMENTAL   = "INCREMENTAL"    # delta: hash-based, delete stale + changed-then-insert
 _PUSH_POLICY_FULL_REPLACE  = "FULL_REPLACE"   # nuke all tables then push entire desired roster
 _PUSH_POLICY_ADDITIVE_ONLY = "ADDITIVE_ONLY"  # push changed/new (delete-then-insert), never remove stale
+
+# Bounded retry for a pin that keeps failing on UNCHANGED content.
+#
+# Without this, marking a refused template as FAILED (which is the whole point
+# of the fix) would re-select that pin on EVERY sync run forever:
+# save_device_sync_state deliberately does NOT store desired_hash when ok=0, so
+# a permanently-refused pin is doubly re-selected (stale hash AND last_ok=0).
+# Each retry costs a firmware-cache clear plus a 10-call probe per finger,
+# inline on the ULTRA worker with RTLog and door commands blocked.
+#
+# New content always changes the desired hash, so a re-enrolment is NEVER
+# delayed by this. FULL_REPLACE / nuke reset pins_to_sync wholesale, so a
+# force-resync always defeats it.
+_SYNC_RETRY_FREE_ATTEMPTS = 3      # first 3 failures retry every run (unchanged behaviour)
+_SYNC_RETRY_BASE_SEC      = 900    # then 15 min, doubling
+_SYNC_RETRY_MAX_SEC       = 86400  # capped at 24 h
 
 
 def _parse_dt_any(s: str) -> datetime | None:
@@ -828,6 +845,7 @@ class DeviceSyncEngine:
                     auth_err,
                 )
 
+            tpl_err: str | None = None
             if templates:
                 _ok_count, errs = self._push_templates(
                     sdk,
@@ -837,6 +855,10 @@ class DeviceSyncEngine:
                     template_version_override=template_version_override,
                 )
                 if errs:
+                    # See _sync_one_device Phase C. This path previously ignored
+                    # templates ENTIRELY when deciding ok: a targeted member sync
+                    # returned True on a fingerprint that never reached the door.
+                    tpl_err = f"template push failed ({len(errs)}): {errs[0]}"
                     self.logger.warning(
                         "[DeviceSync] Device id=%s Pin=%s template errors (%d): %s",
                         device_id,
@@ -845,12 +867,14 @@ class DeviceSyncEngine:
                         errs[:5],
                     )
 
+            push_ok = bool(auth_complete) and tpl_err is None
             save_device_sync_state(
                 device_id=device_id,
                 pin=pin,
                 desired_hash=desired_hash,
-                ok=bool(auth_complete),
-                error=None if auth_complete else (auth_err or "authorize incomplete"),
+                ok=push_ok,
+                error=None if push_ok else ((auth_err or "authorize incomplete")
+                                            if not auth_complete else tpl_err),
             )
             try:
                 upsert_device_mirror_pin(
@@ -861,7 +885,7 @@ class DeviceSyncEngine:
                     door_bitmask=door_bitmask,
                     authorize_tz_id=int(authorize_timezone_id),
                     fp_count=len(templates),
-                    push_ok=bool(auth_complete),
+                    push_ok=push_ok,
                 )
             except Exception:
                 pass
@@ -871,9 +895,9 @@ class DeviceSyncEngine:
                 device_id,
                 device_name,
                 pin,
-                bool(auth_complete),
+                push_ok,
             )
-            return bool(auth_complete)
+            return push_ok
         except Exception as exc:
             save_device_sync_state(
                 device_id=device_id,
@@ -1767,6 +1791,33 @@ class DeviceSyncEngine:
         except Exception:
             pass
 
+    @staticmethod
+    def _retry_due(*, fail_streak: int, updated_at: "str | None",
+                   now: "datetime | None" = None) -> bool:
+        """Is a repeatedly-failing pin due for another attempt?
+
+        Fails OPEN in every ambiguous case -- an unparseable or future
+        timestamp, or a clock that moved backwards, yields True. Stranding a
+        member's fingerprint is worse than one wasted push.
+        """
+        if int(fail_streak or 0) <= _SYNC_RETRY_FREE_ATTEMPTS:
+            return True
+        # now_iso()/format_ts() is LOCAL and NAIVE ("YYYY-MM-DD HH:MM:SS").
+        # Do NOT route it through a tz-aware parser: that would stamp UTC on a
+        # naive value and the comparison would be wrong by the local offset.
+        try:
+            last = datetime.strptime(str(updated_at or ""), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return True
+        elapsed = ((now or datetime.now()) - last).total_seconds()
+        if elapsed < 0:
+            return True
+        delay = min(
+            _SYNC_RETRY_BASE_SEC * (2 ** (int(fail_streak) - _SYNC_RETRY_FREE_ATTEMPTS - 1)),
+            _SYNC_RETRY_MAX_SEC,
+        )
+        return elapsed >= delay
+
     def _compute_desired_hash(
         self,
         *,
@@ -2003,9 +2054,9 @@ class DeviceSyncEngine:
                 known_server_pins.add(p)
 
         with _fsp.step("prev_state"):
-            prev_state = list_device_sync_hashes_and_status(device_id=did)
+            prev_state = list_device_sync_retry_state(device_id=did)
         # Also keep a simple hash dict for backward compat with prune logic
-        prev_hashes = {p: h for p, (h, _ok) in prev_state.items()}
+        prev_hashes = {p: t[0] for p, t in prev_state.items()}
         deletion_only_delta = changed_ids is not None and len(changed_ids) == 0
 
         pins_to_sync: Set[str] = set()
@@ -2017,6 +2068,7 @@ class DeviceSyncEngine:
         # AFTER, at line ~1868, but the hashing itself is unconditional). It is the
         # CPU half of the steady-state freeze — measure it so a 1-member change
         # that stalls minutes names its own cost instead of leaving us to infer it.
+        _backoff_skipped = 0
         with _tel.span("SYNC_HASH_DESIRED", device_id=dev_id, n=len(desired)):
             _hash_i = 0
             for pin, u in desired.items():
@@ -2032,9 +2084,20 @@ class DeviceSyncEngine:
                     authorize_timezone_id=authorize_timezone_id,
                 )
                 desired_hashes[pin] = dh
-                prev_hash, prev_ok = prev_state.get(pin, ("", True))
+                prev_hash, prev_ok, prev_streak, prev_attempt_hash, prev_seen = \
+                    prev_state.get(pin, ("", True, 0, None, None))
                 # Sync if: hash changed OR previous attempt failed
-                if prev_hash != dh or not prev_ok:
+                needs_push = prev_hash != dh or not prev_ok
+                # ... except a pin that has already failed repeatedly on THIS
+                # EXACT desired state. prev_attempt_hash == dh is what proves
+                # "same content, already tried and refused" -- if the member was
+                # re-enrolled, dh differs and the push goes through immediately.
+                if (needs_push and not prev_ok and prev_attempt_hash == dh
+                        and not self._retry_due(fail_streak=prev_streak,
+                                                updated_at=prev_seen)):
+                    needs_push = False
+                    _backoff_skipped += 1
+                if needs_push:
                     pins_to_sync.add(pin)
                     templates_for_sync[pin] = templates
                 # This loop hashes the WHOLE roster even for a 1-member change and
@@ -2068,8 +2131,16 @@ class DeviceSyncEngine:
         self.logger.info(
             f"[DeviceSync] Device id={dev_id} name={dev_name!r} ip={ip}:{port} "
             f"desired={len(desired_pins)} to_sync={len(pins_to_sync)} "
+            f"backoff_skipped={_backoff_skipped} "
             f"door_bitmask={door_bitmask} doorIds={door_ids} tz={authorize_timezone_id} policy={policy}"
         )
+        # A silently skipped pin must never be invisible: without this, a member
+        # in backoff looks identical to a member who is genuinely in sync.
+        if _backoff_skipped:
+            try:
+                _tel.event("SYNC_RETRY_BACKOFF", device_id=did, pins=_backoff_skipped)
+            except Exception:
+                pass
 
         batch_started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         batch_id = insert_push_batch(
@@ -2570,11 +2641,34 @@ class DeviceSyncEngine:
                                 pushed_templates += ok_count
                                 if errs:
                                     warn_templates_users += 1
+                                    # A refused template is a FAILED sync, not a warning.
+                                    # Phase D derives last_ok from pin_outcomes, so leaving
+                                    # this as a log line is what stamped a non-working
+                                    # fingerprint "synced" and stopped it ever being
+                                    # retried -- while the dashboard showed the member green.
+                                    # Mirrors app/sdk/zk_standalone.py, which already does this.
+                                    pin_outcomes[pin] = {
+                                        "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                        "status": "FAILED",
+                                        "error_message": f"template push failed ({len(errs)}): {errs[0]}",
+                                        "duration_ms": 0,
+                                    }
                                     self.logger.warning(
                                         f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
                                         f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
+                                    try:
+                                        _tel.warn("PULLSDK_PUSH_TPL_REFUSED", device_id=dev_id,
+                                                  pin=pin, fingers=len(templates), errs=len(errs))
+                                    except Exception:
+                                        pass
                             except Exception as ex:
                                 warn_templates_users += 1
+                                pin_outcomes[pin] = {
+                                    "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
+                                    "status": "FAILED",
+                                    "error_message": f"template push failed: {ex}",
+                                    "duration_ms": 0,
+                                }
                                 self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} template FAILED: {ex}")
                             # Phase C is a second pass over the same pins: keep the bar moving
                             # through it instead of leaving it pinned at the user-push total.
@@ -2742,6 +2836,7 @@ class DeviceSyncEngine:
                             auth_complete = False
                             self.logger.warning(f"[DeviceSync] Device id={dev_id} Pin={pin} authorize FAILED: {ex}")
 
+                        tpl_err: str | None = None
                         if templates:
                             ok_count, errs = self._push_templates(
                                 sdk, pin=pin, templates=templates,
@@ -2750,11 +2845,19 @@ class DeviceSyncEngine:
                             pushed_templates += ok_count
                             if errs:
                                 warn_templates_users += 1
+                                # See Phase C: a refused template is a failed sync.
+                                tpl_err = f"template push failed ({len(errs)}): {errs[0]}"
                                 self.logger.warning(
                                     f"[DeviceSync] Device id={dev_id} Pin={pin} template errors ({len(errs)}): "
                                     f"{errs[:5]}{'...' if len(errs) > 5 else ''}")
+                                try:
+                                    _tel.warn("PULLSDK_PUSH_TPL_REFUSED", device_id=dev_id,
+                                              pin=pin, fingers=len(templates), errs=len(errs))
+                                except Exception:
+                                    pass
 
-                        if auth_complete:
+                        push_ok = auth_complete and tpl_err is None
+                        if push_ok:
                             save_device_sync_state(
                                 device_id=did, pin=pin,
                                 desired_hash=desired_hashes.get(pin) or "",
@@ -2779,15 +2882,19 @@ class DeviceSyncEngine:
                             except Exception:
                                 pass
                         else:
+                            # Authorize failure takes precedence in the message; a
+                            # template refusal is reported when authorize succeeded.
+                            _pin_err = ((auth_err or "authorize incomplete")
+                                        if not auth_complete else tpl_err)
                             save_device_sync_state(
                                 device_id=did, pin=pin,
                                 desired_hash=desired_hashes.get(pin) or "",
-                                ok=False, error=auth_err or "authorize incomplete",
+                                ok=False, error=_pin_err,
                             )
                             pin_outcomes[pin] = {
                                 "full_name": full_name,
                                 "status": "FAILED",
-                                "error_message": auth_err or "authorize incomplete",
+                                "error_message": _pin_err,
                                 "duration_ms": int((time.perf_counter() - pin_started_perf) * 1000),
                             }
                             failed_synced += 1

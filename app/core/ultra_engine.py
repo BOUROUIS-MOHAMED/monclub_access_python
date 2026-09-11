@@ -1754,13 +1754,59 @@ class UltraDeviceWorker(threading.Thread):
                 self._prefix, exc_info=True,
             )
             return list(users), 0
+        # Bounded retry, mirroring the PullSDK gate in
+        # DeviceSyncEngine._sync_one_device. Without it, marking a refused
+        # template FAILED re-pushes that pin on EVERY cycle forever -- and these
+        # MB2000 terminals are the slowest in the fleet (a documented 419 s for
+        # 928 members), so the unbounded storm is worse here than on PullSDK.
+        #
+        # Fetched SEPARATELY from list_device_sync_hashes_and_status above, and
+        # fail-open, for two reasons: that function is monkeypatched by several
+        # standalone tests (widening or replacing it would break them), and an
+        # unreadable retry state must never STOP a push -- only ever allow one.
+        retry_state: Dict[str, tuple] = {}
+        try:
+            from app.core.db import list_device_sync_retry_state
+            retry_state = list_device_sync_retry_state(device_id=self._device_id) or {}
+        except Exception:
+            retry_state = {}
+
         to_push: list[Dict[str, Any]] = []
+        backoff_skipped = 0
         for u in users:
             pin = str(u.get("pin") or "").strip()
             prev_hash, prev_ok = state.get(pin, ("", False))
             if prev_ok and prev_hash and prev_hash == hashes_by_pin.get(pin):
                 continue
+            rs = retry_state.get(pin)
+            if rs is not None:
+                try:
+                    _h, _ok, _streak, _attempt_hash, _seen = rs
+                    # Same content, already refused repeatedly, not yet due.
+                    # A re-enrolment changes the hash, so it is never delayed.
+                    if (not _ok and _attempt_hash
+                            and _attempt_hash == hashes_by_pin.get(pin)):
+                        from app.core.device_sync import DeviceSyncEngine
+                        if not DeviceSyncEngine._retry_due(fail_streak=_streak,
+                                                           updated_at=_seen):
+                            backoff_skipped += 1
+                            continue
+                except Exception:
+                    pass  # fail open: push it
             to_push.append(u)
+        if backoff_skipped:
+            # Never invisible: a pin in backoff must not look like a pin in sync.
+            logger.info(
+                "%s %d pin(s) held back by retry backoff: unchanged content that has "
+                "already been refused repeatedly. A re-enrolment changes the hash and "
+                "pushes immediately; a full or forced resync ignores this entirely.",
+                self._prefix, backoff_skipped,
+            )
+            try:
+                _tel.event("SYNC_RETRY_BACKOFF", device_id=self._device_id,
+                           pins=backoff_skipped)
+            except Exception:
+                pass
         return to_push, len(users) - len(to_push)
 
     # ---------------------------------------------------------------- #
@@ -2355,7 +2401,12 @@ class UltraDeviceWorker(threading.Thread):
             if pin not in state:
                 return
             # hash="" and fingers=None are both ignored by the ok=0 branch of the
-            # upsert; only last_ok/last_error actually change.
+            # upsert. The empty hash ALSO marks this as a DEFERRAL rather than a
+            # push failure, so the upsert leaves fail_streak and last_attempt_hash
+            # untouched (see save_device_sync_state_batch). That matters: counting
+            # deferrals would burn a member's free retry attempts, so their FIRST
+            # genuine failure would land already inside the bounded-retry backoff.
+            # So only last_ok/last_error actually change.
             save_device_sync_state_batch(
                 device_id=self._device_id,
                 rows=[(pin, "", False, reason, None)],

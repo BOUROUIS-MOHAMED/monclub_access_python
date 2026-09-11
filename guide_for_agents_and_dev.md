@@ -654,6 +654,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
 | `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |
+| `PULLSDK_PUSH_TPL_REFUSED` | `device_sync.py` | `device_id pin fingers errs` |
+| `SYNC_RETRY_BACKOFF` | `device_sync.py`, `ultra_engine.py` | `device_id pins` |
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |

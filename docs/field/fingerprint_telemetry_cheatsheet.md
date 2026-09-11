@@ -197,6 +197,46 @@ its own line:
 grep -F "[T] ZKEM_TPL_VERSION_MISMATCH" app-*.log
 ```
 
+**Why a template was refused — on a PullSDK panel (C2/C3/C4/inBio):**
+
+```bash
+grep -F "[T] PULLSDK_PUSH_TPL_REFUSED" app-*.log
+```
+
+Carries `device_id`, `pin`, `fingers` (how many the member has) and `errs` (how many
+were refused). The parallel of `ZKEM_PUSH_TPL_REFUSED` above, for the other SDK.
+
+> **New since 2026-09-11, and it will look like a regression.** Before this, a refused
+> template on a PullSDK panel was a `logger.warning` and nothing more: the pin was still
+> recorded `last_ok=1`, `push_pin_history.status=SUCCESS` and
+> `device_content_mirror.push_ok=1`, so the dashboard showed the member **green** while
+> their finger did not open the door — and because a stored success also stores the
+> content hash, the pin was never selected for retry again.
+>
+> Those members now show **FAILED / amber**, and a batch that previously read SUCCESS
+> may read PARTIAL. Nothing got worse; a failure that was always there stopped hiding.
+> A gym that has been quietly refusing templates for months will surface all of them on
+> the first sync after upgrading.
+
+**A member who keeps failing and then goes quiet:**
+
+```bash
+grep -F "[T] SYNC_RETRY_BACKOFF" app-*.log
+```
+
+Because a refused template is now a real failure, a pin that can never succeed would be
+re-pushed on **every** sync run forever — each retry costing a firmware-cache clear plus a
+ten-call probe per finger, inline on the worker with the door queue blocked. So after
+**3 free attempts** on unchanged content the retry backs off: 15 min, doubling, capped at
+24 h. `pins=` is how many were held back this run; the same count also appears as
+`backoff_skipped=` on the `[DeviceSync] … DONE` summary line.
+
+Two things deliberately defeat the backoff, so a real fix is never delayed:
+
+- **a re-enrolment** — new content changes the desired hash, and the backoff only applies
+  when the hash is byte-identical to the attempt that failed;
+- **a full or forced resync** (`FULL_REPLACE` / nuke), which rebuilds the push set wholesale.
+
 **A push that stalled:**
 
 ```bash

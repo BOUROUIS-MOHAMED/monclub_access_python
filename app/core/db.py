@@ -1418,6 +1418,23 @@ def init_db() -> None:
             "ownership_confirmed",
             "ownership_confirmed INTEGER NOT NULL DEFAULT 0",
         )
+        # Bounded retry. A pin can fail forever for a reason no retry can fix
+        # (a template/algorithm version mismatch refuses every finger). last_ok=0
+        # alone re-selects it on EVERY sync run, and each refused template costs a
+        # firmware-cache clear plus a 10-call probe inside _push_templates --
+        # inline on the ULTRA worker, with RTLog polling and door commands blocked.
+        # These two columns bound that.
+        #
+        # fail_streak resets to 0 on any success. last_attempt_hash records the
+        # content of the LAST ATTEMPT so genuinely NEW content is never delayed by
+        # the backoff -- a re-enrolment changes the hash and goes straight through.
+        #
+        # No rebuild helper touches device_sync_state (only sync_firmware_profiles
+        # and sync_users have one), so these survive on upgraded field DBs.
+        _ensure_column(conn, "device_sync_state", "fail_streak",
+                       "fail_streak INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "device_sync_state", "last_attempt_hash",
+                       "last_attempt_hash TEXT")
         # Safe installed-base migration. Successful rows are affirmative proof;
         # a recorded finger set also proves an earlier successful standalone push.
         conn.execute(
@@ -6541,6 +6558,38 @@ def list_device_sync_hashes_and_status(*, device_id: int) -> Dict[str, tuple]:
         return out
 
 
+@_tel.timed("DB_READ_list_device_sync_retry_state", slow_ms=50, warn_ms=1000)
+def list_device_sync_retry_state(*, device_id: int) -> Dict[str, tuple]:
+    """{pin: (desired_hash, last_ok, fail_streak, last_attempt_hash, updated_at)}.
+
+    The bounded-retry superset of list_device_sync_hashes_and_status. That
+    function is NOT widened, deliberately: ultra_engine unpacks it as a 2-tuple
+    in three places and four tests monkeypatch it, so changing its shape would
+    raise ValueError on the live worker path.
+
+    Same single SELECT over the same (device_id) index -- no extra scan.
+    """
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, desired_hash, last_ok, fail_streak, last_attempt_hash, updated_at "
+            "FROM device_sync_state WHERE device_id=?",
+            (did,),
+        ).fetchall()
+        out: Dict[str, tuple] = {}
+        for r in rows:
+            p = str(r["pin"] or "")
+            if not p:
+                continue
+            out[p] = (
+                str(r["desired_hash"] or ""),
+                bool(int(r["last_ok"] or 0)),
+                int(r["fail_streak"] or 0),
+                (str(r["last_attempt_hash"]) if r["last_attempt_hash"] is not None else None),
+                (str(r["updated_at"]) if r["updated_at"] is not None else None),
+            )
+        return out
+
 @_tel.timed("DB_READ_list_confirmed_device_sync_pins", slow_ms=50, warn_ms=1000)
 def list_confirmed_device_sync_pins(*, device_id: int) -> "set[str]":
     """Return PINs affirmatively written by MonClub to this device.
@@ -6681,6 +6730,11 @@ def save_device_sync_state_batch(
             updated_at,
             fingers,
             ok_i,
+            # fail_streak seed for a brand-new row; the UPSERT branch below
+            # recomputes it from the stored value.
+            0 if ok_i else 1,
+            # last_attempt_hash: what we just TRIED to push.
+            str(desired_hash or "").strip() if desired_hash else "",
         ))
 
     if not params_list:
@@ -6691,8 +6745,8 @@ def save_device_sync_state_batch(
             """
             INSERT INTO device_sync_state
                 (device_id, pin, desired_hash, last_ok, last_error, updated_at,
-                 pushed_finger_ids, ownership_confirmed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 pushed_finger_ids, ownership_confirmed, fail_streak, last_attempt_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, pin) DO UPDATE SET
                 desired_hash = CASE
                     WHEN excluded.last_ok = 1 THEN excluded.desired_hash
@@ -6714,6 +6768,23 @@ def save_device_sync_state_batch(
                     WHEN device_sync_state.ownership_confirmed = 1
                          OR excluded.ownership_confirmed = 1 THEN 1
                     ELSE 0
+                END,
+                -- An empty desired_hash means "no opinion about content" -- it is
+                -- how ultra_engine._flag_pin_for_retry signals DEFERRAL ("member
+                -- not in sync_users yet, retry later"), not a push failure.
+                -- Counting those would push a repeatedly-deferred member past the
+                -- free attempts, so their FIRST genuine failure would land already
+                -- in a multi-hour backoff.
+                fail_streak = CASE
+                    WHEN excluded.last_ok = 1 THEN 0
+                    WHEN excluded.desired_hash = '' THEN COALESCE(device_sync_state.fail_streak, 0)
+                    ELSE COALESCE(device_sync_state.fail_streak, 0) + 1
+                END,
+                -- Same reason: a deferral must not erase the record of the last
+                -- real attempt, or the backoff would never match and never engage.
+                last_attempt_hash = CASE
+                    WHEN excluded.desired_hash = '' THEN device_sync_state.last_attempt_hash
+                    ELSE excluded.last_attempt_hash
                 END
             """,
             params_list,
@@ -6739,8 +6810,8 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
             """
             INSERT INTO device_sync_state
                 (device_id, pin, desired_hash, last_ok, last_error, updated_at,
-                 ownership_confirmed)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ownership_confirmed, fail_streak, last_attempt_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id, pin) DO UPDATE SET
                 desired_hash = CASE
                     WHEN excluded.last_ok = 1 THEN excluded.desired_hash
@@ -6753,9 +6824,20 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
                     WHEN device_sync_state.ownership_confirmed = 1
                          OR excluded.ownership_confirmed = 1 THEN 1
                     ELSE 0
+                END,
+                -- See save_device_sync_state_batch for why an empty desired_hash
+                -- neither increments the streak nor clobbers last_attempt_hash.
+                fail_streak = CASE
+                    WHEN excluded.last_ok = 1 THEN 0
+                    WHEN excluded.desired_hash = '' THEN COALESCE(device_sync_state.fail_streak, 0)
+                    ELSE COALESCE(device_sync_state.fail_streak, 0) + 1
+                END,
+                last_attempt_hash = CASE
+                    WHEN excluded.desired_hash = '' THEN device_sync_state.last_attempt_hash
+                    ELSE excluded.last_attempt_hash
                 END
             """,
-            (did, p, dh, ok_i, err, now_iso(), ok_i),
+            (did, p, dh, ok_i, err, now_iso(), ok_i, 0 if ok_i else 1, dh),
         )
 
     _run_db_write_sync("save_device_sync_state", _write)
