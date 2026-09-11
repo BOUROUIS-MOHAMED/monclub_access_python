@@ -24,11 +24,29 @@ from __future__ import annotations
 
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.core.ultra_engine import UltraDeviceWorker
+
+_KEEP_ALIVE: list = []
+
+
+def _never_ending_thread() -> threading.Thread:
+    """A live thread standing in for a poll wedged inside the SDK."""
+    stop = threading.Event()
+    t = threading.Thread(target=stop.wait, daemon=True)
+    t.start()
+    _KEEP_ALIVE.append(stop)          # released by the session-end fixture
+    return t
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _release_stand_in_threads():
+    yield
+    for stop in _KEEP_ALIVE:
+        stop.set()
 
 
 class _BlockingDriver:
@@ -181,6 +199,116 @@ class TestAgentWatchdogIsAlsoBounded:
     """realtime_agent had the same defect in a worse form: it spawned its poll
     thread into a LOCAL each iteration, so the next iteration stacked another on
     top of the stuck one with no guard at all."""
+
+    def test_a_wedge_replaces_the_driver_rather_than_reusing_it(self):
+        """The orphan keeps _sdk_lock, so the device object must not be reused.
+
+        PullSDKDevice.connect() builds a fresh PullSDK but never rebuilds
+        _sdk_lock, which lives on the device object the agent creates once in
+        __init__. A poll wedged inside poll_rtlog_once holds that lock forever --
+        and open_door takes the SAME lock, so reusing the object leaves the door
+        permanently unopenable and hangs whoever asks. ultra_engine gets a new
+        driver per connect cycle for free; the agent has to swap explicitly.
+        """
+        import app.core.realtime_agent as ra
+
+        old = _BlockingDriver()
+        built: list = []
+
+        def _fake_get_driver(payload, logger=None):
+            made = _LiveDriver()
+            built.append(made)
+            return made
+
+        w = SimpleNamespace(
+            _device=old,
+            device_payload={"id": 8},
+            device_id=8,
+            logger=MagicMock(),
+        )
+        with patch.object(ra, "get_driver", _fake_get_driver):
+            ra.DeviceWorker._retire_orphan_and_rebuild(w)
+
+        assert built, "no replacement driver was built after the wedge"
+        assert w._device is not old, (
+            "the agent reused the wedged device -- every later call, open_door "
+            "included, would queue behind a lock the orphan never releases"
+        )
+        assert w._device is built[-1]
+
+    def test_a_failed_rebuild_does_not_kill_the_worker(self):
+        """A driver-factory failure must not escape into the run loop."""
+        import app.core.realtime_agent as ra
+
+        def _boom(payload, logger=None):
+            raise RuntimeError("factory down")
+
+        w = SimpleNamespace(
+            _device=_BlockingDriver(), device_payload={"id": 8},
+            device_id=8, logger=MagicMock(),
+        )
+        with patch.object(ra, "get_driver", _boom):
+            ra.DeviceWorker._retire_orphan_and_rebuild(w)   # must not raise
+
+    def test_at_the_cap_it_waits_before_refusing(self):
+        """The cap must not remove the throttle the 15s join used to provide.
+
+        Raising straight away lands in run()'s outer except, which sleeps only
+        0.25s and then reconnects successfully -- the panel is healthy, only our
+        threads are stuck -- so the connect-failure backoff never arms. That is a
+        ~4 Connect/Disconnect per second storm, and plcommpro leaks a handle and
+        ~280KB on every cycle.
+        """
+        import app.core.realtime_agent as ra
+
+        alive = [_never_ending_thread() for _ in range(ra._MAX_ORPHAN_POLL_THREADS)]
+        waits: list = []
+        w = SimpleNamespace(
+            _orphan_poll_threads=list(alive),
+            stop_event=SimpleNamespace(wait=lambda timeout=None: waits.append(timeout)),
+            device_id=8,
+            logger=MagicMock(),
+        )
+
+        with pytest.raises(RuntimeError):
+            ra.DeviceWorker._refuse_if_orphans_at_cap(w, 15.0)
+
+        assert waits == [15.0], (
+            f"expected one 15s wait before refusing, got {waits!r} -- without it the "
+            f"run loop spins Connect/Disconnect roughly four times a second"
+        )
+
+    def test_below_the_cap_it_neither_waits_nor_raises(self):
+        import app.core.realtime_agent as ra
+
+        waits: list = []
+        w = SimpleNamespace(
+            _orphan_poll_threads=[_never_ending_thread()],
+            stop_event=SimpleNamespace(wait=lambda timeout=None: waits.append(timeout)),
+            device_id=8,
+            logger=MagicMock(),
+        )
+        ra.DeviceWorker._refuse_if_orphans_at_cap(w, 15.0)
+        assert waits == [], "a single orphan must not throttle the poll loop"
+
+    def test_retired_orphans_are_pruned_so_a_device_recovers(self):
+        """Threads that came back must not count forever against the cap."""
+        import app.core.realtime_agent as ra
+
+        dead = threading.Thread(target=lambda: None)
+        dead.start()
+        dead.join()
+
+        waits: list = []
+        w = SimpleNamespace(
+            _orphan_poll_threads=[dead] * (ra._MAX_ORPHAN_POLL_THREADS + 2),
+            stop_event=SimpleNamespace(wait=lambda timeout=None: waits.append(timeout)),
+            device_id=8,
+            logger=MagicMock(),
+        )
+        ra.DeviceWorker._refuse_if_orphans_at_cap(w, 15.0)
+        assert w._orphan_poll_threads == [], "finished orphans were never pruned"
+        assert waits == []
 
     def test_agent_module_tracks_and_caps_orphan_poll_threads(self):
         import inspect

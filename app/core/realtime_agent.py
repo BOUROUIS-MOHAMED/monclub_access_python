@@ -667,6 +667,71 @@ class DeviceWorker(threading.Thread):
             self._cmd_ema.add(cmd_ms)
             return CommandResult(ok=False, error=str(e), cmd_ms=cmd_ms)
 
+    def _refuse_if_orphans_at_cap(self, poll_timeout_sec: float) -> None:
+        """Prune retired orphans; refuse (after a wait) once too many are stuck.
+
+        The wait is load-bearing, not politeness. Raising immediately lands in
+        run()'s outer ``except``, which disconnects and sleeps 0.25s, and
+        ensure_connected() then SUCCEEDS -- the panel is healthy, only our poll
+        threads are wedged -- so the connect-failure backoff never arms. That
+        turns a ~15s reconnect cadence into ~4 Connect/Disconnect cycles a
+        second, indefinitely. plcommpro leaks ~1 OS handle + ~280KB per cycle
+        (measured in ultra_engine), so a 32-bit process burns its address space
+        in hours and ends in the "can't start new thread" lockup that
+        begin_remote_enroll now has to survive.
+
+        Before the cap existed the 15s join throttled this loop; wait the same
+        interval so the cadence is unchanged. stop_event keeps shutdown prompt.
+        """
+        self._orphan_poll_threads = [
+            t for t in getattr(self, "_orphan_poll_threads", []) if t.is_alive()
+        ]
+        if len(self._orphan_poll_threads) < _MAX_ORPHAN_POLL_THREADS:
+            return
+        self.logger.error(
+            f"[RT][device={self.device_id}] {len(self._orphan_poll_threads)} orphaned "
+            f"poll thread(s) still stuck in the SDK — refusing to start another"
+        )
+        self.stop_event.wait(timeout=poll_timeout_sec)
+        raise RuntimeError(
+            f"poll_rtlog_once: {len(self._orphan_poll_threads)} orphaned poll "
+            f"threads stuck in the SDK"
+        )
+
+    def _retire_orphan_and_rebuild(self) -> None:
+        """Drop the wedged device and build a fresh one.
+
+        disconnect() no longer frees the native session while a call is inside
+        the DLL -- that was the use-after-free -- so it invalidates the handle
+        and defers the free until the orphan returns.
+
+        The driver must then be REPLACED, not reused. The orphan is wedged in
+        poll_rtlog_once, which holds ``PullSDKDevice._sdk_lock``; connect()
+        builds a fresh ``PullSDK`` but never rebuilds that lock, because it
+        lives on the long-lived device object this worker created once in
+        __init__. Reusing the object means every later call queues behind a lock
+        whose owner will never release it -- not just polling, but open_door,
+        which takes the SAME lock. One wedge would leave that door permanently
+        unopenable and hang whichever thread asked. ultra_engine gets this free
+        by building a driver per connect cycle; the agent holds one, so it has
+        to swap explicitly. The orphan keeps the old object and drains its own
+        deferred free if it ever returns.
+        """
+        try:
+            self._device.disconnect()
+        except Exception:
+            pass
+        try:
+            self._device = get_driver(self.device_payload, logger=self.logger)
+            self.logger.info(
+                f"[RT][device={self.device_id}] rebuilt driver after wedge — fresh SDK "
+                f"lock (the orphan still holds the old one)"
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"[RT][device={self.device_id}] could not rebuild driver after wedge: {exc}"
+            )
+
     def run(self) -> None:
         reconnect_attempt = 0
         last_error = ""
@@ -747,15 +812,7 @@ class DeviceWorker(threading.Thread):
                 self._orphan_poll_threads = [
                     _t for _t in getattr(self, "_orphan_poll_threads", []) if _t.is_alive()
                 ]
-                if len(self._orphan_poll_threads) >= _MAX_ORPHAN_POLL_THREADS:
-                    self.logger.error(
-                        f"[RT][device={self.device_id}] {len(self._orphan_poll_threads)} orphaned "
-                        f"poll thread(s) still stuck in the SDK — refusing to start another"
-                    )
-                    raise RuntimeError(
-                        f"poll_rtlog_once: {len(self._orphan_poll_threads)} orphaned poll "
-                        f"threads stuck in the SDK"
-                    )
+                self._refuse_if_orphans_at_cap(_poll_timeout_sec)
 
                 _poll_thread = threading.Thread(target=_poll_fn, daemon=True)
                 _poll_thread.start()
@@ -768,15 +825,7 @@ class DeviceWorker(threading.Thread):
                         f"forcing reconnect (orphan {len(self._orphan_poll_threads)}/"
                         f"{_MAX_ORPHAN_POLL_THREADS})"
                     )
-                    # disconnect() no longer frees the native session while that
-                    # thread is inside the DLL -- doing so was a use-after-free.
-                    # It invalidates the handle and defers the free until the
-                    # orphan returns; progress comes from the fresh connection
-                    # below, not from unblocking this one.
-                    try:
-                        self._device.disconnect()
-                    except Exception:
-                        pass
+                    self._retire_orphan_and_rebuild()
                     raise RuntimeError(f"poll_rtlog_once watchdog timeout after {_poll_timeout_sec}s")
 
                 if _exc_holder:

@@ -307,6 +307,48 @@ device permanently unpolled — a silently dead turnstile, strictly worse than t
 > runs; if it never does, the orphan fence keeps the device polling regardless.
 > **This change has not been exercised against real PullSDK hardware.**
 
+#### ⛔ A wedged poll poisons the *device object*, not just the connection
+
+`_sdk_lock` is created in `PullSDKDevice.__init__` and **never rebuilt**. `connect()`
+builds a fresh `PullSDK` — a new handle — but reuses the same lock. `[CODE]`
+
+An orphan wedged inside `poll_rtlog_once` holds that lock for as long as it is stuck, and
+every other SDK entry point queues behind it: `open_door`, `get_device_time`,
+`set_device_time`, `get_device_param`, `set_device_param`, `get_table_count`,
+`read_table_rows`, `delete_table_rows`. `[CODE]` **`open_door` is on that list**, so
+reconnecting is not recovery — the door stays unopenable and the thread that asks hangs
+with it, indefinitely.
+
+Recovery therefore requires a **new `PullSDKDevice`**, not a reconnect:
+
+| Caller | Device lifetime | Wedge recovery |
+|---|---|---|
+| `ultra_engine` | new driver per connect cycle (`get_driver` in `_connect`) | free — the new object has a new lock |
+| `realtime_agent` | **one driver for the worker's life** (`__init__`) | must swap explicitly — `_retire_orphan_and_rebuild()` |
+
+The orphan keeps its reference to the old object and drains its own deferred free if it
+ever returns. `[CODE]`
+`[TEST: test_poll_orphan_fence.py::test_a_wedge_replaces_the_driver_rather_than_reusing_it]`
+
+> Acquisition is **untimed** (`with self._sdk_lock:`), so this is a permanent block, not a
+> slow path. Anything new that takes `_sdk_lock` inherits that, and anything that holds a
+> long-lived `PullSDKDevice` inherits the swap obligation.
+
+#### ⛔ Refusing at the orphan cap must not remove the throttle
+
+The agent's cap raises once `_MAX_ORPHAN_POLL_THREADS` orphans are stuck. That
+`RuntimeError` lands in `run()`'s outer `except`, which disconnects and sleeps **0.25 s**,
+and `ensure_connected()` then *succeeds* — the panel is healthy, only the poll threads are
+wedged — so the connect-failure backoff never arms. `[CODE]`
+
+Raising immediately therefore converts a ~15 s reconnect cadence into roughly **four
+`Connect`/`Disconnect` cycles a second, indefinitely**. At ~1 OS handle + ~280 KB leaked
+per cycle (§ reconnect cost), a 32-bit process exhausts its address space in hours and
+ends in the `can't start new thread` lockup. `_refuse_if_orphans_at_cap()` waits
+`poll_timeout_sec` on `stop_event` first, preserving the cadence the 15 s join used to
+provide while keeping shutdown prompt. `[CODE]`
+`[TEST: test_poll_orphan_fence.py::test_at_the_cap_it_waits_before_refusing]`
+
 ### Error reporting
 
 ```python
