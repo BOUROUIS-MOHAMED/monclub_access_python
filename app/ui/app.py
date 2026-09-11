@@ -3383,7 +3383,31 @@ class MainApp:
             args=(uid, fid, full_name, dev, am_override, enroll_id),
             daemon=True,
         )
-        t.start()
+        try:
+            t.start()
+        except RuntimeError as exc:
+            # Type-2 failure mode: the process can no longer create OS threads
+            # ("can't start new thread"). _enroll_running was set above and the
+            # ONLY place that clears it is _remote_enroll_worker's finally --
+            # which never runs if the worker never starts. Without this reset the
+            # flag stays True for the life of the process and EVERY later
+            # enrolment answers 409 "Enroll already running on this PC", so the
+            # gym has to restart the app to enrol anyone. Matches the two other
+            # Thread.start() sites that already report this (ultra_engine.
+            # _poll_with_watchdog, zk_standalone._ensure_sta_thread).
+            with self._enroll_state_lock:
+                self._enroll_running = False
+            _tel.thread_spawn_failure(
+                "app.begin_remote_enroll",
+                enroll_id=enroll_id,
+                user_id=uid,
+                finger_id=fid,
+                err=str(exc),
+            )
+            return {"ok": False, "status": 503,
+                    "error": "PC is out of OS threads; cannot start enrolment. "
+                             "Restart MonClub Access.",
+                    "enrollId": enroll_id}
         return {"ok": True, "message": "Enroll started on PC", "userId": uid, "fingerId": fid,
                 "device": dev, "enrollId": enroll_id}
 
