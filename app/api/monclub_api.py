@@ -18,6 +18,7 @@ class ApiEndpoints:
     sync_url: str
     create_user_fingerprint_url: str
     latest_release_url: str  # NEW
+    report_fingerprint_push_result_url: str = ""
     access_create_membership_url: str = ""
     access_create_account_membership_url: str = ""
     sync_access_history_url: str = ""
@@ -420,6 +421,55 @@ class MonClubApi:
             return False
         if r.status_code < 200 or r.status_code >= 300:
             self.logger.debug("[API] report_daily_sync HTTP %s -> %s", r.status_code, (r.text or "")[:200])
+            return False
+        return True
+
+    def report_fingerprint_push_result(
+        self, *, token: str, items: list, timeout: int = 10
+    ) -> bool:
+        """Tell the backend which fingerprints reached the door, and which did not.
+
+        Populates the dashboard's per-finger ``lastPushError``, which has been
+        rendered since it was added but never written, so a gym had no way to see a
+        fingerprint that silently never landed.
+
+        Best-effort, exactly like report_daily_sync: returns False on any failure and
+        NEVER raises. The caller re-reads the pending set next tick, so a missed
+        report needs no bespoke retry or backoff.
+
+        ``pin`` is the device PIN, which is the activeMembershipId for any member who
+        has one. A member without one is keyed by userId instead -- and cannot have a
+        UserFingerprint row at all, since that entity requires an activeMembership --
+        so the backend simply finds nothing and skips it.
+        """
+        url = (self.endpoints.report_fingerprint_push_result_url or "").strip()
+        if not url:
+            self.logger.debug("[API] report_fingerprint_push_result: no URL configured")
+            return False
+        if not items:
+            return True
+
+        payload = {"items": [
+            {
+                "activeMembershipId": int(it["pin"]),
+                "fingerId": int(it["finger_id"]),
+                "error": it.get("error_message"),
+            }
+            for it in items
+            if str(it.get("pin") or "").strip().isdigit()
+        ]}
+        if not payload["items"]:
+            return True
+
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            r = self._session.post(url, json=payload, headers=headers, timeout=timeout)
+        except Exception as e:
+            self.logger.debug("[API] report_fingerprint_push_result request failed: %s", e)
+            return False
+        if r.status_code < 200 or r.status_code >= 300:
+            self.logger.debug("[API] report_fingerprint_push_result HTTP %s -> %s",
+                              r.status_code, (r.text or "")[:200])
             return False
         return True
 

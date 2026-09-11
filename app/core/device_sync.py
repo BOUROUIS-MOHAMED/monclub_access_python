@@ -20,6 +20,8 @@ from app.core.db import (
     save_device_sync_state_batch,
     delete_device_sync_state,
     prune_device_sync_state,
+    prune_fingerprint_push_status,
+    upsert_fingerprint_push_status,
     upsert_device_mirror_pin,
     upsert_device_mirror_batch,
     delete_device_mirror_pin,
@@ -1706,7 +1708,45 @@ class DeviceSyncEngine:
             if not pushed:
                 failed_fp_errs.append(f"FingerID={fid}: failed to push template (no compatible schema/table)")
 
+            # F11: one hook covers both success paths (L1 cached combo and the L2
+            # probe) and the failure path. This is what finally puts a value into the
+            # dashboard's lastPushError, which has been rendered but never written.
+            self._record_finger_push_status(
+                pin=pin, finger_id=fid, device_id=device_id,
+                status="OK" if pushed else "FAILED",
+                error_message=None if pushed
+                else "failed to push template (no compatible schema/table)",
+            )
+
         return ok, failed_fp_errs
+
+    def _record_finger_push_status(
+        self, *, pin: str, finger_id: int, device_id: int,
+        status: str, error_message: "str | None",
+    ) -> None:
+        """Remember whether ONE finger reached ONE device.
+
+        device_sync_state is per-PIN, but the dashboard's lastPushError is per-FINGER,
+        so the outcome has to be recorded at this granularity -- and `fid` is only in
+        scope here, inside the push loop.
+
+        NEVER raises. This is instrumentation on the live worker path: a bookkeeping
+        failure must not turn a successful push into a failed one. It goes through the
+        same DbWriter queue save_device_sync_state already uses in this loop, so it
+        adds no new blocking mechanism.
+        """
+        try:
+            if int(device_id or 0) <= 0:
+                return
+            upsert_fingerprint_push_status(
+                pin=pin, finger_id=int(finger_id), device_id=int(device_id),
+                status=status, error_message=error_message,
+            )
+        except Exception:
+            self.logger.debug(
+                "[DeviceSync] could not record push status pin=%s finger=%s", pin, finger_id,
+                exc_info=True,
+            )
 
     def _bulk_delete_pins(
         self,
@@ -3054,6 +3094,12 @@ class DeviceSyncEngine:
                             "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
             pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
+            # Same keep-set: a removed or revoked member must not linger in the push
+            # status cache and keep being reported upstream forever.
+            try:
+                prune_fingerprint_push_status(device_id=did, keep_pins=desired_pins)
+            except Exception:
+                pass
 
             # ── Write door timing to controller firmware ──
             # Without this, the C3 keeps its factory/old defaults and the

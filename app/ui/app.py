@@ -2918,6 +2918,46 @@ class MainApp:
                 except Exception as _ds_exc:
                     self.logger.warning("[DailySync] report failed: %s", _ds_exc)
 
+            # Report which fingerprints actually reached the door, so the dashboard's
+            # per-finger lastPushError stops being permanently null (F11).
+            #
+            # Runs EVERY tick, not just the daily one: a member whose fingerprint
+            # never landed should not wait until 22:00 to become visible.
+            #
+            # Only TRANSITIONS are sent -- get_pending_fingerprint_push_reports diffs
+            # against what was last reported. That matters upstream: every backend
+            # write bumps UserFingerprint.updatedAt, which re-flags the member in the
+            # next delta poll, so re-sending an unchanged state would make a
+            # permanently-unpushable template flap forever. In steady state this
+            # returns [] and no HTTP call is made at all.
+            #
+            # This runs on _sync_tick's own daemon thread, NOT the ULTRA live worker,
+            # so it can never block a door scan. Best-effort: a failure just leaves
+            # the rows pending for the next tick.
+            if sync_online:
+                try:
+                    from app.core.db import (
+                        get_pending_fingerprint_push_reports,
+                        mark_fingerprint_push_reported,
+                    )
+                    _fp_pending = get_pending_fingerprint_push_reports()
+                    if _fp_pending:
+                        if self._api().report_fingerprint_push_result(
+                            token=auth.token, items=_fp_pending
+                        ):
+                            mark_fingerprint_push_reported(_fp_pending)
+                            self.logger.info(
+                                "[FingerprintPush] reported %d outcome(s) upstream",
+                                len(_fp_pending),
+                            )
+                        else:
+                            self.logger.debug(
+                                "[FingerprintPush] report failed; %d outcome(s) stay pending",
+                                len(_fp_pending),
+                            )
+                except Exception as _fp_exc:
+                    self.logger.warning("[FingerprintPush] report failed: %s", _fp_exc)
+
             try:
                 self._device_attendance_engine.run_blocking(
                     source="timer",

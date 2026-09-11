@@ -1435,6 +1435,40 @@ def init_db() -> None:
                        "fail_streak INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "device_sync_state", "last_attempt_hash",
                        "last_attempt_hash TEXT")
+
+        # ---- F11: per-finger push outcome, so a gym can SEE a fingerprint that
+        # never reached the door. device_sync_state is per-PIN; lastPushError on the
+        # dashboard is per-FINGER, so the two cannot share a row.
+        #
+        # Status is tracked per DEVICE because a gym has several, and a finger that
+        # lands on one and is refused by another is a real and reportable state.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fingerprint_push_status (
+                pin TEXT NOT NULL,
+                finger_id INTEGER NOT NULL,
+                device_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (pin, finger_id, device_id)
+            );
+            """
+        )
+        # What we last SENT upstream, so only transitions are reported. Without this
+        # every tick would re-POST the same unchanged state, and each backend write
+        # re-flags the member in the next delta poll.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fingerprint_push_reported (
+                pin TEXT NOT NULL,
+                finger_id INTEGER NOT NULL,
+                last_reported TEXT,
+                reported_at TEXT NOT NULL,
+                PRIMARY KEY (pin, finger_id)
+            );
+            """
+        )
         # Safe installed-base migration. Successful rows are affirmative proof;
         # a recorded finger set also proves an earlier successful standalone push.
         conn.execute(
@@ -6874,6 +6908,140 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
         profile["mirror_rows"] = max(0, int(mirror_cur.rowcount or 0))
 
     _run_db_write_sync("clear_device_revocation_state", _write)
+
+
+def upsert_fingerprint_push_status(
+    *, pin: str, finger_id: int, device_id: int, status: str, error_message: str | None
+) -> None:
+    """Record the outcome of pushing ONE finger to ONE device.
+
+    Called from inside _push_templates, so it goes through the same DbWriter queue
+    save_device_sync_state already uses in that loop -- no new blocking cost beyond
+    what the loop already pays per pin.
+    """
+    p = str(pin or "").strip()
+    if not p:
+        return
+    err = (str(error_message or "")[:1000]) or None
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
+        conn.execute(
+            """
+            INSERT INTO fingerprint_push_status
+                (pin, finger_id, device_id, status, error_message, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pin, finger_id, device_id) DO UPDATE SET
+                status = excluded.status,
+                error_message = excluded.error_message,
+                updated_at = excluded.updated_at
+            """,
+            (p, int(finger_id), int(device_id), str(status), err, now_iso()),
+        )
+
+    _run_db_write_sync("upsert_fingerprint_push_status", _write)
+
+
+def get_pending_fingerprint_push_reports() -> List[Dict[str, Any]]:
+    """Rows whose AGGREGATE outcome differs from what we last told the backend.
+
+    Aggregated ACROSS devices: a finger is FAILED if ANY device refused it, and OK
+    only when every device that was attempted accepted it. Reporting per-device would
+    be wrong -- the dashboard's lastPushError is one field per finger, and "it works
+    on the front door but not the gym floor" still means the member has a problem.
+
+    Returns only TRANSITIONS. Re-reporting an unchanged state would make the backend
+    write the row, which re-flags the member in the next delta poll.
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.pin AS pin,
+                   s.finger_id AS finger_id,
+                   MAX(CASE WHEN s.status <> 'OK' THEN 1 ELSE 0 END) AS any_failed,
+                   MAX(CASE WHEN s.status <> 'OK' THEN s.error_message END) AS err
+            FROM fingerprint_push_status s
+            GROUP BY s.pin, s.finger_id
+            """
+        ).fetchall()
+        reported = {
+            (str(r["pin"]), int(r["finger_id"])): r["last_reported"]
+            for r in conn.execute(
+                "SELECT pin, finger_id, last_reported FROM fingerprint_push_reported"
+            ).fetchall()
+        }
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        pin = str(r["pin"] or "")
+        if not pin:
+            continue
+        fid = int(r["finger_id"])
+        current = (str(r["err"]) if int(r["any_failed"] or 0) else None) or None
+        if reported.get((pin, fid), "\x00__never__") != current:
+            out.append({"pin": pin, "finger_id": fid, "error_message": current})
+    return out
+
+
+def mark_fingerprint_push_reported(items: Iterable[Dict[str, Any]]) -> int:
+    """Remember what we just sent, so the next tick reports only what changed."""
+    rows = []
+    for it in (items or []):
+        pin = str((it or {}).get("pin") or "").strip()
+        if not pin:
+            continue
+        rows.append((pin, int(it.get("finger_id")), it.get("error_message"), now_iso()))
+    if not rows:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            """
+            INSERT INTO fingerprint_push_reported (pin, finger_id, last_reported, reported_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(pin, finger_id) DO UPDATE SET
+                last_reported = excluded.last_reported,
+                reported_at = excluded.reported_at
+            """,
+            rows,
+        )
+        return len(rows)
+
+    return int(_run_db_write_sync("mark_fingerprint_push_reported", _write))
+
+
+def prune_fingerprint_push_status(*, device_id: int, keep_pins: Iterable[str]) -> int:
+    """Drop status rows for pins this device no longer carries.
+
+    Mirrors prune_device_sync_state, so a removed or revoked member does not linger
+    in the local cache forever and keep being reported.
+    """
+    did = int(device_id)
+    keep = {str(x).strip() for x in (keep_pins or []) if str(x).strip()}
+    with get_conn() as conn:
+        existing = {
+            str(r["pin"])
+            for r in conn.execute(
+                "SELECT DISTINCT pin FROM fingerprint_push_status WHERE device_id=?", (did,)
+            ).fetchall()
+        }
+    to_remove = sorted([p for p in existing if p not in keep])
+    if not to_remove:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        deleted = 0
+        CHUNK = 300
+        for i in range(0, len(to_remove), CHUNK):
+            chunk = to_remove[i : i + CHUNK]
+            q = ",".join(["?"] * len(chunk))
+            cur = conn.execute(
+                f"DELETE FROM fingerprint_push_status WHERE device_id=? AND pin IN ({q})",
+                (did, *chunk),
+            )
+            deleted += int(cur.rowcount or 0)
+        return deleted
+
+    return int(_run_db_write_sync("prune_fingerprint_push_status", _write))
 
 
 def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
