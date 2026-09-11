@@ -57,6 +57,12 @@ WizardStyle=modern
 [Tasks]
 Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"; Flags: checkedonce
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+; UNCHECKED on purpose. This registers a per-user scheduled task that both starts
+; MonClub Access at logon and restarts it if the backend process dies. There is no
+; autostart entry today, so ticking it changes TWO behaviours at once -- an existing
+; install must never silently acquire a new startup entry on a routine update.
+; UsePreviousTasks=yes means a site that opts in stays opted in on later updates.
+Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Flags: unchecked
 
 [Dirs]
 Name: "{app}\current"
@@ -68,13 +74,36 @@ Name: "{app}\logs"
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Watchdog scripts live OUTSIDE current\ on purpose: the updater deletes and
+; re-creates current\ wholesale, and the scheduled task's action path must stay
+; valid across an update.
+Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
+Source: "..\packaging\watchdog\register_watchdog.ps1";       DestDir: "{app}\watchdog"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
 Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: desktopicon
 
 [Run]
+; Register the watchdog BEFORE launching the app, and only when the task is ticked.
+; runascurrentuser keeps it a per-user task (PrivilegesRequired=lowest, and the app
+; needs the interactive desktop session for its tray icon and Tauri window -- a
+; SYSTEM task would start it in session 0 where nobody can see it).
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\watchdog\register_watchdog.ps1"" -InstallRoot ""{app}"""; \
+  StatusMsg: "Registering the MonClub Access watchdog..."; \
+  Flags: runhidden runascurrentuser waituntilterminated; \
+  Tasks: watchdog
+
 Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall
+
+[UninstallRun]
+; Remove the scheduled task before {app} disappears, otherwise Task Scheduler is
+; left with an entry pointing at a script that no longer exists.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\watchdog\register_watchdog.ps1"" -Remove"; \
+  Flags: runhidden runascurrentuser waituntilterminated; \
+  RunOnceId: "RemoveMonClubWatchdog"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -668,9 +697,45 @@ begin
   end;
 end;
 
+function PauseSentinelPath(): string;
+begin
+  Result := ExpandConstant('{app}\.update-in-progress');
+end;
+
+procedure SetPauseSentinel();
+begin
+  // The watchdog scheduled task (Tasks: watchdog) restarts MonClub Access when it
+  // finds it not running. KillRunningMonClubProcesses is about to make exactly
+  // that true, for several minutes, while current\ is deleted and rewritten. If
+  // the watchdog fired in that window it would relaunch the app from a half-
+  // replaced current\ and hold file locks that break this install.
+  //
+  // Drop a sentinel the watchdog stands down on. It ages out after 30 minutes on
+  // the watchdog side, so an install that crashes before ssPostInstall cannot
+  // disable recovery permanently.
+  ForceDirectories(ExpandConstant('{app}'));
+  if SaveStringToFile(PauseSentinelPath(), 'install in progress', False) then
+    Log('Pause sentinel written: ' + PauseSentinelPath())
+  else
+    Log('WARNING: could not write pause sentinel: ' + PauseSentinelPath());
+end;
+
+procedure ClearPauseSentinel();
+begin
+  if FileExists(PauseSentinelPath()) then
+  begin
+    if DeleteFile(PauseSentinelPath()) then
+      Log('Pause sentinel cleared.')
+    else
+      Log('WARNING: could not delete pause sentinel; it will age out on its own.');
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+
+  SetPauseSentinel();
 
   KillRunningMonClubProcesses();
   Sleep(900);
@@ -681,13 +746,21 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     RegisterZkemkeeper();
+    // Hand control back to the watchdog only once the new current\ is in place.
+    ClearPauseSentinel();
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
+    // Stop the watchdog from resurrecting the app we are about to remove.
+    // [UninstallRun] unregisters the task, but that runs after this step.
+    SetPauseSentinel();
+
     // Drop our own COM registration before {app} is deleted, otherwise the
     // CLSID is left pointing at a file that no longer exists.
     UnregisterZkemkeeper();
