@@ -264,7 +264,7 @@ def test_template_phase_is_budgeted_in_total_and_advances_current(tmp_path, monk
     # Deterministic template push: report every template as pushed.
     monkeypatch.setattr(
         svc, "_push_templates",
-        lambda sdk, *, pin, templates, device_id, template_version_override=None:
+        lambda sdk, *, pin, templates, device_id, template_version_override=None, pin_source=None:
             (len(templates), []),
     )
 
@@ -320,7 +320,7 @@ def test_template_phase_yields_to_doors_and_rtlog(tmp_path, monkeypatch):
     # specifically rather than yields the earlier user-push phase already did.
     seen = []
 
-    def spy_push(sdk, *, pin, templates, device_id, template_version_override=None):
+    def spy_push(sdk, *, pin, templates, device_id, template_version_override=None, pin_source=None):
         seen.append((counts["doors"], counts["rtlog"]))
         return (len(templates), [])
 
@@ -363,7 +363,7 @@ def test_template_phase_progress_is_suppressed_on_the_actor_path(tmp_path, monke
 
     monkeypatch.setattr(
         svc, "_push_templates",
-        lambda sdk, *, pin, templates, device_id, template_version_override=None:
+        lambda sdk, *, pin, templates, device_id, template_version_override=None, pin_source=None:
             (len(templates), []),
     )
 
