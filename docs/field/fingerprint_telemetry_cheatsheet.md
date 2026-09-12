@@ -187,6 +187,16 @@ the same terminal). The WARNING line just above it in the log lists a sample of 
 `activeMembershipId`. A full member refresh fills the field.
 `[CODE: app/core/device_sync.py::_filter_users_for_device]`
 
+**When did a device switch pin scheme?**
+
+```bash
+grep -F "[T] PIN_SCHEME_SWITCH" app-*.log
+```
+
+`previous=` / `scheme=` / `cleared_rows=` for `device_id`. From that moment the client pushes the new
+scheme's pins; the terminal keeps the old scheme's users until an operator wipes it. Door events stamped
+before the switch are read under `previous`. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
+
 > **Per-pin success lines are deliberately not emitted.** The STA thread pumps no COM
 > messages while a command runs and the log handler writes inline, so a line per member on
 > a 928-member push would widen that window — a behaviour change, not instrumentation.

@@ -536,6 +536,48 @@ becomes deliverable moves that device's roster hash, which the scheduler's full 
 sync waits for the operator's "Sync data". `[CODE: UltraSyncScheduler loop — timer pushes are
 skipped when _manual_sync_mode()]`
 
+### 3.2e Switching a device's pin scheme (2026-09-12)
+
+**Detection.** Every device write — `save_sync_cache`, the `save_sync_cache_delta` device section
+and a fast-patch `GYM_DEVICE` upsert — goes through `db._insert_device_row`, which calls
+`_record_device_pin_scheme_switch` in the same transaction. The current scheme is the latest
+`device_pin_scheme_switch` row for the device, MEMBERSHIP when there is none; a payload whose
+normalised `pinScheme` differs is a switch. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
+`[TEST: tests/test_pin_scheme_switch.py::test_every_device_write_path_sees_the_switch_exactly_once]`
+
+**What a switch does — and does not do.**
+
+- Clears that device's per-pin hashes with the **same UPDATE** `clear_device_sync_hashes` and hard
+  reset use (`_clear_device_sync_hashes_on`: `desired_hash=NULL, last_ok=0`). It never DELETEs:
+  `ownership_confirmed` and `pushed_finger_ids` survive. `[TEST: ::test_switching_to_account_records_once_and_clears_hashes_without_deleting]`
+- Records `(device_id, previous_scheme, scheme, switched_at, cleared_rows)` in
+  `device_pin_scheme_switch`. `switched_at` is `now_iso()` — local PC time, the clock and shape of
+  `access_history.created_at`. Kept **outside** `sync_devices`, which every device-section refresh
+  DELETEs and re-inserts. `[TEST: ::test_the_switch_time_survives_a_device_section_refresh]`
+- Logs CRITICAL and emits `[T] PIN_SCHEME_SWITCH`.
+- The roster hash moves (`pinScheme=ACCOUNT` joins its header, §3.2b), so the scheduler does not
+  skip the device's next full sync.
+- It does **not** touch the terminal. Nothing in this repo wipes a device automatically.
+
+> **Operator procedure.** Wipe the terminal's users, then switch `pinScheme` on the device.
+> Until the wipe, a PRESERVE terminal holds the old scheme's users next to the new ones, and on
+> the 110 colliding ids (99 different people) the new push overwrites a stranger's device user.
+> `[UNVERIFIED — HARDWARE-GATED]`: the wipe itself has not been exercised on an MB2000.
+
+**Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
+`device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
+candidates are `owned − keep`, i.e. essentially every old-scheme pin, which exceeds the floor, so it
+returns `REVOKE_ABORT_FLOOR` / `safe_to_prune=False` on every full sync; a full sync that also
+carries explicit revocations reports "authoritative revocation unconfirmed". Targeted member
+revokes (§3.2b) are unaffected. Retiring the old-scheme rows after a confirmed wipe needs an
+explicit operator-confirmed action that does not exist yet. `[CODE: ultra_engine.py::_neutralise_revoked_pins]`
+`[UNKNOWN — not built; needs a decision]`
+
+**Reading the history.** `db.list_device_pin_scheme_switches` and
+`pin_scheme.scheme_at(switches, when)`: no switch → MEMBERSHIP for all time (known, not a guess);
+a switch stamped at or before `when` is in force; an unparseable `when` on a device that has
+switched → `None`, "cannot be known". `[TEST: ::test_switching_back_is_a_second_switch_and_each_window_resolves, ::test_scheme_at_rules]`
+
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
 For PullSDK devices, ULTRA has no push implementation of its own. It copies the device
@@ -1082,6 +1124,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `PULLSDK_PUSH_TPL_REFUSED` | `device_sync.py` | `device_id pin fingers errs` |
 | `SYNC_RETRY_BACKOFF` | `device_sync.py`, `ultra_engine.py` | `device_id pins` |
 | `PIN_SCHEME_ACCOUNT_WITHHELD` | `device_sync.py` | `device_id withheld` (warn; §3.2b — ACCOUNT rows with no `mainAccountId`) |
+| `PIN_SCHEME_SWITCH` | `db.py` | `device_id previous scheme cleared_rows` (warn; §3.2e — the terminal must be wiped) |
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |

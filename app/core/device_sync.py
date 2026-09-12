@@ -138,48 +138,19 @@ def _pin_str(v) -> str:
 
 # ── PIN SCHEME ──────────────────────────────────────────────────────────────────────────
 #
-# Which id a device user's PIN is. Decided PER DEVICE by the backend
-# (GymDeviceDto.pinScheme, the same DTO and the same client path as rosterPushingPolicy)
-# and never implicitly by a client upgrade:
-#
-#   MEMBERSHIP -> activeMembershipId, else userId. The default, and the value whenever the
-#                 backend sends nothing. Byte-identical to every pin minted before account
-#                 pins existed; no collapse.
-#   ACCOUNT    -> mainAccountId ONLY, several memberships of one person collapsed into one
-#                 device row.
-#
-# WHY THE SCHEME IS A DEVICE SETTING AND NOT A FALLBACK CHAIN. On the 2026-09-12 production
-# data 110 main_account.id values equal an existing active_membership.id and 99 of those are
-# a DIFFERENT person. A terminal that still holds membership pins and receives account pins
-# would have person A's row written over device user X that belongs to person B. So a device
-# is switched deliberately (after a manual wipe) and never mixes schemes: under ACCOUNT a row
-# with no mainAccountId is WITHHELD, never emitted under its membership pin.
-# See guide_for_agents_and_dev.md §3.2b.
-PIN_SCHEME_MEMBERSHIP = "MEMBERSHIP"
-PIN_SCHEME_ACCOUNT = "ACCOUNT"
-
-# Which field actually produced a pin. Recorded wherever a pin outlives the derivation
-# (push results reported upstream), because the digits alone cannot say -- that IS the
-# collision.
-PIN_SOURCE_ACCOUNT = "ACCOUNT"
-PIN_SOURCE_MEMBERSHIP = "MEMBERSHIP"
-PIN_SOURCE_USER = "USER"
-
-
-def normalize_pin_scheme(raw: Any) -> str:
-    """"ACCOUNT" only for exactly that token (case/space-insensitive); anything else --
-    None, "", an unknown value from a newer backend -- is MEMBERSHIP, today's behaviour."""
-    return PIN_SCHEME_ACCOUNT if str(raw or "").strip().upper() == PIN_SCHEME_ACCOUNT else PIN_SCHEME_MEMBERSHIP
-
-
-def device_pin_scheme(device: Any) -> str:
-    """The pin scheme a device payload (raw or ``_normalize_device``-d) declares."""
-    if not isinstance(device, dict):
-        return PIN_SCHEME_MEMBERSHIP
-    raw = device.get("pinScheme")
-    if raw is None:
-        raw = device.get("pin_scheme")
-    return normalize_pin_scheme(raw)
+# Which id a device user's PIN is, decided PER DEVICE (GymDeviceDto.pinScheme) and never by a
+# client upgrade. The constants and the scheme normalisation live in app.core.pin_scheme so
+# the storage layer (which this module imports) can use them too; they are re-exported here.
+# derive_member_pin below is THE derivation. See guide_for_agents_and_dev.md §3.2b.
+from app.core.pin_scheme import (  # noqa: E402  (re-exported)
+    PIN_SCHEME_ACCOUNT,
+    PIN_SCHEME_MEMBERSHIP,
+    PIN_SOURCE_ACCOUNT,
+    PIN_SOURCE_MEMBERSHIP,
+    PIN_SOURCE_USER,
+    device_pin_scheme,
+    normalize_pin_scheme,
+)
 
 
 def derive_member_pin(user: Dict[str, Any], scheme: str) -> Tuple[str, str | None]:

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
+from app.core.pin_scheme import PIN_SCHEME_MEMBERSHIP, normalize_pin_scheme
 from app.core.utils import ensure_dirs, format_ts, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -1304,6 +1305,27 @@ def init_db() -> None:
                 last_plan_sample TEXT
             );
             """
+        )
+
+        # Every change of a device's pinScheme, oldest first. Deliberately NOT a column of
+        # sync_devices: every device-section refresh DELETEs that table and re-inserts it, so
+        # a switch time kept there would reset on the next sync and every earlier door event
+        # would then resolve under the new scheme. No row for a device = MEMBERSHIP for all
+        # time (the default; a change away from it is always recorded). guide §3.2e.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_pin_scheme_switch (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id       INTEGER NOT NULL,
+                previous_scheme TEXT    NOT NULL,
+                scheme          TEXT    NOT NULL,
+                switched_at     TEXT    NOT NULL,
+                cleared_rows    INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dpss_device ON device_pin_scheme_switch(device_id, id);"
         )
 
         # -----------------------------
@@ -3592,6 +3614,85 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
     )
+
+    # Same transaction as the device row: every device write path (full, delta, fast patch)
+    # comes through here, so a pinScheme change is detected exactly once, wherever it arrives.
+    _record_device_pin_scheme_switch(cur, d)
+
+
+def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
+    """Detect and record a change of this device's pinScheme. Returns True on a switch.
+
+    On a switch, in the caller's transaction:
+      * the device's per-pin sync hashes are cleared through the SAME statement
+        clear_device_sync_hashes / hard reset use (UPDATE desired_hash=NULL, last_ok=0 --
+        never DELETE: ownership_confirmed and pushed_finger_ids are the only proof of which
+        pins Access put on a shared terminal, guide §3.2c);
+      * a device_pin_scheme_switch row records previous scheme, new scheme and the PC time,
+        which the inbound resolver uses to read a door event under the scheme its pin was
+        minted with;
+      * it is logged CRITICAL: the terminal still holds the previous scheme's users and
+        MUST be wiped by an operator. Nothing here wipes it.
+
+    The current scheme is the latest recorded switch, MEMBERSHIP when there is none.
+    """
+    did = _to_int_or_none(d.get("id"))
+    if did is None:
+        return False
+    raw = d.get("pinScheme")
+    if raw is None:
+        raw = d.get("pin_scheme")
+    new_scheme = normalize_pin_scheme(raw)
+    row = cur.execute(
+        "SELECT scheme FROM device_pin_scheme_switch WHERE device_id=? ORDER BY id DESC LIMIT 1",
+        (did,),
+    ).fetchone()
+    current = normalize_pin_scheme(row[0]) if row else PIN_SCHEME_MEMBERSHIP
+    if new_scheme == current:
+        return False
+    cleared = _clear_device_sync_hashes_on(cur, did)
+    switched_at = now_iso()
+    cur.execute(
+        """
+        INSERT INTO device_pin_scheme_switch
+            (device_id, previous_scheme, scheme, switched_at, cleared_rows)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (did, current, new_scheme, switched_at, int(cleared)),
+    )
+    logging.getLogger(__name__).critical(
+        "[DB] device id=%s name=%r pinScheme switched %s -> %s at %s; cleared %d per-pin sync "
+        "hash(es) (ownership evidence kept). The terminal still holds %s-scheme users: an "
+        "operator MUST wipe its users before it is trusted again (guide §3.2e).",
+        did, d.get("name"), current, new_scheme, switched_at, cleared, current,
+    )
+    try:
+        _tel.warn("PIN_SCHEME_SWITCH", device_id=did, previous=current, scheme=new_scheme,
+                  cleared_rows=int(cleared))
+    except Exception:
+        pass
+    return True
+
+
+def list_device_pin_scheme_switches(*, device_id: int | None = None) -> Dict[int, List[Dict[str, Any]]]:
+    """{device_id: [{"previous_scheme", "scheme", "switched_at"}, ...]} oldest first.
+
+    ``switched_at`` is now_iso() text -- local PC time, the clock and shape access_history
+    ``created_at`` uses. A device with no entry has always been MEMBERSHIP.
+    """
+    sql = "SELECT device_id, previous_scheme, scheme, switched_at FROM device_pin_scheme_switch"
+    params: tuple = ()
+    if device_id is not None:
+        sql += " WHERE device_id=?"
+        params = (int(device_id),)
+    sql += " ORDER BY device_id, id"
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    with get_conn() as conn:
+        for r in conn.execute(sql, params).fetchall():
+            out.setdefault(int(r[0]), []).append(
+                {"previous_scheme": r[1], "scheme": r[2], "switched_at": r[3]}
+            )
+    return out
 
 
 @_tel.timed("CACHE_SAVE_FULL", slow_ms=100, warn_ms=2000)
@@ -7377,19 +7478,27 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
 
 
 # -----------------------------
+def _clear_device_sync_hashes_on(conn: Any, device_id: int) -> int:
+    """The one statement that invalidates a device's content hashes (UPDATE, never DELETE).
+
+    Shared by clear_device_sync_hashes and the pinScheme switch recorder, which must run it
+    inside the device-row transaction rather than through the DB writer queue."""
+    cursor = conn.execute(
+        """
+        UPDATE device_sync_state
+        SET desired_hash=NULL, last_ok=0, last_error='forced resync'
+        WHERE device_id=?
+        """,
+        (int(device_id),),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def clear_device_sync_hashes(*, device_id: int) -> int:
     """Invalidate content hashes without discarding ownership or removal evidence."""
     did = int(device_id)
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
-        cursor = conn.execute(
-            """
-            UPDATE device_sync_state
-            SET desired_hash=NULL, last_ok=0, last_error='forced resync'
-            WHERE device_id=?
-            """,
-            (did,),
-        )
-        return int(cursor.rowcount or 0)
+        return _clear_device_sync_hashes_on(conn, did)
 
     return int(_run_db_write_sync("clear_device_sync_hashes", _write))
 
