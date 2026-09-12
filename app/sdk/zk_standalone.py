@@ -418,23 +418,56 @@ class ZKStandaloneDevice:
     def _refresh_pin_card_map(self) -> None:
         """Rebuild pin->card from the local sync DB (best-effort, never raises).
 
-        Pin convention mirrors device_sync._filter_users_for_device: prefer
-        activeMembershipId, fall back to userId. Card = digits of firstCardId.
+        The pin must be the one THIS device holds, i.e. the one its pinScheme mints
+        (device_sync.derive_member_pin, guide §3.2b). Keyed wrong, a standalone scan
+        either names nobody (cardNo="ZKPIN:<pin>", ZKEM_PIN_UNMAPPED) or -- on the 110 ids
+        where an account id equals another person's membership id -- a stranger's card.
+
+        MEMBERSHIP: prefer activeMembershipId, fall back to userId; card = digits of
+        first_card_id. Unchanged. ACCOUNT: the collapsed per-person rows
+        _filter_users_for_device builds for this device, card = digits of that row's
+        firstCardId -- exactly the entry push_roster wrote. The scheme is read from the
+        device's stored row (the payload this driver was built with can be older than a
+        switch), falling back to that payload.
         """
         try:
-            from app.core.db import get_conn  # lazy: keeps sdk importable standalone
+            from app.core.db import get_conn, get_sync_device_payload  # lazy: keeps sdk importable standalone
+            from app.core.pin_scheme import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+            device: Optional[Dict[str, Any]] = None
+            try:
+                device = get_sync_device_payload(int(self.device_id))
+            except Exception:
+                device = None
+            if not isinstance(device, dict):
+                device = dict(self.payload or {})
 
             mapping: Dict[str, str] = {}
-            with get_conn() as conn:
-                rows = conn.execute(
-                    "SELECT user_id, active_membership_id, first_card_id FROM sync_users"
-                ).fetchall()
-            for r in rows:
-                d = dict(r)
-                pin = str(d.get("active_membership_id") or d.get("user_id") or "").strip()
-                card = _digits_only(d.get("first_card_id"))
-                if pin and card:
-                    mapping[pin] = card
+            if device_pin_scheme(device) == PIN_SCHEME_ACCOUNT:
+                from types import SimpleNamespace
+
+                from app.core.db import list_sync_users_page
+                from app.core.device_sync import DeviceSyncEngine
+
+                users, _total = list_sync_users_page(limit=0, offset=0, include_templates=False)
+                by_pin = DeviceSyncEngine(cfg=SimpleNamespace(), logger=self.logger)._filter_users_for_device(
+                    users=users, device=dict(device), default_door_id=1,
+                )
+                for pin, u in by_pin.items():
+                    card = _digits_only(u.get("firstCardId"))
+                    if card:
+                        mapping[pin] = card
+            else:
+                with get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT user_id, active_membership_id, first_card_id FROM sync_users"
+                    ).fetchall()
+                for r in rows:
+                    d = dict(r)
+                    pin = str(d.get("active_membership_id") or d.get("user_id") or "").strip()
+                    card = _digits_only(d.get("first_card_id"))
+                    if pin and card:
+                        mapping[pin] = card
             with self._pin_map_lock:
                 self._pin_to_card = mapping
             self.logger.info("%s pin->card map refreshed: %d entries", self._prefix, len(mapping))

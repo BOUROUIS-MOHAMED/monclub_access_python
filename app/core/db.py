@@ -6638,6 +6638,30 @@ def list_sync_users_by_main_account_ids(
     return [_coerce_user_row_to_payload(r) for r in rows]
 
 
+def list_sync_users_missing_main_account() -> List[Dict[str, Any]]:
+    """Cached member rows that carry no mainAccountId, WITHOUT templates.
+
+    Under pinScheme=ACCOUNT such a row is withheld from the device and its person's pin
+    cannot be named. A targeted removal of an account pin must first prove none of these is
+    deliverable to the device, or it could strip a person whose other membership row is
+    merely unfilled. Normally empty; after the forced full refresh (guide §3.2d) it stays
+    empty unless the backend omits the field.
+    """
+    with get_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users)").fetchall()]
+        if "main_account_id" not in cols:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in cols if c != "fingerprints_json")
+                + " FROM sync_users"
+            ).fetchall()] if cols else []
+        else:
+            keep = ", ".join(f'"{c}"' for c in cols if c != "fingerprints_json")
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT {keep} FROM sync_users WHERE main_account_id IS NULL"
+            ).fetchall()]
+    return [_coerce_user_row_to_payload(r) for r in rows]
+
+
 def get_main_account_ids_for_memberships(
     active_membership_ids: List[int] | set[int] | tuple[int, ...],
 ) -> Dict[int, int]:

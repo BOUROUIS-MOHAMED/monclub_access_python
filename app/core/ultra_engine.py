@@ -1699,7 +1699,7 @@ class UltraDeviceWorker(threading.Thread):
         full sync and recorded in device_sync_state after each push.
 
         Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
-        VALID_ONLY policy / pin derivation: activeMembershipId, else userId) and
+        VALID_ONLY policy / pin derivation under the device's pinScheme, guide §3.2b) and
         _collect_templates_for_pin (cache fingerprints -> local SQLite fallback)
         so a standalone device sees exactly the roster a PullSDK panel would.
         Cards are passed RAW (digits handled by the driver): the 4-byte CardNo
@@ -1711,11 +1711,20 @@ class UltraDeviceWorker(threading.Thread):
         engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
         device = dict(self._device or {})
         users_all = list(getattr(cache, "users", []) or [])
+        roster_stats: Dict[str, Any] = {}
         by_pin = engine._filter_users_for_device(
-            users=users_all, device=device, default_door_id=1,
+            users=users_all, device=device, default_door_id=1, stats_out=roster_stats,
         )
+        # Read by _run_standalone_full_sync to refuse removals on an incomplete roster.
+        self._last_standalone_roster_stats = roster_stats
         if only_member_ids is not None:
-            wanted = {str(int(m)) for m in only_member_ids}
+            # only_member_ids are MEMBERSHIP ids. MEMBERSHIP: str(int(m)), as before.
+            # ACCOUNT: the person pins those memberships belong to.
+            from app.core.device_sync import device_pins_for_members
+
+            wanted = set(device_pins_for_members(
+                only_member_ids, scheme=roster_stats.get("pin_scheme") or "", users=users_all,
+            ).values())
             by_pin = {p: u for p, u in by_pin.items() if p in wanted}
 
         fp_enabled = bool(self._settings.get("fingerprint_enabled", False))
@@ -2062,6 +2071,13 @@ class UltraDeviceWorker(threading.Thread):
                 revoked_ids=normalized_revoked_ids,
             )
             return
+        # Which device pin each unconfirmed revocation names (MEMBERSHIP: str(id), as before;
+        # ACCOUNT: the person's pin, absent when it cannot be named).
+        revoked_pin_of: Dict[int, str] = {}
+        if unconfirmed_revoked_ids:
+            revoked_pin_of = self._device_pins_for_members(
+                unconfirmed_revoked_ids, users=list(getattr(cache, "users", []) or []),
+            )
         if unconfirmed_revoked_ids:
             try:
                 from app.core.db import list_device_sync_hashes_and_status
@@ -2087,13 +2103,13 @@ class UltraDeviceWorker(threading.Thread):
                 else set()
             )
             missing_pins = {
-                str(member_id)
-                for member_id in unconfirmed_revoked_ids
+                pin
+                for pin in revoked_pin_of.values()
                 if (
                     sync_state is None
-                    or str(member_id) in sync_state
+                    or pin in sync_state
                 )
-                and str(member_id) not in confirmed
+                and pin not in confirmed
             }
             if missing_pins:
                 logger.warning(
@@ -2142,8 +2158,11 @@ class UltraDeviceWorker(threading.Thread):
         skipped_note = ""
         desired_pins: list[str] = []
         try:
+            self._last_standalone_roster_stats = None
             users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
+            _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
+            roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
             # EnableDevice bracketing is DELIBERATELY OFF, including for an explicit
             # full reconcile. Plan decision D6 said the nightly/manual reconcile would
             # bracket, but it never once executed (the condition was a dead reason
@@ -2247,24 +2266,41 @@ class UltraDeviceWorker(threading.Thread):
                 # incremental `to_push` subset -- MIRROR deletes device users absent
                 # from this list, so passing the subset would delete every unchanged
                 # member.
-                try:
-                    self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
-                                                 roster_users=users)
-                except Exception as exc:
-                    logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
-                # Strip credentials from pins WE pushed that have left the roster.
-                # Must run BEFORE the prune below, which deletes the very record of
-                # what we pushed to them.
                 safe_to_prune = True
-                try:
-                    safe_to_prune = self._neutralise_revoked_pins(
-                        desired_pins=desired_pins,
-                        roster_count=len(users),
-                        required_pins={str(member_id) for member_id in unconfirmed_revoked_ids},
+                if roster_withheld:
+                    # pinScheme=ACCOUNT rows without mainAccountId were withheld, so their
+                    # people's pins are missing from `users`/`desired_pins` and would read as
+                    # departed. MIRROR, the revoke pass and the prune all remove by that
+                    # difference -- skip all three. safe_to_prune=False also keeps the
+                    # ownership evidence (guide §3.2c).
+                    logger.warning(
+                        "%s full sync: pinScheme=ACCOUNT roster INCOMPLETE (%d row(s) withheld, "
+                        "no mainAccountId) -- MIRROR reconcile, revoke pass and prune skipped",
+                        self._prefix, roster_withheld,
                     )
-                except Exception as exc:
-                    logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                    _tel.warn("REVOKE_SKIP_INCOMPLETE_ROSTER", worker=self._tel_wid,
+                              withheld=roster_withheld)
                     safe_to_prune = False
+                else:
+                    try:
+                        self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
+                                                     roster_users=users)
+                    except Exception as exc:
+                        logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
+                    # Strip credentials from pins WE pushed that have left the roster.
+                    # Must run BEFORE the prune below, which deletes the very record of
+                    # what we pushed to them.
+                    try:
+                        safe_to_prune = self._neutralise_revoked_pins(
+                            desired_pins=desired_pins,
+                            roster_count=len(users),
+                            required_pins=self._required_revocation_pins(
+                                unconfirmed_revoked_ids, desired_pins, revoked_pin_of,
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                        safe_to_prune = False
                 if unconfirmed_revoked_ids and not safe_to_prune:
                     sync_ok = False
                     sync_error = "authoritative revocation unconfirmed"
@@ -2367,6 +2403,9 @@ class UltraDeviceWorker(threading.Thread):
         """
         rows = self._member_row_in_db(member_id)
         if rows:
+            # ACCOUNT: the device row is the collapse of EVERY membership of the person, so
+            # read all of the person's rows, not just the one that changed.
+            rows = self._person_rows_for_member(member_id, rows)
             return self._build_standalone_roster(
                 SimpleNamespace(users=rows), only_member_ids={int(member_id)},
             )
@@ -2407,6 +2446,21 @@ class UltraDeviceWorker(threading.Thread):
         #                  (allowedMemberships, validity, pin derivation)
         _rows = self._member_row_in_db(member_id)
         in_db = None if _rows is None else bool(_rows)
+        if pin and self._pin_scheme_is_account():
+            # The flag must land on the pin the device holds -- the person's. A membership
+            # number here would flag (at best) nothing and (at worst) another person's pin.
+            try:
+                pin = self._device_pins_for_members({int(member_id)}, users=_rows or []).get(
+                    int(member_id), ""
+                )
+            except Exception:
+                pin = ""
+            if not pin:
+                logger.warning(
+                    "%s member sync deferred: pinScheme=ACCOUNT and membership %s has no "
+                    "known person pin -- nothing flagged; the next full sync reconciles.",
+                    self._prefix, member_id,
+                )
         logger.warning(
             "%s member sync deferred: member %s -- %s (row in sync_users: %s). "
             "Flagged for the next full sync rather than reported as synced.",
@@ -2654,9 +2708,174 @@ class UltraDeviceWorker(threading.Thread):
             failed=frozenset(failed),
         )
 
+    # ------------------------------------------------------------------ #
+    # pinScheme helpers: every request names a MEMBERSHIP; the device row is keyed by the
+    # device's scheme. guide §3.2b.
+    # ------------------------------------------------------------------ #
+    def _pin_scheme_is_account(self) -> bool:
+        from app.core.device_sync import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+        return device_pin_scheme(self._device) == PIN_SCHEME_ACCOUNT
+
+    def _device_pins_for_members(self, member_ids, *, users=None) -> Dict[int, str]:
+        from app.core.device_sync import device_pin_scheme, device_pins_for_members
+
+        return device_pins_for_members(member_ids, scheme=device_pin_scheme(self._device),
+                                      users=users)
+
+    def _person_rows_for_member(self, member_id: int, rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        """Under ACCOUNT, every cached row of the person behind ``member_id`` (falls back to
+        ``rows`` when the person cannot be named or the read fails). MEMBERSHIP: ``rows``."""
+        if not self._pin_scheme_is_account():
+            return rows
+        try:
+            acct = self._device_pins_for_members({int(member_id)}, users=rows).get(int(member_id))
+            if not acct:
+                return rows
+            from app.core.db import list_sync_users_by_main_account_ids
+
+            person = list(list_sync_users_by_main_account_ids({int(acct)}) or [])
+            return person or rows
+        except Exception:
+            logger.debug("%s person rows read failed", self._prefix, exc_info=True)
+            return rows
+
+    def _required_revocation_pins(
+        self,
+        unconfirmed_revoked_ids: set[int],
+        desired_pins,
+        revoked_pin_of: Dict[int, str],
+    ) -> set[str]:
+        """Pins an explicit revocation must see REMOVED.
+
+        MEMBERSHIP: every revoked membership id, as before. ACCOUNT: only the person pins that
+        left the desired roster -- a person who still holds another membership this device
+        accepts is satisfied by the full sync's re-push, not by removal (requiring removal of a
+        pin that is still desired would fail the sync forever). An unmappable membership names
+        no pin; the revoke pass still removes every owned pin that left the roster.
+        """
+        if not self._pin_scheme_is_account():
+            return {str(member_id) for member_id in unconfirmed_revoked_ids}
+        desired = {str(p).strip() for p in (desired_pins or ())}
+        return {
+            pin for member_id, pin in (revoked_pin_of or {}).items()
+            if member_id in unconfirmed_revoked_ids and pin not in desired
+        }
+
+    def _account_member_revoke(self, member_id: int) -> tuple[bool | None, str]:
+        """ACCOUNT half of ``_run_standalone_member_revoke``. Returns ``(result, pin)``.
+
+        ``result`` True/False: handled here -- the person's collapsed row was RE-PUSHED, or the
+        revoke could not proceed. ``None``: nothing of the person remains deliverable to this
+        device, so ``pin`` goes through the normal ownership-checked removal.
+        """
+        acct = ""
+        try:
+            rows = self._member_row_in_db(member_id) or []
+            acct = self._device_pins_for_members({member_id}, users=rows).get(member_id, "")
+        except Exception:
+            logger.warning("%s member revoke: person pin lookup failed for membership %s",
+                           self._prefix, member_id, exc_info=True)
+        if not acct:
+            logger.critical(
+                "%s member revoke: pinScheme=ACCOUNT and membership %s cannot be mapped to its "
+                "person's pin (no cached or linked mainAccountId). NOT removing by the "
+                "membership number, which may be another person's account pin; deferring to "
+                "full reconciliation.",
+                self._prefix, member_id,
+            )
+            _tel.warn("MEMBER_REVOKE_PIN_UNKNOWN", worker=self._tel_wid, member_id=member_id)
+            self.request_full_sync(reason="revoke-pin-unknown", revoked_ids={member_id})
+            return False, ""
+        try:
+            from app.core.db import list_sync_users_by_main_account_ids
+
+            remaining = []
+            for row in list_sync_users_by_main_account_ids({int(acct)}) or []:
+                try:
+                    if int(row.get("activeMembershipId")) == int(member_id):
+                        continue  # defensively: the revoked plan never counts
+                except (TypeError, ValueError):
+                    pass
+                remaining.append(row)
+        except Exception:
+            logger.warning("%s member revoke: person rows unreadable for pin %s",
+                           self._prefix, acct, exc_info=True)
+            _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id, pin=acct)
+            self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+            return False, acct
+        users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(
+            SimpleNamespace(users=remaining)
+        )
+        entry = next((u for u in users if str(u.get("pin") or "").strip() == acct), None)
+        if entry is None:
+            from app.core.device_sync import DeviceSyncEngine, account_roster_withheld_for_device
+
+            withheld = account_roster_withheld_for_device(
+                DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger),
+                dict(self._device or {}),
+            )
+            if withheld:
+                # Nothing NAMED of this person remains, but rows without mainAccountId are
+                # withheld from this device and one of them may be theirs. Removing now could
+                # strip a paying member; defer to the full sync, which also refuses removals
+                # on an incomplete roster.
+                logger.warning(
+                    "%s member revoke: pin %s not removed -- %d deliverable row(s) have no "
+                    "mainAccountId, so the person cannot be proven gone",
+                    self._prefix, acct, withheld,
+                )
+                _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id,
+                          pin=acct)
+                self.request_full_sync(reason="revoke-roster-incomplete", revoked_ids={member_id})
+                return False, acct
+            return None, acct
+        _tel.event("MEMBER_REVOKE_REQUESTED", worker=self._tel_wid, member_id=member_id, pin=acct)
+        templates = {acct: templates_by_pin[acct]} if acct in (templates_by_pin or {}) else {}
+        ok = False
+        try:
+            removals = self._standalone_removals(
+                to_push=[entry], templates_by_pin=templates,
+                pushed_fingers=self._load_pushed_fingers(),
+            )
+            result = self._sdk.push_roster([entry], templates, remove_fingers_by_pin=removals)
+            self._record_standalone_pin_state(
+                users=[entry], hashes_by_pin=hashes_by_pin, result=result,
+                templates_by_pin=templates,
+            )
+            ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
+                users=[entry], result=result,
+            )
+        except Exception:
+            logger.warning("%s member revoke: re-push of pin %s failed", self._prefix, acct,
+                           exc_info=True)
+            ok = False
+        if ok:
+            logger.info(
+                "%s member revoke: membership %s left; person pin %s still holds another "
+                "membership this device accepts -- re-pushed the collapsed row instead of "
+                "deleting it", self._prefix, member_id, acct,
+            )
+            _tel.event("MEMBER_REVOKE_DONE", worker=self._tel_wid, member_id=member_id,
+                       pin=acct, mode="repushed", ok=True)
+            return True, acct
+        _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id, pin=acct)
+        self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+        return False, acct
+
     def _run_standalone_member_revoke(self, member_id: int) -> bool:
-        """Immediately remove one authoritative, MonClub-owned standalone PIN."""
-        pin = str(int(member_id))
+        """Immediately remove one authoritative, MonClub-owned standalone PIN.
+
+        Under pinScheme=ACCOUNT the pin is the PERSON: revoking one membership removes the pin
+        only when nothing of that person remains deliverable to this device; otherwise the
+        collapsed row is re-pushed (``_account_member_revoke``). guide §3.2b.
+        """
+        if self._pin_scheme_is_account():
+            handled, pin = self._account_member_revoke(int(member_id))
+            if handled is not None:
+                return handled
+        else:
+            pin = str(int(member_id))
         _tel.event(
             "MEMBER_REVOKE_REQUESTED",
             worker=self._tel_wid,
@@ -3978,12 +4197,14 @@ class UltraDeviceWorker(threading.Thread):
             user = hits[0] if isinstance(hits, list) else hits
 
         # Fallback: for fingerprint scans the device sets cardNo=pin (F-004).
-        # If card lookup missed, try users_by_am using the raw RTLog pin field.
+        # If card lookup missed, resolve the raw RTLog pin UNDER THIS DEVICE'S pinScheme.
+        # users_by_am is keyed by activeMembershipId: on an ACCOUNT device that lookup names
+        # nobody, or -- for the 110 colliding ids -- a stranger. guide §3.2b.
         if user is None and raw_row:
             pin_raw = str(raw_row.get("pin") or "").strip()
             if pin_raw.isdigit():
                 try:
-                    user = users_by_am.get(int(pin_raw))
+                    user = self._user_for_device_pin(pin_raw, users_by_am)
                 except Exception:
                     pass
 
@@ -4057,6 +4278,37 @@ class UltraDeviceWorker(threading.Thread):
 
         if (time.monotonic() - t0) * 1000 >= 250:
             _tel.warn("ALLOW_HANDLE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
+
+    def _user_for_device_pin(self, pin: str, users_by_am: Dict[int, Any]) -> Optional[Dict[str, Any]]:
+        """The member a pin reported by THIS device names, under its pinScheme.
+
+        MEMBERSHIP: ``users_by_am[int(pin)]`` exactly as before (that index also carries the
+        userId fallback pins). ACCOUNT: the collapsed per-person row
+        ``_filter_users_for_device`` builds for this device -- the same derivation the push
+        used, over the same local-state users -- so an event names the membership the device
+        row represents. Cached per local-state snapshot and device dict.
+        """
+        from app.core.device_sync import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+        if device_pin_scheme(self._device) != PIN_SCHEME_ACCOUNT:
+            return users_by_am.get(int(pin))
+        cached = getattr(self, "_account_pin_index_cache", None)
+        if cached is not None and cached[0] is users_by_am and cached[1] is self._device:
+            index = cached[2]
+        else:
+            from app.core.device_sync import DeviceSyncEngine
+
+            seen: set[int] = set()
+            users: list[Dict[str, Any]] = []
+            for candidate in (users_by_am or {}).values():
+                if isinstance(candidate, dict) and id(candidate) not in seen:
+                    seen.add(id(candidate))
+                    users.append(candidate)
+            index = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)._filter_users_for_device(
+                users=users, device=dict(self._device or {}), default_door_id=1,
+            )
+            self._account_pin_index_cache = (users_by_am, self._device, index)
+        return index.get(str(int(pin)))
 
     # ------------------------------------------------------------------ #
     # TOTP Rescue handler (active: verify + open door)

@@ -320,11 +320,17 @@ means whole-user deletion was consistently confirmed; `mode=neutralised` means t
 disabled blank-card row and every locally tracked finger-slot clear were confirmed.
 `MEMBER_REVOKE_FAILED` keeps local ownership state and schedules full reconciliation.
 `MEMBER_REVOKE_OWNERSHIP_MISSING` makes no destructive device call.
+`MEMBER_REVOKE_DONE mode=repushed` (pinScheme=ACCOUNT devices) means the member lost ONE membership
+but still holds another this device accepts: the person's pin stayed and its row was re-pushed without the
+revoked plan. `MEMBER_REVOKE_PIN_UNKNOWN` means the membership could not be mapped to a person's pin, so
+nothing was removed and a full sync was requested.
 `[CODE: app/core/ultra_engine.py::_run_standalone_member_revoke]`
 
 For full reconciliation, `REVOKE_DONE deleted= neutralised= slots= ok=` counts only
 confirmed outcomes. `ok=False` means at least one PIN or local-state cleanup remains
 for retry.
+`REVOKE_SKIP_INCOMPLETE_ROSTER withheld=N` means the pass did not run at all: N deliverable members on an
+ACCOUNT-pin device have no `mainAccountId`, so departed pins cannot be told apart from theirs.
 
 ---
 

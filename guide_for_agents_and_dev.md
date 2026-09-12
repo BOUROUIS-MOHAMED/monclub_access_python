@@ -272,6 +272,72 @@ device row, and a row carries one validity window, one name and two card slots.
   `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner]`
 - **cards** — the winner's, with an empty slot filled from the loser. `[CODE]`
 
+**Every site that turns a membership into a device pin goes through the device's scheme.**
+Sync requests, delta `changed_ids`, fast-patch impacts and revocations all name MEMBERSHIPS
+(`activeMembershipId`). Under ACCOUNT each site translates before touching a pin — a membership
+number used as a pin names, for the 110 colliding ids, ANOTHER person's device user. The
+translation is `device_sync.device_pins_for_members` (MEMBERSHIP: `str(int(id))`, unchanged;
+ACCOUNT: `account_pins_for_memberships` — the roster in hand, then `member_account_link` (§3.2d),
+which still answers after a revocation deleted the row; an unmappable membership is ABSENT, never
+replaced by its own number). `[CODE]`
+
+| Site | MEMBERSHIP (unchanged) | ACCOUNT |
+|---|---|---|
+| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted |
+| `DeviceSyncEngine._sync_one_device` `known_server_pins` | `activeMembershipId` of every user | account pin of every user |
+| `_sync_one_device` delta pruning / drift check (`int(pin) in changed_ids`) | verbatim | `pin in` the account pins of `changed_ids` |
+| `UltraDeviceWorker._build_standalone_roster(only_member_ids)` | `wanted = {str(int(m))}` | the account pins of those memberships |
+| `UltraDeviceWorker._load_member_roster` | that membership's row | every row of the person |
+| `UltraDeviceWorker._defer_member_sync` | flags `str(member_id)` | flags the person's pin; none when unmappable |
+| `UltraDeviceWorker._run_standalone_member_revoke` | removes `str(member_id)` (ownership-checked) | see below |
+| `_run_standalone_full_sync` explicit-revocation ownership check + `required_pins` | `str(member_id)` | the person's pin, and only when it LEFT the desired roster |
+| `UltraDeviceWorker._handle_allow` fingerprint-scan pin → member (`_user_for_device_pin`) | `users_by_am[int(pin)]` | the collapsed row `_filter_users_for_device` builds for this device |
+| `ZKStandaloneDevice._refresh_pin_card_map` (pin → card on standalone events) | `active_membership_id or user_id` | the collapsed rows for this device, scheme read from the stored device row |
+
+`[TEST: tests/test_account_pin_device_sites.py]` — 18 of its 23 cases fail against the code
+before this conversion (2eafb5f); the 5 that pass there pin MEMBERSHIP behaviour or refusals that
+were already safe.
+
+**Revoking one membership of a person (ACCOUNT).** `_account_member_revoke` names the person's pin,
+reads the person's remaining rows and builds this device's roster from them. If the person is
+still deliverable, the collapsed row is RE-PUSHED (the revoked plan's validity and finger slots
+leave with it; `MEMBER_REVOKE_DONE mode=repushed`) and nothing is deleted. Only when nothing of the
+person remains is the pin removed, through the same ownership-checked `_remove_standalone_pins`.
+An unmappable membership removes nothing (`MEMBER_REVOKE_PIN_UNKNOWN`) and defers to a full sync.
+The full sync's explicit-revocation check likewise requires removal only of person pins that left
+the roster; otherwise a person holding another membership would fail every full sync. A
+revocation whose membership was never seen with a `mainAccountId` names no pin; that membership
+can never have been pushed under ACCOUNT (the push reads `mainAccountId` from the same rows the
+link is refreshed from), so there is nothing of it to remove. `[CODE]`
+`[TEST: ::test_revoking_one_of_two_memberships_repushes_and_keeps_the_pin,
+::test_revoking_the_last_membership_removes_the_account_pin,
+::test_revoking_sonias_membership_5_removes_sonia_not_ali,
+::test_a_revoked_membership_whose_person_remains_does_not_fail_the_sync]`
+
+**No removal on an incomplete ACCOUNT roster.** When `_filter_users_for_device` withheld rows
+(no `mainAccountId`), their people's pins are missing from `desired_pins` and would read as
+departed. So, under ACCOUNT with withheld rows: the standalone full sync skips
+`_maybe_mirror_reconcile`, `_neutralise_revoked_pins` AND `prune_device_sync_state`
+(`safe_to_prune=False`, `[T] REVOKE_SKIP_INCOMPLETE_ROSTER`); the PullSDK full sync skips the
+stale-pin delete, the nuke and both prunes; and the two TARGETED removals
+(`sync_member_on_connected_sdk`, `_account_member_revoke`) first check
+`device_sync.account_roster_withheld_for_device` over `db.list_sync_users_missing_main_account`,
+because a person's other membership row may be the one without the field. This neither mixes
+schemes (nothing is pushed under a membership pin) nor revokes a row already on the device, and it
+keeps the ownership evidence §3.2c depends on. The cost is that, while such rows exist,
+revocations on that device are not carried out — the forced refresh of §3.2d is what ends the
+window. `[CODE]` `[TEST: ::test_an_incomplete_roster_skips_the_revoke_pass_and_the_prune,
+::test_an_incomplete_account_roster_removes_and_prunes_nothing,
+::test_no_delete_while_a_deliverable_row_has_no_main_account_id,
+::test_no_removal_while_a_deliverable_row_has_no_main_account_id]`
+
+**The PullSDK nuke heuristic is off for any device that has switched scheme.** INCREMENTAL clears
+every table when stale pins outnumber desired ones. Right after a switch the old scheme's pins ARE
+that majority, so the heuristic would wipe the terminal automatically — other systems' users
+included. The procedure is a manual wipe (§3.2e), so `_sync_one_device` suppresses the heuristic
+when `device_pin_scheme_switch` has a row for the device; stale pins are still removed one by one.
+An explicit `FULL_REPLACE` policy is left as configured. `[CODE]`
+
 **Inbound is the dangerous direction, and it cannot be fully resolved in code.** A device
 reports a pin; `device_attendance._user_indexes` builds a by-`mainAccountId` index alongside the
 membership one, and `_resolve_history_user` uses whichever reading is UNAMBIGUOUS.
@@ -1105,9 +1171,10 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok op del_attempted del_ok dur_ms ok` |
 | `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason in_db` |
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
-| `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised`) |
+| `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_OWNERSHIP_MISSING` | `ultra_engine.py` | `member_id pin` |
+| `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
 | `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |
 | `MIRROR_SKIP_NO_CAPABILITY` | `ultra_engine.py` | `worker` |
 | `MIRROR_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | `worker` (warn) |
@@ -1118,6 +1185,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `REVOKE_DONE` | `ultra_engine.py` | `pins deleted neutralised slots ok` (confirmed outcomes only) |
 | `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
 | `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |
+| `REVOKE_SKIP_INCOMPLETE_ROSTER` | `ultra_engine.py` | `withheld` (warn; ACCOUNT rows without `mainAccountId` — MIRROR, revoke pass and prune skipped, §3.2b) |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
 | `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |

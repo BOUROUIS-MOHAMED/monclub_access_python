@@ -7,9 +7,10 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
 from app.core.db import (
+    list_device_pin_scheme_switches,
     list_fingerprints,
     list_fingerprints_by_pins,
     list_sync_users_by_active_membership_ids,
@@ -171,6 +172,112 @@ def derive_member_pin(user: Dict[str, Any], scheme: str) -> Tuple[str, str | Non
         return am, PIN_SOURCE_MEMBERSHIP
     uid = _pin_str(user.get("userId"))
     return (uid, PIN_SOURCE_USER) if uid else ("", None)
+
+
+def account_pins_for_memberships(
+    member_ids: Iterable[Any] | None,
+    users: List[Dict[str, Any]] | None = None,
+) -> Dict[int, str]:
+    """membership id -> the ACCOUNT device pin (mainAccountId) of its person.
+
+    Every sync request, delta hint, fast-patch impact and revocation names MEMBERSHIPS
+    (activeMembershipId). Under pinScheme=ACCOUNT a device row is keyed by the person, so
+    each of those sites must translate before touching a pin -- comparing a membership id
+    to an account pin is exactly the 110-id collision.
+
+    Looks in ``users`` first (the roster in hand), then ``member_account_link``, which still
+    answers after a revocation has deleted the member's row. A membership that cannot be
+    mapped is ABSENT from the result: callers must not fall back to the membership number.
+    """
+    wanted: Set[int] = set()
+    for raw in member_ids or ():
+        try:
+            wanted.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    out: Dict[int, str] = {}
+    if not wanted:
+        return out
+    for u in users or []:
+        if not isinstance(u, dict):
+            continue
+        am = _to_int(u.get("activeMembershipId"), default=None)
+        if am is None or int(am) not in wanted:
+            continue
+        acct = _pin_str(u.get("mainAccountId"))
+        if acct.isdigit():
+            out[int(am)] = acct
+    missing = wanted - set(out)
+    if missing:
+        try:
+            from app.core import db as _db  # attribute lookup at call time (patchable)
+
+            for am, acct in (_db.get_main_account_ids_for_memberships(missing) or {}).items():
+                out.setdefault(int(am), str(int(acct)))
+        except Exception:
+            pass  # unknown stays unknown
+    return out
+
+
+def device_pins_for_members(
+    member_ids: Iterable[Any] | None,
+    *,
+    scheme: str,
+    users: List[Dict[str, Any]] | None = None,
+) -> Dict[int, str]:
+    """membership id -> device pin under ``scheme``.
+
+    MEMBERSHIP: ``str(int(id))`` -- the membership IS the pin, byte-identical to every
+    pre-existing ``str(int(member_id))``. ACCOUNT: ``account_pins_for_memberships`` (an
+    unmappable membership is absent)."""
+    if normalize_pin_scheme(scheme) != PIN_SCHEME_ACCOUNT:
+        out: Dict[int, str] = {}
+        for raw in member_ids or ():
+            if raw is None:
+                continue
+            out[int(raw)] = str(int(raw))
+        return out
+    return account_pins_for_memberships(member_ids, users)
+
+
+def person_rows_for_membership(member_id: int) -> Tuple[str | None, List[Dict[str, Any]]]:
+    """(ACCOUNT pin, every cached row of that person) for one membership id.
+
+    The targeted paths need ALL of a person's rows: the device row is the collapse of every
+    membership the device accepts, so a push built from the one membership that changed
+    would carry the wrong validity window and drop the other plans' fingers. ``(None, rows)``
+    when the person cannot be named; the caller must then neither push nor delete.
+    """
+    from app.core import db as _db  # attribute lookup at call time (patchable)
+
+    mid = int(member_id)
+    rows = list(_db.list_sync_users_by_active_membership_ids({mid}) or [])
+    acct = account_pins_for_memberships({mid}, rows).get(mid)
+    if acct is None:
+        return None, rows
+    return acct, list(_db.list_sync_users_by_main_account_ids({int(acct)}) or [])
+
+
+def account_roster_withheld_for_device(engine: "DeviceSyncEngine", device: Dict[str, Any]) -> int:
+    """How many cached rows this ACCOUNT device would carry but cannot name (no mainAccountId).
+
+    A TARGETED removal of an account pin sees only one person's rows; it must not remove
+    while this is non-zero, for the same reason the full syncs refuse removals on an
+    incomplete roster. Unreadable -> treated as incomplete (returns 1).
+    """
+    try:
+        from app.core import db as _db  # attribute lookup at call time (patchable)
+
+        rows = list(_db.list_sync_users_missing_main_account() or [])
+    except Exception:
+        return 1
+    if not rows:
+        return 0
+    stats: Dict[str, Any] = {}
+    engine._filter_users_for_device(
+        users=rows, device=dict(device or {}), default_door_id=1, stats_out=stats,
+    )
+    return int(stats.get("withheld_missing_account") or 0)
 
 
 def reach_of(u: Dict[str, Any]):
@@ -1196,7 +1303,27 @@ class DeviceSyncEngine:
         if not _boolish(normalized_device.get("accessDevice"), default=True):
             return False
 
-        pin = _pin_str(member_id)
+        # The request names a MEMBERSHIP; the device row is keyed by the device's pinScheme.
+        # Under MEMBERSHIP they are the same number (unchanged). Under ACCOUNT the pin is the
+        # person's, and a membership id used as a pin names -- for 110 ids -- ANOTHER
+        # person's device user: the old `desired.get(pin)` then missed and the branch below
+        # DELETED that stranger. guide §3.2b.
+        pin_scheme = device_pin_scheme(normalized_device)
+        account_rows: List[Dict[str, Any]] | None = None
+        if pin_scheme == PIN_SCHEME_ACCOUNT:
+            acct, account_rows = person_rows_for_membership(int(member_id))
+            if acct is None:
+                self.logger.warning(
+                    "[DeviceSync] targeted member sync: device_id=%s device_name=%r "
+                    "pinScheme=ACCOUNT cannot name the device pin of membership %s (no cached "
+                    "or linked mainAccountId) -- nothing pushed, nothing deleted; the next "
+                    "full sync reconciles. source=%s",
+                    did, dev_name, member_id, source,
+                )
+                return False
+            pin = acct
+        else:
+            pin = _pin_str(member_id)
         if not pin or not pin.isdigit():
             return False
 
@@ -1206,13 +1333,37 @@ class DeviceSyncEngine:
             default_door_id=default_door_id,
         )
 
-        target_users = list_sync_users_by_active_membership_ids({int(member_id)})
+        if account_rows is not None:
+            # Every row of the person: the collapse needs all of them.
+            target_users = account_rows
+        else:
+            target_users = list_sync_users_by_active_membership_ids({int(member_id)})
+        filter_stats: Dict[str, Any] = {}
         desired = self._filter_users_for_device(
             users=target_users,
             device=normalized_device,
             default_door_id=default_door_id,
+            stats_out=filter_stats,
         )
         desired_user = desired.get(pin)
+
+        if (
+            not isinstance(desired_user, dict)
+            and pin_scheme == PIN_SCHEME_ACCOUNT
+            and (
+                filter_stats.get("withheld_missing_account")
+                or account_roster_withheld_for_device(self, normalized_device)
+            )
+        ):
+            # Not provably "departed": some row this device would carry has no
+            # mainAccountId, and it may be this person's other membership. Never delete on
+            # an incomplete roster; the full sync skips removals for the same reason.
+            self.logger.warning(
+                "[DeviceSync] targeted member sync: device_id=%s pin=%s pinScheme=ACCOUNT "
+                "roster incomplete (rows without mainAccountId) -- not deleting. source=%s",
+                did, pin, source,
+            )
+            return False
 
         if not isinstance(desired_user, dict):
             deleted = self._delete_pin_unconditional(
@@ -2530,15 +2681,39 @@ class DeviceSyncEngine:
         # reused as a loop variable below.
         _fsp = _tel.profile("FULL_SYNC_DEVICE", device_id=dev_id)
 
+        filter_stats: Dict[str, Any] = {}
         with _fsp.step("filter"):
-            desired = self._filter_users_for_device(users=users, device=device, default_door_id=default_door_id)
+            desired = self._filter_users_for_device(
+                users=users, device=device, default_door_id=default_door_id,
+                stats_out=filter_stats,
+            )
         desired_pins = set(desired.keys())
+        pin_scheme = filter_stats.get("pin_scheme") or device_pin_scheme(device)
+        # A withheld ACCOUNT row (no mainAccountId) has a pin we cannot name, so it cannot be
+        # kept: every REMOVAL below (stale-pin delete, nuke, prune) is skipped this pass.
+        roster_incomplete = bool(filter_stats.get("withheld_missing_account"))
 
         known_server_pins: Set[str] = set()
         for u in users or []:
-            p = _pin_str(u.get("activeMembershipId"))
+            if pin_scheme == PIN_SCHEME_ACCOUNT:
+                p, _src = derive_member_pin(u, PIN_SCHEME_ACCOUNT)
+            else:
+                # MEMBERSHIP: exactly the pre-existing set (activeMembershipId only).
+                p = _pin_str(u.get("activeMembershipId"))
             if p and p.isdigit():
                 known_server_pins.add(p)
+
+        # changed_ids are MEMBERSHIP ids (backend delta, fast-patch impact). Under ACCOUNT
+        # they are translated to the person pins they touch; under MEMBERSHIP the original
+        # `int(pin) in changed_ids` test is kept verbatim.
+        changed_account_pins: Set[str] | None = None
+        if changed_ids is not None and pin_scheme == PIN_SCHEME_ACCOUNT:
+            changed_account_pins = set(account_pins_for_memberships(changed_ids, users).values())
+
+        def _pin_in_changed(pin: str) -> bool:
+            if changed_account_pins is not None:
+                return pin in changed_account_pins
+            return int(pin) in changed_ids
 
         with _fsp.step("prev_state"):
             prev_state = list_device_sync_retry_state(device_id=did)
@@ -2610,7 +2785,7 @@ class DeviceSyncEngine:
             pins_to_sync = {
                 pin for pin in pins_to_sync
                 if (
-                    int(pin) in changed_ids          # changed per backend delta
+                    _pin_in_changed(pin)             # changed per backend delta
                     or not prev_state.get(pin, ("", True))[0]   # no stored hash (new)
                     or not prev_state.get(pin, ("", True))[1]   # previous push failed
                 )
@@ -2692,7 +2867,7 @@ class DeviceSyncEngine:
             # In delta mode skip drift check for unchanged users; they'll be caught on the next full sync.
             for pin in desired_pins:
                 if pin not in device_pins and prev_hashes.get(pin) and pin not in pins_to_sync:
-                    if changed_ids is not None and int(pin) not in changed_ids:
+                    if changed_ids is not None and not _pin_in_changed(pin):
                         continue  # skip drift detection for unchanged users in delta mode
                     self.logger.info(
                         f"[DeviceSync] Device id={dev_id} Pin={pin}: "
@@ -2710,6 +2885,15 @@ class DeviceSyncEngine:
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
             tracked_server_pins = set(known_server_pins) | set(prev_state.keys())
             stale_pins = sorted([p for p in device_pins if p in tracked_server_pins and p not in desired_pins])
+            if roster_incomplete:
+                if stale_pins:
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s pinScheme=ACCOUNT roster INCOMPLETE (%s row(s) "
+                        "withheld, no mainAccountId): NOT removing %d stale pin(s) -- a withheld "
+                        "member cannot be told apart from a departed one.",
+                        dev_id, filter_stats.get("withheld_missing_account"), len(stale_pins),
+                    )
+                stale_pins = []
             self.logger.info(
                 "[DeviceSync] Device id=%s: device_pins=%d desired=%d to_sync=%d "
                 "stale=%d drift_resynced=%d door_bitmask=%d",
@@ -2748,6 +2932,33 @@ class DeviceSyncEngine:
                     False if deletion_only_delta
                     else len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
                 )
+            if nuke_mode and roster_incomplete:
+                # Clearing the tables and re-pushing a roster that is missing people would
+                # take those people off the device.
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s: nuke suppressed -- pinScheme=ACCOUNT roster is "
+                    "incomplete (%s row(s) withheld)", dev_id,
+                    filter_stats.get("withheld_missing_account"),
+                )
+                nuke_mode = False
+            if nuke_mode and policy != _PUSH_POLICY_FULL_REPLACE:
+                # The INCREMENTAL heuristic fires when stale > desired. Right after a pinScheme
+                # switch the old scheme's pins ARE that majority, so it would clear every
+                # table -- other systems' users included -- i.e. wipe the terminal
+                # automatically. The switch procedure is a MANUAL wipe (guide §3.2e), so the
+                # heuristic is off for any device that has ever switched. FULL_REPLACE is an
+                # explicit per-gym policy, not a heuristic, and is left as configured.
+                try:
+                    _switched = bool(list_device_pin_scheme_switches(device_id=did).get(did))
+                except Exception:
+                    _switched = True
+                if _switched:
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s: NUKE-AND-REPAVE heuristic suppressed -- this "
+                        "device has switched pinScheme; stale pins are removed one by one instead",
+                        dev_id,
+                    )
+                    nuke_mode = False
             if nuke_mode:
                 self.logger.info(
                     "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
@@ -3415,13 +3626,18 @@ class DeviceSyncEngine:
                         self.logger.warning(
                             "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
-            pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
-            # Same keep-set: a removed or revoked member must not linger in the push
-            # status cache and keep being reported upstream forever.
-            try:
-                prune_fingerprint_push_status(device_id=did, keep_pins=desired_pins)
-            except Exception:
-                pass
+            if roster_incomplete:
+                # The withheld people's pins are not in desired_pins; pruning would forget
+                # them (and their ownership evidence) while they may still be on the device.
+                pruned = 0
+            else:
+                pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
+                # Same keep-set: a removed or revoked member must not linger in the push
+                # status cache and keep being reported upstream forever.
+                try:
+                    prune_fingerprint_push_status(device_id=did, keep_pins=desired_pins)
+                except Exception:
+                    pass
 
             # ── Write door timing to controller firmware ──
             # Without this, the C3 keeps its factory/old defaults and the
