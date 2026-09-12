@@ -918,6 +918,12 @@ the **oldest** event and inserts the new one, with a warning. `[CODE]`
 Lane direction from the synced door preset is stamped into `rawRow["direction"]`, so
 the existing attendance uploader carries it with zero changes. `[CODE]`
 
+The PIN pushed to and reported by this SDK is not per-person — see
+[`pullsdk_guide.md` §4.6](pullsdk_guide.md#46-one-person-two-pins--ship-it-do-not-fix-it)
+("One person, two PINs"): it is derived the same way for both SDKs
+(`app/core/device_sync.py:1377-1380`), so a member with two date-valid memberships
+occupies two PINs here exactly as on a PullSDK panel.
+
 ---
 
 ## 8. Unverified and unknown — do not treat as settled

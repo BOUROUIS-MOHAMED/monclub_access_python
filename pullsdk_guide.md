@@ -211,6 +211,46 @@ are not ANSI-representable are **silently replaced, not rejected**. `[CODE]`
 Buffers are decoded `mbcs` strict → `utf-8` strict → `latin-1` with `errors="replace"`,
 so decoding never raises. `[CODE]`
 
+### 4.6 One person, two PINs — ship it, do not "fix" it
+
+The `PIN`/`UserId` written to a device row is the `activeMembershipId`, falling back to
+`userId` only when the member has no active membership at all —
+`app/core/device_sync.py:1377-1380`. A person is not one PIN; a *membership* is. So a
+member holding two date-valid memberships at one gym occupies **two PINs on the same
+terminal**, each carrying its own copy of that person's fingerprint templates. `[CODE]`
+Measured on the OXYGENE_FIT payload (2026-08-31): **20 of 914 members carry two
+`activeMembershipId`s, both rows legitimately valid** —
+`app/ui/app.py:3507-3519`. `[FIELD]`
+
+This is enforced, not incidental: `sync_users` carries a unique index on
+`(user_id, active_membership_id)`, **not** on `user_id` alone —
+`app/core/db.py:877` (`uq_sync_users_uid_amid`). `[CODE]` Collapsing the two PINs into
+one would mean dropping a roster row, and a roster row missing a positive-integer
+`activeMembershipId` sets `users_valid = False` (`app/core/db.py:4638-4647`) →
+`delete_refused = True` (`app/core/db.py:4825`), which refuses **all** member
+deletions for that sync. `[CODE]` Fail-open on revocations is a worse bug than a
+duplicated template, so this is a known, accepted shape, not a defect to chase.
+
+**What this means for anything keyed by PIN:**
+
+- **The 10-fingerprint cap is intended to be per `(gym, account)`, never per PIN or
+  per device slot — so a person with two memberships can occupy up to 20 device-row
+  slots for the same 10 templates.** `[UNVERIFIED]` — this is the account-level-
+  fingerprints design (`docs/superpowers/specs/2026-09-11-account-level-fingerprints-
+  design.md` §4.5, §3.5), not yet shipped: as of this writing `monclub_backend` main
+  has no `GymFingerprintEnrolment`/`gym_fingerprint_enrolment`, so the cap today is
+  still whatever the pre-existing per-`activeMembershipId` enforcement is. Re-check
+  this bullet once that backend work ships. Either way: do not "fix" a terminal that
+  looks like it is carrying double the expected fingerprint count for one person —
+  check membership count first.
+- `fingerprint_push_status`'s primary key is `(pin, finger_id, device_id)` and
+  `fingerprint_push_reported`'s is `(pin, finger_id)` — `app/core/db.py:1461-1483`.
+  `[CODE]` Because `pin` is part of both keys and two memberships are two different
+  PINs (above), the two rows a two-membership person produces are never merged or
+  deduplicated by this schema — each PIN's outcome is tracked, and would be reported
+  upstream, completely independently of the other's. Two rows per template for such a
+  person is correct, not a duplicate-row bug.
+
 ---
 
 ## 5. `PullSDK` — low-level reference
