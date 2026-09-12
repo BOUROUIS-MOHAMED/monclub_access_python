@@ -135,6 +135,63 @@ def _pin_str(v) -> str:
     return str(v).strip()
 
 
+def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse two roster rows that resolve to the same device pin into one row.
+
+    Only reachable once the pin is derived from the PERSON (``mainAccountId``): while the
+    pin was the membership id, two rows could not collide. One human holding a 3-month gym
+    plan and a 1-month spa plan is now one device row, and a device row carries exactly one
+    validity window, one name and two card slots.
+
+    **Validity: the furthest reach wins.** Both rows have already passed
+    ``allowedMemberships`` and (when enabled) the validity filter, so both are memberships
+    this device accepts and honours right now. Keeping the shorter would lock a paid-up
+    member out on the day their *other* plan lapses. A ``None``/unparseable ``validTo``
+    counts as furthest -- it is how "no end date" is expressed, and treating an unknown as
+    "expires immediately" would revoke people we simply cannot date.
+
+    **Fingerprints: unioned, never taken from the winner.**
+    ``_collect_templates_for_pin`` treats ``user['fingerprints']`` as the whole answer, and
+    the backend attaches each template to the membership it was enrolled under. So keeping
+    only the winner's list silently deletes every finger scanned on the losing plan. De-dupe
+    by fingerprint id where present, else by (fingerId, templateVersion), because the same
+    account-level template legitimately arrives on both rows.
+
+    **Cards: the winner's, with the loser's kept only to fill an empty slot.** A device row
+    has two card slots and no more; this never invents a third.
+    """
+    def _reach(u: Dict[str, Any]):
+        vt = _parse_dt_any(u.get("validTo") or "")
+        return vt or datetime.max.replace(tzinfo=timezone.utc)
+
+    winner, loser = (a, b) if _reach(a) >= _reach(b) else (b, a)
+    merged = dict(winner)
+
+    seen: Set[Any] = set()
+    fingerprints: List[Dict[str, Any]] = []
+    for src in (winner, loser):
+        for fp in (src.get("fingerprints") or []):
+            if not isinstance(fp, dict):
+                continue
+            key = fp.get("id")
+            if key is None:
+                key = (fp.get("fingerId"), fp.get("templateVersion"))
+            if key in seen:
+                continue
+            seen.add(key)
+            fingerprints.append(fp)
+    if fingerprints or winner.get("fingerprints") is not None:
+        merged["fingerprints"] = fingerprints
+
+    # Fill an empty card slot from the loser rather than discarding a card the member
+    # actually carries. Never overwrite a card the winner already has.
+    for slot in ("firstCardId", "secondCardId"):
+        if not _pin_str(merged.get(slot)) and _pin_str(loser.get(slot)):
+            merged[slot] = loser.get(slot)
+
+    return merged
+
+
 def _normalize_device_card(raw) -> str:
     """The card value the ZKTeco device can actually store: digits only (strips
     admin markers like the '99999+' anti-abuse prefix), within the 4-byte CardNo
@@ -1374,19 +1431,35 @@ class DeviceSyncEngine:
             if not isinstance(u, dict):
                 continue
 
-            # Prefer activeMembershipId as Pin; fall back to userId for users that
-            # have no active membership record in the backend (activeMembershipId=null).
-            # userId is always present, always unique — safe as a device Pin.
+            # PIN derivation, in strict preference order:
+            #
+            #   mainAccountId  -> the PERSON. One human, one device row, for good.
+            #   activeMembershipId -> legacy, and what every already-deployed backend sends.
+            #   userId         -> last resort, for a member with no membership record.
+            #
+            # mainAccountId is preferred because active_membership.id CHURNS: delete and
+            # recreate a membership and the pin changes, which on a preserve-policy device
+            # orphans the old row with its fingerprints and card still resident. A
+            # main_account.id never changes. It also matches the data model now that a
+            # fingerprint template belongs to the account rather than to a membership --
+            # keying the device by anything else means pushing one account-level template
+            # under N pins and consuming N device slots for one finger.
+            #
+            # The fallback chain is what makes this safe to deploy before the backend that
+            # emits mainAccountId: an older payload simply has no such key and the client
+            # behaves exactly as it does today.
+            acct_pin = _pin_str(u.get("mainAccountId"))
             am_pin = _pin_str(u.get("activeMembershipId"))
-            pin = am_pin or _pin_str(u.get("userId"))
+            pin = acct_pin or am_pin or _pin_str(u.get("userId"))
             if not pin:
                 continue
             if not pin.isdigit():
                 continue
 
-            # Collision guard: a userId-fallback pin must not overwrite an
-            # activeMembershipId-based entry already placed in the output.
-            if pin in out and not am_pin:
+            # Collision guard: a weaker-derivation pin must not overwrite a stronger one
+            # already placed. (Originally only userId-vs-activeMembershipId; mainAccountId
+            # now sits above both.)
+            if pin in out and not acct_pin and not am_pin:
                 continue
 
             mid = _to_int(u.get("membershipId"), default=None)
@@ -1401,7 +1474,27 @@ class DeviceSyncEngine:
                 if vt and now > vt:
                     continue
 
-            out[pin] = u
+            prior = out.get(pin)
+            if prior is None:
+                out[pin] = u
+                continue
+
+            # Two memberships, one person, one device row.
+            #
+            # Under an account-derived pin this is no longer the impossible case it was
+            # when the pin was the membership id. The device row carries ONE validity
+            # window, so we keep the membership that reaches furthest -- among those this
+            # device accepts and that survived the filters above, which is exactly the set
+            # still standing at this point. Keeping the shorter one would lock a paid-up
+            # member out; `out[pin] = u` (last-wins) would make it depend on payload order,
+            # which is worse than either.
+            #
+            # CRITICAL: the credentials are UNIONED, not taken from the winner.
+            # _collect_templates_for_pin states that "user['fingerprints'] is the whole
+            # answer", so keeping only the winner's entry would silently drop every finger
+            # enrolled under the losing membership -- a member whose finger was scanned on
+            # his spa plan would lose it the moment his longer gym plan won the row.
+            out[pin] = _merge_same_pin_entries(prior, u)
 
         return out
 
