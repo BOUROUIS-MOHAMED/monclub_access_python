@@ -375,6 +375,7 @@ def test_request_running_ultra_sync_delegates_delta_ids():
         revoked_ids=set(),
         device_ids=None,
         reason="sync_now_api",
+        full_reconcile=False,
     )
 
 

@@ -34,6 +34,7 @@ This file is only useful while it is true. If you change any of the following, y
 | `app/sdk/device_driver.py` — protocol enum, aliases, resolution order | §4 Protocol resolution |
 | A `supports_*` / capability class attribute on any driver | §5 Capability flags |
 | Which engine services which `accessDataMode` | §3 The three modes |
+| How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
@@ -261,6 +262,124 @@ an event is attributed to cannot drift apart. `[CODE]`
 **Cutover is a WIPE, not a re-key.** Because of those 110 collisions, re-keying a device in place
 can graft one member's fingerprints onto another member's row. Existing terminals must be cleared
 and re-pushed. `[UNVERIFIED — the wipe path itself has not been exercised on hardware]`
+**And the wipe must be MANUAL** — neither automatic removal path can do it. §3.2c says why.
+
+### 3.2c Neither automatic path can clear an old-scheme PIN (2026-09-12)
+
+> **The pin-scheme cutover is a MANUAL wipe. This is settled, not a preference.**
+
+Two mechanisms could in principle remove a stale pin from a `ZK_STANDALONE` terminal. On the
+installed fleet neither can, for independent reasons. Establish this before promising an
+operator that "mirror mode will clean it up".
+
+**1. MIRROR reconcile — blocked twice over.**
+
+`_maybe_mirror_reconcile` gates policy FIRST: `rosterPushingPolicy != "MIRROR"` returns before
+anything else. Gym 45's two turnstiles (device 8 "Sortie", device 10 "Entrée") are
+`device_protocol=ZK_STANDALONE`, `roster_pushing_policy=PRESERVE`, `access_data_mode=ULTRA`,
+both active. `[FIELD: restored production DB, 2026-09-12 — gym_device joined to
+gym_infrastructure/gym_agent on gym 45]` PRESERVE is the default every gym runs, so **no code
+change in this repo makes MIRROR run there**; it needs the backend to change
+`gym_device.roster_pushing_policy`.
+
+Independently, the trigger gate was unsatisfiable. It read
+`reason in ("user-sync", "daily-forced-sync", "hard-reset")`, but `reason` carries a
+*trigger_source* token — `app.py` passes `trigger_context.trigger_source`, whose vocabulary is
+`API_MANUAL`, `CHANGE_DETECTOR`, `FAST_PATCH_BUNDLE`, `FINGERPRINT_ENROLLED`, `MANUAL`,
+`MANUAL_EVALUATE`, `STARTUP`, `SYNC_NOW_API`, `TIMER`, plus the scheduler's `startup`/`timer`
+and the worker's `revoke-*`. **No producer ever emitted those three literals**: every
+occurrence in the repo's history is a test hand-passing the literal into the gate.
+`[CODE + git archaeology: a -S search over all history for those assignments returns only
+test hunks]`
+
+Two of the three were not even spelled correctly for the field they belonged to: the real
+`trigger_hint` markers are `user-sync` and **`daily-auto-sync`** (never `daily-forced-sync`),
+and a hard reset is `run_type="HARD_RESET"` / `hint["hardReset"]`, not a reason at all.
+
+*Fixed 2026-09-12 by carrying the answer, not re-deriving it.*
+`sync_observability.is_explicit_user_sync` already folds those three cases into one predicate
+and already gates `_should_push` in manual-sync mode. The app layer evaluates it once and a
+`full_reconcile: bool` travels with the request — `_request_running_ultra_sync` →
+`UltraEngine.request_sync_now` → `UltraSyncScheduler.request_sync_now` → pending merge/drain →
+`_sync_all` → `UltraDeviceWorker.request_full_sync` → `_run_standalone_full_sync` → the gate.
+It merges by OR, never assignment, so coalescing a timer tick into a queued operator reconcile
+cannot downgrade it. `[CODE: the named symbols]`
+`[TEST: tests/test_mirror_reconcile_reachability.py]`
+
+Two further skips had to move or the repaired flag would have been dead again — both are
+`[TEST]`-pinned in that file:
+
+- `_sync_all` skips a device whose desired-roster fingerprint is unchanged. A reconcile targets
+  rows the TERMINAL holds and the roster does not, which never moves that hash.
+- `UltraEngine.request_sync_now` routes targeted member syncs whenever `changed_ids` is not
+  `None`. A delta-mode explicit sync would never have requested a full sync.
+
+**One condition remains, by design.** `_request_running_ultra_sync` returns early unless the
+sync actually returned a roster refresh (`refresh["members"]` or `refresh["devices"]`), so a
+"Sync data" click on a gym with no changes dispatches nothing to reconcile. A **hard reset**
+always qualifies: it clears the version tokens, so the next `getSyncData` runs in FULL mode.
+Use hard reset when the point is the reconcile rather than the changes.
+`[CODE: app.py::_request_running_ultra_sync, local_access_api_v2.py::_handle_sync_hard_reset]`
+
+**2. The revoke pass — aborts on its own floor, and that abort is protective.**
+
+`_neutralise_revoked_pins` is trigger-independent: it runs on every successful standalone full
+sync, and it is the only removal path a PRESERVE device has. Its candidate set is `owned` (pins
+with `ownership_confirmed=1` in `device_sync_state`) minus `keep` (the desired roster) minus the
+grace/allowlist. It refuses a bulk strip above
+`ceiling = max(_REVOKE_ABSOLUTE_FLOOR=10, roster_count * _MIRROR_MAX_DELETE_FRACTION=0.25)`.
+
+After a pin-scheme change `owned` holds old membership pins and `keep` holds new account pins,
+so the difference is essentially the whole roster. Gym 45 has **990 ACTIVE memberships across
+988 distinct accounts** `[FIELD: restored production DB, 2026-09-12]`, giving a ceiling near 247
+against ~900+ candidates → `REVOKE_ABORT_FLOOR`, nothing removed, and it never self-resolves
+because nothing shrinks between runs.
+
+**Do not raise the floor to "unblock" a cutover.** Nothing inside that function can tell a
+pin-scheme change from a truncated or half-built roster — they are informationally identical
+there — and the second is the case the floor exists to refuse.
+
+**The abort is accidentally load-bearing.** It returns `safe_to_prune=False`, which skips
+`prune_device_sync_state(keep_pins=desired_pins)`. Post-cutover that prune would delete the
+`device_sync_state` row — and with it the `ownership_confirmed` bit — for every old-scheme pin.
+`owned` would then be empty, the revoke pass could never target those pins again, and they would
+be stranded on the turnstile permanently and invisibly. **Any change that makes `safe_to_prune`
+true without actually removing the pins is worse than the current behaviour.**
+`[CODE: ultra_engine.py::_neutralise_revoked_pins, ::_run_standalone_full_sync]`
+
+The abort fails the sync (`sync_ok=False`, `"authoritative revocation unconfirmed"`) **only when
+that sync also carried explicit authoritative revocations** — `if unconfirmed_revoked_ids and
+not safe_to_prune`, where `unconfirmed_revoked_ids` comes from the request's own `revoked_ids`,
+not from the roster diff. An ordinary post-cutover sync therefore aborts the revoke pass, skips
+the prune, logs `REVOKE_ABORT_FLOOR`, and still reports success. `[CODE]`
+
+**Hard reset does NOT strand ownership evidence.** `clear_all_device_sync_hashes` and
+`clear_device_sync_hashes` set only `desired_hash=NULL, last_ok=0, last_error='forced resync'`;
+`UltraSyncScheduler.force_resync` clears in-memory hashes only. `ownership_confirmed` and
+`pushed_finger_ids` survive both, so a hard reset is safe to reach for and a later pass can
+still reconcile. `[CODE: db.py::clear_all_device_sync_hashes, ::clear_device_sync_hashes;
+ultra_engine.py::UltraSyncScheduler.force_resync]`
+
+**EnableDevice bracketing stays OFF — deliberately reversing plan decision D6.**
+
+D6 said the explicit/nightly reconcile would re-push every pin inside an `EnableDevice(False)`
+bracket. It never once executed, because its condition was the same dead reason-string test.
+Meanwhile the driver changed underneath it: `push_roster` collapses a bracketed roster into ONE
+command (`chunks = [users]`) with `timeout_sec` as the whole budget, bypassing the per-chunk
+timeout and wedge recovery that exist because a single-command ~950-member push meant "the gym
+never got more than the first 10 members". Bracketing also holds the terminal — the gym's sole
+verifier — locked for the entire push. So `bracket` is now an explicit `False`, and an explicit
+reconcile stays incremental and unbracketed. Turning it on is a separate, hardware-gated
+decision, not a side effect of repairing the MIRROR trigger.
+`[CODE: ultra_engine.py::_run_standalone_full_sync; zk_standalone.py::push_roster]`
+`[TEST: test_zk_standalone_driver.py::TestStandaloneFullSyncBranch::
+test_an_explicit_reconcile_does_not_bracket_enable_device]`
+
+**What this means operationally.** "Use mirror mode first, wipe manually only if it has a
+problem" is not available on the installed fleet: on a PRESERVE device mirror mode is a no-op
+regardless of trigger, and the revoke pass refuses a roster-sized strip by design. **The PIN
+cutover must be a manual wipe of each terminal, followed by a re-push.** The wipe path itself is
+still `[UNVERIFIED — HARDWARE-GATED]` (§3.2b).
 
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
@@ -672,10 +791,15 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1321 passed, no
-warnings** (2026-09-09, after the durable ownership correction for immediate
-authoritative revocation; exit code
-0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1544 passed** (with
+warnings; 2026-09-12, after the §3.2c reconcile-trigger repair; exit code 0). `[TEST]`
+
+> A stale `device_sync_state` row in the **developer's installed database** (not a temp
+> one) makes `test_zk_standalone_driver.py::TestStandaloneFullSyncBranch::
+> test_full_sync_pushes_roster_and_terminates` fail: that harness stubs the hash lookup
+> but not `list_confirmed_device_sync_pins`, so the revoke pass sees leftover
+> `ownership_confirmed` pins as departed members and adds neutralise pushes. Any new test
+> that drives a full sync must use the documented `_DB_PATH` temp-database override.
 
 ```bash
 python tools/check_sql_arity.py
@@ -706,6 +830,21 @@ this guide is out of date.
 Match on `\.push_roster(`, not the bare word: `push_roster` also appears in an
 explanatory comment in `local_access_api_v2.py`, and a looser grep makes an intact rule
 look broken.
+
+To confirm §3.2c (the reconcile trigger is a flag, not a reason string):
+
+```bash
+grep -rnE "_MIRROR_RECONCILE_REASONS|bracket = reason" app/ --include=*.py
+```
+
+**Expected: no matches.** Any hit means the gate has been reverted to a reason-string
+test that no producer can satisfy. Match on the *symbol* and the *assignment*, not on the
+literals `user-sync` / `daily-forced-sync`: those still appear in the explanatory comment
+above `_MIRROR_MAX_DELETE_FRACTION`, and a looser grep makes an intact rule look broken.
+
+```bash
+python -m pytest tests/test_mirror_reconcile_reachability.py tests/test_mirror_pushing_policy.py -q
+```
 
 To regenerate the door-open table in §3.1:
 
@@ -763,6 +902,13 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised`) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_OWNERSHIP_MISSING` | `ultra_engine.py` | `member_id pin` |
+| `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |
+| `MIRROR_SKIP_NO_CAPABILITY` | `ultra_engine.py` | `worker` |
+| `MIRROR_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | `worker` (warn) |
+| `MIRROR_SKIP_LIST_FAILED` | `ultra_engine.py` | `worker err` (warn) |
+| `MIRROR_NOOP` | `ultra_engine.py` | `worker device roster` |
+| `MIRROR_ABORT_FLOOR` | `ultra_engine.py` | `worker extras roster max_frac` (warn) |
+| `MIRROR_PLAN` | `ultra_engine.py` | `worker would_delete sample armed` |
 | `REVOKE_DONE` | `ultra_engine.py` | `pins deleted neutralised slots ok` (confirmed outcomes only) |
 | `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
 | `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |

@@ -31,7 +31,8 @@ def test_ultra_sync_scheduler_request_sync_now_wakes_without_waiting_interval(mo
     device = {"id": 5, "_settings": {"ultra_sync_interval_minutes": 999}}
     calls: list[tuple[str, set[int] | None]] = []
 
-    def fake_sync_all(self, *, changed_ids=None, revoked_ids=None, device_ids=None, reason="timer"):
+    def fake_sync_all(self, *, changed_ids=None, revoked_ids=None, device_ids=None,
+                      reason="timer", full_reconcile=False):
         normalized = None if changed_ids is None else set(changed_ids)
         calls.append((reason, normalized))
         if len(calls) >= 2:
@@ -226,6 +227,7 @@ def test_ultra_engine_request_sync_now_falls_back_for_registered_dead_worker():
         revoked_ids={17},
         device_ids={5},
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -260,6 +262,7 @@ def test_ultra_engine_request_sync_now_falls_back_only_for_unmatched_device_ids(
         revoked_ids={17},
         device_ids={6},
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -288,6 +291,7 @@ def test_ultra_engine_request_sync_now_preserves_broadcast_fallback_without_work
         revoked_ids={17},
         device_ids=None,
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -320,6 +324,7 @@ def test_ultra_engine_request_sync_now_preserves_broadcast_for_partial_workers()
         revoked_ids={17},
         device_ids=None,
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -352,6 +357,7 @@ def test_ultra_engine_request_sync_now_falls_back_when_revoke_enqueue_raises():
         revoked_ids={17},
         device_ids={5},
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
     engine._logger.warning.assert_called()
 
@@ -413,6 +419,7 @@ def test_ultra_engine_request_sync_now_passes_changes_and_revocations_to_schedul
         revoked_ids={13, 17},
         device_ids={6},
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -565,6 +572,7 @@ def test_ultra_engine_request_sync_now_uses_scheduler_for_full_refresh_without_l
         revoked_ids=set(),
         device_ids={5},
         reason="device_refresh",
+        full_reconcile=False,
     )
 
 
@@ -585,6 +593,7 @@ def test_ultra_sync_scheduler_accumulates_and_drains_revocations_separately():
         {17},
         {5},
         "fast_patch_bundle",
+        False,
     )
 
 
@@ -611,6 +620,7 @@ def test_ultra_sync_scheduler_revocation_wins_across_coalesced_requests():
         {13, 17},
         {5, 6},
         "second",
+        False,
     )
 
 
@@ -631,6 +641,7 @@ def test_ultra_sync_scheduler_accepts_revoke_only_request():
         {17},
         {5},
         "revoked_only",
+        False,
     )
 
 
@@ -651,6 +662,7 @@ def test_ultra_sync_scheduler_keeps_none_changed_ids_as_full_refresh_signal():
         {17},
         {5},
         "device_refresh",
+        False,
     )
 
 
@@ -757,6 +769,7 @@ def test_ultra_sync_scheduler_no_worker_additive_pull_device_keeps_revocation_pe
         {17},
         {5},
         "fast_patch_bundle",
+        False,
     )
 
 
@@ -789,6 +802,7 @@ def test_ultra_sync_scheduler_no_worker_untracked_pull_pin_keeps_revocation_pend
         {99117},
         {5},
         "fast_patch_bundle",
+        False,
     )
 
 
@@ -812,6 +826,7 @@ def test_ultra_sync_scheduler_failed_full_sync_requeues_authoritative_revocation
         {17},
         {5},
         "fast_patch_bundle",
+        False,
     )
     assert scheduler._drain_pending_sync_request() is None
 
@@ -845,6 +860,7 @@ def test_ultra_sync_scheduler_preserves_standalone_revocation_until_worker_repla
         {17},
         {5},
         "fast_patch_bundle",
+        False,
     )
 
 

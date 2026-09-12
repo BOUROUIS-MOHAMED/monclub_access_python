@@ -572,6 +572,7 @@ class TestAuthoritativeFullSyncRetry:
             {34439},
             {9},
             "fast_patch_bundle",
+            False,
         )
 
         fstate.rows["34439"] = ("old-hash", True, {0})
@@ -646,7 +647,7 @@ class TestAuthoritativeFullSyncRetry:
 
         def finish_and_redeliver(**kwargs):
             scheduler._handle_worker_full_sync_finished(**kwargs)
-            changed_ids, revoked_ids, device_ids, reason = (
+            changed_ids, revoked_ids, device_ids, reason, _full_reconcile = (
                 scheduler._drain_pending_sync_request()
             )
             assert changed_ids is None

@@ -337,6 +337,7 @@ def test_request_running_ultra_sync_gives_revocation_precedence():
         revoked_ids={9},
         device_ids={7},
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -364,6 +365,7 @@ def test_request_running_ultra_sync_does_not_skip_revoke_only_request():
         revoked_ids={9},
         device_ids=None,
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 
@@ -391,6 +393,7 @@ def test_request_running_ultra_sync_rejects_noncanonical_member_ids():
         revoked_ids={44, 45},
         device_ids=None,
         reason="fast_patch_bundle",
+        full_reconcile=False,
     )
 
 

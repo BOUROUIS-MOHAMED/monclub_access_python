@@ -537,11 +537,21 @@ class TestStandaloneFullSyncBranch:
         assert kwargs["ok"] is True
         assert kwargs["fingerprint_hash"] == "abc123"
 
-    def test_manual_user_sync_brackets_enable_device(self, monkeypatch):
+    def test_an_explicit_reconcile_does_not_bracket_enable_device(self, monkeypatch):
+        """Deliberate reversal of plan decision D6, which never once executed.
+
+        The old condition was `reason in ("user-sync", "daily-forced-sync",
+        "hard-reset")`, but `reason` carries a trigger_source token, so no production
+        trigger could satisfy it. Meanwhile push_roster gained chunking: bracketing
+        collapses the roster into ONE command with no per-chunk timeout, undoing the
+        wedge recovery added because a single-command 950-member push left the gym
+        with only the first 10 members -- and it holds EnableDevice(False) across the
+        whole push on the gym's sole verifier. See guide §3.2c."""
         w = _make_sync_worker(monkeypatch)
-        w.request_full_sync(reason="user-sync", fingerprint_hash=None)
+        w.request_full_sync(reason="sync_now_api", fingerprint_hash=None,
+                            full_reconcile=True)
         w._drain_full_sync_commands(limit=1)
-        assert w._sdk.push_calls[0][2] is True       # bracket_enable_device
+        assert w._sdk.push_calls[0][2] is False      # bracket_enable_device
 
     def test_failed_push_still_terminates_and_reports(self, monkeypatch):
         w = _make_sync_worker(monkeypatch, driver=_FakeStandaloneDriver(ok=False))
