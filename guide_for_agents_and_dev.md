@@ -569,7 +569,11 @@ is older than `history_retention_days` (default 30). The reason is written to
 `backend_last_error`. `prune_access_history` is unchanged: its `COALESCE(backend_synced_at,
 created_at)` ages an expired row on `created_at`, so an expired row is deleted **in the same
 pass** — the same lifetime a `SYNCED` row gets. A row that only ever failed on outages is never
-expired or pruned. Both functions compare `julianday('now')` (UTC) with a local-time
+expired or pruned. Expiry runs **only** in `run_blocking`, deliberately: `realtime_agent.py`
+also calls `prune_access_history` every 200 history writes, but that call only deletes what is
+already `SYNCED`/`FAILED_TERMINAL`, and the tick — which reaches expiry on every started tick in
+every mode — is enough to bound the queue. `[CODE: realtime_agent.py, the `_writes % 200` prune]`
+Both functions compare `julianday('now')` (UTC) with a local-time
 `created_at`, so ages read low by the UTC offset; they agree with each other. `[CODE]`
 `[TEST: ::test_expiry_needs_the_verdict_floor_and_the_retention_age_together,
 ::test_a_row_the_backend_keeps_rejecting_is_expired_and_pruned_end_to_end]`
