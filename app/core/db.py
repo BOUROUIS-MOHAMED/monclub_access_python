@@ -1330,6 +1330,11 @@ def init_db() -> None:
         # valid activeMembership for QR/TOTP rows (which have no device pin/card to
         # re-resolve). Without it the backend silently drops those rows.
         _ensure_column(conn, "access_history", "active_membership_id", "active_membership_id INTEGER")
+        # Explicit "unresolved" verdicts from the backend (its failedIds), counted apart from
+        # backend_attempt_count / backend_failure_count: those two also rise on every 5xx,
+        # timeout and network error, so a bound on either would expire real events during an
+        # outage. Only mark_access_history_unresolved() increments this column.
+        _ensure_column(conn, "access_history", "backend_unresolved_count", "backend_unresolved_count INTEGER NOT NULL DEFAULT 0")
         conn.execute("UPDATE access_history SET history_source='AGENT' WHERE history_source IS NULL OR history_source=''")
         conn.execute("UPDATE access_history SET backend_sync_state='PENDING' WHERE backend_sync_state IS NULL OR backend_sync_state=''")
         conn.execute("UPDATE access_history SET backend_attempt_count=0 WHERE backend_attempt_count IS NULL")
@@ -7649,6 +7654,9 @@ class AccessHistoryRow:
     # Membership resolved at verify time (QR/TOTP has no device pin/card to re-resolve
     # on upload). Persisted so the uploader can send a valid activeMembership.
     active_membership_id: Optional[int] = None
+    # Explicit backend "unresolved" verdicts; see mark_access_history_unresolved(). Must stay
+    # a defaulted field: rows are hydrated with AccessHistoryRow(**dict(row)) from SELECT *.
+    backend_unresolved_count: int = 0
 
 
 ACCESS_HISTORY_SOURCE_AGENT = "AGENT"
@@ -8100,6 +8108,116 @@ def mark_access_history_sync_failure(
             WHERE id IN ({placeholders})
             """,
             (state, ts, next_retry, str(error or "")[:2000], *ids),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def mark_access_history_unresolved(
+    *,
+    row_ids: Iterable[int],
+    error: str,
+    base_retry_seconds: int,
+    max_retry_seconds: int,
+    attempted_at: str | None = None,
+) -> int:
+    """Record that the backend NAMED these rows unresolved (its ``failedIds`` verdict).
+
+    Not the same as mark_access_history_sync_failure(terminal=False), which is for failures
+    that say nothing about the row -- 5xx, timeouts, network, a body naming no row. Only this
+    path raises ``backend_unresolved_count``, and only that counter feeds
+    expire_unresolved_access_history(), so an outage can never expire an event.
+
+    The retry delay doubles per verdict from ``base_retry_seconds`` up to
+    ``max_retry_seconds``. Without that, a row the backend keeps rejecting is due again on
+    every sync tick, and because the uploader takes the OLDEST due rows first
+    (list_pending_access_history_for_sync, ORDER BY id), enough of them fill every batch and
+    hold newer events back.
+    """
+    ids = sorted({int(x) for x in row_ids if int(x) > 0})
+    if not ids:
+        return 0
+    ts = str(attempted_at or now_iso())
+    try:
+        base_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        base_dt = datetime.now()
+    base = max(30, int(base_retry_seconds or 300))
+    cap = max(base, int(max_retry_seconds or base))
+    placeholders = ",".join("?" for _ in ids)
+    with get_conn() as conn:
+        current = conn.execute(
+            f"SELECT id, COALESCE(backend_unresolved_count, 0) AS n FROM access_history WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        params: List[tuple[Any, ...]] = []
+        for r in current:
+            verdicts = int(r["n"]) + 1
+            delay = min(cap, base * (2 ** min(verdicts - 1, 30)))
+            # format_ts(), never isoformat(): compared as TEXT against now_iso().
+            retry_at = format_ts(base_dt + timedelta(seconds=delay))
+            params.append(
+                (ACCESS_HISTORY_SYNC_FAILED_RETRYABLE, ts, retry_at, str(error or "")[:2000], verdicts, int(r["id"]))
+            )
+        if not params:
+            return 0
+        conn.executemany(
+            """
+            UPDATE access_history
+            SET backend_sync_state=?,
+                backend_attempt_count=COALESCE(backend_attempt_count, 0) + 1,
+                backend_failure_count=COALESCE(backend_failure_count, 0) + 1,
+                backend_last_attempt_at=?,
+                backend_next_retry_at=?,
+                backend_last_error=?,
+                backend_unresolved_count=?
+            WHERE id=?
+            """,
+            params,
+        )
+        conn.commit()
+        return len(params)
+
+
+def expire_unresolved_access_history(*, retention_days: int, min_unresolved_verdicts: int) -> int:
+    """Stop retrying rows the backend has kept calling unresolved, once past local retention.
+
+    A row is expired only when BOTH hold:
+
+    * it is FAILED_RETRYABLE with at least ``min_unresolved_verdicts`` explicit unresolved
+      verdicts. A row that only ever failed on 5xx / network has a count of 0 and is never
+      touched, so an outage longer than retention loses nothing;
+    * it is older than ``retention_days`` on the same clock prune_access_history() uses
+      (``julianday('now') - julianday(created_at)``).
+
+    Archived, not deleted: the row becomes FAILED_TERMINAL -- never uploaded again -- with
+    the reason in backend_last_error, and prune_access_history() deletes it under its own,
+    unchanged rule. Its backend_synced_at is NULL, so that rule ages it on created_at: a row
+    expired here is by construction already past retention and is deleted in the same
+    maintenance pass. That is the lifetime every SYNCED row already gets.
+    """
+    days = max(1, int(retention_days))
+    floor = max(1, int(min_unresolved_verdicts))
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE access_history
+            SET backend_sync_state=?,
+                backend_next_retry_at=NULL,
+                backend_last_error='retries stopped after ' || COALESCE(backend_unresolved_count, 0)
+                    || ' unresolved verdicts from the backend; event older than the '
+                    || ? || '-day history retention'
+            WHERE backend_sync_state=?
+              AND COALESCE(backend_unresolved_count, 0) >= ?
+              AND julianday('now') - julianday(created_at) > ?
+            """,
+            (
+                ACCESS_HISTORY_SYNC_FAILED_TERMINAL,
+                days,
+                ACCESS_HISTORY_SYNC_FAILED_RETRYABLE,
+                floor,
+                days,
+            ),
         )
         conn.commit()
         return int(cur.rowcount or 0)

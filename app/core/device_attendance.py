@@ -15,8 +15,10 @@ from app.core.db import (
     list_pending_access_history_for_sync,
     list_sync_devices_payload,
     load_device_attendance_state,
+    expire_unresolved_access_history,
     mark_access_history_sync_failure,
     mark_access_history_synced,
+    mark_access_history_unresolved,
     prune_access_history,
     save_device_attendance_state,
 )
@@ -31,6 +33,54 @@ READ_ERROR_RETRY_SECONDS = 300
 UPLOAD_FAILURE_RETRY_SECONDS = 300
 PURGE_WINDOW_START_HOUR = 2
 PURGE_WINDOW_DURATION_HOURS = 3
+
+# ── Rows the backend keeps calling unresolved (its failedIds) ──────────────────────────
+# Retry delay doubles per explicit verdict from UPLOAD_FAILURE_RETRY_SECONDS up to this cap,
+# so once capped such a row costs one upload a day instead of one per sync tick
+# (agentSyncBackendRefreshMin, default 30 min). POLICY, not a measured value.
+UNRESOLVED_RETRY_MAX_SECONDS = 24 * 3600
+# Explicit unresolved verdicts a row must have collected before it can be expired. A guard,
+# not the bound -- the bound is history_retention_days. It ensures a row that first reaches
+# the backend after an outage longer than retention still gets several judged attempts
+# (the first three are >= 300 s and 600 s of backoff apart) before it is given up on. POLICY.
+UNRESOLVED_MIN_VERDICTS_TO_EXPIRE = 3
+
+# Response keys whose tokens are per-row RETRYABLE verdicts. Shared by _parse_upload_response
+# and _named_retry_row_ids so the two can never disagree about what counts as a verdict.
+_RETRY_TOKEN_KEYS = (
+    "failedIds",
+    "failedEventIds",
+    "failedInsertionIds",
+    "failedInsertionEventIds",
+    "retryableFailedIds",
+    "retryableFailedEventIds",
+)
+
+
+def _named_retry_row_ids(
+    response: Any,
+    row_ids_by_event: Dict[str, int],
+    row_ids_by_local: Dict[str, int],
+) -> set[int]:
+    """Local row ids the response NAMES in a retryable list.
+
+    _parse_upload_response also returns rows as retryable when the body named nothing about
+    them -- ``ok`` false with no lists, or rows left over when ``failedCount`` is positive.
+    Those are not verdicts on the row and must not count toward expiry; this is how the
+    caller tells the two apart. Unwraps and maps tokens exactly as the parser does.
+    """
+    payload: Dict[str, Any] = response if isinstance(response, dict) else {"raw": response}
+    data = payload.get("data")
+    if isinstance(data, dict):
+        payload = data
+    named: set[int] = set()
+    for key in _RETRY_TOKEN_KEYS:
+        for token in _coerce_id_values(payload.get(key)):
+            if token in row_ids_by_local:
+                named.add(int(row_ids_by_local[token]))
+            elif token in row_ids_by_event:
+                named.add(int(row_ids_by_event[token]))
+    return named
 
 
 def _safe_str(v: Any, default: str = "") -> str:
@@ -458,6 +508,7 @@ class DeviceAttendanceMaintenanceEngine:
             "rowsPurged": 0,
             "uploaded": 0,
             "uploadFailed": 0,
+            "expired": 0,
             "pruned": 0,
         }
 
@@ -482,11 +533,19 @@ class DeviceAttendanceMaintenanceEngine:
             summary["uploaded"] = int(upload_summary.get("uploaded", 0))
             summary["uploadFailed"] = int(upload_summary.get("failed", 0))
 
-            retention_days = _safe_int(global_settings.get("history_retention_days"), 30)
-            summary["pruned"] = int(prune_access_history(retention_days=max(1, retention_days)))
+            retention_days = max(1, _safe_int(global_settings.get("history_retention_days"), 30))
+            # Expire BEFORE pruning: an expired row is already past retention, so the prune
+            # right below deletes it in this same pass (see expire_unresolved_access_history).
+            summary["expired"] = int(
+                expire_unresolved_access_history(
+                    retention_days=retention_days,
+                    min_unresolved_verdicts=UNRESOLVED_MIN_VERDICTS_TO_EXPIRE,
+                )
+            )
+            summary["pruned"] = int(prune_access_history(retention_days=retention_days))
 
             self.logger.info(
-                "[DeviceAttendance] source=%s devices=%s read_devices=%s rows_read=%s inserted=%s purged_devices=%s purged_rows=%s uploaded=%s upload_failed=%s pruned=%s",
+                "[DeviceAttendance] source=%s devices=%s read_devices=%s rows_read=%s inserted=%s purged_devices=%s purged_rows=%s uploaded=%s upload_failed=%s expired=%s pruned=%s",
                 source,
                 summary["devicesConsidered"],
                 summary["devicesRead"],
@@ -496,6 +555,7 @@ class DeviceAttendanceMaintenanceEngine:
                 summary["rowsPurged"],
                 summary["uploaded"],
                 summary["uploadFailed"],
+                summary["expired"],
                 summary["pruned"],
             )
             return summary
@@ -978,11 +1038,12 @@ class DeviceAttendanceMaintenanceEngine:
             if success_ids:
                 uploaded += mark_access_history_synced(row_ids=success_ids, synced_at=attempted_at)
             if retryable_ids:
-                failed += mark_access_history_sync_failure(
-                    row_ids=retryable_ids,
-                    error="syncAccessHistory response reported retryable failures",
-                    retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
-                    terminal=False, attempted_at=attempted_at,
+                failed += self._mark_retryable(
+                    response=response,
+                    retryable_ids=retryable_ids,
+                    row_ids_by_event=row_ids_by_event,
+                    row_ids_by_local=row_ids_by_local,
+                    attempted_at=attempted_at,
                 )
             if terminal_ids:
                 failed += mark_access_history_sync_failure(
@@ -1106,11 +1167,11 @@ class DeviceAttendanceMaintenanceEngine:
         if success_ids:
             uploaded = mark_access_history_synced(row_ids=success_ids, synced_at=attempted_at)
         if retryable_ids:
-            failed += mark_access_history_sync_failure(
-                row_ids=retryable_ids,
-                error="syncAccessHistory response reported retryable failures",
-                retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
-                terminal=False,
+            failed += self._mark_retryable(
+                response=response,
+                retryable_ids=retryable_ids,
+                row_ids_by_event=row_ids_by_event,
+                row_ids_by_local=row_ids_by_local,
                 attempted_at=attempted_at,
             )
         if terminal_ids:
@@ -1122,6 +1183,43 @@ class DeviceAttendanceMaintenanceEngine:
                 attempted_at=attempted_at,
             )
         return {"uploaded": uploaded, "failed": failed}
+
+    def _mark_retryable(
+        self,
+        *,
+        response: Any,
+        retryable_ids: List[int],
+        row_ids_by_event: Dict[str, int],
+        row_ids_by_local: Dict[str, int],
+        attempted_at: str,
+    ) -> int:
+        """Persist retryable rows, counting a verdict only where the backend named the row.
+
+        A named row is one the backend looked at and could not resolve: it backs off and
+        moves toward expiry (mark_access_history_unresolved). Every other retryable row keeps
+        the plain fixed retry and never counts, because nothing in the body was about it.
+        """
+        named = _named_retry_row_ids(response, row_ids_by_event, row_ids_by_local)
+        unresolved = [rid for rid in retryable_ids if rid in named]
+        unjudged = [rid for rid in retryable_ids if rid not in named]
+        failed = 0
+        if unresolved:
+            failed += mark_access_history_unresolved(
+                row_ids=unresolved,
+                error="syncAccessHistory response reported the row unresolved (failedIds)",
+                base_retry_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                max_retry_seconds=UNRESOLVED_RETRY_MAX_SECONDS,
+                attempted_at=attempted_at,
+            )
+        if unjudged:
+            failed += mark_access_history_sync_failure(
+                row_ids=unjudged,
+                error="syncAccessHistory response reported retryable failures",
+                retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
+                terminal=False,
+                attempted_at=attempted_at,
+            )
+        return failed
 
     def _parse_upload_response(
         self,
@@ -1172,14 +1270,7 @@ class DeviceAttendanceMaintenanceEngine:
             success_tokens.extend(_coerce_id_values(payload.get(key)))
 
         retry_tokens: List[str] = []
-        for key in (
-            "failedIds",
-            "failedEventIds",
-            "failedInsertionIds",
-            "failedInsertionEventIds",
-            "retryableFailedIds",
-            "retryableFailedEventIds",
-        ):
+        for key in _RETRY_TOKEN_KEYS:
             retry_tokens.extend(_coerce_id_values(payload.get(key)))
 
         terminal_tokens: List[str] = []

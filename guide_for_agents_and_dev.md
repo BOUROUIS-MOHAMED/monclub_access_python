@@ -38,6 +38,7 @@ This file is only useful while it is true. If you change any of the following, y
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
+| How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -523,6 +524,71 @@ installed MB2000/standalone firmware and wiring. They remain
 `[UNVERIFIED — HARDWARE-GATED]`; there is deliberately **no `[FIELD]` claim** until that
 site validation is recorded.
 
+### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
+
+**Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
+`_sync_tick` returns early otherwise — and in every mode, the tick's `work()` calls
+`DeviceAttendanceMaintenanceEngine.run_blocking`, which uploads **one** batch — the
+`UPLOAD_BATCH_SIZE` (200) oldest due rows (`list_pending_access_history_for_sync`, `ORDER BY
+id`) — then expires, then prunes. The tick interval is the backend's
+`agentSyncBackendRefreshMin` (default 30 min), else local `sync_interval_sec` (default 60 s),
+with exponential backoff on failed syncs. `[CODE: app.py::reschedule_sync_timer, ::_sync_tick;
+device_attendance.py::run_blocking, ::_sync_pending_history]`
+
+**How each outcome is persisted.** `_parse_upload_response` is unchanged in behaviour; only what
+happens to its retryable list is new.
+
+| Outcome | Row becomes | Counts toward expiry |
+|---|---|---|
+| Named in `successIds` (or no lists, `ok` true, `failedCount` 0 — e.g. an old backend's bare `"DONE"`) | `SYNCED` | — |
+| Named in `failedIds` (any `_RETRY_TOKEN_KEYS` key) | `FAILED_RETRYABLE` via `mark_access_history_unresolved`: `backend_unresolved_count` +1, delay `300 s × 2^(n−1)` capped at `UNRESOLVED_RETRY_MAX_SECONDS` (24 h) | **yes** |
+| Retryable but **not named** (`ok` false with no lists; rows left over when `failedCount` > 0) | `FAILED_RETRYABLE`, fixed 300 s | no |
+| Named in `terminalFailedIds` | `FAILED_TERMINAL` | — |
+| HTTP 400 | per-row isolation, then the rows above apply per row | as above |
+| 5xx, timeout, network | `FAILED_RETRYABLE`, fixed 300 s | **no** |
+
+`[CODE: device_attendance.py::_mark_retryable, ::_named_retry_row_ids;
+db.py::mark_access_history_unresolved]`
+`[TEST: test_access_history_unresolved_bound.py]`
+
+`backend_unresolved_count` is a separate column because `backend_attempt_count` and
+`backend_failure_count` both rise on outages too — a bound on either would expire real events
+during a long backend outage. `[CODE: db.py::init_db, the _ensure_column for it]`
+
+**What the backend puts in each list** (monclub_backend `GymAccessController`
+`bulkSaveGymAccessHistory`, branch `claude/door-event-terminal`). Terminal: the row carries no
+identifier, or **every** person id it carries (`userId`, `mainAccountId`) is a positive id naming
+no row — user and account ids come from forward-only sequences, so a deleted one never returns.
+Retryable: a person who exists but does not resolve on the gym's own-plan roster (lapsed with
+the membership deleted, or on a family-shared plan), a non-positive id (this client's synthetic
+offline-pending ids, `db.py::_synthetic_negative_id`), and every PIN-only row. `[CODE: backend]`
+
+**Expiry.** `expire_unresolved_access_history` moves a row to `FAILED_TERMINAL` only when it is
+`FAILED_RETRYABLE` **and** has ≥ `UNRESOLVED_MIN_VERDICTS_TO_EXPIRE` (3) explicit verdicts **and**
+is older than `history_retention_days` (default 30). The reason is written to
+`backend_last_error`. `prune_access_history` is unchanged: its `COALESCE(backend_synced_at,
+created_at)` ages an expired row on `created_at`, so an expired row is deleted **in the same
+pass** — the same lifetime a `SYNCED` row gets. A row that only ever failed on outages is never
+expired or pruned. Both functions compare `julianday('now')` (UTC) with a local-time
+`created_at`, so ages read low by the UTC offset; they agree with each other. `[CODE]`
+`[TEST: ::test_expiry_needs_the_verdict_floor_and_the_retention_age_together,
+::test_a_row_the_backend_keeps_rejecting_is_expired_and_pruned_end_to_end]`
+
+**Wire compatibility.** `_parse_upload_response`, `_coerce_id_values` and `_safe_int` are
+source-identical (`ast.get_source_segment`) in `access_1.4.30`, `access_1.4.31`,
+`access_1.4.33` and `master` 7e2c2d3, and every one of those `prune_access_history` deletes
+`FAILED_TERMINAL`. Installed clients therefore stop retrying — and later prune — a backend
+terminal verdict with no release. They do **not** get the bound: an installed client still
+retries a backend-retryable row every tick, indefinitely. `[CODE]`
+`[TEST: ::test_deployed_client_routes_every_verdict_class_of_the_new_backend,
+::test_old_done_backend_acks_every_row_and_never_counts_a_verdict]`
+
+`[UNVERIFIED]` The two constants (24 h cap, 3-verdict floor) are policy, not measurements. No
+gym's client database has been observed holding `FAILED_RETRYABLE` rows: the three gym-45
+`access.db` copies measured on 2026-09-12 hold none, and the gym-58 backlog reported in review
+was inferred from backend history (804 rows / 18 users whose memberships were since deleted),
+not read from a client queue.
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver
@@ -821,8 +887,8 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1548 passed** (with
-warnings; 2026-09-12, after the §3.2c reconcile-trigger repair; exit code 0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1571 passed** (with
+warnings; 2026-09-12, after the §3.5 unresolved retry bound; exit code 0). `[TEST]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
