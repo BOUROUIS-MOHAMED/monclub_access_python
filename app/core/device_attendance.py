@@ -298,20 +298,47 @@ def _device_row_to_history(
     }
 
 
-def _user_indexes(users: Iterable[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+def _user_indexes(
+    users: Iterable[Dict[str, Any]],
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+    """(by activeMembershipId, by card, by mainAccountId).
+
+    The account index exists because the device PIN is derived from the PERSON
+    (``main_account.id``) — see ``device_sync._filter_users_for_device``. A device reports a
+    pin; without this index that pin is looked up in the membership index, where it either
+    misses entirely or — for the ids that numerically collide between the two sequences —
+    silently matches a REAL BUT UNRELATED member.
+
+    One person may hold several memberships, so the account index resolves to the row the
+    device's single collapsed row actually represents: the furthest-reaching one, chosen by
+    the SAME ``furthest_reach`` helper the push uses. If these two disagreed, a door event
+    would be attributed to a different membership than the one that opened the door.
+    """
     by_am: Dict[int, Dict[str, Any]] = {}
     by_card: Dict[str, Dict[str, Any]] = {}
+    by_account_rows: Dict[int, List[Dict[str, Any]]] = {}
     for user in users or []:
         if not isinstance(user, dict):
             continue
         am = _safe_int(user.get("activeMembershipId") or user.get("active_membership_id"), 0)
         if am > 0 and am not in by_am:
             by_am[am] = user
+        acct = _safe_int(user.get("mainAccountId") or user.get("main_account_id"), 0)
+        if acct > 0:
+            by_account_rows.setdefault(acct, []).append(user)
         for key in ("firstCardId", "secondCardId", "first_card_id", "second_card_id", "cardNo", "card_no"):
             token = _normalize_card_token(user.get(key))
             if token and token not in by_card:
                 by_card[token] = user
-    return by_am, by_card
+
+    from app.core.device_sync import furthest_reach
+
+    by_account: Dict[int, Dict[str, Any]] = {}
+    for acct, rows in by_account_rows.items():
+        chosen = furthest_reach(rows)
+        if chosen is not None:
+            by_account[acct] = chosen
+    return by_am, by_card, by_account
 
 
 def _resolve_history_user(
@@ -319,10 +346,28 @@ def _resolve_history_user(
     raw: Dict[str, Any],
     users_by_am: Dict[int, Dict[str, Any]],
     users_by_card: Dict[str, Dict[str, Any]],
+    users_by_account: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     lowered = _lower_keys(raw)
     pin_raw = _pick_ci(lowered, "pin", "userid", "userpin", "personid", "enrollnumber")
     pin = _safe_int(pin_raw, 0)
+
+    # ACCOUNT FIRST, and the order is load-bearing.
+    #
+    # The pin is derived from the person (main_account.id) by
+    # device_sync._filter_users_for_device, with activeMembershipId as the legacy fallback.
+    # The two id sequences overlap — on the 2026-09-12 production data, 110 account ids
+    # numerically equal an existing active_membership.id — so trying the membership index
+    # first would, for those members, resolve a pin to a REAL BUT UNRELATED person and
+    # attribute their door event to a stranger. That failure is silent: no error, no gap in
+    # the log, just attendance on the wrong member.
+    #
+    # Trying the account index first mirrors the derivation order used to PUSH the pin, so
+    # a pin always resolves under the scheme it was minted with. The membership lookup stays
+    # for devices still holding pre-cutover rows and for older backends that send no
+    # mainAccountId at all.
+    if pin > 0 and pin in (users_by_account or {}):
+        return users_by_account[pin]
     if pin > 0 and pin in users_by_am:
         return users_by_am[pin]
 
@@ -727,10 +772,11 @@ class DeviceAttendanceMaintenanceEngine:
         users_by_am: Dict[int, Dict[str, Any]],
         users_by_card: Dict[str, Dict[str, Any]],
         devices_by_id: Dict[int, Dict[str, Any]],
+        users_by_account: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         raw = _load_json_object(row.raw_json)
         lowered = _lower_keys(raw)
-        user = _resolve_history_user(row, raw, users_by_am, users_by_card)
+        user = _resolve_history_user(row, raw, users_by_am, users_by_card, users_by_account)
         pin_raw = _pick_ci(lowered, "pin", "userid", "userpin", "personid", "enrollnumber")
         pin = _safe_int(pin_raw, 0)
         if pin <= 0 and user:
@@ -951,13 +997,14 @@ class DeviceAttendanceMaintenanceEngine:
         except Exception:
             users = []
 
-        users_by_am, users_by_card = _user_indexes(users)
+        users_by_am, users_by_card, users_by_account = _user_indexes(users)
         items = [
             self._serialize_row_for_backend(
                 row=row,
                 users_by_am=users_by_am,
                 users_by_card=users_by_card,
                 devices_by_id=devices_by_id,
+                users_by_account=users_by_account,
             )
             for row in rows
         ]

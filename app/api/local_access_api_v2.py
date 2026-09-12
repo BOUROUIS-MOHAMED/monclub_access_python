@@ -5399,7 +5399,11 @@ def _dash_user_indexes() -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str,
 
         cache = load_sync_cache()
         users = list(getattr(cache, "users", []) or []) if cache else []
-        by_am, by_card = _user_indexes(users)
+        # _user_indexes also returns a by-mainAccountId index (the device pin is derived
+        # from the person now). This dashboard-facing cache resolves by membership id and
+        # card only, so the third index is deliberately unused here — but it MUST be
+        # unpacked, or this is a ValueError on every refresh.
+        by_am, by_card, _by_account = _user_indexes(users)
         for dev in list_sync_devices_payload() or []:
             try:
                 devices[int(dev.get("id") or dev.get("deviceId") or 0)] = _safe_str(dev.get("name"), "")

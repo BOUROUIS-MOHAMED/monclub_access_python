@@ -193,6 +193,59 @@ about DEVICE mode. It is true only of *automatic* decisions.
 **So: an MB2000 must be `accessDataMode=ULTRA`.** In `DEVICE` mode it is silent and
 empty, and every surface will still report success.
 
+### 3.2b What a device PIN actually is — and why it changed
+
+> **The PIN is the PERSON (`main_account.id`), not the membership.**
+
+Derivation happens in exactly ONE place, `DeviceSyncEngine._filter_users_for_device`, which
+both the PullSDK path and the standalone path route through. Order:
+
+| preference | source | when |
+|---|---|---|
+| 1 | `mainAccountId` | the person — current scheme |
+| 2 | `activeMembershipId` | legacy; also what a pre-SP2 backend sends |
+| 3 | `userId` | member with no membership record |
+
+`[CODE: app/core/device_sync.py::_filter_users_for_device]`
+`[TEST: tests/test_account_pin_derivation.py]`
+
+**Why.** `active_membership.id` churns — delete and recreate a membership and the pin changes,
+which on a preserve-policy device orphans the old row with its fingerprints and card still
+resident. `main_account.id` never changes. It also matches the data model now that a fingerprint
+template belongs to the account: a membership-keyed pin pushes one template under N pins and
+burns N device slots for one finger.
+
+**The collapse.** One person holding several memberships at one gym is now ONE device row, and a
+row carries one validity window, one name and two card slots. `_merge_same_pin_entries` resolves
+it:
+
+- **validity** — the furthest-reaching membership wins, *among those this device accepts*, since
+  `allowedMemberships` and the validity filter both run BEFORE the collision is possible. An
+  absent `validTo` counts as furthest: that is how "no end date" is expressed, and treating an
+  unknown as expired would revoke members we cannot date. `[CODE]`
+- **fingerprints** — UNIONED, never the winner's alone. `_collect_templates_for_pin` treats
+  `user['fingerprints']` as the whole answer and the backend attaches each template to the
+  membership it was enrolled under, so taking only the winner's list silently deletes every
+  finger scanned on the losing plan. De-duped by template id. `[CODE]`
+  `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner]`
+- **cards** — the winner's, with an empty slot filled from the loser. `[CODE]`
+
+**Inbound is the dangerous direction.** A device reports a pin; `device_attendance._user_indexes`
+builds a by-`mainAccountId` index and `_resolve_history_user` consults it **before** the
+membership index. The order is load-bearing: on the 2026-09-12 production data **110
+`main_account.id` values numerically equal an existing `active_membership.id`**, so a
+membership-first lookup would resolve those pins to a REAL BUT UNRELATED member and attribute one
+person's door event to a stranger — silently, with no error and no gap in the log.
+`[CODE: app/core/device_attendance.py]`
+`[TEST: test_a_colliding_id_does_not_resolve_to_the_wrong_person]`
+
+Both directions share `device_sync.furthest_reach` so the row the device holds and the membership
+an event is attributed to cannot drift apart. `[CODE]`
+
+**Cutover is a WIPE, not a re-key.** Because of those 110 collisions, re-keying a device in place
+can graft one member's fingerprints onto another member's row. Existing terminals must be cleared
+and re-pushed. `[UNVERIFIED — the wipe path itself has not been exercised on hardware]`
+
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
 For PullSDK devices, ULTRA has no push implementation of its own. It copies the device

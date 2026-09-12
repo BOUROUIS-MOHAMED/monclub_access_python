@@ -135,6 +135,43 @@ def _pin_str(v) -> str:
     return str(v).strip()
 
 
+def reach_of(u: Dict[str, Any]):
+    """How far into the future a roster row stays valid — the tie-break when several
+    memberships collapse onto one device pin.
+
+    A missing or unparseable ``validTo`` sorts FURTHEST, because that is how "no end date"
+    is expressed on the wire. Treating an unknown as "expires now" would revoke members we
+    simply cannot date.
+
+    Public and shared on purpose: the device push (``_merge_same_pin_entries``) and the
+    inbound door-event resolver (``device_attendance``) MUST agree on which membership a
+    person's single device row represents. If they drift, a door event is attributed to a
+    different membership than the one that opened the door.
+    """
+    vt = _parse_dt_any(u.get("validTo") or "")
+    return vt or datetime.max.replace(tzinfo=timezone.utc)
+
+
+def furthest_reach(rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    """The row a collapsed device pin represents: the furthest-reaching membership.
+
+    Ties are broken by the larger activeMembershipId so the choice is deterministic rather
+    than dependent on payload order.
+    """
+    best = None
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        if best is None:
+            best = r
+            continue
+        rk = (reach_of(r), _to_int(r.get("activeMembershipId"), default=0) or 0)
+        bk = (reach_of(best), _to_int(best.get("activeMembershipId"), default=0) or 0)
+        if rk > bk:
+            best = r
+    return best
+
+
 def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse two roster rows that resolve to the same device pin into one row.
 
@@ -160,11 +197,7 @@ def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, A
     **Cards: the winner's, with the loser's kept only to fill an empty slot.** A device row
     has two card slots and no more; this never invents a third.
     """
-    def _reach(u: Dict[str, Any]):
-        vt = _parse_dt_any(u.get("validTo") or "")
-        return vt or datetime.max.replace(tzinfo=timezone.utc)
-
-    winner, loser = (a, b) if _reach(a) >= _reach(b) else (b, a)
+    winner, loser = (a, b) if reach_of(a) >= reach_of(b) else (b, a)
     merged = dict(winner)
 
     seen: Set[Any] = set()

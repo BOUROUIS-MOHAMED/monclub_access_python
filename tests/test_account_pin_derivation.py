@@ -167,3 +167,74 @@ def test_an_absent_end_date_counts_as_furthest():
         "no end date means no end; treating an unknown as 'expired' would revoke people "
         "we simply cannot date"
     )
+
+
+# ── inbound: a pin coming BACK from a device ────────────────────────────────────────────
+
+from app.core.device_attendance import _user_indexes, _resolve_history_user
+from types import SimpleNamespace as _NS
+
+
+def _roster_row(**kw):
+    r = {
+        "activeMembershipId": 1,
+        "mainAccountId": 5,
+        "userId": 900,
+        "fullName": "Ali",
+        "validTo": "2026-12-31T00:00:00",
+        "firstCardId": "",
+        "secondCardId": "",
+    }
+    r.update(kw)
+    return r
+
+
+def _hist(pin):
+    return _NS(id=1, device_id=1, card_no="", event_id="e1", event_time="", created_at="",
+               raw_json='{"pin": "%s"}' % pin, door_id=1, allowed=1, reason="", event_type="")
+
+
+def test_an_account_pin_resolves_to_the_right_person():
+    rows = [_roster_row(activeMembershipId=31000, mainAccountId=5)]
+    by_am, by_card, by_account = _user_indexes(rows)
+
+    got = _resolve_history_user(_hist(5), {"pin": "5"}, by_am, by_card, by_account)
+    assert got is not None and got["activeMembershipId"] == 31000
+
+
+def test_a_colliding_id_does_not_resolve_to_the_wrong_person():
+    """THE BUG THIS GUARDS. On the 2026-09-12 production data, 110 main_account ids
+    numerically equal an existing active_membership.id. Ali's account id is 5; a DIFFERENT
+    member, Sonia, holds active_membership 5. A device reports pin 5 for Ali. Looking the pin
+    up in the membership index first would silently attribute Ali's entry to Sonia."""
+    ali = _roster_row(activeMembershipId=31000, mainAccountId=5, fullName="Ali")
+    sonia = _roster_row(activeMembershipId=5, mainAccountId=777, fullName="Sonia", userId=901)
+    by_am, by_card, by_account = _user_indexes([ali, sonia])
+
+    got = _resolve_history_user(_hist(5), {"pin": "5"}, by_am, by_card, by_account)
+
+    assert got is not None
+    assert got["fullName"] == "Ali", (
+        "account index must be consulted BEFORE the membership index, or a colliding id "
+        "attributes one member's door event to a stranger"
+    )
+
+
+def test_a_legacy_membership_pin_still_resolves():
+    """Devices not yet cut over still hold membership-derived pins, and older backends send
+    no mainAccountId at all. Those must keep working."""
+    rows = [_roster_row(activeMembershipId=31000, mainAccountId=None)]
+    by_am, by_card, by_account = _user_indexes(rows)
+
+    got = _resolve_history_user(_hist(31000), {"pin": "31000"}, by_am, by_card, by_account)
+    assert got is not None and got["activeMembershipId"] == 31000
+
+
+def test_the_account_index_picks_the_same_membership_the_push_did():
+    """The device row represents the furthest-reaching membership. The inbound resolver must
+    agree, or a door event is attributed to a different plan than the one that opened it."""
+    spa = _roster_row(activeMembershipId=1, mainAccountId=5, validTo="2026-10-01T00:00:00")
+    gym = _roster_row(activeMembershipId=2, mainAccountId=5, validTo="2026-12-31T00:00:00")
+    _by_am, _by_card, by_account = _user_indexes([spa, gym])
+
+    assert by_account[5]["activeMembershipId"] == 2
