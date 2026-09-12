@@ -500,6 +500,12 @@ def _make_sync_worker(monkeypatch, driver=None, users=None):
     # behaviour these tests were written against) and no writes to a real DB.
     import app.core.db as _db
     monkeypatch.setattr(_db, "list_device_sync_hashes_and_status", lambda **kw: {})
+    # Also the OWNERSHIP read. Without it the revoke pass reads the developer's
+    # installed database, and any leftover ownership_confirmed row there looks like a
+    # departed member -- adding neutralise pushes these assertions do not expect.
+    monkeypatch.setattr(_db, "list_confirmed_device_sync_pins", lambda **kw: set(),
+                        raising=False)
+    monkeypatch.setattr(_db, "list_device_pushed_fingers", lambda **kw: {}, raising=False)
     monkeypatch.setattr(_db, "save_device_sync_state_batch", lambda **kw: 0)
     monkeypatch.setattr(_db, "prune_device_sync_state", lambda **kw: 0)
     monkeypatch.setattr(_db, "delete_device_sync_state", lambda **kw: None)

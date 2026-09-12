@@ -272,7 +272,7 @@ Two mechanisms could in principle remove a stale pin from a `ZK_STANDALONE` term
 installed fleet neither can, for independent reasons. Establish this before promising an
 operator that "mirror mode will clean it up".
 
-**1. MIRROR reconcile — blocked twice over.**
+**1. MIRROR reconcile — blocked three times over, and the third survives the repair.**
 
 `_maybe_mirror_reconcile` gates policy FIRST: `rosterPushingPolicy != "MIRROR"` returns before
 anything else. Gym 45's two turnstiles (device 8 "Sortie", device 10 "Entrée") are
@@ -314,12 +314,33 @@ Two further skips had to move or the repaired flag would have been dead again �
 - `UltraEngine.request_sync_now` routes targeted member syncs whenever `changed_ids` is not
   `None`. A delta-mode explicit sync would never have requested a full sync.
 
+**Cost note.** Because an explicit sync now bypasses the roster-hash skip, every "Sync data"
+click drives a full sync on each ULTRA device. On a PRESERVE device the per-pin diff keeps
+`to_push` empty, so it stays cheap. On a MIRROR device each click additionally enumerates the
+whole terminal (`list_device_users`) over the STA thread. `[CODE]`
+
 **One condition remains, by design.** `_request_running_ultra_sync` returns early unless the
 sync actually returned a roster refresh (`refresh["members"]` or `refresh["devices"]`), so a
 "Sync data" click on a gym with no changes dispatches nothing to reconcile. A **hard reset**
 always qualifies: it clears the version tokens, so the next `getSyncData` runs in FULL mode.
 Use hard reset when the point is the reconcile rather than the changes.
 `[CODE: app.py::_request_running_ultra_sync, local_access_api_v2.py::_handle_sync_hard_reset]`
+
+**Even on a MIRROR device, a cutover-sized diff never reaches the plan.** Gate 8 — the 25 %
+floor, `if len(extras) > roster_count * _MIRROR_MAX_DELETE_FRACTION` — precedes gate 9, which
+is what calls `mirror_reconcile_record_plan`. At cutover every device pin is absent from the
+new roster, so `extras` is essentially the whole roster and the pass returns on
+`MIRROR_ABORT_FLOOR` **before any plan is written**. `/mirror-plan` keeps returning
+`lastPlanCount: null` and the dashboard's arm button stays disabled — the same symptom the
+trigger repair removes for *ordinary* churn. Unlike the revoke pass, MIRROR's floor is purely
+fractional: there is no `_REVOKE_ABSOLUTE_FLOOR` equivalent, so a full re-key is refused at any
+roster size. `[CODE: ultra_engine.py::_maybe_mirror_reconcile, gate order]`
+`[TEST: test_mirror_reconcile_reachability.py::
+test_a_cutover_sized_diff_aborts_mirror_before_any_plan_is_recorded]`
+
+> So **flipping `roster_pushing_policy` to MIRROR does not buy a cutover.** The repaired
+> trigger restores the dry-run → `/mirror-plan` → arm chain for everyday departures, which is
+> what it is for. It does not, and cannot, re-key a terminal.
 
 **2. The revoke pass — aborts on its own floor, and that abort is protective.**
 
@@ -330,10 +351,17 @@ grace/allowlist. It refuses a bulk strip above
 `ceiling = max(_REVOKE_ABSOLUTE_FLOOR=10, roster_count * _MIRROR_MAX_DELETE_FRACTION=0.25)`.
 
 After a pin-scheme change `owned` holds old membership pins and `keep` holds new account pins,
-so the difference is essentially the whole roster. Gym 45 has **990 ACTIVE memberships across
-988 distinct accounts** `[FIELD: restored production DB, 2026-09-12]`, giving a ceiling near 247
-against ~900+ candidates → `REVOKE_ABORT_FLOOR`, nothing removed, and it never self-resolves
+so the difference is essentially the whole roster. Gym 45 has **1080 ACTIVE memberships across
+1061 distinct accounts**, counted across all five of its `gym_agent` rows (8, 49, 50, 51, 52 —
+counting only agent 8 gives 990/988 and is a lower bound).
+`[FIELD: restored production DB, 2026-09-12]` The ceiling is therefore of order 250 against a
+candidate set of order 1000 → `REVOKE_ABORT_FLOOR`, nothing removed, and it never self-resolves
 because nothing shrinks between runs.
+
+Treat that ceiling as an **estimate, not a measurement**: `roster_count` is the *device* roster
+after `shouldExposeMembership`, the validity window and `allowedMemberships`, not the
+ACTIVE-membership count. The order of magnitude is the point — the candidate set is the whole
+roster and the ceiling is a quarter of it.
 
 **Do not raise the floor to "unblock" a cutover.** Nothing inside that function can tell a
 pin-scheme change from a truncated or half-built roster — they are informationally identical
@@ -376,8 +404,10 @@ decision, not a side effect of repairing the MIRROR trigger.
 test_an_explicit_reconcile_does_not_bracket_enable_device]`
 
 **What this means operationally.** "Use mirror mode first, wipe manually only if it has a
-problem" is not available on the installed fleet: on a PRESERVE device mirror mode is a no-op
-regardless of trigger, and the revoke pass refuses a roster-sized strip by design. **The PIN
+problem" is not available on the installed fleet, and no setting change makes it available: on
+a PRESERVE device mirror mode is a no-op regardless of trigger; on a MIRROR device a
+cutover-sized diff aborts on the 25 % floor before it records a plan, so the arm button never
+becomes clickable; and the revoke pass refuses a roster-sized strip by design. **The PIN
 cutover must be a manual wipe of each terminal, followed by a re-push.** The wipe path itself is
 still `[UNVERIFIED — HARDWARE-GATED]` (§3.2b).
 
@@ -791,15 +821,17 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1544 passed** (with
+background-thread exceptions are promoted to failures. Last run: **1548 passed** (with
 warnings; 2026-09-12, after the §3.2c reconcile-trigger repair; exit code 0). `[TEST]`
 
-> A stale `device_sync_state` row in the **developer's installed database** (not a temp
-> one) makes `test_zk_standalone_driver.py::TestStandaloneFullSyncBranch::
-> test_full_sync_pushes_roster_and_terminates` fail: that harness stubs the hash lookup
-> but not `list_confirmed_device_sync_pins`, so the revoke pass sees leftover
-> `ownership_confirmed` pins as departed members and adds neutralise pushes. Any new test
-> that drives a full sync must use the documented `_DB_PATH` temp-database override.
+> **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
+> override.** Without it the run writes per-pin state into the developer's *installed*
+> database, and a leftover `ownership_confirmed` row there then looks like a departed
+> member to the next suite's revoke pass — which adds neutralise pushes and fails
+> assertions far away from the cause. `_make_sync_worker` in
+> `test_zk_standalone_driver.py` now also stubs `list_confirmed_device_sync_pins`, so a
+> polluted database can no longer reach it; `get_conn()` does **not** commit ad-hoc
+> writes, so clean up through `_run_db_write_sync` if you ever need to.
 
 ```bash
 python tools/check_sql_arity.py

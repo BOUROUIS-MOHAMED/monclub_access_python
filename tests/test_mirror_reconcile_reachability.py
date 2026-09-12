@@ -579,3 +579,86 @@ def test_an_explicit_reconcile_with_delta_changed_ids_still_routes_a_full_sync()
 
     assert worker.request_full_sync.called, "an explicit reconcile needs a FULL sync"
     assert worker.request_full_sync.call_args.kwargs["full_reconcile"] is True
+
+
+# --------------------------------------------------------------------------- #
+# The third MIRROR blocker — survives this fix, and settles the cutover question
+# --------------------------------------------------------------------------- #
+
+def test_a_cutover_sized_diff_aborts_mirror_before_any_plan_is_recorded(monkeypatch):
+    """Gate 8 (the 25 % floor) precedes gate 9 (record the dry-run plan).
+
+    So even on a hypothetically-MIRROR gym 45, a pin-scheme cutover -- where EVERY
+    device pin is absent from the new roster -- aborts on MIRROR_ABORT_FLOOR and writes
+    no plan. `/mirror-plan` keeps returning lastPlanCount: null and the dashboard's arm
+    button stays disabled, which is the very symptom the trigger repair fixes for
+    ORDINARY churn. Mirror's floor is purely fractional -- no absolute allowance like
+    _REVOKE_ABSOLUTE_FLOOR -- so a full re-key is refused at any roster size.
+
+    This is why "manual wipe" is settled rather than "settled unless you flip the
+    policy". See guide §3.2c.
+    """
+    planned: List[Dict[str, Any]] = []
+    monkeypatch.setattr("app.core.db.mirror_reconcile_is_armed", lambda **kw: False)
+    monkeypatch.setattr("app.core.db.mirror_reconcile_record_plan",
+                        lambda **kw: planned.append(kw))
+    monkeypatch.setattr("app.core.db.delete_device_mirror_pin", lambda **kw: None)
+
+    old_scheme_pins = [str(p) for p in range(20000, 20900)]      # what the terminal holds
+    new_scheme_pins = [str(p) for p in range(30000, 30900)]      # what the roster now says
+    w = _gate_worker(device_pins=old_scheme_pins)
+
+    w._maybe_mirror_reconcile(full_reconcile=True,
+                              roster_users=[{"pin": p} for p in new_scheme_pins])
+
+    assert planned == [], "the floor must abort BEFORE a plan is recorded"
+    assert w._sdk.deleted is None
+    assert w._sdk.list_calls == 1, "it did enumerate -- it aborted on the diff, not earlier"
+
+
+def test_ordinary_churn_still_records_a_plan_on_a_mirror_device(monkeypatch):
+    """The contrast: a handful of departed members is under the floor and DOES plan."""
+    planned: List[Dict[str, Any]] = []
+    monkeypatch.setattr("app.core.db.mirror_reconcile_is_armed", lambda **kw: False)
+    monkeypatch.setattr("app.core.db.mirror_reconcile_record_plan",
+                        lambda **kw: planned.append(kw))
+    monkeypatch.setattr("app.core.db.delete_device_mirror_pin", lambda **kw: None)
+
+    roster = [str(p) for p in range(30000, 30100)]
+    w = _gate_worker(device_pins=roster + ["20001", "20002"])
+
+    w._maybe_mirror_reconcile(full_reconcile=True,
+                              roster_users=[{"pin": p} for p in roster])
+
+    assert len(planned) == 1 and planned[0]["count"] == 2
+    assert w._sdk.deleted is None, "still a dry run until armed"
+
+
+# --------------------------------------------------------------------------- #
+# The revoke-only short-circuit must not swallow an explicit reconcile
+# --------------------------------------------------------------------------- #
+
+def test_a_reconcile_riding_an_already_owned_revocation_is_still_queued(monkeypatch):
+    """request_full_sync returns early for a revoke-only request whose ids are already
+    owned by a targeted command. That is right for the revocation -- someone else will
+    deliver it -- but the RECONCILE half has no other carrier, so it must still queue."""
+    w = _standalone_worker(monkeypatch, users=_users(4))
+    w._active_member_revoke_ids = {7}          # already owned by a live targeted revoke
+
+    assert w.request_full_sync(reason="sync_now_api", revoked_ids={7},
+                               full_reconcile=True) is True
+
+    assert w._pending_full_sync_request is not None, "the reconcile must not be dropped"
+    assert w._pending_full_sync_request["full_reconcile"] is True
+    # the revocation stays owned by the targeted command, not re-queued here
+    assert w._pending_full_sync_request["revoked_ids"] == set()
+    assert 7 in w._pending_full_sync_request["excluded_ids"]
+
+
+def test_a_revoke_only_request_without_a_reconcile_still_short_circuits(monkeypatch):
+    """The guard must be narrow: no reconcile asked for, no new full sync invented."""
+    w = _standalone_worker(monkeypatch, users=_users(4))
+    w._active_member_revoke_ids = {7}
+
+    assert w.request_full_sync(reason="fast_patch_bundle", revoked_ids={7}) is True
+    assert w._pending_full_sync_request is None
