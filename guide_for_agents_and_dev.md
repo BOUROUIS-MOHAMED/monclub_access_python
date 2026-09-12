@@ -354,6 +354,14 @@ Two further skips had to move or the repaired flag would have been dead again â€
   rows the TERMINAL holds and the roster does not, which never moves that hash.
 - `UltraEngine.request_sync_now` routes targeted member syncs whenever `changed_ids` is not
   `None`. A delta-mode explicit sync would never have requested a full sync.
+- `UltraSyncScheduler._sync_all` had the same branch on the **scheduler-fallback** route (a
+  dead or refusing worker hands the request to the scheduler, which drains it into
+  `_sync_all`): it tested only `normalized_changed_ids is not None`, so the reconcile was lost
+  there even after the engine route was fixed, and with no usable worker `_sync_device` was
+  handed the delta's `changed_ids`. Both now honour `full_reconcile`.
+  `[TEST: test_mirror_reconcile_reachability.py::test_the_scheduler_fallback_honours_full_reconcile_with_delta_changed_ids,
+  ::test_the_whole_fallback_chain_delivers_the_reconcile,
+  ::test_a_reconcile_without_a_usable_worker_is_not_narrowed_to_changed_ids]`
 
 **Cost note.** Because an explicit sync now bypasses the roster-hash skip, every "Sync data"
 click drives a full sync on each ULTRA device. On a PRESERVE device the per-pin diff keeps

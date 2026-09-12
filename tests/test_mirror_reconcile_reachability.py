@@ -581,6 +581,116 @@ def test_an_explicit_reconcile_with_delta_changed_ids_still_routes_a_full_sync()
     assert worker.request_full_sync.call_args.kwargs["full_reconcile"] is True
 
 
+def _fallback_scheduler(monkeypatch, worker):
+    scheduler = ue.UltraSyncScheduler(cfg=SimpleNamespace(), logger_inst=MagicMock())
+    scheduler.set_workers({5: worker})
+    scheduler._devices = [{"id": 5, "name": "Door 1", "accessDataMode": "ULTRA",
+                           "_settings": {}}]
+    scheduler._last_hash = {5: "unchanged-hash"}
+
+    class _FakeDeviceSyncEngine:
+        def __init__(self, cfg, logger):
+            pass
+
+        def build_device_sync_fingerprint(self, *, device, users, local_fp_index=None,
+                                          detail_out=None):
+            return ("unchanged-hash", 1)
+
+    monkeypatch.setattr(ue, "load_sync_cache",
+                        lambda: SimpleNamespace(users=[{"activeMembershipId": 11}], devices=[]))
+    monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _FakeDeviceSyncEngine)
+    monkeypatch.setattr(scheduler, "_sync_device", MagicMock(return_value=True))
+    return scheduler
+
+
+def test_the_scheduler_fallback_honours_full_reconcile_with_delta_changed_ids(monkeypatch):
+    """The SCHEDULER-FALLBACK twin of the test above.
+
+    UltraEngine.request_sync_now hands a request to the scheduler whenever a worker is
+    dead or refuses it. The scheduler drains it into `_sync_all`, which branched ONLY on
+    `if normalized_changed_ids is not None:` -- so a delta-mode "Sync data" click that
+    took this route became targeted member syncs and never reached the reconcile, even
+    though the engine route had already been fixed.
+    """
+    worker = SimpleNamespace(
+        request_member_sync=MagicMock(return_value=True),
+        has_pending_member_sync=MagicMock(return_value=False),
+        request_member_revoke=MagicMock(return_value=True),
+        request_full_sync=MagicMock(return_value=True),
+    )
+    scheduler = _fallback_scheduler(monkeypatch, worker)
+
+    scheduler._sync_all(changed_ids={11}, device_ids={5}, reason="sync_now_api",
+                        full_reconcile=True)
+
+    assert worker.request_full_sync.called, "an explicit reconcile needs a FULL sync"
+    assert worker.request_full_sync.call_args.kwargs["full_reconcile"] is True
+    worker.request_member_sync.assert_not_called()
+
+
+def test_the_whole_fallback_chain_delivers_the_reconcile(monkeypatch):
+    """Dead worker at request time -> scheduler merge -> drain -> `_sync_all` -> the
+    (now live) worker gets a FULL, reconcile-marked sync."""
+    live = SimpleNamespace(
+        request_member_sync=MagicMock(return_value=True),
+        has_pending_member_sync=MagicMock(return_value=False),
+        request_member_revoke=MagicMock(return_value=True),
+        request_full_sync=MagicMock(return_value=True),
+    )
+    scheduler = _fallback_scheduler(monkeypatch, live)
+    monkeypatch.setattr(scheduler, "_wake_sync", SimpleNamespace(set=lambda: None), raising=False)
+
+    engine = ue.UltraEngine.__new__(ue.UltraEngine)
+    engine._running = True
+    engine._logger = MagicMock()
+    engine._workers = {}                       # no usable worker -> scheduler fallback
+    engine._sync_scheduler = scheduler
+
+    assert engine.request_sync_now(changed_ids={11}, device_ids={5},
+                                   reason="sync_now_api", full_reconcile=True)
+    pending = scheduler._drain_pending_sync_request()
+    assert pending is not None
+    changed_ids, revoked_ids, device_ids, reason, full_reconcile = pending
+    assert changed_ids == {11} and full_reconcile is True
+
+    scheduler._sync_all(changed_ids=changed_ids, revoked_ids=revoked_ids,
+                        device_ids=device_ids, reason=reason, full_reconcile=full_reconcile)
+
+    assert live.request_full_sync.called
+    assert live.request_full_sync.call_args.kwargs["full_reconcile"] is True
+    live.request_member_sync.assert_not_called()
+
+
+def test_the_scheduler_fallback_still_targets_an_ordinary_delta(monkeypatch):
+    """Unchanged for everything that is not an explicit reconcile."""
+    worker = SimpleNamespace(
+        request_member_sync=MagicMock(return_value=True),
+        has_pending_member_sync=MagicMock(return_value=False),
+        request_member_revoke=MagicMock(return_value=True),
+        request_full_sync=MagicMock(return_value=True),
+    )
+    scheduler = _fallback_scheduler(monkeypatch, worker)
+
+    scheduler._sync_all(changed_ids={11}, device_ids={5}, reason="change_detector",
+                        full_reconcile=False)
+
+    worker.request_member_sync.assert_called_once_with(11)
+    worker.request_full_sync.assert_not_called()
+
+
+def test_a_reconcile_without_a_usable_worker_is_not_narrowed_to_changed_ids(monkeypatch):
+    """With no live worker `_sync_all` pushes through `_sync_device`; a reconcile must not
+    hand it the delta's changed_ids, which would limit the push to those members."""
+    scheduler = _fallback_scheduler(monkeypatch, worker=SimpleNamespace())
+    scheduler.set_workers({})
+
+    scheduler._sync_all(changed_ids={11}, device_ids={5}, reason="sync_now_api",
+                        full_reconcile=True)
+
+    scheduler._sync_device.assert_called_once()
+    assert scheduler._sync_device.call_args.kwargs["changed_ids"] is None
+
+
 # --------------------------------------------------------------------------- #
 # The third MIRROR blocker — survives this fix, and settles the cutover question
 # --------------------------------------------------------------------------- #

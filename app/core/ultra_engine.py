@@ -5611,7 +5611,14 @@ class UltraSyncScheduler:
                 if worker is not None and _worker_is_usable(worker):
                     try:
                         commands_handled = True
-                        if normalized_changed_ids is not None:
+                        # A delta names only the members that changed; an explicit
+                        # reconcile is about the rows the TERMINAL holds and the roster
+                        # no longer names, which targeted member syncs never see. So a
+                        # reconcile always takes the full route -- exactly like
+                        # UltraEngine.request_sync_now. Without the second condition a
+                        # request that reached this scheduler as the FALLBACK (dead or
+                        # refusing worker) lost its reconcile. guide §3.2c.
+                        if normalized_changed_ids is not None and not full_reconcile:
                             for member_id in sorted(normalized_revoked_ids):
                                 commands_handled = (
                                     _worker_member_revoke_accepted_or_covered(
@@ -5719,7 +5726,8 @@ class UltraSyncScheduler:
                         )
                     else:
                         sync_kwargs: Dict[str, Any] = {
-                            "changed_ids": normalized_changed_ids,
+                            # A reconcile is never narrowed to the delta's members.
+                            "changed_ids": None if full_reconcile else normalized_changed_ids,
                         }
                         did_sync = self._sync_device(d, **sync_kwargs)
                 interval = int(
