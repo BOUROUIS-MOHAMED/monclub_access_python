@@ -12,6 +12,7 @@ from app.core.db import (
     ACCESS_HISTORY_SOURCE_DEVICE,
     AccessHistoryRow,
     insert_access_history_batch,
+    list_device_pin_scheme_switches,
     list_pending_access_history_for_sync,
     list_sync_devices_payload,
     load_device_attendance_state,
@@ -21,6 +22,7 @@ from app.core.db import (
     save_device_attendance_state,
 )
 from app.core.settings_reader import get_backend_global_settings, normalize_device_settings
+from app.core.pin_scheme import PIN_SCHEME_ACCOUNT, PIN_SCHEME_MEMBERSHIP, scheme_at
 from app.core.utils import now_iso
 from app.sdk.pullsdk import PullSDKDevice
 from app.sdk.device_driver import get_driver
@@ -347,25 +349,33 @@ def _resolve_history_user(
     users_by_am: Dict[int, Dict[str, Any]],
     users_by_card: Dict[str, Dict[str, Any]],
     users_by_account: Optional[Dict[int, Dict[str, Any]]] = None,
+    pin_scheme: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """The member a door-history row names: by its pin, else by its card.
+
+    ``pin_scheme`` is the scheme the row's DEVICE ran when the event happened
+    (``HistoryPinResolver.scheme_for``). When it is known the pin is read under exactly that
+    scheme -- never the other index, because the two id sequences collide (110 values on the
+    2026-09-12 data, 99 of them different people). ``None`` means it cannot be known (a
+    legacy caller, or a switched device with an unparseable event time): then the
+    unambiguous reading is used and a pin that is both prefers the MEMBERSHIP reading.
+    """
     lowered = _lower_keys(raw)
     pin_raw = _pick_ci(lowered, "pin", "userid", "userpin", "personid", "enrollnumber")
     pin = _safe_int(pin_raw, 0)
 
-    # ACCOUNT FIRST, and the order is load-bearing.
-    #
-    # The pin is derived from the person (main_account.id) by
-    # device_sync._filter_users_for_device, with activeMembershipId as the legacy fallback.
-    # The two id sequences overlap — on the 2026-09-12 production data, 110 account ids
-    # numerically equal an existing active_membership.id — so trying the membership index
-    # first would, for those members, resolve a pin to a REAL BUT UNRELATED person and
-    # attribute their door event to a stranger. That failure is silent: no error, no gap in
-    # the log, just attendance on the wrong member.
-    #
-    # Trying the account index first mirrors the derivation order used to PUSH the pin, so
-    # a pin always resolves under the scheme it was minted with. The membership lookup stays
-    # for devices still holding pre-cutover rows and for older backends that send no
-    # mainAccountId at all.
+    if pin_scheme in (PIN_SCHEME_ACCOUNT, PIN_SCHEME_MEMBERSHIP):
+        index = (users_by_account or {}) if pin_scheme == PIN_SCHEME_ACCOUNT else users_by_am
+        if pin > 0 and pin in index:
+            return index[pin]
+        card = _normalize_card_token(row.card_no or _pick_ci(lowered, "cardno", "card", "cardid"))
+        if card and card in users_by_card:
+            return users_by_card[card]
+        return None
+
+    # SCHEME UNKNOWN. Use whichever reading is unambiguous. c13d1c2 consulted the account
+    # index unconditionally first, which INVERTED correctness on a device still holding
+    # membership pins; the ambiguous case below prefers the membership reading.
     acct_hit = users_by_account.get(pin) if (pin > 0 and users_by_account) else None
     am_hit = users_by_am.get(pin) if pin > 0 else None
 
@@ -386,15 +396,13 @@ def _resolve_history_user(
         # device still holding old membership pins would have had those 110 resolved to the
         # account owner — a bug that did not exist before the account index was introduced.
         #
-        # This is the safe default, not a complete answer: once a device HAS been cut over,
-        # the same ambiguity points the other way. Making it exact needs the pin scheme
-        # recorded per (device, pin) at push time; until then the cutover must be
-        # wipe-and-repush so that no device ever holds both schemes at once.
+        # Reached only when the scheme cannot be known: HistoryPinResolver reads every pin
+        # under its device's recorded scheme (guide §3.2b), so this is a legacy caller or a
+        # switched device whose event time did not parse.
         logging.getLogger("zkapp").warning(
             "[DeviceAttendance] ambiguous pin %s on device %s — it is both an account id and "
-            "a membership id for different people; resolving as MEMBERSHIP (pre-cutover "
-            "default). If this device has been cut over to account pins, this attribution is "
-            "wrong and the device must be re-wiped.",
+            "a membership id for different people, and the device's pin scheme at this "
+            "event's time cannot be determined; resolving as MEMBERSHIP.",
             pin, getattr(row, "device_id", None),
         )
         return am_hit
@@ -403,6 +411,81 @@ def _resolve_history_user(
     if card and card in users_by_card:
         return users_by_card[card]
     return None
+
+
+class HistoryPinResolver:
+    """Resolve door-history rows under the pin scheme each row's DEVICE ran at the event's time.
+
+    * scheme: the device's ``device_pin_scheme_switch`` history (``db.list_device_pin_scheme_switches``)
+      read by ``pin_scheme.scheme_at`` at the row's ``event_time`` (the DEVICE's clock). No
+      recorded switch -> MEMBERSHIP, known. A switched device and an unparseable time -> None.
+    * ACCOUNT pins resolve through the collapsed row ``_filter_users_for_device`` builds for
+      THAT device -- its allowedMemberships / validity policy and ``pin_row_rank`` -- so an
+      event names the membership the device row represents. A device no longer in the cache
+      falls back to the unfiltered by-account index, ranked the same way.
+    * MEMBERSHIP pins resolve through the membership index only.
+
+    Built once per upload batch / dashboard cache; the per-device ACCOUNT index is memoised.
+    """
+
+    def __init__(
+        self,
+        *,
+        users: Iterable[Dict[str, Any]],
+        devices_by_id: Dict[int, Dict[str, Any]] | None,
+        switches_by_device: Dict[int, List[Dict[str, Any]]] | None,
+    ) -> None:
+        self.users = [u for u in (users or []) if isinstance(u, dict)]
+        self.users_by_am, self.users_by_card, self.users_by_account = _user_indexes(self.users)
+        self._devices_by_id = {int(k): v for k, v in (devices_by_id or {}).items()}
+        self._switches: Dict[int, List[Tuple[str, Optional[datetime]]]] = {}
+        for device_id, entries in (switches_by_device or {}).items():
+            self._switches[int(device_id)] = [
+                (str((e or {}).get("scheme") or ""), _dt_from_any((e or {}).get("switched_at")))
+                for e in (entries or [])
+            ]
+        self._account_index: Dict[int, Dict[int, Dict[str, Any]]] = {}
+
+    def scheme_for(self, row: Any) -> Optional[str]:
+        device_id = _safe_int(getattr(row, "device_id", None), 0)
+        switches = self._switches.get(device_id) or []
+        if not switches:
+            return PIN_SCHEME_MEMBERSHIP
+        return scheme_at(switches, _dt_from_any(getattr(row, "event_time", None)))
+
+    def account_index_for(self, device_id: Any) -> Dict[int, Dict[str, Any]]:
+        did = _safe_int(device_id, 0)
+        cached = self._account_index.get(did)
+        if cached is not None:
+            return cached
+        device = self._devices_by_id.get(did)
+        if not isinstance(device, dict):
+            index = dict(self.users_by_account)
+        else:
+            from types import SimpleNamespace
+
+            from app.core.device_sync import DeviceSyncEngine
+
+            scoped = dict(device)
+            # The event was minted under ACCOUNT even if the device has since switched back.
+            scoped["pinScheme"] = PIN_SCHEME_ACCOUNT
+            by_pin = DeviceSyncEngine(
+                cfg=SimpleNamespace(), logger=logging.getLogger("zkapp"),
+            )._filter_users_for_device(users=self.users, device=scoped, default_door_id=1)
+            index = {int(p): u for p, u in by_pin.items() if str(p).isdigit()}
+        self._account_index[did] = index
+        return index
+
+    def resolve(self, row: Any, raw: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        scheme = self.scheme_for(row)
+        by_account = (
+            self.account_index_for(getattr(row, "device_id", None))
+            if scheme == PIN_SCHEME_ACCOUNT else self.users_by_account
+        )
+        user = _resolve_history_user(
+            row, raw, self.users_by_am, self.users_by_card, by_account, pin_scheme=scheme,
+        )
+        return user, scheme
 
 
 def _coerce_id_values(values: Any) -> List[str]:
@@ -801,10 +884,16 @@ class DeviceAttendanceMaintenanceEngine:
         users_by_card: Dict[str, Dict[str, Any]],
         devices_by_id: Dict[int, Dict[str, Any]],
         users_by_account: Optional[Dict[int, Dict[str, Any]]] = None,
+        resolver: Optional[HistoryPinResolver] = None,
     ) -> Dict[str, Any]:
         raw = _load_json_object(row.raw_json)
         lowered = _lower_keys(raw)
-        user = _resolve_history_user(row, raw, users_by_am, users_by_card, users_by_account)
+        scheme_known = resolver is not None
+        pin_scheme: Optional[str] = None
+        if resolver is not None:
+            user, pin_scheme = resolver.resolve(row, raw)
+        else:
+            user = _resolve_history_user(row, raw, users_by_am, users_by_card, users_by_account)
         pin_raw = _pick_ci(lowered, "pin", "userid", "userpin", "personid", "enrollnumber")
         pin = _safe_int(pin_raw, 0)
         if pin <= 0 and user:
@@ -814,7 +903,14 @@ class DeviceAttendanceMaintenanceEngine:
         item: Dict[str, Any] = {
             "localRowId": int(row.id),
             "eventId": _safe_str(row.event_id, ""),
-            "activeMembership": int(pin) if pin > 0 else None,
+            # The raw pin is a membership id ONLY under MEMBERSHIP (or for a legacy caller that
+            # knows no scheme -- the pre-existing behaviour). Under ACCOUNT it is a person id,
+            # and when the scheme is unknowable it could be either; posted as activeMembership
+            # it would be filed against whoever holds that membership id. guide §3.2b.
+            "activeMembership": (
+                int(pin) if (pin > 0 and (not scheme_known or pin_scheme == PIN_SCHEME_MEMBERSHIP))
+                else None
+            ),
             "deviceId": int(row.device_id) if row.device_id is not None else None,
             "deviceName": _safe_str(device.get("name"), ""),
             "doorId": int(row.door_id) if row.door_id is not None else None,
@@ -829,6 +925,12 @@ class DeviceAttendanceMaintenanceEngine:
             "reason": _safe_str(row.reason, ""),
             "historySource": _safe_str(row.history_source, ""),
         }
+
+        if not user and scheme_known and pin_scheme == PIN_SCHEME_ACCOUNT and _safe_int(pin_raw, 0) > 0:
+            # An account pin the local roster cannot name: send it as the PERSON. The backend
+            # history ingest resolves mainAccountId gym-scoped and uses activeMembership only
+            # when no person identifier is present.
+            item["mainAccountId"] = int(_safe_int(pin_raw, 0))
 
         if user:
             active_membership_id = _safe_int(
@@ -1025,14 +1127,28 @@ class DeviceAttendanceMaintenanceEngine:
         except Exception:
             users = []
 
-        users_by_am, users_by_card, users_by_account = _user_indexes(users)
+        # Each row's pin is read under the scheme its device ran at the event's time
+        # (guide §3.2b/§3.2e). Without the switch history that cannot be done, and uploading
+        # anyway could file a door event against a stranger -- so the rows stay pending.
+        try:
+            switches_by_device = list_device_pin_scheme_switches() or {}
+        except Exception:
+            self.logger.warning(
+                "[DeviceAttendance] pin-scheme switch history unreadable -- door history not "
+                "uploaded this tick", exc_info=True,
+            )
+            return {"uploaded": 0, "failed": 0}
+        resolver = HistoryPinResolver(
+            users=users, devices_by_id=devices_by_id, switches_by_device=switches_by_device,
+        )
         items = [
             self._serialize_row_for_backend(
                 row=row,
-                users_by_am=users_by_am,
-                users_by_card=users_by_card,
+                users_by_am=resolver.users_by_am,
+                users_by_card=resolver.users_by_card,
                 devices_by_id=devices_by_id,
-                users_by_account=users_by_account,
+                users_by_account=resolver.users_by_account,
+                resolver=resolver,
             )
             for row in rows
         ]

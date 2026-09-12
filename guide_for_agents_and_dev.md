@@ -366,33 +366,44 @@ db.py::get_pending_fingerprint_push_reports]`
 the ZK_STANDALONE `push_roster` path records none, so gym 45's MB2000s emit no push reports at
 all — before or after this change. `[CODE: upsert_fingerprint_push_status has one caller]`
 
-**Inbound is the dangerous direction, and it cannot be fully resolved in code.** A device
-reports a pin; `device_attendance._user_indexes` builds a by-`mainAccountId` index alongside the
-membership one, and `_resolve_history_user` uses whichever reading is UNAMBIGUOUS.
+**Inbound: a pin is read under the scheme its DEVICE ran when the event happened.** A device
+reports a pin, and on the 2026-09-12 production data **110 `main_account.id` values numerically
+equal an existing `active_membership.id`**, for **99** of them DIFFERENT people (**0** the same
+person). Nothing in the event says which scheme minted the pin — but the device runs one scheme at
+a time and every change is recorded with its time (§3.2e). `device_attendance.HistoryPinResolver`
+uses that:
 
-On the 2026-09-12 production data **110 `main_account.id` values numerically equal an existing
-`active_membership.id`**, and for **99** of them the two are DIFFERENT people (**0** are the same
-person). Such a pin is genuinely ambiguous: it is one person's account id and another's
-membership id, and nothing in the payload says which scheme minted it.
+- **scheme at event time** — `db.list_device_pin_scheme_switches` read by `pin_scheme.scheme_at`
+  at the row's `event_time`. No recorded switch → MEMBERSHIP (known: the default, and every change
+  away from it is recorded). A switch at or before the event → its scheme; before the first switch
+  → MEMBERSHIP.
+- **MEMBERSHIP** → the membership index only. **ACCOUNT** → the collapsed row
+  `_filter_users_for_device` builds for THAT device (its `allowedMemberships` / validity policy,
+  `pin_row_rank`), so an event names the membership the device row represents; a device no longer
+  in the cache falls back to the unfiltered by-account index, ranked the same way. A known scheme
+  never consults the other index.
+- **unknown** (a switched device whose `event_time` does not parse, or a legacy caller of
+  `_resolve_history_user` without `pin_scheme`) → the old rule: the unambiguous reading, and a pin
+  that is both prefers MEMBERSHIP, with a WARNING. c13d1c2's "account index first" inverted
+  correctness on devices still holding membership pins; that is why the fallback prefers
+  membership.
 
-The resolver therefore prefers the **membership** reading when both match, logs a warning naming
-the pin and device, and does not guess. That is correct BEFORE a device is cut over — which is
-what a device actually holds until it is wiped — and it is the safe default because consulting
-the account index unconditionally first (an earlier revision) INVERTED correctness during the
-rollout window: a device still holding membership pins would have had those 110 resolved to the
-account owner, a wrong-person bug that did not exist before the account index was added.
+Used by the backend uploader (`_sync_pending_history` → `_serialize_row_for_backend(resolver=…)`)
+and the dashboard feed (`_dash_user_indexes` / `_dash_history_resolver`). The upload item for an
+**unresolved** pin: MEMBERSHIP → `activeMembership` = pin (unchanged); ACCOUNT → `mainAccountId` =
+pin and **no** `activeMembership` (the backend's history ingest resolves `userId`, then
+`mainAccountId`, gym-scoped, and reads `activeMembership` only when neither is sent); unknown →
+neither. If the switch history cannot be read, the batch is not uploaded that tick and the rows stay
+pending. `[CODE: app/core/device_attendance.py::HistoryPinResolver, ::_resolve_history_user,
+::DeviceAttendanceMaintenanceEngine._serialize_row_for_backend]`
+`[TEST: tests/test_account_pin_inbound_by_scheme.py;
+test_account_pin_derivation.py::test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality]`
 
-`[CODE: app/core/device_attendance.py::_resolve_history_user]`
-`[TEST: test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality,
- test_an_unambiguous_account_pin_still_resolves_to_the_person]`
-
-**After a device IS cut over the same ambiguity points the other way.** Making it exact needs the
-pin scheme recorded per `(device, pin)` at push time — `device_sync_state` is the natural home and
-`_ensure_column` the house idiom for adding it. Until that exists, the cutover MUST be
-wipe-and-repush so no device ever holds both schemes at once. `[UNVERIFIED — not yet built]`
-
-Both directions share `device_sync.furthest_reach` so the row the device holds and the membership
-an event is attributed to cannot drift apart. `[CODE]`
+`[UNVERIFIED]` **the event clock.** `event_time` is the terminal's clock and `switched_at` the PC's.
+C3-200 panels were measured 38–74 s behind the PC (§2) and `UltraDeviceWorker._device_tz_offset_sec`
+exists because a device clock can differ further. An event within that offset of a switch can be
+read under the wrong scheme. Across that window an unwiped terminal holds both schemes anyway, which
+is why the procedure wipes BEFORE switching.
 
 **Cutover is a WIPE, not a re-key.** Because of those 110 collisions, re-keying a device in place
 can graft one member's fingerprints onto another member's row. Existing terminals must be cleared

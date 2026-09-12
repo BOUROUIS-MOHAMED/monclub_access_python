@@ -5403,6 +5403,7 @@ def _dash_user_indexes() -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str,
     by_am: Dict[int, Dict[str, Any]] = {}
     by_card: Dict[str, Dict[str, Any]] = {}
     devices: Dict[int, str] = {}
+    resolver = None
     try:
         from app.core.device_attendance import _user_indexes
         from access.store import load_sync_cache, list_sync_devices_payload
@@ -5419,12 +5420,36 @@ def _dash_user_indexes() -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Dict[str,
                 devices[int(dev.get("id") or dev.get("deviceId") or 0)] = _safe_str(dev.get("name"), "")
             except Exception:
                 continue
+        # Door events are read under the pin scheme their device ran at the event's time
+        # (guide §3.2b). Unreadable switch history -> no resolver -> the legacy rule.
+        try:
+            from app.core.db import list_device_pin_scheme_switches
+            from app.core.device_attendance import HistoryPinResolver
+
+            payload_by_id: Dict[int, Dict[str, Any]] = {}
+            for dev in list_sync_devices_payload() or []:
+                did = _safe_int(dev.get("id") or dev.get("deviceId"), 0)
+                if did > 0:
+                    payload_by_id[did] = dev
+            resolver = HistoryPinResolver(
+                users=users, devices_by_id=payload_by_id,
+                switches_by_device=list_device_pin_scheme_switches() or {},
+            )
+        except Exception:
+            resolver = None
     except Exception:
         pass
 
     with _dash_lock:
-        _dash_users_cache.update({"at": now, "by_am": by_am, "by_card": by_card, "devices": devices})
+        _dash_users_cache.update({"at": now, "by_am": by_am, "by_card": by_card, "devices": devices,
+                                  "resolver": resolver})
     return by_am, by_card, devices
+
+
+def _dash_history_resolver():
+    """The HistoryPinResolver built with the last _dash_user_indexes refresh (or None)."""
+    with _dash_lock:
+        return _dash_users_cache.get("resolver")
 
 
 def _dash_today() -> Dict[str, Any]:
@@ -5504,6 +5529,7 @@ def _handle_dashboard_overview(ctx: _Ctx) -> None:
         from access.store import get_recent_access_history
 
         by_am, by_card, device_names = _dash_user_indexes()
+        resolver = _dash_history_resolver()
         try:
             briefs = get_membership_brief_index_cached() or {}
         except Exception:
@@ -5512,7 +5538,10 @@ def _handle_dashboard_overview(ctx: _Ctx) -> None:
         for row in get_recent_access_history(limit=limit):
             raw = _load_json_object(row.raw_json)
             lowered = _lower_keys(raw)
-            user = _resolve_history_user(row, raw, by_am, by_card) or {}
+            if resolver is not None:
+                user = resolver.resolve(row, raw)[0] or {}
+            else:
+                user = _resolve_history_user(row, raw, by_am, by_card) or {}
             plan_id = _safe_int(user.get("membershipId") or user.get("membership_id"), 0)
             brief = briefs.get(plan_id) if plan_id else None
             device_id = int(row.device_id) if row.device_id is not None else None
