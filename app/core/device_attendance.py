@@ -366,10 +366,38 @@ def _resolve_history_user(
     # a pin always resolves under the scheme it was minted with. The membership lookup stays
     # for devices still holding pre-cutover rows and for older backends that send no
     # mainAccountId at all.
-    if pin > 0 and pin in (users_by_account or {}):
-        return users_by_account[pin]
-    if pin > 0 and pin in users_by_am:
-        return users_by_am[pin]
+    acct_hit = users_by_account.get(pin) if (pin > 0 and users_by_account) else None
+    am_hit = users_by_am.get(pin) if pin > 0 else None
+
+    if acct_hit is not None and am_hit is None:
+        return acct_hit
+    if am_hit is not None and acct_hit is None:
+        return am_hit
+    if acct_hit is not None and am_hit is not None:
+        # AMBIGUOUS, and it cannot be resolved by inspection: this pin is simultaneously
+        # one person's main_account.id and another person's active_membership.id. On the
+        # 2026-09-12 dump that is 110 values, and for 99 of them the two are DIFFERENT
+        # people (0 are the same person), so guessing wrong attributes a door event to a
+        # stranger.
+        #
+        # Prefer the MEMBERSHIP reading, because that is what a device actually holds until
+        # it has been wiped and re-pushed. An earlier revision consulted the account index
+        # unconditionally first, which INVERTED correctness during the rollout window: a
+        # device still holding old membership pins would have had those 110 resolved to the
+        # account owner — a bug that did not exist before the account index was introduced.
+        #
+        # This is the safe default, not a complete answer: once a device HAS been cut over,
+        # the same ambiguity points the other way. Making it exact needs the pin scheme
+        # recorded per (device, pin) at push time; until then the cutover must be
+        # wipe-and-repush so that no device ever holds both schemes at once.
+        logging.getLogger("zkapp").warning(
+            "[DeviceAttendance] ambiguous pin %s on device %s — it is both an account id and "
+            "a membership id for different people; resolving as MEMBERSHIP (pre-cutover "
+            "default). If this device has been cut over to account pins, this attribution is "
+            "wrong and the device must be re-wiped.",
+            pin, getattr(row, "device_id", None),
+        )
+        return am_hit
 
     card = _normalize_card_token(row.card_no or _pick_ci(lowered, "cardno", "card", "cardid"))
     if card and card in users_by_card:

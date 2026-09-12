@@ -230,14 +230,30 @@ it:
   `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner]`
 - **cards** — the winner's, with an empty slot filled from the loser. `[CODE]`
 
-**Inbound is the dangerous direction.** A device reports a pin; `device_attendance._user_indexes`
-builds a by-`mainAccountId` index and `_resolve_history_user` consults it **before** the
-membership index. The order is load-bearing: on the 2026-09-12 production data **110
-`main_account.id` values numerically equal an existing `active_membership.id`**, so a
-membership-first lookup would resolve those pins to a REAL BUT UNRELATED member and attribute one
-person's door event to a stranger — silently, with no error and no gap in the log.
-`[CODE: app/core/device_attendance.py]`
-`[TEST: test_a_colliding_id_does_not_resolve_to_the_wrong_person]`
+**Inbound is the dangerous direction, and it cannot be fully resolved in code.** A device
+reports a pin; `device_attendance._user_indexes` builds a by-`mainAccountId` index alongside the
+membership one, and `_resolve_history_user` uses whichever reading is UNAMBIGUOUS.
+
+On the 2026-09-12 production data **110 `main_account.id` values numerically equal an existing
+`active_membership.id`**, and for **99** of them the two are DIFFERENT people (**0** are the same
+person). Such a pin is genuinely ambiguous: it is one person's account id and another's
+membership id, and nothing in the payload says which scheme minted it.
+
+The resolver therefore prefers the **membership** reading when both match, logs a warning naming
+the pin and device, and does not guess. That is correct BEFORE a device is cut over — which is
+what a device actually holds until it is wiped — and it is the safe default because consulting
+the account index unconditionally first (an earlier revision) INVERTED correctness during the
+rollout window: a device still holding membership pins would have had those 110 resolved to the
+account owner, a wrong-person bug that did not exist before the account index was added.
+
+`[CODE: app/core/device_attendance.py::_resolve_history_user]`
+`[TEST: test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality,
+ test_an_unambiguous_account_pin_still_resolves_to_the_person]`
+
+**After a device IS cut over the same ambiguity points the other way.** Making it exact needs the
+pin scheme recorded per `(device, pin)` at push time — `device_sync_state` is the natural home and
+`_ensure_column` the house idiom for adding it. Until that exists, the cutover MUST be
+wipe-and-repush so no device ever holds both schemes at once. `[UNVERIFIED — not yet built]`
 
 Both directions share `device_sync.furthest_reach` so the row the device holds and the membership
 an event is attributed to cannot drift apart. `[CODE]`

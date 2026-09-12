@@ -202,11 +202,16 @@ def test_an_account_pin_resolves_to_the_right_person():
     assert got is not None and got["activeMembershipId"] == 31000
 
 
-def test_a_colliding_id_does_not_resolve_to_the_wrong_person():
-    """THE BUG THIS GUARDS. On the 2026-09-12 production data, 110 main_account ids
-    numerically equal an existing active_membership.id. Ali's account id is 5; a DIFFERENT
-    member, Sonia, holds active_membership 5. A device reports pin 5 for Ali. Looking the pin
-    up in the membership index first would silently attribute Ali's entry to Sonia."""
+def test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality():
+    """On the 2026-09-12 production data, 110 main_account ids numerically equal an existing
+    active_membership.id, and for 99 of them the two are DIFFERENT people (0 are the same
+    person). Such a pin cannot be disambiguated by inspection.
+
+    An earlier revision consulted the account index unconditionally first. That INVERTED
+    correctness during the rollout window: a device still holding old membership pins would
+    have had those 110 resolved to the account owner -- a wrong-person bug that did not exist
+    before the account index was added. The safe default is the membership reading, because
+    that is what a device actually holds until it is wiped and re-pushed."""
     ali = _roster_row(activeMembershipId=31000, mainAccountId=5, fullName="Ali")
     sonia = _roster_row(activeMembershipId=5, mainAccountId=777, fullName="Sonia", userId=901)
     by_am, by_card, by_account = _user_indexes([ali, sonia])
@@ -214,10 +219,19 @@ def test_a_colliding_id_does_not_resolve_to_the_wrong_person():
     got = _resolve_history_user(_hist(5), {"pin": "5"}, by_am, by_card, by_account)
 
     assert got is not None
-    assert got["fullName"] == "Ali", (
-        "account index must be consulted BEFORE the membership index, or a colliding id "
-        "attributes one member's door event to a stranger"
+    assert got["fullName"] == "Sonia", (
+        "pin 5 is Sonia's membership id and Ali's account id; until the device is cut over "
+        "it holds membership pins, so the membership reading is the correct default"
     )
+
+
+def test_an_unambiguous_account_pin_still_resolves_to_the_person():
+    """The common case: no collision, so the account reading is unambiguous and wins."""
+    ali = _roster_row(activeMembershipId=31000, mainAccountId=5, fullName="Ali")
+    by_am, by_card, by_account = _user_indexes([ali])
+
+    got = _resolve_history_user(_hist(5), {"pin": "5"}, by_am, by_card, by_account)
+    assert got is not None and got["fullName"] == "Ali"
 
 
 def test_a_legacy_membership_pin_still_resolves():
