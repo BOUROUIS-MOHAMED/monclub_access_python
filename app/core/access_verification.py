@@ -740,8 +740,12 @@ def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]],
                         idx_by_am[int(s)] = u
                 else:
                     # Fallback: index by userId for users without activeMembershipId.
-                    # device_sync uses userId as the device Pin when activeMembershipId
-                    # is null, so the same key must be in this lookup index.
+                    # This index is keyed like a MEMBERSHIP-scheme device pin
+                    # (device_sync.derive_member_pin: activeMembershipId, else userId).
+                    # It is NOT the pin rule on a pinScheme=ACCOUNT device, whose pin is
+                    # mainAccountId: pin -> member there goes through
+                    # UltraDeviceWorker._user_for_device_pin (guide §3.2b). The other
+                    # consumers (TOTP grants, image prefetch) key by membership id.
                     user_id = u.get("userId")
                     if user_id is not None:
                         s = str(user_id).strip()

@@ -1161,8 +1161,10 @@ To confirm §3.2 (the roster rule) still holds:
 grep -rn "\.push_roster(" app/ --include=*.py
 ```
 
-**Expected:** every match inside `app/core/ultra_engine.py` — currently two real calls
-plus one docstring mention. A match in any other file means the rule has changed and
+**Expected:** every match inside `app/core/ultra_engine.py` — currently four real calls
+(`_run_standalone_full_sync`, `_run_standalone_member_sync`, the neutralise fallback in
+`_remove_standalone_pins`, and the ACCOUNT revoke re-push in `_account_member_revoke`, §3.2b)
+plus one docstring mention (`_build_standalone_roster`). A match in any other file means the rule has changed and
 this guide is out of date.
 
 Match on `\.push_roster(`, not the bare word: `push_roster` also appears in an

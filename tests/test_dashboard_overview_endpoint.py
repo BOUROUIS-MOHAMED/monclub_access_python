@@ -103,7 +103,7 @@ def _reset_caches():
     import app.api.local_access_api_v2 as m
 
     m._dash_today_cache.update({"at": 0.0, "day": "", "value": None})
-    m._dash_users_cache.update({"at": 0.0, "by_am": {}, "by_card": {}, "devices": {}})
+    m._dash_users_cache.update({"at": 0.0, "by_am": {}, "by_card": {}, "devices": {}, "resolver": None})
 
 
 def test_today_buckets_by_local_hour_and_ignores_other_days(seeded_db):
