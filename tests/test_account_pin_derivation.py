@@ -20,7 +20,9 @@ def _engine() -> DeviceSyncEngine:
 
 
 def _device(**kw):
-    d = {"doorIds": [1]}
+    # The push-side tests below exercise the ACCOUNT scheme. MEMBERSHIP (the default) is
+    # pinned byte-for-byte against the pre-account derivation in test_pin_scheme_gate.py.
+    d = {"doorIds": [1], "pinScheme": "ACCOUNT"}
     d.update(kw)
     return d
 
@@ -48,18 +50,29 @@ def test_pin_prefers_main_account_id():
     assert list(out) == ["5"], "the person is the pin, not the membership"
 
 
-def test_falls_back_to_active_membership_when_backend_is_older():
-    """Deployed backends do not send mainAccountId. The client must not regress on them."""
+def test_a_membership_device_uses_the_membership_id_whatever_the_backend_sends():
+    """Deployed backends do not send mainAccountId, and a device the operator has not
+    switched stays MEMBERSHIP even when the backend does."""
+    for extra in ({}, {"mainAccountId": 5}):
+        out = _engine()._filter_users_for_device(
+            users=[_user(activeMembershipId=31000, userId=900, **extra)],
+            device=_device(pinScheme="MEMBERSHIP"), default_door_id=1,
+        )
+        assert list(out) == ["31000"]
+
+
+def test_an_account_device_never_falls_back_to_the_membership_id():
+    """A fallback would put a membership pin on an account terminal: never mix schemes."""
     out = _engine()._filter_users_for_device(
         users=[_user(activeMembershipId=31000, userId=900)],
         device=_device(), default_door_id=1,
     )
-    assert list(out) == ["31000"]
+    assert out == {}
 
 
 def test_falls_back_to_user_id_when_there_is_no_membership():
     out = _engine()._filter_users_for_device(
-        users=[_user(userId=900)], device=_device(), default_door_id=1,
+        users=[_user(userId=900)], device=_device(pinScheme="MEMBERSHIP"), default_door_id=1,
     )
     assert list(out) == ["900"]
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -135,6 +136,72 @@ def _pin_str(v) -> str:
     return str(v).strip()
 
 
+# ── PIN SCHEME ──────────────────────────────────────────────────────────────────────────
+#
+# Which id a device user's PIN is. Decided PER DEVICE by the backend
+# (GymDeviceDto.pinScheme, the same DTO and the same client path as rosterPushingPolicy)
+# and never implicitly by a client upgrade:
+#
+#   MEMBERSHIP -> activeMembershipId, else userId. The default, and the value whenever the
+#                 backend sends nothing. Byte-identical to every pin minted before account
+#                 pins existed; no collapse.
+#   ACCOUNT    -> mainAccountId ONLY, several memberships of one person collapsed into one
+#                 device row.
+#
+# WHY THE SCHEME IS A DEVICE SETTING AND NOT A FALLBACK CHAIN. On the 2026-09-12 production
+# data 110 main_account.id values equal an existing active_membership.id and 99 of those are
+# a DIFFERENT person. A terminal that still holds membership pins and receives account pins
+# would have person A's row written over device user X that belongs to person B. So a device
+# is switched deliberately (after a manual wipe) and never mixes schemes: under ACCOUNT a row
+# with no mainAccountId is WITHHELD, never emitted under its membership pin.
+# See guide_for_agents_and_dev.md §3.2b.
+PIN_SCHEME_MEMBERSHIP = "MEMBERSHIP"
+PIN_SCHEME_ACCOUNT = "ACCOUNT"
+
+# Which field actually produced a pin. Recorded wherever a pin outlives the derivation
+# (push results reported upstream), because the digits alone cannot say -- that IS the
+# collision.
+PIN_SOURCE_ACCOUNT = "ACCOUNT"
+PIN_SOURCE_MEMBERSHIP = "MEMBERSHIP"
+PIN_SOURCE_USER = "USER"
+
+
+def normalize_pin_scheme(raw: Any) -> str:
+    """"ACCOUNT" only for exactly that token (case/space-insensitive); anything else --
+    None, "", an unknown value from a newer backend -- is MEMBERSHIP, today's behaviour."""
+    return PIN_SCHEME_ACCOUNT if str(raw or "").strip().upper() == PIN_SCHEME_ACCOUNT else PIN_SCHEME_MEMBERSHIP
+
+
+def device_pin_scheme(device: Any) -> str:
+    """The pin scheme a device payload (raw or ``_normalize_device``-d) declares."""
+    if not isinstance(device, dict):
+        return PIN_SCHEME_MEMBERSHIP
+    raw = device.get("pinScheme")
+    if raw is None:
+        raw = device.get("pin_scheme")
+    return normalize_pin_scheme(raw)
+
+
+def derive_member_pin(user: Dict[str, Any], scheme: str) -> Tuple[str, str | None]:
+    """THE derivation: ``(pin, source)`` for one roster row under ``scheme``.
+
+    ``("", None)`` means the row has no pin under this scheme. Under ACCOUNT that is a row
+    without ``mainAccountId`` (e.g. a cache row written before the column existed) and the
+    caller must WITHHOLD it -- falling back to the membership id would mix schemes on one
+    terminal. The returned pin is not validated as digits; callers skip non-digit pins.
+    """
+    if not isinstance(user, dict):
+        return "", None
+    if normalize_pin_scheme(scheme) == PIN_SCHEME_ACCOUNT:
+        acct = _pin_str(user.get("mainAccountId"))
+        return (acct, PIN_SOURCE_ACCOUNT) if acct else ("", None)
+    am = _pin_str(user.get("activeMembershipId"))
+    if am:
+        return am, PIN_SOURCE_MEMBERSHIP
+    uid = _pin_str(user.get("userId"))
+    return (uid, PIN_SOURCE_USER) if uid else ("", None)
+
+
 def reach_of(u: Dict[str, Any]):
     """How far into the future a roster row stays valid — the tie-break when several
     memberships collapse onto one device pin.
@@ -152,11 +219,24 @@ def reach_of(u: Dict[str, Any]):
     return vt or datetime.max.replace(tzinfo=timezone.utc)
 
 
+def pin_row_rank(u: Dict[str, Any]):
+    """The TOTAL order both collapse sides rank a person's memberships by:
+    ``(reach_of(u), activeMembershipId)``.
+
+    The id is the tie-break. Before it was shared, the push (``_merge_same_pin_entries``)
+    kept the FIRST row on equal reach while the inbound resolver (``furthest_reach``) kept
+    the LARGER id -- so for two memberships ending the same day the device row carried one
+    membership's name and cards while its door events were attributed to the other.
+    A pairwise max over a total order is also independent of payload order.
+    """
+    return (reach_of(u), _to_int(u.get("activeMembershipId"), default=0) or 0)
+
+
 def furthest_reach(rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
     """The row a collapsed device pin represents: the furthest-reaching membership.
 
-    Ties are broken by the larger activeMembershipId so the choice is deterministic rather
-    than dependent on payload order.
+    Ranked by ``pin_row_rank`` -- the same key ``_merge_same_pin_entries`` uses -- so the
+    choice is deterministic and agrees with the push.
     """
     best = None
     for r in rows or []:
@@ -165,9 +245,7 @@ def furthest_reach(rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
         if best is None:
             best = r
             continue
-        rk = (reach_of(r), _to_int(r.get("activeMembershipId"), default=0) or 0)
-        bk = (reach_of(best), _to_int(best.get("activeMembershipId"), default=0) or 0)
-        if rk > bk:
+        if pin_row_rank(r) > pin_row_rank(best):
             best = r
     return best
 
@@ -175,8 +253,8 @@ def furthest_reach(rows: List[Dict[str, Any]]) -> Dict[str, Any] | None:
 def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse two roster rows that resolve to the same device pin into one row.
 
-    Only reachable once the pin is derived from the PERSON (``mainAccountId``): while the
-    pin was the membership id, two rows could not collide. One human holding a 3-month gym
+    Only reachable under ``pinScheme=ACCOUNT`` (``mainAccountId``): under MEMBERSHIP two
+    rows cannot collide and this is never called. One human holding a 3-month gym
     plan and a 1-month spa plan is now one device row, and a device row carries exactly one
     validity window, one name and two card slots.
 
@@ -197,7 +275,7 @@ def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, A
     **Cards: the winner's, with the loser's kept only to fill an empty slot.** A device row
     has two card slots and no more; this never invents a third.
     """
-    winner, loser = (a, b) if reach_of(a) >= reach_of(b) else (b, a)
+    winner, loser = (a, b) if pin_row_rank(a) >= pin_row_rank(b) else (b, a)
     merged = dict(winner)
 
     seen: Set[Any] = set()
@@ -1404,6 +1482,11 @@ class DeviceSyncEngine:
             # NEW (from backend/device DTO)
             "authorizeTimezoneId": int(tz_id),
             "pushingToDevicePolicy": pushing_policy,
+            # PIN SCHEME: this normalized dict is what _sync_one_device, the targeted
+            # member sync and build_device_sync_fingerprint hand to
+            # _filter_users_for_device. Dropping the key here would silently derive
+            # MEMBERSHIP pins for a device the backend switched to ACCOUNT.
+            "pinScheme": g("pinScheme", "pin_scheme", default=None),
             "doorPresets": list(g("doorPresets", "door_presets", default=None) or []),
             "fingerprintEnabled": _boolish(g("fingerprintEnabled", "fingerprint_enabled", default=False), False),
             # Per-device fingerprint template-version override (9 or 10) parsed
@@ -1425,7 +1508,14 @@ class DeviceSyncEngine:
         }
 
     @_tel.timed("SYNC_FILTER_USERS", slow_ms=100)
-    def _filter_users_for_device(self, *, users: List[Dict[str, Any]], device: Dict[str, Any], default_door_id: int) -> Dict[str, Dict[str, Any]]:
+    def _filter_users_for_device(
+        self,
+        *,
+        users: List[Dict[str, Any]],
+        device: Dict[str, Any],
+        default_door_id: int,
+        stats_out: Dict[str, Any] | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
 
@@ -1435,6 +1525,19 @@ class DeviceSyncEngine:
           (default: push ALL members with an activeMembershipId regardless of
           expiry — the PC/ULTRA engine handles real-time validity at scan time)
         - pin must be digits (controllers expect numeric Pin)
+
+        PIN: ``derive_member_pin`` under the DEVICE's ``pinScheme`` (``device_pin_scheme``).
+        MEMBERSHIP is byte-identical to the derivation before account pins existed (last row
+        wins a pin, a userId-fallback row never displaces a membership row). ACCOUNT keys by
+        ``mainAccountId`` only, collapses one person's memberships with
+        ``_merge_same_pin_entries``, and WITHHOLDS a deliverable row that has no
+        mainAccountId (counted in ``stats_out["withheld_missing_account"]``).
+
+        ``stats_out`` (optional) receives ``pin_scheme``, ``pin_sources`` (pin -> which field
+        produced it) and ``withheld_missing_account`` / ``withheld_sample``. A caller that
+        REMOVES pins not in this result must treat ``withheld_missing_account > 0`` as an
+        incomplete roster -- the withheld person's account pin cannot be named, so it cannot
+        be kept.
 
         Also ensures device has a usable doorIds list (fallback to default_door_id).
         """
@@ -1457,77 +1560,117 @@ class DeviceSyncEngine:
         policy = str(device.get("pushingToDevicePolicy") or "").strip().upper()
         filter_by_validity = (policy == "VALID_ONLY")
 
+        scheme = device_pin_scheme(device)
         now = datetime.now(tz=timezone.utc)
         out: Dict[str, Dict[str, Any]] = {}
+        sources: Dict[str, str] = {}
+        withheld = 0
+        withheld_sample: List[Dict[str, Any]] = []
 
-        for u in users or []:
-            if not isinstance(u, dict):
-                continue
-
-            # PIN derivation, in strict preference order:
-            #
-            #   mainAccountId  -> the PERSON. One human, one device row, for good.
-            #   activeMembershipId -> legacy, and what every already-deployed backend sends.
-            #   userId         -> last resort, for a member with no membership record.
-            #
-            # mainAccountId is preferred because active_membership.id CHURNS: delete and
-            # recreate a membership and the pin changes, which on a preserve-policy device
-            # orphans the old row with its fingerprints and card still resident. A
-            # main_account.id never changes. It also matches the data model now that a
-            # fingerprint template belongs to the account rather than to a membership --
-            # keying the device by anything else means pushing one account-level template
-            # under N pins and consuming N device slots for one finger.
-            #
-            # The fallback chain is what makes this safe to deploy before the backend that
-            # emits mainAccountId: an older payload simply has no such key and the client
-            # behaves exactly as it does today.
-            acct_pin = _pin_str(u.get("mainAccountId"))
-            am_pin = _pin_str(u.get("activeMembershipId"))
-            pin = acct_pin or am_pin or _pin_str(u.get("userId"))
-            if not pin:
-                continue
-            if not pin.isdigit():
-                continue
-
-            # Collision guard: a weaker-derivation pin must not overwrite a stronger one
-            # already placed. (Originally only userId-vs-activeMembershipId; mainAccountId
-            # now sits above both.)
-            if pin in out and not acct_pin and not am_pin:
-                continue
-
+        def _deliverable(u: Dict[str, Any]) -> bool:
             mid = _to_int(u.get("membershipId"), default=None)
             if allowed_set and (mid is None or int(mid) not in allowed_set):
-                continue
-
+                return False
             if filter_by_validity:
                 vf = _parse_dt_any(u.get("validFrom") or "")
                 vt = _parse_dt_any(u.get("validTo") or "")
                 if vf and now < vf:
-                    continue
+                    return False
                 if vt and now > vt:
+                    return False
+            return True
+
+        if scheme != PIN_SCHEME_ACCOUNT:
+            for u in users or []:
+                if not isinstance(u, dict):
                     continue
 
-            prior = out.get(pin)
-            if prior is None:
-                out[pin] = u
-                continue
+                # MEMBERSHIP: activeMembershipId, else userId for a member with no
+                # membership record (activeMembershipId=null). mainAccountId is IGNORED
+                # here, even when present -- that is what keeps a terminal that holds
+                # membership pins from ever receiving an account pin.
+                pin, source = derive_member_pin(u, PIN_SCHEME_MEMBERSHIP)
+                if not pin:
+                    continue
+                if not pin.isdigit():
+                    continue
 
-            # Two memberships, one person, one device row.
-            #
-            # Under an account-derived pin this is no longer the impossible case it was
-            # when the pin was the membership id. The device row carries ONE validity
-            # window, so we keep the membership that reaches furthest -- among those this
-            # device accepts and that survived the filters above, which is exactly the set
-            # still standing at this point. Keeping the shorter one would lock a paid-up
-            # member out; `out[pin] = u` (last-wins) would make it depend on payload order,
-            # which is worse than either.
-            #
-            # CRITICAL: the credentials are UNIONED, not taken from the winner.
-            # _collect_templates_for_pin states that "user['fingerprints'] is the whole
-            # answer", so keeping only the winner's entry would silently drop every finger
-            # enrolled under the losing membership -- a member whose finger was scanned on
-            # his spa plan would lose it the moment his longer gym plan won the row.
-            out[pin] = _merge_same_pin_entries(prior, u)
+                # Collision guard: a userId-fallback pin must not overwrite an
+                # activeMembershipId-based entry already placed in the output.
+                if pin in out and source != PIN_SOURCE_MEMBERSHIP:
+                    continue
+
+                if not _deliverable(u):
+                    continue
+
+                out[pin] = u
+                sources[pin] = str(source)
+        else:
+            for u in users or []:
+                if not isinstance(u, dict):
+                    continue
+
+                # Deliverability first, so "withheld" counts only people this device
+                # would actually have carried.
+                if not _deliverable(u):
+                    continue
+
+                pin, _source = derive_member_pin(u, PIN_SCHEME_ACCOUNT)
+                if not pin or not pin.isdigit():
+                    # NEVER fall back to activeMembershipId/userId here: on an ACCOUNT
+                    # terminal that number may be another person's account pin.
+                    withheld += 1
+                    if len(withheld_sample) < 10:
+                        withheld_sample.append({
+                            "userId": u.get("userId"),
+                            "activeMembershipId": u.get("activeMembershipId"),
+                        })
+                    continue
+
+                prior = out.get(pin)
+                if prior is None:
+                    out[pin] = u
+                    sources[pin] = PIN_SOURCE_ACCOUNT
+                    continue
+
+                # Two memberships, one person, one device row.
+                #
+                # The device row carries ONE validity window, so we keep the membership
+                # that reaches furthest -- among those this device accepts and that
+                # survived the filters above, which is exactly the set still standing at
+                # this point. Keeping the shorter one would lock a paid-up member out;
+                # `out[pin] = u` (last-wins) would make it depend on payload order, which
+                # is worse than either.
+                #
+                # CRITICAL: the credentials are UNIONED, not taken from the winner.
+                # _collect_templates_for_pin states that "user['fingerprints'] is the whole
+                # answer", so keeping only the winner's entry would silently drop every
+                # finger enrolled under the losing membership -- a member whose finger was
+                # scanned on his spa plan would lose it the moment his longer gym plan won
+                # the row.
+                out[pin] = _merge_same_pin_entries(prior, u)
+
+            if withheld:
+                log = self.logger or logging.getLogger("zkapp")
+                log.warning(
+                    "[DeviceSync] device id=%s pinScheme=ACCOUNT: WITHHELD %d deliverable "
+                    "member row(s) that carry no mainAccountId (sample=%s). They are NOT "
+                    "pushed under a membership pin (that would mix schemes on one terminal), "
+                    "and callers that remove pins must treat this roster as INCOMPLETE. "
+                    "A full member refresh fills the column.",
+                    device.get("id"), withheld, withheld_sample,
+                )
+                try:
+                    _tel.warn("PIN_SCHEME_ACCOUNT_WITHHELD", device_id=device.get("id"),
+                              withheld=withheld)
+                except Exception:
+                    pass
+
+        if stats_out is not None:
+            stats_out["pin_scheme"] = scheme
+            stats_out["pin_sources"] = sources
+            stats_out["withheld_missing_account"] = withheld
+            stats_out["withheld_sample"] = withheld_sample
 
         return out
 
@@ -2275,6 +2418,12 @@ class DeviceSyncEngine:
             f"policy={policy}",
             f"fingerprintEnabled={1 if fingerprint_enabled else 0}",
         ]
+        # The pin scheme joins the header ONLY for ACCOUNT. A MEMBERSHIP device keeps the
+        # exact header it had before pinScheme existed, so upgrading the client does not
+        # move any roster hash; a device switched to ACCOUNT gets a new hash even in the
+        # degenerate case where every per-user part happens to be unchanged.
+        if device_pin_scheme(normalized_device) == PIN_SCHEME_ACCOUNT:
+            fingerprint_parts.append(f"pinScheme={PIN_SCHEME_ACCOUNT}")
 
         if detail_out is not None:
             # Header (device-level) part of the fingerprint, before per-user parts.

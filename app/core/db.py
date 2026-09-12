@@ -1061,6 +1061,8 @@ def init_db() -> None:
 
                 roster_pushing_policy TEXT,
 
+                pin_scheme TEXT,
+
                 device_capabilities TEXT
             );
             """
@@ -1131,6 +1133,12 @@ def init_db() -> None:
         # -> PRESERVE (additive, current behavior); 'MIRROR' -> the standalone full
         # sync deletes device users not in the app roster (guarded, ZK_STANDALONE only).
         _ensure_column(conn, "sync_devices", "roster_pushing_policy", "roster_pushing_policy TEXT")
+
+        # Per-device PIN scheme (backend GymDeviceDto.pinScheme). NULL/absent -> MEMBERSHIP
+        # (activeMembershipId pins, exactly the pre-existing behaviour); 'ACCOUNT' ->
+        # main_account.id pins. Read by device_sync.device_pin_scheme. Delivered on the same
+        # path as roster_pushing_policy. See guide §3.2b.
+        _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
 
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
@@ -3310,6 +3318,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             roster_pushing_policy,
 
+            pin_scheme,
+
             device_capabilities
         )
         VALUES (
@@ -3333,6 +3343,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?,
             ?,
             ?, ?,
+            ?,
             ?,
             ?,
             ?
@@ -3415,6 +3426,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             (_safe_str(d.get("deviceProtocol") or d.get("device_protocol"), "").strip().upper() or None),
 
             (_safe_str(d.get("rosterPushingPolicy") or d.get("roster_pushing_policy"), "").strip().upper() or None),
+
+            (_safe_str(d.get("pinScheme") or d.get("pin_scheme"), "").strip().upper() or None),
 
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
@@ -5319,6 +5332,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         # Roster pushing policy (PRESERVE default / MIRROR). None -> engine treats as
         # PRESERVE, so pre-migration rows keep the additive behavior.
         "rosterPushingPolicy": g("rosterPushingPolicy", "roster_pushing_policy"),
+
+        # PIN scheme (MEMBERSHIP default / ACCOUNT). None -> device_sync.device_pin_scheme
+        # answers MEMBERSHIP, so pre-migration rows keep membership pins.
+        "pinScheme": g("pinScheme", "pin_scheme"),
 
         # Opaque capability descriptor (e.g. {"fingerprintTemplateVersion": 9}).
         # Parsed dict when the stored JSON is valid, else None.

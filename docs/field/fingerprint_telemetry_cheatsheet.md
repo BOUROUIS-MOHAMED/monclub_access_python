@@ -174,6 +174,19 @@ grep -F "[T] ZKEM_PUSH_FAILED_PINS" app-*.log
 A pin absent from every `ZKEM_PUSH_FAILED_PINS` line, in a push whose `ZKEM_PUSH_DONE`
 says `ok=True`, was pushed. `[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`
 
+**A member missing from the roster entirely on an ACCOUNT-pin device:**
+
+```bash
+grep -F "[T] PIN_SCHEME_ACCOUNT_WITHHELD" app-*.log
+```
+
+`withheld=N` members were deliverable to `device_id` but their cached row carries no
+`mainAccountId`, so no pin could be derived under `pinScheme=ACCOUNT`. They are not pushed
+under their membership id on purpose (that number can be another person's account pin on
+the same terminal). The WARNING line just above it in the log lists a sample of `userId` /
+`activeMembershipId`. A full member refresh fills the field.
+`[CODE: app/core/device_sync.py::_filter_users_for_device]`
+
 > **Per-pin success lines are deliberately not emitted.** The STA thread pumps no COM
 > messages while a command runs and the log handler writes inline, so a line per member on
 > a 928-member push would widen that window — a behaviour change, not instrumentation.

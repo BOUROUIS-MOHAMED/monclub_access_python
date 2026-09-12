@@ -36,6 +36,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Which engine services which `accessDataMode` | §3 The three modes |
 | How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
+| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound) | §3.2b What a device PIN actually is |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | The test / verification commands | §9 Verifying this guide |
@@ -196,34 +197,74 @@ empty, and every surface will still report success.
 
 ### 3.2b What a device PIN actually is — and why it changed
 
-> **The PIN is the PERSON (`main_account.id`), not the membership.**
+> **The PIN is a per-device choice: `pinScheme` = `MEMBERSHIP` (the default) or `ACCOUNT`.**
+> Nothing switches a device implicitly — not a client upgrade, and not the backend starting
+> to send `mainAccountId`.
 
-Derivation happens in exactly ONE place, `DeviceSyncEngine._filter_users_for_device`, which
-both the PullSDK path and the standalone path route through. Order:
+Derivation happens in exactly ONE function, `device_sync.derive_member_pin(user, scheme)`,
+applied by `DeviceSyncEngine._filter_users_for_device` under the device's
+`device_sync.device_pin_scheme(device)`. Both the PullSDK path and the standalone path route
+through that filter.
 
-| preference | source | when |
-|---|---|---|
-| 1 | `mainAccountId` | the person — current scheme |
-| 2 | `activeMembershipId` | legacy; also what a pre-SP2 backend sends |
-| 3 | `userId` | member with no membership record |
+| `pinScheme` | pin | several memberships of one person | row lacking the field |
+|---|---|---|---|
+| `MEMBERSHIP` — absent, `null`, `""`, or any value other than `ACCOUNT` | `activeMembershipId`, else `userId` | stay separate rows (last row wins a pin; a `userId` pin never displaces a membership pin) | n/a |
+| `ACCOUNT` | `mainAccountId` **only** | collapsed into one row (below) | **withheld** — never emitted under its membership pin |
 
-`[CODE: app/core/device_sync.py::_filter_users_for_device]`
-`[TEST: tests/test_account_pin_derivation.py]`
+`[CODE: app/core/device_sync.py::derive_member_pin, ::device_pin_scheme, ::_filter_users_for_device]`
+`[TEST: tests/test_pin_scheme_gate.py::test_membership_scheme_is_byte_identical_to_the_pre_account_derivation]`
+— MEMBERSHIP is checked against a verbatim copy of the loop as it was at `c13d1c2^`, over
+randomised rosters that carry `mainAccountId`: same pins, same order, same row objects.
 
-**Why.** `active_membership.id` churns — delete and recreate a membership and the pin changes,
-which on a preserve-policy device orphans the old row with its fingerprints and card still
-resident. `main_account.id` never changes. It also matches the data model now that a fingerprint
-template belongs to the account: a membership-keyed pin pushes one template under N pins and
-burns N device slots for one finger.
+**Why a gate, not a fallback chain.** `c13d1c2` derived `mainAccountId → activeMembershipId →
+userId` unconditionally. On the 2026-09-12 production data **110 `main_account.id` values
+equal an existing `active_membership.id`, and 99 of those are a DIFFERENT person** (0 the same
+person). The first client to see `mainAccountId` would have pushed account pins onto terminals
+that still hold membership pins: on a PRESERVE device, pin X for person A overwrites device user
+X that belongs to person B — wrong fingerprint and card on the wrong person — and the old rows
+are never removed. So a device is switched deliberately, after a manual wipe (§3.2c), and never
+mixes schemes. That is also why ACCOUNT does not fall back: a withheld row's membership id may
+be another person's account pin on that terminal.
 
-**The collapse.** One person holding several memberships at one gym is now ONE device row, and a
-row carries one validity window, one name and two card slots. `_merge_same_pin_entries` resolves
-it:
+**Why ACCOUNT exists.** `active_membership.id` churns — delete and recreate a membership and the
+pin changes, which on a preserve-policy device orphans the old row with its fingerprints and
+card still resident. `main_account.id` never changes. It also matches the data model now that a
+fingerprint template belongs to the account: a membership-keyed pin pushes one template under N
+pins and burns N device slots for one finger.
+
+**Where `pinScheme` comes from — the same path as `rosterPushingPolicy`.** Backend
+`GymDeviceDto.pinScheme` → `getSyncData` `devices[]` (and fast-patch `GYM_DEVICE` upserts) →
+`db._insert_device_row` → `sync_devices.pin_scheme` (upper-cased, `NULL` when absent) → the
+device payload projection's `"pinScheme"` → `list_sync_devices_payload` /
+`get_sync_device_payload` / `load_sync_cache().devices` → the ULTRA worker's raw
+`self._device`, and `DeviceSyncEngine._normalize_device`, whose allowlist now carries the key
+(§6.2). `[CODE]`
+`[TEST: test_pin_scheme_gate.py::test_pin_scheme_survives_ingest_to_the_engine,
+::test_pin_scheme_survives_the_delta_device_refresh]`
+
+**A withheld row makes the device's roster INCOMPLETE.** Under ACCOUNT a deliverable row
+without `mainAccountId` (for example a cache row written before `sync_users` stored `mainAccountId`) is counted in
+`stats_out["withheld_missing_account"]`, logged at WARNING and emitted as
+`[T] PIN_SCHEME_ACCOUNT_WITHHELD`. Its account pin cannot be named, so it cannot be kept: any
+caller that REMOVES pins absent from the filter's result must not remove on an incomplete
+roster. `[CODE]` `[TEST: test_pin_scheme_gate.py::test_account_scheme_withholds_a_row_without_main_account_id_and_reports_it]`
+
+**The roster hash.** `build_device_sync_fingerprint` adds `pinScheme=ACCOUNT` to its header only
+for ACCOUNT, so a MEMBERSHIP device's hash is unchanged by the upgrade.
+`[TEST: test_pin_scheme_gate.py::test_a_membership_device_keeps_its_roster_hash_and_an_account_device_does_not]`
+
+**The collapse (ACCOUNT only).** One person holding several memberships at one gym is ONE
+device row, and a row carries one validity window, one name and two card slots.
+`_merge_same_pin_entries` resolves it:
 
 - **validity** — the furthest-reaching membership wins, *among those this device accepts*, since
   `allowedMemberships` and the validity filter both run BEFORE the collision is possible. An
   absent `validTo` counts as furthest: that is how "no end date" is expressed, and treating an
-  unknown as expired would revoke members we cannot date. `[CODE]`
+  unknown as expired would revoke members we cannot date. **Ties go to the larger
+  `activeMembershipId`**: both the push and `furthest_reach` rank by the one total order
+  `device_sync.pin_row_rank`. Before that key was shared, the push kept the FIRST row on a tie
+  and the inbound resolver the LARGER id. `[CODE]`
+  `[TEST: test_pin_scheme_gate.py::test_equal_reach_is_broken_by_the_larger_membership_id_on_both_sides]`
 - **fingerprints** — UNIONED, never the winner's alone. `_collect_templates_for_pin` treats
   `user['fingerprints']` as the whole answer and the backend attaches each template to the
   membership it was enrolled under, so taking only the winner's list silently deletes every
@@ -703,6 +744,13 @@ without ever constructing a PullSDK object.
 `[TEST: test_device_sync_protocol_guard.py::TestNormalizationCarriesProtocol
 and ::TestSyncOneDeviceRefusesNonPullSDK]`
 
+`pinScheme` is on the allowlist for the same reason (2026-09-12). `_sync_one_device`, the
+targeted `sync_member_on_connected_sdk` and `build_device_sync_fingerprint` all hand the
+NORMALIZED dict to `_filter_users_for_device`, while the standalone roster passes the worker's
+raw `self._device`. Without the key, an ACCOUNT device would have received MEMBERSHIP pins on
+the PullSDK paths and ACCOUNT pins on the standalone path — the mixing §3.2b exists to prevent.
+`[TEST: test_pin_scheme_gate.py::test_pin_scheme_survives_ingest_to_the_engine]`
+
 ---
 
 ## 7. Unverified and hardware-gated — do not treat these as known
@@ -949,6 +997,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |
 | `PULLSDK_PUSH_TPL_REFUSED` | `device_sync.py` | `device_id pin fingers errs` |
 | `SYNC_RETRY_BACKOFF` | `device_sync.py`, `ultra_engine.py` | `device_id pins` |
+| `PIN_SCHEME_ACCOUNT_WITHHELD` | `device_sync.py` | `device_id withheld` (warn; §3.2b — ACCOUNT rows with no `mainAccountId`) |
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |
