@@ -460,6 +460,82 @@ becomes clickable; and the revoke pass refuses a roster-sized strip by design. *
 cutover must be a manual wipe of each terminal, followed by a re-push.** The wipe path itself is
 still `[UNVERIFIED — HARDWARE-GATED]` (§3.2b).
 
+### 3.2d The member cache carries the person — and the upgrade trap (2026-09-12)
+
+**Until this change `mainAccountId` never survived `sync_users`.** No writer stored it and
+`_coerce_user_row_to_payload` never read it back, so every roster the engines saw had no
+`mainAccountId`: the account pin, the collapse and the account index of §3.2b were inert on
+every installed client while their raw-dict tests passed. `[CODE: git show 0f0a445:app/core/db.py]`
+
+Now `sync_users.main_account_id INTEGER` is written by **every** sync_users writer — found by
+grepping `INSERT INTO sync_users` / `INSERT OR REPLACE INTO sync_users` / `UPDATE sync_users`,
+not from memory:
+
+| Writer | Path |
+|---|---|
+| `save_sync_cache` | full replace |
+| `save_sync_cache_delta` → `_apply_full_users_refresh` (INSERT **and** UPDATE) | FULL member refresh, per-row diff |
+| `save_sync_cache_delta` delta branch | DELTA member refresh |
+| `upsert_delta_users` | delta helper |
+| `_upsert_sync_user_row` ← `apply_fast_patch_bundle` | fast-patch `ACTIVE_MEMBERSHIP` upsert |
+| `_rebuild_sync_users_without_legacy_fingerprint` | legacy-schema migration |
+
+and read back as `"mainAccountId"`. `main_account_id` is part of `_SYNC_USER_COLUMNS`, the
+tuple the full-refresh diff compares: a row whose **only** change is a newly-arrived
+`mainAccountId` must compare unequal or it would stay NULL. `[CODE]`
+`[TEST: tests/test_account_pin_sqlite_roundtrip.py::test_every_writer_round_trips_main_account_id_into_the_pin,
+::test_the_full_refresh_diff_updates_a_row_whose_only_change_is_main_account_id]`
+
+**Migration order is load-bearing.** The legacy rebuild re-creates `sync_users` from a
+hardcoded column list, so every `sync_users` `_ensure_column` now runs **after** it. They used
+to run before, which is how `birthday`, `image_source`, `user_image_status` and
+`user_profile_image` were added and then silently dropped on a legacy database (the next write
+naming them failed); the rebuild's list now names them and `main_account_id` too. `[CODE]`
+`[TEST: test_account_pin_sqlite_roundtrip.py::test_a_legacy_database_is_rebuilt_without_losing_a_column]`
+
+**The upgrade trap, and the one forced refresh.** Once the column exists every cached row is
+NULL until the members section is re-fetched — and nothing re-fetches it: the backend's
+`membersVersion` does not change because a client upgraded, so each sync answers
+`refreshMembers=false` or a delta naming only members that happened to change. Under
+`pinScheme=ACCOUNT` those rows are withheld indefinitely. So when `init_db` finds the column
+**absent** (measured before the legacy rebuild, which re-creates the table with an empty
+column), `_ensure_main_account_id_column` deletes `membersVersion` and `membersUpdatedAfter` —
+the house mechanism behind hard reset and `strip_all_member_version_tokens` — and keeps every
+other section's token. The next `getSyncData` carries neither (`MonClubApi.get_sync_data`
+sends the stored tokens as request params), the backend answers in FULL member mode, and the
+per-row diff fills the column. `[CODE: db.py::_ensure_main_account_id_column, init_db]`
+`[TEST: ::test_an_old_database_gains_the_column_and_forces_one_full_member_refresh,
+::test_the_forced_refresh_actually_reaches_the_backend_request_in_full_mode,
+::test_the_refresh_is_forced_once_not_on_every_start]`
+
+It is **atomic**: the token DELETE runs before the ALTER, so both sit in the single transaction
+`init_db` commits at its end; a crash in between rolls both back and the next start detects the
+missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]`
+If the backend in use does not emit `mainAccountId`, the refresh still runs once and the column
+stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone (§3.2b).
+
+**`member_account_link` — membership → person, durable.** `_refresh_member_account_links` runs at
+the end of every sync_users write transaction and records each cached `(active_membership_id,
+main_account_id)` pair; rows are never deleted with the member. A revocation deletes the
+member's `sync_users` row (and its `member_shadow` row) **before** the device worker acts on
+it, and under ACCOUNT that worker must still name the person's pin.
+`db.get_main_account_ids_for_memberships` reads it; `db.list_sync_users_by_main_account_ids`
+reads every cached row of a person. `[CODE]`
+`[TEST: ::test_the_link_survives_the_member_row_being_deleted]`
+
+**`member_shadow.pin` is not a device pin, and nothing reads it.** It holds the
+`activeMembershipId`. Every `FROM member_shadow` reader selects `active_membership_id` /
+`card_id` or compares card, name, `fp_hash`, dates and `membership_id` (grep, 2026-09-12), so no
+revoke or diff path looks a device row up through it; the table is unchanged and rows written by
+deployed versions diff exactly as before. The shadow diff deliberately does **not** compare
+`main_account_id`: the forced refresh above would flag every member (1 080 at gym 45) as
+modified and dispatch that many targeted member syncs to MEMBERSHIP devices on which nothing
+changed. A device reaches ACCOUNT only through an operator switch, and a withheld row that
+becomes deliverable moves that device's roster hash, which the scheduler's full sync acts on.
+`[CODE: ultra_engine.py::UltraSyncScheduler._sync_all]` In a manual-sync-mode gym that full
+sync waits for the operator's "Sync data". `[CODE: UltraSyncScheduler loop — timer pushes are
+skipped when _manual_sync_mode()]`
+
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
 For PullSDK devices, ULTRA has no push implementation of its own. It copies the device
