@@ -36,7 +36,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Which engine services which `accessDataMode` | §3 The three modes |
 | How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
-| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound) | §3.2b What a device PIN actually is |
+| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches; local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | The test / verification commands | §9 Verifying this guide |
@@ -683,6 +683,32 @@ explicit operator-confirmed action that does not exist yet. `[CODE: ultra_engine
 a switch stamped at or before `when` is in force; an unparseable `when` on a device that has
 switched → `None`, "cannot be known". `[TEST: ::test_switching_back_is_a_second_switch_and_each_window_resolves, ::test_scheme_at_rules]`
 
+### 3.2f Local API handlers that carry a member or a pin (2026-09-12)
+
+Every localhost handler that accepts a membership id or a device pin, or turns a device pin into a
+member, with its request fields and how the pin scheme reaches it. Routes are in
+`access/local_api_routes.py`; handlers in `app/api/local_access_api_v2.py`. The dashboard calls
+were confirmed by a read-only sweep of the dashboard branch `claude/fingerprints-quick-wins`; the
+Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
+
+| Route → handler | Request fields | Member/pin handling | Scheme |
+|---|---|---|---|
+| `POST /api/v2/enroll/start` → `_handle_enroll_start` (dashboard fingerprint dialog, `tauri-ui` UsersPage) | `type`/`target`, `userId`, **`activeMembershipId`** (optional, preferred), `fingerId`, `fullName`, `device` | Backend `createUserFingerprint(activeMembershipId)` (a backend id, not a device pin), then `_request_running_ultra_sync(changed_ids={activeMembershipId})` | The targeted member sync converts: ACCOUNT → the person's pin, every row of the person, collapsed (§3.2b table). No handler change needed. |
+| `GET /api/v1/access/enroll` → `_handle_v1_enroll` (deprecated) | `id`/`userId`, `fingerId`, `fullName`, `device` | Same path, membership resolved from `userId` | Same as above |
+| `POST /api/v2/sync/now` → `_handle_sync_now` (dashboard) | optional hint `{entityType, entityId, operation, priority}`; `entityId` is an `activeMembershipId` when `entityType=ACTIVE_MEMBERSHIP` (the dashboard rewrites FINGERPRINT changes into that) | The hint only strips `membersVersion` (`sync_scope.apply_trigger_hint_to_version_tokens`); the resulting delta's membership ids flow into `_request_running_ultra_sync` | Converted downstream: targeted syncs, `changed_ids` pruning and revokes all translate membership → person pin (§3.2b) |
+| `POST /api/v2/sync/fast-patch-bundle` → `_handle_sync_fast_patch_bundle` (dashboard) | the backend patch bundle verbatim; member items are `ActiveMemberUserDto` carrying `mainAccountId`; device items carry `pinScheme` | `db.apply_fast_patch_bundle` stores `main_account_id` and the membership→person link (§3.2d) and a `GYM_DEVICE` upsert records a pinScheme switch (§3.2e); impact membership ids go to `_request_running_ultra_sync` | Converted downstream, as above |
+| `POST /api/v2/devices/{deviceId}/users/push` → `_handle_device_users_push` (PullSDK only) | `pin`, `name`, `cardNo`, `doorIds`, `templates` | RAW pin, written as given — no derivation exists | The caller must send the pin under the device's scheme. The per-finger push outcome is recorded with the device's scheme, so the upstream report names `mainAccountId` on an ACCOUNT device (§3.2b push report) |
+| `POST /api/v2/devices/{deviceId}/users/delete` → `_handle_device_users_delete` (PullSDK only) | `pin` | RAW pin deleted as given | Caller's responsibility; no local state touched |
+| `GET /api/v2/devices/{deviceId}/users` → `_handle_device_users_list` | — | Lists the terminal's raw pins | Display only |
+| `GET /api/v2/dashboard/overview` → `_handle_dashboard_overview` (tauri-ui DashboardPage) | `limit` | Door-history pin → member for the feed | `HistoryPinResolver`: scheme of the event's device at the event's time (§3.2b inbound) |
+| `GET /api/v2/push-history/{batchId}/pins`, `GET /api/v2/devices/{deviceId}/mirror-plan`, `GET /api/v2/db/access-history`, `GET /api/v2/popup/poll` | — | Raw pins / stored rows / engine-enriched notifications, no pin → member mapping in the handler (`popup/poll` payloads are enriched by `_handle_allow`, which is converted) | Display only |
+| `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
+| `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
+| `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
+
+`[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
+dashboard sweep found those routes only in code comments, and `tauri-ui/src` has no caller.
+
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
 For PullSDK devices, ULTRA has no push implementation of its own. It copies the device
@@ -1100,8 +1126,9 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1548 passed** (with
-warnings; 2026-09-12, after the §3.2c reconcile-trigger repair; exit code 0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1716 passed** (with
+warnings; 2026-09-12, after the pin-scheme work of §3.2b–§3.2f, run with the CLAUDE.md command
+`python -m pytest tests/ -q --ignore=tests/_pydeps`; exit code 0). `[TEST]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
