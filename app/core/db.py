@@ -1633,6 +1633,13 @@ def init_db() -> None:
             );
             """
         )
+        # Which field produced the pin (device_sync.PIN_SOURCE_*: ACCOUNT / MEMBERSHIP /
+        # USER). The report cannot infer it from the digits -- 110 account ids equal
+        # another person's membership id -- so it is recorded at push time. NULL = a row
+        # written before this column: every pin was membership-derived then (mainAccountId
+        # never reached the roster, guide §3.2d), and a userId-keyed member cannot own a
+        # UserFingerprint, so NULL reads as MEMBERSHIP.
+        _ensure_column(conn, "fingerprint_push_status", "pin_source", "pin_source TEXT")
         # What we last SENT upstream, so only transitions are reported. Without this
         # every tick would re-POST the same unchanged state, and each backend write
         # re-flags the member in the next delta poll.
@@ -1647,6 +1654,35 @@ def init_db() -> None:
             );
             """
         )
+        # The same record keyed by (pin_source, pin, finger_id). The v1 key cannot hold an
+        # ACCOUNT pin 5 and a MEMBERSHIP pin 5 -- two different people -- at once. v1 is
+        # left in place and no longer written; its rows are copied ONCE, as MEMBERSHIP (the
+        # only scheme that existed when they were written), when v2 is first created, so a
+        # transition already reported is not re-sent after the upgrade.
+        _push_reported_v2_existed = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fingerprint_push_reported_v2'"
+        ).fetchone())
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fingerprint_push_reported_v2 (
+                pin_source TEXT NOT NULL,
+                pin TEXT NOT NULL,
+                finger_id INTEGER NOT NULL,
+                last_reported TEXT,
+                reported_at TEXT NOT NULL,
+                PRIMARY KEY (pin_source, pin, finger_id)
+            );
+            """
+        )
+        if not _push_reported_v2_existed:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO fingerprint_push_reported_v2
+                    (pin_source, pin, finger_id, last_reported, reported_at)
+                SELECT 'MEMBERSHIP', pin, finger_id, last_reported, reported_at
+                FROM fingerprint_push_reported
+                """
+            )
         # Safe installed-base migration. Successful rows are affirmative proof;
         # a recorded finger set also proves an earlier successful standalone push.
         conn.execute(
@@ -7344,7 +7380,8 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
 
 
 def upsert_fingerprint_push_status(
-    *, pin: str, finger_id: int, device_id: int, status: str, error_message: str | None
+    *, pin: str, finger_id: int, device_id: int, status: str, error_message: str | None,
+    pin_source: str | None = None,
 ) -> None:
     """Record the outcome of pushing ONE finger to ONE device.
 
@@ -7356,19 +7393,21 @@ def upsert_fingerprint_push_status(
     if not p:
         return
     err = (str(error_message or "")[:1000]) or None
+    source = (str(pin_source).strip().upper() or None) if pin_source is not None else None
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO fingerprint_push_status
-                (pin, finger_id, device_id, status, error_message, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (pin, finger_id, device_id, status, error_message, updated_at, pin_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pin, finger_id, device_id) DO UPDATE SET
                 status = excluded.status,
                 error_message = excluded.error_message,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                pin_source = excluded.pin_source
             """,
-            (p, int(finger_id), int(device_id), str(status), err, now_iso()),
+            (p, int(finger_id), int(device_id), str(status), err, now_iso(), source),
         )
 
     _run_db_write_sync("upsert_fingerprint_push_status", _write)
@@ -7384,22 +7423,27 @@ def get_pending_fingerprint_push_reports() -> List[Dict[str, Any]]:
 
     Returns only TRANSITIONS. Re-reporting an unchanged state would make the backend
     write the row, which re-flags the member in the next delta poll.
+
+    Aggregated per (pin_source, pin, finger): pin 5 under ACCOUNT on one device and pin 5
+    under MEMBERSHIP on another are two different people and are never merged. Each item
+    carries ``pin_source`` so the report can name the right id (guide §3.2b).
     """
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT s.pin AS pin,
+            SELECT COALESCE(s.pin_source, 'MEMBERSHIP') AS pin_source,
+                   s.pin AS pin,
                    s.finger_id AS finger_id,
                    MAX(CASE WHEN s.status <> 'OK' THEN 1 ELSE 0 END) AS any_failed,
                    MAX(CASE WHEN s.status <> 'OK' THEN s.error_message END) AS err
             FROM fingerprint_push_status s
-            GROUP BY s.pin, s.finger_id
+            GROUP BY COALESCE(s.pin_source, 'MEMBERSHIP'), s.pin, s.finger_id
             """
         ).fetchall()
         reported = {
-            (str(r["pin"]), int(r["finger_id"])): r["last_reported"]
+            (str(r["pin_source"]), str(r["pin"]), int(r["finger_id"])): r["last_reported"]
             for r in conn.execute(
-                "SELECT pin, finger_id, last_reported FROM fingerprint_push_reported"
+                "SELECT pin_source, pin, finger_id, last_reported FROM fingerprint_push_reported_v2"
             ).fetchall()
         }
 
@@ -7408,10 +7452,12 @@ def get_pending_fingerprint_push_reports() -> List[Dict[str, Any]]:
         pin = str(r["pin"] or "")
         if not pin:
             continue
+        source = str(r["pin_source"] or "MEMBERSHIP")
         fid = int(r["finger_id"])
         current = (str(r["err"]) if int(r["any_failed"] or 0) else None) or None
-        if reported.get((pin, fid), "\x00__never__") != current:
-            out.append({"pin": pin, "finger_id": fid, "error_message": current})
+        if reported.get((source, pin, fid), "\x00__never__") != current:
+            out.append({"pin": pin, "pin_source": source, "finger_id": fid,
+                        "error_message": current})
     return out
 
 
@@ -7422,16 +7468,18 @@ def mark_fingerprint_push_reported(items: Iterable[Dict[str, Any]]) -> int:
         pin = str((it or {}).get("pin") or "").strip()
         if not pin:
             continue
-        rows.append((pin, int(it.get("finger_id")), it.get("error_message"), now_iso()))
+        source = str(it.get("pin_source") or "MEMBERSHIP").strip().upper() or "MEMBERSHIP"
+        rows.append((source, pin, int(it.get("finger_id")), it.get("error_message"), now_iso()))
     if not rows:
         return 0
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         conn.executemany(
             """
-            INSERT INTO fingerprint_push_reported (pin, finger_id, last_reported, reported_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(pin, finger_id) DO UPDATE SET
+            INSERT INTO fingerprint_push_reported_v2
+                (pin_source, pin, finger_id, last_reported, reported_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(pin_source, pin, finger_id) DO UPDATE SET
                 last_reported = excluded.last_reported,
                 reported_at = excluded.reported_at
             """,

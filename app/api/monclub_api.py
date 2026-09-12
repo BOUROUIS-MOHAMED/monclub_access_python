@@ -437,10 +437,23 @@ class MonClubApi:
         NEVER raises. The caller re-reads the pending set next tick, so a missed
         report needs no bespoke retry or backoff.
 
-        ``pin`` is the device PIN, which is the activeMembershipId for any member who
-        has one. A member without one is keyed by userId instead -- and cannot have a
-        UserFingerprint row at all, since that entity requires an activeMembership --
-        so the backend simply finds nothing and skips it.
+        ``pin`` is the device PIN and ``pin_source`` says which id it is -- decided by the
+        device's pinScheme when the finger was pushed (guide §3.2b). The digits alone
+        cannot say: on the 2026-09-12 production data 110 main_account.id values equal an
+        existing active_membership.id, 99 of them a different person, so posting an
+        account pin as ``activeMembershipId`` would write a push error onto a STRANGER's
+        fingerprint.
+
+          ACCOUNT    -> ``mainAccountId``; the backend resolves it through the reporting
+                        gym's enabled enrolment of that finger.
+          MEMBERSHIP -> ``activeMembershipId`` (also for items with no ``pin_source``:
+                        every pin recorded before the field existed was membership-derived).
+          USER       -> skipped. A member keyed by userId has no activeMembership and cannot
+                        own a UserFingerprint, and a userId can equal another member's
+                        activeMembershipId.
+
+        An older backend ignores ``mainAccountId`` (Jackson FAIL_ON_UNKNOWN_PROPERTIES is
+        not enabled) and skips an item without ``activeMembershipId`` -- safe.
         """
         url = (self.endpoints.report_fingerprint_push_result_url or "").strip()
         if not url:
@@ -449,15 +462,24 @@ class MonClubApi:
         if not items:
             return True
 
-        payload = {"items": [
-            {
-                "activeMembershipId": int(it["pin"]),
+        report_items = []
+        for it in items:
+            pin = str(it.get("pin") or "").strip()
+            if not pin.isdigit():
+                continue
+            source = str(it.get("pin_source") or "MEMBERSHIP").strip().upper()
+            if source == "ACCOUNT":
+                key = {"mainAccountId": int(pin)}
+            elif source == "MEMBERSHIP":
+                key = {"activeMembershipId": int(pin)}
+            else:
+                continue  # USER (or an unknown source): no id the backend can safely resolve
+            report_items.append({
+                **key,
                 "fingerId": int(it["finger_id"]),
                 "error": it.get("error_message"),
-            }
-            for it in items
-            if str(it.get("pin") or "").strip().isdigit()
-        ]}
+            })
+        payload = {"items": report_items}
         if not payload["items"]:
             return True
 

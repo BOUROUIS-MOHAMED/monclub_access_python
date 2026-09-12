@@ -53,7 +53,7 @@ class TestPendingReports:
         db.upsert_fingerprint_push_status(pin="1001", finger_id=6, device_id=1,
                                           status="FAILED", error_message="no compatible schema")
         pending = db.get_pending_fingerprint_push_reports()
-        assert pending == [{"pin": "1001", "finger_id": 6,
+        assert pending == [{"pin": "1001", "pin_source": "MEMBERSHIP", "finger_id": 6,
                             "error_message": "no compatible schema"}]
 
     def test_reporting_it_clears_the_pending_set(self, db):
@@ -88,7 +88,7 @@ class TestPendingReports:
                                           status="OK", error_message=None)
 
         assert db.get_pending_fingerprint_push_reports() == [
-            {"pin": "1001", "finger_id": 6, "error_message": None}
+            {"pin": "1001", "pin_source": "MEMBERSHIP", "finger_id": 6, "error_message": None}
         ], "recovering must clear the dashboard's error, not just stop reporting"
 
     def test_a_success_on_a_never_reported_finger_is_still_a_transition(self, db):
@@ -96,7 +96,7 @@ class TestPendingReports:
         db.upsert_fingerprint_push_status(pin="1001", finger_id=6, device_id=1,
                                           status="OK", error_message=None)
         assert db.get_pending_fingerprint_push_reports() == [
-            {"pin": "1001", "finger_id": 6, "error_message": None}
+            {"pin": "1001", "pin_source": "MEMBERSHIP", "finger_id": 6, "error_message": None}
         ]
 
     def test_failure_on_ANY_device_makes_the_finger_failed(self, db):
@@ -152,7 +152,7 @@ class TestPushTemplatesRecordsOutcome:
         self._engine()._push_templates(sdk, pin="1001", templates=[tpl], device_id=40)
 
         assert db.get_pending_fingerprint_push_reports() == [
-            {"pin": "1001", "finger_id": 6, "error_message": None}
+            {"pin": "1001", "pin_source": "MEMBERSHIP", "finger_id": 6, "error_message": None}
         ]
 
     def test_a_refused_push_is_recorded_failed(self, db):

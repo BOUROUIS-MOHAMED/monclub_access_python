@@ -338,6 +338,34 @@ included. The procedure is a manual wipe (§3.2e), so `_sync_one_device` suppres
 when `device_pin_scheme_switch` has a row for the device; stale pins are still removed one by one.
 An explicit `FULL_REPLACE` policy is left as configured. `[CODE]`
 
+**The fingerprint push report names the id the pin IS.** `report_fingerprint_push_result` posted
+every pin as `activeMembershipId`; the backend then runs
+`findByActiveMembershipIdAndFingerId(<that number>, fingerId)`, so under ACCOUNT a report for
+account pin 5 would write — or clear — a push error on the fingerprint of the person whose
+MEMBERSHIP is 5. The digits cannot say which scheme minted them, so the push records it:
+`_filter_users_for_device` exposes `stats_out["pin_sources"]`, every `_push_templates` caller
+(targeted push, full-sync phase C, the per-pin path, and the admin raw push, which records the
+device's scheme) passes `pin_source`, and `fingerprint_push_status.pin_source` stores it
+(`NULL` = written before the column = MEMBERSHIP: every pin was membership-derived then, and a
+userId-keyed member cannot own a UserFingerprint). `get_pending_fingerprint_push_reports`
+aggregates per `(pin_source, pin, finger)` — pin 5 under two schemes is two people — and the
+"last reported" record moved to `fingerprint_push_reported_v2`, keyed the same way (v1 rows copied
+once as MEMBERSHIP, so no transition is re-sent after the upgrade). The report then sends:
+
+| `pin_source` | item key |
+|---|---|
+| `ACCOUNT` | `mainAccountId` — the backend resolves it through the reporting gym's enabled enrolment of that finger |
+| `MEMBERSHIP`, or absent | `activeMembershipId` |
+| `USER` | nothing (skipped) |
+
+An older backend ignores `mainAccountId` (Jackson `FAIL_ON_UNKNOWN_PROPERTIES` is not enabled)
+and skips an item without `activeMembershipId`. `[CODE: app/api/monclub_api.py::report_fingerprint_push_result,
+db.py::get_pending_fingerprint_push_reports]`
+`[TEST: tests/test_push_report_pin_scheme.py]`
+**Scope:** only the PullSDK push (`DeviceSyncEngine._push_templates`) records per-finger outcomes;
+the ZK_STANDALONE `push_roster` path records none, so gym 45's MB2000s emit no push reports at
+all — before or after this change. `[CODE: upsert_fingerprint_push_status has one caller]`
+
 **Inbound is the dangerous direction, and it cannot be fully resolved in code.** A device
 reports a pin; `device_attendance._user_indexes` builds a by-`mainAccountId` index alongside the
 membership one, and `_resolve_history_user` uses whichever reading is UNAMBIGUOUS.

@@ -1119,6 +1119,7 @@ class DeviceSyncEngine:
         templates: List[Dict[str, Any]],
         fingerprint_enabled: bool = True,
         template_version_override: int | None = None,
+        pin_source: str | None = None,
     ) -> bool:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
@@ -1206,6 +1207,7 @@ class DeviceSyncEngine:
                     templates=templates,
                     device_id=device_id,
                     template_version_override=template_version_override,
+                    pin_source=pin_source,
                 )
                 if errs:
                     # See _sync_one_device Phase C. This path previously ignored
@@ -1429,6 +1431,7 @@ class DeviceSyncEngine:
             templates=templates,
             fingerprint_enabled=fingerprint_enabled,
             template_version_override=self._resolve_template_version_override(normalized_device),
+            pin_source=(filter_stats.get("pin_sources") or {}).get(pin),
         )
 
     def _global_defaults(self) -> Dict[str, Any]:
@@ -1993,8 +1996,13 @@ class DeviceSyncEngine:
         templates: List[Dict[str, Any]],
         device_id: int,
         template_version_override: int | None = None,
+        pin_source: str | None = None,
     ) -> Tuple[int, List[str]]:
         """Push fingerprint templates to device.
+
+        ``pin_source`` (device_sync.PIN_SOURCE_*) is which field produced ``pin``. It is
+        recorded with every finger's outcome so the upstream report names the right id:
+        the digits alone cannot say (guide §3.2b).
 
         Tries the cached (table, body_index) combo first for each template (1 SDK call).
         Falls back to the full retry loop on cache miss or if the cached combo fails.
@@ -2157,7 +2165,7 @@ class DeviceSyncEngine:
             # probe) and the failure path. This is what finally puts a value into the
             # dashboard's lastPushError, which has been rendered but never written.
             self._record_finger_push_status(
-                pin=pin, finger_id=fid, device_id=device_id,
+                pin=pin, finger_id=fid, device_id=device_id, pin_source=pin_source,
                 status="OK" if pushed else "FAILED",
                 error_message=None if pushed
                 else "failed to push template (no compatible schema/table)",
@@ -2168,6 +2176,7 @@ class DeviceSyncEngine:
     def _record_finger_push_status(
         self, *, pin: str, finger_id: int, device_id: int,
         status: str, error_message: "str | None",
+        pin_source: "str | None" = None,
     ) -> None:
         """Remember whether ONE finger reached ONE device.
 
@@ -2185,7 +2194,7 @@ class DeviceSyncEngine:
                 return
             upsert_fingerprint_push_status(
                 pin=pin, finger_id=int(finger_id), device_id=int(device_id),
-                status=status, error_message=error_message,
+                status=status, error_message=error_message, pin_source=pin_source,
             )
         except Exception:
             self.logger.debug(
@@ -3336,7 +3345,8 @@ class DeviceSyncEngine:
                                 ok_count, errs = self._push_templates(
                                     sdk, pin=pin, templates=templates,
                                     device_id=int(dev_id) if dev_id is not None else 0,
-                                    template_version_override=template_version_override)
+                                    template_version_override=template_version_override,
+                                    pin_source=(filter_stats.get("pin_sources") or {}).get(pin))
                                 pushed_templates += ok_count
                                 if errs:
                                     warn_templates_users += 1
@@ -3540,7 +3550,8 @@ class DeviceSyncEngine:
                             ok_count, errs = self._push_templates(
                                 sdk, pin=pin, templates=templates,
                                 device_id=int(dev_id) if dev_id is not None else 0,
-                                template_version_override=template_version_override)
+                                template_version_override=template_version_override,
+                                pin_source=(filter_stats.get("pin_sources") or {}).get(pin))
                             pushed_templates += ok_count
                             if errs:
                                 warn_templates_users += 1

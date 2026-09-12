@@ -4728,9 +4728,19 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         # fingerId is deliberately NOT coerced here. _push_templates skips and REPORTS
         # an unusable fingerId; coercing a missing one to slot 0 would write a
         # biometric to a finger the caller never named.
+        # The operator names the pin directly; it is recorded under the scheme the device
+        # runs, so the upstream push report names mainAccountId for an ACCOUNT device and
+        # activeMembershipId for a MEMBERSHIP one (guide §3.2b).
+        from app.core.device_sync import device_pin_scheme
+
+        try:
+            raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
+        except Exception:
+            raw_pin_source = None
         pushed, push_errs = engine._push_templates(
             sdk, pin=pin, templates=wire_templates, device_id=did,
             template_version_override=template_version_override,
+            pin_source=raw_pin_source,
         )
         tpl_errors.extend(push_errs)
 
