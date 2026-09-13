@@ -157,6 +157,47 @@ def test_switching_back_is_a_second_switch_and_each_window_resolves(db, monkeypa
     assert scheme_at(switches, datetime(2026, 9, 21, 8, 0, 0)) == "MEMBERSHIP"
 
 
+_DEVICES_ONLY = {"members": False, "devices": True, "credentials": False, "settings": False}
+
+
+@pytest.mark.parametrize("later", [
+    {},                               # an older backend: no key at all
+    {"pinScheme": None},              # a partial payload: key present, value null
+    {"pinScheme": ""},
+    {"pinScheme": "FACE"},            # a token this client does not know
+], ids=["absent", "null", "empty", "unrecognised"])
+def test_a_payload_without_a_recognised_pin_scheme_keeps_the_last_known_scheme(db, later):
+    """Review #6. Folding an absent/unknown pinScheme to MEMBERSHIP recorded an ACCOUNT ->
+    MEMBERSHIP switch, cleared every hash, and made the next roster derive membership pins
+    for a terminal that holds account pins -- with no wipe. Only an explicit, recognised
+    value may switch; the backend's own rule for this field is "absent keeps the current"."""
+    from app.core.device_sync import device_pin_scheme
+
+    db.save_sync_cache_delta({"devices": [_device(42, pinScheme="ACCOUNT")]}, _DEVICES_ONLY)
+    _seed_state(db, 42, [5])
+
+    db.save_sync_cache_delta({"devices": [_device(42, **later)]}, _DEVICES_ONLY)
+
+    assert len(db.list_device_pin_scheme_switches(device_id=42)[42]) == 1, "not a switch"
+    assert _state(db, 42)["5"][:2] == ("h-old", 1), "no hash clear without a switch"
+    payload = db.get_sync_device_payload(42)
+    assert device_pin_scheme(payload) == "ACCOUNT", (
+        "the device must keep deriving ACCOUNT pins; NULL here reads as MEMBERSHIP"
+    )
+
+
+def test_an_explicit_membership_after_account_is_still_a_switch(db):
+    db.save_sync_cache_delta({"devices": [_device(42, pinScheme="ACCOUNT")]}, _DEVICES_ONLY)
+    _seed_state(db, 42, [5])
+
+    db.save_sync_cache_delta({"devices": [_device(42, pinScheme="MEMBERSHIP")]}, _DEVICES_ONLY)
+
+    history = db.list_device_pin_scheme_switches(device_id=42)[42]
+    assert [h["scheme"] for h in history][-1] == "MEMBERSHIP"
+    assert _state(db, 42)["5"][:2] == (None, 0), "the explicit switch clears hashes (UPDATE)"
+    assert db.get_sync_device_payload(42)["pinScheme"] == "MEMBERSHIP"
+
+
 def test_scheme_at_rules():
     at = datetime(2026, 9, 12, 10, 0, 0)
     assert scheme_at([], None) == "MEMBERSHIP", "never switched: known, not a guess"

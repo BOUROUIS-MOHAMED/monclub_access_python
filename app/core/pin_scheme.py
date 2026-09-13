@@ -38,6 +38,18 @@ def normalize_pin_scheme(raw: Any) -> str:
     return PIN_SCHEME_ACCOUNT if str(raw or "").strip().upper() == PIN_SCHEME_ACCOUNT else PIN_SCHEME_MEMBERSHIP
 
 
+def recognized_pin_scheme(raw: Any) -> Optional[str]:
+    """``ACCOUNT`` / ``MEMBERSHIP`` for exactly those tokens (case/space-insensitive), else None.
+
+    Used ONLY to decide whether a device payload may CHANGE the scheme. An absent key (an
+    older backend, a partial payload), null, "" or a token this client does not know says
+    nothing about the device and must keep the last known scheme -- folding it to MEMBERSHIP
+    would switch an ACCOUNT terminal back with no wipe. ``normalize_pin_scheme`` keeps its
+    default for every other reader."""
+    token = str(raw or "").strip().upper()
+    return token if token in (PIN_SCHEME_ACCOUNT, PIN_SCHEME_MEMBERSHIP) else None
+
+
 def device_pin_scheme(device: Any) -> str:
     """The pin scheme a device payload (raw or ``_normalize_device``-d) declares."""
     if not isinstance(device, dict):

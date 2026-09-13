@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
-from app.core.pin_scheme import PIN_SCHEME_MEMBERSHIP, normalize_pin_scheme
+from app.core.pin_scheme import PIN_SCHEME_MEMBERSHIP, normalize_pin_scheme, recognized_pin_scheme
 from app.core.utils import ensure_dirs, format_ts, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -3494,6 +3494,21 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
     if adm not in ("DEVICE", "AGENT", "ULTRA"):
         adm = "DEVICE"
 
+    # pinScheme: only an explicit, recognised value is stored as given. An absent key, null,
+    # "" or an unknown token keeps the LAST KNOWN scheme (the switch history -- sync_devices
+    # itself is deleted and re-inserted on every device refresh), so a partial payload never
+    # turns an ACCOUNT terminal back into a MEMBERSHIP one. Review #6, guide §3.2e.
+    explicit_pin_scheme = _explicit_device_pin_scheme(d)
+    stored_pin_scheme = explicit_pin_scheme
+    if stored_pin_scheme is None:
+        stored_pin_scheme = _last_known_device_pin_scheme(cur, _to_int_or_none(d.get("id")))
+        if stored_pin_scheme is not None:
+            logging.getLogger(__name__).warning(
+                "[DB] device id=%s payload carries no recognised pinScheme (%r); keeping the last "
+                "known scheme %s -- only an explicit value switches a device (guide §3.2e).",
+                d.get("id"), d.get("pinScheme", d.get("pin_scheme")), stored_pin_scheme,
+            )
+
     cur.execute(
         """
         INSERT INTO sync_devices (
@@ -3645,7 +3660,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             (_safe_str(d.get("rosterPushingPolicy") or d.get("roster_pushing_policy"), "").strip().upper() or None),
 
-            (_safe_str(d.get("pinScheme") or d.get("pin_scheme"), "").strip().upper() or None),
+            stored_pin_scheme,
 
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
@@ -3654,6 +3669,25 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
     # Same transaction as the device row: every device write path (full, delta, fast patch)
     # comes through here, so a pinScheme change is detected exactly once, wherever it arrives.
     _record_device_pin_scheme_switch(cur, d)
+
+
+def _explicit_device_pin_scheme(d: dict) -> Optional[str]:
+    """The pinScheme a device payload states explicitly and this client recognises, else None."""
+    raw = d.get("pinScheme")
+    if raw is None:
+        raw = d.get("pin_scheme")
+    return recognized_pin_scheme(raw)
+
+
+def _last_known_device_pin_scheme(cur: sqlite3.Cursor, device_id: Optional[int]) -> Optional[str]:
+    """The scheme of the device's latest recorded switch; None when it has none."""
+    if device_id is None:
+        return None
+    row = cur.execute(
+        "SELECT scheme FROM device_pin_scheme_switch WHERE device_id=? ORDER BY id DESC LIMIT 1",
+        (int(device_id),),
+    ).fetchone()
+    return normalize_pin_scheme(row[0]) if row else None
 
 
 def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
@@ -3670,20 +3704,17 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
       * it is logged CRITICAL: the terminal still holds the previous scheme's users and
         MUST be wiped by an operator. Nothing here wipes it.
 
-    The current scheme is the latest recorded switch, MEMBERSHIP when there is none.
+    The current scheme is the latest recorded switch, MEMBERSHIP when there is none. Only an
+    explicit, recognised ``pinScheme`` can switch: an absent key, null, "" or an unknown
+    token is not evidence of a change (review #6).
     """
     did = _to_int_or_none(d.get("id"))
     if did is None:
         return False
-    raw = d.get("pinScheme")
-    if raw is None:
-        raw = d.get("pin_scheme")
-    new_scheme = normalize_pin_scheme(raw)
-    row = cur.execute(
-        "SELECT scheme FROM device_pin_scheme_switch WHERE device_id=? ORDER BY id DESC LIMIT 1",
-        (did,),
-    ).fetchone()
-    current = normalize_pin_scheme(row[0]) if row else PIN_SCHEME_MEMBERSHIP
+    new_scheme = _explicit_device_pin_scheme(d)
+    if new_scheme is None:
+        return False
+    current = _last_known_device_pin_scheme(cur, did) or PIN_SCHEME_MEMBERSHIP
     if new_scheme == current:
         return False
     cleared = _clear_device_sync_hashes_on(cur, did)

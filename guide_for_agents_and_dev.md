@@ -198,8 +198,9 @@ empty, and every surface will still report success.
 ### 3.2b What a device PIN actually is — and why it changed
 
 > **The PIN is a per-device choice: `pinScheme` = `MEMBERSHIP` (the default) or `ACCOUNT`.**
-> Nothing switches a device implicitly — not a client upgrade, and not the backend starting
-> to send `mainAccountId`.
+> Nothing switches a device implicitly — not a client upgrade, not the backend starting
+> to send `mainAccountId`, and not a device payload that omits `pinScheme` or carries a token
+> this client does not recognise (§3.2e: those keep the last known scheme).
 
 Derivation happens in exactly ONE function, `device_sync.derive_member_pin(user, scheme)`,
 applied by `DeviceSyncEngine._filter_users_for_device` under the device's
@@ -208,7 +209,7 @@ through that filter.
 
 | `pinScheme` | pin | several memberships of one person | row lacking the field |
 |---|---|---|---|
-| `MEMBERSHIP` — absent, `null`, `""`, or any value other than `ACCOUNT` | `activeMembershipId`, else `userId` | stay separate rows (last row wins a pin; a `userId` pin never displaces a membership pin) | n/a |
+| `MEMBERSHIP` — the stored value, or none stored for a device with no `ACCOUNT` history | `activeMembershipId`, else `userId` | stay separate rows (last row wins a pin; a `userId` pin never displaces a membership pin) | n/a |
 | `ACCOUNT` | `mainAccountId` **only** | collapsed into one row (below) | **withheld** — never emitted under its membership pin |
 
 `[CODE: app/core/device_sync.py::derive_member_pin, ::device_pin_scheme, ::_filter_users_for_device]`
@@ -234,7 +235,8 @@ pins and burns N device slots for one finger.
 
 **Where `pinScheme` comes from — the same path as `rosterPushingPolicy`.** Backend
 `GymDeviceDto.pinScheme` → `getSyncData` `devices[]` (and fast-patch `GYM_DEVICE` upserts) →
-`db._insert_device_row` → `sync_devices.pin_scheme` (upper-cased, `NULL` when absent) → the
+`db._insert_device_row` → `sync_devices.pin_scheme` (`ACCOUNT`/`MEMBERSHIP` when the payload
+states one of them; otherwise the last recorded scheme, `NULL` when there is none) → the
 device payload projection's `"pinScheme"` → `list_sync_devices_payload` /
 `get_sync_device_payload` / `load_sync_cache().devices` → the ULTRA worker's raw
 `self._device`, and `DeviceSyncEngine._normalize_device`, whose allowlist now carries the key
@@ -647,8 +649,16 @@ skipped when _manual_sync_mode()]`
 and a fast-patch `GYM_DEVICE` upsert — goes through `db._insert_device_row`, which calls
 `_record_device_pin_scheme_switch` in the same transaction. The current scheme is the latest
 `device_pin_scheme_switch` row for the device, MEMBERSHIP when there is none; a payload whose
-normalised `pinScheme` differs is a switch. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
-`[TEST: tests/test_pin_scheme_switch.py::test_every_device_write_path_sees_the_switch_exactly_once]`
+`pinScheme` is **explicitly** `ACCOUNT` or `MEMBERSHIP` (case/space-insensitive,
+`pin_scheme.recognized_pin_scheme`) and differs is a switch. An absent key (an older backend, a
+partial payload), `null`, `""` or an unknown token is **not** a switch: nothing is recorded, no
+hash is cleared, and `sync_devices.pin_scheme` is written with the last recorded scheme, so the
+push keeps deriving that scheme's pins (WARNING logged). This matches the backend's own rule for
+the field ("old clients don't send it — keep the current value"). A current backend always sends
+it. `[CODE: app/core/db.py::_insert_device_row, ::_record_device_pin_scheme_switch]`
+`[TEST: tests/test_pin_scheme_switch.py::test_every_device_write_path_sees_the_switch_exactly_once,
+::test_a_payload_without_a_recognised_pin_scheme_keeps_the_last_known_scheme,
+::test_an_explicit_membership_after_account_is_still_a_switch]`
 
 **What a switch does — and does not do.**
 
