@@ -245,6 +245,33 @@ class TestFullPullSdkSync:
             "pruning would forget a pin that may belong to the withheld member"
         )
 
+    def test_a_queued_offline_creation_does_not_freeze_removals(self, sqlite_db):
+        """Review #12. load_sync_cache().users always carries a synthetic row for each queued
+        offline creation; it never has mainAccountId and no roster refresh can give it one
+        (it is not a sync_users row). Counted as withheld, it made every ACCOUNT roster
+        'incomplete' for as long as the item stayed queued (blocked_auth waits on an
+        operator), so a departed member's pin stayed on the terminal."""
+        ali = {**_ali_gym(), "accountUsernameId": "ali"}
+        _cache(sqlite_db, [ali, _sonia()])
+        sqlite_db.insert_offline_creation(
+            creation_kind="membership_only", state="failed_retryable",
+            payload={"accountUsernameId": "ali", "membershipId": 8,
+                     "startDate": "2026-09-01", "endDate": "2026-12-31"},
+        )
+        sqlite_db.save_device_sync_state(device_id=1, pin="888", desired_hash="h", ok=True, error=None)
+        users = list(sqlite_db.load_sync_cache().users)
+        assert any(u.get("offlinePending") for u in users), "the projection is in the roster"
+
+        device = _pullsdk_device(pinScheme="ACCOUNT")
+        stats: Dict[str, Any] = {}
+        by_pin = _engine()._filter_users_for_device(
+            users=users, device=dict(device), default_door_id=1, stats_out=stats)
+        assert stats["withheld_missing_account"] == 0
+        assert set(by_pin) == {"5", "777"}, "the projection is never emitted, under any pin"
+
+        sdk = self._run(sqlite_db, users, device, device_pins=["5", "777", "888"])
+        assert _removed_pins(sdk) == {"888"}, "Karim departed: his account pin is removed"
+
 
 # ═════════════════════════════ ZK_STANDALONE worker ═════════════════════════════
 

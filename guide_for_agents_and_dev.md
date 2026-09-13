@@ -250,6 +250,15 @@ without `mainAccountId` (for example a cache row written before `sync_users` sto
 `[T] PIN_SCHEME_ACCOUNT_WITHHELD`. Its account pin cannot be named, so it cannot be kept: any
 caller that REMOVES pins absent from the filter's result must not remove on an incomplete
 roster. `[CODE]` `[TEST: test_pin_scheme_gate.py::test_account_scheme_withholds_a_row_without_main_account_id_and_reports_it]`
+**Offline projections are not withheld.** `load_sync_cache().users` also carries one synthetic row
+per queued offline creation (`db.list_projected_offline_users`, `offlinePending: True`, negative
+synthetic ids, never a `mainAccountId`). No roster refresh can fill it — it is not a `sync_users`
+row — and a `blocked_auth` item waits on an operator, so counting it froze every removal on every
+ACCOUNT device for as long as the item stayed queued (review #12). Under ACCOUNT such a row is
+skipped: not emitted under any pin, counted only in `stats_out["skipped_offline_projections"]`.
+Under MEMBERSHIP its negative pin already fails the digit check, so neither scheme pushes an
+unconfirmed offline sale. `[CODE: device_sync.py::_filter_users_for_device]`
+`[TEST: test_account_pin_device_sites.py::test_a_queued_offline_creation_does_not_freeze_removals]`
 
 **The roster hash.** `build_device_sync_fingerprint` adds `pinScheme=ACCOUNT` to its header only
 for ACCOUNT, so a MEMBERSHIP device's hash is unchanged by the upgrade.

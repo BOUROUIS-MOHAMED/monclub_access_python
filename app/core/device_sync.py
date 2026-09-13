@@ -1690,6 +1690,7 @@ class DeviceSyncEngine:
         out: Dict[str, Dict[str, Any]] = {}
         sources: Dict[str, str] = {}
         withheld = 0
+        offline_projections = 0
         withheld_sample: List[Dict[str, Any]] = []
 
         def _deliverable(u: Dict[str, Any]) -> bool:
@@ -1744,6 +1745,15 @@ class DeviceSyncEngine:
                 if not pin or not pin.isdigit():
                     # NEVER fall back to activeMembershipId/userId here: on an ACCOUNT
                     # terminal that number may be another person's account pin.
+                    if u.get("offlinePending"):
+                        # A projection of a queued offline creation (db.list_projected_offline_users),
+                        # not a sync_users row: no roster refresh can ever give it a
+                        # mainAccountId, and under MEMBERSHIP its negative synthetic id is never
+                        # pushed either. Not emitted, and NOT counted as withheld -- counting it
+                        # froze every removal on the device for as long as the item stayed
+                        # queued (review #12, guide §3.2b).
+                        offline_projections += 1
+                        continue
                     withheld += 1
                     if len(withheld_sample) < 10:
                         withheld_sample.append({
@@ -1796,6 +1806,7 @@ class DeviceSyncEngine:
             stats_out["pin_sources"] = sources
             stats_out["withheld_missing_account"] = withheld
             stats_out["withheld_sample"] = withheld_sample
+            stats_out["skipped_offline_projections"] = offline_projections
 
         return out
 
