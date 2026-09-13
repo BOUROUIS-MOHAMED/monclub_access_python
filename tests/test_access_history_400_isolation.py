@@ -85,6 +85,7 @@ def _run_upload(rows, fake_api):
     with (
         patch("app.core.device_attendance.build_access_api_endpoints", return_value=SimpleNamespace()),
         patch("app.core.device_attendance.list_pending_access_history_for_sync", return_value=list(rows)),
+        patch("app.core.device_attendance.list_device_pin_scheme_switches", return_value={}),
         patch("app.core.device_attendance.list_sync_devices_payload", return_value=[{"id": 8, "name": "Sortie"}]),
         patch("app.core.device_attendance.MonClubApi", return_value=fake_api),
         patch("app.core.device_attendance.mark_access_history_synced", synced),

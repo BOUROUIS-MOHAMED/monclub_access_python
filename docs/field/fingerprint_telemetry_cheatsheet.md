@@ -174,6 +174,29 @@ grep -F "[T] ZKEM_PUSH_FAILED_PINS" app-*.log
 A pin absent from every `ZKEM_PUSH_FAILED_PINS` line, in a push whose `ZKEM_PUSH_DONE`
 says `ok=True`, was pushed. `[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`
 
+**A member missing from the roster entirely on an ACCOUNT-pin device:**
+
+```bash
+grep -F "[T] PIN_SCHEME_ACCOUNT_WITHHELD" app-*.log
+```
+
+`withheld=N` members were deliverable to `device_id` but their cached row carries no
+`mainAccountId`, so no pin could be derived under `pinScheme=ACCOUNT`. They are not pushed
+under their membership id on purpose (that number can be another person's account pin on
+the same terminal). The WARNING line just above it in the log lists a sample of `userId` /
+`activeMembershipId`. A full member refresh fills the field.
+`[CODE: app/core/device_sync.py::_filter_users_for_device]`
+
+**When did a device switch pin scheme?**
+
+```bash
+grep -F "[T] PIN_SCHEME_SWITCH" app-*.log
+```
+
+`previous=` / `scheme=` / `cleared_rows=` for `device_id`. From that moment the client pushes the new
+scheme's pins; the terminal keeps the old scheme's users until an operator wipes it. Door events stamped
+before the switch are read under `previous`. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
+
 > **Per-pin success lines are deliberately not emitted.** The STA thread pumps no COM
 > messages while a command runs and the log handler writes inline, so a line per member on
 > a 928-member push would widen that window — a behaviour change, not instrumentation.
@@ -297,11 +320,17 @@ means whole-user deletion was consistently confirmed; `mode=neutralised` means t
 disabled blank-card row and every locally tracked finger-slot clear were confirmed.
 `MEMBER_REVOKE_FAILED` keeps local ownership state and schedules full reconciliation.
 `MEMBER_REVOKE_OWNERSHIP_MISSING` makes no destructive device call.
+`MEMBER_REVOKE_DONE mode=repushed` (pinScheme=ACCOUNT devices) means the member lost ONE membership
+but still holds another this device accepts: the person's pin stayed and its row was re-pushed without the
+revoked plan. `MEMBER_REVOKE_PIN_UNKNOWN` means the membership could not be mapped to a person's pin, so
+nothing was removed and a full sync was requested.
 `[CODE: app/core/ultra_engine.py::_run_standalone_member_revoke]`
 
 For full reconciliation, `REVOKE_DONE deleted= neutralised= slots= ok=` counts only
 confirmed outcomes. `ok=False` means at least one PIN or local-state cleanup remains
 for retry.
+`REVOKE_SKIP_INCOMPLETE_ROSTER withheld=N` means the pass did not run at all: N deliverable members on an
+ACCOUNT-pin device have no `mainAccountId`, so departed pins cannot be told apart from theirs.
 
 ---
 

@@ -19,6 +19,12 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
+from app.core.pin_scheme import (
+    PIN_SCHEME_MEMBERSHIP,
+    PIN_SCHEME_UNKNOWN,
+    normalize_pin_scheme,
+    recognized_pin_scheme,
+)
 from app.core.utils import ensure_dirs, format_ts, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -563,6 +569,173 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col_name: str, col_def_
         pass
 
 
+# The two member progress markers. Dropping BOTH makes the next getSyncData run a FULL
+# member refresh (sync_scope.strip_all_member_version_tokens documents the same pair).
+_MEMBER_VERSION_TOKEN_KEYS = ("membersVersion", "membersUpdatedAfter")
+
+
+def _ensure_main_account_id_column(
+    conn: sqlite3.Connection,
+    *,
+    column_was_present: bool | None = None,
+) -> bool:
+    """Add ``sync_users.main_account_id``; when it is NEWLY added, force ONE full member refresh.
+
+    WHY THE REFRESH. Once the column exists every cached row is NULL until the members
+    section is re-fetched -- and nothing re-fetches it: the backend's ``membersVersion``
+    token does not change because a client upgraded, so each sync answers
+    ``refreshMembers=false`` or a delta naming only members that happened to change.
+    Under ``pinScheme=ACCOUNT`` those NULL rows are WITHHELD from the device
+    (device_sync._filter_users_for_device), indefinitely. Dropping the two member progress
+    tokens is the house mechanism for "rebuild the member cache" (hard reset,
+    ``sync_scope.strip_all_member_version_tokens``, the ``members_delete_refused`` retry):
+    the next ``getSyncData`` carries neither, so the backend answers in FULL mode and
+    ``_apply_full_users_refresh`` UPDATEs every row whose ``main_account_id`` differs.
+    Other sections' tokens are kept.
+
+    ONE-SHOT. Acts only when the column was absent, so it never re-forces a refresh.
+
+    ``column_was_present`` is what ``init_db`` measured BEFORE
+    ``_rebuild_sync_users_without_legacy_fingerprint``: that rebuild re-creates the table
+    WITH an empty ``main_account_id``, so testing the column only afterwards would see it
+    "already there" on a legacy database and skip the refresh its NULL rows need.
+
+    ATOMIC. The DELETE runs BEFORE the ALTER, so both sit in the one transaction ``init_db``
+    commits at its end (Python's sqlite3 opens it at the DELETE and does not commit before
+    DDL): a crash in between rolls both back and the next start detects the missing column
+    again. The other order would autocommit a lone ALTER (DDL outside a transaction) and
+    lose the refresh for good. [TEST: tests/test_account_pin_sqlite_roundtrip.py]
+
+    Returns True when the column was added.
+    """
+    cols = set(_table_columns(conn, "sync_users"))
+    if not cols:
+        return False
+    present_before = ("main_account_id" in cols) if column_was_present is None else bool(column_was_present)
+    if present_before:
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    cursor = conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key IN (?, ?)",
+        _MEMBER_VERSION_TOKEN_KEYS,
+    )
+    dropped = int(cursor.rowcount or 0)
+    if "main_account_id" not in cols:
+        conn.execute("ALTER TABLE sync_users ADD COLUMN main_account_id INTEGER")
+    logging.getLogger(__name__).warning(
+        "[DB] sync_users.main_account_id added; dropped %d member version token(s) so the "
+        "next getSyncData runs a FULL member refresh and fills the column for every cached "
+        "member (guide §3.2d).",
+        dropped,
+    )
+    return True
+
+
+def _ensure_pin_scheme_column(
+    conn: sqlite3.Connection,
+    *,
+    table_existed: bool,
+    column_was_present: bool,
+) -> bool:
+    """Add ``sync_devices.pin_scheme``; when an EXISTING table gains it, force ONE device refresh.
+
+    WHY (review #13). The column arrives NULL and the backend's ``devicesVersion`` does not
+    change because a client upgraded, so every sync answers ``refreshDevices=false``. A device
+    an operator set to ACCOUNT while this PC still ran the old client would read as MEMBERSHIP
+    -- no switch recorded, no hash cleared -- until some unrelated device edit moved
+    ``devicesVersion``, and then switch with no wipe in between. Dropping ``devicesVersion``
+    (the device section's only progress token) makes the next ``getSyncData`` send the device
+    section in full, exactly as ``_ensure_main_account_id_column`` does for members.
+
+    It also records every device already in the table as SEEN on MEMBERSHIP: the client that
+    wrote this database had no other scheme, so the ACCOUNT value the refresh brings is a real
+    switch (hashes cleared, CRITICAL), not a first sighting of unknown history (guide §3.2e).
+
+    ONE-SHOT and ATOMIC like the members helper: the token DELETE runs before the ALTER, so both
+    sit in the single transaction ``init_db`` commits. A fresh database (no table before
+    ``init_db``) is not an upgrade and keeps its tokens.
+    """
+    if column_was_present:
+        return False
+    if not table_existed:
+        _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    dropped = int(conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key = ?", ("devicesVersion",),
+    ).rowcount or 0)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_pin_scheme_seen (
+            device_id     INTEGER PRIMARY KEY,
+            first_scheme  TEXT    NOT NULL,
+            first_seen_at TEXT    NOT NULL
+        );
+        """
+    )
+    seeded = int(conn.execute(
+        "INSERT OR IGNORE INTO device_pin_scheme_seen (device_id, first_scheme, first_seen_at) "
+        "SELECT DISTINCT id, ?, ? FROM sync_devices WHERE id IS NOT NULL",
+        (PIN_SCHEME_MEMBERSHIP, now_iso()),
+    ).rowcount or 0)
+    if "pin_scheme" not in set(_table_columns(conn, "sync_devices")):
+        conn.execute("ALTER TABLE sync_devices ADD COLUMN pin_scheme TEXT")
+    logging.getLogger(__name__).warning(
+        "[DB] sync_devices.pin_scheme added; dropped %d devicesVersion token(s) so the next "
+        "getSyncData refreshes every device, and recorded %d known device(s) as seen on "
+        "MEMBERSHIP (guide §3.2d/§3.2e).",
+        dropped, seeded,
+    )
+    return True
+
+
+def _member_main_account_id(u: Dict[str, Any]) -> Any:
+    """The mainAccountId a member dict carries: camelCase from the backend payload,
+    snake_case from a cached row. None when absent."""
+    value = u.get("mainAccountId")
+    if value is None:
+        value = u.get("main_account_id")
+    return value
+
+
+def _refresh_member_account_links(cur: Any) -> None:
+    """Record every cached (activeMembershipId -> mainAccountId) pair in member_account_link.
+
+    Called at the end of every sync_users write transaction. The link outlives the member
+    row on purpose: a REVOKED membership's sync_users row (and its member_shadow row) are
+    deleted before the device worker acts on the revocation, and under pinScheme=ACCOUNT
+    that worker must still name the person's device pin. Rows are never deleted here; an
+    UPDATE happens only when the pair actually changed.
+    """
+    cur.execute(
+        """
+        INSERT INTO member_account_link (active_membership_id, main_account_id, updated_at)
+        SELECT active_membership_id, main_account_id, ?
+        FROM sync_users
+        WHERE active_membership_id IS NOT NULL AND main_account_id IS NOT NULL
+        ON CONFLICT(active_membership_id) DO UPDATE SET
+            main_account_id = excluded.main_account_id,
+            updated_at = excluded.updated_at
+        WHERE member_account_link.main_account_id IS NOT excluded.main_account_id
+        """,
+        (now_iso(),),
+    )
+
+
 def _sync_users_has_legacy_fingerprint(conn: sqlite3.Connection) -> bool:
     cols = _table_columns(conn, "sync_users")
     return "fingerprint" in cols
@@ -675,7 +848,12 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             fingerprints_json TEXT,
             face_id TEXT,
             account_username_id TEXT,
-            qr_code_payload TEXT
+            qr_code_payload TEXT,
+            birthday TEXT,
+            image_source TEXT,
+            user_image_status TEXT,
+            user_profile_image TEXT,
+            main_account_id INTEGER
         );
         """
     )
@@ -692,7 +870,9 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             full_name, phone, email, valid_from, valid_to,
             first_card_id, second_card_id, image,
             fingerprints_json,
-            face_id, account_username_id, qr_code_payload
+            face_id, account_username_id, qr_code_payload,
+            birthday, image_source, user_image_status, user_profile_image,
+            main_account_id
         )
         SELECT
             {sel("user_id")},
@@ -709,7 +889,12 @@ def _rebuild_sync_users_without_legacy_fingerprint(conn: sqlite3.Connection) -> 
             {fps_expr},
             {sel("face_id")},
             {sel("account_username_id")},
-            {sel("qr_code_payload")}
+            {sel("qr_code_payload")},
+            {sel("birthday")},
+            {sel("image_source")},
+            {sel("user_image_status")},
+            {sel("user_profile_image")},
+            {sel("main_account_id")}
         FROM sync_users;
         """
     )
@@ -858,13 +1043,16 @@ def init_db() -> None:
         _ensure_column(conn, "sync_firmware_profiles", "template_version_bias",
                        "template_version_bias INTEGER DEFAULT 0")
 
-        _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
-        _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
-        _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
-        _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
-        _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
-        _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
-        _ensure_column(conn, "sync_users", "user_profile_image", "user_profile_image TEXT")
+        # ORDER IS LOAD-BEARING. _rebuild_sync_users_without_legacy_fingerprint re-creates
+        # sync_users from a HARDCODED column list, so every sync_users _ensure_column runs
+        # AFTER it. Placed before (as they used to be), a column survives on a fresh
+        # database -- every test passes -- and is silently dropped on the legacy database
+        # the rebuild exists for: birthday / image_source / user_image_status /
+        # user_profile_image were added and then dropped that way, so the next write naming
+        # them failed. Same trap as template_version_bias above.
+        # [TEST: tests/test_account_pin_sqlite_roundtrip.py::test_a_legacy_database_is_rebuilt_without_losing_a_column]
+        # Measured BEFORE the rebuild, which re-creates the table with an empty column.
+        _main_account_col_before = "main_account_id" in set(_table_columns(conn, "sync_users"))
         try:
             _rebuild_sync_users_without_legacy_fingerprint(conn)
         except Exception as _mig_exc:
@@ -872,11 +1060,28 @@ def init_db() -> None:
                 "[DB] schema migration _rebuild_sync_users failed: %s",
                 _mig_exc,
             )
+        _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
+        _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
+        _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
+        _ensure_column(conn, "sync_users", "birthday",           "birthday TEXT")
+        _ensure_column(conn, "sync_users", "image_source",       "image_source TEXT")
+        _ensure_column(conn, "sync_users", "user_image_status",  "user_image_status TEXT")
+        _ensure_column(conn, "sync_users", "user_profile_image", "user_profile_image TEXT")
+        # The PERSON behind a member row (backend mainAccountId). NULL until the members
+        # section is re-fetched, which the helper forces exactly once. guide §3.2d.
+        try:
+            _ensure_main_account_id_column(conn, column_was_present=_main_account_col_before)
+        except Exception as _mig_exc:
+            logging.getLogger(__name__).error(
+                "[DB] schema migration sync_users.main_account_id failed: %s",
+                _mig_exc,
+            )
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_users_first_card ON sync_users(first_card_id) WHERE first_card_id IS NOT NULL;")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_users_second_card ON sync_users(second_card_id) WHERE second_card_id IS NOT NULL;")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_users_main_account ON sync_users(main_account_id) WHERE main_account_id IS NOT NULL;")
 
         # -----------------------------
         # memberships
@@ -982,6 +1187,11 @@ def init_db() -> None:
         # -----------------------------
         # devices (matches GymDeviceDto)
         # -----------------------------
+        # Measured BEFORE the CREATE below, which gives a fresh database the column: only a
+        # database that already had sync_devices without pin_scheme is an upgrade.
+        _sync_devices_cols_before = set(_table_columns(conn, "sync_devices"))
+        _sync_devices_existed_before = bool(_sync_devices_cols_before)
+        _pin_scheme_col_before = "pin_scheme" in _sync_devices_cols_before
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_devices (
@@ -1061,6 +1271,8 @@ def init_db() -> None:
 
                 roster_pushing_policy TEXT,
 
+                pin_scheme TEXT,
+
                 device_capabilities TEXT
             );
             """
@@ -1132,6 +1344,23 @@ def init_db() -> None:
         # sync deletes device users not in the app roster (guarded, ZK_STANDALONE only).
         _ensure_column(conn, "sync_devices", "roster_pushing_policy", "roster_pushing_policy TEXT")
 
+        # Per-device PIN scheme (backend GymDeviceDto.pinScheme). NULL/absent -> MEMBERSHIP
+        # (activeMembershipId pins, exactly the pre-existing behaviour); 'ACCOUNT' ->
+        # main_account.id pins. Read by device_sync.device_pin_scheme. Delivered on the same
+        # path as roster_pushing_policy. See guide §3.2b. When NEWLY added the helper forces one
+        # device-section refresh (review #13, guide §3.2d).
+        try:
+            _ensure_pin_scheme_column(
+                conn,
+                table_existed=_sync_devices_existed_before,
+                column_was_present=_pin_scheme_col_before,
+            )
+        except Exception as _mig_exc:
+            logging.getLogger(__name__).error(
+                "[DB] schema migration sync_devices.pin_scheme failed: %s", _mig_exc,
+            )
+            _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
+
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
         # parsed back to a dict on payload projection. NULL/absent -> no capabilities.
@@ -1160,6 +1389,41 @@ def init_db() -> None:
                 last_plan_at    TEXT,
                 last_plan_count INTEGER,
                 last_plan_sample TEXT
+            );
+            """
+        )
+
+        # Every change of a device's pinScheme, oldest first. Deliberately NOT a column of
+        # sync_devices: every device-section refresh DELETEs that table and re-inserts it, so
+        # a switch time kept there would reset on the next sync and every earlier door event
+        # would then resolve under the new scheme. No row for a device = this DB has only seen
+        # it on MEMBERSHIP (or not at all). A row with previous_scheme='UNKNOWN' is a FIRST
+        # SIGHTING already on ACCOUNT: events before it have no known scheme. guide §3.2e.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_pin_scheme_switch (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id       INTEGER NOT NULL,
+                previous_scheme TEXT    NOT NULL,
+                scheme          TEXT    NOT NULL,
+                switched_at     TEXT    NOT NULL,
+                cleared_rows    INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dpss_device ON device_pin_scheme_switch(device_id, id);"
+        )
+        # Which devices this DB has seen with an explicit pinScheme, and on which. It is what
+        # tells a FIRST SIGHTING already on ACCOUNT (history before it unknown: a new or
+        # reinstalled PC) from a device this DB watched on MEMBERSHIP and then saw switch.
+        # Not in sync_devices, for the same reason as the switch table. guide §3.2e.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_pin_scheme_seen (
+                device_id     INTEGER PRIMARY KEY,
+                first_scheme  TEXT    NOT NULL,
+                first_seen_at TEXT    NOT NULL
             );
             """
         )
@@ -1469,6 +1733,13 @@ def init_db() -> None:
             );
             """
         )
+        # Which field produced the pin (device_sync.PIN_SOURCE_*: ACCOUNT / MEMBERSHIP /
+        # USER). The report cannot infer it from the digits -- 110 account ids equal
+        # another person's membership id -- so it is recorded at push time. NULL = a row
+        # written before this column: every pin was membership-derived then (mainAccountId
+        # never reached the roster, guide §3.2d), and a userId-keyed member cannot own a
+        # UserFingerprint, so NULL reads as MEMBERSHIP.
+        _ensure_column(conn, "fingerprint_push_status", "pin_source", "pin_source TEXT")
         # What we last SENT upstream, so only transitions are reported. Without this
         # every tick would re-POST the same unchanged state, and each backend write
         # re-flags the member in the next delta poll.
@@ -1483,6 +1754,35 @@ def init_db() -> None:
             );
             """
         )
+        # The same record keyed by (pin_source, pin, finger_id). The v1 key cannot hold an
+        # ACCOUNT pin 5 and a MEMBERSHIP pin 5 -- two different people -- at once. v1 is
+        # left in place and no longer written; its rows are copied ONCE, as MEMBERSHIP (the
+        # only scheme that existed when they were written), when v2 is first created, so a
+        # transition already reported is not re-sent after the upgrade.
+        _push_reported_v2_existed = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fingerprint_push_reported_v2'"
+        ).fetchone())
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fingerprint_push_reported_v2 (
+                pin_source TEXT NOT NULL,
+                pin TEXT NOT NULL,
+                finger_id INTEGER NOT NULL,
+                last_reported TEXT,
+                reported_at TEXT NOT NULL,
+                PRIMARY KEY (pin_source, pin, finger_id)
+            );
+            """
+        )
+        if not _push_reported_v2_existed:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO fingerprint_push_reported_v2
+                    (pin_source, pin, finger_id, last_reported, reported_at)
+                SELECT 'MEMBERSHIP', pin, finger_id, last_reported, reported_at
+                FROM fingerprint_push_reported
+                """
+            )
         # Safe installed-base migration. Successful rows are affirmative proof;
         # a recorded finger set also proves an earlier successful standalone push.
         conn.execute(
@@ -1815,6 +2115,30 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ms_card ON member_shadow(card_id) WHERE card_id IS NOT NULL;"
+        )
+        # member_shadow.pin holds the activeMembershipId. It is NOT the device pin once a
+        # device runs pinScheme=ACCOUNT, and nothing reads it: every member_shadow reader
+        # selects active_membership_id / card_id or compares card, name, fp_hash, dates and
+        # membership_id (grep "FROM member_shadow", 2026-09-12). The mapping a revocation
+        # actually needs -- membership -> person -- lives in member_account_link below,
+        # because shadow rows are deleted in the same step that produces the revoked ids.
+
+        # Durable activeMembershipId -> mainAccountId link, refreshed from sync_users by
+        # _refresh_member_account_links at the end of every sync_users write and never
+        # deleted with the member. Under pinScheme=ACCOUNT a revoked membership must still
+        # resolve to its person's device pin after its sync_users row is gone. One small row
+        # per membership ever seen. guide §3.2b.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_account_link (
+                active_membership_id INTEGER PRIMARY KEY,
+                main_account_id      INTEGER NOT NULL,
+                updated_at           TEXT    NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mal_account ON member_account_link(main_account_id);"
         )
 
         # -----------------------------
@@ -2708,8 +3032,8 @@ def upsert_delta_users(users: list[dict]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id,
                     qr_code_payload, birthday, image_source, user_image_status,
-                    user_profile_image
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    user_profile_image, main_account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"), am_id, m_id,
@@ -2722,8 +3046,10 @@ def upsert_delta_users(users: list[dict]) -> None:
                     u.get("qrCodePayload"), u.get("birthday"),
                     u.get("imageSource"), u.get("userImageStatus"),
                     u.get("userProfileImage"),
+                    _member_main_account_id(u),
                 ),
             )
+        _refresh_member_account_links(conn)
         conn.commit()
 
 
@@ -3268,6 +3594,21 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
     if adm not in ("DEVICE", "AGENT", "ULTRA"):
         adm = "DEVICE"
 
+    # pinScheme: only an explicit, recognised value is stored as given. An absent key, null,
+    # "" or an unknown token keeps the LAST KNOWN scheme (the switch history -- sync_devices
+    # itself is deleted and re-inserted on every device refresh), so a partial payload never
+    # turns an ACCOUNT terminal back into a MEMBERSHIP one. Review #6, guide §3.2e.
+    explicit_pin_scheme = _explicit_device_pin_scheme(d)
+    stored_pin_scheme = explicit_pin_scheme
+    if stored_pin_scheme is None:
+        stored_pin_scheme = _last_known_device_pin_scheme(cur, _to_int_or_none(d.get("id")))
+        if stored_pin_scheme is not None:
+            logging.getLogger(__name__).warning(
+                "[DB] device id=%s payload carries no recognised pinScheme (%r); keeping the last "
+                "known scheme %s -- only an explicit value switches a device (guide §3.2e).",
+                d.get("id"), d.get("pinScheme", d.get("pin_scheme")), stored_pin_scheme,
+            )
+
     cur.execute(
         """
         INSERT INTO sync_devices (
@@ -3310,6 +3651,8 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             roster_pushing_policy,
 
+            pin_scheme,
+
             device_capabilities
         )
         VALUES (
@@ -3333,6 +3676,7 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
             ?, ?, ?,
             ?,
             ?, ?,
+            ?,
             ?,
             ?,
             ?
@@ -3416,9 +3760,141 @@ def _insert_device_row(cur: sqlite3.Cursor, d: dict) -> None:
 
             (_safe_str(d.get("rosterPushingPolicy") or d.get("roster_pushing_policy"), "").strip().upper() or None),
 
+            stored_pin_scheme,
+
             _device_capabilities_to_text(d.get("deviceCapabilities") or d.get("device_capabilities")),
         ),
     )
+
+    # Same transaction as the device row: every device write path (full, delta, fast patch)
+    # comes through here, so a pinScheme change is detected exactly once, wherever it arrives.
+    _record_device_pin_scheme_switch(cur, d)
+
+
+def _explicit_device_pin_scheme(d: dict) -> Optional[str]:
+    """The pinScheme a device payload states explicitly and this client recognises, else None."""
+    raw = d.get("pinScheme")
+    if raw is None:
+        raw = d.get("pin_scheme")
+    return recognized_pin_scheme(raw)
+
+
+def _last_known_device_pin_scheme(cur: sqlite3.Cursor, device_id: Optional[int]) -> Optional[str]:
+    """The scheme of the device's latest recorded switch; None when it has none."""
+    if device_id is None:
+        return None
+    row = cur.execute(
+        "SELECT scheme FROM device_pin_scheme_switch WHERE device_id=? ORDER BY id DESC LIMIT 1",
+        (int(device_id),),
+    ).fetchone()
+    return normalize_pin_scheme(row[0]) if row else None
+
+
+def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
+    """Detect and record a change of this device's pinScheme. Returns True on a switch.
+
+    On a switch, in the caller's transaction:
+      * the device's per-pin sync hashes are cleared through the SAME statement
+        clear_device_sync_hashes / hard reset use (UPDATE desired_hash=NULL, last_ok=0 --
+        never DELETE: ownership_confirmed and pushed_finger_ids are the only proof of which
+        pins Access put on a shared terminal, guide §3.2c);
+      * a device_pin_scheme_switch row records previous scheme, new scheme and the PC time,
+        which the inbound resolver uses to read a door event under the scheme its pin was
+        minted with;
+      * it is logged CRITICAL: the terminal still holds the previous scheme's users and
+        MUST be wiped by an operator. Nothing here wipes it.
+
+    The current scheme is the latest recorded switch, MEMBERSHIP when there is none. Only an
+    explicit, recognised ``pinScheme`` can switch: an absent key, null, "" or an unknown
+    token is not evidence of a change (review #6).
+
+    FIRST SIGHTING (review #1/#14). A device this DB has never seen with an explicit scheme
+    (no ``device_pin_scheme_seen`` row, no switch row) is recorded as seen. On MEMBERSHIP that
+    is all. Already on ACCOUNT, WHEN it switched is not known -- a new or reinstalled PC, a
+    lost SQLite file -- so the row is written with ``previous_scheme='UNKNOWN'``, which makes
+    ``pin_scheme.scheme_at`` answer None (the unknown-scheme rule) for events before it
+    instead of inventing a MEMBERSHIP window ending at PC-now. Hashes are still cleared (an
+    idempotent UPDATE; state rows here were pushed before any scheme was recorded, i.e. as
+    membership pins), and the operator is told to wipe only when such rows existed.
+    """
+    did = _to_int_or_none(d.get("id"))
+    if did is None:
+        return False
+    new_scheme = _explicit_device_pin_scheme(d)
+    if new_scheme is None:
+        return False
+    last_known = _last_known_device_pin_scheme(cur, did)
+    first_sighting = last_known is None and cur.execute(
+        "SELECT 1 FROM device_pin_scheme_seen WHERE device_id=?", (did,),
+    ).fetchone() is None
+    switched_at = now_iso()
+    if first_sighting:
+        cur.execute(
+            "INSERT OR IGNORE INTO device_pin_scheme_seen (device_id, first_scheme, first_seen_at) "
+            "VALUES (?, ?, ?)",
+            (did, new_scheme, switched_at),
+        )
+        if new_scheme == PIN_SCHEME_MEMBERSHIP:
+            return False
+        current = PIN_SCHEME_UNKNOWN
+    else:
+        current = last_known or PIN_SCHEME_MEMBERSHIP
+        if new_scheme == current:
+            return False
+    cleared = _clear_device_sync_hashes_on(cur, did)
+    cur.execute(
+        """
+        INSERT INTO device_pin_scheme_switch
+            (device_id, previous_scheme, scheme, switched_at, cleared_rows)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (did, current, new_scheme, switched_at, int(cleared)),
+    )
+    log = logging.getLogger(__name__)
+    if first_sighting and not cleared:
+        log.warning(
+            "[DB] device id=%s name=%r first seen by this database already on pinScheme=%s at %s. "
+            "Not a switch: when it switched is unknown, so door events stamped before now are read "
+            "under the unknown-scheme rule (guide §3.2e).",
+            did, d.get("name"), new_scheme, switched_at,
+        )
+    else:
+        log.critical(
+            "[DB] device id=%s name=%r pinScheme %s -> %s at %s; cleared %d per-pin sync "
+            "hash(es) (ownership evidence kept). The terminal may still hold %s-scheme users "
+            "this PC pushed: an operator MUST wipe its users before it is trusted again "
+            "(guide §3.2e).",
+            did, d.get("name"), current, new_scheme, switched_at, cleared,
+            PIN_SCHEME_MEMBERSHIP if first_sighting else current,
+        )
+    try:
+        _tel.warn("PIN_SCHEME_SWITCH", device_id=did, previous=current, scheme=new_scheme,
+                  cleared_rows=int(cleared), first_sighting=bool(first_sighting))
+    except Exception:
+        pass
+    return True
+
+
+def list_device_pin_scheme_switches(*, device_id: int | None = None) -> Dict[int, List[Dict[str, Any]]]:
+    """{device_id: [{"previous_scheme", "scheme", "switched_at"}, ...]} oldest first.
+
+    ``switched_at`` is now_iso() text -- local PC time, the clock and shape access_history
+    ``created_at`` uses. A device with no entry has only been seen on MEMBERSHIP. An entry
+    whose ``previous_scheme`` is ``UNKNOWN`` is a first sighting already on that scheme.
+    """
+    sql = "SELECT device_id, previous_scheme, scheme, switched_at FROM device_pin_scheme_switch"
+    params: tuple = ()
+    if device_id is not None:
+        sql += " WHERE device_id=?"
+        params = (int(device_id),)
+    sql += " ORDER BY device_id, id"
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    with get_conn() as conn:
+        for r in conn.execute(sql, params).fetchall():
+            out.setdefault(int(r[0]), []).append(
+                {"previous_scheme": r[1], "scheme": r[2], "switched_at": r[3]}
+            )
+    return out
 
 
 @_tel.timed("CACHE_SAVE_FULL", slow_ms=100, warn_ms=2000)
@@ -3663,8 +4139,9 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     first_card_id, second_card_id, image,
                     fingerprints_json,
                     face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status, user_profile_image
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image,
+                    main_account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     u.get("userId"),
@@ -3686,8 +4163,10 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     u.get("imageSource"),
                     u.get("userImageStatus"),
                     u.get("userProfileImage"),
+                    _member_main_account_id(u),
                 ),
             )
+        _refresh_member_account_links(cur)
 
         # memberships
         for m in memberships:
@@ -4090,8 +4569,9 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             first_card_id, second_card_id, image,
             fingerprints_json,
             face_id, account_username_id, qr_code_payload, birthday,
-            image_source, user_image_status, user_profile_image
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            image_source, user_image_status, user_profile_image,
+            main_account_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             member.get("userId"),
@@ -4113,6 +4593,7 @@ def _upsert_sync_user_row(cur: sqlite3.Cursor, member: Dict[str, Any]) -> None:
             member.get("imageSource"),
             member.get("userImageStatus"),
             member.get("userProfileImage"),
+            _member_main_account_id(member),
         ),
     )
 
@@ -4285,6 +4766,7 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
             applied += 1
             applied_item_indexes.append(item_index)
 
+        _refresh_member_account_links(cur)
         conn.commit()
 
     return {
@@ -4305,17 +4787,23 @@ _SYNC_USER_COLUMNS: tuple[str, ...] = (
     "first_card_id", "second_card_id", "image",
     "fingerprints_json", "face_id", "account_username_id", "qr_code_payload", "birthday",
     "image_source", "user_image_status", "user_profile_image",
+    # APPENDED, never inserted earlier: the diff keys rows on positions 0 and 1. Part of the
+    # diffed tuple on purpose -- a row whose ONLY change is a newly-arrived mainAccountId
+    # must compare unequal, or the forced refresh of §3.2d would leave it NULL forever.
+    "main_account_id",
 )
-# Schema affinities (CREATE TABLE sync_users + the _ensure_column migrations): the three
+# Schema affinities (CREATE TABLE sync_users + the _ensure_column migrations): the four
 # ids are INTEGER, every other column is TEXT.
-_SYNC_USER_INTEGER_COLUMNS = frozenset({"user_id", "active_membership_id", "membership_id"})
+_SYNC_USER_INTEGER_COLUMNS = frozenset(
+    {"user_id", "active_membership_id", "membership_id", "main_account_id"}
+)
 _SYNC_USER_COLUMN_IS_INTEGER: tuple[bool, ...] = tuple(
     c in _SYNC_USER_INTEGER_COLUMNS for c in _SYNC_USER_COLUMNS
 )
 
 
 def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
-    """The 19 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
+    """The 20 values the sync_users INSERT binds, in _SYNC_USER_COLUMNS order.
 
     Mirrors the delta-branch INSERT exactly -- same activeMembershipId -> membershipId
     fallback, same key aliases, same json.dumps of the templates -- so a full and a
@@ -4339,6 +4827,7 @@ def _sync_user_row_values(u: Dict[str, Any]) -> tuple:
         u.get("imageSource"),
         u.get("userImageStatus"),
         u.get("userProfileImage"),
+        _member_main_account_id(u),
     )
 
 
@@ -4408,7 +4897,7 @@ def _apply_full_users_refresh(
     superseded and a current membership is two keys and both survive.
 
       * key not stored                      -> INSERT
-      * key stored, any of the 19 columns
+      * key stored, any of the 20 columns
         differs after affinity normalisation -> UPDATE ... WHERE rowid=?  (rowid stable)
       * key stored, identical               -> untouched (no write at all)
       * key stored, absent from the payload -> DELETE.  Derived from the incoming key
@@ -4431,7 +4920,7 @@ def _apply_full_users_refresh(
     fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
 
     t_diff = time.perf_counter()
-    # key -> (rowid, normalised 19-tuple) for every diffable stored row
+    # key -> (rowid, normalised 20-tuple) for every diffable stored row
     current: Dict[tuple, tuple[int, tuple]] = {}
     doomed: List[int] = []  # NULL-key rows (+ defensively: a duplicate key, impossible under the index)
     for row in existing:
@@ -4472,8 +4961,8 @@ def _apply_full_users_refresh(
                     full_name, phone, email, valid_from, valid_to,
                     first_card_id, second_card_id, image,
                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                    image_source, user_image_status, user_profile_image
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_source, user_image_status, user_profile_image, main_account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 vals,
             )
@@ -4491,7 +4980,8 @@ def _apply_full_users_refresh(
                     full_name=?, phone=?, email=?, valid_from=?, valid_to=?,
                     first_card_id=?, second_card_id=?, image=?,
                     fingerprints_json=?, face_id=?, account_username_id=?, qr_code_payload=?, birthday=?,
-                    image_source=?, user_image_status=?, user_profile_image=?
+                    image_source=?, user_image_status=?, user_profile_image=?,
+                    main_account_id=?
                 WHERE rowid=?
                 """,
                 vals + (hit[0],),
@@ -4802,8 +5292,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     full_name, phone, email, valid_from, valid_to,
                                     first_card_id, second_card_id, image,
                                     fingerprints_json, face_id, account_username_id, qr_code_payload, birthday,
-                                    image_source, user_image_status, user_profile_image
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    image_source, user_image_status, user_profile_image,
+                                    main_account_id
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
                                     u.get("userId"), am_id, m_id,
@@ -4817,6 +5308,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                     u.get("imageSource"),
                                     u.get("userImageStatus"),
                                     u.get("userProfileImage"),
+                                    _member_main_account_id(u),
                                 ),
                             )
                             upserted_count += 1
@@ -4983,6 +5475,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                             "[SYNC-DEBUG] save_sync_cache_delta: after members update, new_db_count=%d",
                             new_count,
                         )
+            # Same transaction as the member rows, on both branches (delta and full).
+            _refresh_member_account_links(cur)
         else:
             _logger.info("[SYNC-DEBUG] save_sync_cache_delta: refreshMembers=False, skipping members section")
 
@@ -5103,6 +5597,10 @@ def _coerce_user_row_to_payload(u: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "userId": g("userId", "userid", "user_id", "id"),
         "activeMembershipId": active_membership_id,
+        # The PERSON (main_account.id). Without this key every cached row read back with no
+        # mainAccountId, so the account pin, the collapse and the account index were inert
+        # in the field. guide §3.2d.
+        "mainAccountId": g("mainAccountId", "main_account_id"),
         "membershipId": membership_id,
         "fullName": g("fullName", "full_name", "name"),
         "phone": g("phone"),
@@ -5319,6 +5817,10 @@ def _coerce_device_row_to_payload(d: Dict[str, Any]) -> Dict[str, Any]:
         # Roster pushing policy (PRESERVE default / MIRROR). None -> engine treats as
         # PRESERVE, so pre-migration rows keep the additive behavior.
         "rosterPushingPolicy": g("rosterPushingPolicy", "roster_pushing_policy"),
+
+        # PIN scheme (MEMBERSHIP default / ACCOUNT). None -> device_sync.device_pin_scheme
+        # answers MEMBERSHIP, so pre-migration rows keep membership pins.
+        "pinScheme": g("pinScheme", "pin_scheme"),
 
         # Opaque capability descriptor (e.g. {"fingerprintTemplateVersion": 9}).
         # Parsed dict when the stored JSON is valid, else None.
@@ -6309,6 +6811,84 @@ def list_sync_users_by_active_membership_ids(
     return [_coerce_user_row_to_payload(r) for r in rows]
 
 
+def list_sync_users_by_main_account_ids(
+    main_account_ids: List[int] | set[int] | tuple[int, ...],
+) -> List[Dict[str, Any]]:
+    """Every cached member row of the given people (one person may hold several memberships).
+
+    The targeted device paths need ALL of a person's rows under pinScheme=ACCOUNT: the device
+    row is the collapse of every membership the device accepts, so building it from the one
+    membership that changed would push a partial row -- the wrong validity window, and the
+    other plans' fingers missing.
+    """
+    normalized = sorted({
+        int(account_id)
+        for account_id in (main_account_ids or [])
+        if account_id is not None
+    })
+    if not normalized:
+        return []
+    placeholders = ",".join("?" for _ in normalized)
+    with get_conn() as conn:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                f"SELECT * FROM sync_users WHERE main_account_id IN ({placeholders})",
+                tuple(normalized),
+            ).fetchall()
+        ]
+    return [_coerce_user_row_to_payload(r) for r in rows]
+
+
+def list_sync_users_missing_main_account() -> List[Dict[str, Any]]:
+    """Cached member rows that carry no mainAccountId, WITHOUT templates.
+
+    Under pinScheme=ACCOUNT such a row is withheld from the device and its person's pin
+    cannot be named. A targeted removal of an account pin must first prove none of these is
+    deliverable to the device, or it could strip a person whose other membership row is
+    merely unfilled. Normally empty; after the forced full refresh (guide §3.2d) it stays
+    empty unless the backend omits the field.
+    """
+    with get_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_users)").fetchall()]
+        if "main_account_id" not in cols:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT " + ", ".join(f'"{c}"' for c in cols if c != "fingerprints_json")
+                + " FROM sync_users"
+            ).fetchall()] if cols else []
+        else:
+            keep = ", ".join(f'"{c}"' for c in cols if c != "fingerprints_json")
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT {keep} FROM sync_users WHERE main_account_id IS NULL"
+            ).fetchall()]
+    return [_coerce_user_row_to_payload(r) for r in rows]
+
+
+def get_main_account_ids_for_memberships(
+    active_membership_ids: List[int] | set[int] | tuple[int, ...],
+) -> Dict[int, int]:
+    """activeMembershipId -> mainAccountId from member_account_link.
+
+    Answers for a membership whose sync_users row is already gone (a revocation), which is
+    the point of the table. A membership never seen with a mainAccountId is absent.
+    """
+    normalized = sorted({
+        int(member_id)
+        for member_id in (active_membership_ids or [])
+        if member_id is not None
+    })
+    if not normalized:
+        return {}
+    placeholders = ",".join("?" for _ in normalized)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT active_membership_id, main_account_id FROM member_account_link "
+            f"WHERE active_membership_id IN ({placeholders})",
+            tuple(normalized),
+        ).fetchall()
+    return {int(r[0]): int(r[1]) for r in rows}
+
+
 def list_sync_memberships() -> List[Dict[str, Any]]:
     with get_conn() as conn:
         return [dict(r) for r in conn.execute("SELECT * FROM sync_memberships").fetchall()]
@@ -6966,7 +7546,8 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
 
 
 def upsert_fingerprint_push_status(
-    *, pin: str, finger_id: int, device_id: int, status: str, error_message: str | None
+    *, pin: str, finger_id: int, device_id: int, status: str, error_message: str | None,
+    pin_source: str | None = None,
 ) -> None:
     """Record the outcome of pushing ONE finger to ONE device.
 
@@ -6978,19 +7559,21 @@ def upsert_fingerprint_push_status(
     if not p:
         return
     err = (str(error_message or "")[:1000]) or None
+    source = (str(pin_source).strip().upper() or None) if pin_source is not None else None
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO fingerprint_push_status
-                (pin, finger_id, device_id, status, error_message, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (pin, finger_id, device_id, status, error_message, updated_at, pin_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(pin, finger_id, device_id) DO UPDATE SET
                 status = excluded.status,
                 error_message = excluded.error_message,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                pin_source = excluded.pin_source
             """,
-            (p, int(finger_id), int(device_id), str(status), err, now_iso()),
+            (p, int(finger_id), int(device_id), str(status), err, now_iso(), source),
         )
 
     _run_db_write_sync("upsert_fingerprint_push_status", _write)
@@ -7006,22 +7589,27 @@ def get_pending_fingerprint_push_reports() -> List[Dict[str, Any]]:
 
     Returns only TRANSITIONS. Re-reporting an unchanged state would make the backend
     write the row, which re-flags the member in the next delta poll.
+
+    Aggregated per (pin_source, pin, finger): pin 5 under ACCOUNT on one device and pin 5
+    under MEMBERSHIP on another are two different people and are never merged. Each item
+    carries ``pin_source`` so the report can name the right id (guide §3.2b).
     """
     with get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT s.pin AS pin,
+            SELECT COALESCE(s.pin_source, 'MEMBERSHIP') AS pin_source,
+                   s.pin AS pin,
                    s.finger_id AS finger_id,
                    MAX(CASE WHEN s.status <> 'OK' THEN 1 ELSE 0 END) AS any_failed,
                    MAX(CASE WHEN s.status <> 'OK' THEN s.error_message END) AS err
             FROM fingerprint_push_status s
-            GROUP BY s.pin, s.finger_id
+            GROUP BY COALESCE(s.pin_source, 'MEMBERSHIP'), s.pin, s.finger_id
             """
         ).fetchall()
         reported = {
-            (str(r["pin"]), int(r["finger_id"])): r["last_reported"]
+            (str(r["pin_source"]), str(r["pin"]), int(r["finger_id"])): r["last_reported"]
             for r in conn.execute(
-                "SELECT pin, finger_id, last_reported FROM fingerprint_push_reported"
+                "SELECT pin_source, pin, finger_id, last_reported FROM fingerprint_push_reported_v2"
             ).fetchall()
         }
 
@@ -7030,10 +7618,12 @@ def get_pending_fingerprint_push_reports() -> List[Dict[str, Any]]:
         pin = str(r["pin"] or "")
         if not pin:
             continue
+        source = str(r["pin_source"] or "MEMBERSHIP")
         fid = int(r["finger_id"])
         current = (str(r["err"]) if int(r["any_failed"] or 0) else None) or None
-        if reported.get((pin, fid), "\x00__never__") != current:
-            out.append({"pin": pin, "finger_id": fid, "error_message": current})
+        if reported.get((source, pin, fid), "\x00__never__") != current:
+            out.append({"pin": pin, "pin_source": source, "finger_id": fid,
+                        "error_message": current})
     return out
 
 
@@ -7044,16 +7634,18 @@ def mark_fingerprint_push_reported(items: Iterable[Dict[str, Any]]) -> int:
         pin = str((it or {}).get("pin") or "").strip()
         if not pin:
             continue
-        rows.append((pin, int(it.get("finger_id")), it.get("error_message"), now_iso()))
+        source = str(it.get("pin_source") or "MEMBERSHIP").strip().upper() or "MEMBERSHIP"
+        rows.append((source, pin, int(it.get("finger_id")), it.get("error_message"), now_iso()))
     if not rows:
         return 0
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         conn.executemany(
             """
-            INSERT INTO fingerprint_push_reported (pin, finger_id, last_reported, reported_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(pin, finger_id) DO UPDATE SET
+            INSERT INTO fingerprint_push_reported_v2
+                (pin_source, pin, finger_id, last_reported, reported_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(pin_source, pin, finger_id) DO UPDATE SET
                 last_reported = excluded.last_reported,
                 reported_at = excluded.reported_at
             """,
@@ -7124,19 +7716,27 @@ def prune_device_sync_state(*, device_id: int, keep_pins: Iterable[str]) -> int:
 
 
 # -----------------------------
+def _clear_device_sync_hashes_on(conn: Any, device_id: int) -> int:
+    """The one statement that invalidates a device's content hashes (UPDATE, never DELETE).
+
+    Shared by clear_device_sync_hashes and the pinScheme switch recorder, which must run it
+    inside the device-row transaction rather than through the DB writer queue."""
+    cursor = conn.execute(
+        """
+        UPDATE device_sync_state
+        SET desired_hash=NULL, last_ok=0, last_error='forced resync'
+        WHERE device_id=?
+        """,
+        (int(device_id),),
+    )
+    return int(cursor.rowcount or 0)
+
+
 def clear_device_sync_hashes(*, device_id: int) -> int:
     """Invalidate content hashes without discarding ownership or removal evidence."""
     did = int(device_id)
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
-        cursor = conn.execute(
-            """
-            UPDATE device_sync_state
-            SET desired_hash=NULL, last_ok=0, last_error='forced resync'
-            WHERE device_id=?
-            """,
-            (did,),
-        )
-        return int(cursor.rowcount or 0)
+        return _clear_device_sync_hashes_on(conn, did)
 
     return int(_run_db_write_sync("clear_device_sync_hashes", _write))
 

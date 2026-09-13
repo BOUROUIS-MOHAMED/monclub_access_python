@@ -19,8 +19,8 @@ now does the same — and, above all, the SAFETY DIRECTIONS:
 * a driver that cannot say which pins failed => every attempted pin is unconfirmed;
 * MIRROR always receives the FULL desired roster, never the incremental subset
   (passing the subset would delete every unchanged member off a live turnstile);
-* bracketed syncs (user-sync / daily-forced-sync / hard-reset) keep pushing every
-  pin — their semantics are unchanged.
+* an explicit full reconcile stays INCREMENTAL and unbracketed — the D6 bracket
+  never executed and would now bypass the driver's per-chunk wedge recovery.
 """
 
 from __future__ import annotations
@@ -197,8 +197,9 @@ def _worker(monkeypatch, *, driver=None, users=None):
     return w, cache
 
 
-def _full_sync(w, *, reason="timer", fingerprint_hash="h1"):
-    w.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash)
+def _full_sync(w, *, reason="timer", fingerprint_hash="h1", full_reconcile=False):
+    w.request_full_sync(reason=reason, fingerprint_hash=fingerprint_hash,
+                        full_reconcile=full_reconcile)
     assert w._drain_full_sync_commands(limit=1) == 1
     assert w._pending_full_sync_request is None, "full sync must always terminate"
 
@@ -316,15 +317,22 @@ class TestIncrementalFullSync:
         _full_sync(w)
         assert _pins(w._sdk.push_calls[1]) == {"118"}
 
-    @pytest.mark.parametrize("reason", ["user-sync", "daily-forced-sync", "hard-reset"])
-    def test_bracketed_reasons_push_everything_regardless_of_state(self, monkeypatch, state, reason):
+    def test_even_an_explicit_reconcile_stays_incremental_and_unbracketed(
+            self, monkeypatch, state):
+        """Plan decision D6 said the explicit/nightly reconcile would re-push every
+        pin under an EnableDevice bracket. It never once ran -- the condition was
+        `reason in ("user-sync", "daily-forced-sync", "hard-reset")` and `reason` is a
+        trigger_source token -- and the driver has since changed underneath it:
+        push_roster collapses a bracketed roster into ONE command, bypassing the
+        per-chunk timeout and the wedge recovery added because a single-command
+        950-member push meant the gym got only the first 10 members. So bracketing
+        stays OFF and the reconcile stays incremental. See guide §3.2c."""
         users = [_user(117, "Bob", "1"), _user(118, "Alice", "2")]
         w, _ = _worker(monkeypatch, users=users)
         _full_sync(w)                                   # everything now recorded synced
-        _full_sync(w, reason=reason)
-        users_pushed, _t, bracket = w._sdk.push_calls[1]
-        assert {u["pin"] for u in users_pushed} == {"117", "118"}
-        assert bracket is True
+        _full_sync(w, reason="sync_now_api", full_reconcile=True)
+        assert len(w._sdk.push_calls) == 1, "nothing changed -- no second push"
+        assert all(bracket is False for *_r, bracket in w._sdk.push_calls)
 
     def test_prune_forgets_pins_no_longer_desired(self, monkeypatch, state):
         users = [_user(117, "Bob", "1"), _user(118, "Alice", "2")]
@@ -509,7 +517,8 @@ class TestMirrorSafety:
         _full_sync(w)
         seen: Dict[str, Any] = {}
         monkeypatch.setattr(w, "_maybe_mirror_reconcile",
-                            lambda *, reason, roster_users: seen.update(roster=[u["pin"] for u in roster_users]))
+                            lambda *, full_reconcile, roster_users: seen.update(
+                                roster=[u["pin"] for u in roster_users]))
         cache.users[2]["firstCardId"] = "333"                 # only Eve changes
         _full_sync(w)
         assert _pins(w._sdk.push_calls[1]) == {"119"}
@@ -537,7 +546,7 @@ class TestMirrorSafety:
         w._device["rosterPushingPolicy"] = "MIRROR"
         w._recent_member_push = {}
         state.rows["40001"] = ("stale-hash", True)            # a leftover 'synced' record
-        _full_sync(w, reason="user-sync")
+        _full_sync(w, reason="sync_now_api", full_reconcile=True)
         assert drv.deleted == ["40001"]
         assert "40001" in state.delete_calls
         assert "40001" not in state.rows

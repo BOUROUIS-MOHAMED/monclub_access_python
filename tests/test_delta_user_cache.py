@@ -51,6 +51,20 @@ def test_upsert_users_updates_existing_user(db):
     assert len([i for i in ids if i == 1]) == 1
 
 
+def test_upsert_users_ignores_unknown_extra_keys(db):
+    """The account-level-fingerprints backend adds a ``mainAccountId`` key to every
+    member dict (design doc §3.5: "additive now, collapse later"). ``upsert_delta_users``
+    reads fields by name with ``.get()`` and never enumerates or validates the input
+    dict's keys, so a new, unrecognised key must be silently ignored -- not raise, and
+    not corrupt the known fields."""
+    user = _make_user(am_id=7, full_name="Mainaccount Carrier")
+    user["mainAccountId"] = 999123
+    user["someFutureField"] = {"nested": "value"}
+    db.upsert_delta_users([user])
+    ids = db.get_all_cached_user_am_ids()
+    assert 7 in ids
+
+
 def test_upsert_users_handles_multiple_users(db):
     """Multiple users can be upserted in one call."""
     db.upsert_delta_users([_make_user(am_id=1), _make_user(am_id=2), _make_user(am_id=3)])

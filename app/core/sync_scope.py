@@ -152,9 +152,15 @@ MEMBER_CACHE_HEAL_RATIO = 0.5
 def member_count_from_token(members_version: Any) -> int | None:
     """Return the member count the backend encoded in a ``membersVersion`` token.
 
-    The backend builds it as ``"<memberCount>:<maxUpdated>:<fpCount>:<maxFpUpdated>"``
-    (``GymAccessController.computeMembersVersion``). Returns the leading count, or
-    ``None`` when the token is absent or unparseable."""
+    The backend builds it as a colon-delimited string whose FIRST component is the
+    member count (``GymAccessController.computeMembersVersion``). Historically that
+    was ``"<memberCount>:<maxUpdated>:<fpCount>:<maxFpUpdated>"`` (4 components); the
+    account-level-fingerprints work appends two more, ``:<enrCount>:<maxEnrUpdated>``
+    (6 components) -- and per the design doc, further components may be appended
+    again later. This parser only ever reads component 0 (``split(":", 1)``), so it
+    is forward-compatible with any NUMBER of trailing components. Only prepending a
+    component, or changing what component 0 means, would break it. Returns the
+    leading count, or ``None`` when the token is absent or unparseable."""
     if members_version in (None, ""):
         return None
     try:

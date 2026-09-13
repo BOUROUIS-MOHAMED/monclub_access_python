@@ -34,7 +34,9 @@ This file is only useful while it is true. If you change any of the following, y
 | `app/sdk/device_driver.py` — protocol enum, aliases, resolution order | §4 Protocol resolution |
 | A `supports_*` / capability class attribute on any driver | §5 Capability flags |
 | Which engine services which `accessDataMode` | §3 The three modes |
+| How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
+| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches; local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | The test / verification commands | §9 Verifying this guide |
@@ -192,6 +194,624 @@ about DEVICE mode. It is true only of *automatic* decisions.
 
 **So: an MB2000 must be `accessDataMode=ULTRA`.** In `DEVICE` mode it is silent and
 empty, and every surface will still report success.
+
+### 3.2b What a device PIN actually is — and why it changed
+
+> **The PIN is a per-device choice: `pinScheme` = `MEMBERSHIP` (the default) or `ACCOUNT`.**
+> Nothing switches a device implicitly — not a client upgrade, not the backend starting
+> to send `mainAccountId`, and not a device payload that omits `pinScheme` or carries a token
+> this client does not recognise (§3.2e: those keep the last known scheme).
+
+Derivation happens in exactly ONE function, `device_sync.derive_member_pin(user, scheme)`,
+applied by `DeviceSyncEngine._filter_users_for_device` under the device's
+`device_sync.device_pin_scheme(device)`. Both the PullSDK path and the standalone path route
+through that filter.
+
+| `pinScheme` | pin | several memberships of one person | row lacking the field |
+|---|---|---|---|
+| `MEMBERSHIP` — the stored value, or none stored for a device with no `ACCOUNT` history | `activeMembershipId`, else `userId` | stay separate rows (last row wins a pin; a `userId` pin never displaces a membership pin) | n/a |
+| `ACCOUNT` | `mainAccountId` **only** | collapsed into one row (below) | **withheld** — never emitted under its membership pin |
+
+`[CODE: app/core/device_sync.py::derive_member_pin, ::device_pin_scheme, ::_filter_users_for_device]`
+`[TEST: tests/test_pin_scheme_gate.py::test_membership_scheme_is_byte_identical_to_the_pre_account_derivation]`
+— MEMBERSHIP is checked against a verbatim copy of the loop as it was at `c13d1c2^`, over
+randomised rosters that carry `mainAccountId`: same pins, same order, same row objects.
+
+**Why a gate, not a fallback chain.** `c13d1c2` derived `mainAccountId → activeMembershipId →
+userId` unconditionally. On the 2026-09-12 production data **110 `main_account.id` values
+equal an existing `active_membership.id`, and 99 of those are a DIFFERENT person** (0 the same
+person). The first client to see `mainAccountId` would have pushed account pins onto terminals
+that still hold membership pins: on a PRESERVE device, pin X for person A overwrites device user
+X that belongs to person B — wrong fingerprint and card on the wrong person — and the old rows
+are never removed. So a device is switched deliberately, after a manual wipe (§3.2c), and never
+mixes schemes. That is also why ACCOUNT does not fall back: a withheld row's membership id may
+be another person's account pin on that terminal.
+
+**Why ACCOUNT exists.** `active_membership.id` churns — delete and recreate a membership and the
+pin changes, which on a preserve-policy device orphans the old row with its fingerprints and
+card still resident. `main_account.id` never changes. It also matches the data model now that a
+fingerprint template belongs to the account: a membership-keyed pin pushes one template under N
+pins and burns N device slots for one finger.
+
+**Where `pinScheme` comes from — the same path as `rosterPushingPolicy`.** Backend
+`GymDeviceDto.pinScheme` → `getSyncData` `devices[]` (and fast-patch `GYM_DEVICE` upserts) →
+`db._insert_device_row` → `sync_devices.pin_scheme` (`ACCOUNT`/`MEMBERSHIP` when the payload
+states one of them; otherwise the last recorded scheme, `NULL` when there is none) → the
+device payload projection's `"pinScheme"` → `list_sync_devices_payload` /
+`get_sync_device_payload` / `load_sync_cache().devices` → the ULTRA worker's raw
+`self._device`, and `DeviceSyncEngine._normalize_device`, whose allowlist now carries the key
+(§6.2). `[CODE]`
+`[TEST: test_pin_scheme_gate.py::test_pin_scheme_survives_ingest_to_the_engine,
+::test_pin_scheme_survives_the_delta_device_refresh]`
+
+**A withheld row makes the device's roster INCOMPLETE.** Under ACCOUNT a deliverable row
+without `mainAccountId` (for example a cache row written before `sync_users` stored `mainAccountId`) is counted in
+`stats_out["withheld_missing_account"]`, logged at WARNING and emitted as
+`[T] PIN_SCHEME_ACCOUNT_WITHHELD`. Its account pin cannot be named, so it cannot be kept: any
+caller that REMOVES pins absent from the filter's result must not remove on an incomplete
+roster. `[CODE]` `[TEST: test_pin_scheme_gate.py::test_account_scheme_withholds_a_row_without_main_account_id_and_reports_it]`
+**Offline projections are not withheld.** `load_sync_cache().users` also carries one synthetic row
+per queued offline creation (`db.list_projected_offline_users`, `offlinePending: True`, negative
+synthetic ids, never a `mainAccountId`). No roster refresh can fill it — it is not a `sync_users`
+row — and a `blocked_auth` item waits on an operator, so counting it froze every removal on every
+ACCOUNT device for as long as the item stayed queued (review #12). Under ACCOUNT such a row is
+skipped: not emitted under any pin, counted only in `stats_out["skipped_offline_projections"]`.
+Under MEMBERSHIP its negative pin already fails the digit check, so neither scheme pushes an
+unconfirmed offline sale. `[CODE: device_sync.py::_filter_users_for_device]`
+`[TEST: test_account_pin_device_sites.py::test_a_queued_offline_creation_does_not_freeze_removals]`
+
+**The roster hash.** `build_device_sync_fingerprint` adds `pinScheme=ACCOUNT` to its header only
+for ACCOUNT, so a MEMBERSHIP device's hash is unchanged by the upgrade.
+`[TEST: test_pin_scheme_gate.py::test_a_membership_device_keeps_its_roster_hash_and_an_account_device_does_not]`
+
+**The collapse (ACCOUNT only).** One person holding several memberships at one gym is ONE
+device row, and a row carries one validity window, one name and — on the terminal — one card.
+`_merge_same_pin_entries` resolves it:
+
+- **validity** — the furthest-reaching membership wins, *among those this device accepts*, since
+  `allowedMemberships` and the validity filter both run BEFORE the collision is possible. An
+  absent `validTo` counts as furthest: that is how "no end date" is expressed, and treating an
+  unknown as expired would revoke members we cannot date. **Ties go to the larger
+  `activeMembershipId`**: both the push and `furthest_reach` rank by the one total order
+  `device_sync.pin_row_rank`. Before that key was shared, the push kept the FIRST row on a tie
+  and the inbound resolver the LARGER id. `[CODE]`
+  `[TEST: test_pin_scheme_gate.py::test_equal_reach_is_broken_by_the_larger_membership_id_on_both_sides]`
+- **fingerprints** — UNIONED, never the winner's alone. `_collect_templates_for_pin` treats
+  `user['fingerprints']` as the whole answer and the backend attaches each template to the
+  membership it was enrolled under, so taking only the winner's list silently deletes every
+  finger scanned on the losing plan. De-duped by template id. The union is **sorted**
+  (`fingerId`, `templateVersion`, template id, data): `_collect_templates_for_pin` keeps the last
+  template per finger, so before the sort a finger enrolled under two memberships got whichever
+  template the row order put last, and its desired hash moved with payload order (review #7). Now
+  the largest template id wins that finger in any order. `[CODE]`
+  `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner,
+  test_pin_scheme_gate.py::test_the_template_pushed_for_a_finger_does_not_depend_on_row_order]`
+- **cards** — the winner's, with an empty slot filled from the loser. **Only `firstCardId` reaches
+  the terminal**: every PullSDK user write sends one `CardNo` from it (targeted push and full-sync
+  writes) and the standalone `push_roster` entry carries one `card` from it (one
+  `SetStrCardNumber`); `secondCardId` is never pushed. So when a person's accepted memberships carry
+  different cards, the reach winner's card is on the device and **the others are dropped there** —
+  under MEMBERSHIP each was on its own device user. The PC-side rescue opens only for STAFF, and a
+  ZK_STANDALONE terminal decides alone, so a dropped card is refused. `_filter_users_for_device`
+  counts them in `stats_out["dropped_cards"]` and logs one WARNING per roster build with a sample of
+  the memberships whose card was dropped (review #5). The rank that picks the card is the validity
+  rank (`pin_row_rank`), which must stay shared with the inbound resolver, so it is not a "best
+  card" choice. Whether a device user record could hold a second card (e.g. a C3 multi-card table,
+  a second MB2000 card) is `[UNVERIFIED — HARDWARE-GATED]`; nothing here writes one.
+  `[CODE]` `[TEST: test_pin_scheme_gate.py::test_a_collapse_that_drops_a_card_reports_it]`
+
+**Every site that turns a membership into a device pin goes through the device's scheme.**
+Sync requests, delta `changed_ids`, fast-patch impacts and revocations all name MEMBERSHIPS
+(`activeMembershipId`). Under ACCOUNT each site translates before touching a pin — a membership
+number used as a pin names, for the 110 colliding ids, ANOTHER person's device user. The
+translation is `device_sync.device_pins_for_members` (MEMBERSHIP: `str(int(id))`, unchanged;
+ACCOUNT: `account_pins_for_memberships` — the roster in hand, then `member_account_link` (§3.2d),
+which still answers after a revocation deleted the row; an unmappable membership is ABSENT, never
+replaced by its own number). `[CODE]`
+
+| Site | MEMBERSHIP (unchanged) | ACCOUNT |
+|---|---|---|
+| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted; `revocation=True` with the person still deliverable → the collapsed row is re-pushed even when its hash is unchanged, and that push is the return value |
+| `DeviceSyncEngine._sync_one_device` `known_server_pins` | `activeMembershipId` of every user | account pin of every user |
+| `_sync_one_device` delta pruning / drift check (`int(pin) in changed_ids`) | verbatim | `pin in` the account pins of `changed_ids` |
+| `UltraDeviceWorker._build_standalone_roster(only_member_ids)` | `wanted = {str(int(m))}` | the account pins of those memberships |
+| `UltraDeviceWorker._load_member_roster` | that membership's row | every row of the person |
+| `UltraDeviceWorker._defer_member_sync` | flags `str(member_id)` | flags the person's pin; none when unmappable |
+| `UltraDeviceWorker._run_standalone_member_revoke` | removes `str(member_id)` (ownership-checked) | see below |
+| `_run_standalone_full_sync` explicit-revocation ownership check + `required_pins` | `str(member_id)` | the person's pin, and only when it LEFT the desired roster |
+| `UltraDeviceWorker._handle_allow` fingerprint-scan pin → member (`_user_for_device_pin`) | `users_by_am[int(pin)]` | the collapsed row `_filter_users_for_device` builds for this device |
+| `ZKStandaloneDevice._refresh_pin_card_map` (pin → card on standalone events) | `active_membership_id or user_id` | the collapsed rows for this device, scheme read from the stored device row |
+
+`[TEST: tests/test_account_pin_device_sites.py]` — 18 of its 23 cases fail against the code
+before this conversion (2eafb5f); the 5 that pass there pin MEMBERSHIP behaviour or refusals that
+were already safe.
+
+**Revoking one membership of a person (ACCOUNT).** `_account_member_revoke` names the person's pin,
+reads the person's remaining rows and builds this device's roster from them. If the person is
+still deliverable, the collapsed row is RE-PUSHED (the revoked plan's validity and finger slots
+leave with it; `MEMBER_REVOKE_DONE mode=repushed`) and nothing is deleted. Only when nothing of the
+person remains is the pin removed, through the same ownership-checked `_remove_standalone_pins`.
+An unmappable membership removes nothing (`MEMBER_REVOKE_PIN_UNKNOWN`) and defers to a full sync.
+The full sync's explicit-revocation check likewise requires removal only of person pins that left
+the roster; otherwise a person holding another membership would fail every full sync. A
+revocation whose membership was never seen with a `mainAccountId` names no pin; that membership
+can never have been pushed under ACCOUNT (the push reads `mainAccountId` from the same rows the
+link is refreshed from), so there is nothing of it to remove. `[CODE]`
+`[TEST: ::test_revoking_one_of_two_memberships_repushes_and_keeps_the_pin,
+::test_revoking_the_last_membership_removes_the_account_pin,
+::test_revoking_sonias_membership_5_removes_sonia_not_ali,
+::test_a_revoked_membership_whose_person_remains_does_not_fail_the_sync]`
+
+**The PullSDK path (review #11).** Both ULTRA PullSDK consumers read
+`sync_member_on_connected_sdk`'s bool as "revocation done": the targeted drain finalises the
+revoke, and the full sync's `_mark_member_revoke_confirmed` decides whether the sync reports
+"authoritative revocation unconfirmed". The per-pin hash carries no validity window, so when a
+person keeps another plan the collapsed row's hash does not move, and the "unchanged" skip
+returned False on every run — every full sync failed forever. Both call sites now pass
+`revocation=True`; under ACCOUNT with the person still deliverable the collapsed row is re-pushed
+regardless of the hash and that push's result is returned. A non-revocation sync still skips an
+unchanged row. `[CODE: device_sync.py::sync_member_on_connected_sdk; ultra_engine.py call sites]`
+`[TEST: test_account_pin_device_sites.py::test_revoking_one_of_two_memberships_is_confirmed_by_the_repush,
+::test_an_unchanged_non_revocation_sync_still_skips]` — the call sites passing the flag are `[CODE]`
+only; no worker-level test drives them. **Still open:** an UNMAPPABLE membership's revocation
+returns False on this path (nothing to name), so it stays unconfirmed and re-queues a full sync on
+every run, whereas the standalone full sync treats it as nothing to remove.
+
+**No removal on an incomplete ACCOUNT roster.** When `_filter_users_for_device` withheld rows
+(no `mainAccountId`), their people's pins are missing from `desired_pins` and would read as
+departed. So, under ACCOUNT with withheld rows: the standalone full sync skips
+`_maybe_mirror_reconcile`, `_neutralise_revoked_pins` AND `prune_device_sync_state`
+(`safe_to_prune=False`, `[T] REVOKE_SKIP_INCOMPLETE_ROSTER`); the PullSDK full sync skips the
+stale-pin delete, the nuke and both prunes; and the two TARGETED removals
+(`sync_member_on_connected_sdk`, `_account_member_revoke`) first check
+`device_sync.account_roster_withheld_for_device` over `db.list_sync_users_missing_main_account`,
+because a person's other membership row may be the one without the field. This neither mixes
+schemes (nothing is pushed under a membership pin) nor revokes a row already on the device, and it
+keeps the ownership evidence §3.2c depends on. The cost is that, while such rows exist,
+revocations on that device are not carried out — the forced refresh of §3.2d is what ends the
+window. `[CODE]` `[TEST: ::test_an_incomplete_roster_skips_the_revoke_pass_and_the_prune,
+::test_an_incomplete_account_roster_removes_and_prunes_nothing,
+::test_no_delete_while_a_deliverable_row_has_no_main_account_id,
+::test_no_removal_while_a_deliverable_row_has_no_main_account_id]`
+
+**The PullSDK nuke heuristic is off for any device that has switched scheme.** INCREMENTAL clears
+every table when stale pins outnumber desired ones. Right after a switch the old scheme's pins ARE
+that majority, so the heuristic would wipe the terminal automatically — other systems' users
+included. The procedure is a manual wipe (§3.2e), so `_sync_one_device` suppresses the heuristic
+when `device_pin_scheme_switch` has a row for the device; stale pins are still removed one by one.
+An explicit `FULL_REPLACE` policy is left as configured. `[CODE]`
+
+**The fingerprint push report names the id the pin IS.** `report_fingerprint_push_result` posted
+every pin as `activeMembershipId`; the backend then runs
+`findByActiveMembershipIdAndFingerId(<that number>, fingerId)`, so under ACCOUNT a report for
+account pin 5 would write — or clear — a push error on the fingerprint of the person whose
+MEMBERSHIP is 5. The digits cannot say which scheme minted them, so the push records it:
+`_filter_users_for_device` exposes `stats_out["pin_sources"]`, every `_push_templates` caller
+(targeted push, full-sync phase C, the per-pin path, and the admin raw push, which records the
+device's scheme — or `UNKNOWN` when the device row cannot be read, which the report never sends,
+review #10) passes `pin_source`, and `fingerprint_push_status.pin_source` stores it
+(`NULL` = written before the column = MEMBERSHIP: every pin was membership-derived then, and a
+userId-keyed member cannot own a UserFingerprint). `get_pending_fingerprint_push_reports`
+aggregates per `(pin_source, pin, finger)` — pin 5 under two schemes is two people — and the
+"last reported" record moved to `fingerprint_push_reported_v2`, keyed the same way (v1 rows copied
+once as MEMBERSHIP, so no transition is re-sent after the upgrade). The report then sends:
+
+| `pin_source` | item key |
+|---|---|
+| `ACCOUNT` | `mainAccountId` — the backend resolves it through the reporting gym's enabled enrolment of that finger |
+| `MEMBERSHIP`, or absent | `activeMembershipId` |
+| `USER` | nothing (skipped) |
+
+An older backend ignores `mainAccountId` (Jackson `FAIL_ON_UNKNOWN_PROPERTIES` is not enabled)
+and skips an item without `activeMembershipId`. `[CODE: app/api/monclub_api.py::report_fingerprint_push_result,
+db.py::get_pending_fingerprint_push_reports]`
+`[TEST: tests/test_push_report_pin_scheme.py]`
+**Scope:** only the PullSDK push (`DeviceSyncEngine._push_templates`) records per-finger outcomes;
+the ZK_STANDALONE `push_roster` path records none, so gym 45's MB2000s emit no push reports at
+all — before or after this change. `[CODE: upsert_fingerprint_push_status has one caller]`
+
+**Inbound: a pin is read under the scheme its DEVICE ran when the event happened.** A device
+reports a pin, and on the 2026-09-12 production data **110 `main_account.id` values numerically
+equal an existing `active_membership.id`**, for **99** of them DIFFERENT people (**0** the same
+person). Nothing in the event says which scheme minted the pin — but the device runs one scheme at
+a time and every change is recorded with its time (§3.2e). `device_attendance.HistoryPinResolver`
+uses that:
+
+- **scheme at event time** — `db.list_device_pin_scheme_switches` read by `pin_scheme.scheme_at`
+  at the row's `event_time`. No row → MEMBERSHIP: this database has only seen the device on
+  MEMBERSHIP. A row at or before the event → its scheme. Before the first row → that row's
+  `previous_scheme`: MEMBERSHIP for a recorded switch, **unknown** for a first sighting
+  (`previous_scheme='UNKNOWN'`, §3.2e) — a database that first sees a device already on ACCOUNT
+  does not know when it switched, so it does not invent a MEMBERSHIP window ending at PC-now.
+- **MEMBERSHIP** → the membership index only. **ACCOUNT** → the collapsed row
+  `_filter_users_for_device` builds for THAT device (its `allowedMemberships` / validity policy,
+  `pin_row_rank`), so an event names the membership the device row represents; a device no longer
+  in the cache falls back to the unfiltered by-account index, ranked the same way. A known scheme
+  never consults the other index.
+- **unknown** (a device with history whose `event_time` does not parse, an event before a first
+  sighting on ACCOUNT, or a legacy caller of
+  `_resolve_history_user` without `pin_scheme`) → the old rule: the unambiguous reading, and a pin
+  that is both prefers MEMBERSHIP, with a WARNING. c13d1c2's "account index first" inverted
+  correctness on devices still holding membership pins; that is why the fallback prefers
+  membership.
+
+Used by the backend uploader (`_sync_pending_history` → `_serialize_row_for_backend(resolver=…)`)
+and the dashboard feed (`_dash_user_indexes` / `_dash_history_resolver`). When the dashboard cannot
+build the resolver (switch history unreadable), it names a member **by card only** — the old
+fallback was a membership-only pin lookup that showed a stranger for an account pin on an ACCOUNT
+device, for the 60 s the cache lives (review #3). Display only. The 60 s cache also means events
+just after a switch can be shown under the old scheme for up to a minute `[CODE]`, not fixed.
+`[TEST: test_account_pin_inbound_by_scheme.py::test_the_dashboard_feed_uses_the_same_resolution]`
+The upload item for an
+**unresolved** pin: MEMBERSHIP → `activeMembership` = pin (unchanged); ACCOUNT → `mainAccountId` =
+pin and **no** `activeMembership` (the backend's history ingest resolves `userId`, then
+`mainAccountId`, gym-scoped, and reads `activeMembership` only when neither is sent); unknown →
+neither. If the switch history cannot be read, the batch is not uploaded that tick and the rows stay
+pending. **Cost of "unknown → neither" (review #9):** an item with no identifier is, per the
+reviewer's read of `GymAccessController` (`anyIdentifier` false → `unidentified`, token in
+`terminalFailedIds`) `[UNVERIFIED — not re-read here]`, terminal on the backend, and the client
+then marks the row terminal, so that door event never reaches attendance history even after the
+roster catches up. Deliberately not changed: naming either id would be a guess, and retrying never
+makes the scheme knowable. Since the first-sighting rule (§3.2e), this also covers unresolved pins
+in the backlog before a device was first seen on ACCOUNT. `[CODE: app/core/device_attendance.py::HistoryPinResolver, ::_resolve_history_user,
+::DeviceAttendanceMaintenanceEngine._serialize_row_for_backend]`
+`[TEST: tests/test_account_pin_inbound_by_scheme.py;
+test_account_pin_derivation.py::test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality]`
+
+`[UNVERIFIED]` **the event clock.** `event_time` is the terminal's clock and `switched_at` the PC's.
+C3-200 panels were measured 38–74 s behind the PC (§2) and `UltraDeviceWorker._device_tz_offset_sec`
+exists because a device clock can differ further. An event within that offset of a switch can be
+read under the wrong scheme. Across that window an unwiped terminal holds both schemes anyway, which
+is why the procedure wipes BEFORE switching.
+
+**Cutover is a WIPE, not a re-key.** Because of those 110 collisions, re-keying a device in place
+can graft one member's fingerprints onto another member's row. Existing terminals must be cleared
+and re-pushed. `[UNVERIFIED — the wipe path itself has not been exercised on hardware]`
+**And the wipe must be MANUAL** — neither automatic removal path can do it. §3.2c says why.
+
+### 3.2c Neither automatic path can clear an old-scheme PIN (2026-09-12)
+
+> **The pin-scheme cutover is a MANUAL wipe. This is settled, not a preference.**
+
+Two mechanisms could in principle remove a stale pin from a `ZK_STANDALONE` terminal. On the
+installed fleet neither can, for independent reasons. Establish this before promising an
+operator that "mirror mode will clean it up".
+
+**1. MIRROR reconcile — blocked three times over, and the third survives the repair.**
+
+`_maybe_mirror_reconcile` gates policy FIRST: `rosterPushingPolicy != "MIRROR"` returns before
+anything else. Gym 45's two turnstiles (device 8 "Sortie", device 10 "Entrée") are
+`device_protocol=ZK_STANDALONE`, `roster_pushing_policy=PRESERVE`, `access_data_mode=ULTRA`,
+both active. `[FIELD: restored production DB, 2026-09-12 — gym_device joined to
+gym_infrastructure/gym_agent on gym 45]` PRESERVE is the default every gym runs, so **no code
+change in this repo makes MIRROR run there**; it needs the backend to change
+`gym_device.roster_pushing_policy`.
+
+Independently, the trigger gate was unsatisfiable. It read
+`reason in ("user-sync", "daily-forced-sync", "hard-reset")`, but `reason` carries a
+*trigger_source* token — `app.py` passes `trigger_context.trigger_source`, whose vocabulary is
+`API_MANUAL`, `CHANGE_DETECTOR`, `FAST_PATCH_BUNDLE`, `FINGERPRINT_ENROLLED`, `MANUAL`,
+`MANUAL_EVALUATE`, `STARTUP`, `SYNC_NOW_API`, `TIMER`, plus the scheduler's `startup`/`timer`
+and the worker's `revoke-*`. **No producer ever emitted those three literals**: every
+occurrence in the repo's history is a test hand-passing the literal into the gate.
+`[CODE + git archaeology: a -S search over all history for those assignments returns only
+test hunks]`
+
+Two of the three were not even spelled correctly for the field they belonged to: the real
+`trigger_hint` markers are `user-sync` and **`daily-auto-sync`** (never `daily-forced-sync`),
+and a hard reset is `run_type="HARD_RESET"` / `hint["hardReset"]`, not a reason at all.
+
+*Fixed 2026-09-12 by carrying the answer, not re-deriving it.*
+`sync_observability.is_explicit_user_sync` already folds those three cases into one predicate
+and already gates `_should_push` in manual-sync mode. The app layer evaluates it once and a
+`full_reconcile: bool` travels with the request — `_request_running_ultra_sync` →
+`UltraEngine.request_sync_now` → `UltraSyncScheduler.request_sync_now` → pending merge/drain →
+`_sync_all` → `UltraDeviceWorker.request_full_sync` → `_run_standalone_full_sync` → the gate.
+It merges by OR, never assignment, so coalescing a timer tick into a queued operator reconcile
+cannot downgrade it. `[CODE: the named symbols]`
+`[TEST: tests/test_mirror_reconcile_reachability.py]`
+
+Two further skips had to move or the repaired flag would have been dead again — both are
+`[TEST]`-pinned in that file:
+
+- `_sync_all` skips a device whose desired-roster fingerprint is unchanged. A reconcile targets
+  rows the TERMINAL holds and the roster does not, which never moves that hash.
+- `UltraEngine.request_sync_now` routes targeted member syncs whenever `changed_ids` is not
+  `None`. A delta-mode explicit sync would never have requested a full sync.
+- `UltraSyncScheduler._sync_all` had the same branch on the **scheduler-fallback** route (a
+  dead or refusing worker hands the request to the scheduler, which drains it into
+  `_sync_all`): it tested only `normalized_changed_ids is not None`, so the reconcile was lost
+  there even after the engine route was fixed, and with no usable worker `_sync_device` was
+  handed the delta's `changed_ids`. Both now honour `full_reconcile`.
+  `[TEST: test_mirror_reconcile_reachability.py::test_the_scheduler_fallback_honours_full_reconcile_with_delta_changed_ids,
+  ::test_the_whole_fallback_chain_delivers_the_reconcile,
+  ::test_a_reconcile_without_a_usable_worker_is_not_narrowed_to_changed_ids]`
+
+**Cost note.** Because an explicit sync now bypasses the roster-hash skip, every "Sync data"
+click drives a full sync on each ULTRA device. On a PRESERVE device the per-pin diff keeps
+`to_push` empty, so it stays cheap. On a MIRROR device each click additionally enumerates the
+whole terminal (`list_device_users`) over the STA thread. `[CODE]`
+
+**One condition remains, by design.** `_request_running_ultra_sync` returns early unless the
+sync actually returned a roster refresh (`refresh["members"]` or `refresh["devices"]`), so a
+"Sync data" click on a gym with no changes dispatches nothing to reconcile. A **hard reset**
+always qualifies: it clears the version tokens, so the next `getSyncData` runs in FULL mode.
+Use hard reset when the point is the reconcile rather than the changes.
+`[CODE: app.py::_request_running_ultra_sync, local_access_api_v2.py::_handle_sync_hard_reset]`
+
+**Even on a MIRROR device, a cutover-sized diff never reaches the plan.** Gate 8 — the 25 %
+floor, `if len(extras) > roster_count * _MIRROR_MAX_DELETE_FRACTION` — precedes gate 9, which
+is what calls `mirror_reconcile_record_plan`. At cutover every device pin is absent from the
+new roster, so `extras` is essentially the whole roster and the pass returns on
+`MIRROR_ABORT_FLOOR` **before any plan is written**. `/mirror-plan` keeps returning
+`lastPlanCount: null` and the dashboard's arm button stays disabled — the same symptom the
+trigger repair removes for *ordinary* churn. Unlike the revoke pass, MIRROR's floor is purely
+fractional: there is no `_REVOKE_ABSOLUTE_FLOOR` equivalent, so a full re-key is refused at any
+roster size. `[CODE: ultra_engine.py::_maybe_mirror_reconcile, gate order]`
+`[TEST: test_mirror_reconcile_reachability.py::
+test_a_cutover_sized_diff_aborts_mirror_before_any_plan_is_recorded]`
+
+> So **flipping `roster_pushing_policy` to MIRROR does not buy a cutover.** The repaired
+> trigger restores the dry-run → `/mirror-plan` → arm chain for everyday departures, which is
+> what it is for. It does not, and cannot, re-key a terminal.
+
+**2. The revoke pass — aborts on its own floor, and that abort is protective.**
+
+`_neutralise_revoked_pins` is trigger-independent: it runs on every successful standalone full
+sync, and it is the only removal path a PRESERVE device has. Its candidate set is `owned` (pins
+with `ownership_confirmed=1` in `device_sync_state`) minus `keep` (the desired roster) minus the
+grace/allowlist. It refuses a bulk strip above
+`ceiling = max(_REVOKE_ABSOLUTE_FLOOR=10, roster_count * _MIRROR_MAX_DELETE_FRACTION=0.25)`.
+
+After a pin-scheme change `owned` holds old membership pins and `keep` holds new account pins,
+so the difference is essentially the whole roster. Gym 45 has **1080 ACTIVE memberships across
+1061 distinct accounts**, counted across all five of its `gym_agent` rows (8, 49, 50, 51, 52 —
+counting only agent 8 gives 990/988 and is a lower bound).
+`[FIELD: restored production DB, 2026-09-12]` The ceiling is therefore of order 250 against a
+candidate set of order 1000 → `REVOKE_ABORT_FLOOR`, nothing removed, and it never self-resolves
+because nothing shrinks between runs.
+
+Treat that ceiling as an **estimate, not a measurement**: `roster_count` is the *device* roster
+after `shouldExposeMembership`, the validity window and `allowedMemberships`, not the
+ACTIVE-membership count. The order of magnitude is the point — the candidate set is the whole
+roster and the ceiling is a quarter of it.
+
+**Do not raise the floor to "unblock" a cutover.** Nothing inside that function can tell a
+pin-scheme change from a truncated or half-built roster — they are informationally identical
+there — and the second is the case the floor exists to refuse.
+
+**The abort is accidentally load-bearing.** It returns `safe_to_prune=False`, which skips
+`prune_device_sync_state(keep_pins=desired_pins)`. Post-cutover that prune would delete the
+`device_sync_state` row — and with it the `ownership_confirmed` bit — for every old-scheme pin.
+`owned` would then be empty, the revoke pass could never target those pins again, and they would
+be stranded on the turnstile permanently and invisibly. **Any change that makes `safe_to_prune`
+true without actually removing the pins is worse than the current behaviour.**
+`[CODE: ultra_engine.py::_neutralise_revoked_pins, ::_run_standalone_full_sync]`
+
+The abort fails the sync (`sync_ok=False`, `"authoritative revocation unconfirmed"`) **only when
+that sync also carried explicit authoritative revocations** — `if unconfirmed_revoked_ids and
+not safe_to_prune`, where `unconfirmed_revoked_ids` comes from the request's own `revoked_ids`,
+not from the roster diff. An ordinary post-cutover sync therefore aborts the revoke pass, skips
+the prune, logs `REVOKE_ABORT_FLOOR`, and still reports success. `[CODE]`
+
+**Hard reset does NOT strand ownership evidence.** `clear_all_device_sync_hashes` and
+`clear_device_sync_hashes` set only `desired_hash=NULL, last_ok=0, last_error='forced resync'`;
+`UltraSyncScheduler.force_resync` clears in-memory hashes only. `ownership_confirmed` and
+`pushed_finger_ids` survive both, so a hard reset is safe to reach for and a later pass can
+still reconcile. `[CODE: db.py::clear_all_device_sync_hashes, ::clear_device_sync_hashes;
+ultra_engine.py::UltraSyncScheduler.force_resync]`
+
+**EnableDevice bracketing stays OFF — deliberately reversing plan decision D6.**
+
+D6 said the explicit/nightly reconcile would re-push every pin inside an `EnableDevice(False)`
+bracket. It never once executed, because its condition was the same dead reason-string test.
+Meanwhile the driver changed underneath it: `push_roster` collapses a bracketed roster into ONE
+command (`chunks = [users]`) with `timeout_sec` as the whole budget, bypassing the per-chunk
+timeout and wedge recovery that exist because a single-command ~950-member push meant "the gym
+never got more than the first 10 members". Bracketing also holds the terminal — the gym's sole
+verifier — locked for the entire push. So `bracket` is now an explicit `False`, and an explicit
+reconcile stays incremental and unbracketed. Turning it on is a separate, hardware-gated
+decision, not a side effect of repairing the MIRROR trigger.
+`[CODE: ultra_engine.py::_run_standalone_full_sync; zk_standalone.py::push_roster]`
+`[TEST: test_zk_standalone_driver.py::TestStandaloneFullSyncBranch::
+test_an_explicit_reconcile_does_not_bracket_enable_device]`
+
+**What this means operationally.** "Use mirror mode first, wipe manually only if it has a
+problem" is not available on the installed fleet, and no setting change makes it available: on
+a PRESERVE device mirror mode is a no-op regardless of trigger; on a MIRROR device a
+cutover-sized diff aborts on the 25 % floor before it records a plan, so the arm button never
+becomes clickable; and the revoke pass refuses a roster-sized strip by design. **The PIN
+cutover must be a manual wipe of each terminal, followed by a re-push.** The wipe path itself is
+still `[UNVERIFIED — HARDWARE-GATED]` (§3.2b).
+
+### 3.2d The member cache carries the person — and the upgrade trap (2026-09-12)
+
+**Until this change `mainAccountId` never survived `sync_users`.** No writer stored it and
+`_coerce_user_row_to_payload` never read it back, so every roster the engines saw had no
+`mainAccountId`: the account pin, the collapse and the account index of §3.2b were inert on
+every installed client while their raw-dict tests passed. `[CODE: git show 0f0a445:app/core/db.py]`
+
+Now `sync_users.main_account_id INTEGER` is written by **every** sync_users writer — found by
+grepping `INSERT INTO sync_users` / `INSERT OR REPLACE INTO sync_users` / `UPDATE sync_users`,
+not from memory:
+
+| Writer | Path |
+|---|---|
+| `save_sync_cache` | full replace |
+| `save_sync_cache_delta` → `_apply_full_users_refresh` (INSERT **and** UPDATE) | FULL member refresh, per-row diff |
+| `save_sync_cache_delta` delta branch | DELTA member refresh |
+| `upsert_delta_users` | delta helper |
+| `_upsert_sync_user_row` ← `apply_fast_patch_bundle` | fast-patch `ACTIVE_MEMBERSHIP` upsert |
+| `_rebuild_sync_users_without_legacy_fingerprint` | legacy-schema migration |
+
+and read back as `"mainAccountId"`. `main_account_id` is part of `_SYNC_USER_COLUMNS`, the
+tuple the full-refresh diff compares: a row whose **only** change is a newly-arrived
+`mainAccountId` must compare unequal or it would stay NULL. `[CODE]`
+`[TEST: tests/test_account_pin_sqlite_roundtrip.py::test_every_writer_round_trips_main_account_id_into_the_pin,
+::test_the_full_refresh_diff_updates_a_row_whose_only_change_is_main_account_id]`
+
+**Migration order is load-bearing.** The legacy rebuild re-creates `sync_users` from a
+hardcoded column list, so every `sync_users` `_ensure_column` now runs **after** it. They used
+to run before, which is how `birthday`, `image_source`, `user_image_status` and
+`user_profile_image` were added and then silently dropped on a legacy database (the next write
+naming them failed); the rebuild's list now names them and `main_account_id` too. `[CODE]`
+`[TEST: test_account_pin_sqlite_roundtrip.py::test_a_legacy_database_is_rebuilt_without_losing_a_column]`
+
+**The upgrade trap, and the one forced refresh.** Once the column exists every cached row is
+NULL until the members section is re-fetched — and nothing re-fetches it: the backend's
+`membersVersion` does not change because a client upgraded, so each sync answers
+`refreshMembers=false` or a delta naming only members that happened to change. Under
+`pinScheme=ACCOUNT` those rows are withheld indefinitely. So when `init_db` finds the column
+**absent** (measured before the legacy rebuild, which re-creates the table with an empty
+column), `_ensure_main_account_id_column` deletes `membersVersion` and `membersUpdatedAfter` —
+the house mechanism behind hard reset and `strip_all_member_version_tokens` — and keeps every
+other section's token. The next `getSyncData` carries neither (`MonClubApi.get_sync_data`
+sends the stored tokens as request params), the backend answers in FULL member mode, and the
+per-row diff fills the column. `[CODE: db.py::_ensure_main_account_id_column, init_db]`
+`[TEST: ::test_an_old_database_gains_the_column_and_forces_one_full_member_refresh,
+::test_the_forced_refresh_actually_reaches_the_backend_request_in_full_mode,
+::test_the_refresh_is_forced_once_not_on_every_start]`
+
+It is **atomic**: the token DELETE runs before the ALTER, so both sit in the single transaction
+`init_db` commits at its end; a crash in between rolls both back and the next start detects the
+missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]`
+**The same trap on the device side (review #13).** `sync_devices.pin_scheme` also arrives NULL,
+and `devicesVersion` survives the upgrade, so the backend answers `refreshDevices=false`: a device
+set to ACCOUNT while the PC still ran the old client would read as MEMBERSHIP (no switch, no hash
+clear) until an unrelated device edit moved the token, and then switch with no wipe in between.
+`_ensure_pin_scheme_column` therefore, when a sync_devices table that existed before `init_db`
+lacks the column (measured before the `CREATE TABLE`, so a fresh install is not an upgrade),
+deletes `devicesVersion` — the device section's only progress token — and records every device
+already in the table as seen on MEMBERSHIP (the old client had no other scheme, so the ACCOUNT
+value the refresh brings is a real switch, §3.2e). Same one-shot, DELETE-before-ALTER atomicity
+as the members helper. The backend half (`refreshDevices = clientDevicesVersion == null || …`) was
+read in `GymAccessController`, not run. `[CODE: db.py::_ensure_pin_scheme_column, init_db]`
+`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh]`
+
+If the backend in use does not emit `mainAccountId`, the refresh still runs once and the column
+stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone (§3.2b).
+
+**`member_account_link` — membership → person, durable.** `_refresh_member_account_links` runs at
+the end of every sync_users write transaction and records each cached `(active_membership_id,
+main_account_id)` pair; rows are never deleted with the member. A revocation deletes the
+member's `sync_users` row (and its `member_shadow` row) **before** the device worker acts on
+it, and under ACCOUNT that worker must still name the person's pin.
+`db.get_main_account_ids_for_memberships` reads it; `db.list_sync_users_by_main_account_ids`
+reads every cached row of a person. `[CODE]`
+`[TEST: ::test_the_link_survives_the_member_row_being_deleted]`
+
+**`member_shadow.pin` is not a device pin, and nothing reads it.** It holds the
+`activeMembershipId`. Every `FROM member_shadow` reader selects `active_membership_id` /
+`card_id` or compares card, name, `fp_hash`, dates and `membership_id` (grep, 2026-09-12), so no
+revoke or diff path looks a device row up through it; the table is unchanged and rows written by
+deployed versions diff exactly as before. The shadow diff deliberately does **not** compare
+`main_account_id`: the forced refresh above would flag every member (1 080 at gym 45) as
+modified and dispatch that many targeted member syncs to MEMBERSHIP devices on which nothing
+changed. A device reaches ACCOUNT only through an operator switch, and a withheld row that
+becomes deliverable moves that device's roster hash, which the scheduler's full sync acts on.
+`[CODE: ultra_engine.py::UltraSyncScheduler._sync_all]` In a manual-sync-mode gym that full
+sync waits for the operator's "Sync data". `[CODE: UltraSyncScheduler loop — timer pushes are
+skipped when _manual_sync_mode()]`
+
+### 3.2e Switching a device's pin scheme (2026-09-12)
+
+**Detection.** Every device write — `save_sync_cache`, the `save_sync_cache_delta` device section
+and a fast-patch `GYM_DEVICE` upsert — goes through `db._insert_device_row`, which calls
+`_record_device_pin_scheme_switch` in the same transaction. The current scheme is the latest
+`device_pin_scheme_switch` row for the device, MEMBERSHIP when there is none; a payload whose
+`pinScheme` is **explicitly** `ACCOUNT` or `MEMBERSHIP` (case/space-insensitive,
+`pin_scheme.recognized_pin_scheme`) and differs is a switch. An absent key (an older backend, a
+partial payload), `null`, `""` or an unknown token is **not** a switch: nothing is recorded, no
+hash is cleared, and `sync_devices.pin_scheme` is written with the last recorded scheme, so the
+push keeps deriving that scheme's pins (WARNING logged). This matches the backend's own rule for
+the field ("old clients don't send it — keep the current value"). A current backend always sends
+it. `[CODE: app/core/db.py::_insert_device_row, ::_record_device_pin_scheme_switch]`
+`[TEST: tests/test_pin_scheme_switch.py::test_every_device_write_path_sees_the_switch_exactly_once,
+::test_a_payload_without_a_recognised_pin_scheme_keeps_the_last_known_scheme,
+::test_an_explicit_membership_after_account_is_still_a_switch]`
+
+**What a switch does — and does not do.**
+
+- Clears that device's per-pin hashes with the **same UPDATE** `clear_device_sync_hashes` and hard
+  reset use (`_clear_device_sync_hashes_on`: `desired_hash=NULL, last_ok=0`). It never DELETEs:
+  `ownership_confirmed` and `pushed_finger_ids` survive. `[TEST: ::test_switching_to_account_records_once_and_clears_hashes_without_deleting]`
+- Records `(device_id, previous_scheme, scheme, switched_at, cleared_rows)` in
+  `device_pin_scheme_switch`. `switched_at` is `now_iso()` — local PC time, the clock and shape of
+  `access_history.created_at`. Kept **outside** `sync_devices`, which every device-section refresh
+  DELETEs and re-inserts. `[TEST: ::test_the_switch_time_survives_a_device_section_refresh]`
+- Logs CRITICAL and emits `[T] PIN_SCHEME_SWITCH`.
+- The roster hash moves (`pinScheme=ACCOUNT` joins its header, §3.2b), so the scheduler does not
+  skip the device's next full sync.
+- It does **not** touch the terminal. Nothing in this repo wipes a device automatically.
+
+**A first sighting is not a switch** (a new or reinstalled PC, a lost SQLite file, or a device
+added after the upgrade). `device_pin_scheme_seen` records each device the database has seen with
+an explicit scheme. A device with neither a seen row nor a switch row is a first sighting: on
+MEMBERSHIP only the seen row is written; already on ACCOUNT, a row `('UNKNOWN' → 'ACCOUNT', now)`
+is written, so events stamped before it resolve under the unknown-scheme rule (§3.2b inbound) —
+not as MEMBERSHIP. Hashes are still cleared (idempotent UPDATE). It logs WARNING when there was
+nothing to clear; CRITICAL (wipe) only when this PC already held sync state for the device, since
+those pins were pushed before any scheme was recorded, i.e. as membership pins. The row counts as
+history for the nuke suppression below. `[CODE: db.py::_record_device_pin_scheme_switch]`
+`[TEST: test_pin_scheme_switch.py::test_a_first_sighting_on_account_is_not_a_switch_and_earlier_events_are_unknown,
+::test_a_device_seen_on_membership_then_account_is_a_real_switch]`
+
+*Decision for review #14 (a PC with no history).* A first sighting on **MEMBERSHIP** is read as
+MEMBERSHIP for earlier events too, not unknown. Reason: treating it as unknown would degrade every
+new install at a MEMBERSHIP gym — a backlog pin not in the cache would go up with no identifier
+(dropped by the backend), and a membership pin that equals a cached account id would name the
+account holder. The residual `[UNVERIFIED — not observed]`: a device that ran ACCOUNT and was
+switched back to MEMBERSHIP before this database first saw it has its ACCOUNT-period backlog read
+as MEMBERSHIP.
+
+> **Operator procedure.** Wipe the terminal's users, then switch `pinScheme` on the device.
+> Until the wipe, a PRESERVE terminal holds the old scheme's users next to the new ones, and on
+> the 110 colliding ids (99 different people) the new push overwrites a stranger's device user.
+> `[UNVERIFIED — HARDWARE-GATED]`: the wipe itself has not been exercised on an MB2000.
+
+**Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
+`device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
+candidates are `owned − keep`, i.e. essentially every old-scheme pin, which exceeds the floor, so it
+returns `REVOKE_ABORT_FLOOR` / `safe_to_prune=False` on every full sync; a full sync that also
+carries explicit revocations reports "authoritative revocation unconfirmed". Targeted member
+revokes (§3.2b) are unaffected. Retiring the old-scheme rows after a confirmed wipe needs an
+explicit operator-confirmed action that does not exist yet. `[CODE: ultra_engine.py::_neutralise_revoked_pins]`
+`[UNKNOWN — not built; needs a decision]`
+
+**Reading the history.** `db.list_device_pin_scheme_switches` and
+`pin_scheme.scheme_at(switches, when)`, items `(scheme, switched_at, previous_scheme)`: no row →
+MEMBERSHIP (only ever seen on MEMBERSHIP — see the #14 decision above for what that does not
+cover); before the first row → its `previous_scheme`, `None` when that is `UNKNOWN`; a row
+stamped at or before `when` is in force; an unparseable `when` on a device with rows → `None`; a
+row with an unparseable time → `None` until the next parseable row at or before `when`.
+`[TEST: ::test_switching_back_is_a_second_switch_and_each_window_resolves, ::test_scheme_at_rules,
+::test_scheme_at_reads_the_scheme_before_the_first_row_from_that_row]`
+
+### 3.2f Local API handlers that carry a member or a pin (2026-09-12)
+
+Every localhost handler that accepts a membership id or a device pin, or turns a device pin into a
+member, with its request fields and how the pin scheme reaches it. Routes are in
+`access/local_api_routes.py`; handlers in `app/api/local_access_api_v2.py`. The dashboard calls
+were confirmed by a read-only sweep of the dashboard branch `claude/fingerprints-quick-wins`; the
+Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
+
+| Route → handler | Request fields | Member/pin handling | Scheme |
+|---|---|---|---|
+| `POST /api/v2/enroll/start` → `_handle_enroll_start` (dashboard fingerprint dialog, `tauri-ui` UsersPage) | `type`/`target`, `userId`, **`activeMembershipId`** (optional, preferred), `fingerId`, `fullName`, `device` | Backend `createUserFingerprint(activeMembershipId)` (a backend id, not a device pin), then `_request_running_ultra_sync(changed_ids={activeMembershipId})` | The targeted member sync converts: ACCOUNT → the person's pin, every row of the person, collapsed (§3.2b table). No handler change needed. |
+| `GET /api/v1/access/enroll` → `_handle_v1_enroll` (deprecated) | `id`/`userId`, `fingerId`, `fullName`, `device` | Same path, membership resolved from `userId` | Same as above |
+| `POST /api/v2/sync/now` → `_handle_sync_now` (dashboard) | optional hint `{entityType, entityId, operation, priority}`; `entityId` is an `activeMembershipId` when `entityType=ACTIVE_MEMBERSHIP` (the dashboard rewrites FINGERPRINT changes into that) | The hint only strips `membersVersion` (`sync_scope.apply_trigger_hint_to_version_tokens`); the resulting delta's membership ids flow into `_request_running_ultra_sync` | Converted downstream: targeted syncs, `changed_ids` pruning and revokes all translate membership → person pin (§3.2b) |
+| `POST /api/v2/sync/fast-patch-bundle` → `_handle_sync_fast_patch_bundle` (dashboard) | the backend patch bundle verbatim; member items are `ActiveMemberUserDto` carrying `mainAccountId`; device items carry `pinScheme` | `db.apply_fast_patch_bundle` stores `main_account_id` and the membership→person link (§3.2d) and a `GYM_DEVICE` upsert records a pinScheme switch (§3.2e); impact membership ids go to `_request_running_ultra_sync` | Converted downstream, as above |
+| `POST /api/v2/devices/{deviceId}/users/push` → `_handle_device_users_push` (PullSDK only) | `pin`, `name`, `cardNo`, `doorIds`, `templates` | RAW pin, written as given — no derivation exists | The caller must send the pin under the device's scheme. The per-finger push outcome is recorded with the device's scheme, so the upstream report names `mainAccountId` on an ACCOUNT device (§3.2b push report); if the device row cannot be read it is recorded `UNKNOWN` and not reported `[TEST: test_push_report_pin_scheme.py::test_an_unreadable_device_scheme_is_never_reported_as_a_membership]` |
+| `POST /api/v2/devices/{deviceId}/users/delete` → `_handle_device_users_delete` (PullSDK only) | `pin` | RAW pin deleted as given | Caller's responsibility; no local state touched |
+| `GET /api/v2/devices/{deviceId}/users` → `_handle_device_users_list` | — | Lists the terminal's raw pins | Display only |
+| `GET /api/v2/dashboard/overview` → `_handle_dashboard_overview` (tauri-ui DashboardPage) | `limit` | Door-history pin → member for the feed | `HistoryPinResolver`: scheme of the event's device at the event's time (§3.2b inbound) |
+| `GET /api/v2/push-history/{batchId}/pins`, `GET /api/v2/devices/{deviceId}/mirror-plan`, `GET /api/v2/db/access-history`, `GET /api/v2/popup/poll` | — | Raw pins / stored rows / engine-enriched notifications, no pin → member mapping in the handler (`popup/poll` payloads are enriched by `_handle_allow`, which is converted) | Display only |
+| `POST /api/v2/members/photo`, `POST /api/v2/members/mutation`, `POST /api/v2/enroll/retry-push` | `activeMembershipId` / `targetId` | Backend-side membership ids; no device pin | n/a |
+| `GET /api/v2/sync/cache/users`, `GET /api/v2/members` (`_handle_members_roster`) | paging/filter | Cached rows; they now also carry `mainAccountId` | n/a |
+| `POST /api/v2/devices/{deviceId}/force-resync` | — | `clear_device_sync_hashes` (UPDATE) + scheduler `force_resync` | n/a |
+
+`[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
+dashboard sweep found those routes only in code comments, and `tauri-ui/src` has no caller.
 
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
@@ -485,6 +1105,13 @@ without ever constructing a PullSDK object.
 `[TEST: test_device_sync_protocol_guard.py::TestNormalizationCarriesProtocol
 and ::TestSyncOneDeviceRefusesNonPullSDK]`
 
+`pinScheme` is on the allowlist for the same reason (2026-09-12). `_sync_one_device`, the
+targeted `sync_member_on_connected_sdk` and `build_device_sync_fingerprint` all hand the
+NORMALIZED dict to `_filter_users_for_device`, while the standalone roster passes the worker's
+raw `self._device`. Without the key, an ACCOUNT device would have received MEMBERSHIP pins on
+the PullSDK paths and ACCOUNT pins on the standalone path — the mixing §3.2b exists to prevent.
+`[TEST: test_pin_scheme_gate.py::test_pin_scheme_survives_ingest_to_the_engine]`
+
 ---
 
 ## 7. Unverified and hardware-gated — do not treat these as known
@@ -603,10 +1230,18 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1321 passed, no
-warnings** (2026-09-09, after the durable ownership correction for immediate
-authoritative revocation; exit code
-0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1716 passed** (with
+warnings; 2026-09-12, after the pin-scheme work of §3.2b–§3.2f, run with the CLAUDE.md command
+`python -m pytest tests/ -q --ignore=tests/_pydeps`; exit code 0). `[TEST]`
+
+> **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
+> override.** Without it the run writes per-pin state into the developer's *installed*
+> database, and a leftover `ownership_confirmed` row there then looks like a departed
+> member to the next suite's revoke pass — which adds neutralise pushes and fails
+> assertions far away from the cause. `_make_sync_worker` in
+> `test_zk_standalone_driver.py` now also stubs `list_confirmed_device_sync_pins`, so a
+> polluted database can no longer reach it; `get_conn()` does **not** commit ad-hoc
+> writes, so clean up through `_run_db_write_sync` if you ever need to.
 
 ```bash
 python tools/check_sql_arity.py
@@ -630,13 +1265,30 @@ To confirm §3.2 (the roster rule) still holds:
 grep -rn "\.push_roster(" app/ --include=*.py
 ```
 
-**Expected:** every match inside `app/core/ultra_engine.py` — currently two real calls
-plus one docstring mention. A match in any other file means the rule has changed and
+**Expected:** every match inside `app/core/ultra_engine.py` — currently four real calls
+(`_run_standalone_full_sync`, `_run_standalone_member_sync`, the neutralise fallback in
+`_remove_standalone_pins`, and the ACCOUNT revoke re-push in `_account_member_revoke`, §3.2b)
+plus one docstring mention (`_build_standalone_roster`). A match in any other file means the rule has changed and
 this guide is out of date.
 
 Match on `\.push_roster(`, not the bare word: `push_roster` also appears in an
 explanatory comment in `local_access_api_v2.py`, and a looser grep makes an intact rule
 look broken.
+
+To confirm §3.2c (the reconcile trigger is a flag, not a reason string):
+
+```bash
+grep -rnE "_MIRROR_RECONCILE_REASONS|bracket = reason" app/ --include=*.py
+```
+
+**Expected: no matches.** Any hit means the gate has been reverted to a reason-string
+test that no producer can satisfy. Match on the *symbol* and the *assignment*, not on the
+literals `user-sync` / `daily-forced-sync`: those still appear in the explanatory comment
+above `_MIRROR_MAX_DELETE_FRACTION`, and a looser grep makes an intact rule look broken.
+
+```bash
+python -m pytest tests/test_mirror_reconcile_reachability.py tests/test_mirror_pushing_policy.py -q
+```
 
 To regenerate the door-open table in §3.1:
 
@@ -691,17 +1343,28 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `ZKEM_PUSH_CHUNK` | `zk_standalone.py` | `chunk chunks members first_pin last_pin pushed failed tpl_attempted tpl_ok op del_attempted del_ok dur_ms ok` |
 | `MEMBER_SYNC_DEFERRED` | `ultra_engine.py` | `member_id reason in_db` |
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
-| `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised`) |
+| `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_OWNERSHIP_MISSING` | `ultra_engine.py` | `member_id pin` |
+| `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
+| `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |
+| `MIRROR_SKIP_NO_CAPABILITY` | `ultra_engine.py` | `worker` |
+| `MIRROR_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | `worker` (warn) |
+| `MIRROR_SKIP_LIST_FAILED` | `ultra_engine.py` | `worker err` (warn) |
+| `MIRROR_NOOP` | `ultra_engine.py` | `worker device roster` |
+| `MIRROR_ABORT_FLOOR` | `ultra_engine.py` | `worker extras roster max_frac` (warn) |
+| `MIRROR_PLAN` | `ultra_engine.py` | `worker would_delete sample armed` |
 | `REVOKE_DONE` | `ultra_engine.py` | `pins deleted neutralised slots ok` (confirmed outcomes only) |
 | `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
 | `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |
+| `REVOKE_SKIP_INCOMPLETE_ROSTER` | `ultra_engine.py` | `withheld` (warn; ACCOUNT rows without `mainAccountId` — MIRROR, revoke pass and prune skipped, §3.2b) |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |
 | `ZKEM_PUSH_TPL_REFUSED` | `zk_standalone.py` | `pin finger size template_version device_fp_version fp_used fp_capacity` |
 | `ZKEM_TPL_VERSION_MISMATCH` | `zk_standalone.py` | `pin finger template_version device_fp_version` |
 | `PULLSDK_PUSH_TPL_REFUSED` | `device_sync.py` | `device_id pin fingers errs` |
 | `SYNC_RETRY_BACKOFF` | `device_sync.py`, `ultra_engine.py` | `device_id pins` |
+| `PIN_SCHEME_ACCOUNT_WITHHELD` | `device_sync.py` | `device_id withheld` (warn; §3.2b — ACCOUNT rows with no `mainAccountId`) |
+| `PIN_SCHEME_SWITCH` | `db.py` | `device_id previous scheme cleared_rows` (warn; §3.2e — the terminal must be wiped) |
 | `ZKEM_PUSH_WEDGED` | `zk_standalone.py` | `chunk chunks members consecutive pushed_before err` |
 | `ZKEM_PUSH_RECONNECT` | `zk_standalone.py` | `chunk ok err` |
 | `ZKEM_PUSH_ABANDONED` | `zk_standalone.py` | `consecutive chunk chunks pushed` |

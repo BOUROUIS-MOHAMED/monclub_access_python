@@ -79,6 +79,7 @@ def test_sync_pending_history_posts_raw_array_payload() -> None:
     with (
         patch("app.core.device_attendance.build_access_api_endpoints", return_value=SimpleNamespace()),
         patch("app.core.device_attendance.list_pending_access_history_for_sync", return_value=[row]),
+        patch("app.core.device_attendance.list_device_pin_scheme_switches", return_value={}),
         patch("app.core.device_attendance.list_sync_devices_payload", return_value=[{"id": 5, "name": "door 1"}]),
         patch("app.core.device_attendance.MonClubApi", return_value=fake_api),
         patch("app.core.device_attendance.mark_access_history_synced", return_value=1),

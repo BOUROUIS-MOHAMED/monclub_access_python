@@ -973,7 +973,18 @@ class MainApp:
         revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str,
+        full_reconcile: bool = False,
     ) -> bool:
+        """Ask the running ULTRA engine to push.
+
+        `full_reconcile` says a PERSON (or the nightly job) asked for a complete
+        reconcile of the device, as opposed to an automatic tick. Derive it from
+        sync_observability.is_explicit_user_sync -- the same predicate that gates
+        `_should_push` in manual-sync mode -- and never from `reason`, which is a
+        trigger_source token and cannot express the distinction. It is what lets a
+        MIRROR device delete departed users; defaults False so a caller that forgets
+        it fails closed. See guide_for_agents_and_dev.md §3.2c.
+        """
         if not (refresh.get("members") or refresh.get("devices")):
             return False
 
@@ -1007,6 +1018,7 @@ class MainApp:
                 "revoked_ids": requested_revoked_ids,
                 "device_ids": requested_device_ids,
                 "reason": normalized_reason,
+                "full_reconcile": bool(full_reconcile),
             }
             started = bool(
                 self._ultra_engine.request_sync_now(**sync_kwargs)
@@ -2747,6 +2759,7 @@ class MainApp:
                         changed_ids=_delta_changed_ids,
                         revoked_ids=_delta_revoked_ids,
                         reason=trigger_context.trigger_source,
+                        full_reconcile=_is_user_initiated_sync,
                     )
                     ultra_push_requested = True
                 sync_online = True
@@ -3061,6 +3074,7 @@ class MainApp:
                     changed_ids=None,
                     revoked_ids=_delta_revoked_ids,
                     reason=trigger_context.trigger_source,
+                    full_reconcile=_is_user_initiated_sync,
                 )
                 # Record the ULTRA dispatch so the sync-run row stops reporting
                 # "Appareils 0" on a gym whose roster genuinely was pushed.

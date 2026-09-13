@@ -72,39 +72,42 @@ def _patch_db(monkeypatch):
 def test_empty_roster_never_deletes():
     """MANDATORY: an empty roster must never wipe the device."""
     w = _make_worker(device_pins=["40000", "40001"])
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster([]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster([]))
     assert w._sdk.deleted is None
     assert w._sdk.list_calls == 0  # bailed before even listing
 
 
 def test_preserve_policy_is_noop():
     w = _make_worker(policy="PRESERVE", device_pins=["40000"])
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster(["117"]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(["117"]))
     assert w._sdk.deleted is None and w._sdk.list_calls == 0
 
 
 def test_null_policy_is_noop():
     w = _make_worker(policy=None, device_pins=["40000"])
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster(["117"]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(["117"]))
     assert w._sdk.deleted is None
 
 
-def test_reason_gate_blocks_non_full_reasons():
+def test_trigger_gate_blocks_anything_but_an_explicit_full_reconcile():
+    """Was a reason-string gate; `reason` is a trigger_source token and could never
+    satisfy it, so the reconcile was structurally dead. The request now carries the
+    answer as a boolean -- see tests/test_mirror_reconcile_reachability.py."""
     w = _make_worker(device_pins=["40000"])
-    w._maybe_mirror_reconcile(reason="timer-refresh", roster_users=_roster(["117"]))
+    w._maybe_mirror_reconcile(full_reconcile=False, roster_users=_roster(["117"]))
     assert w._sdk.deleted is None and w._sdk.list_calls == 0
 
 
 def test_pullsdk_driver_without_primitives_is_noop():
     w = _make_worker(sdk=PullSDKishDriver())
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster(["117"]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(["117"]))
     assert w._sdk.deleted is None
 
 
 def test_list_failure_never_deletes():
     """A failed enumeration must NOT be read as an empty device."""
     w = _make_worker(device_pins=["40000", "40001"], list_ok=False)
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster(["117"]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(["117"]))
     assert w._sdk.deleted is None
 
 
@@ -119,7 +122,7 @@ def test_protected_floor_and_allowlist_excluded():
         device_pins=["117", "40001", "95000", "50000"],
         capabilities={"mirrorProtectedPins": ["50000"]},
     )
-    w._maybe_mirror_reconcile(reason="user-sync",
+    w._maybe_mirror_reconcile(full_reconcile=True,
                               roster_users=_roster(["117", "200", "201", "202", "203"]))
     assert w._sdk.deleted == ["40001"]  # only the true extra
 
@@ -128,7 +131,7 @@ def test_grace_window_protects_recent_enroll():
     import time as _t
     w = _make_worker(device_pins=["117", "88888"],
                      recent={"88888": _t.monotonic()})  # just pushed
-    w._maybe_mirror_reconcile(reason="user-sync",
+    w._maybe_mirror_reconcile(full_reconcile=True,
                               roster_users=_roster(["117", "200", "201", "202"]))
     assert w._sdk.deleted is None  # 88888 protected by grace -> no extras
 
@@ -136,7 +139,7 @@ def test_grace_window_protects_recent_enroll():
 def test_percent_floor_aborts_mass_delete(monkeypatch):
     # 3 extras vs a roster of 4 -> 75% > 25% cap -> abort.
     w = _make_worker(device_pins=["1", "2", "3", "117"])
-    w._maybe_mirror_reconcile(reason="user-sync", roster_users=_roster(["117", "118", "119", "120"]))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(["117", "118", "119", "120"]))
     assert w._sdk.deleted is None
 
 
@@ -146,7 +149,7 @@ def test_dry_run_unarmed_logs_but_never_deletes(monkeypatch):
     monkeypatch.setattr("app.core.db.mirror_reconcile_record_plan",
                         lambda **kw: recorded.update(kw))
     w = _make_worker(device_pins=["117", "40001"])
-    w._maybe_mirror_reconcile(reason="user-sync",
+    w._maybe_mirror_reconcile(full_reconcile=True,
                               roster_users=_roster(["117", "200", "201", "202"]))
     assert w._sdk.deleted is None          # dry-run: nothing deleted
     assert recorded.get("count") == 1      # but the plan was recorded for review
@@ -156,5 +159,5 @@ def test_happy_path_deletes_extras_sorted():
     # roster of 9 so 2 extras (2/9 = 22%) stays under the 25% floor
     roster = ["117"] + [str(200 + i) for i in range(8)]
     w = _make_worker(device_pins=["117", "40002", "40001"])
-    w._maybe_mirror_reconcile(reason="daily-forced-sync", roster_users=_roster(roster))
+    w._maybe_mirror_reconcile(full_reconcile=True, roster_users=_roster(roster))
     assert w._sdk.deleted == ["40001", "40002"]  # both extras, sorted, deleted once

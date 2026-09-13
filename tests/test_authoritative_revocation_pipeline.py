@@ -715,6 +715,7 @@ def test_main_sync_dispatches_separate_ultra_ids_and_legacy_device_union(
         revoked_ids=revoked_ids,
         device_ids=None,
         reason="timer",
+        full_reconcile=False,
     )
     assert device_run.call_args.kwargs["changed_ids"] == expected_device_ids
 
@@ -744,6 +745,7 @@ def test_main_sync_h006_refusal_dispatches_no_revocations_and_clears_member_toke
         revoked_ids=set(),
         device_ids=None,
         reason="timer",
+        full_reconcile=False,
     )
     assert device_run.call_args.kwargs["changed_ids"] is None
     assert db.load_version_tokens() == {
@@ -765,7 +767,8 @@ def test_main_sync_inconsistent_delta_dispatches_only_accepted_safe_upsert(monke
 
     assert shadow_sync.call_args.kwargs["delta_changed_ids"] == {2}
     ultra_request.assert_called_once_with(
-        changed_ids={2}, revoked_ids=set(), device_ids=None, reason="timer"
+        changed_ids={2}, revoked_ids=set(), device_ids=None, reason="timer",
+        full_reconcile=False,
     )
     assert device_run.call_args.kwargs["changed_ids"] == {2}
     token_delete.assert_called_once_with({"membersVersion", "membersUpdatedAfter"})

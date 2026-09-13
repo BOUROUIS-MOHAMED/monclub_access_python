@@ -84,6 +84,7 @@ def _worker_full_sync_accepted_or_pending(
     fingerprint_hash: str | None = None,
     revoked_ids: set[int] | None = None,
     require_full_refresh: bool = False,
+    full_reconcile: bool = False,
 ) -> bool:
     request = getattr(worker, "request_full_sync", None)
     if not callable(request):
@@ -95,6 +96,8 @@ def _worker_full_sync_accepted_or_pending(
         kwargs["revoked_ids"] = set(revoked_ids)
     if require_full_refresh:
         kwargs["require_full_refresh"] = True
+    if full_reconcile:
+        kwargs["full_reconcile"] = True
     return bool(request(**kwargs))
 
 
@@ -169,13 +172,22 @@ _ZKEM_INVALID_EVENT_TYPE = "zkem_invalid"
 # ---- MIRROR pushing policy (per-device, ZK_STANDALONE) ----------------------
 # The destructive reconcile that deletes device users NOT in the app roster.
 # Guardrails (see _maybe_mirror_reconcile):
-#  - only these reasons reconcile (the bracketed full syncs; never a daytime or a
-#    spurious device-sync-flip full sync);
+#  - only an explicit full reconcile reconciles -- the `full_reconcile` flag the
+#    request carries, never a daytime or a spurious device-sync-flip full sync;
 #  - abort if it would delete more than this fraction of the roster;
 #  - pins >= the reserved floor are protected (manual/admin/staff enrollments);
 #  - never delete a pin pushed within the grace window (a just-enrolled member the
 #    stale roster hasn't caught up to yet).
-_MIRROR_RECONCILE_REASONS = ("user-sync", "daily-forced-sync", "hard-reset")
+#
+# `full_reconcile` is a BOOLEAN carried with the request, not a string sniffed out
+# of `reason`. This gate used to read
+# `reason in ("user-sync", "daily-forced-sync", "hard-reset")`, but `reason` is a
+# trigger_source token (SYNC_NOW_API / TIMER / CHANGE_DETECTOR / ...), so no
+# producer could ever satisfy it and the reconcile was structurally dead -- see
+# guide_for_agents_and_dev.md §3.2c. The distinction those literals were reaching
+# for lives in `trigger_hint`, and `sync_observability.is_explicit_user_sync`
+# already folds it into one predicate; the app layer evaluates that predicate once
+# and the answer travels with the request.
 _MIRROR_MAX_DELETE_FRACTION = 0.25
 _MIRROR_RESERVED_PIN_FLOOR = 90000
 _MIRROR_ENROLL_GRACE_SEC = 600.0
@@ -1236,8 +1248,10 @@ class UltraDeviceWorker(threading.Thread):
         fingerprint_hash: str | None = None,
         revoked_ids: set[int] | None = None,
         require_full_refresh: bool = False,
+        full_reconcile: bool = False,
     ) -> bool:
         normalized_reason = str(reason or "manual").strip() or "manual"
+        normalized_full_reconcile = bool(full_reconcile)
         normalized_revoked_ids = {
             int(member_id)
             for member_id in (revoked_ids or set())
@@ -1308,6 +1322,10 @@ class UltraDeviceWorker(threading.Thread):
                     )
                     if require_full_refresh:
                         pending["require_full_refresh"] = True
+                    # OR, never assignment: coalescing a later timer push into a
+                    # queued explicit reconcile must not downgrade it.
+                    if normalized_full_reconcile:
+                        pending["full_reconcile"] = True
                     for member_id in retry_revoked_ids:
                         phases.pop(member_id, None)
                     for member_id in retry_excluded_ids:
@@ -1335,6 +1353,9 @@ class UltraDeviceWorker(threading.Thread):
                     and not retry_revoked_ids
                     and not retry_excluded_ids
                     and not require_full_refresh
+                    # An operator's explicit reconcile is never "already covered"
+                    # by someone else's revocation ownership -- it must still run.
+                    and not normalized_full_reconcile
                 ):
                     return True
                 for member_id in retry_revoked_ids:
@@ -1347,6 +1368,7 @@ class UltraDeviceWorker(threading.Thread):
                     "revoked_ids": queued_revoked_ids,
                     "excluded_ids": inherited_excluded_ids | queued_revoked_ids,
                     "require_full_refresh": bool(require_full_refresh),
+                    "full_reconcile": normalized_full_reconcile,
                 }
                 if queued_targeted_revoked_ids:
                     self._pending_member_syncs = deque(
@@ -1618,6 +1640,7 @@ class UltraDeviceWorker(threading.Thread):
                         device=self._device,
                         member_id=member_id,
                         source="ultra_targeted_member_sync",
+                        revocation=bool(is_revocation),
                     )
                     if is_revocation:
                         if member_sync_ok:
@@ -1677,7 +1700,7 @@ class UltraDeviceWorker(threading.Thread):
         full sync and recorded in device_sync_state after each push.
 
         Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
-        VALID_ONLY policy / pin derivation: activeMembershipId, else userId) and
+        VALID_ONLY policy / pin derivation under the device's pinScheme, guide §3.2b) and
         _collect_templates_for_pin (cache fingerprints -> local SQLite fallback)
         so a standalone device sees exactly the roster a PullSDK panel would.
         Cards are passed RAW (digits handled by the driver): the 4-byte CardNo
@@ -1689,11 +1712,20 @@ class UltraDeviceWorker(threading.Thread):
         engine = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)
         device = dict(self._device or {})
         users_all = list(getattr(cache, "users", []) or [])
+        roster_stats: Dict[str, Any] = {}
         by_pin = engine._filter_users_for_device(
-            users=users_all, device=device, default_door_id=1,
+            users=users_all, device=device, default_door_id=1, stats_out=roster_stats,
         )
+        # Read by _run_standalone_full_sync to refuse removals on an incomplete roster.
+        self._last_standalone_roster_stats = roster_stats
         if only_member_ids is not None:
-            wanted = {str(int(m)) for m in only_member_ids}
+            # only_member_ids are MEMBERSHIP ids. MEMBERSHIP: str(int(m)), as before.
+            # ACCOUNT: the person pins those memberships belong to.
+            from app.core.device_sync import device_pins_for_members
+
+            wanted = set(device_pins_for_members(
+                only_member_ids, scheme=roster_stats.get("pin_scheme") or "", users=users_all,
+            ).values())
             by_pin = {p: u for p, u in by_pin.items() if p in wanted}
 
         fp_enabled = bool(self._settings.get("fingerprint_enabled", False))
@@ -1999,6 +2031,7 @@ class UltraDeviceWorker(threading.Thread):
         self,
         *,
         reason: str,
+        full_reconcile: bool = False,
         fingerprint_hash: str | None,
         revoked_ids: set[int] | None = None,
         excluded_ids: set[int] | None = None,
@@ -2039,6 +2072,13 @@ class UltraDeviceWorker(threading.Thread):
                 revoked_ids=normalized_revoked_ids,
             )
             return
+        # Which device pin each unconfirmed revocation names (MEMBERSHIP: str(id), as before;
+        # ACCOUNT: the person's pin, absent when it cannot be named).
+        revoked_pin_of: Dict[int, str] = {}
+        if unconfirmed_revoked_ids:
+            revoked_pin_of = self._device_pins_for_members(
+                unconfirmed_revoked_ids, users=list(getattr(cache, "users", []) or []),
+            )
         if unconfirmed_revoked_ids:
             try:
                 from app.core.db import list_device_sync_hashes_and_status
@@ -2064,13 +2104,13 @@ class UltraDeviceWorker(threading.Thread):
                 else set()
             )
             missing_pins = {
-                str(member_id)
-                for member_id in unconfirmed_revoked_ids
+                pin
+                for pin in revoked_pin_of.values()
                 if (
                     sync_state is None
-                    or str(member_id) in sync_state
+                    or pin in sync_state
                 )
-                and str(member_id) not in confirmed
+                and pin not in confirmed
             }
             if missing_pins:
                 logger.warning(
@@ -2119,18 +2159,25 @@ class UltraDeviceWorker(threading.Thread):
         skipped_note = ""
         desired_pins: list[str] = []
         try:
+            self._last_standalone_roster_stats = None
             users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
-            # Daytime pushes must NOT EnableDevice-lock the terminal (it is the
-            # gym's sole verifier); only the explicit nightly/manual reconcile
-            # brackets. See plan decision D6.
-            bracket = reason in ("user-sync", "daily-forced-sync", "hard-reset")
-            # Bracketed = explicit/nightly full reconcile: keep pushing EVERY pin
-            # (unchanged semantics). Everything else is incremental.
-            if bracket:
-                to_push = list(users)
-            else:
-                to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
+            _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
+            roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
+            # EnableDevice bracketing is DELIBERATELY OFF, including for an explicit
+            # full reconcile. Plan decision D6 said the nightly/manual reconcile would
+            # bracket, but it never once executed (the condition was a dead reason
+            # string) and the driver has since changed underneath it: push_roster
+            # collapses a bracketed roster into ONE command (`chunks = [users]`) with
+            # no per-chunk timeout, which bypasses the wedge recovery added because a
+            # single-command 950-member push meant "the gym never got more than the
+            # first 10 members". It also holds EnableDevice(False) across the whole
+            # push, and the terminal is the gym's sole verifier.
+            #
+            # Turning this on is a separate, hardware-gated decision, NOT a side
+            # effect of repairing the MIRROR trigger. See guide §3.2c.
+            bracket = False
+            to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
             # Which finger slots this terminal currently holds per pin. Read ONCE
             # per sync; used both to name vacated slots below and to give unchanged
             # pins a baseline they would otherwise never get.
@@ -2220,23 +2267,41 @@ class UltraDeviceWorker(threading.Thread):
                 # incremental `to_push` subset -- MIRROR deletes device users absent
                 # from this list, so passing the subset would delete every unchanged
                 # member.
-                try:
-                    self._maybe_mirror_reconcile(reason=reason, roster_users=users)
-                except Exception as exc:
-                    logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
-                # Strip credentials from pins WE pushed that have left the roster.
-                # Must run BEFORE the prune below, which deletes the very record of
-                # what we pushed to them.
                 safe_to_prune = True
-                try:
-                    safe_to_prune = self._neutralise_revoked_pins(
-                        desired_pins=desired_pins,
-                        roster_count=len(users),
-                        required_pins={str(member_id) for member_id in unconfirmed_revoked_ids},
+                if roster_withheld:
+                    # pinScheme=ACCOUNT rows without mainAccountId were withheld, so their
+                    # people's pins are missing from `users`/`desired_pins` and would read as
+                    # departed. MIRROR, the revoke pass and the prune all remove by that
+                    # difference -- skip all three. safe_to_prune=False also keeps the
+                    # ownership evidence (guide §3.2c).
+                    logger.warning(
+                        "%s full sync: pinScheme=ACCOUNT roster INCOMPLETE (%d row(s) withheld, "
+                        "no mainAccountId) -- MIRROR reconcile, revoke pass and prune skipped",
+                        self._prefix, roster_withheld,
                     )
-                except Exception as exc:
-                    logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                    _tel.warn("REVOKE_SKIP_INCOMPLETE_ROSTER", worker=self._tel_wid,
+                              withheld=roster_withheld)
                     safe_to_prune = False
+                else:
+                    try:
+                        self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
+                                                     roster_users=users)
+                    except Exception as exc:
+                        logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
+                    # Strip credentials from pins WE pushed that have left the roster.
+                    # Must run BEFORE the prune below, which deletes the very record of
+                    # what we pushed to them.
+                    try:
+                        safe_to_prune = self._neutralise_revoked_pins(
+                            desired_pins=desired_pins,
+                            roster_count=len(users),
+                            required_pins=self._required_revocation_pins(
+                                unconfirmed_revoked_ids, desired_pins, revoked_pin_of,
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                        safe_to_prune = False
                 if unconfirmed_revoked_ids and not safe_to_prune:
                     sync_ok = False
                     sync_error = "authoritative revocation unconfirmed"
@@ -2339,6 +2404,9 @@ class UltraDeviceWorker(threading.Thread):
         """
         rows = self._member_row_in_db(member_id)
         if rows:
+            # ACCOUNT: the device row is the collapse of EVERY membership of the person, so
+            # read all of the person's rows, not just the one that changed.
+            rows = self._person_rows_for_member(member_id, rows)
             return self._build_standalone_roster(
                 SimpleNamespace(users=rows), only_member_ids={int(member_id)},
             )
@@ -2379,6 +2447,21 @@ class UltraDeviceWorker(threading.Thread):
         #                  (allowedMemberships, validity, pin derivation)
         _rows = self._member_row_in_db(member_id)
         in_db = None if _rows is None else bool(_rows)
+        if pin and self._pin_scheme_is_account():
+            # The flag must land on the pin the device holds -- the person's. A membership
+            # number here would flag (at best) nothing and (at worst) another person's pin.
+            try:
+                pin = self._device_pins_for_members({int(member_id)}, users=_rows or []).get(
+                    int(member_id), ""
+                )
+            except Exception:
+                pin = ""
+            if not pin:
+                logger.warning(
+                    "%s member sync deferred: pinScheme=ACCOUNT and membership %s has no "
+                    "known person pin -- nothing flagged; the next full sync reconciles.",
+                    self._prefix, member_id,
+                )
         logger.warning(
             "%s member sync deferred: member %s -- %s (row in sync_users: %s). "
             "Flagged for the next full sync rather than reported as synced.",
@@ -2626,9 +2709,174 @@ class UltraDeviceWorker(threading.Thread):
             failed=frozenset(failed),
         )
 
+    # ------------------------------------------------------------------ #
+    # pinScheme helpers: every request names a MEMBERSHIP; the device row is keyed by the
+    # device's scheme. guide §3.2b.
+    # ------------------------------------------------------------------ #
+    def _pin_scheme_is_account(self) -> bool:
+        from app.core.device_sync import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+        return device_pin_scheme(self._device) == PIN_SCHEME_ACCOUNT
+
+    def _device_pins_for_members(self, member_ids, *, users=None) -> Dict[int, str]:
+        from app.core.device_sync import device_pin_scheme, device_pins_for_members
+
+        return device_pins_for_members(member_ids, scheme=device_pin_scheme(self._device),
+                                      users=users)
+
+    def _person_rows_for_member(self, member_id: int, rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        """Under ACCOUNT, every cached row of the person behind ``member_id`` (falls back to
+        ``rows`` when the person cannot be named or the read fails). MEMBERSHIP: ``rows``."""
+        if not self._pin_scheme_is_account():
+            return rows
+        try:
+            acct = self._device_pins_for_members({int(member_id)}, users=rows).get(int(member_id))
+            if not acct:
+                return rows
+            from app.core.db import list_sync_users_by_main_account_ids
+
+            person = list(list_sync_users_by_main_account_ids({int(acct)}) or [])
+            return person or rows
+        except Exception:
+            logger.debug("%s person rows read failed", self._prefix, exc_info=True)
+            return rows
+
+    def _required_revocation_pins(
+        self,
+        unconfirmed_revoked_ids: set[int],
+        desired_pins,
+        revoked_pin_of: Dict[int, str],
+    ) -> set[str]:
+        """Pins an explicit revocation must see REMOVED.
+
+        MEMBERSHIP: every revoked membership id, as before. ACCOUNT: only the person pins that
+        left the desired roster -- a person who still holds another membership this device
+        accepts is satisfied by the full sync's re-push, not by removal (requiring removal of a
+        pin that is still desired would fail the sync forever). An unmappable membership names
+        no pin; the revoke pass still removes every owned pin that left the roster.
+        """
+        if not self._pin_scheme_is_account():
+            return {str(member_id) for member_id in unconfirmed_revoked_ids}
+        desired = {str(p).strip() for p in (desired_pins or ())}
+        return {
+            pin for member_id, pin in (revoked_pin_of or {}).items()
+            if member_id in unconfirmed_revoked_ids and pin not in desired
+        }
+
+    def _account_member_revoke(self, member_id: int) -> tuple[bool | None, str]:
+        """ACCOUNT half of ``_run_standalone_member_revoke``. Returns ``(result, pin)``.
+
+        ``result`` True/False: handled here -- the person's collapsed row was RE-PUSHED, or the
+        revoke could not proceed. ``None``: nothing of the person remains deliverable to this
+        device, so ``pin`` goes through the normal ownership-checked removal.
+        """
+        acct = ""
+        try:
+            rows = self._member_row_in_db(member_id) or []
+            acct = self._device_pins_for_members({member_id}, users=rows).get(member_id, "")
+        except Exception:
+            logger.warning("%s member revoke: person pin lookup failed for membership %s",
+                           self._prefix, member_id, exc_info=True)
+        if not acct:
+            logger.critical(
+                "%s member revoke: pinScheme=ACCOUNT and membership %s cannot be mapped to its "
+                "person's pin (no cached or linked mainAccountId). NOT removing by the "
+                "membership number, which may be another person's account pin; deferring to "
+                "full reconciliation.",
+                self._prefix, member_id,
+            )
+            _tel.warn("MEMBER_REVOKE_PIN_UNKNOWN", worker=self._tel_wid, member_id=member_id)
+            self.request_full_sync(reason="revoke-pin-unknown", revoked_ids={member_id})
+            return False, ""
+        try:
+            from app.core.db import list_sync_users_by_main_account_ids
+
+            remaining = []
+            for row in list_sync_users_by_main_account_ids({int(acct)}) or []:
+                try:
+                    if int(row.get("activeMembershipId")) == int(member_id):
+                        continue  # defensively: the revoked plan never counts
+                except (TypeError, ValueError):
+                    pass
+                remaining.append(row)
+        except Exception:
+            logger.warning("%s member revoke: person rows unreadable for pin %s",
+                           self._prefix, acct, exc_info=True)
+            _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id, pin=acct)
+            self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+            return False, acct
+        users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(
+            SimpleNamespace(users=remaining)
+        )
+        entry = next((u for u in users if str(u.get("pin") or "").strip() == acct), None)
+        if entry is None:
+            from app.core.device_sync import DeviceSyncEngine, account_roster_withheld_for_device
+
+            withheld = account_roster_withheld_for_device(
+                DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger),
+                dict(self._device or {}),
+            )
+            if withheld:
+                # Nothing NAMED of this person remains, but rows without mainAccountId are
+                # withheld from this device and one of them may be theirs. Removing now could
+                # strip a paying member; defer to the full sync, which also refuses removals
+                # on an incomplete roster.
+                logger.warning(
+                    "%s member revoke: pin %s not removed -- %d deliverable row(s) have no "
+                    "mainAccountId, so the person cannot be proven gone",
+                    self._prefix, acct, withheld,
+                )
+                _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id,
+                          pin=acct)
+                self.request_full_sync(reason="revoke-roster-incomplete", revoked_ids={member_id})
+                return False, acct
+            return None, acct
+        _tel.event("MEMBER_REVOKE_REQUESTED", worker=self._tel_wid, member_id=member_id, pin=acct)
+        templates = {acct: templates_by_pin[acct]} if acct in (templates_by_pin or {}) else {}
+        ok = False
+        try:
+            removals = self._standalone_removals(
+                to_push=[entry], templates_by_pin=templates,
+                pushed_fingers=self._load_pushed_fingers(),
+            )
+            result = self._sdk.push_roster([entry], templates, remove_fingers_by_pin=removals)
+            self._record_standalone_pin_state(
+                users=[entry], hashes_by_pin=hashes_by_pin, result=result,
+                templates_by_pin=templates,
+            )
+            ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
+                users=[entry], result=result,
+            )
+        except Exception:
+            logger.warning("%s member revoke: re-push of pin %s failed", self._prefix, acct,
+                           exc_info=True)
+            ok = False
+        if ok:
+            logger.info(
+                "%s member revoke: membership %s left; person pin %s still holds another "
+                "membership this device accepts -- re-pushed the collapsed row instead of "
+                "deleting it", self._prefix, member_id, acct,
+            )
+            _tel.event("MEMBER_REVOKE_DONE", worker=self._tel_wid, member_id=member_id,
+                       pin=acct, mode="repushed", ok=True)
+            return True, acct
+        _tel.warn("MEMBER_REVOKE_FAILED", worker=self._tel_wid, member_id=member_id, pin=acct)
+        self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+        return False, acct
+
     def _run_standalone_member_revoke(self, member_id: int) -> bool:
-        """Immediately remove one authoritative, MonClub-owned standalone PIN."""
-        pin = str(int(member_id))
+        """Immediately remove one authoritative, MonClub-owned standalone PIN.
+
+        Under pinScheme=ACCOUNT the pin is the PERSON: revoking one membership removes the pin
+        only when nothing of that person remains deliverable to this device; otherwise the
+        collapsed row is re-pushed (``_account_member_revoke``). guide §3.2b.
+        """
+        if self._pin_scheme_is_account():
+            handled, pin = self._account_member_revoke(int(member_id))
+            if handled is not None:
+                return handled
+        else:
+            pin = str(int(member_id))
         _tel.event(
             "MEMBER_REVOKE_REQUESTED",
             worker=self._tel_wid,
@@ -2889,22 +3137,27 @@ class UltraDeviceWorker(threading.Thread):
                     out.add(s)
         return out
 
-    def _maybe_mirror_reconcile(self, *, reason: str, roster_users: list[Dict[str, Any]]) -> None:
+    def _maybe_mirror_reconcile(self, *, full_reconcile: bool,
+                                roster_users: list[Dict[str, Any]]) -> None:
         """MIRROR pushing policy: delete device users NOT in the app roster.
 
         DESTRUCTIVE — removes users off a live turnstile. Every gate is an early
         return with a MIRROR_SKIP_*/ABORT telemetry event; the first run on a device
         is dry-run only (logs the plan, deletes nothing) until an operator arms it via
         db.arm_mirror_reconcile. PRESERVE (default) and PullSDK drivers never get here.
+
+        `full_reconcile` is the request's own flag, derived ONCE at the app layer by
+        sync_observability.is_explicit_user_sync. Do not re-derive it from `reason`:
+        `reason` is a trigger_source token and cannot express this distinction.
         """
         # 1) policy gate
         policy = str((self._device or {}).get("rosterPushingPolicy") or "").strip().upper()
         if policy != "MIRROR":
             return  # PRESERVE / null / pre-migration -> additive, nothing to reconcile
 
-        # 2) reason gate — only the bracketed full reconciles (never daytime/spurious)
-        if reason not in _MIRROR_RECONCILE_REASONS:
-            _tel.event("MIRROR_SKIP_REASON", worker=self._tel_wid, reason=reason)
+        # 2) trigger gate — only an explicit full reconcile (never daytime/spurious)
+        if not full_reconcile:
+            _tel.event("MIRROR_SKIP_NOT_FULL_RECONCILE", worker=self._tel_wid)
             return
 
         # 3) capability gate — driver must enumerate + delete (PullSDK cannot)
@@ -3156,6 +3409,7 @@ class UltraDeviceWorker(threading.Thread):
                 break
             reason = str(request.get("reason") or "manual")
             fingerprint_hash = str(request.get("fingerprint_hash") or "").strip() or None
+            full_reconcile = bool(request.get("full_reconcile"))
             revoked_ids = request_revoked_ids
             excluded_ids = request_excluded_ids
 
@@ -3168,6 +3422,7 @@ class UltraDeviceWorker(threading.Thread):
                         reason=reason,
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
+                        full_reconcile=full_reconcile,
                     )
                     break
                 # Push drivers (ZK_STANDALONE) have no raw PullSDK handle — the
@@ -3177,6 +3432,7 @@ class UltraDeviceWorker(threading.Thread):
                 if getattr(self._sdk, "owns_event_source", False):
                     self._run_standalone_full_sync(
                         reason=reason,
+                        full_reconcile=full_reconcile,
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
                         excluded_ids=excluded_ids,
@@ -3192,6 +3448,7 @@ class UltraDeviceWorker(threading.Thread):
                         reason=reason,
                         fingerprint_hash=fingerprint_hash,
                         revoked_ids=revoked_ids,
+                        full_reconcile=full_reconcile,
                     )
                     break
                 cache = load_sync_cache()
@@ -3254,6 +3511,7 @@ class UltraDeviceWorker(threading.Thread):
                         device=device_copy,
                         member_id=member_id,
                         source="ultra_full_sync_revoke",
+                        revocation=True,
                     ):
                         self._mark_member_revoke_confirmed(member_id)
                 sync_ok = bool(engine.run_one_device_on_connected_sdk(
@@ -3941,12 +4199,14 @@ class UltraDeviceWorker(threading.Thread):
             user = hits[0] if isinstance(hits, list) else hits
 
         # Fallback: for fingerprint scans the device sets cardNo=pin (F-004).
-        # If card lookup missed, try users_by_am using the raw RTLog pin field.
+        # If card lookup missed, resolve the raw RTLog pin UNDER THIS DEVICE'S pinScheme.
+        # users_by_am is keyed by activeMembershipId: on an ACCOUNT device that lookup names
+        # nobody, or -- for the 110 colliding ids -- a stranger. guide §3.2b.
         if user is None and raw_row:
             pin_raw = str(raw_row.get("pin") or "").strip()
             if pin_raw.isdigit():
                 try:
-                    user = users_by_am.get(int(pin_raw))
+                    user = self._user_for_device_pin(pin_raw, users_by_am)
                 except Exception:
                     pass
 
@@ -4020,6 +4280,37 @@ class UltraDeviceWorker(threading.Thread):
 
         if (time.monotonic() - t0) * 1000 >= 250:
             _tel.warn("ALLOW_HANDLE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
+
+    def _user_for_device_pin(self, pin: str, users_by_am: Dict[int, Any]) -> Optional[Dict[str, Any]]:
+        """The member a pin reported by THIS device names, under its pinScheme.
+
+        MEMBERSHIP: ``users_by_am[int(pin)]`` exactly as before (that index also carries the
+        userId fallback pins). ACCOUNT: the collapsed per-person row
+        ``_filter_users_for_device`` builds for this device -- the same derivation the push
+        used, over the same local-state users -- so an event names the membership the device
+        row represents. Cached per local-state snapshot and device dict.
+        """
+        from app.core.device_sync import PIN_SCHEME_ACCOUNT, device_pin_scheme
+
+        if device_pin_scheme(self._device) != PIN_SCHEME_ACCOUNT:
+            return users_by_am.get(int(pin))
+        cached = getattr(self, "_account_pin_index_cache", None)
+        if cached is not None and cached[0] is users_by_am and cached[1] is self._device:
+            index = cached[2]
+        else:
+            from app.core.device_sync import DeviceSyncEngine
+
+            seen: set[int] = set()
+            users: list[Dict[str, Any]] = []
+            for candidate in (users_by_am or {}).values():
+                if isinstance(candidate, dict) and id(candidate) not in seen:
+                    seen.add(id(candidate))
+                    users.append(candidate)
+            index = DeviceSyncEngine(cfg=self._cfg or SimpleNamespace(), logger=logger)._filter_users_for_device(
+                users=users, device=dict(self._device or {}), default_door_id=1,
+            )
+            self._account_pin_index_cache = (users_by_am, self._device, index)
+        return index.get(str(int(pin)))
 
     # ------------------------------------------------------------------ #
     # TOTP Rescue handler (active: verify + open door)
@@ -5137,6 +5428,7 @@ class UltraSyncScheduler:
         self._pending_all_devices = False
         self._pending_device_ids: Set[int] = set()
         self._pending_reason = "manual"
+        self._pending_full_reconcile = False
 
     def set_workers(self, workers: Dict[int, "UltraDeviceWorker"]):
         """Register per-device worker references so sync requests stay worker-owned."""
@@ -5156,10 +5448,15 @@ class UltraSyncScheduler:
         revoked_ids: set[int],
         device_ids: set[int] | None,
         reason: str,
+        full_reconcile: bool = False,
     ) -> None:
         with self._pending_sync_lock:
             self._pending_sync_requested = True
             self._pending_reason = reason
+            # OR, never assignment: an automatic tick coalescing into a pending
+            # operator reconcile must not downgrade it to an ordinary push.
+            if full_reconcile:
+                self._pending_full_reconcile = True
             if changed_ids is None:
                 self._pending_full_sync = True
                 self._pending_changed_ids.clear()
@@ -5180,12 +5477,14 @@ class UltraSyncScheduler:
         revoked_ids: set[int],
         device_ids: set[int],
         reason: str,
+        full_reconcile: bool = False,
     ) -> None:
         self._merge_pending_sync_request(
             changed_ids=changed_ids,
             revoked_ids=revoked_ids,
             device_ids=device_ids,
             reason=reason,
+            full_reconcile=bool(full_reconcile),
         )
         self._logger.warning(
             "[UltraSyncScheduler] preserved sync for worker retry: reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
@@ -5374,6 +5673,7 @@ class UltraSyncScheduler:
         revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "manual",
+        full_reconcile: bool = False,
     ) -> None:
         normalized_reason = str(reason or "manual").strip().lower() or "manual"
         normalized_changed_ids = (
@@ -5412,6 +5712,7 @@ class UltraSyncScheduler:
             revoked_ids=normalized_revoked_ids,
             device_ids=normalized_device_ids,
             reason=normalized_reason,
+            full_reconcile=bool(full_reconcile),
         )
         self._logger.info(
             "[UltraSyncScheduler] request_sync_now: reason=%s changed_ids=%s revoked_ids=%d device_ids=%s",
@@ -5424,11 +5725,12 @@ class UltraSyncScheduler:
 
     def _drain_pending_sync_request(
         self,
-    ) -> tuple[set[int] | None, set[int], set[int] | None, str] | None:
+    ) -> tuple[set[int] | None, set[int], set[int] | None, str, bool] | None:
         with self._pending_sync_lock:
             if not self._pending_sync_requested:
                 return None
             reason = self._pending_reason
+            full_reconcile = bool(self._pending_full_reconcile)
             changed_ids = None if self._pending_full_sync else set(self._pending_changed_ids)
             revoked_ids = set(self._pending_revoked_ids)
             device_ids = None if self._pending_all_devices else set(self._pending_device_ids)
@@ -5439,7 +5741,8 @@ class UltraSyncScheduler:
             self._pending_all_devices = False
             self._pending_device_ids.clear()
             self._pending_reason = "manual"
-            return changed_ids, revoked_ids, device_ids, reason
+            self._pending_full_reconcile = False
+            return changed_ids, revoked_ids, device_ids, reason, full_reconcile
 
     @staticmethod
     def _manual_sync_mode() -> bool:
@@ -5476,12 +5779,13 @@ class UltraSyncScheduler:
                 pending = self._drain_pending_sync_request()
                 if pending is None:
                     continue
-                changed_ids, revoked_ids, device_ids, reason = pending
+                changed_ids, revoked_ids, device_ids, reason, full_reconcile = pending
                 self._sync_all(
                     changed_ids=changed_ids,
                     revoked_ids=revoked_ids,
                     device_ids=device_ids,
                     reason=reason,
+                    full_reconcile=full_reconcile,
                 )
                 continue
             # A request preserved for a dead standalone worker must survive until
@@ -5490,12 +5794,13 @@ class UltraSyncScheduler:
             # timer pushes, never an already-authorized explicit request.
             pending = self._drain_pending_sync_request()
             if pending is not None:
-                changed_ids, revoked_ids, device_ids, reason = pending
+                changed_ids, revoked_ids, device_ids, reason, full_reconcile = pending
                 self._sync_all(
                     changed_ids=changed_ids,
                     revoked_ids=revoked_ids,
                     device_ids=device_ids,
                     reason=reason,
+                    full_reconcile=full_reconcile,
                 )
             elif not self._manual_sync_mode():
                 self._sync_all(reason="timer")
@@ -5512,6 +5817,7 @@ class UltraSyncScheduler:
         revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "timer",
+        full_reconcile: bool = False,
     ):
         """Push user data to all ULTRA devices (with hash-based skip)."""
         normalized_revoked_ids = {
@@ -5559,7 +5865,14 @@ class UltraSyncScheduler:
                 if worker is not None and _worker_is_usable(worker):
                     try:
                         commands_handled = True
-                        if normalized_changed_ids is not None:
+                        # A delta names only the members that changed; an explicit
+                        # reconcile is about the rows the TERMINAL holds and the roster
+                        # no longer names, which targeted member syncs never see. So a
+                        # reconcile always takes the full route -- exactly like
+                        # UltraEngine.request_sync_now. Without the second condition a
+                        # request that reached this scheduler as the FALLBACK (dead or
+                        # refusing worker) lost its reconcile. guide §3.2c.
+                        if normalized_changed_ids is not None and not full_reconcile:
                             for member_id in sorted(normalized_revoked_ids):
                                 commands_handled = (
                                     _worker_member_revoke_accepted_or_covered(
@@ -5602,6 +5915,11 @@ class UltraSyncScheduler:
                                 )
                                 if (
                                     not normalized_revoked_ids
+                                    # A reconcile targets rows the TERMINAL holds and
+                                    # the roster does not -- which never moves the
+                                    # roster hash. Skipping here would make the
+                                    # operator's click unreachable all over again.
+                                    and not full_reconcile
                                     and self._last_hash.get(device_id) == current_hash
                                 ):
                                     self._logger.info(
@@ -5625,6 +5943,7 @@ class UltraSyncScheduler:
                                         fingerprint_hash=current_hash,
                                         revoked_ids=normalized_revoked_ids,
                                         require_full_refresh=True,
+                                        full_reconcile=bool(full_reconcile),
                                     )
                                     target_handled = commands_handled and full_sync_handled
                                     routed = target_handled
@@ -5657,10 +5976,12 @@ class UltraSyncScheduler:
                             revoked_ids=normalized_revoked_ids,
                             device_ids={int(device_id)},
                             reason=str(reason or "manual"),
+                            full_reconcile=bool(full_reconcile),
                         )
                     else:
                         sync_kwargs: Dict[str, Any] = {
-                            "changed_ids": normalized_changed_ids,
+                            # A reconcile is never narrowed to the delta's members.
+                            "changed_ids": None if full_reconcile else normalized_changed_ids,
                         }
                         did_sync = self._sync_device(d, **sync_kwargs)
                 interval = int(
@@ -6247,9 +6568,11 @@ class UltraEngine:
         revoked_ids: set[int] | None = None,
         device_ids: set[int] | None = None,
         reason: str = "manual",
+        full_reconcile: bool = False,
     ) -> bool:
         if not self._running or not self._sync_scheduler:
             return False
+        normalized_full_reconcile = bool(full_reconcile)
         normalized_changed_ids = (
             None
             if changed_ids is None
@@ -6304,13 +6627,18 @@ class UltraEngine:
                 continue
             try:
                 commands_handled = True
-                if normalized_changed_ids is None:
+                # A delta answer names only the members that changed, but an explicit
+                # reconcile is about the ones the terminal still holds and the roster
+                # no longer names. Targeted member syncs can never see those, so an
+                # operator's reconcile always takes the full-sync route.
+                if normalized_changed_ids is None or normalized_full_reconcile:
                     commands_handled = (
                         _worker_full_sync_accepted_or_pending(
                             worker,
                             reason=reason,
                             revoked_ids=normalized_revoked_ids,
                             require_full_refresh=True,
+                            full_reconcile=normalized_full_reconcile,
                         )
                         and commands_handled
                     )
@@ -6359,6 +6687,7 @@ class UltraEngine:
                     revoked_ids=normalized_revoked_ids,
                     device_ids=fallback_device_ids,
                     reason=reason,
+                    full_reconcile=normalized_full_reconcile,
                 )
                 scheduled = True
             except Exception as exc:

@@ -119,6 +119,21 @@ def test_member_count_from_token_handles_missing_or_garbage() -> None:
     assert member_count_from_token("not-a-number:x") is None
 
 
+def test_member_count_from_token_tolerates_appended_components() -> None:
+    """Account-level fingerprints (SP2) append ":<enrCount>:<maxEnrUpdated>" to the
+    4-component token, making it 6. ``split(":", 1)`` only ever reads component 0,
+    so this -- and any future number of appended components -- must parse exactly
+    like the legacy 4-component token. Only PREPENDING a component, or changing what
+    component 0 means, is the actual compatibility break (see
+    docs/superpowers/specs/2026-09-11-account-level-fingerprints-design.md §3.2a)."""
+    legacy_4 = "1706:2026-06-10T15:01:39.328283:0:0"
+    new_6 = "1706:2026-06-10T15:01:39.328283:0:0:3:2026-09-11T10:00:00"
+    assert member_count_from_token(new_6) == member_count_from_token(legacy_4) == 1706
+    # A hypothetical future 8-component token must be equally tolerated.
+    future_8 = new_6 + ":extra:component"
+    assert member_count_from_token(future_8) == 1706
+
+
 def test_member_cache_is_stale_flags_wiped_cache() -> None:
     # 30 local rows but the token says the backend has 1706 valid members.
     assert member_cache_is_stale(30, "1706:2026-06-10T15:01:39:0:0") is True

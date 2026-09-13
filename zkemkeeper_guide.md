@@ -473,8 +473,13 @@ zk.RefreshData(1)           # in the same finally, AFTER the re-enable, UNCONDIT
 ```
 
 > `EnableDevice(False)` **locks the terminal UI**, and it is the gym's sole verifier.
-> Only the 22:00 / manual full reconcile may set `bracket_enable_device=True`. A default
-> daytime push never *locks* the terminal. `[CODE]` `[TEST]`
+> **No caller in the app sets `bracket_enable_device=True` any more** — the engine passes a
+> literal `False`. The "22:00 / manual full reconcile" that was supposed to bracket never
+> once executed (its condition tested a reason string no producer emits), and bracketing
+> would now undo the chunked wedge recovery below. Reversed deliberately on 2026-09-12; see
+> `guide_for_agents_and_dev.md` §3.2c. The parameter is kept because the driver-level
+> behaviour is still pinned. `[CODE: ultra_engine.py::_run_standalone_full_sync]`
+> `[TEST: test_zk_standalone_driver.py::TestPushRoster::test_bracketed_push_enables_around_batch]`
 
 #### ⛔ Every connect releases a lock a dead bracket may have left
 
@@ -653,6 +658,10 @@ test_standalone_revoked_pin_removal.py]`
 A bracketed push is **one** command spanning the whole roster (its own deliberate
 window). Everything else is chunked at `_PUSH_CHUNK_MEMBERS` (10). `[CODE]`
 
+> That collapse is exactly why the engine no longer brackets: one command means one
+> deadline and no per-chunk wedge recovery, which is what left a gym with only the first
+> 10 of ~950 members. `guide_for_agents_and_dev.md` §3.2c.
+
 Per-chunk deadline: `[CODE]`
 ```python
 chunk_timeout = min(timeout_sec, max(45.0, len(part) * 5.0))
@@ -730,8 +739,12 @@ _record_standalone_pin_state, _standalone_pin_hash]`
 - A non-bracketed full sync pushes only pins that are **new, changed, or failed last
   time**; when nothing differs it sends **no COM calls** and still completes with full
   bookkeeping, so the scheduler records the hash.
-- **Bracketed** syncs (`user-sync`, `daily-forced-sync`, `hard-reset`) still push
-  every pin — their semantics are unchanged.
+- **Every** full sync is incremental now, including an operator's explicit reconcile.
+  The bracketed "push every pin" branch was gated on `reason in ("user-sync",
+  "daily-forced-sync", "hard-reset")`, and `reason` carries a trigger_source token, so it
+  never ran; it is now an explicit `False`. `guide_for_agents_and_dev.md` §3.2c. `[CODE]`
+  `[TEST: test_standalone_incremental_sync.py::TestIncrementalFullSync::
+  test_even_an_explicit_reconcile_stays_incremental_and_unbracketed]`
 - A member sync records its pin as synced, so the post-enrolment cascade becomes a
   no-op reconcile.
 - **A targeted member sync reads that member from `sync_users` DIRECTLY, not from the
@@ -917,6 +930,12 @@ the **oldest** event and inserts the new one, with a warning. `[CODE]`
 
 Lane direction from the synced door preset is stamped into `rawRow["direction"]`, so
 the existing attendance uploader carries it with zero changes. `[CODE]`
+
+The PIN pushed to and reported by this SDK is not per-person — see
+[`pullsdk_guide.md` §4.6](pullsdk_guide.md#46-one-person-two-pins--ship-it-do-not-fix-it)
+("One person, two PINs"): it is derived the same way for both SDKs
+(`app/core/device_sync.py:1377-1380`), so a member with two date-valid memberships
+occupies two PINs here exactly as on a PullSDK panel.
 
 ---
 
