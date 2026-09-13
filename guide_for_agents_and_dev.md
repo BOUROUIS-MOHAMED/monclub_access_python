@@ -294,7 +294,7 @@ replaced by its own number). `[CODE]`
 
 | Site | MEMBERSHIP (unchanged) | ACCOUNT |
 |---|---|---|
-| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted |
+| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted; `revocation=True` with the person still deliverable → the collapsed row is re-pushed even when its hash is unchanged, and that push is the return value |
 | `DeviceSyncEngine._sync_one_device` `known_server_pins` | `activeMembershipId` of every user | account pin of every user |
 | `_sync_one_device` delta pruning / drift check (`int(pin) in changed_ids`) | verbatim | `pin in` the account pins of `changed_ids` |
 | `UltraDeviceWorker._build_standalone_roster(only_member_ids)` | `wanted = {str(int(m))}` | the account pins of those memberships |
@@ -324,6 +324,21 @@ link is refreshed from), so there is nothing of it to remove. `[CODE]`
 ::test_revoking_the_last_membership_removes_the_account_pin,
 ::test_revoking_sonias_membership_5_removes_sonia_not_ali,
 ::test_a_revoked_membership_whose_person_remains_does_not_fail_the_sync]`
+
+**The PullSDK path (review #11).** Both ULTRA PullSDK consumers read
+`sync_member_on_connected_sdk`'s bool as "revocation done": the targeted drain finalises the
+revoke, and the full sync's `_mark_member_revoke_confirmed` decides whether the sync reports
+"authoritative revocation unconfirmed". The per-pin hash carries no validity window, so when a
+person keeps another plan the collapsed row's hash does not move, and the "unchanged" skip
+returned False on every run — every full sync failed forever. Both call sites now pass
+`revocation=True`; under ACCOUNT with the person still deliverable the collapsed row is re-pushed
+regardless of the hash and that push's result is returned. A non-revocation sync still skips an
+unchanged row. `[CODE: device_sync.py::sync_member_on_connected_sdk; ultra_engine.py call sites]`
+`[TEST: test_account_pin_device_sites.py::test_revoking_one_of_two_memberships_is_confirmed_by_the_repush,
+::test_an_unchanged_non_revocation_sync_still_skips]` — the call sites passing the flag are `[CODE]`
+only; no worker-level test drives them. **Still open:** an UNMAPPABLE membership's revocation
+returns False on this path (nothing to name), so it stays unconfirmed and re-queues a full sync on
+every run, whereas the standalone full sync treats it as nothing to remove.
 
 **No removal on an incomplete ACCOUNT roster.** When `_filter_users_for_device` withheld rows
 (no `mainAccountId`), their people's pins are missing from `desired_pins` and would read as

@@ -1291,6 +1291,7 @@ class DeviceSyncEngine:
         device: Dict[str, Any],
         member_id: int,
         source: str = "targeted_member_sync",
+        revocation: bool = False,
     ) -> bool:
         normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
         dev_id = normalized_device.get("id")
@@ -1408,7 +1409,20 @@ class DeviceSyncEngine:
         # Targeted: fetch ONLY this pin's stored hash (PK lookup ~ms) instead of
         # reading the whole device_sync_state table (~1798 rows, 11-20s on the gym PC).
         prev_hash, prev_ok = get_device_sync_hash_for_pin(device_id=did, pin=pin)
-        if prev_hash == desired_hash and prev_ok:
+        if prev_hash == desired_hash and prev_ok and revocation and pin_scheme == PIN_SCHEME_ACCOUNT:
+            # Revoking ONE of a person's memberships while another still admits them: the
+            # collapsed row stays, and its hash (no validity window) cannot move, so "unchanged"
+            # here would read as "revocation not done" to both ULTRA consumers and fail every
+            # full sync. Re-push the merged entry -- the revoked plan's validity and fingers leave
+            # with it -- and let that push be the revoke's outcome, as _account_member_revoke
+            # does on the standalone path (review #11, guide §3.2b).
+            self.logger.info(
+                "[DeviceSync] targeted member revoke: device_id=%s pin=%s pinScheme=ACCOUNT person "
+                "still deliverable -- re-pushing the collapsed row as the revoke outcome "
+                "(membership %s) source=%s",
+                did, pin, member_id, source,
+            )
+        elif prev_hash == desired_hash and prev_ok:
             self.logger.info(
                 "[DeviceSync] targeted member sync skip: device_id=%s device_name=%r pin=%s unchanged source=%s",
                 did,

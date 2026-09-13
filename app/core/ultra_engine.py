@@ -1640,6 +1640,7 @@ class UltraDeviceWorker(threading.Thread):
                         device=self._device,
                         member_id=member_id,
                         source="ultra_targeted_member_sync",
+                        revocation=bool(is_revocation),
                     )
                     if is_revocation:
                         if member_sync_ok:
@@ -3510,6 +3511,7 @@ class UltraDeviceWorker(threading.Thread):
                         device=device_copy,
                         member_id=member_id,
                         source="ultra_full_sync_revoke",
+                        revocation=True,
                     ):
                         self._mark_member_revoke_confirmed(member_id)
                 sync_ok = bool(engine.run_one_device_on_connected_sdk(

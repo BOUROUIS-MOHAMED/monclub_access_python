@@ -185,6 +185,33 @@ class TestTargetedPullSdkMemberSync:
         assert _removed_pins(sdk) == set()
         assert sqlite_db.get_device_sync_hash_for_pin(device_id=1, pin="5")[0], "state keyed by the person"
 
+    @pytest.mark.parametrize("revoked, kept", [(31001, 31000), (31000, 31001)],
+                             ids=["the-shorter-plan", "the-reach-winner"])
+    def test_revoking_one_of_two_memberships_is_confirmed_by_the_repush(self, sqlite_db, revoked, kept):
+        """Review #11. The person keeps another plan, so the collapsed row stays and its hash
+        (pin, name, card, doors, templates -- no validity) cannot move. The hash skip returned
+        False, which both ULTRA consumers read as 'revocation not done': the full sync failed
+        with 'authoritative revocation unconfirmed' on every run, forever. The re-push of the
+        merged entry is the revoke's outcome, as on the standalone path."""
+        _cache(sqlite_db, [_ali_gym(), _ali_spa(), _sonia()])
+        device = _pullsdk_device(pinScheme="ACCOUNT")
+        assert _engine().sync_member_on_connected_sdk(sdk=_sdk(), device=device, member_id=kept)
+        _cache(sqlite_db, [], valid_ids=[kept, 5])            # one of Ali's plans revoked
+        sdk = _sdk(device_pins=["5", "777"])
+
+        assert _engine().sync_member_on_connected_sdk(
+            sdk=sdk, device=device, member_id=revoked, revocation=True) is True
+        assert "5" in _written_pins(sdk), "the merged entry is re-pushed"
+        assert _removed_pins(sdk) == set(), "Ali keeps pin 5"
+
+    def test_an_unchanged_non_revocation_sync_still_skips(self, sqlite_db):
+        _cache(sqlite_db, [_ali_gym(), _ali_spa()])
+        device = _pullsdk_device(pinScheme="ACCOUNT")
+        assert _engine().sync_member_on_connected_sdk(sdk=_sdk(), device=device, member_id=31000)
+        sdk = _sdk()
+        assert _engine().sync_member_on_connected_sdk(sdk=sdk, device=device, member_id=31001) is False
+        assert _written_pins(sdk) == []
+
     def test_an_unmappable_membership_is_neither_pushed_nor_deleted(self, sqlite_db):
         _cache(sqlite_db, [_ali_gym()])
         sdk = _sdk()

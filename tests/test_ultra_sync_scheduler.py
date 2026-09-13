@@ -925,7 +925,7 @@ def test_ultra_worker_drains_targeted_member_sync_commands_one_member_at_a_time(
             self.cfg = cfg
             self.logger = logger
 
-        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source, revocation=False):
             synced_members.append((sdk, member_id, source))
             return True
 
@@ -1147,7 +1147,7 @@ def test_pullsdk_full_sync_executes_adopted_revoke_before_filtered_roster(monkey
         def __init__(self, cfg, logger):
             self._last_single_device_error = ""
 
-        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source, revocation=False):
             events.append(("targeted", member_id))
             return True
 
@@ -1217,7 +1217,7 @@ def _blocked_pull_full_sync_worker(
         ):
             return "compound-full-hash", len(users)
 
-        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source, revocation=False):
             events.append(("targeted", member_id))
             return True
 
@@ -1413,7 +1413,7 @@ def _blocked_pull_targeted_revoke_worker(monkeypatch):
         def __init__(self, cfg, logger):
             pass
 
-        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source, revocation=False):
             events.append(("targeted", member_id))
             entered.set()
             assert release.wait(1.0)
@@ -1816,7 +1816,7 @@ def test_pullsdk_member_revoke_uses_targeted_member_sync(monkeypatch):
             self.cfg = cfg
             self.logger = logger
 
-        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source):
+        def sync_member_on_connected_sdk(self, *, sdk, device, member_id, source, revocation=False):
             synced_members.append((sdk, member_id, source))
             return True
 
