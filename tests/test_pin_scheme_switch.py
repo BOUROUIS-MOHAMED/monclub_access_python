@@ -283,6 +283,54 @@ def test_scheme_at_reads_the_scheme_before_the_first_row_from_that_row():
     assert scheme_at(broken, datetime(2026, 9, 21)) == "MEMBERSHIP"
 
 
+def _make_pre_feature_db(db, device_id=42):
+    """A database as the deployed client left it: sync_devices WITHOUT pin_scheme, no switch
+    or seen history, a stored devicesVersion. Built from the current schema minus the column,
+    so every other device column a later write names exists."""
+    with db.get_conn() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_devices)").fetchall()
+                if r[1] != "pin_scheme"]
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        conn.execute("DROP INDEX IF EXISTS uq_sync_devices_id")
+        conn.execute(f"CREATE TABLE sync_devices_old AS SELECT {col_list} FROM sync_devices")
+        conn.execute("DROP TABLE sync_devices")
+        conn.execute("ALTER TABLE sync_devices_old RENAME TO sync_devices")
+        conn.execute("DROP TABLE device_pin_scheme_switch")
+        conn.execute("DROP TABLE IF EXISTS device_pin_scheme_seen")
+        conn.execute("INSERT INTO sync_devices (id, name) VALUES (?, 'Lane')", (device_id,))
+        conn.commit()
+    db.save_version_tokens({"devicesVersion": "1:2026-09-12T08:00:00",
+                            "settingsVersion": "s-1"})
+
+
+def test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh(db):
+    """Review #13. The column arrives NULL and devicesVersion survives the upgrade, so the backend
+    keeps answering refreshDevices=false: a device set to ACCOUNT while the PC still ran the old
+    client reads as MEMBERSHIP until an unrelated device edit moves devicesVersion -- and then
+    switches with no wipe in between. Dropping devicesVersion once, when the column is added,
+    makes the next getSyncData carry the device section in full."""
+    _make_pre_feature_db(db)
+
+    db.init_db()
+
+    with db.get_conn() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_devices)").fetchall()}
+    assert "pin_scheme" in cols
+    tokens = db.load_version_tokens()
+    assert "devicesVersion" not in tokens, "the device section must be re-fetched once"
+    assert tokens.get("settingsVersion") == "s-1", "other sections keep their tokens"
+
+    # The deployed client only ever pushed membership pins, so a device it knew is known
+    # MEMBERSHIP: the ACCOUNT value the refresh brings is a real switch, not a first sighting.
+    db.save_sync_cache_delta({"devices": [_device(42, pinScheme="ACCOUNT")]}, _DEVICES_ONLY)
+    [switch] = db.list_device_pin_scheme_switches(device_id=42)[42]
+    assert (switch["previous_scheme"], switch["scheme"]) == ("MEMBERSHIP", "ACCOUNT")
+
+    db.save_version_tokens({"devicesVersion": "2:2026-09-13T08:00:00"})
+    db.init_db()
+    assert db.load_version_tokens().get("devicesVersion") == "2:2026-09-13T08:00:00", "once"
+
+
 def test_scheme_at_rules():
     at = datetime(2026, 9, 12, 10, 0, 0)
     assert scheme_at([], None) == "MEMBERSHIP", "never switched: known, not a guess"

@@ -621,6 +621,19 @@ per-row diff fills the column. `[CODE: db.py::_ensure_main_account_id_column, in
 It is **atomic**: the token DELETE runs before the ALTER, so both sit in the single transaction
 `init_db` commits at its end; a crash in between rolls both back and the next start detects the
 missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]`
+**The same trap on the device side (review #13).** `sync_devices.pin_scheme` also arrives NULL,
+and `devicesVersion` survives the upgrade, so the backend answers `refreshDevices=false`: a device
+set to ACCOUNT while the PC still ran the old client would read as MEMBERSHIP (no switch, no hash
+clear) until an unrelated device edit moved the token, and then switch with no wipe in between.
+`_ensure_pin_scheme_column` therefore, when a sync_devices table that existed before `init_db`
+lacks the column (measured before the `CREATE TABLE`, so a fresh install is not an upgrade),
+deletes `devicesVersion` — the device section's only progress token — and records every device
+already in the table as seen on MEMBERSHIP (the old client had no other scheme, so the ACCOUNT
+value the refresh brings is a real switch, §3.2e). Same one-shot, DELETE-before-ALTER atomicity
+as the members helper. The backend half (`refreshDevices = clientDevicesVersion == null || …`) was
+read in `GymAccessController`, not run. `[CODE: db.py::_ensure_pin_scheme_column, init_db]`
+`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh]`
+
 If the backend in use does not emit `mainAccountId`, the refresh still runs once and the column
 stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone (§3.2b).
 

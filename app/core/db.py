@@ -638,6 +638,71 @@ def _ensure_main_account_id_column(
     return True
 
 
+def _ensure_pin_scheme_column(
+    conn: sqlite3.Connection,
+    *,
+    table_existed: bool,
+    column_was_present: bool,
+) -> bool:
+    """Add ``sync_devices.pin_scheme``; when an EXISTING table gains it, force ONE device refresh.
+
+    WHY (review #13). The column arrives NULL and the backend's ``devicesVersion`` does not
+    change because a client upgraded, so every sync answers ``refreshDevices=false``. A device
+    an operator set to ACCOUNT while this PC still ran the old client would read as MEMBERSHIP
+    -- no switch recorded, no hash cleared -- until some unrelated device edit moved
+    ``devicesVersion``, and then switch with no wipe in between. Dropping ``devicesVersion``
+    (the device section's only progress token) makes the next ``getSyncData`` send the device
+    section in full, exactly as ``_ensure_main_account_id_column`` does for members.
+
+    It also records every device already in the table as SEEN on MEMBERSHIP: the client that
+    wrote this database had no other scheme, so the ACCOUNT value the refresh brings is a real
+    switch (hashes cleared, CRITICAL), not a first sighting of unknown history (guide §3.2e).
+
+    ONE-SHOT and ATOMIC like the members helper: the token DELETE runs before the ALTER, so both
+    sit in the single transaction ``init_db`` commits. A fresh database (no table before
+    ``init_db``) is not an upgrade and keeps its tokens.
+    """
+    if column_was_present:
+        return False
+    if not table_existed:
+        _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    dropped = int(conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key = ?", ("devicesVersion",),
+    ).rowcount or 0)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_pin_scheme_seen (
+            device_id     INTEGER PRIMARY KEY,
+            first_scheme  TEXT    NOT NULL,
+            first_seen_at TEXT    NOT NULL
+        );
+        """
+    )
+    seeded = int(conn.execute(
+        "INSERT OR IGNORE INTO device_pin_scheme_seen (device_id, first_scheme, first_seen_at) "
+        "SELECT DISTINCT id, ?, ? FROM sync_devices WHERE id IS NOT NULL",
+        (PIN_SCHEME_MEMBERSHIP, now_iso()),
+    ).rowcount or 0)
+    if "pin_scheme" not in set(_table_columns(conn, "sync_devices")):
+        conn.execute("ALTER TABLE sync_devices ADD COLUMN pin_scheme TEXT")
+    logging.getLogger(__name__).warning(
+        "[DB] sync_devices.pin_scheme added; dropped %d devicesVersion token(s) so the next "
+        "getSyncData refreshes every device, and recorded %d known device(s) as seen on "
+        "MEMBERSHIP (guide §3.2d/§3.2e).",
+        dropped, seeded,
+    )
+    return True
+
+
 def _member_main_account_id(u: Dict[str, Any]) -> Any:
     """The mainAccountId a member dict carries: camelCase from the backend payload,
     snake_case from a cached row. None when absent."""
@@ -1122,6 +1187,11 @@ def init_db() -> None:
         # -----------------------------
         # devices (matches GymDeviceDto)
         # -----------------------------
+        # Measured BEFORE the CREATE below, which gives a fresh database the column: only a
+        # database that already had sync_devices without pin_scheme is an upgrade.
+        _sync_devices_cols_before = set(_table_columns(conn, "sync_devices"))
+        _sync_devices_existed_before = bool(_sync_devices_cols_before)
+        _pin_scheme_col_before = "pin_scheme" in _sync_devices_cols_before
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_devices (
@@ -1277,8 +1347,19 @@ def init_db() -> None:
         # Per-device PIN scheme (backend GymDeviceDto.pinScheme). NULL/absent -> MEMBERSHIP
         # (activeMembershipId pins, exactly the pre-existing behaviour); 'ACCOUNT' ->
         # main_account.id pins. Read by device_sync.device_pin_scheme. Delivered on the same
-        # path as roster_pushing_policy. See guide §3.2b.
-        _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
+        # path as roster_pushing_policy. See guide §3.2b. When NEWLY added the helper forces one
+        # device-section refresh (review #13, guide §3.2d).
+        try:
+            _ensure_pin_scheme_column(
+                conn,
+                table_existed=_sync_devices_existed_before,
+                column_was_present=_pin_scheme_col_before,
+            )
+        except Exception as _mig_exc:
+            logging.getLogger(__name__).error(
+                "[DB] schema migration sync_devices.pin_scheme failed: %s", _mig_exc,
+            )
+            _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
 
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
