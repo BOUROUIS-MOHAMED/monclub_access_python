@@ -1300,8 +1300,9 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1716 passed** (with
-warnings; 2026-09-12, after the pin-scheme work of §3.2b–§3.2f, run with the CLAUDE.md command
+background-thread exceptions are promoted to failures. Last run: **1771 passed** (with
+warnings; 2026-09-13, on master after merging the account-pin work of §3.2b–§3.2f and the §3.5
+unresolved retry bound, run with the CLAUDE.md command
 `python -m pytest tests/ -q --ignore=tests/_pydeps`; exit code 0). `[TEST]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
