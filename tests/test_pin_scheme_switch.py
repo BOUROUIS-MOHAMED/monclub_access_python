@@ -240,6 +240,16 @@ def test_a_first_sighting_on_account_is_not_a_switch_and_earlier_events_are_unkn
     assert resolver.scheme_for(_event("2026-09-12 18:00:00", 5)) is None, "before the sighting"
     assert resolver.scheme_for(_event("2026-09-13 09:30:00", 5)) == "ACCOUNT"
 
+    # RESIDUAL, pinned on purpose (review #2 is deferred): a pin that is BOTH an account id and
+    # another person's membership id takes the documented unknown-scheme rule, which prefers
+    # MEMBERSHIP. So for the 110 colliding ids the pre-sighting backlog still names Sonia for
+    # Ali's pin 5. Changing that is an owner decision (guide §3.2b inbound, "unknown").
+    before = _event("2026-09-12 18:00:00", 5)
+    user, scheme = resolver.resolve(before, {"pin": "5"})
+    assert (scheme, user["fullName"]) == (None, "Sonia")
+    after = _event("2026-09-13 09:30:00", 5)
+    assert resolver.resolve(after, {"pin": "5"})[0]["fullName"] == "Ali"
+
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 

@@ -343,7 +343,10 @@ class TestFullPullSdkSync:
         assert set(old) <= _removed_pins(sdk), "stale pins are removed one by one instead"
 
     def test_the_nuke_heuristic_still_fires_without_scheme_history(self, sqlite_db):
-        """Control for the test above: the same roster with no history does reach the nuke."""
+        """Control for the test above: the same roster with no history does reach the nuke.
+        No device row is written here, so there is no first-sighting row either -- in production
+        an ACCOUNT device always has one after its first write (guide §3.2e), which is what
+        keeps the heuristic off for it."""
         old = [str(31000 + i) for i in range(12)]
         for pin in old:
             sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h-old", ok=True, error=None)
