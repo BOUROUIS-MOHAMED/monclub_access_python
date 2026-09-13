@@ -228,3 +228,20 @@ def test_the_dashboard_feed_uses_the_same_resolution(monkeypatch):
     names = {i["eventId"]: i["userFullName"] for i in sent["payload"]["feed"]}
     assert names == {"after": "Ali", "before": "Sonia"}
     m._dash_users_cache.update({"at": 0.0, "by_am": {}, "by_card": {}, "devices": {}, "resolver": None})
+
+    # Review #3. When the resolver cannot be built (switch history unreadable, e.g. a locked
+    # DB), the old fallback was a membership-only pin lookup: on this ACCOUNT device Ali's
+    # pin 5 was shown as Sonia for the 60 s the cache lives. The scheme is unknown, so the
+    # feed names a member only by card, like the uploader, which uploads nothing then.
+    def _locked(**kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(dbmod, "list_device_pin_scheme_switches", _locked, raising=False)
+    carded = SimpleNamespace(**{**vars(rows[0]), "event_id": "carded", "card_no": "1900"})
+    monkeypatch.setattr(store, "get_recent_access_history", lambda limit=50: rows + [carded],
+                        raising=False)
+    sent.clear()
+    m._handle_dashboard_overview(ctx)
+    names = {i["eventId"]: i["userFullName"] for i in sent["payload"]["feed"]}
+    assert names == {"after": "", "before": "", "carded": "Ali"}
+    m._dash_users_cache.update({"at": 0.0, "by_am": {}, "by_card": {}, "devices": {}, "resolver": None})

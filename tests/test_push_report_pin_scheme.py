@@ -232,3 +232,27 @@ class TestTheAdminRawPushRecordsTheDevicesScheme:
         assert db.get_pending_fingerprint_push_reports() == [
             {"pin": "1001", "pin_source": expected, "finger_id": 6, "error_message": None}
         ]
+
+    def test_an_unreadable_device_scheme_is_never_reported_as_a_membership(self, db, monkeypatch):
+        """Review #10. If the device row cannot be read, the pin's id space is unknown. A NULL
+        pin_source reads back as MEMBERSHIP and posts activeMembershipId=<pin> -- on an
+        ACCOUNT device, the person whose membership has that number."""
+        from tests.test_admin_push_delegates_to_engine import _run, _tpl as _admin_tpl
+
+        real = db.get_sync_device_payload
+
+        def _unreadable(device_id):
+            import traceback
+            if any("_handle_device_users_push" in f.name and "device_pin_scheme" in (f.line or "")
+                   for f in traceback.extract_stack()):
+                raise RuntimeError("database is locked")
+            return real(device_id)
+
+        monkeypatch.setattr(db, "get_sync_device_payload", _unreadable)
+        sent, _sdk = _run(monkeypatch, db, [_admin_tpl()])
+
+        pending = db.get_pending_fingerprint_push_reports()
+        assert [(p["pin"], p["pin_source"]) for p in pending] == [("1001", "UNKNOWN")]
+        api = _api()
+        assert api.report_fingerprint_push_result(token="T", items=pending) is True
+        api._session.post.assert_not_called()

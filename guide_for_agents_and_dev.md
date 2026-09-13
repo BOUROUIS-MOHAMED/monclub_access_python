@@ -388,7 +388,8 @@ account pin 5 would write — or clear — a push error on the fingerprint of th
 MEMBERSHIP is 5. The digits cannot say which scheme minted them, so the push records it:
 `_filter_users_for_device` exposes `stats_out["pin_sources"]`, every `_push_templates` caller
 (targeted push, full-sync phase C, the per-pin path, and the admin raw push, which records the
-device's scheme) passes `pin_source`, and `fingerprint_push_status.pin_source` stores it
+device's scheme — or `UNKNOWN` when the device row cannot be read, which the report never sends,
+review #10) passes `pin_source`, and `fingerprint_push_status.pin_source` stores it
 (`NULL` = written before the column = MEMBERSHIP: every pin was membership-derived then, and a
 userId-keyed member cannot own a UserFingerprint). `get_pending_fingerprint_push_reports`
 aggregates per `(pin_source, pin, finger)` — pin 5 under two schemes is two people — and the
@@ -435,12 +436,24 @@ uses that:
   membership.
 
 Used by the backend uploader (`_sync_pending_history` → `_serialize_row_for_backend(resolver=…)`)
-and the dashboard feed (`_dash_user_indexes` / `_dash_history_resolver`). The upload item for an
+and the dashboard feed (`_dash_user_indexes` / `_dash_history_resolver`). When the dashboard cannot
+build the resolver (switch history unreadable), it names a member **by card only** — the old
+fallback was a membership-only pin lookup that showed a stranger for an account pin on an ACCOUNT
+device, for the 60 s the cache lives (review #3). Display only. The 60 s cache also means events
+just after a switch can be shown under the old scheme for up to a minute `[CODE]`, not fixed.
+`[TEST: test_account_pin_inbound_by_scheme.py::test_the_dashboard_feed_uses_the_same_resolution]`
+The upload item for an
 **unresolved** pin: MEMBERSHIP → `activeMembership` = pin (unchanged); ACCOUNT → `mainAccountId` =
 pin and **no** `activeMembership` (the backend's history ingest resolves `userId`, then
 `mainAccountId`, gym-scoped, and reads `activeMembership` only when neither is sent); unknown →
 neither. If the switch history cannot be read, the batch is not uploaded that tick and the rows stay
-pending. `[CODE: app/core/device_attendance.py::HistoryPinResolver, ::_resolve_history_user,
+pending. **Cost of "unknown → neither" (review #9):** an item with no identifier is, per the
+reviewer's read of `GymAccessController` (`anyIdentifier` false → `unidentified`, token in
+`terminalFailedIds`) `[UNVERIFIED — not re-read here]`, terminal on the backend, and the client
+then marks the row terminal, so that door event never reaches attendance history even after the
+roster catches up. Deliberately not changed: naming either id would be a guess, and retrying never
+makes the scheme knowable. Since the first-sighting rule (§3.2e), this also covers unresolved pins
+in the backlog before a device was first seen on ACCOUNT. `[CODE: app/core/device_attendance.py::HistoryPinResolver, ::_resolve_history_user,
 ::DeviceAttendanceMaintenanceEngine._serialize_row_for_backend]`
 `[TEST: tests/test_account_pin_inbound_by_scheme.py;
 test_account_pin_derivation.py::test_an_ambiguous_pin_resolves_as_a_membership_the_pre_cutover_reality]`
@@ -788,7 +801,7 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 | `GET /api/v1/access/enroll` → `_handle_v1_enroll` (deprecated) | `id`/`userId`, `fingerId`, `fullName`, `device` | Same path, membership resolved from `userId` | Same as above |
 | `POST /api/v2/sync/now` → `_handle_sync_now` (dashboard) | optional hint `{entityType, entityId, operation, priority}`; `entityId` is an `activeMembershipId` when `entityType=ACTIVE_MEMBERSHIP` (the dashboard rewrites FINGERPRINT changes into that) | The hint only strips `membersVersion` (`sync_scope.apply_trigger_hint_to_version_tokens`); the resulting delta's membership ids flow into `_request_running_ultra_sync` | Converted downstream: targeted syncs, `changed_ids` pruning and revokes all translate membership → person pin (§3.2b) |
 | `POST /api/v2/sync/fast-patch-bundle` → `_handle_sync_fast_patch_bundle` (dashboard) | the backend patch bundle verbatim; member items are `ActiveMemberUserDto` carrying `mainAccountId`; device items carry `pinScheme` | `db.apply_fast_patch_bundle` stores `main_account_id` and the membership→person link (§3.2d) and a `GYM_DEVICE` upsert records a pinScheme switch (§3.2e); impact membership ids go to `_request_running_ultra_sync` | Converted downstream, as above |
-| `POST /api/v2/devices/{deviceId}/users/push` → `_handle_device_users_push` (PullSDK only) | `pin`, `name`, `cardNo`, `doorIds`, `templates` | RAW pin, written as given — no derivation exists | The caller must send the pin under the device's scheme. The per-finger push outcome is recorded with the device's scheme, so the upstream report names `mainAccountId` on an ACCOUNT device (§3.2b push report) |
+| `POST /api/v2/devices/{deviceId}/users/push` → `_handle_device_users_push` (PullSDK only) | `pin`, `name`, `cardNo`, `doorIds`, `templates` | RAW pin, written as given — no derivation exists | The caller must send the pin under the device's scheme. The per-finger push outcome is recorded with the device's scheme, so the upstream report names `mainAccountId` on an ACCOUNT device (§3.2b push report); if the device row cannot be read it is recorded `UNKNOWN` and not reported `[TEST: test_push_report_pin_scheme.py::test_an_unreadable_device_scheme_is_never_reported_as_a_membership]` |
 | `POST /api/v2/devices/{deviceId}/users/delete` → `_handle_device_users_delete` (PullSDK only) | `pin` | RAW pin deleted as given | Caller's responsibility; no local state touched |
 | `GET /api/v2/devices/{deviceId}/users` → `_handle_device_users_list` | — | Lists the terminal's raw pins | Display only |
 | `GET /api/v2/dashboard/overview` → `_handle_dashboard_overview` (tauri-ui DashboardPage) | `limit` | Door-history pin → member for the feed | `HistoryPinResolver`: scheme of the event's device at the event's time (§3.2b inbound) |

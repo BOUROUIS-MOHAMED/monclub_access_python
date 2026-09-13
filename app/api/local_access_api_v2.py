@@ -4736,7 +4736,15 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
         try:
             raw_pin_source = device_pin_scheme(get_sync_device_payload(did) or {})
         except Exception:
-            raw_pin_source = None
+            # The device's scheme cannot be read, so which id this pin IS is unknown. NULL
+            # would read back as MEMBERSHIP and report an account pin against the person whose
+            # membership has that number; UNKNOWN is stored and never reported (the report
+            # skips any source but ACCOUNT/MEMBERSHIP). Review #10.
+            _logger.warning(
+                "[API] users/push device=%s pin=%s: device pin scheme unreadable -- the push "
+                "outcome is recorded as UNKNOWN and not reported upstream", did, pin,
+            )
+            raw_pin_source = "UNKNOWN"
         pushed, push_errs = engine._push_templates(
             sdk, pin=pin, templates=wire_templates, device_id=did,
             template_version_override=template_version_override,
@@ -5541,7 +5549,11 @@ def _handle_dashboard_overview(ctx: _Ctx) -> None:
             if resolver is not None:
                 user = resolver.resolve(row, raw)[0] or {}
             else:
-                user = _resolve_history_user(row, raw, by_am, by_card) or {}
+                # No resolver (switch history unreadable): the scheme a pin was minted under is
+                # unknown, and a membership-only pin lookup names a stranger for an account pin
+                # on an ACCOUNT device (110 colliding ids). Name a member by CARD only -- the
+                # uploader uploads nothing in the same situation. Review #3, guide §3.2b.
+                user = _resolve_history_user(row, raw, {}, by_card) or {}
             plan_id = _safe_int(user.get("membershipId") or user.get("membership_id"), 0)
             brief = briefs.get(plan_id) if plan_id else None
             device_id = int(row.device_id) if row.device_id is not None else None
