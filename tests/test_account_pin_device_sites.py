@@ -613,6 +613,23 @@ class TestInboundScanOnTheWorker:
         w, _c = _worker(monkeypatch, users=[])
         assert w._user_for_device_pin("5", self._users_by_am())["fullName"] == "Sonia"
 
+    @pytest.mark.parametrize("make, expected", [(_account_worker, "Ali"), (_worker, "Sonia")],
+                             ids=["account", "membership"])
+    def test_a_fingerprint_allow_is_enriched_through_the_devices_scheme(self, monkeypatch, make, expected):
+        """Review #22. Drives the production call site (_handle_allow), not only the helper: a
+        fingerprint scan misses the card index and falls back to the RTLog pin."""
+        w, _c = make(monkeypatch, users=[])
+        users_by_am = self._users_by_am()
+        monkeypatch.setattr(w, "_get_cached_local_state", lambda: ({}, users_by_am, {}))
+        sent: Dict[str, Any] = {}
+        monkeypatch.setattr(w, "_enqueue_notification", lambda **kw: sent.update(kw))
+        monkeypatch.setattr(w, "_enqueue_history", lambda **kw: None)
+
+        w._handle_allow(card_no="5", event_time="2026-09-13 10:00:00", event_id="e1",
+                        door_id=1, event_type="", raw_row={"pin": "5"})
+
+        assert sent["user_full_name"] == expected
+
 
 # ═════════════════════════════ ZK_STANDALONE driver: pin -> card ═════════════════════════════
 
