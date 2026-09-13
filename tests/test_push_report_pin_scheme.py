@@ -169,15 +169,25 @@ class TestThePushRecordsTheScheme:
             "activeMembershipId 5 is Sonia -- the report must not name her"
         )
 
-    def test_a_full_sync_account_push_is_reported_as_the_person(self, db):
+    @pytest.mark.parametrize("extra_people", [0, 6], ids=["per-pin-push", "batch-phase-c"])
+    def test_a_full_sync_account_push_is_reported_as_the_person(self, db, extra_people):
         """Review #15. The full sync's _push_templates call sites pass pin_source too; dropping
         it stores NULL, which reads as MEMBERSHIP and reports Ali's finger against Sonia's
-        membership 5."""
+        membership 5. More than 5 pins to push takes the batch branch (Phase C templates);
+        fewer takes the per-pin branch -- each has its own call site."""
         from app.core.device_sync import DeviceSyncEngine
-        from tests.test_account_pin_device_sites import _pullsdk_device, _sdk
+        from tests.test_account_pin_device_sites import _member, _pullsdk_device, _sdk
         from unittest.mock import patch
 
         self._cache(db)
+        extra = [_member(40000 + i, 1000 + i, 6000 + i, f"P{i}", card=str(2000 + i),
+                         fps=[_tpl(1, "CCCC")]) for i in range(extra_people)]
+        if extra:
+            db.save_sync_cache_delta(
+                {"users": extra, "membersDeltaMode": True,
+                 "validMemberIds": [31000, 5] + [u["activeMembershipId"] for u in extra]},
+                {"members": True, "devices": False, "credentials": False, "settings": False},
+            )
         db.invalidate_sync_cache(clear_cached=True)   # the cache is process-wide
         users = list(db.load_sync_cache().users)
         sdk = _sdk()
@@ -186,8 +196,9 @@ class TestThePushRecordsTheScheme:
                 device=_pullsdk_device(pinScheme="ACCOUNT", fingerprintEnabled=True),
                 users=users, local_fp_index={}, default_door_id=1, changed_ids=None)
 
-        assert db.get_pending_fingerprint_push_reports() == [
-            {"pin": "5", "pin_source": "ACCOUNT", "finger_id": 1, "error_message": None}]
+        pending = {(r["pin"], r["pin_source"]) for r in db.get_pending_fingerprint_push_reports()}
+        assert ("5", "ACCOUNT") in pending and ("5", "MEMBERSHIP") not in pending
+        assert all(source == "ACCOUNT" for _pin, source in pending)
 
     def test_a_membership_push_is_reported_as_the_membership(self, db):
         self._cache(db)
