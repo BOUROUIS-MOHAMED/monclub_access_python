@@ -30,6 +30,8 @@ def db(tmp_path, monkeypatch):
     monkeypatch.setattr(db_module, "_DB_PATH", str(tmp_path / "report.db"), raising=False)
     db_module.init_db()
     yield db_module
+    # load_sync_cache() memoises process-wide; do not leak a warm cache into later tests.
+    db_module.invalidate_sync_cache(clear_cached=True)
     if hasattr(db_module, "_shutdown_db_writer_for_tests"):
         db_module._shutdown_db_writer_for_tests()
 

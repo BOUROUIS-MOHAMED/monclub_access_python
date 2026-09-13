@@ -86,6 +86,9 @@ def sqlite_db(tmp_path, monkeypatch):
     monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "sites.db"), raising=False)
     dbmod.init_db()
     yield dbmod
+    # load_sync_cache() memoises process-wide; a warm cache from this temp DB leaks into later
+    # tests (test_sync_hot_path_optimizations reads contractStatus through it).
+    dbmod.invalidate_sync_cache(clear_cached=True)
     if hasattr(dbmod, "_shutdown_db_writer_for_tests"):
         dbmod._shutdown_db_writer_for_tests()
 
