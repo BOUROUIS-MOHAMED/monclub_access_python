@@ -331,6 +331,36 @@ def test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh(db):
     assert db.load_version_tokens().get("devicesVersion") == "2:2026-09-13T08:00:00", "once"
 
 
+def _write_device_via(db, path, device):
+    if path == "full":
+        db.save_sync_cache({"users": [], "devices": [device], "contractStatus": True})
+    elif path == "delta":
+        db.save_sync_cache_delta({"devices": [device]}, _DEVICES_ONLY)
+    else:
+        db.apply_fast_patch_bundle({
+            "bundleId": f"b-{device.get('pinScheme')}",
+            "items": [{"kind": "ENTITY_UPSERT", "entityType": "GYM_DEVICE", "entityId": device["id"],
+                       "revision": f"2026-09-12T10:00:0{0 if device.get('pinScheme') == 'MEMBERSHIP' else 1}",
+                       "payload": {"device": device}}],
+        })
+
+
+@pytest.mark.parametrize("path", ["full", "delta", "fast_patch"])
+def test_each_device_write_path_records_a_switch_on_its_own(db, path):
+    """Review #21. The every-path test ran the full path first, so the delta and fast-patch
+    writes saw no change: a path that stopped recording would still pass. Here each path is
+    the only writer, from a fresh database."""
+    _write_device_via(db, path, _device(42, pinScheme="MEMBERSHIP"))
+    _seed_state(db, 42, [5])
+
+    _write_device_via(db, path, _device(42, pinScheme="ACCOUNT"))
+
+    [switch] = db.list_device_pin_scheme_switches(device_id=42)[42]
+    assert (switch["previous_scheme"], switch["scheme"]) == ("MEMBERSHIP", "ACCOUNT")
+    assert _state(db, 42)["5"][:2] == (None, 0), "the switch cleared the hash (UPDATE)"
+    assert db.get_sync_device_payload(42)["pinScheme"] == "ACCOUNT"
+
+
 def test_scheme_at_rules():
     at = datetime(2026, 9, 12, 10, 0, 0)
     assert scheme_at([], None) == "MEMBERSHIP", "never switched: known, not a guess"

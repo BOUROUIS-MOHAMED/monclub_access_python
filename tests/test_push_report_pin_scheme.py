@@ -169,6 +169,26 @@ class TestThePushRecordsTheScheme:
             "activeMembershipId 5 is Sonia -- the report must not name her"
         )
 
+    def test_a_full_sync_account_push_is_reported_as_the_person(self, db):
+        """Review #15. The full sync's _push_templates call sites pass pin_source too; dropping
+        it stores NULL, which reads as MEMBERSHIP and reports Ali's finger against Sonia's
+        membership 5."""
+        from app.core.device_sync import DeviceSyncEngine
+        from tests.test_account_pin_device_sites import _pullsdk_device, _sdk
+        from unittest.mock import patch
+
+        self._cache(db)
+        db.invalidate_sync_cache(clear_cached=True)   # the cache is process-wide
+        users = list(db.load_sync_cache().users)
+        sdk = _sdk()
+        with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
+            DeviceSyncEngine(cfg=MagicMock(), logger=logging.getLogger("t"))._sync_one_device(
+                device=_pullsdk_device(pinScheme="ACCOUNT", fingerprintEnabled=True),
+                users=users, local_fp_index={}, default_door_id=1, changed_ids=None)
+
+        assert db.get_pending_fingerprint_push_reports() == [
+            {"pin": "5", "pin_source": "ACCOUNT", "finger_id": 1, "error_message": None}]
+
     def test_a_membership_push_is_reported_as_the_membership(self, db):
         self._cache(db)
         self._sync(None)

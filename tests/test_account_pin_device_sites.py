@@ -121,7 +121,18 @@ def _sdk(device_pins=()):
     sdk.get_device_data_rows.return_value = rows
     sdk.get_all_device_data.return_value = rows
     sdk.supports_delete_device_data.return_value = True
+    sdk.set_device_data_batch.return_value = (0, [])   # (ok_count, failed_rows) when a batch runs
     return sdk
+
+
+def _record_schemes(db, *schemes):
+    """Write device 1 once per scheme, the way a device refresh does (delete, then insert)."""
+    with db.get_conn() as conn:
+        cur = conn.cursor()
+        for scheme in schemes:
+            cur.execute("DELETE FROM sync_devices WHERE id = 1")
+            db._insert_device_row(cur, _pullsdk_device(pinScheme=scheme))
+        conn.commit()
 
 
 def _deleted_pins(sdk) -> List[str]:
@@ -185,6 +196,21 @@ class TestTargetedPullSdkMemberSync:
         assert _removed_pins(sdk) == set()
         assert sqlite_db.get_device_sync_hash_for_pin(device_id=1, pin="5")[0], "state keyed by the person"
 
+    def test_a_targeted_account_push_carries_every_plans_fingers(self, sqlite_db):
+        """Review #16. The push deletes the pin's templates before re-writing, so a push built
+        from the changed membership's row alone would strip the other plan's finger. Pins and
+        cards cannot show that (both of Ali's rows share them); the pushed fingers can."""
+        _cache(sqlite_db, [_ali_gym(), _ali_spa(), _sonia()])
+        sdk = _sdk()
+
+        _engine().sync_member_on_connected_sdk(
+            sdk=sdk, device=_pullsdk_device(pinScheme="ACCOUNT", fingerprintEnabled=True),
+            member_id=31001)
+
+        fingers = sorted(r["finger_id"] for r in sqlite_db.get_pending_fingerprint_push_reports()
+                         if r["pin"] == "5")
+        assert fingers == [1, 2], "finger 1 (gym plan) and finger 2 (spa plan) are both pushed"
+
     @pytest.mark.parametrize("revoked, kept", [(31001, 31000), (31000, 31001)],
                              ids=["the-shorter-plan", "the-reach-winner"])
     def test_revoking_one_of_two_memberships_is_confirmed_by_the_repush(self, sqlite_db, revoked, kept):
@@ -240,7 +266,7 @@ class TestFullPullSdkSync:
                                        default_door_id=1, changed_ids=None)
         return sdk
 
-    def test_account_stale_pins_are_account_pins_and_old_membership_pins_are_untouched(self, sqlite_db):
+    def test_account_stale_pins_are_account_pins_and_an_untracked_pin_is_untouched(self, sqlite_db):
         karim = _member(40, 902, 888, "Karim", card="1902", membership_id=99)   # not accepted
         users = [_ali_gym(), _sonia(), karim]
 
@@ -248,9 +274,93 @@ class TestFullPullSdkSync:
                         device_pins=["5", "777", "888", "31000"])
 
         assert _removed_pins(sdk) == {"888"}, (
-            "Karim left this door: his ACCOUNT pin is stale. 31000 is an old membership pin "
-            "Access does not track under ACCOUNT, so it is not touched"
+            "Karim left this door: his ACCOUNT pin is stale. 31000 has NO device_sync_state row in "
+            "this fixture and is not a desired or known pin, so it is not touched -- this is not "
+            "the post-switch state, see the next test"
         )
+
+    def test_after_a_switch_owned_old_membership_pins_are_removed_one_by_one(self, sqlite_db):
+        """Review #23. A switch clears hashes by UPDATE and keeps the old scheme's rows, so they
+        stay tracked: on an UNWIPED panel the first ACCOUNT sync deletes every owned old
+        membership pin no longer desired (and overwrites a colliding one such as 5). The wipe
+        is still the procedure; this sync does not leave old pins alone."""
+        _record_schemes(sqlite_db, "MEMBERSHIP", "ACCOUNT")
+        for pin in ("31000", "5"):
+            sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h-old", ok=True, error=None)
+        karim = _member(40, 902, 888, "Karim", card="1902", membership_id=99)
+
+        sdk = self._run(sqlite_db, [_ali_gym(), _sonia(), karim],
+                        _pullsdk_device(pinScheme="ACCOUNT", allowedMemberships=[7]),
+                        device_pins=["5", "777", "888", "31000"])
+
+        assert _removed_pins(sdk) == {"888", "31000"}
+        assert "5" in _written_pins(sdk), "the colliding pin is re-written with Ali"
+
+    def test_an_account_delta_pushes_the_changed_persons_pin(self, sqlite_db):
+        """Review #17. changed_ids name MEMBERSHIPS. Under ACCOUNT the delta prune must compare
+        person pins: membership 31000 is pin 5, and Sonia's membership 5 is pin 777."""
+        device = _pullsdk_device(pinScheme="ACCOUNT")
+        self._run(sqlite_db, [_ali_gym(), _sonia()], dict(device), device_pins=[])
+
+        ali_new_card = _ali_gym(); ali_new_card["firstCardId"] = "1999"
+        sdk = self._run(sqlite_db, [ali_new_card, _sonia()], dict(device), device_pins=["5", "777"])
+        # (first, a control: a full sync pushes the changed pin)
+        assert "5" in _written_pins(sdk)
+
+        ali_newer_card = _ali_gym(); ali_newer_card["firstCardId"] = "2999"
+        users = [ali_newer_card, _sonia()]
+        sdk = _sdk(["5", "777"])
+        with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
+            _engine()._sync_one_device(device=dict(device), users=users, local_fp_index={},
+                                       default_door_id=1, changed_ids={31000})
+        assert "5" in _written_pins(sdk), "membership 31000 is Ali: pin 5 is pushed"
+
+        ali_newest_card = _ali_gym(); ali_newest_card["firstCardId"] = "3999"
+        sdk = _sdk(["5", "777"])
+        with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
+            _engine()._sync_one_device(device=dict(device), users=[ali_newest_card, _sonia()],
+                                       local_fp_index={}, default_door_id=1, changed_ids={5})
+        assert "5" not in _written_pins(sdk), (
+            "a delta naming Sonia's membership 5 is about pin 777, not Ali's pin 5")
+
+    @pytest.mark.parametrize("history", ["switch", "first-sighting"])
+    def test_a_device_with_scheme_history_is_never_nuked_by_the_heuristic(self, sqlite_db, history):
+        """Review #18. Right after a switch the old scheme's owned pins outnumber the desired
+        roster -- exactly when INCREMENTAL's stale > desired && > 10 nuke fires. The cutover is
+        a manual wipe, so the heuristic is off for any device with scheme history."""
+        _record_schemes(sqlite_db, *(["MEMBERSHIP", "ACCOUNT"] if history == "switch" else ["ACCOUNT"]))
+        old =[str(31000 + i) for i in range(12)]
+        for pin in old:
+            sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h-old", ok=True, error=None)
+
+        sdk = self._run(sqlite_db, [_ali_gym(), _sonia()], _pullsdk_device(pinScheme="ACCOUNT"),
+                        device_pins=old + ["5", "777"])
+
+        assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]] == []
+        assert set(old) <= _removed_pins(sdk), "stale pins are removed one by one instead"
+
+    def test_the_nuke_heuristic_still_fires_without_scheme_history(self, sqlite_db):
+        """Control for the test above: the same roster with no history does reach the nuke."""
+        old = [str(31000 + i) for i in range(12)]
+        for pin in old:
+            sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h-old", ok=True, error=None)
+        sdk = self._run(sqlite_db, [_ali_gym(), _sonia()], _pullsdk_device(pinScheme="ACCOUNT"),
+                        device_pins=old + ["5", "777"])
+        assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]]
+
+    def test_full_replace_never_nukes_an_incomplete_account_roster(self, sqlite_db):
+        """Review #19. FULL_REPLACE sets nuke_mode unconditionally, and the switched-device
+        suppression deliberately skips it, so the incomplete-roster guard is all that keeps a
+        withheld member's device user and fingerprints on the panel."""
+        device = _pullsdk_device(pinScheme="ACCOUNT", pushingToDevicePolicy="DELETE_ALL_BEFORE_PUSHING")
+        sdk = self._run(sqlite_db, [_ali_gym(), _sonia(), _nadia_unfilled()], dict(device),
+                        device_pins=["5", "777", "888"])
+        assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]] == []
+
+        control = self._run(sqlite_db, [_ali_gym(), _sonia()], dict(device),
+                            device_pins=["5", "777", "888"])
+        assert [c for c in control.mock_calls if "clear_device_table" in c[0]], (
+            "control: FULL_REPLACE does clear the tables when the roster is complete")
 
     def test_membership_stale_pins_are_unchanged(self, sqlite_db):
         karim = _member(40, 902, 888, "Karim", card="1902", membership_id=99)
@@ -286,6 +396,7 @@ class TestFullPullSdkSync:
                      "startDate": "2026-09-01", "endDate": "2026-12-31"},
         )
         sqlite_db.save_device_sync_state(device_id=1, pin="888", desired_hash="h", ok=True, error=None)
+        sqlite_db.invalidate_sync_cache(clear_cached=True)   # the cache is process-wide
         users = list(sqlite_db.load_sync_cache().users)
         assert any(u.get("offlinePending") for u in users), "the projection is in the roster"
 

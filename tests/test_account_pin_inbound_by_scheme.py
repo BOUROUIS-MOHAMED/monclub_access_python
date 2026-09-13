@@ -99,6 +99,27 @@ class TestResolution:
         assert scheme == "ACCOUNT" and user is None
 
 
+def test_an_account_window_event_on_a_device_switched_back_is_still_ali():
+    """Review #20. account_index_for forces the ACCOUNT reading for an event from an ACCOUNT
+    window even when the device has since switched back to MEMBERSHIP; without it the index is
+    keyed by membership id and pin 5 names Sonia."""
+    devices = {8: {"id": 8, "name": "Sortie", "allowedMemberships": [7], "pinScheme": "MEMBERSHIP"}}
+    switches = {8: [
+        {"previous_scheme": "MEMBERSHIP", "scheme": "ACCOUNT", "switched_at": "2026-09-12 10:00:00"},
+        {"previous_scheme": "ACCOUNT", "scheme": "MEMBERSHIP", "switched_at": "2026-09-20 18:30:00"},
+    ]}
+    resolver = HistoryPinResolver(users=USERS, devices_by_id=devices, switches_by_device=switches)
+
+    in_window = _row(8, "2026-09-15 08:00:00", 5)
+    user, scheme = resolver.resolve(in_window, json.loads(in_window.raw_json))
+    assert scheme == "ACCOUNT"
+    assert user is not None and user["fullName"] == "Ali" and user["activeMembershipId"] == 31000
+
+    after = _row(8, "2026-09-21 08:00:00", 5)
+    user, scheme = resolver.resolve(after, json.loads(after.raw_json))
+    assert (scheme, user["fullName"]) == ("MEMBERSHIP", "Sonia")
+
+
 class TestUploadItems:
 
     def _item(self, row):
