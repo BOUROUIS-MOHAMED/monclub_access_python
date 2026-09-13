@@ -265,7 +265,7 @@ for ACCOUNT, so a MEMBERSHIP device's hash is unchanged by the upgrade.
 `[TEST: test_pin_scheme_gate.py::test_a_membership_device_keeps_its_roster_hash_and_an_account_device_does_not]`
 
 **The collapse (ACCOUNT only).** One person holding several memberships at one gym is ONE
-device row, and a row carries one validity window, one name and two card slots.
+device row, and a row carries one validity window, one name and — on the terminal — one card.
 `_merge_same_pin_entries` resolves it:
 
 - **validity** — the furthest-reaching membership wins, *among those this device accepts*, since
@@ -281,7 +281,19 @@ device row, and a row carries one validity window, one name and two card slots.
   membership it was enrolled under, so taking only the winner's list silently deletes every
   finger scanned on the losing plan. De-duped by template id. `[CODE]`
   `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner]`
-- **cards** — the winner's, with an empty slot filled from the loser. `[CODE]`
+- **cards** — the winner's, with an empty slot filled from the loser. **Only `firstCardId` reaches
+  the terminal**: every PullSDK user write sends one `CardNo` from it (targeted push and full-sync
+  writes) and the standalone `push_roster` entry carries one `card` from it (one
+  `SetStrCardNumber`); `secondCardId` is never pushed. So when a person's accepted memberships carry
+  different cards, the reach winner's card is on the device and **the others are dropped there** —
+  under MEMBERSHIP each was on its own device user. The PC-side rescue opens only for STAFF, and a
+  ZK_STANDALONE terminal decides alone, so a dropped card is refused. `_filter_users_for_device`
+  counts them in `stats_out["dropped_cards"]` and logs one WARNING per roster build with a sample of
+  the memberships whose card was dropped (review #5). The rank that picks the card is the validity
+  rank (`pin_row_rank`), which must stay shared with the inbound resolver, so it is not a "best
+  card" choice. Whether a device user record could hold a second card (e.g. a C3 multi-card table,
+  a second MB2000 card) is `[UNVERIFIED — HARDWARE-GATED]`; nothing here writes one.
+  `[CODE]` `[TEST: test_pin_scheme_gate.py::test_a_collapse_that_drops_a_card_reports_it]`
 
 **Every site that turns a membership into a device pin goes through the device's scheme.**
 Sync requests, delta `changed_ids`, fast-patch impacts and revocations all name MEMBERSHIPS

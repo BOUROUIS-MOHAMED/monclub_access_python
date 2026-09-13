@@ -334,7 +334,7 @@ def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, A
     Only reachable under ``pinScheme=ACCOUNT`` (``mainAccountId``): under MEMBERSHIP two
     rows cannot collide and this is never called. One human holding a 3-month gym
     plan and a 1-month spa plan is now one device row, and a device row carries exactly one
-    validity window, one name and two card slots.
+    validity window, one name and -- on the terminal -- one card.
 
     **Validity: the furthest reach wins.** Both rows have already passed
     ``allowedMemberships`` and (when enabled) the validity filter, so both are memberships
@@ -350,8 +350,12 @@ def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, A
     by fingerprint id where present, else by (fingerId, templateVersion), because the same
     account-level template legitimately arrives on both rows.
 
-    **Cards: the winner's, with the loser's kept only to fill an empty slot.** A device row
-    has two card slots and no more; this never invents a third.
+    **Cards: the winner's, with the loser's kept only to fill an empty slot.** Every device push
+    writes ONE card per user -- PullSDK ``CardNo`` and the standalone entry's ``card``, both from
+    ``firstCardId``; ``secondCardId`` is never pushed -- so only ``firstCardId`` reaches the
+    terminal and a losing membership's different card is dropped there.
+    ``_filter_users_for_device`` counts and logs those (``stats_out["dropped_cards"]``).
+    Whether a record could hold a second card is [UNVERIFIED -- HARDWARE-GATED].
     """
     winner, loser = (a, b) if pin_row_rank(a) >= pin_row_rank(b) else (b, a)
     merged = dict(winner)
@@ -1706,6 +1710,9 @@ class DeviceSyncEngine:
         withheld = 0
         offline_projections = 0
         withheld_sample: List[Dict[str, Any]] = []
+        cards_by_pin: Dict[str, Dict[str, Any]] = {}
+        dropped_cards = 0
+        dropped_sample: List[Dict[str, Any]] = []
 
         def _deliverable(u: Dict[str, Any]) -> bool:
             mid = _to_int(u.get("membershipId"), default=None)
@@ -1776,6 +1783,14 @@ class DeviceSyncEngine:
                         })
                     continue
 
+                # Every push writes ONE card per device user (PullSDK CardNo / the standalone
+                # entry's "card", both from firstCardId), so a collapsed row carries one card.
+                # Remember each membership's card to report the ones that no longer reach the
+                # terminal (review #5).
+                card = _pin_str(u.get("firstCardId"))
+                if card:
+                    cards_by_pin.setdefault(pin, {}).setdefault(card, u.get("activeMembershipId"))
+
                 prior = out.get(pin)
                 if prior is None:
                     out[pin] = u
@@ -1799,6 +1814,26 @@ class DeviceSyncEngine:
                 # the row.
                 out[pin] = _merge_same_pin_entries(prior, u)
 
+            for pin, cards in cards_by_pin.items():
+                if len(cards) < 2 or pin not in out:
+                    continue
+                pushed_card = _pin_str(out[pin].get("firstCardId"))
+                lost = {c: am for c, am in cards.items() if c != pushed_card}
+                if not lost:
+                    continue
+                dropped_cards += len(lost)
+                if len(dropped_sample) < 10:
+                    dropped_sample.append({"pin": pin, "droppedFromMemberships": sorted(
+                        {str(am) for am in lost.values()})})
+            if dropped_cards:
+                (self.logger or logging.getLogger("zkapp")).warning(
+                    "[DeviceSync] device id=%s pinScheme=ACCOUNT: %d card(s) do not reach the "
+                    "terminal -- a device user holds ONE card (firstCardId) and a person's "
+                    "memberships carry different ones; the furthest-reaching membership's card is "
+                    "pushed (sample=%s). Those cards are refused at the terminal.",
+                    device.get("id"), dropped_cards, dropped_sample,
+                )
+
             if withheld:
                 log = self.logger or logging.getLogger("zkapp")
                 log.warning(
@@ -1821,6 +1856,7 @@ class DeviceSyncEngine:
             stats_out["withheld_missing_account"] = withheld
             stats_out["withheld_sample"] = withheld_sample
             stats_out["skipped_offline_projections"] = offline_projections
+            stats_out["dropped_cards"] = dropped_cards
 
         return out
 

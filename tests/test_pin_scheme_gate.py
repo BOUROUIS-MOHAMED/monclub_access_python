@@ -261,6 +261,35 @@ def test_reach_still_dominates_the_id():
     assert furthest_reach([shorter_big_id, longer_small_id])["fullName"] == "Long"
 
 
+def test_a_collapse_that_drops_a_card_reports_it(caplog):
+    """Review #5. Every push writes ONE card per device user -- PullSDK `CardNo` from
+    firstCardId (targeted and full-sync writes), the standalone entry's single "card" from
+    firstCardId -- so a collapsed row can carry one card to the terminal. Under MEMBERSHIP each
+    membership's firstCardId reached the device on its own user; under ACCOUNT only the reach
+    winner's does. That loss was silent; it must be counted and logged."""
+    gym = {**_row(10, "Ali", "2027-06-30T00:00:00"), "firstCardId": "111"}
+    spa = {**_row(20, "Ali", "2026-10-01T00:00:00"), "firstCardId": "222"}
+    same_card = {**_row(30, "Ali", "2026-11-01T00:00:00"), "firstCardId": "111"}
+
+    for order in ([gym, spa, same_card], [same_card, spa, gym]):
+        stats: Dict[str, Any] = {}
+        with caplog.at_level("WARNING"):
+            out = _engine()._filter_users_for_device(
+                users=order, device={"doorIds": [1], "pinScheme": "ACCOUNT", "id": 9},
+                default_door_id=1, stats_out=stats)
+        assert out["5"]["firstCardId"] == "111", "the reach winner's card is the one pushed"
+        assert stats["dropped_cards"] == 1, "card 222 of membership 20 reaches no device user"
+    assert any("card" in r.getMessage() and "20" in r.getMessage() for r in caplog.records)
+
+
+def test_a_membership_device_never_reports_dropped_cards():
+    stats: Dict[str, Any] = {}
+    _engine()._filter_users_for_device(
+        users=[{**_row(10, "A"), "firstCardId": "111"}, {**_row(20, "B"), "firstCardId": "222"}],
+        device={"doorIds": [1]}, default_door_id=1, stats_out=stats)
+    assert stats["dropped_cards"] == 0
+
+
 # ── the roster hash ─────────────────────────────────────────────────────────────────────
 
 def test_a_membership_device_keeps_its_roster_hash_and_an_account_device_does_not():
