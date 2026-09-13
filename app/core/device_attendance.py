@@ -397,8 +397,9 @@ def _resolve_history_user(
         # account owner — a bug that did not exist before the account index was introduced.
         #
         # Reached only when the scheme cannot be known: HistoryPinResolver reads every pin
-        # under its device's recorded scheme (guide §3.2b), so this is a legacy caller or a
-        # switched device whose event time did not parse.
+        # under its device's recorded scheme (guide §3.2b), so this is a legacy caller, a
+        # device with history whose event time did not parse, or an event stamped before this
+        # database first saw the device already on ACCOUNT (guide §3.2e, first sighting).
         logging.getLogger("zkapp").warning(
             "[DeviceAttendance] ambiguous pin %s on device %s — it is both an account id and "
             "a membership id for different people, and the device's pin scheme at this "
@@ -418,7 +419,8 @@ class HistoryPinResolver:
 
     * scheme: the device's ``device_pin_scheme_switch`` history (``db.list_device_pin_scheme_switches``)
       read by ``pin_scheme.scheme_at`` at the row's ``event_time`` (the DEVICE's clock). No
-      recorded switch -> MEMBERSHIP, known. A switched device and an unparseable time -> None.
+      recorded row -> MEMBERSHIP. A device with rows and an unparseable time -> None; an event
+      before a FIRST SIGHTING already on ACCOUNT (previous_scheme 'UNKNOWN') -> None.
     * ACCOUNT pins resolve through the collapsed row ``_filter_users_for_device`` builds for
       THAT device -- its allowedMemberships / validity policy and ``pin_row_rank`` -- so an
       event names the membership the device row represents. A device no longer in the cache
@@ -438,10 +440,13 @@ class HistoryPinResolver:
         self.users = [u for u in (users or []) if isinstance(u, dict)]
         self.users_by_am, self.users_by_card, self.users_by_account = _user_indexes(self.users)
         self._devices_by_id = {int(k): v for k, v in (devices_by_id or {}).items()}
-        self._switches: Dict[int, List[Tuple[str, Optional[datetime]]]] = {}
+        self._switches: Dict[int, List[Tuple[str, Optional[datetime], str]]] = {}
         for device_id, entries in (switches_by_device or {}).items():
+            # previous_scheme travels too: 'UNKNOWN' on the first row is a first sighting, and
+            # events before it have no known scheme (pin_scheme.scheme_at).
             self._switches[int(device_id)] = [
-                (str((e or {}).get("scheme") or ""), _dt_from_any((e or {}).get("switched_at")))
+                (str((e or {}).get("scheme") or ""), _dt_from_any((e or {}).get("switched_at")),
+                 str((e or {}).get("previous_scheme") or PIN_SCHEME_MEMBERSHIP))
                 for e in (entries or [])
             ]
         self._account_index: Dict[int, Dict[int, Dict[str, Any]]] = {}

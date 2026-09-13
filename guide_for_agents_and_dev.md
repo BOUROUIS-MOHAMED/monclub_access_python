@@ -376,15 +376,18 @@ a time and every change is recorded with its time (§3.2e). `device_attendance.H
 uses that:
 
 - **scheme at event time** — `db.list_device_pin_scheme_switches` read by `pin_scheme.scheme_at`
-  at the row's `event_time`. No recorded switch → MEMBERSHIP (known: the default, and every change
-  away from it is recorded). A switch at or before the event → its scheme; before the first switch
-  → MEMBERSHIP.
+  at the row's `event_time`. No row → MEMBERSHIP: this database has only seen the device on
+  MEMBERSHIP. A row at or before the event → its scheme. Before the first row → that row's
+  `previous_scheme`: MEMBERSHIP for a recorded switch, **unknown** for a first sighting
+  (`previous_scheme='UNKNOWN'`, §3.2e) — a database that first sees a device already on ACCOUNT
+  does not know when it switched, so it does not invent a MEMBERSHIP window ending at PC-now.
 - **MEMBERSHIP** → the membership index only. **ACCOUNT** → the collapsed row
   `_filter_users_for_device` builds for THAT device (its `allowedMemberships` / validity policy,
   `pin_row_rank`), so an event names the membership the device row represents; a device no longer
   in the cache falls back to the unfiltered by-account index, ranked the same way. A known scheme
   never consults the other index.
-- **unknown** (a switched device whose `event_time` does not parse, or a legacy caller of
+- **unknown** (a device with history whose `event_time` does not parse, an event before a first
+  sighting on ACCOUNT, or a legacy caller of
   `_resolve_history_user` without `pin_scheme`) → the old rule: the unambiguous reading, and a pin
   that is both prefers MEMBERSHIP, with a WARNING. c13d1c2's "account index first" inverted
   correctness on devices still holding membership pins; that is why the fallback prefers
@@ -674,6 +677,26 @@ it. `[CODE: app/core/db.py::_insert_device_row, ::_record_device_pin_scheme_swit
   skip the device's next full sync.
 - It does **not** touch the terminal. Nothing in this repo wipes a device automatically.
 
+**A first sighting is not a switch** (a new or reinstalled PC, a lost SQLite file, or a device
+added after the upgrade). `device_pin_scheme_seen` records each device the database has seen with
+an explicit scheme. A device with neither a seen row nor a switch row is a first sighting: on
+MEMBERSHIP only the seen row is written; already on ACCOUNT, a row `('UNKNOWN' → 'ACCOUNT', now)`
+is written, so events stamped before it resolve under the unknown-scheme rule (§3.2b inbound) —
+not as MEMBERSHIP. Hashes are still cleared (idempotent UPDATE). It logs WARNING when there was
+nothing to clear; CRITICAL (wipe) only when this PC already held sync state for the device, since
+those pins were pushed before any scheme was recorded, i.e. as membership pins. The row counts as
+history for the nuke suppression below. `[CODE: db.py::_record_device_pin_scheme_switch]`
+`[TEST: test_pin_scheme_switch.py::test_a_first_sighting_on_account_is_not_a_switch_and_earlier_events_are_unknown,
+::test_a_device_seen_on_membership_then_account_is_a_real_switch]`
+
+*Decision for review #14 (a PC with no history).* A first sighting on **MEMBERSHIP** is read as
+MEMBERSHIP for earlier events too, not unknown. Reason: treating it as unknown would degrade every
+new install at a MEMBERSHIP gym — a backlog pin not in the cache would go up with no identifier
+(dropped by the backend), and a membership pin that equals a cached account id would name the
+account holder. The residual `[UNVERIFIED — not observed]`: a device that ran ACCOUNT and was
+switched back to MEMBERSHIP before this database first saw it has its ACCOUNT-period backlog read
+as MEMBERSHIP.
+
 > **Operator procedure.** Wipe the terminal's users, then switch `pinScheme` on the device.
 > Until the wipe, a PRESERVE terminal holds the old scheme's users next to the new ones, and on
 > the 110 colliding ids (99 different people) the new push overwrites a stranger's device user.
@@ -689,9 +712,13 @@ explicit operator-confirmed action that does not exist yet. `[CODE: ultra_engine
 `[UNKNOWN — not built; needs a decision]`
 
 **Reading the history.** `db.list_device_pin_scheme_switches` and
-`pin_scheme.scheme_at(switches, when)`: no switch → MEMBERSHIP for all time (known, not a guess);
-a switch stamped at or before `when` is in force; an unparseable `when` on a device that has
-switched → `None`, "cannot be known". `[TEST: ::test_switching_back_is_a_second_switch_and_each_window_resolves, ::test_scheme_at_rules]`
+`pin_scheme.scheme_at(switches, when)`, items `(scheme, switched_at, previous_scheme)`: no row →
+MEMBERSHIP (only ever seen on MEMBERSHIP — see the #14 decision above for what that does not
+cover); before the first row → its `previous_scheme`, `None` when that is `UNKNOWN`; a row
+stamped at or before `when` is in force; an unparseable `when` on a device with rows → `None`; a
+row with an unparseable time → `None` until the next parseable row at or before `when`.
+`[TEST: ::test_switching_back_is_a_second_switch_and_each_window_resolves, ::test_scheme_at_rules,
+::test_scheme_at_reads_the_scheme_before_the_first_row_from_that_row]`
 
 ### 3.2f Local API handlers that carry a member or a pin (2026-09-12)
 

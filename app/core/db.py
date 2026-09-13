@@ -19,7 +19,12 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
-from app.core.pin_scheme import PIN_SCHEME_MEMBERSHIP, normalize_pin_scheme, recognized_pin_scheme
+from app.core.pin_scheme import (
+    PIN_SCHEME_MEMBERSHIP,
+    PIN_SCHEME_UNKNOWN,
+    normalize_pin_scheme,
+    recognized_pin_scheme,
+)
 from app.core.utils import ensure_dirs, format_ts, now_iso
 from shared.auth_state import AuthTokenState, protect_auth_token, unprotect_auth_token
 
@@ -1310,8 +1315,9 @@ def init_db() -> None:
         # Every change of a device's pinScheme, oldest first. Deliberately NOT a column of
         # sync_devices: every device-section refresh DELETEs that table and re-inserts it, so
         # a switch time kept there would reset on the next sync and every earlier door event
-        # would then resolve under the new scheme. No row for a device = MEMBERSHIP for all
-        # time (the default; a change away from it is always recorded). guide §3.2e.
+        # would then resolve under the new scheme. No row for a device = this DB has only seen
+        # it on MEMBERSHIP (or not at all). A row with previous_scheme='UNKNOWN' is a FIRST
+        # SIGHTING already on ACCOUNT: events before it have no known scheme. guide §3.2e.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS device_pin_scheme_switch (
@@ -1326,6 +1332,19 @@ def init_db() -> None:
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dpss_device ON device_pin_scheme_switch(device_id, id);"
+        )
+        # Which devices this DB has seen with an explicit pinScheme, and on which. It is what
+        # tells a FIRST SIGHTING already on ACCOUNT (history before it unknown: a new or
+        # reinstalled PC) from a device this DB watched on MEMBERSHIP and then saw switch.
+        # Not in sync_devices, for the same reason as the switch table. guide §3.2e.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_pin_scheme_seen (
+                device_id     INTEGER PRIMARY KEY,
+                first_scheme  TEXT    NOT NULL,
+                first_seen_at TEXT    NOT NULL
+            );
+            """
         )
 
         # -----------------------------
@@ -3707,6 +3726,15 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
     The current scheme is the latest recorded switch, MEMBERSHIP when there is none. Only an
     explicit, recognised ``pinScheme`` can switch: an absent key, null, "" or an unknown
     token is not evidence of a change (review #6).
+
+    FIRST SIGHTING (review #1/#14). A device this DB has never seen with an explicit scheme
+    (no ``device_pin_scheme_seen`` row, no switch row) is recorded as seen. On MEMBERSHIP that
+    is all. Already on ACCOUNT, WHEN it switched is not known -- a new or reinstalled PC, a
+    lost SQLite file -- so the row is written with ``previous_scheme='UNKNOWN'``, which makes
+    ``pin_scheme.scheme_at`` answer None (the unknown-scheme rule) for events before it
+    instead of inventing a MEMBERSHIP window ending at PC-now. Hashes are still cleared (an
+    idempotent UPDATE; state rows here were pushed before any scheme was recorded, i.e. as
+    membership pins), and the operator is told to wipe only when such rows existed.
     """
     did = _to_int_or_none(d.get("id"))
     if did is None:
@@ -3714,11 +3742,25 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
     new_scheme = _explicit_device_pin_scheme(d)
     if new_scheme is None:
         return False
-    current = _last_known_device_pin_scheme(cur, did) or PIN_SCHEME_MEMBERSHIP
-    if new_scheme == current:
-        return False
-    cleared = _clear_device_sync_hashes_on(cur, did)
+    last_known = _last_known_device_pin_scheme(cur, did)
+    first_sighting = last_known is None and cur.execute(
+        "SELECT 1 FROM device_pin_scheme_seen WHERE device_id=?", (did,),
+    ).fetchone() is None
     switched_at = now_iso()
+    if first_sighting:
+        cur.execute(
+            "INSERT OR IGNORE INTO device_pin_scheme_seen (device_id, first_scheme, first_seen_at) "
+            "VALUES (?, ?, ?)",
+            (did, new_scheme, switched_at),
+        )
+        if new_scheme == PIN_SCHEME_MEMBERSHIP:
+            return False
+        current = PIN_SCHEME_UNKNOWN
+    else:
+        current = last_known or PIN_SCHEME_MEMBERSHIP
+        if new_scheme == current:
+            return False
+    cleared = _clear_device_sync_hashes_on(cur, did)
     cur.execute(
         """
         INSERT INTO device_pin_scheme_switch
@@ -3727,15 +3769,26 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
         """,
         (did, current, new_scheme, switched_at, int(cleared)),
     )
-    logging.getLogger(__name__).critical(
-        "[DB] device id=%s name=%r pinScheme switched %s -> %s at %s; cleared %d per-pin sync "
-        "hash(es) (ownership evidence kept). The terminal still holds %s-scheme users: an "
-        "operator MUST wipe its users before it is trusted again (guide §3.2e).",
-        did, d.get("name"), current, new_scheme, switched_at, cleared, current,
-    )
+    log = logging.getLogger(__name__)
+    if first_sighting and not cleared:
+        log.warning(
+            "[DB] device id=%s name=%r first seen by this database already on pinScheme=%s at %s. "
+            "Not a switch: when it switched is unknown, so door events stamped before now are read "
+            "under the unknown-scheme rule (guide §3.2e).",
+            did, d.get("name"), new_scheme, switched_at,
+        )
+    else:
+        log.critical(
+            "[DB] device id=%s name=%r pinScheme %s -> %s at %s; cleared %d per-pin sync "
+            "hash(es) (ownership evidence kept). The terminal may still hold %s-scheme users "
+            "this PC pushed: an operator MUST wipe its users before it is trusted again "
+            "(guide §3.2e).",
+            did, d.get("name"), current, new_scheme, switched_at, cleared,
+            PIN_SCHEME_MEMBERSHIP if first_sighting else current,
+        )
     try:
         _tel.warn("PIN_SCHEME_SWITCH", device_id=did, previous=current, scheme=new_scheme,
-                  cleared_rows=int(cleared))
+                  cleared_rows=int(cleared), first_sighting=bool(first_sighting))
     except Exception:
         pass
     return True
@@ -3745,7 +3798,8 @@ def list_device_pin_scheme_switches(*, device_id: int | None = None) -> Dict[int
     """{device_id: [{"previous_scheme", "scheme", "switched_at"}, ...]} oldest first.
 
     ``switched_at`` is now_iso() text -- local PC time, the clock and shape access_history
-    ``created_at`` uses. A device with no entry has always been MEMBERSHIP.
+    ``created_at`` uses. A device with no entry has only been seen on MEMBERSHIP. An entry
+    whose ``previous_scheme`` is ``UNKNOWN`` is a first sighting already on that scheme.
     """
     sql = "SELECT device_id, previous_scheme, scheme, switched_at FROM device_pin_scheme_switch"
     params: tuple = ()
