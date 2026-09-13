@@ -279,8 +279,13 @@ device row, and a row carries one validity window, one name and — on the termi
 - **fingerprints** — UNIONED, never the winner's alone. `_collect_templates_for_pin` treats
   `user['fingerprints']` as the whole answer and the backend attaches each template to the
   membership it was enrolled under, so taking only the winner's list silently deletes every
-  finger scanned on the losing plan. De-duped by template id. `[CODE]`
-  `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner]`
+  finger scanned on the losing plan. De-duped by template id. The union is **sorted**
+  (`fingerId`, `templateVersion`, template id, data): `_collect_templates_for_pin` keeps the last
+  template per finger, so before the sort a finger enrolled under two memberships got whichever
+  template the row order put last, and its desired hash moved with payload order (review #7). Now
+  the largest template id wins that finger in any order. `[CODE]`
+  `[TEST: test_fingerprints_are_unioned_not_taken_from_the_winner,
+  test_pin_scheme_gate.py::test_the_template_pushed_for_a_finger_does_not_depend_on_row_order]`
 - **cards** — the winner's, with an empty slot filled from the loser. **Only `firstCardId` reaches
   the terminal**: every PullSDK user write sends one `CardNo` from it (targeted push and full-sync
   writes) and the standalone `push_roster` entry carries one `card` from it (one

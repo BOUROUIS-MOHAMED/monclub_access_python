@@ -360,19 +360,30 @@ def _merge_same_pin_entries(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, A
     winner, loser = (a, b) if pin_row_rank(a) >= pin_row_rank(b) else (b, a)
     merged = dict(winner)
 
+    # Deterministic order (review #7): _collect_templates_for_pin keeps the LAST template per
+    # fingerId, so when one finger was enrolled under two memberships the list order decided
+    # which bytes -- and which desired hash -- the device got, and that order followed the
+    # payload. Sorted by (fingerId, templateVersion, id, data), the largest template id wins a
+    # finger whatever order the rows arrive in.
+    def _fp_order(fp: Dict[str, Any]):
+        def _n(v):
+            n = _to_int(v, default=None)
+            return (0, int(n)) if n is not None else (1, str(v or ""))
+        return (_n(fp.get("fingerId")), _n(fp.get("templateVersion")), _n(fp.get("id")),
+                str(fp.get("templateData") or ""))
+
+    candidates = [fp for src in (winner, loser) for fp in (src.get("fingerprints") or [])
+                  if isinstance(fp, dict)]
     seen: Set[Any] = set()
     fingerprints: List[Dict[str, Any]] = []
-    for src in (winner, loser):
-        for fp in (src.get("fingerprints") or []):
-            if not isinstance(fp, dict):
-                continue
-            key = fp.get("id")
-            if key is None:
-                key = (fp.get("fingerId"), fp.get("templateVersion"))
-            if key in seen:
-                continue
-            seen.add(key)
-            fingerprints.append(fp)
+    for fp in sorted(candidates, key=_fp_order):
+        key = fp.get("id")
+        if key is None:
+            key = (fp.get("fingerId"), fp.get("templateVersion"))
+        if key in seen:
+            continue
+        seen.add(key)
+        fingerprints.append(fp)
     if fingerprints or winner.get("fingerprints") is not None:
         merged["fingerprints"] = fingerprints
 

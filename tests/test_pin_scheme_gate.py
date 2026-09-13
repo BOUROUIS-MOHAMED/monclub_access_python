@@ -282,6 +282,30 @@ def test_a_collapse_that_drops_a_card_reports_it(caplog):
     assert any("card" in r.getMessage() and "20" in r.getMessage() for r in caplog.records)
 
 
+def test_the_template_pushed_for_a_finger_does_not_depend_on_row_order():
+    """Review #7. Finger 1 enrolled under two memberships arrives as two templates with
+    distinct ids; _collect_templates_for_pin keeps the LAST per finger, so the unioned list's
+    order decided which bytes (and which hash) a collapsed row carried."""
+    import itertools
+
+    def fp(tid, data):
+        return {"id": tid, "fingerId": 1, "templateVersion": 10, "templateData": data,
+                "templateSize": 4, "enabled": True}
+
+    rows = [{**_row(30, "Ali"), "fingerprints": []},
+            {**_row(20, "Ali"), "fingerprints": [fp(201, "QkJC")]},
+            {**_row(10, "Ali"), "fingerprints": [fp(101, "Q0ND")]}]
+    engine = _engine()
+    seen = set()
+    for order in itertools.permutations(rows):
+        out = engine._filter_users_for_device(
+            users=list(order), device={"doorIds": [1], "pinScheme": "ACCOUNT"}, default_door_id=1)
+        tpls = engine._collect_templates_for_pin(
+            user=out["5"], pin="5", local_fp_index={}, fingerprint_enabled=True)
+        seen.add(tuple(t.get("templateData") for t in tpls))
+    assert len(seen) == 1, f"order-dependent templates: {seen}"
+
+
 def test_a_membership_device_never_reports_dropped_cards():
     stats: Dict[str, Any] = {}
     _engine()._filter_users_for_device(
