@@ -201,8 +201,12 @@ drain, and the worker drains only while connected — so an open pressed during 
 sync hand-off (`pause_for_sync`, which has no door yield) pulsed the relay on the next
 reconnect, however late. `request_door_open` also returns a **copy** of the result box, and the
 worker writes `ok`/`error` in one `dict.update`, so the handler can no longer read a half-written
-pair. `[CODE: ultra_engine.py::request_door_open, ::_drain_commands]`
-`[TEST: test_door_open_deadline.py]`
+pair. Worker and waiter share the ~15.6 ms monotonic tick, so the worker can mark an entry
+expired just before the caller copies the box; `request_door_open` reports that as its own
+`timeout` (nothing was sent), which keeps the local API on its 503 instead of a generic 500.
+Mid-push, `[T] SYNC_DOOR_YIELD` now carries `opened` (entries sent to the device, as before)
+and `expired` (skipped) separately. `[CODE: ultra_engine.py::request_door_open,
+::_drain_commands, ::_sync_yield_to_doors]` `[TEST: test_door_open_deadline.py]`
 
 What it does **not** change: the check is at dequeue, so an open taken just inside the deadline
 still runs, and the SDK call (`timeout_ms=4000`) can finish a few seconds after the caller was
@@ -1870,6 +1874,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | Event | Where | Carries |
 |---|---|---|
 | `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller's deadline, **not executed** (§3.1a) |
+| `SYNC_DOOR_YIELD` | `ultra_engine.py::_sync_yield_to_doors` | `worker opened expired` — operator opens drained between push chunks; `opened` = sent to the device (whatever it answered), `expired` = skipped. `expired` added 2026-09-18; before, `opened` counted every queued entry (§3.1a) |
 | `QR_ROSTER_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict mode allowed` — one per QR scan whose verdict is not `in_roster`; no member id, name or credential (§3.1b) |
 | `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty refused` — running totals since the process started, at most once an hour (§3.1b) |
 

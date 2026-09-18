@@ -110,6 +110,45 @@ def test_the_mid_push_door_yield_also_skips_an_expired_open() -> None:
     assert ev.is_set() and box["error"] == "expired (not executed)"
 
 
+def test_an_expiry_the_caller_reads_is_reported_as_its_timeout() -> None:
+    # Worker and waiter share the ~15.6 ms monotonic tick: the worker can mark the entry
+    # expired just before the caller copies the box. The local API maps only "timeout"
+    # to its 503; anything else became a generic 500 with an English internal string.
+    worker = _connected_worker()
+    holder = {}
+
+    def caller():
+        holder["box"] = worker.request_door_open(door_id=1, pulse_ms=3000, timeout=2.0)
+
+    t = threading.Thread(target=caller)
+    t.start()
+    for _ in range(400):
+        if not worker._cmd_queue.empty():
+            break
+        time.sleep(0.005)
+    door, pulse, ev, box, _deadline = worker._cmd_queue.get_nowait()
+    worker._cmd_queue.put_nowait((door, pulse, ev, box, time.monotonic() - 0.001))
+    worker._drain_commands()  # marks it expired and wakes the caller early
+    t.join(timeout=2.0)
+
+    worker._sdk.open_door.assert_not_called()
+    assert holder["box"] == {"ok": False, "error": "timeout"}
+
+
+def test_the_mid_push_yield_event_counts_expired_opens_apart() -> None:
+    worker = _connected_worker()
+    worker._settings["ultra_sync_yield_to_doors"] = True
+    worker._cmd_queue.put_nowait((1, 3000, threading.Event(), {}, time.monotonic() - 0.001))
+    worker._cmd_queue.put_nowait((2, 3000, threading.Event(), {}, time.monotonic() + 60.0))
+
+    with patch("app.core.ultra_engine._tel.event") as tel:
+        worker._sync_yield_to_doors()
+
+    yields = [c.kwargs for c in tel.call_args_list if c.args[0] == "SYNC_DOOR_YIELD"]
+    assert yields == [{"worker": worker._tel_wid, "opened": 1, "expired": 1}]
+    worker._sdk.open_door.assert_called_once_with(door_id=2, pulse_time_ms=3000, timeout_ms=4000)
+
+
 def test_rescue_opens_do_not_use_the_queue() -> None:
     worker = _connected_worker()
     assert worker._open_door_with_retry(door_id=1) is True

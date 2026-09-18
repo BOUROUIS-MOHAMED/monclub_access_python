@@ -1002,7 +1002,13 @@ class UltraDeviceWorker(threading.Thread):
 
         result_event.wait(timeout=timeout)
         # A copy: the worker may still be writing ok/error into the live box.
-        return dict(result_box)
+        result = dict(result_box)
+        # The worker and this wait both run on the ~15.6 ms monotonic tick, so an
+        # entry can be marked expired just before we read it. The caller's deadline
+        # passed either way and nothing was sent: that is this call's "timeout".
+        if result.get("error") == "expired (not executed)":
+            result["error"] = "timeout"
+        return result
 
     def request_run_sdk(
         self,
@@ -1432,12 +1438,17 @@ class UltraDeviceWorker(threading.Thread):
         (``request_door_open``) are queued here; QR/TOTP and staff-RFID rescue opens
         call the SDK directly on this thread (``_open_door_with_retry``) and never
         pass through this queue.
+
+        Returns ``(drained, expired)``: entries taken off the queue, and how many of
+        them were skipped as expired (never sent to the device).
         """
+        drained = expired = 0
         while not self._cmd_queue.empty():
             try:
                 door_id, pulse_ms, result_event, result_box, deadline = self._cmd_queue.get_nowait()
             except queue.Empty:
                 break
+            drained += 1
             # The caller has already returned "timeout": skip, never open late.
             # Checked at dequeue, so an open taken just inside the deadline still runs
             # and can finish a few seconds after the caller gave up (the SDK call
@@ -1450,6 +1461,7 @@ class UltraDeviceWorker(threading.Thread):
                 )
                 _tel.event("DOOR_CMD_EXPIRED", worker=self._tel_wid, door=door_id)
                 result_event.set()
+                expired += 1
                 continue
             try:
                 if self._sdk is None or not self._connected:
@@ -1467,6 +1479,7 @@ class UltraDeviceWorker(threading.Thread):
                 )
             finally:
                 result_event.set()
+        return drained, expired
 
     def _drain_sdk_commands(self):
         """Execute pending operator SDK calls on the held connection.
@@ -1532,8 +1545,11 @@ class UltraDeviceWorker(threading.Thread):
         try:
             pending = self._cmd_queue.qsize()
             if pending:
-                self._drain_commands()
-                _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid, opened=pending)
+                drained, expired = self._drain_commands()
+                # opened = entries sent to the device (as before, whatever it answered);
+                # expired = entries past their caller's deadline, never sent (§3.1a).
+                _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid,
+                           opened=drained - expired, expired=expired)
         except Exception:
             pass
 
