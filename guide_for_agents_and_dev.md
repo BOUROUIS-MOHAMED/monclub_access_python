@@ -237,9 +237,10 @@ allowed even when **none** of that credential's `grantedActiveMembershipIds` was
 `users_by_am` — the PC's member list; it fell back to the first grant id with `user=None`. The
 eligibility filter (`_iter_eligible_totp_creds`) checks only `enabled`, the ids, the secret and a
 non-empty grant list. So a member dropped from the member list kept opening the door by QR
-until the credentials themselves were refreshed. `[CODE]`
-`[TEST: test_access_verification.py::test_totp_no_matching_user_in_users_by_am — still pins the
-allow, now as trial-mode behaviour]`
+until the credentials themselves were refreshed. `[CODE: 62773a3 access_verification.py::verify_totp]`
+`[TEST: test_totp_roster_check.py::test_trial_is_the_default_and_still_allows — the old allow, now
+trial-mode behaviour; test_access_verification.py::test_totp_no_matching_user_in_users_by_am
+passes an EMPTY member list, so it now pins `roster_empty`, not this case]`
 
 **Where the check is.** In `verify_totp`'s final ALLOW step, after the hits are resolved — so
 the TOTP speed index and the full loop reach it with the same `grants` and the same
@@ -337,14 +338,17 @@ comes an hour after start, and on a PC with no ULTRA worker it comes only with a
 **How the counts leave the PC — the log upload, not the heartbeat.** Every `[T]` line is in the
 app log, and `log_uploader.py` uploads each log window when it closes; the dashboard's "Sync logs
 now" button (fast path to 127.0.0.1, else a backend request the PC's `LogSyncRequestPoller` picks
-up within ~10 min) uploads the open window on demand. No backend change is needed. **Reading the
-files needs a MonClub admin account:** the dashboard's Access logs page and its API
-(`/protected/access/logs`) are ADMIN-only; a gym account sees upload status only. The PC heartbeat
+up within ~10 min) uploads the open window on demand. No backend change is needed. **In the
+dashboard, only a MonClub admin can open the files:** its Access logs page is in the ADMIN-only
+menu and calls the ADMIN-only `/protected/access/logs`; a gym account's dashboard shows upload
+status only. The backend also serves each gym its own files at `/api/v1/gym/access/logs` and
+`…/download-url` (GYM role, gym taken from the token), but no dashboard page calls them yet. The PC heartbeat
 (`pc_identity.py::build_heartbeat_payload` → `/public/access/v1/pc/heartbeat`, every 300 s) was
 rejected as the carrier: the backend's `HeartbeatRequest` has no field for it, Jackson drops
 unknown properties, and `GymAccessPcService.heartbeat` reads four declared fields — showing counts
 on `/access-pcs` needs a DTO field, a column and a dashboard change. `[CODE: backend main
-AccessLogAdminController, AccessLogGymController, GymAccessPcDtos, GymAccessPcService; dashboard
+AccessLogAdminController, AccessLogGymController.resolveScopedGym, SecurityConfiguration,
+GymAccessPcDtos, GymAccessPcService; dashboard
 config-nav-dashboard.tsx, sync-logs-header-button.tsx]`
 
 **What does not change.** Card checks (`verify_card`), the staff-RFID rescue, and the staff QR

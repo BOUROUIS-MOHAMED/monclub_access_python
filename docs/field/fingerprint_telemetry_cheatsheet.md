@@ -424,10 +424,12 @@ grep -F "[T] QR_ROSTER_CHECK" app-*.log
 
 To read it without visiting the gym: press "Sync logs now" in the dashboard header, wait
 up to ~10 min for the PC to upload, then open the newest window on the Access logs page and
-search `QR_ROSTER`. **The Access logs page needs a MonClub admin account** — a gym account
-sees only whether the upload happened, not the file. The first summary line appears an hour
-after the app starts. `[CODE: app/core/log_sync_request_poller.py, app/core/log_uploader.py;
-dashboard config-nav-dashboard.tsx]`
+search `QR_ROSTER`. **In the dashboard the Access logs page is in the admin-only menu** — a
+gym account's dashboard shows only whether the upload happened. (The backend also lets a gym
+account fetch its own files through `/api/v1/gym/access/logs`, but no dashboard page uses it
+yet.) The first summary line appears an hour after the app starts.
+`[CODE: app/core/log_sync_request_poller.py, app/core/log_uploader.py; dashboard
+config-nav-dashboard.tsx; backend AccessLogGymController]`
 
 To switch one device to enforce, its `deviceCapabilities` JSON must contain
 `"totpRosterCheckMode": "enforce"` (guide §3.1b). No dashboard field edits that JSON yet.
