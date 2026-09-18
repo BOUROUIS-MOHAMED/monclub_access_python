@@ -97,6 +97,7 @@ class _Harness:
         app._sync_rerun_requested = False
         app._last_tick_device_reconcile_mono = None
         app._ultra_defer_until_mono = None
+        app._sync_rerun_after_id = None
         app._last_sync_at = None
         app._last_sync_ok = False
         app._last_sync_error = None
@@ -634,3 +635,71 @@ def test_no_deferral_recorded_when_no_worker_was_deferred(harness) -> None:
     MainApp._defer_ultra_reconnects(harness.app, trigger_source="SYNC_NOW_API", duration_sec=20.0)
 
     assert harness.app._ultra_defer_until_mono is None
+
+
+
+# ── Second review (2026-09-18): the delayed re-run must not lose an explicit sync ───
+
+
+def _rerun_ticks(harness: _Harness) -> List[Tuple[float, Any]]:
+    return [
+        (delay, cb) for delay, cb in harness.pending_callbacks()
+        if _is_sync_tick(cb, harness.app) and delay < 1000
+    ]
+
+
+def test_an_explicit_rerun_is_not_delayed_by_the_ultra_deferral(harness) -> None:
+    harness.tick()
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"reason": "user-sync"})
+    time.sleep(0.06)
+    harness.run_due()
+    harness.app._ultra_defer_until_mono = time.monotonic() + 20.0
+
+    _succeed(harness)
+
+    reruns = _rerun_ticks(harness)
+    assert len(reruns) == 1 and reruns[0][0] <= 0.1
+
+
+def test_a_request_during_the_rerun_wait_leaves_no_stale_tick(harness) -> None:
+    """Reviewer scenario: while an automatic re-run waits out the deferral, a new request
+    starts a sync at once; the delayed tick is then stale and must not fire as a TIMER sync."""
+    harness.tick()
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"n": 1})
+    time.sleep(0.06)
+    harness.run_due()
+    harness.app._ultra_defer_until_mono = time.monotonic() + 20.0
+    _succeed(harness)
+    assert len(_rerun_ticks(harness)) == 1  # the delayed re-run, ~25 s out
+
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"n": 2})
+    time.sleep(0.06)
+    harness.run_due()
+
+    assert len(_CapturedThread.started) == 1
+    assert harness.resolved[-1].trigger_hint == {"n": 2}
+    assert _rerun_ticks(harness) == []  # the stale re-run was cancelled
+
+
+def test_an_automatic_request_does_not_replace_a_waiting_explicit_one(harness) -> None:
+    harness.tick()  # a sync is running
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"reason": "user-sync"})
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"entityId": 7})
+    MainApp.request_sync_now(harness.app, trigger_source="FAST_PATCH_BUNDLE", trigger_hint={"reason": "fast_patch_bundle"})
+
+    assert harness.app._pending_sync_context.trigger_hint == {"reason": "user-sync"}
+
+    time.sleep(0.06)
+    harness.run_due()
+    _succeed(harness)
+    harness.run_due()
+    assert harness.resolved[-1].trigger_hint == {"reason": "user-sync"}
+
+
+def test_an_explicit_request_replaces_a_waiting_automatic_one(harness) -> None:
+    harness.tick()
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"entityId": 7})
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", run_type="HARD_RESET",
+                             trigger_hint={"hardReset": True})
+
+    assert harness.app._pending_sync_context.run_type == "HARD_RESET"

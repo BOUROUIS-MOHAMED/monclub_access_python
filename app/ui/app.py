@@ -630,6 +630,8 @@ class MainApp:
         self._last_tick_device_reconcile_mono: float | None = None
         # monotonic time the last ULTRA reconnect deferral (_defer_ultra_reconnects) ends
         self._ultra_defer_until_mono: float | None = None
+        # after() id of a delayed re-run tick; cancelled once any tick starts a sync
+        self._sync_rerun_after_id: int | None = None
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -2407,18 +2409,24 @@ class MainApp:
         normalized_run_type = str(run_type or "TRIGGERED").strip().upper()
         normalized_trigger_source = str(trigger_source or "SYNC_NOW_API").strip().upper()
         normalized_trigger_hint = dict(trigger_hint) if isinstance(trigger_hint, dict) else None
-        preserve_pending = (
-            self._pending_sync_context is not None
-            and normalized_run_type == "TRIGGERED"
-            and normalized_trigger_source == "SYNC_NOW_API"
-            and normalized_trigger_hint is None
+        requested = SyncTriggerContext(
+            run_type=normalized_run_type,
+            trigger_source=normalized_trigger_source,
+            trigger_hint=normalized_trigger_hint,
+        )
+        pending = self._pending_sync_context
+        preserve_pending = pending is not None and (
+            (
+                normalized_run_type == "TRIGGERED"
+                and normalized_trigger_source == "SYNC_NOW_API"
+                and normalized_trigger_hint is None
+            )
+            # A waiting explicit sync (Sync data, hard reset, daily) is a full sync that also
+            # pushes in manual mode; an automatic request must not replace it and drop it.
+            or (is_explicit_user_sync(pending) and not is_explicit_user_sync(requested))
         )
         if not preserve_pending:
-            self._pending_sync_context = SyncTriggerContext(
-                run_type=normalized_run_type,
-                trigger_source=normalized_trigger_source,
-                trigger_hint=normalized_trigger_hint,
-            )
+            self._pending_sync_context = requested
         self.after(50, self._sync_tick)
 
     def reschedule_sync_timer(self, *, after_failure: bool = False):
@@ -2509,7 +2517,12 @@ class MainApp:
             return
         if rerun and self._pending_sync_context is not None:
             delay = 0.0
-            if self._ultra_defer_until_mono is not None:
+            # Only automatic re-runs wait out the deferral: those are what arrive in streams
+            # (per-edit dispatch, change detector). An explicit one runs at once.
+            if (
+                self._ultra_defer_until_mono is not None
+                and not is_explicit_user_sync(self._pending_sync_context)
+            ):
                 delay = max(
                     0.0,
                     self._ultra_defer_until_mono + _RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC - time.monotonic(),
@@ -2519,7 +2532,13 @@ class MainApp:
                 delay,
                 self._pending_sync_context.trigger_source,
             )
-            self.after(int(delay * 1000), self._sync_tick)
+            self._cancel_pending_rerun()
+            self._sync_rerun_after_id = self.after(int(delay * 1000), self._sync_tick)
+
+    def _cancel_pending_rerun(self):
+        if self._sync_rerun_after_id is not None:
+            self.after_cancel(self._sync_rerun_after_id)
+            self._sync_rerun_after_id = None
 
     def _sync_tick(self):
         self.reschedule_sync_timer()
@@ -2548,6 +2567,8 @@ class MainApp:
             startup_pending=self._startup_sync_pending,
         )
         self._pending_sync_context = None
+        # This sync serves the pending request; a delayed re-run queued for it is now stale.
+        self._cancel_pending_rerun()
         # Timer ticks start at least one healthy interval apart, so the reconcile gate
         # (_offline_device_reconcile_due) compares tick start times, not dispatch times.
         tick_started_mono = time.monotonic()

@@ -83,6 +83,28 @@ class TestChangeDetectorSubsequentPolls:
 
         mock_app.after.assert_called_once_with(0, mock_app.request_sync_now)
         assert svc._last_known_version == _DT2  # updated to newer datetime
+        assert mock_app._pending_sync_context.trigger_source == "CHANGE_DETECTOR"
+
+    def test_a_waiting_explicit_sync_is_not_replaced(self, mock_app, mock_logger):
+        from app.core.sync_observability import SyncTriggerContext
+
+        click = SyncTriggerContext(
+            run_type="TRIGGERED", trigger_source="SYNC_NOW_API", trigger_hint={"reason": "user-sync"},
+        )
+        mock_app._pending_sync_context = click
+        svc = make_service(mock_app, mock_logger)
+        svc._last_known_version = _DT1
+
+        with patch("app.core.change_detector._requests") as mock_requests:
+            mock_requests.RequestException = Exception
+            mock_requests.get.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {"gymId": 42, "lastModifiedAt": _V2},
+            )
+            svc._poll_once()
+
+        assert mock_app._pending_sync_context is click
+        mock_app.after.assert_called_once_with(0, mock_app.request_sync_now)
 
 
 class TestChangeDetectorAuth:

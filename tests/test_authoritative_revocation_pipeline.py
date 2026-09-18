@@ -641,6 +641,7 @@ def _run_main_sync_dispatch(
         after=MagicMock(),
         evaluate_access_and_redirect=MagicMock(),
         reschedule_sync_timer=MagicMock(),
+        _cancel_pending_rerun=MagicMock(),
         _api=lambda: api,
         _defer_ultra_reconnects=MagicMock(return_value=0),
         _apply_member_shadow_sync=shadow_sync,

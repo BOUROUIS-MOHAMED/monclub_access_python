@@ -40,7 +40,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
-| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
+| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -1079,10 +1079,23 @@ The re-run does not start inside the previous sync's ULTRA reconnect deferral: a
 `SYNC_NOW_API` / `CHANGE_DETECTOR` / `FAST_PATCH_BUNDLE` sync defers a *disconnected* ULTRA
 worker's reconnect by 20 s (`_defer_ultra_reconnects`), and back-to-back re-runs during a stream
 of dashboard edits would re-defer it for the whole stream — no PC-side RTLog or QR/TOTP rescue at
-that terminal meanwhile. So the re-run waits until `_ultra_defer_until_mono` +
+that terminal meanwhile. So an *automatic* re-run waits until `_ultra_defer_until_mono` +
 `_RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC` (5 s; the worker re-checks its connect deadline at least
-once a second). A new request arriving in that gap still starts a sync at once, as before this
-change. `[TEST: ::test_a_rerun_waits_for_the_previous_syncs_ultra_reconnect_deferral,
+once a second). An explicit one (`is_explicit_user_sync`: Sync data, hard reset, daily) runs at
+once — those do not come in streams. A request arriving during the wait starts a sync at once
+with the latest context, and the waiting re-run tick (`_sync_rerun_after_id`) is cancelled as
+soon as any tick starts a sync, so it cannot fire later as a stray TIMER sync.
+
+**A waiting explicit sync is never replaced by an automatic request.** `_pending_sync_context`
+is one slot; `request_sync_now` and the change detector (`change_detector.py::_poll_once`, which
+writes the slot from its own thread) keep a pending explicit context when the new request is
+automatic — otherwise a per-edit dispatch landing after a "Sync data" click would silently turn
+the click's full sync (which also pushes in manual-sync mode) into an automatic one. Among
+automatic requests, and among explicit ones, the latest still wins. `[TEST:
+::test_an_automatic_request_does_not_replace_a_waiting_explicit_one,
+::test_a_request_during_the_rerun_wait_leaves_no_stale_tick,
+::test_an_explicit_rerun_is_not_delayed_by_the_ultra_deferral;
+test_change_detector.py::test_a_waiting_explicit_sync_is_not_replaced]` `[TEST: ::test_a_rerun_waits_for_the_previous_syncs_ultra_reconnect_deferral,
 ::test_a_rerun_after_an_expired_deferral_starts_at_once]` `[UNVERIFIED]` Field delta-sync
 durations and edit rates; the starvation regime was shown with a simulation, not on hardware.
 `[TEST: ::test_a_request_during_a_running_sync_reruns_when_it_finishes,
@@ -1097,8 +1110,15 @@ max(healthy interval, `_OFFLINE_RECONCILE_MIN_INTERVAL_SEC` = 600 s) ago
 (`_last_tick_device_reconcile_mono`). Timer ticks start one interval apart, so with the default
 30 min interval a failure on the next healthy tick still reconciles exactly as before. Explicit
 syncs (`is_explicit_user_sync`) and every successful tick are unchanged. During an outage the
-panels therefore see at most min(healthy rate, 6/h) — 2/h at 30 min, 6/h at 1–10 min — never
-more than the old code's outage cadence (1800 s once, then ~600 s). (A healthy tick with no
+panels therefore see at most min(healthy rate, 6/h), never more than the old code's outage
+cadence (1800 s once, then ~600 s); simulated steady outage rates were 6.0/h at 1–2 min, 4.8/h at
+5–10 min, 3.4/h at 15 min, ~2/h at 30 min. The flip side, a behaviour change: at a 30 min interval
+the cached-roster reconcile runs every ~30 min during an outage instead of every ~10 min, and at
+1–5 min the first outage reconcile comes ~11–14 min after the last one instead of on the next
+tick. Anything that only a reconcile applies — e.g. a `VALID_ONLY` panel dropping a member whose
+membership expired while offline (`device_sync.py`, policy handling) — is correspondingly later
+during an outage, at the healthy cadence rather than faster than it. `[UNVERIFIED]` whether any
+gym relies on the old faster offline cadence. (A healthy tick with no
 member delta already runs this same full reconcile, so a short interval means that load anyway
 while online.) AGENT and ULTRA
 devices, ZK_STANDALONE terminals, RTLog and QR/TOTP rescue get no device I/O from a failed tick.
@@ -1449,7 +1469,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1841 passed** (2026-09-18,
+background-thread exceptions are promoted to failures. Last run: **1846 passed** (2026-09-18,
 branch `claude/access-loop-retry-fixes`: §3.6 loop and sync timer, §3.7 optional content; with
 the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
 Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). `[TEST]`
