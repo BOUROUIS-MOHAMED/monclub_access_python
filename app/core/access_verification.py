@@ -142,6 +142,7 @@ ROSTER_IN = "in_roster"            # a granted membership is on the PC's member 
 ROSTER_IN_BY_ACCOUNT = "in_roster_by_account"  # no grant listed, but the same account is
 ROSTER_NOT_IN = "not_in_roster"    # neither: the member was removed from the list
 ROSTER_UNEVALUABLE = "roster_empty"  # the PC's member list is empty: nothing to check
+ROSTER_BEHIND = "roster_behind"   # not listed, but the list is older than the matching index
 
 
 # (member-list object, its main account ids). The ULTRA member list is a long-lived,
@@ -195,6 +196,7 @@ ROSTER_REFUSED = "refused"
 _roster_counts_lock = threading.Lock()
 _roster_counts: Dict[str, int] = {
     ROSTER_IN: 0, ROSTER_IN_BY_ACCOUNT: 0, ROSTER_NOT_IN: 0, ROSTER_UNEVALUABLE: 0,
+    ROSTER_BEHIND: 0,
     ROSTER_REFUSED: 0,
 }
 _roster_counts_since = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -214,7 +216,9 @@ def record_totp_roster_check(result: Any, *, source: str = "") -> None:
     """
     try:
         verdict = result.get("rosterCheck") if isinstance(result, dict) else None
-        if verdict not in (ROSTER_IN, ROSTER_IN_BY_ACCOUNT, ROSTER_NOT_IN, ROSTER_UNEVALUABLE):
+        if verdict not in (
+            ROSTER_IN, ROSTER_IN_BY_ACCOUNT, ROSTER_NOT_IN, ROSTER_UNEVALUABLE, ROSTER_BEHIND,
+        ):
             return
         allowed = bool(result.get("allowed"))
         with _roster_counts_lock:
@@ -233,7 +237,8 @@ def record_totp_roster_check(result: Any, *, source: str = "") -> None:
 
 def totp_roster_check_counts() -> Dict[str, Any]:
     """Counts since this process started:
-    ``{since, in_roster, in_roster_by_account, not_in_roster, roster_empty, refused}``."""
+    ``{since, in_roster, in_roster_by_account, not_in_roster, roster_empty, roster_behind,
+    refused}``."""
     with _roster_counts_lock:
         out: Dict[str, Any] = dict(_roster_counts)
     out["since"] = _roster_counts_since
@@ -256,7 +261,8 @@ def maybe_log_totp_roster_summary(*, now_mono: Optional[float] = None) -> bool:
             "QR_ROSTER_SUMMARY", since=_roster_counts_since,
             in_roster=counts[ROSTER_IN], in_roster_by_account=counts[ROSTER_IN_BY_ACCOUNT],
             not_in_roster=counts[ROSTER_NOT_IN],
-            roster_empty=counts[ROSTER_UNEVALUABLE], refused=counts[ROSTER_REFUSED],
+            roster_empty=counts[ROSTER_UNEVALUABLE], roster_behind=counts[ROSTER_BEHIND],
+            refused=counts[ROSTER_REFUSED],
         )
         return True
     except Exception:
@@ -527,6 +533,7 @@ def verify_totp(
     users_by_card: Dict[str, List[Dict[str, Any]]],
     now_unix: Optional[float] = None,
     totp_index: Optional[Dict[str, Any]] = None,
+    roster_current: bool = True,
 ) -> Dict[str, Any]:
     """Validate a scanned QR/TOTP string.
 
@@ -729,6 +736,11 @@ def verify_totp(
             # keeps the old id here. The same main account on a listed row is the
             # same person with a valid membership (account<->user is 1:1).
             roster_check = ROSTER_IN_BY_ACCOUNT
+        elif not roster_current:
+            # The caller's member list is older than the credentials that matched
+            # (ULTRA: a newer shared index, no list as new): the member may simply
+            # be newer than the list. Never refused.
+            roster_check = ROSTER_BEHIND
         else:
             roster_check = ROSTER_NOT_IN
         roster_mode = totp_roster_check_mode(settings)
@@ -790,6 +802,7 @@ def verify_totp_resilient(
     users_by_card: Dict[str, List[Dict[str, Any]]],
     scan_epoch: Optional[float] = None,
     totp_index: Optional[Dict[str, Any]] = None,
+    roster_current: bool = True,
 ) -> Dict[str, Any]:
     """Validate a QR/TOTP code resiliently against unreliable clocks.
 
@@ -813,7 +826,7 @@ def verify_totp_resilient(
     primary = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=now_unix,
-        totp_index=totp_index,
+        totp_index=totp_index, roster_current=roster_current,
     )
     primary_clock = "scan" if now_unix is not None else "wall"
     # A roster refusal already matched a credential: the retry exists for clock skew
@@ -832,7 +845,7 @@ def verify_totp_resilient(
     fallback = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
-        totp_index=totp_index,
+        totp_index=totp_index, roster_current=roster_current,
     )
     # Allowed on the wall clock -- or refused there by the roster check, which means
     # the code DID match a credential: report that verdict (and let it be counted),

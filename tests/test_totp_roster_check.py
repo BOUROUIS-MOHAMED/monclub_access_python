@@ -257,10 +257,11 @@ def test_mode_parsing_is_trial_unless_exactly_enforce(raw, expected):
 # ---------------------------------------------------------------------------
 
 def _counts_delta(before, after):
-    return {k: after[k] - before[k] for k in (av.ROSTER_IN, av.ROSTER_NOT_IN, av.ROSTER_UNEVALUABLE)}
+    return {k: after[k] - before[k]
+            for k in (av.ROSTER_IN, av.ROSTER_NOT_IN, av.ROSTER_UNEVALUABLE, av.ROSTER_BEHIND)}
 
 
-_NO_CHANGE = {av.ROSTER_IN: 0, av.ROSTER_NOT_IN: 0, av.ROSTER_UNEVALUABLE: 0}
+_NO_CHANGE = {av.ROSTER_IN: 0, av.ROSTER_NOT_IN: 0, av.ROSTER_UNEVALUABLE: 0, av.ROSTER_BEHIND: 0}
 
 
 def test_verify_totp_itself_counts_nothing(world):
@@ -316,7 +317,8 @@ def test_the_summary_line_is_logged_at_most_once_per_interval():
     tel.assert_called_once()
     assert tel.call_args.args[0] == "QR_ROSTER_SUMMARY"
     assert set(tel.call_args.kwargs) == {
-        "since", "in_roster", "in_roster_by_account", "not_in_roster", "roster_empty", "refused"}
+        "since", "in_roster", "in_roster_by_account", "not_in_roster", "roster_empty",
+        "roster_behind", "refused"}
 
 
 def test_a_card_result_is_not_counted():
@@ -377,13 +379,13 @@ def test_ultra_rescue_of_a_listed_member_opens_in_enforce(world):
     assert rec.allowed is True and rec.reason == "ALLOW"
 
 
-@pytest.mark.parametrize("shared_gen, opens", [(6, True), (5, False)])
-def test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new(shared_gen, opens):
+@pytest.mark.parametrize("shared_gen, verdict", [(6, "in_roster"), (5, "roster_behind")])
+def test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new(shared_gen, verdict):
     # The shared index is accepted when its generation is >= the worker's own, so it
     # can carry a credential for a member added after this worker's member list was
     # loaded. The roster check must then use the process-wide member list (published
-    # before the index is built from it) -- or a brand-new member is refused in
-    # enforce mode and inflates the trial count.
+    # before the index is built from it). With no list as new as the index, the
+    # verdict is roster_behind -- never a refusal of a member newer than the list.
     import app.core.ultra_engine as _ue
     rng = random.Random(11)
     member, newbie = _cred(1, [101], rng), _cred(9, [505], rng)
@@ -395,21 +397,25 @@ def test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new(shared
     worker._get_cached_local_state = MagicMock(return_value=old_state)
     _ue._set_shared_totp_index(av.build_totp_index(new_state[0], s, time.time(), margin=1), 6)
     _ue._set_shared_local_state(new_state if shared_gen == 6 else old_state, shared_gen)
+    before = av.totp_roster_check_counts()
     try:
         rec = _ultra_scan(worker, _code_for(newbie, s, time.time()))
     finally:
         _ue._set_shared_totp_index(None, -1)
         _ue._set_shared_local_state(None, -1)
-    assert worker._sdk.open_door.called is opens
-    assert rec.allowed is opens
+    assert worker._sdk.open_door.called is True
+    assert rec.allowed is True
+    key = {"in_roster": av.ROSTER_IN, "roster_behind": av.ROSTER_BEHIND}[verdict]
+    assert _counts_delta(before, av.totp_roster_check_counts())[key] == 1
 
 
-@pytest.mark.parametrize("who, opens", [("removed", False), ("member", True)])
-def test_ultra_never_adopts_an_empty_shared_member_list(world, who, opens):
+@pytest.mark.parametrize("who", ["removed", "member"])
+def test_ultra_never_adopts_an_empty_shared_member_list(world, who):
     # Another worker's refresh read the credentials but failed the users query:
     # load_local_state returned (creds, {}, {}) and it was published at gen 6 with the
-    # index. Adopting that empty list would lose the member's name and turn an enforce
-    # refusal into roster_empty (open). The worker keeps its own list.
+    # index. Adopting that empty list would lose the member's name from popup and
+    # history. The worker keeps its own list -- which is older than the index, so a
+    # "not listed" code is roster_behind: never refused, never roster_empty.
     import app.core.ultra_engine as _ue
     creds, users_by_am, member, removed, _s = world
     s = {**_settings(), "totp_roster_check_mode": "enforce"}
@@ -426,10 +432,46 @@ def test_ultra_never_adopts_an_empty_shared_member_list(world, who, opens):
     finally:
         _ue._set_shared_totp_index(None, -1)
         _ue._set_shared_local_state(None, -1)
-    assert worker._sdk.open_door.called is opens
-    assert _counts_delta(before, av.totp_roster_check_counts())[av.ROSTER_UNEVALUABLE] == 0
+    assert worker._sdk.open_door.called is True
+    delta = _counts_delta(before, av.totp_roster_check_counts())
+    assert delta[av.ROSTER_UNEVALUABLE] == 0
     if who == "member":
-        assert req.user_full_name == "M101"
+        assert req.user_full_name == "M101" and delta[av.ROSTER_IN] == 1
+    else:
+        assert delta[av.ROSTER_BEHIND] == 1
+
+
+def test_the_shared_member_list_never_goes_back_a_generation():
+    # A refresh whose slow load straddled a sync commit publishes an OLDER list after a
+    # newer one; the shared index already refuses that, the member list must too.
+    import app.core.ultra_engine as _ue
+    try:
+        _ue._set_shared_local_state(("new",), 6)
+        _ue._set_shared_local_state(("old",), 5)
+        assert _ue._get_shared_local_state() == (("new",), 6)
+        _ue._set_shared_local_state(("same-gen",), 6)
+        assert _ue._get_shared_local_state() == (("same-gen",), 6)
+        _ue._set_shared_local_state(None, -1)  # a clear is always allowed
+        assert _ue._get_shared_local_state() == (None, -1)
+    finally:
+        _ue._set_shared_local_state(None, -1)
+
+
+@pytest.mark.parametrize("mode", ["trial", "enforce"])
+def test_a_list_older_than_the_credentials_never_refuses(world, mode):
+    creds, users_by_am, member, removed, _s = world
+    s = _settings(totp_roster_check_mode=mode)
+    now = time.time()
+    idx = av.build_totp_index(creds, s, now, margin=1)
+    for use_idx in (None, idx):
+        r = av.verify_totp(scanned=_code_for(removed, s, now), settings=s, creds_payload=creds,
+                           users_by_am=users_by_am, users_by_card={}, now_unix=now,
+                           totp_index=use_idx, roster_current=False)
+        assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_BEHIND
+        r = av.verify_totp(scanned=_code_for(member, s, now), settings=s, creds_payload=creds,
+                           users_by_am=users_by_am, users_by_card={}, now_unix=now,
+                           totp_index=use_idx, roster_current=False)
+        assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_IN
 
 
 # ---------------------------------------------------------------------------

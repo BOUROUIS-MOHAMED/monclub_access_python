@@ -419,6 +419,7 @@ grep -F "[T] QR_ROSTER_CHECK" app-*.log
 | `in_roster_by_account` | QR scans whose cached membership id is out of date (e.g. a renewal) but whose account is on the list — never refused |
 | `not_in_roster` | QR scans whose membership is **not** on the list — the would-be refusals in trial |
 | `roster_empty` | QR scans checked while the PC's list was empty — never refused, in any mode |
+| `roster_behind` | QR scans not on the list, but the list was older than the codes being checked (a refresh was catching up) — never refused |
 | `refused` | QR scans actually refused (only in enforce mode) |
 | `since` | when the counts started — they restart with the app |
 

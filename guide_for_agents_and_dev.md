@@ -255,6 +255,7 @@ index-equals-loop contract. Every matched QR result now carries `rosterCheck` an
 | `in_roster_by_account` | no grant is listed, but a listed row carries the credential's `accountId` as `mainAccountId` | allow (counted) | allow (counted) |
 | `not_in_roster` | neither | allow (counted) | **deny** `DENY_NOT_IN_LOCAL_ROSTER`, `user=None` |
 | `roster_empty` | the member list is empty | allow (counted) | allow (counted) |
+| `roster_behind` | not listed, but the list checked is older than the credential index that matched (ULTRA only) | allow (counted) | allow (counted) |
 
 Only the new fields change on an allow: `activeMembershipId` and `user` are resolved exactly as
 before. `roster_empty` exists because an empty list cannot be told apart from a failed read:
@@ -314,13 +315,20 @@ the worker's own, so the index can carry a credential for a member added after t
 member list was loaded. `_handle_totp_rescue` then checks against the process-wide member list
 (`_get_shared_local_state`) when it is at least as new as the index — it is published by the
 refresh that the index is later built from. Without it, a brand-new member would read as
-`not_in_roster`: a false count in trial, a refusal in enforce. If the shared list is older
-than the index (a slower refresh overwrote it), or **empty** — a refresh whose users query
-failed still publishes `(creds, {}, {})` — the worker's own list is used: adopting an empty one
-would drop member names from the popup and history and turn an enforce refusal into
-`roster_empty`. `[CODE: ultra_engine.py::_handle_totp_rescue]`
+`not_in_roster`: a false count in trial, a refusal in enforce. The shared list is published
+**monotonically**, like the index: a refresh whose slow load straddled a sync commit cannot put
+an older list back over a newer one (`_set_shared_local_state` ignores a lower generation; a
+clear is always allowed). An **empty** shared list is never adopted — a refresh whose users
+query failed still publishes `(creds, {}, {})`, and adopting it would drop member names from the
+popup and history. When no non-empty list at least as new as the index exists, the worker checks
+its own (older) list and passes `roster_current=False`: a "not listed" code is then
+`roster_behind` — counted, **never refused** — because the member may simply be newer than the
+list. `[CODE: ultra_engine.py::_handle_totp_rescue, ::_set_shared_local_state;
+access_verification.py::verify_totp]`
 `[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new,
-::test_ultra_never_adopts_an_empty_shared_member_list]`
+::test_ultra_never_adopts_an_empty_shared_member_list,
+::test_the_shared_member_list_never_goes_back_a_generation,
+::test_a_list_older_than_the_credentials_never_refuses]`
 
 **Counting.** `verify_totp` stays pure — `verify_totp_resilient` calls it twice on the denial
 path (scan clock, then wall clock) and tests call it freely. Each engine records the **final**
@@ -1880,7 +1888,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller's deadline, **not executed** (§3.1a) |
 | `SYNC_DOOR_YIELD` | `ultra_engine.py::_sync_yield_to_doors` | `worker opened expired` — operator opens drained between push chunks; `opened` = sent to the device (whatever it answered), `expired` = skipped. `expired` added 2026-09-18; before, `opened` counted every queued entry (§3.1a) |
 | `QR_ROSTER_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict mode allowed` — one per QR scan whose verdict is not `in_roster`; no member id, name or credential (§3.1b) |
-| `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty refused` — running totals since the process started, at most once an hour (§3.1b) |
+| `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty roster_behind refused` — running totals since the process started, at most once an hour (§3.1b) |
 
 `[TEST: test_door_open_deadline.py::test_an_expired_open_is_reported_expired_and_releases_its_waiter;
 test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identity,

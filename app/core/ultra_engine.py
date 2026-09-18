@@ -308,10 +308,18 @@ def _get_shared_local_state():
 
 
 def _set_shared_local_state(value, gen) -> None:
+    """Publish the process-wide member snapshot. MONOTONIC like the TOTP index: a
+    refresh whose slow load finished after a newer one must not put an older list
+    back (the QR roster check compares it with the index, guide §3.1b). A clear
+    (value=None) is always allowed."""
     try:
+        g = int(gen)
         with _SHARED_LOCAL_STATE_LOCK:
+            if value is not None and _SHARED_LOCAL_STATE["value"] is not None \
+                    and g < int(_SHARED_LOCAL_STATE["gen"]):
+                return
             _SHARED_LOCAL_STATE["value"] = value
-            _SHARED_LOCAL_STATE["gen"] = int(gen)
+            _SHARED_LOCAL_STATE["gen"] = g
     except Exception:
         pass
 
@@ -4394,6 +4402,7 @@ class UltraDeviceWorker(threading.Thread):
         # Never adopt an EMPTY shared list: load_local_state turns a failed users read
         # into [] and the refresh still publishes it, so an empty list there says
         # nothing about the members -- keeping our own list keeps names and the check.
+        roster_gen = self._cached_state_gen
         if totp_index is not None and _idx_gen > self._cached_state_gen:
             _shared, _shared_gen = _get_shared_local_state()
             if (
@@ -4403,6 +4412,11 @@ class UltraDeviceWorker(threading.Thread):
                 and _shared[1]
             ):
                 users_by_am = _shared[1]
+                roster_gen = _shared_gen
+        # No list at least as new as the index (e.g. the newest refresh failed its
+        # users read): a "not listed" verdict could be a member newer than the list,
+        # so it is recorded as roster_behind and never refused.
+        roster_current = totp_index is None or roster_gen >= _idx_gen
 
         t0 = time.monotonic()
         result = verify_totp_resilient(
@@ -4413,6 +4427,7 @@ class UltraDeviceWorker(threading.Thread):
             users_by_card=users_by_card,
             scan_epoch=scan_epoch,
             totp_index=totp_index,
+            roster_current=roster_current,
         )
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
