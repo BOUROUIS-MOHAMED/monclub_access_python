@@ -170,6 +170,7 @@ grep -F "[T] ZKEM_PUSH_FAILED_PINS" app-*.log
 | `finger_remove_exception_fN` | removal of tracked vacated slot **N** raised; revocation is unconfirmed |
 | `exception:<Type>` | the push raised part-way through that member |
 | `chunk_wedged_or_unconfirmed` | the whole chunk wedged; nothing in it was confirmed |
+| `not_attempted` | the push stopped early (3 wedges or a failed reconnect) before this member's chunk was sent — nothing was written |
 
 A pin absent from every `ZKEM_PUSH_FAILED_PINS` line, in a push whose `ZKEM_PUSH_DONE`
 says `ok=True`, was pushed. `[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`

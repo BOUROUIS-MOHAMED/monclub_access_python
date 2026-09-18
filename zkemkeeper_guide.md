@@ -682,13 +682,25 @@ the wedge handler that abort the remaining roster: `[CODE]`
 The `continue` is reached **only when none of those fire**. `consecutive_wedges` resets
 to 0 after any successful chunk.
 
+**Every chunk a `break` leaves unsent is named in `failed_pins` (2026-09-18, P3a-2).**
+Before, those pins were simply absent from `failed_pins`, so the engine recorded them
+`ok=True` — `ownership_confirmed=1` plus a stored hash for a member never written: skipped
+as "unchanged" forever, and a revoke-pass delete candidate on a shared terminal. Each
+`break` now appends every pin of the remaining chunks (reason `not_attempted`, counted in
+the aggregate's `not_attempted` and on `ZKEM_PUSH_DONE`). The engine adds a second rail:
+`_standalone_failed_pins_from_result` treats a result whose confirmed pins outnumber
+`pushed + skipped_pin` as ambiguous and confirms none of them. `[CODE: push_roster
+mark_not_attempted; ultra_engine.py::_standalone_failed_pins_from_result]`
+`[TEST: test_push_roster_unattempted_pins.py]`
+
 > The comment claiming a wedged chunk simply carries on is `[COMMENT]` and is
 > **incomplete** as written. Do not restate it.
 
 ### Result dict
 
 Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedged`,
-`errors`, **`failed_pins`**, and **`del_attempted` / `del_ok`** (added 2026-09-05).
+`errors`, **`failed_pins`**, **`del_attempted` / `del_ok`** (added 2026-09-05), and
+**`not_attempted`** (added 2026-09-18: pins of chunks never sent after a `break`).
 `[CODE]`
 
 `del_attempted` counts every `SSR_DelUserTmpExt` issued — both the delete-before-write
@@ -709,8 +721,11 @@ They are not present on the aggregate `push_roster` return. `[CODE]`
 
 - **`failed_pins`** (added 2026-08-31) — every pin **not confirmed** on the terminal:
   a refused `SSR_SetUserInfo`, a refused template (`SetUserTmpExStr` → `False`), an
-  exception mid-member, a refused/raised caller-requested vacated-slot clear, and
-  **every member of a wedged chunk** (nothing in a wedged chunk came back confirmed).
+  exception mid-member, a refused/raised caller-requested vacated-slot clear,
+  **every member of a wedged chunk** (nothing in a wedged chunk came back confirmed),
+  and — since 2026-09-18 — **every member of a chunk never sent** because the loop
+  stopped at one of its three `break`s (reason `not_attempted`). Until then this claim
+  was false for those chunks.
   Deduplicated — a member with two refused fingers is one entry. The engine uses it to
   mark only those pins as needing retry; a driver that
   omits the key, or reports `ok=False` with an empty list, is read conservatively as

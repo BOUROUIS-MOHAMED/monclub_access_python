@@ -1897,7 +1897,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 
 `ZKEM_PUSH_FAILED_PINS` reasons: `set_user_info_false`, `template_refused_f<N>`,
 `finger_remove_false_f<N>`, `finger_remove_exception_f<N>`, `exception:<Type>`,
-`chunk_wedged_or_unconfirmed`. `[CODE: _do_push_roster]`
+`chunk_wedged_or_unconfirmed`, and `not_attempted` (a chunk never sent because the loop
+stopped early, added 2026-09-18). `[CODE: _do_push_roster, push_roster]`
 
 ### 10.2a Door queue and QR roster check (added 2026-09-18)
 

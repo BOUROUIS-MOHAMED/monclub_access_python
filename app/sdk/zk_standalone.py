@@ -688,6 +688,20 @@ class ZKStandaloneDevice:
                 return "?"
             return f"{part[0].get('pin')}..{part[-1].get('pin')}"
 
+        def mark_not_attempted(remaining: List[List[Dict[str, Any]]]) -> None:
+            # The loop is about to stop with these chunks never sent. Before P3a-2
+            # their pins were simply absent from failed_pins, so the engine recorded
+            # them ok=True: ownership_confirmed=1 and a stored hash for a member that
+            # was never written -- skipped as "unchanged" forever, and a revoke-pass
+            # delete candidate on a terminal shared with another system.
+            for _part in remaining:
+                for _u in _part:
+                    _p = str(_u.get("pin") or "").strip()
+                    if _p and _p not in agg["failed_pins"]:
+                        agg["failed_pins"].append(_p)
+                        agg["not_attempted"] += 1
+                        agg_failed_reasons.setdefault(_p, "not_attempted")
+
         agg: Dict[str, Any] = {"ok": True, "pushed": 0, "failed": 0,
                                "templates_failed": 0, "skipped_pin": 0,
                                # Slot clears issued vs confirmed by the terminal.
@@ -696,9 +710,12 @@ class ZKStandaloneDevice:
                                "del_attempted": 0, "del_ok": 0,
                                "chunks_wedged": 0, "errors": [],
                                # Every pin NOT confirmed on the terminal: per-member
-                               # failures reported by the chunk, plus every member of
-                               # a chunk that wedged (none of those were confirmed).
-                               "failed_pins": []}
+                               # failures reported by the chunk, every member of a
+                               # chunk that wedged (none of those were confirmed), and
+                               # every member of a chunk never sent because the loop
+                               # stopped early (the three `break`s below).
+                               "failed_pins": [],
+                               "not_attempted": 0}
         # Telemetry-only accumulators (never read by the engine).
         agg_failed_reasons: Dict[str, str] = {}
         agg_tpl_attempted = 0
@@ -791,6 +808,7 @@ class ZKStandaloneDevice:
                                   chunks=len(chunks), pushed=agg["pushed"])
                     except Exception:
                         pass
+                    mark_not_attempted(chunks[idx:])
                     break
                 # Rebuild the link before the next chunk; without this every
                 # remaining _call raises "STA thread not running".
@@ -805,6 +823,7 @@ class ZKStandaloneDevice:
                                       chunk=idx, ok=False, err="connect_falsy")
                         except Exception:
                             pass
+                        mark_not_attempted(chunks[idx:])
                         break
                 except Exception:
                     self.logger.warning(
@@ -816,6 +835,7 @@ class ZKStandaloneDevice:
                                   chunk=idx, ok=False, err="connect_raised")
                     except Exception:
                         pass
+                    mark_not_attempted(chunks[idx:])
                     break
                 try:
                     _tel.event("ZKEM_PUSH_RECONNECT", worker=self._tel_wid,
@@ -908,7 +928,8 @@ class ZKStandaloneDevice:
                        tpl_attempted=agg_tpl_attempted, tpl_ok=agg_tpl_ok,
                        tpl_failed=agg["templates_failed"],
                        op="del_user_tmp_ext",
-                       del_attempted=agg_del_attempted, del_ok=agg_del_ok)
+                       del_attempted=agg_del_attempted, del_ok=agg_del_ok,
+                       not_attempted=agg["not_attempted"] or None)
             # WHICH pins did not land, and WHY. One line, so "was pin X pushed?"
             # is a single grep. A pin with no recorded reason came from a WEDGED
             # chunk -- nothing in that chunk was confirmed -- which is itself the

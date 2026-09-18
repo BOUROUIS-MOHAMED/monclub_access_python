@@ -2087,6 +2087,18 @@ class UltraDeviceWorker(threading.Thread):
             or (not ok and not failed)
         ):
             return set(attempted)
+        # Every pin this result would CONFIRM must be one the driver says it wrote
+        # (or skipped as an invalid pin). A driver that stopped early without naming
+        # the chunks it never sent -- push_roster before P3a-2 did exactly that on
+        # its three `break` exits -- reports fewer pushed than it confirms, and those
+        # extra pins were recorded owned without ever reaching the terminal. Only an
+        # int `pushed` can prove the gap; absent it the contract above is unchanged.
+        pushed = result.get("pushed")
+        skipped = result.get("skipped_pin", 0)
+        if type(pushed) is int and pushed >= 0:
+            skipped_n = skipped if type(skipped) is int and skipped >= 0 else 0
+            if len(attempted - failed) > pushed + skipped_n:
+                return set(attempted)
         return failed
 
     def _run_standalone_full_sync(
