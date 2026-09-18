@@ -1300,10 +1300,10 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1771 passed** (with
-warnings; 2026-09-13, on master after merging the account-pin work of §3.2b–§3.2f and the §3.5
-unresolved retry bound, run with the CLAUDE.md command
-`python -m pytest tests/ -q --ignore=tests/_pydeps`; exit code 0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1771 passed**
+(2026-09-18, branch `claude/test-db-isolation`, both this command and the CLAUDE.md command
+`python -m pytest tests/ -q --ignore=tests/_pydeps`, each with `MONCLUB_ACCESS_DATA_ROOT` set
+to an empty scratch folder; exit code 0; no database created under that folder). `[TEST]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
@@ -1313,6 +1313,52 @@ unresolved retry bound, run with the CLAUDE.md command
 > `test_zk_standalone_driver.py` now also stubs `list_confirmed_device_sync_pins`, so a
 > polluted database can no longer reach it; `get_conn()` does **not** commit ad-hoc
 > writes, so clean up through `_run_db_write_sync` if you ever need to.
+
+> **No test reaches the default database any more — `tests/conftest.py` enforces it.**
+> The default data root is `C:\ProgramData\MonClub Access` (`_candidate_data_roots` in
+> `app/core/utils.py`), so with `_DB_PATH` left at `None` a test run on a gym or dev PC opens
+> the *installed* `access.db`. A per-file sweep on master (2026-09-18: each `tests/test_*.py`
+> run alone with `MONCLUB_ACCESS_DATA_ROOT` set to a fresh empty folder) found **34 of 118**
+> files creating `access/access.db` under that root. `[TEST]` The main path was a read:
+> engine and sync code reaching `get_backend_global_settings` →
+> `load_sync_access_software_settings` unpatched. A second sweep with an `sqlite3` authorizer
+> (root pre-seeded with a migrated DB, one sweep, 2026-09-18) showed which ones **write**:
+> `test_access_history_user_id`, `test_daily_counter` and `test_anti_fraud_daily_limit_integration`
+> INSERT/UPDATE/DELETE `access_history` (the committed inserts advance its `AUTOINCREMENT`
+> counter even after cleanup; cleanup runs only if the test passes), and `test_db_anti_fraud_columns`
+> INSERTs/DELETEs `sync_devices`. `test_device_sync_protocol_guard::test_pullsdk_device_is_not_refused`
+> and `test_zk_standalone_driver::…::test_full_sync_pushes_roster_and_terminates` leave rows in
+> `push_batch_history`. `test_sync_observability::test_main_app_initializes_scheduler_before_first_after`
+> runs `cleanup_stale_in_progress_sync_runs`, which commits `UPDATE sync_run_history SET
+> status='INTERRUPTED' WHERE status='IN_PROGRESS'` and would mark a running app's live sync as
+> interrupted. Those first four files also run `init_db()` from a module-scoped fixture, so they
+> applied schema migrations (DDL) to the installed database. `[TEST]` That sweep ran against an
+> *empty* migrated schema. A populated installed database could send the same tests down
+> further write paths. `[UNVERIFIED]`
+>
+> `tests/conftest.py` now points `_DB_PATH` at one empty temp file for the whole session.
+> It never calls `init_db()`, so an unpatched read of a missing table still fails loudly
+> instead of passing against an already-migrated file. That is how the 7 tests in
+> `test_access_history_unresolved_bound.py` hid an unpatched read until commit 86be8ea
+> (cherry-picked from a87830b). Two details are load-bearing. `[CODE]` **Session scope:**
+> module-scoped `init_db()` fixtures run before any function-scoped override, and the db
+> writer, sync-cache loader and popup prefetch threads outlive single tests, so the path is
+> never reverted to `None`. **Re-applied around every test:** seven fixtures call
+> `importlib.reload(app.core.db)`, which re-executes `_DB_PATH = None`. Their `monkeypatch`
+> then restores that `None` at teardown, which made every later test open the default
+> database again. Tests that need a schema still patch `_DB_PATH` to their own `tmp_path` and
+> call `init_db()`. The conftest is a safety net, not a substitute for that. After the change
+> the same sweep finds **0 of 118** files creating a database, and all 118 pass alone. `[TEST]`
+> To re-run it (expected output: nothing):
+>
+> ```bash
+> for f in tests/test_*.py; do r=$(mktemp -d); MONCLUB_ACCESS_DATA_ROOT="$r" python -m pytest "$f" -q -p no:cacheprovider >/dev/null 2>&1; find "$r" -name '*.db*' | sed "s|^|$f: |"; rm -rf "$r"; done
+> ```
+>
+> Other files still land under the data root: `test_feedback_api` and `test_scan_session_api`
+> write `access/config.json`, `tv/config.json` and `shared/install.json`, and `test_ultra_engine`
+> writes an image under `access/cache/images/`. They are not databases and were not audited here.
+> Always run the suite with `MONCLUB_ACCESS_DATA_ROOT` set to a scratch folder. `[TEST]`
 
 ```bash
 python tools/check_sql_arity.py
