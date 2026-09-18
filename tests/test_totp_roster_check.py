@@ -445,33 +445,104 @@ def test_the_shared_member_list_never_goes_back_a_generation():
     # A refresh whose slow load straddled a sync commit publishes an OLDER list after a
     # newer one; the shared index already refuses that, the member list must too.
     import app.core.ultra_engine as _ue
+    new, old, same = (["c"], {1: "n"}, {}), (["c"], {1: "o"}, {}), (["c"], {1: "s"}, {})
     try:
-        _ue._set_shared_local_state(("new",), 6)
-        _ue._set_shared_local_state(("old",), 5)
-        assert _ue._get_shared_local_state() == (("new",), 6)
-        _ue._set_shared_local_state(("same-gen",), 6)
-        assert _ue._get_shared_local_state() == (("same-gen",), 6)
+        _ue._set_shared_local_state(new, 6)
+        _ue._set_shared_local_state(old, 5)
+        assert _ue._get_shared_local_state() == (new, 6)
+        _ue._set_shared_local_state(same, 6)
+        assert _ue._get_shared_local_state() == (same, 6)
         _ue._set_shared_local_state(None, -1)  # a clear is always allowed
         assert _ue._get_shared_local_state() == (None, -1)
     finally:
         _ue._set_shared_local_state(None, -1)
 
 
+def test_an_empty_member_list_is_not_newer_information():
+    # A refresh whose users read failed publishes (creds, {}, {}) at the newest
+    # generation. An older COMPLETE list finishing afterwards may replace it -- the
+    # empty one says nothing about members -- but never the other way round.
+    import app.core.ultra_engine as _ue
+    full, empty = (["c"], {1: {"activeMembershipId": 1}}, {}), (["c"], {}, {})
+    try:
+        _ue._set_shared_local_state(empty, 6)
+        _ue._set_shared_local_state(full, 5)
+        assert _ue._get_shared_local_state() == (full, 5)
+        _ue._set_shared_local_state(full, 6)
+        _ue._set_shared_local_state(empty, 5)
+        assert _ue._get_shared_local_state() == (full, 6)
+    finally:
+        _ue._set_shared_local_state(None, -1)
+
+
+def test_a_cold_worker_that_adopts_an_empty_list_refreshes_itself():
+    # At the current generation nothing else would reload it before the 300 s TTL:
+    # every QR scan would be roster_empty (no refusal, no names) and staff cards unknown.
+    import app.core.ultra_engine as _ue
+    from app.core.db import get_local_state_generation
+    worker = _ultra_worker(_settings(), [], {})
+    worker._cached_state = None
+    gen = get_local_state_generation()
+    worker._trigger_bg_cache_refresh = MagicMock()
+    try:
+        _ue._set_shared_local_state((["c"], {}, {}), gen)
+        adopted = worker._get_cached_local_state()
+    finally:
+        _ue._set_shared_local_state(None, -1)
+    assert adopted == (["c"], {}, {})
+    worker._trigger_bg_cache_refresh.assert_called_once()
+
+
+def test_ultra_loop_fallback_keeps_a_trustworthy_refusal(world):
+    # Newer index (gen 6), empty shared list, worker at gen 5 -- but the scan is outside
+    # the index's window, so verify_totp checks the worker's OWN gen-5 credentials
+    # against its OWN gen-5 list: the refusal is trustworthy and stands in enforce.
+    import app.core.ultra_engine as _ue
+    creds, users_by_am, _m, removed, _s = world
+    s = {**_settings(), "totp_roster_check_mode": "enforce"}
+    worker = _ultra_worker(s, creds, users_by_am)
+    worker._cached_state_gen = 5
+    worker._get_cached_local_state = MagicMock(return_value=(creds, users_by_am, {}))
+    _ue._set_shared_totp_index(av.build_totp_index(creds, s, time.time() - 3600, margin=1), 6)
+    _ue._set_shared_local_state((creds, {}, {}), 6)
+    try:
+        rec = _ultra_scan(worker, _code_for(removed, s, time.time()))
+    finally:
+        _ue._set_shared_totp_index(None, -1)
+        _ue._set_shared_local_state(None, -1)
+    worker._sdk.open_door.assert_not_called()
+    assert rec.allowed is False and rec.reason == "DENY_NOT_IN_LOCAL_ROSTER"
+
+
 @pytest.mark.parametrize("mode", ["trial", "enforce"])
-def test_a_list_older_than_the_credentials_never_refuses(world, mode):
+def test_a_list_older_than_the_index_that_matched_never_refuses(world, mode):
     creds, users_by_am, member, removed, _s = world
     s = _settings(totp_roster_check_mode=mode)
     now = time.time()
     idx = av.build_totp_index(creds, s, now, margin=1)
-    for use_idx in (None, idx):
+    r = av.verify_totp(scanned=_code_for(removed, s, now), settings=s, creds_payload=creds,
+                       users_by_am=users_by_am, users_by_card={}, now_unix=now,
+                       totp_index=idx, roster_current=False)
+    assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_BEHIND
+    r = av.verify_totp(scanned=_code_for(member, s, now), settings=s, creds_payload=creds,
+                       users_by_am=users_by_am, users_by_card={}, now_unix=now,
+                       totp_index=idx, roster_current=False)
+    assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_IN
+
+
+def test_roster_current_only_qualifies_an_index_match(world):
+    # roster_current describes the INDEX. When verify_totp falls back to the loop, the
+    # caller's own credentials matched -- from the same load as its list -- so a
+    # "not listed" verdict stands (refused in enforce), whatever the flag says.
+    creds, users_by_am, _m, removed, _s = world
+    s = _settings(totp_roster_check_mode="enforce")
+    now = time.time()
+    stale_idx = av.build_totp_index(creds, s, now - 3600, margin=1)  # does not cover now
+    for idx in (None, stale_idx):
         r = av.verify_totp(scanned=_code_for(removed, s, now), settings=s, creds_payload=creds,
                            users_by_am=users_by_am, users_by_card={}, now_unix=now,
-                           totp_index=use_idx, roster_current=False)
-        assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_BEHIND
-        r = av.verify_totp(scanned=_code_for(member, s, now), settings=s, creds_payload=creds,
-                           users_by_am=users_by_am, users_by_card={}, now_unix=now,
-                           totp_index=use_idx, roster_current=False)
-        assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_IN
+                           totp_index=idx, roster_current=False)
+        assert r["allowed"] is False and r["rosterCheck"] == av.ROSTER_NOT_IN
 
 
 # ---------------------------------------------------------------------------

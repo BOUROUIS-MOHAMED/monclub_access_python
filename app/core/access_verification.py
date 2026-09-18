@@ -736,10 +736,11 @@ def verify_totp(
             # keeps the old id here. The same main account on a listed row is the
             # same person with a valid membership (account<->user is 1:1).
             roster_check = ROSTER_IN_BY_ACCOUNT
-        elif not roster_current:
-            # The caller's member list is older than the credentials that matched
-            # (ULTRA: a newer shared index, no list as new): the member may simply
-            # be newer than the list. Never refused.
+        elif used_index and not roster_current:
+            # The caller says its member list is older than the index, and the index
+            # is what matched: the member may simply be newer than the list. Never
+            # refused. (On the loop the caller's own credentials matched, which come
+            # from the same load as its list, so the verdict stands.)
             roster_check = ROSTER_BEHIND
         else:
             roster_check = ROSTER_NOT_IN

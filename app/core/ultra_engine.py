@@ -307,16 +307,24 @@ def _get_shared_local_state():
         return None, -1
 
 
+def _snapshot_has_members(value) -> bool:
+    return isinstance(value, (tuple, list)) and len(value) >= 2 and bool(value[1])
+
+
 def _set_shared_local_state(value, gen) -> None:
     """Publish the process-wide member snapshot. MONOTONIC like the TOTP index: a
     refresh whose slow load finished after a newer one must not put an older list
-    back (the QR roster check compares it with the index, guide §3.1b). A clear
-    (value=None) is always allowed."""
+    back (the QR roster check compares it with the index, guide §3.1b). A stored
+    snapshot with NO members is not newer information -- load_local_state returns
+    an empty list when its users read fails -- so an older complete one may replace
+    it. A clear (value=None) is always allowed."""
     try:
         g = int(gen)
         with _SHARED_LOCAL_STATE_LOCK:
-            if value is not None and _SHARED_LOCAL_STATE["value"] is not None \
-                    and g < int(_SHARED_LOCAL_STATE["gen"]):
+            stored = _SHARED_LOCAL_STATE["value"]
+            if value is not None and stored is not None \
+                    and g < int(_SHARED_LOCAL_STATE["gen"]) \
+                    and _snapshot_has_members(stored):
                 return
             _SHARED_LOCAL_STATE["value"] = value
             _SHARED_LOCAL_STATE["gen"] = g
@@ -5382,7 +5390,10 @@ class UltraDeviceWorker(threading.Thread):
                 _tel.event("CACHE_ADOPTED_SHARED", worker=self._tel_wid, creds=len(shared_value[0]))
             except Exception:
                 pass
-            if shared_gen != current_gen:
+            # Also refresh when the adopted snapshot has no members: that is a failed
+            # users read, not "no members", and at the current generation nothing else
+            # would reload it before the TTL.
+            if shared_gen != current_gen or not _snapshot_has_members(shared_value):
                 self._trigger_bg_cache_refresh()
             return self._cached_state
 

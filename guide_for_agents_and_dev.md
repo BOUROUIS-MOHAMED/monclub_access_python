@@ -255,7 +255,7 @@ index-equals-loop contract. Every matched QR result now carries `rosterCheck` an
 | `in_roster_by_account` | no grant is listed, but a listed row carries the credential's `accountId` as `mainAccountId` | allow (counted) | allow (counted) |
 | `not_in_roster` | neither | allow (counted) | **deny** `DENY_NOT_IN_LOCAL_ROSTER`, `user=None` |
 | `roster_empty` | the member list is empty | allow (counted) | allow (counted) |
-| `roster_behind` | not listed, but the list checked is older than the credential index that matched (ULTRA only) | allow (counted) | allow (counted) |
+| `roster_behind` | not listed, but the shared credential index matched and the list checked is older than it (ULTRA only) | allow (counted) | allow (counted) |
 
 Only the new fields change on an allow: `activeMembershipId` and `user` are resolved exactly as
 before. `roster_empty` exists because an empty list cannot be told apart from a failed read:
@@ -317,18 +317,25 @@ member list was loaded. `_handle_totp_rescue` then checks against the process-wi
 refresh that the index is later built from. Without it, a brand-new member would read as
 `not_in_roster`: a false count in trial, a refusal in enforce. The shared list is published
 **monotonically**, like the index: a refresh whose slow load straddled a sync commit cannot put
-an older list back over a newer one (`_set_shared_local_state` ignores a lower generation; a
-clear is always allowed). An **empty** shared list is never adopted — a refresh whose users
-query failed still publishes `(creds, {}, {})`, and adopting it would drop member names from the
-popup and history. When no non-empty list at least as new as the index exists, the worker checks
-its own (older) list and passes `roster_current=False`: a "not listed" code is then
-`roster_behind` — counted, **never refused** — because the member may simply be newer than the
-list. `[CODE: ultra_engine.py::_handle_totp_rescue, ::_set_shared_local_state;
-access_verification.py::verify_totp]`
+an older complete list back over a newer one (`_set_shared_local_state` ignores a lower
+generation; a clear is always allowed). A snapshot with **no members** is not newer information
+— `load_local_state` returns `(creds, {}, {})` when its users read fails — so an older complete
+list may replace it, the rescue never adopts it, and a cold worker that adopts one in
+`_get_cached_local_state` starts its own refresh at once (at the current generation nothing else
+would reload it before the 300 s TTL). When no non-empty list at least as new as the index
+exists, the rescue checks the worker's own (older) list and passes `roster_current=False`; if the
+**index** is what matched, a "not listed" code is then `roster_behind` — counted, **never
+refused** — because the member may simply be newer than the list. If `verify_totp` fell back to
+the loop (the index did not cover the scan's window), the worker's own credentials matched,
+from the same load as its list, and the verdict stands. `[CODE: ultra_engine.py::_handle_totp_rescue,
+::_set_shared_local_state, ::_get_cached_local_state; access_verification.py::verify_totp]`
 `[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new,
 ::test_ultra_never_adopts_an_empty_shared_member_list,
 ::test_the_shared_member_list_never_goes_back_a_generation,
-::test_a_list_older_than_the_credentials_never_refuses]`
+::test_an_empty_member_list_is_not_newer_information,
+::test_a_cold_worker_that_adopts_an_empty_list_refreshes_itself,
+::test_a_list_older_than_the_index_that_matched_never_refuses,
+::test_roster_current_only_qualifies_an_index_match, ::test_ultra_loop_fallback_keeps_a_trustworthy_refusal]`
 
 **Counting.** `verify_totp` stays pure — `verify_totp_resilient` calls it twice on the denial
 path (scan clock, then wall clock) and tests call it freely. Each engine records the **final**
