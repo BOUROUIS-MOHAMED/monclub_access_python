@@ -173,13 +173,54 @@ Regenerate with `grep -rn "\.open_door(" app/ --include=*.py`. `[CODE]`
 |---|---|---|
 | `realtime_agent.py::DecisionService` (→ `DeviceCommandBus.open_door`) | **Automatic** — the AGENT access decision | AGENT only (workers are only built for AGENT devices) |
 | `ultra_engine.py::_open_door_with_retry` | **Automatic** — ULTRA TOTP/QR and staff-RFID rescues only | ULTRA only |
-| `ultra_engine.py` command-queue handler | Queued door command executed on the ULTRA worker's connection | ULTRA only |
+| `ultra_engine.py::_drain_commands` (command queue, fed only by `request_door_open`) | Queued **operator** door command executed on the ULTRA worker's connection; skipped once past its deadline (§3.1a) | ULTRA only |
 | `realtime_agent.py::DeviceCommandBus` / `DeviceWorker.open_door` | Plumbing beneath the two above | — |
 | `device_actor_runtime.py::_handle_message` (`OPEN_DOOR`) | Actor-message plumbing | — |
 | `local_access_api_v2.py::_handle_device_door_open` | **Manual operator action** from the UI | **All modes** — tries the AGENT engine, then the ULTRA worker, then falls back to a direct PullSDK connect for "DEVICE-mode or unmanaged devices" `[CODE: that comment marks the fallback]` |
 
 The last row is why "the PC is not in the live path" is **false** as a blanket statement
 about DEVICE mode. It is true only of *automatic* decisions.
+
+### 3.1a A queued operator door-open has a deadline (2026-09-18)
+
+`UltraDeviceWorker.request_door_open` is the **only** producer of `_cmd_queue`, and its only
+caller is `_handle_device_door_open` (route `POST /api/v2/devices/{id}/door/open`, used by the
+Tauri pages, the tray and the favourite shortcuts), which waits 2.0 s and answers 503
+"device unreachable (command timed out)" on timeout. `[CODE]` The dashboard's door button
+calls `/api/v1/service/openDoor` on 127.0.0.1, a route this app does not serve (404) — it
+reaches no queue. `[CODE: mon_club_dashboard layout.tsx, LocalAccessService.ts;
+access/local_api_routes.py]`
+
+Each queued entry now carries `deadline = time.monotonic() + timeout` — the caller's own wait.
+`_drain_commands` (also reached mid-push through `_sync_yield_to_doors`) skips an entry past it:
+no SDK call, result `expired (not executed)`, a `CMD door_open EXPIRED` log line and
+`[T] DOOR_CMD_EXPIRED`. Before, nothing removed an abandoned entry except a newer press or a
+drain, and the worker drains only while connected — so an open pressed during an outage or a
+sync hand-off (`pause_for_sync`, which has no door yield) pulsed the relay on the next
+reconnect, however late. `request_door_open` also returns a **copy** of the result box, and the
+worker writes `ok`/`error` in one `dict.update`, so the handler can no longer read a half-written
+pair. `[CODE: ultra_engine.py::request_door_open, ::_drain_commands]`
+`[TEST: test_door_open_deadline.py]`
+
+What it does **not** change: the check is at dequeue, so an open taken just inside the deadline
+still runs, and the SDK call (`timeout_ms=4000`) can finish a few seconds after the caller was
+told "timed out" — the same overlap as before. The expiry applies to operator opens only.
+QR/TOTP and staff-RFID rescue opens call `self._sdk.open_door` directly on the worker thread
+(`_open_door_with_retry`) and never touch this queue, so no rescue is delayed or dropped by it.
+`[TEST: ::test_rescue_opens_do_not_use_the_queue]` Member syncs and revocations live in other
+structures (`_pending_member_syncs`, the revoke-id sets, `_pending_full_sync_request`) and are
+deliberately re-queued — they have no deadline and must not get one (§3.4).
+
+Found while tracing this, **not changed** `[CODE]`:
+- AGENT has no queue — `DecisionService` and the local API call `DeviceWorker.open_door`
+  synchronously — but `PullSDKDevice.open_door` waits on `_sdk_lock` with no timeout and
+  ignores `timeout_ms`, so a caller blocked behind a wedged poll can still pulse late.
+- A rescue has no event-age gate: `verify_totp_resilient` accepts a scan time up to
+  `EVENT_TIME_SANITY_BOUND_SEC` (3600 s) from the PC clock, so a QR scan observed late (RTLog
+  backlog after an outage) can still be rescued late.
+- `_handle_device_door_open` falls through from a failed AGENT open to a direct PullSDK
+  connect for a device with no ULTRA worker; if the AGENT pulse was sent but reported False,
+  the door can pulse twice.
 
 ### 3.2 The roster rule — the most operationally important fact in this file
 

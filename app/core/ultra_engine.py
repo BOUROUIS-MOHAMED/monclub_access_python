@@ -970,6 +970,11 @@ class UltraDeviceWorker(threading.Thread):
         Called from the HTTP handler thread.  The worker drains the queue
         between polls and executes via its already-connected SDK, avoiding
         the TCP disconnect/reconnect cycle that caused 5s latency.
+
+        The command carries a monotonic deadline equal to ``timeout``. A command
+        still queued when the caller gives up is never executed later: without it,
+        an open queued during an outage or a sync hand-off pulsed the relay on the
+        next reconnect, minutes after the desk was told "timed out".
         """
         # Drain stale pending commands before adding a new one.
         # When the device is offline, callers time out and return but their
@@ -977,7 +982,7 @@ class UltraDeviceWorker(threading.Thread):
         # press is what matters; old stale entries should not pile up.
         while True:
             try:
-                _, _, stale_ev, stale_box = self._cmd_queue.get_nowait()
+                _, _, stale_ev, stale_box, _ = self._cmd_queue.get_nowait()
                 stale_box["ok"] = False
                 stale_box["error"] = "superseded"
                 stale_ev.set()
@@ -986,14 +991,16 @@ class UltraDeviceWorker(threading.Thread):
 
         result_event = threading.Event()
         result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
+        deadline = time.monotonic() + float(timeout)
         try:
-            self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box))
+            self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box, deadline))
             self._wake_evt.set()
         except queue.Full:
             return {"ok": False, "error": "command queue full"}
 
         result_event.wait(timeout=timeout)
-        return result_box
+        # A copy: the worker may still be writing ok/error into the live box.
+        return dict(result_box)
 
     def request_run_sdk(
         self,
@@ -1417,26 +1424,42 @@ class UltraDeviceWorker(threading.Thread):
 
     @_tel.timed("DOOR_DRAIN", slow_ms=500)
     def _drain_commands(self):
-        """Execute pending door-open commands using the current SDK connection."""
+        """Execute pending door-open commands using the current SDK connection.
+
+        Also reached mid-push through ``_sync_yield_to_doors``. Only operator opens
+        (``request_door_open``) are queued here; QR/TOTP and staff-RFID rescue opens
+        call the SDK directly on this thread (``_open_door_with_retry``) and never
+        pass through this queue.
+        """
         while not self._cmd_queue.empty():
             try:
-                door_id, pulse_ms, result_event, result_box = self._cmd_queue.get_nowait()
+                door_id, pulse_ms, result_event, result_box, deadline = self._cmd_queue.get_nowait()
             except queue.Empty:
                 break
+            # The caller has already returned "timeout": skip, never open late.
+            # Checked at dequeue, so an open taken just inside the deadline still runs
+            # and can finish a few seconds after the caller gave up (the SDK call
+            # itself has a 4 s timeout) -- that overlap is unchanged from before.
+            if time.monotonic() > float(deadline):
+                result_box.update({"ok": False, "error": "expired (not executed)"})
+                logger.warning(
+                    f"{self._prefix} CMD door_open EXPIRED (not executed): door={door_id} "
+                    f"late_by_ms={round((time.monotonic() - float(deadline)) * 1000)}"
+                )
+                _tel.event("DOOR_CMD_EXPIRED", worker=self._tel_wid, door=door_id)
+                result_event.set()
+                continue
             try:
                 if self._sdk is None or not self._connected:
-                    result_box["ok"] = False
-                    result_box["error"] = "not connected"
+                    result_box.update({"ok": False, "error": "not connected"})
                 else:
                     ok = self._sdk.open_door(door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
-                    result_box["ok"] = bool(ok)
-                    result_box["error"] = "" if ok else "open_door returned False"
+                    result_box.update({"ok": bool(ok), "error": "" if ok else "open_door returned False"})
                     logger.info(
                         f"{self._prefix} CMD door_open: door={door_id} pulse={pulse_ms}ms ok={ok}"
                     )
             except Exception as e:
-                result_box["ok"] = False
-                result_box["error"] = str(e)
+                result_box.update({"ok": False, "error": str(e)})
                 logger.warning(
                     f"{self._prefix} CMD door_open FAILED: door={door_id} err={e}"
                 )
