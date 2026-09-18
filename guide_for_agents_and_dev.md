@@ -46,6 +46,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
+| What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -210,6 +211,11 @@ expired just before the caller copies the box; `request_door_open` reports that 
 Mid-push, `[T] SYNC_DOOR_YIELD` now carries `opened` (entries sent to the device, as before)
 and `expired` (skipped) separately. `[CODE: ultra_engine.py::request_door_open,
 ::_drain_commands, ::_sync_yield_to_doors]` `[TEST: test_door_open_deadline.py]`
+
+On a standalone (MB2000) full sync the queue is drained between push chunks too since P3a-2
+(§3.4e). A press early in a chunk still waits for the rest of that chunk — up to ~4.1 s at the
+field write rate, longer than the handler's 2.0 s — so it answers 503 and, by the deadline above,
+is never executed afterwards. `[TEST: measured on a fake terminal, §3.4e]`
 
 What it does **not** change: the check is at dequeue, so an open taken just inside the deadline
 still runs, and the SDK call (`timeout_ms=4000`) can finish a few seconds after the caller was
@@ -1418,6 +1424,98 @@ deploy grep `TEMPLATE_VERSION_MISMATCH`: any hit names fingers that were never u
 terminal. Whether a mismatched template can in fact never match is itself `[UNVERIFIED —
 HARDWARE-GATED]` ("template portability", module docstring).
 
+### 3.4e The door does not wait behind a push; one pass is capped (MB2000, P3a-2, 2026-09-19)
+
+**Before.** A standalone full sync ran `push_roster` to its end on the worker thread. Each chunk
+(`_PUSH_CHUNK_MEMBERS` = 10 members, one STA command) returned to the worker, but nothing ran
+between chunks: a scan the terminal reported during the push waited in the driver's event queue,
+a desk open in `_cmd_queue`, an enrolment's targeted push in the member queue — until the whole
+push ended (419 s for 928 members, field v1.4.26). And one pass pushed every pin that needed it.
+`[CODE]` `[TEST: test_push_yield_and_cap.py — 14 of its 15 tests fail on c42e589]` The PullSDK
+path is unchanged: it already yields between `SetDeviceData` chunks (`_door_yield_cb`, and
+`_rtlog_yield_cb` behind the gym flag `ultra_sync_yield_to_rtlog`, default OFF).
+
+**Between two chunks** (`push_roster(between_chunks=…)` → `UltraDeviceWorker._standalone_push_yield`),
+on the worker, while the STA thread is idle:
+
+1. The events the terminal buffered during the chunk are already queued: the `push_roster` STA op
+   runs `_pump_events_once` itself before releasing the caller, and the loop's own step-2 pump is
+   skipped for that iteration — the same COM calls, earlier. On a pump error step 2 runs and
+   handles it exactly as before (a dying pump is a disconnect). `[CODE: _sta_main]`
+2. `_yield_during_device_work`: every queued event is decided (`_process_event` — a QR/TOTP or
+   staff-RFID rescue opens the door here) and queued desk opens run (`_sync_yield_to_doors`).
+3. At most ONE pending member update or revoke is served (`_drain_member_sync_commands(limit=1)`),
+   never twice for the same member in one pass (a failing revoke re-queues itself). The pins it
+   handled — named by `_note_push_superseded` from the member-sync, deferral and revoke paths,
+   whatever their outcome — are dropped from the chunks not yet sent and returned in the result's
+   `superseded_pins`: neither pushed, nor failed, nor `not_attempted`. The pass then leaves them
+   out of its own state write (`_push_with_chunk_recording`'s tail) and its success check
+   (`_standalone_failed_pins_from_result` sees only the pins actually sent), and adds every pin it
+   handled to the prune's keep set and to MIRROR's roster. Without that a member revoked mid-push
+   is re-enrolled from the pass's older snapshot, a renamed one is overwritten and stamped with the
+   old hash (the 2026-09-06 stale-snapshot bug), and a member enrolled mid-push loses the row that
+   proves MonClub wrote it.
+4. The worker state goes `push_yield` → `full_sync`, so `WORKER_STALL` (25 s in one state) now
+   measures one chunk, not the whole push — the worker is no longer frozen between chunks.
+
+Never in bracket mode, never before the first or after the last chunk, never after the loop
+stopped; an exception in the yield is logged and the push carries on. `[CODE]`
+`[TEST: test_push_yield_and_cap.py]`
+
+**Measured** on a fake terminal (harness `measure_door_wait.py`, kept out of the repo; waits
+counted in member writes, which do not depend on machine speed, projected with the field
+419 s / 928): a scan, a desk open or a member update queued during a 100-member push waited up to
+**99 writes before** (the rest of the push, median 67; 44.7 s projected — on a 928-member re-push
+up to 927 writes ≈ 418 s) and at most **9 writes after** (the rest of its chunk, median 5; 4.1 s
+projected). `[TEST: fake terminal]` `[UNVERIFIED — HARDWARE-GATED]`: that the MB2000 hands over, at
+the chunk's end, the events of scans made during the chunk (`ReadRTLog`/`GetRTLog` after a write
+loop), and that the terminal's own card and fingerprint decisions — which the PC does not make — are
+unaffected by a concurrent push.
+
+**The desk's Open button can still time out during a push** (§3.1a): 4.1 s > the handler's 2.0 s.
+Rescue opens have no such deadline and do go through. A `_PUSH_CHUNK_MEMBERS` of about 4 would bring
+the worst case under 2 s, but every chunk also costs a `RefreshData(1)` whose duration on the MB2000
+is `[UNKNOWN]`, so it is not changed without that number.
+
+**The cap.** `_FULL_SYNC_MAX_PINS_PER_PASS = 50` pins pushed per pass; removals (they run first,
+§3.4b) are not counted. It is not what protects the door (the yield does, every 10 members): it
+bounds how long anything that needs a NEW pass waits — an expiry the scheduler found, the 30–300 s
+removal retry of §3.4b, a revoke that fell back to a full sync. 50 × 0.45 s (the field per-member
+rate) = 22.6 s, under the 30 s first removal retry; before, such a pass waited for the whole push.
+There is no opening-hours data in this app, so the cap applies at every hour. When more pins need a
+push, they go in this order (`_prioritise_for_cap`, stable): a vacated finger slot to clear first,
+then new members, then retries of unconfirmed pushes, then plain changes — sorted BEFORE capacity
+admission and sliced AFTER it, never before the backfill (a pin cut there would be backfilled as in
+sync). A pin left for later gets no state row. The capped pass reports `ok` with the roster hash
+withheld, skips MIRROR (its last continuation runs it), writes the push-history note
+`PUSH_CAPPED=n (50 per pass; the rest next pass)`, emits `[T] FULL_SYNC_CAPPED`, and — only when it
+wrote at least one member — queues its own continuation (`request_full_sync(reason="push-capped")`,
+carrying the roster hash and `full_reconcile`). A pass that wrote nothing queues none, so a terminal
+refusing everything cannot loop; the withheld hash makes the scheduler retry it. `[CODE]`
+`[TEST: test_push_yield_and_cap.py::TestOnePassIsCapped]` Measured on the fake: 928 members → 19
+passes; each pass's setup before its first write (roster build, state reads) median 17 ms with the
+local fingerprint index stubbed. `[UNVERIFIED]` on the gym PC — FIELD-TEST: compare each
+`FULL_SYNC_START` with that pass's first `ZKEM_PUSH_CHUNK`.
+
+**Still one command: removals.** The removal step deletes every departed pin in ONE STA command
+(`delete_users`, at most the §3.2g ceiling), with no event pump and no door for its duration. Its
+duration is now on `[T] ZKEM_DELETE_DONE dur_ms`; the per-delete time on the MB2000 is `[UNKNOWN]`.
+
+**Idle door path, before vs after** (base `d09f88f` vs this branch; the real
+`UltraDeviceWorker.run()` loop over a fake terminal; 3 runs x 150 scans and 150 desk opens each,
+plus 400 desk opens with a stack probe). The decision code — `_poll_with_watchdog`,
+`_process_event`, `_handle_totp_rescue`, `_open_door_with_retry` — and the driver's `open_door`,
+`poll_rtlog_once` and `_on_att_event` are byte-identical to the base. `[CODE: git diff d09f88f]` The
+run loop gained two idle calls (`_maybe_request_removal_retry`, `_drain_daily_maintenance`):
++3.2 to 4.0 µs per iteration. Scan to decision, median 256 / 305 / 304 ms on the base and 288 / 270 /
+275 ms on the branch (p95 460-494 vs 462-493 ms; set by the STA loop's 250 ms idle wait, which
+neither version changes); no scan lost. Desk-open round trip, median 0.6-0.8 ms on both. Two branch
+runs had one slow open each (148 and 230 ms of 150); the 400-open probe then gave base max 54 ms
+(worker asleep: thread scheduling) and branch max 29 ms — no systematic difference.
+`[TEST: fake terminal]` Not measured here: while the once-a-day intent read-back (one terminal
+enumeration, §3.4a) or a sweep command (at most 0.5 s, §3.4c) runs, the loop waits for it; their
+MB2000 durations are field items.
+
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
@@ -1942,6 +2040,11 @@ the actual terminal.
 Declared in `zk_standalone.py`'s own module docstring: in-process COM viability, event
 field semantics, template portability, and the card-number space.
 
+From P3a-2 (§3.4e), measured only on a fake terminal: whether the MB2000 hands over at a chunk's
+end the events of scans made during it; the duration of `RefreshData(1)` (what a smaller chunk
+would cost); the per-pin duration of the whole-user delete (`ZKEM_DELETE_DONE dur_ms`); the gym
+PC's setup time per capped pass.
+
 ### ~~Why fingerprint templates were refused~~ — RESOLVED (see zkemkeeper_guide §8)
 
 This section used to list two unproven causes (a full store, an algorithm-version mismatch).
@@ -2132,6 +2235,10 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
 | `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped` (warn; writes needing a new slot refused, pins left pending, §3.4d) |
 | `TEMPLATE_VERSION_MISMATCH` | `zk_standalone.py::push_roster` | `worker skipped device_fp_version` (warn; templates of another algorithm version not uploaded, once per push, §3.4d) |
+| `PUSH_YIELD` | `ultra_engine.py::_standalone_push_yield` | `worker member_updates pins dur_ms` — a member update or revoke served between two push chunks; `pins` = pins it handled, dropped from the rest of the push. Emitted only when one was served (§3.4e) |
+| `FULL_SYNC_CAPPED` | `ultra_engine.py::_run_standalone_full_sync` | `worker cap pushing left` — this pass pushes `pushing` pins and leaves `left` for its continuation (§3.4e) |
+| `ZKEM_PUSH_DONE` | `zk_standalone.py::push_roster` | `pushed failed skipped_pin ok chunks tpl_attempted tpl_ok tpl_failed op del_attempted del_ok not_attempted superseded` — `superseded` (2026-09-19) = pins the between-chunks caller handled itself and dropped (§3.4e) |
+| `ZKEM_DELETE_DONE` | `zk_standalone.py::_do_delete_users` | `deleted failed ok dur_ms` — `dur_ms` (2026-09-19) is the one STA command's duration: no door, no event pump during it (§3.4e) |
 | `FINGER_SWEEP` | `ultra_engine.py` | `worker pin source ok op cleared empty raised dur_ms` (`source` ∈ `targeted`, `daily`; `cleared` = slots that held a template, `empty` = already empty; §3.4c) |
 | `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |

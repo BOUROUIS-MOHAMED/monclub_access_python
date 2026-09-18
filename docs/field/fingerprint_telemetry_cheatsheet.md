@@ -386,6 +386,24 @@ grep -E "\[T\] (CAPACITY_FULL|TEMPLATE_VERSION_MISMATCH)" app-*.log
 
 ---
 
+## 4c. Did the door wait behind a push? (P3a-2)
+
+```bash
+grep -E "\[T\] (FULL_SYNC_CAPPED|PUSH_YIELD|SYNC_DOOR_YIELD|WORKER_STALL|ZKEM_DELETE_DONE)" app-*.log
+```
+
+During a push to the MB2000 the PC now stops every 10 members to decide the scans that came in
+(QR codes, staff cards), to open the doors pressed at the desk, and to push or remove one member
+waiting for it. `PUSH_YIELD member_updates=1 pins=1` is one such member served in the middle of a
+push. `FULL_SYNC_CAPPED pushing=50 left=N` means the terminal needed more than 50 members written:
+50 now, the rest in the next passes, one after another (the push-history page says
+`PUSH_CAPPED=N`). `WORKER_STALL state=full_sync` should now appear only if ONE group of 10 members
+takes more than 25 s — a real problem, not a long push. `ZKEM_DELETE_DONE dur_ms=` is how long a
+removal kept the door waiting (removals still go in one command). The desk's Open button can still
+answer "timed out" when pressed during a push; the door is then NOT opened later.
+
+---
+
 ## 4a. Was a deleted finger cleared from the MB2000? (P3a-2)
 
 ```bash

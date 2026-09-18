@@ -687,6 +687,7 @@ class ZKStandaloneDevice:
         bracket_enable_device: bool = False,
         timeout_sec: float = 600.0,
         on_chunk: "Callable[[List[Dict[str, Any]], Dict[str, Any] | None], None] | None" = None,
+        between_chunks: "Callable[[], Any] | None" = None,
     ) -> Dict[str, Any]:
         """Push users (+ fingerprint templates) to the terminal (D6).
 
@@ -702,6 +703,16 @@ class ZKStandaloneDevice:
         crash between chunks never leaves an unrecorded member on the terminal.
         Exceptions from it are logged and swallowed; a chunk never sent (after a
         `break`) is not reported here -- it is in the aggregate's failed_pins.
+        between_chunks: called on the CALLER's thread BETWEEN two chunks -- after a
+        chunk returned (and after its on_chunk), before the next one is sent; never
+        before the first, never after the last, never in bracket mode, never after the
+        loop stopped. The STA thread is idle then (its event pump already ran, see the
+        push_roster op), so the caller may issue its own commands: open a door, push
+        or remove one member (P3a-2 item 6: the door no longer waits behind a push).
+        It may return pins to DROP from the chunks not yet sent -- pins it has just
+        written or removed itself, whose data in this roster is now older. They are
+        reported in ``superseded_pins``: neither pushed, nor failed, nor not_attempted.
+        Exceptions from it are logged and swallowed; the push carries on.
         """
         users = list(users or [])
         templates_by_pin = templates_by_pin or {}
@@ -741,6 +752,10 @@ class ZKStandaloneDevice:
             for _part in remaining:
                 for _u in _part:
                     _p = str(_u.get("pin") or "").strip()
+                    if _p in superseded:
+                        if _p not in agg["superseded_pins"]:
+                            agg["superseded_pins"].append(_p)
+                        continue
                     if _p and _p not in agg["failed_pins"]:
                         agg["failed_pins"].append(_p)
                         agg["not_attempted"] += 1
@@ -759,7 +774,11 @@ class ZKStandaloneDevice:
                                # every member of a chunk never sent because the loop
                                # stopped early (the three `break`s below).
                                "failed_pins": [],
-                               "not_attempted": 0}
+                               "not_attempted": 0,
+                               # Dropped from the chunks not yet sent because the
+                               # between_chunks caller wrote/removed them itself.
+                               "superseded_pins": []}
+        superseded: set = set()
         # Telemetry-only accumulators (never read by the engine).
         agg_failed_reasons: Dict[str, str] = {}
         agg_tpl_attempted = 0
@@ -779,6 +798,33 @@ class ZKStandaloneDevice:
             self._prefix, total, len(templates_by_pin), len(chunks), bool(bracket_enable_device),
         )
         for idx, part in enumerate(chunks, 1):
+            if idx > 1 and between_chunks is not None and not bracket_enable_device:
+                try:
+                    _dropped = between_chunks()
+                except Exception as exc:
+                    _dropped = None
+                    self.logger.warning(
+                        "%s push_roster between_chunks hook failed (ignored): %s",
+                        self._prefix, str(exc),
+                    )
+                if isinstance(_dropped, str):
+                    _dropped = [_dropped]
+                for _p in (_dropped or ()):
+                    _p = str(_p or "").strip()
+                    if _p:
+                        superseded.add(_p)
+            if superseded:
+                _kept = []
+                for _u in part:
+                    _p = str(_u.get("pin") or "").strip()
+                    if _p in superseded:
+                        if _p not in agg["superseded_pins"]:
+                            agg["superseded_pins"].append(_p)
+                    else:
+                        _kept.append(_u)
+                if not _kept:
+                    continue  # nothing of this chunk is left to send: no command
+                part = _kept
             # Bound each command. A wedged terminal now costs ONE chunk and is
             # detected in seconds, instead of hanging the worker for the full
             # timeout and leaving the device dead until the app restarts.
@@ -977,7 +1023,8 @@ class ZKStandaloneDevice:
                        tpl_failed=agg["templates_failed"],
                        op="del_user_tmp_ext",
                        del_attempted=agg_del_attempted, del_ok=agg_del_ok,
-                       not_attempted=agg["not_attempted"] or None)
+                       not_attempted=agg["not_attempted"] or None,
+                       superseded=len(agg["superseded_pins"]) or None)
             if agg_tpl_version_skipped:
                 # P3a-2 item 7: once per push, never per finger inside the STA loop.
                 _tel.warn(
@@ -1212,6 +1259,7 @@ class ZKStandaloneDevice:
                                         self._prefix, gen, self._sta_gen)
                     break
                 # 1) service pending commands (each with its own error capture)
+                pumped_in_cmd = False
                 try:
                     cmd = self._cmd_queue.get(timeout=_STA_LOOP_IDLE_SLEEP_SEC)
                 except queue.Empty:
@@ -1266,6 +1314,19 @@ class ZKStandaloneDevice:
                                     trace_members=int(cmd.args.get("trace_members") or 0),
                                     trace_templates=int(cmd.args.get("trace_templates") or 0),
                                 )
+                                # P3a-2 item 6: fetch the events the terminal buffered
+                                # during this chunk BEFORE the caller is released, so its
+                                # between-chunks yield sees them now rather than one
+                                # chunk later. Step 2 below would run this same pump
+                                # right after; it is skipped instead, so the COM calls
+                                # are unchanged. On an error step 2 runs and handles it
+                                # exactly as before (a dying pump is a disconnect).
+                                if not cmd.args["bracket"] and connected:
+                                    try:
+                                        self._pump_events_once(zk)
+                                        pumped_in_cmd = True
+                                    except Exception:
+                                        pumped_in_cmd = False
                         elif cmd.op == "list_users":
                             if zk is None or not connected:
                                 cmd.result = {"ok": False, "users": [], "error": "not connected"}
@@ -1331,7 +1392,7 @@ class ZKStandaloneDevice:
                         cmd.done.set()
 
                 # 2) pump real-time events
-                if zk is not None and connected:
+                if zk is not None and connected and not pumped_in_cmd:
                     try:
                         self._pump_events_once(zk)
                     except Exception as exc:
@@ -2172,6 +2233,9 @@ class ZKStandaloneDevice:
         # deleted must be left alone -- SSR_SetUserInfo auto-creates, so touching it
         # again would resurrect it as an empty row. Mirrors push_roster's failed_pins.
         failed_pins: List[str] = []
+        # One STA command for the whole list: no event pump, no door for its duration.
+        # dur_ms below is the field measurement of that window (P3a-2 item 6).
+        t0 = time.monotonic()
         for raw in pins or []:
             pin = str(raw or "").strip()
             if not pin.isdigit() or len(pin) > _MAX_PIN_DIGITS:
@@ -2204,7 +2268,8 @@ class ZKStandaloneDevice:
         ok = failed == 0
         try:
             _tel.event("ZKEM_DELETE_DONE", worker=self._tel_wid,
-                       deleted=deleted, failed=failed, ok=ok)
+                       deleted=deleted, failed=failed, ok=ok,
+                       dur_ms=round((time.monotonic() - t0) * 1000))
         except Exception:
             pass
         return {"ok": ok, "deleted": deleted, "failed": failed, "errors": errors,

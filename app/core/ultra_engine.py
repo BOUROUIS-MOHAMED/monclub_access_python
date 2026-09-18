@@ -235,6 +235,18 @@ _SWEEP_SLOTS_PER_COMMAND = 3
 _FINGER_SWEEP_DAILY_CAP = 100
 _ALL_FINGER_SLOTS = tuple(range(10))
 
+# P3a-2 item 6: at most this many pins are PUSHED by one standalone full-sync pass
+# (guide §3.4e). Removals are not counted: they run first and have their own ceiling.
+# The rest stay pending -- no state row -- and the pass queues its own continuation, so
+# the run loop runs between two passes. What that buys: a full sync that carries a
+# removal (an expiry the scheduler found, the 30-300 s removal retry of §3.4b, an
+# explicit revoke that fell back to a full sync) waits for at most one capped pass
+# instead of a whole-roster push (419 s for 928 members, field v1.4.26). 50 x 0.45 s
+# (that run's per-member rate) = 22.6 s, below the 30 s first removal retry. Doors and
+# rescues do NOT depend on this number: they are served between chunks of 10. There
+# is no opening-hours data in this app, so the cap applies at every hour.
+_FULL_SYNC_MAX_PINS_PER_PASS = 50
+
 
 def _revoke_skipped_not_owned(engine: Any) -> bool:
     """True when DeviceSyncEngine's last targeted revoke was SKIPPED_NOT_OWNED.
@@ -1932,6 +1944,11 @@ class UltraDeviceWorker(threading.Thread):
         self, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str]
     ) -> tuple[list[Dict[str, Any]], int]:
         """Return (pins to push, number skipped as unchanged)."""
+        # Why each returned pin needs a push -- "new" (no row), "failed" (row, last push
+        # not confirmed) or "changed" (confirmed, content differs). Read by the per-pass
+        # cap to choose what goes first (P3a-2 item 6).
+        kinds: Dict[str, str] = {}
+        self._last_push_kinds = kinds
         try:
             from app.core.db import list_device_sync_hashes_and_status
             state = list_device_sync_hashes_and_status(device_id=self._device_id) or {}
@@ -1982,6 +1999,7 @@ class UltraDeviceWorker(threading.Thread):
                             continue
                 except Exception:
                     pass  # fail open: push it
+            kinds[pin] = "new" if pin not in state else ("changed" if prev_ok else "failed")
             to_push.append(u)
         if backoff_skipped:
             # Never invisible: a pin in backoff must not look like a pin in sync.
@@ -2377,6 +2395,101 @@ class UltraDeviceWorker(threading.Thread):
         except Exception:
             pass
 
+    # ---------------------------------------------------------------- #
+    # Between the chunks of a full-sync push (P3a-2 item 6, guide §3.4e)
+    # ---------------------------------------------------------------- #
+    def _note_push_superseded(self, pins) -> None:
+        """A targeted update served INSIDE a full-sync push names the pins it handled.
+
+        Those pins' data in the running pass is now older than what the update wrote (or
+        removed): the pass must not push them from its snapshot, record them, or prune
+        them. Called by the member sync / revoke paths; a no-op outside a push yield.
+        """
+        sink = getattr(self, "_push_yield_pins", None)
+        if sink is None:
+            return
+        for p in pins or ():
+            p = str(p if p is not None else "").strip()
+            if p:
+                sink.add(p)
+
+    def _standalone_push_yield(self) -> set[str]:
+        """``push_roster``'s between_chunks hook for a standalone full sync.
+
+        Runs on the worker between two chunks (the STA thread is idle and its event pump
+        already ran): decides the scans queued meanwhile -- a QR/TOTP or staff-RFID rescue
+        opens the door here -- runs queued desk opens, then serves at most ONE pending
+        member update or revoke. A member already served in this pass is not served again
+        (a failing revoke re-queues itself; it must not be retried at every chunk).
+        Returns the pins that update handled, which the driver drops from the chunks not
+        yet sent. Also restarts the WORKER_STALL clock: the worker is not frozen, and the
+        stall warning now measures one chunk, not the whole push.
+        """
+        if getattr(self, "_in_push_yield", False):
+            return set()
+        self._in_push_yield = True
+        touched: set[str] = set()
+        served = 0
+        t0 = time.monotonic()
+        try:
+            _tel.set_state(self._tel_wid, "push_yield")
+            self._yield_during_device_work()
+            served_ids = getattr(self, "_pass_served_members", None)
+            with self._member_sync_lock:
+                nxt = self._pending_member_syncs[0] if self._pending_member_syncs else None
+            if nxt is not None and (served_ids is None or int(nxt) not in served_ids):
+                if served_ids is not None:
+                    served_ids.add(int(nxt))
+                self._push_yield_pins = touched
+                try:
+                    served = self._drain_member_sync_commands(limit=1)
+                finally:
+                    self._push_yield_pins = None
+        except Exception:
+            logger.warning("%s push yield failed (the push carries on)", self._prefix,
+                           exc_info=True)
+        finally:
+            self._in_push_yield = False
+            _tel.set_state(self._tel_wid, "full_sync", getattr(self, "_push_yield_detail", ""))
+        acc = getattr(self, "_pass_touched_pins", None)
+        if acc is not None:
+            acc.update(touched)
+        if served or touched:
+            _tel.event("PUSH_YIELD", worker=self._tel_wid, member_updates=served,
+                       pins=len(touched), dur_ms=round((time.monotonic() - t0) * 1000))
+        return touched
+
+    def _prioritise_for_cap(
+        self,
+        to_push: list[Dict[str, Any]],
+        templates_by_pin: Dict[str, list] | None,
+        pushed_fingers: Dict[str, Any],
+    ) -> list[Dict[str, Any]]:
+        """Order a pass that exceeds the cap: removals, new, failed, changed.
+
+        A pin with a vacated finger slot goes first (a deleted finger keeps opening the
+        door until its push clears the slot), then members not on the terminal yet, then
+        retries of unconfirmed pushes, then plain changes. Stable: roster order within a
+        group. Only the ORDER changes here; the slice is taken after capacity admission.
+        """
+        kinds = getattr(self, "_last_push_kinds", None) or {}
+        try:
+            removals = self._standalone_removals(
+                to_push=to_push, templates_by_pin=templates_by_pin or {},
+                pushed_fingers=pushed_fingers or {},
+            )
+        except Exception:
+            removals = {}
+        rank = {"new": 1, "failed": 2}
+
+        def _key(u: Dict[str, Any]) -> int:
+            pin = str(u.get("pin") or "").strip()
+            if removals.get(pin):
+                return 0
+            return rank.get(kinds.get(pin, ""), 3)
+
+        return sorted(to_push, key=_key)
+
     def _drain_finger_sweep(self, today: str) -> None:
         """The daily bounded batch: ONE short sweep command per run-loop iteration."""
         if not bool(self._settings.get("fingerprint_enabled", False)):
@@ -2519,6 +2632,7 @@ class UltraDeviceWorker(threading.Thread):
         *,
         removals: Dict[str, list[int]],
         bracket: bool,
+        between_chunks: "Callable[[], Any] | None" = None,
     ) -> Dict[str, Any]:
         """push_roster, recording each chunk's outcome as soon as the chunk returns.
 
@@ -2546,8 +2660,19 @@ class UltraDeviceWorker(threading.Thread):
                                   "bracket_enable_device": bracket}
         if _accepts_kwarg(self._sdk.push_roster, "on_chunk"):
             kwargs["on_chunk"] = _on_chunk
+        if between_chunks is not None and _accepts_kwarg(self._sdk.push_roster, "between_chunks"):
+            kwargs["between_chunks"] = between_chunks
         result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
-        remaining = [u for u in users if str(u.get("pin") or "").strip() not in recorded]
+        # A pin the between-chunks yield handled itself (P3a-2 item 6) was never sent by
+        # this push; recording it from this result would overwrite the newer state the
+        # targeted update just wrote -- the 2026-09-06 stale-snapshot bug again.
+        superseded = {
+            str(p if p is not None else "").strip()
+            for p in ((result.get("superseded_pins") if isinstance(result, dict) else None) or [])
+        }
+        remaining = [u for u in users
+                     if str(u.get("pin") or "").strip() not in recorded
+                     and str(u.get("pin") or "").strip() not in superseded]
         if remaining:
             self._record_standalone_pin_state(
                 users=remaining, hashes_by_pin=hashes_by_pin, result=result,
@@ -2772,6 +2897,12 @@ class UltraDeviceWorker(threading.Thread):
         capacity_skipped: list[str] = []
         # Explicit revocations whose pin the removal step (which runs first) removed.
         removed_revokes: set[int] = set()
+        # P3a-2 item 6: pins left for the pass's own continuation (the per-pass cap), and
+        # every pin a targeted update served between two chunks handled (never pushed
+        # from this pass's snapshot, never pruned, never deleted by MIRROR).
+        capped_out: list[str] = []
+        pass_touched: set[str] = set()
+        pushed_users: list[Dict[str, Any]] = []
         self._last_revoke_aborted = 0
         desired_pins: list[str] = []
         try:
@@ -2872,6 +3003,12 @@ class UltraDeviceWorker(threading.Thread):
                 hashes_by_pin=hashes_by_pin,
                 pushed_fingers=pushed_fingers,
             )
+            # P3a-2 item 6: a pass that needs more than the cap pushes the most urgent
+            # first. Sorted here, SLICED after capacity admission -- never before the
+            # backfill above: a pin sliced off earlier would be backfilled as in sync.
+            _cap = _FULL_SYNC_MAX_PINS_PER_PASS
+            if len(to_push) > _cap:
+                to_push = self._prioritise_for_cap(to_push, templates_by_pin, pushed_fingers)
             # P3a-2 item 7: a write that needs a NEW user or fingerprint slot is refused
             # when the terminal reports none free (CAPACITY_FULL); the pin stays pending.
             to_push, capacity_skipped = self._capacity_admit(
@@ -2879,6 +3016,21 @@ class UltraDeviceWorker(threading.Thread):
             )
             if capacity_skipped:
                 pass_incomplete = True
+            if len(to_push) > _cap:
+                # Only to_push is cut -- never users/desired_pins, which MIRROR, the
+                # revoke pass and the prune read as "the roster". A capped-out pin gets
+                # no state row: it stays pending and the continuation pushes it.
+                capped_out = [str(u.get("pin") or "").strip() for u in to_push[_cap:]]
+                to_push = to_push[:_cap]
+                pass_incomplete = True
+                logger.info(
+                    "%s full sync (reason=%s): %d pin(s) need a push -- %d now, %d in the "
+                    "next pass (at most %d per pass)", self._prefix, reason,
+                    len(to_push) + len(capped_out), len(to_push), len(capped_out), _cap,
+                )
+                _tel.event("FULL_SYNC_CAPPED", worker=self._tel_wid, cap=_cap,
+                           pushing=len(to_push), left=len(capped_out))
+            pushed_users = list(to_push)
             batch_attempted = len(to_push)
             try:
                 batch_id = insert_push_batch(
@@ -2951,12 +3103,30 @@ class UltraDeviceWorker(threading.Thread):
                     # prune, so a failed pin is remembered as failed even if a later
                     # step raises -- and a crash between chunks loses at most the
                     # chunk in flight, which its intent still covers.
-                    result = self._push_with_chunk_recording(
-                        to_push, templates_to_push, hashes_by_pin,
-                        removals=removals, bracket=bracket,
-                    )
+                    # Between two chunks the yield serves doors, rescues and ONE pending
+                    # member update or revoke (P3a-2 item 6).
+                    self._push_yield_detail = f"reason={reason}"
+                    self._pass_touched_pins = pass_touched
+                    self._pass_served_members = set()
+                    try:
+                        result = self._push_with_chunk_recording(
+                            to_push, templates_to_push, hashes_by_pin,
+                            removals=removals, bracket=bracket,
+                            between_chunks=self._standalone_push_yield,
+                        )
+                    finally:
+                        self._pass_touched_pins = None
+                        self._pass_served_members = None
+                    _superseded = {
+                        str(p if p is not None else "").strip()
+                        for p in (result.get("superseded_pins") or [])
+                    }
+                    # A superseded pin was not sent: it is neither confirmed nor failed.
+                    pushed_users = [u for u in to_push
+                                    if str(u.get("pin") or "").strip() not in _superseded]
+                    batch_attempted = len(pushed_users)
                     sync_ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
-                        users=to_push, result=result,
+                        users=pushed_users, result=result,
                     )
                     sync_error = "" if sync_ok else str(
                         (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
@@ -2970,10 +3140,18 @@ class UltraDeviceWorker(threading.Thread):
                 # incremental `to_push` subset -- MIRROR deletes device users absent
                 # from this list, so passing the subset would delete every unchanged
                 # member.
-                if not roster_withheld:
+                # A capped pass leaves MIRROR to its last continuation. Pins a targeted
+                # update handled mid-push (a member enrolled after this snapshot) count
+                # as roster, so MIRROR can never delete them (P3a-2 item 6).
+                if not roster_withheld and not capped_out:
+                    _desired_set = {p for p in desired_pins if p}
+                    _mirror_roster = list(users) + [
+                        {"pin": p, "name": "", "card": ""}
+                        for p in sorted(pass_touched - _desired_set)
+                    ]
                     try:
                         self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
-                                                     roster_users=users)
+                                                     roster_users=_mirror_roster)
                     except Exception as exc:
                         logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
                 if (unconfirmed_revoked_ids - set(skipped_revokes) - removed_revokes) \
@@ -2987,7 +3165,12 @@ class UltraDeviceWorker(threading.Thread):
                 if safe_to_prune:
                     try:
                         from app.core.db import prune_device_sync_state
-                        prune_device_sync_state(device_id=self._device_id, keep_pins=desired_pins)
+                        # + the pins a mid-push targeted update wrote: not in this
+                        # snapshot, but their rows are MonClub's ownership proof.
+                        prune_device_sync_state(
+                            device_id=self._device_id,
+                            keep_pins=list(desired_pins) + sorted(pass_touched),
+                        )
                     except Exception:
                         logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
             # This pass built the roster, pushed and ran its removal step: the day's
@@ -3011,7 +3194,7 @@ class UltraDeviceWorker(threading.Thread):
                 # Count per PIN from the same conservative normalization used by
                 # retry state instead of trusting contradictory aggregate counters.
                 failed_pins = self._standalone_failed_pins_from_result(
-                    users=to_push if batch_attempted else [], result=result,
+                    users=pushed_users if batch_attempted else [], result=result,
                 )
                 skipped_pins = max(0, int(result.get("skipped_pin") or 0))
                 pins_failed = len(failed_pins)
@@ -3039,6 +3222,10 @@ class UltraDeviceWorker(threading.Thread):
                             _push_safety.CAPACITY_FULL, len(capacity_skipped),
                             "pins " + ",".join(capacity_skipped[:20]),
                         ) if capacity_skipped else "",
+                        _push_safety.outcome_note(
+                            _push_safety.PUSH_CAPPED, len(capped_out),
+                            f"{_FULL_SYNC_MAX_PINS_PER_PASS} per pass; the rest next pass",
+                        ) if capped_out else "",
                     ) or None),
                 )
             except Exception:
@@ -3069,6 +3256,13 @@ class UltraDeviceWorker(threading.Thread):
                 ok=True,
                 excluded_ids=normalized_excluded_ids,
             )
+        # P3a-2 item 6: a capped pass queues its own continuation -- only when it wrote
+        # something, so a terminal refusing everything cannot loop; the scheduler's own
+        # retry (the roster hash was withheld) covers that case. The roster hash is
+        # carried: the continuation builds its roster from a cache at least as new.
+        if capped_out and int((result or {}).get("pushed") or 0) > 0:
+            self.request_full_sync(reason="push-capped", fingerprint_hash=fingerprint_hash,
+                                   full_reconcile=full_reconcile)
 
     def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> None:
         """Drop explicit revocations of pins MonClub cannot prove it owns (FINAL).
@@ -3189,6 +3383,9 @@ class UltraDeviceWorker(threading.Thread):
                     "known person pin -- nothing flagged; the next full sync reconciles.",
                     self._prefix, member_id,
                 )
+        # Inside a full-sync push (P3a-2 item 6) the push must not re-send this member
+        # from its snapshot after the targeted path found them gone or unreadable.
+        self._note_push_superseded([pin])
         logger.warning(
             "%s member sync deferred: member %s -- %s (row in sync_users: %s). "
             "Flagged for the next full sync rather than reported as synced.",
@@ -3248,6 +3445,9 @@ class UltraDeviceWorker(threading.Thread):
                     member_id, reason="member not visible in the sync cache",
                 )
                 return
+            # Served between two chunks of a full-sync push (P3a-2 item 6): these pins'
+            # data in that push is now older than this update's. No-op otherwise.
+            self._note_push_superseded(u.get("pin") for u in users)
             # Same vacated-slot removal as the full sync. This path runs seconds
             # after a dashboard change, so without it a revoked finger stays live
             # until the next full sync happens to pick the pin up.
@@ -3625,10 +3825,14 @@ class UltraDeviceWorker(threading.Thread):
         """
         if self._pin_scheme_is_account():
             handled, pin = self._account_member_revoke(int(member_id))
+            # Served inside a full-sync push (P3a-2 item 6): that push must not re-send
+            # this person from its older snapshot, whatever the outcome here.
+            self._note_push_superseded([pin])
             if handled is not None:
                 return handled
         else:
             pin = str(int(member_id))
+            self._note_push_superseded([pin])
         _tel.event(
             "MEMBER_REVOKE_REQUESTED",
             worker=self._tel_wid,

@@ -134,6 +134,12 @@ the event pump is treated as a **disconnect** — it clears the connected state 
 Because the loop is sequential, **one command is a window in which no COM message is
 pumped and no device event is drained.** That is why the roster push is chunked (§5).
 
+One exception (P3a-2, 2026-09-19): after a non-bracketed `push_roster` command the event
+pump runs INSIDE the command, before the caller is released, and the step-2 pump is
+skipped for that iteration — the same calls, earlier, so the caller's between-chunks
+yield sees the chunk's events at once. On a pump error step 2 runs and handles it as
+before. `[CODE: _sta_main]` `[TEST: test_push_yield_and_cap.py::test_events_of_a_chunk_are_queued_before_the_hook_runs]`
+
 ### ⛔ Teardown ordering — the apartment must outlive the COM object
 
 **Added 2026-09-11 — this ordering is why the Oxyfit PC died every ~30 minutes.**
@@ -671,6 +677,16 @@ window). Everything else is chunked at `_PUSH_CHUNK_MEMBERS` (10). `[CODE]`
 > deadline and no per-chunk wedge recovery, which is what left a gym with only the first
 > 10 of ~950 members. `guide_for_agents_and_dev.md` §3.2c.
 
+**Between chunks (P3a-2, 2026-09-19).** `push_roster(between_chunks=fn)` calls `fn()` on the
+caller's thread after a chunk returned (and after its `on_chunk`), before the next one is sent —
+never before the first, never after the last, never in bracket mode, never after a `break`. The
+STA thread is idle then, so the caller issues its own commands (the ULTRA worker decides queued
+scans, opens queued doors, and may push or remove ONE member). `fn` may return pins to drop from
+the chunks not yet sent — members it just wrote or removed itself — reported in
+`superseded_pins`; a chunk left empty is not sent. An exception from `fn` is logged and the push
+carries on. `[CODE]` `[TEST: test_push_yield_and_cap.py::TestDriverBetweenChunks]`
+`guide_for_agents_and_dev.md` §3.4e has the engine side and the measured waits.
+
 Per-chunk deadline: `[CODE]`
 ```python
 chunk_timeout = min(timeout_sec, max(45.0, len(part) * 5.0))
@@ -708,9 +724,10 @@ mark_not_attempted; ultra_engine.py::_standalone_failed_pins_from_result]`
 ### Result dict
 
 Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedged`,
-`errors`, **`failed_pins`**, **`del_attempted` / `del_ok`** (added 2026-09-05), and
-**`not_attempted`** (added 2026-09-18: pins of chunks never sent after a `break`).
-`[CODE]`
+`errors`, **`failed_pins`**, **`del_attempted` / `del_ok`** (added 2026-09-05),
+**`not_attempted`** (added 2026-09-18: pins of chunks never sent after a `break`), and
+**`superseded_pins`** (added 2026-09-19: pins the `between_chunks` caller dropped — not
+pushed, not failed). `[CODE]`
 
 `del_attempted` counts every `SSR_DelUserTmpExt` issued — both the delete-before-write
 of a desired slot and the removal of a vacated one. `del_ok` counts the ones the
@@ -1107,7 +1124,7 @@ The canonical index of every `[T]` event, its fields and the rules for adding on
 From this file: `ZKEM_PUSH_DONE`, `ZKEM_PUSH_CHUNK`, `ZKEM_PUSH_FAILED_PINS`,
 `ZKEM_PUSH_TPL_REFUSED`, `ZKEM_TPL_VERSION_MISMATCH`, `ZKEM_PUSH_WEDGED`,
 `ZKEM_PUSH_RECONNECT`, `ZKEM_PUSH_ABANDONED`, `ZKEM_DEVICE_COUNTERS`,
-`ZKEM_DELETE_DONE`, `ZKEM_PIN_UNMAPPED`, `ZKEM_STA_WEDGED`, `ZKEM_EVT_SINK_DOWN`,
+`ZKEM_DELETE_DONE` (with `dur_ms` since 2026-09-19), `ZKEM_PIN_UNMAPPED`, `ZKEM_STA_WEDGED`, `ZKEM_EVT_SINK_DOWN`,
 `DOOR_OPEN`, `DOOR_OPEN_SWITCH`, and (P3a-2) `TEMPLATE_VERSION_MISMATCH`. All keyed
 `worker=ZKEM:<device id>`. `[CODE]`
 
