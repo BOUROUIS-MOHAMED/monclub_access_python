@@ -92,7 +92,9 @@ class OptionalContentSyncScheduler:
         from app.api.monclub_api import MonClubApi
         from app.core.db import load_auth_token
 
-        token = load_auth_token()
+        # load_auth_token() returns an AuthTokenState; the API wants the bearer string only.
+        auth = load_auth_token()
+        token = auth.token if auth else ""
         if not token:
             raise RuntimeError("No auth token stored — skipping optional content sync.")
 
@@ -110,6 +112,7 @@ class OptionalContentSyncScheduler:
             replace_optional_products,
             save_optional_sync_state,
         )
+        from app.core.utils import now_iso
 
         _log.info("[OptionalContentSync] Starting sync cycle.")
 
@@ -126,9 +129,10 @@ class OptionalContentSyncScheduler:
             _log.warning("[OptionalContentSync] Failed to read sync state: %s", exc)
             state = {}
 
-        events_ver: Optional[str] = state.get("events_last_version_at") or None
-        products_ver: Optional[str] = state.get("products_last_version_at") or None
-        deals_ver: Optional[str] = state.get("deals_last_version_at") or None
+        # Column names of optional_sync_state (db.get_optional_sync_state).
+        events_ver: Optional[str] = state.get("events_version_at") or None
+        products_ver: Optional[str] = state.get("products_version_at") or None
+        deals_ver: Optional[str] = state.get("deals_version_at") or None
 
         # 3. Call backend
         try:
@@ -157,10 +161,15 @@ class OptionalContentSyncScheduler:
         new_products_ver: Optional[str] = resp.get("productsVersionAt") or products_ver
         new_deals_ver: Optional[str] = resp.get("dealsVersionAt") or deals_ver
 
+        # A section's marker only advances once its rows are stored; otherwise the next
+        # cycle would present the new marker and never be sent the rows again.
+        stored_events = stored_products = stored_deals = False
+
         if refresh_events:
             events: List[Dict[str, Any]] = resp.get("events") or []
             try:
                 replace_optional_events(events)
+                stored_events = True
                 _log.info("[OptionalContentSync] Replaced %d upcoming events.", len(events))
             except Exception as exc:
                 _log.warning("[OptionalContentSync] Failed to store events: %s", exc)
@@ -169,6 +178,7 @@ class OptionalContentSyncScheduler:
             products: List[Dict[str, Any]] = resp.get("products") or []
             try:
                 replace_optional_products(products)
+                stored_products = True
                 _log.info("[OptionalContentSync] Replaced %d products.", len(products))
             except Exception as exc:
                 _log.warning("[OptionalContentSync] Failed to store products: %s", exc)
@@ -177,19 +187,21 @@ class OptionalContentSyncScheduler:
             deals: List[Dict[str, Any]] = resp.get("deals") or []
             try:
                 replace_optional_deals(deals)
+                stored_deals = True
                 _log.info("[OptionalContentSync] Replaced %d deals.", len(deals))
             except Exception as exc:
                 _log.warning("[OptionalContentSync] Failed to store deals: %s", exc)
 
-        # 5. Persist updated version markers (only overwrite sections that refreshed)
+        # 5. Persist updated version markers (only overwrite sections that were stored)
         try:
             save_optional_sync_state(
-                events_last_version_at=new_events_ver if refresh_events else None,
-                products_last_version_at=new_products_ver if refresh_products else None,
-                deals_last_version_at=new_deals_ver if refresh_deals else None,
-                update_events=refresh_events,
-                update_products=refresh_products,
-                update_deals=refresh_deals,
+                events_version_at=new_events_ver if stored_events else None,
+                products_version_at=new_products_ver if stored_products else None,
+                deals_version_at=new_deals_ver if stored_deals else None,
+                last_sync_at=now_iso(),
+                refresh_events=stored_events,
+                refresh_products=stored_products,
+                refresh_deals=stored_deals,
             )
         except Exception as exc:
             _log.warning("[OptionalContentSync] Failed to save sync state: %s", exc)
