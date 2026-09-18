@@ -95,6 +95,7 @@ class _Harness:
         app._sync_fail_count = 0
         app._sync_retry_after_sec = None
         app._sync_rerun_requested = False
+        app._last_tick_device_reconcile_mono = None
         app._last_sync_at = None
         app._last_sync_ok = False
         app._last_sync_error = None
@@ -421,3 +422,92 @@ def test_a_worker_that_cannot_start_does_not_wedge_the_sync(harness) -> None:
     assert harness.app._sync_work_running is False
     assert 12 - 0.5 <= harness.armed_sync_timer_sec() <= 18
     assert harness.app._pending_sync_context.trigger_hint == {"reason": "user-sync"}
+
+
+# ── Fast retries must not multiply device reconciles ────────────────────────────────
+#
+# A tick whose getSyncData fails still reconciles DEVICE-mode panels from the cached roster
+# (PullSDK connect, full Pin read, SetDeviceParam; a FULL_REPLACE panel is wiped and re-pushed).
+# Only the backend fetch retries fast: a failed-fetch tick dispatches that reconcile only when
+# the last one from a sync tick is at least one healthy interval old.
+
+
+def _with_device_mode_panel(monkeypatch, h: _Harness) -> MagicMock:
+    engine = MagicMock()
+    engine.run_blocking.return_value = True
+    engine.get_progress_snapshot.return_value = ({"total": 1}, None)
+    h.app._device_sync_engine = engine
+    h.app.cfg.device_sync_enabled = True
+    h.app._restriction_reasons = lambda: []
+    h.app.get_access_mode_summary = lambda: {"DEVICE": 1, "AGENT": 0, "ULTRA": 0, "UNKNOWN": 0}
+    monkeypatch.setattr(app_module, "load_sync_cache", lambda: SimpleNamespace(devices=[{"id": 1}], users=[]))
+    return engine
+
+
+def test_retry_ticks_during_an_outage_do_not_repeat_the_device_reconcile(monkeypatch, harness) -> None:
+    engine = _with_device_mode_panel(monkeypatch, harness)
+
+    for _ in range(6):  # the first failed tick, then five fast retries
+        harness.tick()
+        harness.finish_worker(fail=True)
+        harness.run_due()
+
+    assert engine.run_blocking.call_count == 1
+
+
+def test_a_failed_tick_reconciles_again_once_a_healthy_interval_has_passed(monkeypatch, harness) -> None:
+    engine = _with_device_mode_panel(monkeypatch, harness)
+    harness.tick()
+    harness.finish_worker(fail=True)
+    harness.run_due()
+    assert engine.run_blocking.call_count == 1
+
+    harness.app._last_tick_device_reconcile_mono -= HEALTHY_30_MIN + 1
+    harness.tick()
+    harness.finish_worker(fail=True)
+
+    assert engine.run_blocking.call_count == 2
+
+
+def test_the_first_failed_tick_after_start_still_reconciles(monkeypatch, harness) -> None:
+    engine = _with_device_mode_panel(monkeypatch, harness)
+    harness.tick()
+    harness.finish_worker(fail=True)
+
+    engine.run_blocking.assert_called_once()
+
+
+def test_the_first_failed_healthy_tick_after_a_reconcile_still_reconciles(monkeypatch, harness) -> None:
+    """Healthy timer ticks start one interval apart; the gate compares tick starts, so a
+    failure on the very next healthy tick reconciles exactly as it did before this change."""
+    engine = _with_device_mode_panel(monkeypatch, harness)
+    harness.app._last_tick_device_reconcile_mono = time.monotonic() - HEALTHY_30_MIN
+
+    before = time.monotonic()
+    harness.tick()
+    after_tick = time.monotonic()
+    time.sleep(0.02)  # the worker (fetch, then dispatch) runs later than the tick itself
+    harness.finish_worker(fail=True)
+
+    engine.run_blocking.assert_called_once()
+    # Stamped with this tick's start, not the (later) dispatch time.
+    assert before <= harness.app._last_tick_device_reconcile_mono <= after_tick
+
+
+@pytest.mark.parametrize(
+    ("run_type", "hint"),
+    [("TRIGGERED", {"reason": "user-sync"}), ("HARD_RESET", {"hardReset": True}),
+     ("TRIGGERED", {"reason": "daily-auto-sync"})],
+)
+def test_an_explicit_sync_still_reconciles_while_the_backend_is_down(monkeypatch, harness, run_type, hint) -> None:
+    engine = _with_device_mode_panel(monkeypatch, harness)
+    harness.tick()
+    harness.finish_worker(fail=True)  # automatic tick: reconciles, stamps the gate
+    assert engine.run_blocking.call_count == 1
+
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", run_type=run_type, trigger_hint=hint)
+    time.sleep(0.06)
+    harness.run_due()
+    harness.finish_worker(fail=True)
+
+    assert engine.run_blocking.call_count == 2

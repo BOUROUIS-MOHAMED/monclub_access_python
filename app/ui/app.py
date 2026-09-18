@@ -611,6 +611,8 @@ class MainApp:
         self._sync_retry_after_sec: float | None = None  # backend Retry-After from the last failure
         # Set when a sync is requested while one is running; the finishing sync re-runs once.
         self._sync_rerun_requested = False
+        # Start time (monotonic) of the last sync tick that dispatched the DEVICE-mode reconcile
+        self._last_tick_device_reconcile_mono: float | None = None
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -2410,24 +2412,7 @@ class MainApp:
                 pass
             self._sync_after_id = None
 
-        # Use backend-driven agentSyncBackendRefreshMin (in minutes) if available,
-        # otherwise fall back to local config sync_interval_sec (in seconds).
-        # The backend setting is configured in the dashboard under Access Software Settings.
-        backend_min = None
-        try:
-            from app.core.settings_reader import get_backend_global_settings
-            gs = get_backend_global_settings() or {}
-            val = gs.get("agent_sync_backend_refresh_min")
-            if val is not None and int(val) > 0:
-                backend_min = int(val)
-        except Exception:
-            pass
-        if backend_min is not None:
-            base_interval = backend_min * 60  # convert minutes to seconds
-        else:
-            interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
-            base_interval = int(max(10, int(interval_cfg)))
-
+        base_interval = self._sync_base_interval_sec()
         if after_failure:
             interval = sync_retry_delay_sec(
                 self._sync_fail_count,
@@ -2442,6 +2427,36 @@ class MainApp:
         else:
             self._sync_after_id = self.after(base_interval * 1000, self._sync_tick)
             self.logger.info(f"Sync scheduled every {base_interval} sec")
+
+    def _sync_base_interval_sec(self) -> int:
+        """The healthy sync interval in seconds."""
+        # Use backend-driven agentSyncBackendRefreshMin (in minutes) if available,
+        # otherwise fall back to local config sync_interval_sec (in seconds).
+        # The backend setting is configured in the dashboard under Access Software Settings.
+        backend_min = None
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+            gs = get_backend_global_settings() or {}
+            val = gs.get("agent_sync_backend_refresh_min")
+            if val is not None and int(val) > 0:
+                backend_min = int(val)
+        except Exception:
+            pass
+        if backend_min is not None:
+            return backend_min * 60  # convert minutes to seconds
+        interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
+        return int(max(10, int(interval_cfg)))
+
+    def _offline_device_reconcile_due(self) -> bool:
+        """After a failed getSyncData: may this tick still reconcile DEVICE-mode panels?
+
+        Failed syncs retry fast (app.core.sync_retry), but the cached-roster reconcile each
+        would dispatch opens a PullSDK session per DEVICE-mode panel (and wipes and re-pushes a
+        FULL_REPLACE panel). Keep that at the healthy cadence: only when the tick that last
+        dispatched it started at least one healthy interval ago.
+        """
+        last = self._last_tick_device_reconcile_mono
+        return last is None or time.monotonic() - last >= self._sync_base_interval_sec()
 
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).
@@ -2492,6 +2507,9 @@ class MainApp:
             startup_pending=self._startup_sync_pending,
         )
         self._pending_sync_context = None
+        # Timer ticks start at least one healthy interval apart, so the reconcile gate
+        # (_offline_device_reconcile_due) compares tick start times, not dispatch times.
+        tick_started_mono = time.monotonic()
 
         sync_run_id: int | None = None
         sync_started_perf = 0.0
@@ -2916,9 +2934,22 @@ class MainApp:
                                     "devicesDispatched": 0,
                                     "skippedReason": "NO_MEMBER_DELTA",
                                 }
+                        elif (
+                            not sync_online
+                            and not _is_user_initiated_sync
+                            and not self._offline_device_reconcile_due()
+                        ):
+                            # An automatic fast failure retry: the backend is unreachable and the
+                            # panels were reconciled from this same cache less than an interval
+                            # ago. Explicit syncs (Sync data, hard reset, daily) still push.
+                            self.logger.info(
+                                "[DeviceSync] Skipped: backend unreachable; panels were reconciled "
+                                "less than one sync interval ago."
+                            )
                         else:
                             cache = load_sync_cache()
                             if cache:
+                                self._last_tick_device_reconcile_mono = tick_started_mono
                                 started = self._device_sync_engine.run_blocking(
                                     cache=cache, source=trigger_context.trigger_source.lower(),
                                     changed_ids=_device_changed_ids,
