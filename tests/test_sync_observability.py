@@ -360,8 +360,14 @@ def test_sync_handlers_schedule_expected_trigger_metadata():
         "trigger_hint": None,
     }
 
-    with patch("app.core.db.clear_all_device_sync_hashes", return_value=7):
+    # Both db writes are patched: unpatched, clear_version_tokens() deletes from whatever
+    # database is active -- the installed gym database when no override is set.
+    with (
+        patch("app.core.db.clear_all_device_sync_hashes", return_value=7),
+        patch("app.core.db.clear_version_tokens") as clear_tokens,
+    ):
         api_module._handle_sync_hard_reset(ctx)
+    clear_tokens.assert_called_once_with()
     assert responses[-1][0] == 200
     assert responses[-1][1]["cleared"] == 7
     scheduled.pop(0)[1]()

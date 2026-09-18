@@ -283,6 +283,9 @@ def _run_upload(rows: List[AccessHistoryRow], *, response: Any = None, side_effe
         patch("app.core.device_attendance.mark_access_history_synced", marks.synced),
         patch("app.core.device_attendance.mark_access_history_sync_failure", marks.failure),
         patch("app.core.device_attendance.mark_access_history_unresolved", marks.unresolved),
+        # Unpatched, this reads the pin-scheme switch table of whatever database is active --
+        # the installed gym database when no override is set.
+        patch("app.core.device_attendance.list_device_pin_scheme_switches", return_value={}),
         patch("access.store.load_sync_cache", return_value=SimpleNamespace(users=[])),
     ):
         result = engine._sync_pending_history(token="local-token", sync_online=True)
