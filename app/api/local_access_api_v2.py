@@ -3895,6 +3895,11 @@ def _door_open_error_fr(err: Any) -> str:
         return "appareil non connecté"
     if e == "superseded":
         return "commande remplacée par un appui plus récent"
+    if e == "sent, no answer":
+        # The worker was already sending the open when the wait ran out (§3.1a):
+        # the door may have opened, so this must not read as a failure.
+        return ("commande envoyée à l'appareil, sans réponse à temps "
+                "— vérifier si la porte s'est ouverte")
     return f"échec de l'ouverture de porte ({e or 'erreur inconnue'})"
 
 

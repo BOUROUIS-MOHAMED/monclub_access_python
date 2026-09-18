@@ -45,7 +45,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
-| The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
+| The ULTRA operator door-open queue, its deadline or its claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::_DoorOpenClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr`) | §3.1a |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
@@ -180,7 +180,7 @@ Regenerate with `grep -rn "\.open_door(" app/ --include=*.py`. `[CODE]`
 |---|---|---|
 | `realtime_agent.py::DecisionService` (→ `DeviceCommandBus.open_door`) | **Automatic** — the AGENT access decision | AGENT only (workers are only built for AGENT devices) |
 | `ultra_engine.py::_open_door_with_retry` | **Automatic** — ULTRA TOTP/QR and staff-RFID rescues only | ULTRA only |
-| `ultra_engine.py::_drain_commands` (command queue, fed only by `request_door_open`) | Queued **operator** door command executed on the ULTRA worker's connection; skipped once past its deadline (§3.1a) | ULTRA only |
+| `ultra_engine.py::_drain_commands` (command queue, fed only by `request_door_open`) | Queued **operator** door command executed on the ULTRA worker's connection; skipped once its caller has given up or its deadline has passed (§3.1a) | ULTRA only |
 | `realtime_agent.py::DeviceCommandBus` / `DeviceWorker.open_door` | Plumbing beneath the two above | — |
 | `device_actor_runtime.py::_handle_message` (`OPEN_DOOR`) | Actor-message plumbing | — |
 | `local_access_api_v2.py::_handle_device_door_open` | **Manual operator action** from the UI | **All modes** — tries the AGENT engine, then the ULTRA worker, then falls back to a direct PullSDK connect for "DEVICE-mode or unmanaged devices" `[CODE: that comment marks the fallback]` |
@@ -198,29 +198,75 @@ calls `/api/v1/service/openDoor` on 127.0.0.1, a route this app does not serve (
 reaches no queue. `[CODE: mon_club_dashboard layout.tsx, LocalAccessService.ts;
 access/local_api_routes.py]`
 
-Each queued entry now carries `deadline = time.monotonic() + timeout` — the caller's own wait.
-`_drain_commands` (also reached mid-push through `_sync_yield_to_doors`) skips an entry past it:
-no SDK call, result `expired (not executed)`, a `CMD door_open EXPIRED` log line and
-`[T] DOOR_CMD_EXPIRED`. Before, nothing removed an abandoned entry except a newer press or a
-drain, and the worker drains only while connected — so an open pressed during an outage or a
-sync hand-off (`pause_for_sync`, which has no door yield) pulsed the relay on the next
-reconnect, however late. `request_door_open` also returns a **copy** of the result box, and the
-worker writes `ok`/`error` in one `dict.update`, so the handler can no longer read a half-written
-pair. Worker and waiter share the ~15.6 ms monotonic tick, so the worker can mark an entry
-expired just before the caller copies the box; `request_door_open` reports that as its own
-`timeout` (nothing was sent), which keeps the local API on its 503 instead of a generic 500.
-Mid-push, `[T] SYNC_DOOR_YIELD` now carries `opened` (entries sent to the device, as before)
-and `expired` (skipped) separately. `[CODE: ultra_engine.py::request_door_open,
-::_drain_commands, ::_sync_yield_to_doors]` `[TEST: test_door_open_deadline.py]`
+Each queued entry carries `deadline = time.monotonic() + timeout` — the caller's own wait — and
+a `_DoorOpenClaim` (below). `_drain_commands` (also reached mid-push through
+`_sync_yield_to_doors`) skips an entry whose caller has given up or whose deadline has passed:
+no SDK call, result `expired (not executed)`, a `CMD door_open EXPIRED` log line (with
+`reason=caller_gave_up` or `reason=deadline`) and `[T] DOOR_CMD_EXPIRED`. Before, nothing
+removed an abandoned entry except a newer press or a drain, and the worker drains only while
+connected — so an open pressed during an outage or a sync hand-off (`pause_for_sync`, which has
+no door yield) pulsed the relay on the next reconnect, however late. `request_door_open` also
+returns a **copy** of the result box, and the worker writes `ok`/`error` in one `dict.update`,
+so the handler can no longer read a half-written pair. Mid-push, `[T] SYNC_DOOR_YIELD` carries
+`opened` (entries sent to the device, as before) and `expired` (skipped) separately.
+`[CODE: ultra_engine.py::request_door_open, ::_drain_commands, ::_sync_yield_to_doors]`
+`[TEST: test_door_open_deadline.py]`
+
+**Exactly one side decides an entry — the worker or its caller (2026-09-19).** The deadline
+alone did not keep the promise above. `Event.wait(timeout)` is not timed by `time.monotonic`
+and can return while `monotonic()` is still ≤ `deadline`; the caller then answered "timeout"
+and a drain in that gap still opened the door. `[TEST]` The scenario of
+`::test_a_door_open_the_caller_gave_up_on_is_never_executed_later` (`timeout=0.05`, then an
+immediate `_drain_commands`), looped 300 times with the 32-bit `.venv` Python 3.11 on the dev
+PC, opened the door 23/300 times, then 15, 8 and 15 /300 in three reruns on `d09f88f`; 0/300 in
+three runs with this change. It also failed once in a full-suite run.
+
+Now each entry carries a `_DoorOpenClaim`, a lock and an owner, taken once. The worker takes it
+before any SDK call and skips the entry if the caller already has it. The caller, when its wait
+runs out, takes it before answering "timeout". Whoever comes second is refused:
+
+- **The caller took it** → the worker never sends that open; the caller answers `timeout`
+  (local API: 503 "device unreachable (command timed out)").
+- **The worker took it first** → the open is being sent, so the caller does **not** answer
+  "timeout". It waits up to `_DOOR_OPEN_IN_FLIGHT_WAIT_SEC` more (the 4 s `timeout_ms` the worker
+  passes to the driver, plus 1 s — a chosen bound) and returns the worker's own answer, `ok=True`
+  on success. If that wait also runs out it returns `sent, no answer`, never `timeout`; the
+  local API answers 500 with "commande envoyée à l'appareil, sans réponse à temps — vérifier si
+  la porte s'est ouverte", not the generic "échec…".
+
+`[CODE: ultra_engine.py::_DoorOpenClaim, ::request_door_open, ::_drain_commands;
+local_access_api_v2.py::_door_open_error_fr]` `[TEST: test_door_open_deadline.py::
+test_a_wait_that_ends_before_the_deadline_still_never_opens_later,
+::test_an_open_the_worker_took_first_is_answered_with_its_result_not_timeout,
+::test_an_open_still_being_sent_after_the_in_flight_wait_is_not_called_a_timeout,
+::test_a_queued_door_open_is_decided_once_by_its_worker_or_its_caller,
+::test_the_desk_is_told_an_unanswered_open_was_sent]` — these drive the order through a
+scripted `Event.wait` on the caller's result event, not through sleeps or the clock.
 
 On a standalone (MB2000) full sync the queue is drained between push chunks too since P3a-2
-(§3.4e). A press early in a chunk still waits for the rest of that chunk — up to ~4.1 s at the
-field write rate, longer than the handler's 2.0 s — so it answers 503 and, by the deadline above,
-is never executed afterwards. `[TEST: measured on a fake terminal, §3.4e]`
+(§3.4e), by the same `_drain_commands`, so the claim decides there as well. A press early in a
+chunk still waits for the rest of that chunk — up to ~4.1 s at the field write rate, longer than
+the handler's 2.0 s. `[TEST: measured on a fake terminal, §3.4e]` If the caller's wait runs out
+first it takes the claim and answers 503, and the yield skips the entry afterwards; if the yield
+takes it first, the caller waits for the device's answer as above. `[CODE]`
 
-What it does **not** change: the check is at dequeue, so an open taken just inside the deadline
-still runs, and the SDK call (`timeout_ms=4000`) can finish a few seconds after the caller was
-told "timed out" — the same overlap as before. The expiry applies to operator opens only.
+The deadline check stays, as a second reason to skip only. The worker's clock can pass the
+deadline while the caller's wait is still running, and mark the entry expired just before the
+caller copies the box; `request_door_open` reports that as its own `timeout` (nothing was
+sent), which keeps the local API on its 503 instead of a generic 500.
+
+What it does **not** change: the check is at dequeue, so an open taken inside the deadline still
+runs and its waiter gets the device's answer. The cost is time. When the worker takes an open
+at the very end of the caller's 2 s wait, `_handle_device_door_open` can take up to
+2 s + 5 s. The Tauri pages' `post` aborts after 15 s `[CODE: tauri-ui/src/api/client.ts::post]`;
+the tray and favourite-shortcut calls set no timeout of their own
+`[CODE: tauri-ui/src-tauri/src/lib.rs::post_open_door, the shortcut handler's reqwest call]`.
+How long the SDK call itself can take is driver-specific. The standalone driver gives up after
+`max(2 s, timeout_ms)` and abandons its STA thread `[CODE: zk_standalone.py::open_door, ::_call]`.
+`PullSDKDevice.open_door` ignores `timeout_ms` and may reconnect inside the call
+(`ensure_connected`), so its duration is bounded only by the DLL. `[UNKNOWN]` That bound has
+never been measured. When it is exceeded the desk reads "sent, no answer" and the door may still
+pulse. The expiry applies to operator opens only.
 QR/TOTP and staff-RFID rescue opens call `self._sdk.open_door` directly on the worker thread
 (`_open_door_with_retry`) and never touch this queue, so no rescue is delayed or dropped by it.
 `[TEST: ::test_rescue_opens_do_not_use_the_queue]` Member syncs and revocations live in other
@@ -237,6 +283,11 @@ Found while tracing this, **not changed** `[CODE]`:
 - `_handle_device_door_open` falls through from a failed AGENT open to a direct PullSDK
   connect for a device with no ULTRA worker; if the AGENT pulse was sent but reported False,
   the door can pulse twice.
+- `request_run_sdk` / `_drain_sdk_commands` (the control panel's device reads and writes) still
+  skip an abandoned command only by `time.monotonic() > deadline`, the check the door queue just
+  outgrew. So a `SetDeviceParam` whose caller already got "timeout" can still be applied when
+  the wait ends before the deadline. `request_run_sdk` also returns the live result box, not a
+  copy.
 
 ### 3.1b The QR/TOTP roster check — trial first, then enforce (2026-09-18)
 
@@ -2617,7 +2668,7 @@ because its algorithm version differs from the terminal's, §3.4d). `[CODE: _do_
 
 | Event | Where | Carries |
 |---|---|---|
-| `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller's deadline, **not executed** (§3.1a) |
+| `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller gave up or its deadline passed, **not executed** (§3.1a). Which of the two is only in the log line's `reason=` |
 | `SYNC_DOOR_YIELD` | `ultra_engine.py::_sync_yield_to_doors` | `worker opened expired` — operator opens drained between push chunks; `opened` = sent to the device (whatever it answered), `expired` = skipped. `expired` added 2026-09-18; before, `opened` counted every queued entry (§3.1a) |
 | `QR_ROSTER_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict mode allowed` — one per QR scan whose verdict is not `in_roster`; no member id, name or credential (§3.1b) |
 | `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty roster_behind refused` — running totals since the process started, at most once an hour (§3.1b) |

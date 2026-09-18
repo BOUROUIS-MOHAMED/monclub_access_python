@@ -107,8 +107,10 @@ class TestTheDoorDoesNotWait:
         drv, w = _setup(monkeypatch, term, _members(40))
         box = {"ok": False, "error": "timeout"}
         done = threading.Event()
+        # An entry as request_door_open queues it: its last field is the claim that
+        # decides, once, whether the worker sends it or its caller answers "timeout".
         term.on_user["30012"] = lambda: w._cmd_queue.put_nowait(
-            (1, 3000, done, box, time.monotonic() + 30.0))
+            (1, 3000, done, box, time.monotonic() + 30.0, ue._DoorOpenClaim()))
         try:
             w._run_standalone_full_sync(reason="timer", fingerprint_hash="h")
         finally:

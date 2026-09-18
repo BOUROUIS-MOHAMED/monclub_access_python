@@ -281,6 +281,44 @@ def _revoke_skipped_not_owned(engine: Any) -> bool:
     return getattr(engine, "_last_member_sync_outcome", None) == _push_safety.SKIPPED_NOT_OWNED
 
 
+# An operator door-open queued by request_door_open (guide §3.1a). The worker passes
+# the SDK timeout to the driver; the in-flight wait is how long a caller whose open the
+# worker already took keeps waiting for the answer after its own timeout ran out.
+_DOOR_OPEN_SDK_TIMEOUT_MS = 4000
+_DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
+
+
+class _DoorOpenClaim:
+    """Decides, once, who owns a queued door-open: its worker or its caller.
+
+    The worker takes it before sending the open; the caller takes it when its wait
+    runs out, to answer "timeout". Whoever comes second is refused, so an open whose
+    caller answered "timeout" is never sent, and an open being sent is never answered
+    "timeout". A clock comparison cannot decide this: ``Event.wait`` is not timed by
+    ``time.monotonic``, and can end while ``monotonic()`` is still before the deadline.
+    """
+
+    __slots__ = ("_lock", "_owner")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._owner: Optional[str] = None
+
+    def _take(self, owner: str) -> bool:
+        with self._lock:
+            if self._owner is None:
+                self._owner = owner
+            return self._owner == owner
+
+    def take_for_worker(self) -> bool:
+        """True if the worker may send the open (its caller has not given up)."""
+        return self._take("worker")
+
+    def give_up(self) -> bool:
+        """True if the caller may answer "timeout" (the worker has not taken it)."""
+        return self._take("caller")
+
+
 @dataclass(frozen=True)
 class _StandalonePinRemovalResult:
     """Affirmatively confirmed outcomes from one standalone removal pass."""
@@ -1208,10 +1246,14 @@ class UltraDeviceWorker(threading.Thread):
         between polls and executes via its already-connected SDK, avoiding
         the TCP disconnect/reconnect cycle that caused 5s latency.
 
-        The command carries a monotonic deadline equal to ``timeout``. A command
-        still queued when the caller gives up is never executed later: without it,
-        an open queued during an outage or a sync hand-off pulsed the relay on the
-        next reconnect, minutes after the desk was told "timed out".
+        A command still queued when the caller gives up is never executed later:
+        without that, an open queued during an outage or a sync hand-off pulsed the
+        relay on the next reconnect, minutes after the desk was told "timed out".
+        Each entry carries a ``_DoorOpenClaim``: when the wait runs out the caller
+        gives up only if the worker has not taken the entry; if it has, the open is
+        being sent and the caller waits up to ``_DOOR_OPEN_IN_FLIGHT_WAIT_SEC`` more
+        for its answer ("sent, no answer" if none comes -- never "timeout"). The entry
+        also carries a monotonic deadline equal to ``timeout``.
         """
         # Drain stale pending commands before adding a new one.
         # When the device is offline, callers time out and return but their
@@ -1219,7 +1261,7 @@ class UltraDeviceWorker(threading.Thread):
         # press is what matters; old stale entries should not pile up.
         while True:
             try:
-                _, _, stale_ev, stale_box, _ = self._cmd_queue.get_nowait()
+                _, _, stale_ev, stale_box, _, _ = self._cmd_queue.get_nowait()
                 stale_box["ok"] = False
                 stale_box["error"] = "superseded"
                 stale_ev.set()
@@ -1228,19 +1270,24 @@ class UltraDeviceWorker(threading.Thread):
 
         result_event = threading.Event()
         result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
+        claim = _DoorOpenClaim()
         deadline = time.monotonic() + float(timeout)
         try:
-            self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box, deadline))
+            self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box, deadline, claim))
             self._wake_evt.set()
         except queue.Full:
             return {"ok": False, "error": "command queue full"}
 
-        result_event.wait(timeout=timeout)
+        if not result_event.wait(timeout=timeout) and not claim.give_up():
+            # The worker took the entry before we gave up: the open is being sent.
+            # "timeout" would tell the desk nothing was sent, so wait for its answer.
+            if not result_event.wait(timeout=_DOOR_OPEN_IN_FLIGHT_WAIT_SEC):
+                return {"ok": False, "error": "sent, no answer"}
         # A copy: the worker may still be writing ok/error into the live box.
         result = dict(result_box)
-        # The worker and this wait both run on the ~15.6 ms monotonic tick, so an
-        # entry can be marked expired just before we read it. The caller's deadline
-        # passed either way and nothing was sent: that is this call's "timeout".
+        # The worker's clock can pass the deadline while this wait is still running
+        # (Event.wait is not timed by time.monotonic), so it can mark the entry
+        # expired just before we read it. Nothing was sent: that is our "timeout".
         if result.get("error") == "expired (not executed)":
             result["error"] = "timeout"
         return result
@@ -1699,19 +1746,23 @@ class UltraDeviceWorker(threading.Thread):
         drained = expired = 0
         while not self._cmd_queue.empty():
             try:
-                door_id, pulse_ms, result_event, result_box, deadline = self._cmd_queue.get_nowait()
+                door_id, pulse_ms, result_event, result_box, deadline, claim = (
+                    self._cmd_queue.get_nowait()
+                )
             except queue.Empty:
                 break
             drained += 1
-            # The caller has already returned "timeout": skip, never open late.
-            # Checked at dequeue, so an open taken just inside the deadline still runs
-            # and can finish a few seconds after the caller gave up (the SDK call
-            # itself has a 4 s timeout) -- that overlap is unchanged from before.
-            if time.monotonic() > float(deadline):
+            # Skip, never open late, if the caller has given up (it answers "timeout"
+            # only after winning the claim) or its deadline has passed. Once taken here,
+            # the caller cannot give up: it waits for this open's answer instead.
+            caller_gave_up = not claim.take_for_worker()
+            if caller_gave_up or time.monotonic() > float(deadline):
                 result_box.update({"ok": False, "error": "expired (not executed)"})
+                late_ms = round((time.monotonic() - float(deadline)) * 1000)
                 logger.warning(
                     f"{self._prefix} CMD door_open EXPIRED (not executed): door={door_id} "
-                    f"late_by_ms={round((time.monotonic() - float(deadline)) * 1000)}"
+                    f"reason={'caller_gave_up' if caller_gave_up else 'deadline'} "
+                    f"late_by_ms={late_ms}"
                 )
                 _tel.event("DOOR_CMD_EXPIRED", worker=self._tel_wid, door=door_id)
                 result_event.set()
@@ -1721,7 +1772,9 @@ class UltraDeviceWorker(threading.Thread):
                 if self._sdk is None or not self._connected:
                     result_box.update({"ok": False, "error": "not connected"})
                 else:
-                    ok = self._sdk.open_door(door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=4000)
+                    ok = self._sdk.open_door(
+                        door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=_DOOR_OPEN_SDK_TIMEOUT_MS,
+                    )
                     result_box.update({"ok": bool(ok), "error": "" if ok else "open_door returned False"})
                     logger.info(
                         f"{self._prefix} CMD door_open: door={door_id} pulse={pulse_ms}ms ok={ok}"
