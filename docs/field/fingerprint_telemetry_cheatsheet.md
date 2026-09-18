@@ -321,7 +321,10 @@ grep -F "[T] MEMBER_REVOKE" app-*.log
 means whole-user deletion was consistently confirmed; `mode=neutralised` means the
 disabled blank-card row and every locally tracked finger-slot clear were confirmed.
 `MEMBER_REVOKE_FAILED` keeps local ownership state and schedules full reconciliation.
-`MEMBER_REVOKE_OWNERSHIP_MISSING` makes no destructive device call.
+`MEMBER_REVOKE_SKIPPED_NOT_OWNED` (since P3a-2; replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`) means MonClub
+has no proof it wrote that pin, so it made no destructive device call and FINISHED the revocation — the
+member may still be on the terminal (another system's user, or a push MonClub never confirmed). It no longer
+blocks later syncs. The push-history page shows `SKIPPED_NOT_OWNED=n (...)`.
 `MEMBER_REVOKE_DONE mode=repushed` (pinScheme=ACCOUNT devices) means the member lost ONE membership
 but still holds another this device accepts: the person's pin stayed and its row was re-pushed without the
 revoked plan. `MEMBER_REVOKE_PIN_UNKNOWN` means the membership could not be mapped to a person's pin, so

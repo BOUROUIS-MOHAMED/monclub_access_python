@@ -18,6 +18,7 @@ from app.core.db import (
     list_device_sync_hashes_and_status,
     list_device_sync_retry_state,
     get_device_sync_hash_for_pin,
+    get_device_sync_ownership_for_pin,
     save_device_sync_state,
     save_device_sync_state_batch,
     delete_device_sync_state,
@@ -107,6 +108,13 @@ _PUSH_POLICY_ADDITIVE_ONLY = "ADDITIVE_ONLY"  # push changed/new (delete-then-in
 # New content always changes the desired hash, so a re-enrolment is NEVER
 # delayed by this. FULL_REPLACE / nuke reset pins_to_sync wholesale, so a
 # force-resync always defeats it.
+# Outcome of the last sync_member_on_connected_sdk call (engine._last_member_sync_outcome).
+# The bool it returns means "revocation done"; these say WHY it is False. P3a-2.
+MEMBER_SYNC_DELETED = "DELETED"
+MEMBER_SYNC_DELETE_FAILED = "DELETE_FAILED"
+MEMBER_SYNC_SKIPPED_NOT_OWNED = "SKIPPED_NOT_OWNED"      # final: never ours to delete
+MEMBER_SYNC_OWNERSHIP_UNREADABLE = "OWNERSHIP_UNREADABLE"  # retry: cannot tell yet
+
 _SYNC_RETRY_FREE_ATTEMPTS = 3      # first 3 failures retry every run (unchanged behaviour)
 _SYNC_RETRY_BASE_SEC      = 900    # then 15 min, doubling
 _SYNC_RETRY_MAX_SEC       = 86400  # capped at 24 h
@@ -1310,6 +1318,7 @@ class DeviceSyncEngine:
         source: str = "targeted_member_sync",
         revocation: bool = False,
     ) -> bool:
+        self._last_member_sync_outcome = None
         normalized_device = self._normalize_device(device if isinstance(device, dict) else {})
         dev_id = normalized_device.get("id")
         dev_name = normalized_device.get("name", "")
@@ -1386,14 +1395,50 @@ class DeviceSyncEngine:
             return False
 
         if not isinstance(desired_user, dict):
+            # OWNERSHIP GATE (P3a-2, guide §3.4). This deleted the pin from four tables
+            # with no check at all -- under ACCOUNT, for the 110 account ids that equal
+            # another person's membership id, that is a stranger's device user. Only a
+            # pin MonClub affirmatively wrote (ownership_confirmed=1) is deleted, under
+            # EITHER scheme: "never delete an unowned user" is not conditional on a
+            # setting. Unreadable ownership is a retry, never read as "not owned".
+            try:
+                owned = get_device_sync_ownership_for_pin(device_id=did, pin=pin)
+            except Exception as ex:
+                self._last_member_sync_outcome = MEMBER_SYNC_OWNERSHIP_UNREADABLE
+                self.logger.warning(
+                    "[DeviceSync] targeted member delete: device_id=%s pin=%s ownership "
+                    "unreadable (%s) -- nothing deleted, retried later. source=%s",
+                    did, pin, ex, source,
+                )
+                return False
+            if not owned:
+                self._last_member_sync_outcome = MEMBER_SYNC_SKIPPED_NOT_OWNED
+                self.logger.critical(
+                    "[DeviceSync] targeted member delete SKIPPED_NOT_OWNED: device_id=%s "
+                    "device_name=%r pin=%s membership=%s pinScheme=%s -- MonClub has no "
+                    "proof it wrote this device user, so it is never deleted. source=%s",
+                    did, dev_name, pin, member_id, pin_scheme, source,
+                )
+                try:
+                    _tel.warn(
+                        "MEMBER_REVOKE_SKIPPED_NOT_OWNED", device_id=did, member_id=member_id,
+                        pin=pin, pin_scheme=pin_scheme or None, protocol="ZK_PULLSDK",
+                        source=source,
+                    )
+                except Exception:
+                    pass
+                return False
             deleted = self._delete_pin_unconditional(
                 sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
             )
-            delete_device_sync_state(device_id=did, pin=pin)
-            try:
-                delete_device_mirror_pin(device_id=did, pin=pin)
-            except Exception:
-                pass
+            if deleted:
+                self._last_member_sync_outcome = MEMBER_SYNC_DELETED
+                # State, mirror and push intent, in one transaction.
+                clear_device_revocation_state(device_id=did, pin=pin)
+            else:
+                # KEEP the row: it is the ownership proof the retry needs. It used to be
+                # deleted regardless, so every retry then read "not owned".
+                self._last_member_sync_outcome = MEMBER_SYNC_DELETE_FAILED
             self.logger.info(
                 "[DeviceSync] targeted member delete: device_id=%s device_name=%r pin=%s deleted=%s source=%s",
                 did,
@@ -2690,7 +2735,10 @@ class DeviceSyncEngine:
         # device (REVOKE_ABORTED), pins whose delete failed (kept for the retry), and
         # the push-batch notes that carry both to /api/v2/push-history.
         removal_aborted = 0
-        removal_notes: List[str] = []
+        # A caller (the ULTRA worker's revoke pre-pass) may hand over notes of its own,
+        # e.g. SKIPPED_NOT_OWNED, so they land on the same push-batch row.
+        removal_notes: List[str] = list(getattr(self, "_extra_batch_notes", None) or [])
+        self._extra_batch_notes = []
         failed_stale: List[str] = []
         self._last_removal_report = {"aborted": 0, "failed": []}
 

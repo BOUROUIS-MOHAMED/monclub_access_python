@@ -534,14 +534,14 @@ replaced by its own number). `[CODE]`
 
 | Site | MEMBERSHIP (unchanged) | ACCOUNT |
 |---|---|---|
-| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted; `revocation=True` with the person still deliverable → the collapsed row is re-pushed even when its hash is unchanged, and that push is the return value |
+| `DeviceSyncEngine.sync_member_on_connected_sdk` (PullSDK targeted push / revoke) | `pin = member_id`; rows of that membership | `pin` = the person's account pin; rows = EVERY row of the person (`person_rows_for_membership`), so the collapse is complete; unmappable → nothing pushed or deleted; `revocation=True` with the person still deliverable → the collapsed row is re-pushed even when its hash is unchanged, and that push is the return value. Both schemes: a pin that is no longer deliverable is deleted ONLY when owned (P3a-2, §3.4) |
 | `DeviceSyncEngine._sync_one_device` `known_server_pins` | `activeMembershipId` of every user | account pin of every user |
 | `_sync_one_device` delta pruning / drift check (`int(pin) in changed_ids`) | verbatim | `pin in` the account pins of `changed_ids` |
 | `UltraDeviceWorker._build_standalone_roster(only_member_ids)` | `wanted = {str(int(m))}` | the account pins of those memberships |
 | `UltraDeviceWorker._load_member_roster` | that membership's row | every row of the person |
 | `UltraDeviceWorker._defer_member_sync` | flags `str(member_id)` | flags the person's pin; none when unmappable |
-| `UltraDeviceWorker._run_standalone_member_revoke` | removes `str(member_id)` (ownership-checked) | see below |
-| `_run_standalone_full_sync` explicit-revocation ownership check + `required_pins` | `str(member_id)` | the person's pin, and only when it LEFT the desired roster |
+| `UltraDeviceWorker._run_standalone_member_revoke` | removes `str(member_id)` (ownership-checked; not owned → `SKIPPED_NOT_OWNED`, final, §3.4) | see below |
+| `_run_standalone_full_sync` explicit-revocation ownership check + `required_pins` | `str(member_id)`; a revoked pin that is not owned is dropped from the pass as `SKIPPED_NOT_OWNED` (§3.4) | the person's pin, and only when it LEFT the desired roster (a still-desired person pin is re-pushed, never skipped) |
 | `UltraDeviceWorker._handle_allow` fingerprint-scan pin → member (`_user_for_device_pin`) | `users_by_am[int(pin)]` | the collapsed row `_filter_users_for_device` builds for this device |
 | `ZKStandaloneDevice._refresh_pin_card_map` (pin → card on standalone events) | `active_membership_id or user_id` | the collapsed rows for this device, scheme read from the stored device row |
 
@@ -1155,17 +1155,41 @@ installed databases, `last_ok=1` or a recorded `pushed_finger_ids` set is conser
 migration evidence; ambiguous legacy rows remain unconfirmed. A failed first push
 therefore cannot authorize deletion or neutralisation of a colliding manually managed
 user on a shared MB2000. Without this affirmative proof, the worker makes **no
-destructive SDK call**, writes a critical log for `MEMBER_REVOKE_OWNERSHIP_MISSING`,
-emits warning-level telemetry with the same event name, and schedules full
-reconciliation. Full reconciliation also fails closed before ordinary roster I/O when
-an explicit revoke has a recorded but unconfirmed attempt. Such an unowned PIN is
-intentionally left untouched for alert/reconciliation investigation.
+destructive SDK call** — on either protocol.
 Force-resync commands invalidate content hashes and retry status without deleting
 ownership or pushed-finger evidence, so a later full pass can still reconcile stale
 revoked credentials.
-`[CODE: ultra_engine.py::_run_standalone_member_revoke]`
-`[TEST: test_standalone_revoked_pin_removal.py::
-TestImmediateAuthoritativeRevoke::test_unowned_pin_is_not_touched_and_requests_full_reconciliation]`
+
+**Not owned is FINAL: `SKIPPED_NOT_OWNED` (P3a-2, 2026-09-18).** Until P3a-2 an unowned pin
+escalated into a full reconciliation that refused before any roster I/O (a recorded but
+unconfirmed attempt) or pushed and then aborted its whole revoke pass (no row at all) — and
+every later full sync of that device failed the same way, for the life of the process, while
+the other departed members MonClub did own were never removed either. Now the three places
+that decide it treat "provably not owned" as a finished outcome and "cannot read ownership"
+as a retry:
+
+| Site | Not owned (row absent or `ownership_confirmed=0`) | Ownership unreadable |
+|---|---|---|
+| `ultra_engine.py::_run_standalone_member_revoke` (targeted, MB2000) | nothing deleted, `[T] MEMBER_REVOKE_SKIPPED_NOT_OWNED`, returns True (revocation finished), no full sync | False + `request_full_sync(revoke-failed)` (unchanged) |
+| `ultra_engine.py::_run_standalone_full_sync` (explicit revocations, MB2000) | once the desired roster is known, a revoked pin that LEFT it and is not owned is dropped from the pass (`_skip_unowned_revocations`): its physical-revoke phase is finalised, it is removed from the required pins, the rest of the roster is pushed and the other departed owned pins are removed; the pass is not failed and the id is never sent back to the scheduler. ACCOUNT: a person pin still desired is re-pushed, not skipped | the pass is refused before device I/O (unchanged) |
+| `device_sync.py::sync_member_on_connected_sdk` (PullSDK, targeted and the ULTRA full sync's revoke pre-pass) | nothing deleted, `engine._last_member_sync_outcome="SKIPPED_NOT_OWNED"`, returns False (never a false success); both ULTRA callers read the marker and treat it as finished (`_revoke_skipped_not_owned`) | `OWNERSHIP_UNREADABLE`, False, retried as before |
+
+`[CODE: those symbols; db.py::get_device_sync_ownership_for_pin]` `[TEST: test_revoke_ownership_skip.py]`
+The PullSDK gate is **scheme-independent**: before P3a-2 that path deleted with no check at all,
+under both schemes (and erased the state row even when the SDK delete failed, so every retry then
+read "not owned" — it now keeps the row). Under MEMBERSHIP the pin is the revoked membership's own
+number, so the old delete could only hit a non-MonClub user at that number; under ACCOUNT it hit
+the 110 colliding ids (§3.2b). The gate does not protect an UNWIPED terminal after a scheme switch:
+the old scheme's rows keep `ownership_confirmed=1` (§3.2c), so only the manual wipe does.
+**What a gym sees:** a revoked member whose device user MonClub cannot prove it wrote stays on the
+terminal and is reported (`MEMBER_REVOKE_SKIPPED_NOT_OWNED`, push-history note
+`SKIPPED_NOT_OWNED=n (...)`) instead of blocking every later sync. On gym 58 the pins this PC pushed
+have owned rows (the boot migration also promotes `last_ok=1` rows); `[UNVERIFIED]` how many panel
+pins lack one — FIELD-TEST: compare `GET /api/v2/devices/{id}/users` with
+`SELECT pin FROM device_sync_state WHERE device_id IN (5,6) AND ownership_confirmed=1`.
+**Contrast `REVOKE_ABORTED` (§3.2g):** above the removal ceiling the step is refused but the
+revocation stays PENDING and the scheduler re-queues it; a skip is never used for that.
+`[TEST: test_revoke_ownership_skip.py::test_an_above_ceiling_abort_still_leaves_the_revocation_pending]`
 
 Full reconciliation is the recovery route, not the primary revoke route. Separate
 physical-revocation and roster-exclusion ownership, with lock-guarded `ACTIVE` and
@@ -1176,7 +1200,7 @@ revoke-only change remains an immediate targeted command. PullSDK and standalone
 retain authoritative revocation ownership across missing, dead, disconnected, or
 otherwise unusable workers until physical removal is confirmed.
 `[CODE: UltraDeviceWorker.request_member_revoke, ::request_full_sync,
-::_drain_pending_full_sync; UltraEngine.request_sync_now;
+::_drain_full_sync_commands; UltraEngine.request_sync_now;
 UltraSyncScheduler._sync_all]`
 `[TEST: test_ultra_sync_scheduler.py::test_ultra_engine_full_refresh_routes_revocation_as_one_full_command,
 ::test_ultra_engine_revoke_only_still_routes_immediate_member_command,
@@ -1916,7 +1940,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
-| `MEMBER_REVOKE_OWNERSHIP_MISSING` | `ultra_engine.py` | `member_id pin` |
+| `MEMBER_REVOKE_SKIPPED_NOT_OWNED` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id member_id pin protocol` (+ `row` on the full sync, `pin_scheme source` on PullSDK) (warn; P3a-2 — FINAL: MonClub cannot prove it wrote that pin, nothing deleted, revocation finished, §3.4). Replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`, which is no longer emitted |
 | `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
 | `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |
 | `MIRROR_SKIP_NO_CAPABILITY` | `ultra_engine.py` | `worker` |

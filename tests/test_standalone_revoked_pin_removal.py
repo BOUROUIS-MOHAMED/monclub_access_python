@@ -351,8 +351,11 @@ class TestImmediateAuthoritativeRevoke:
         )
         assert done.kwargs["mode"] == "neutralised"
 
-    def test_unowned_pin_is_not_touched_and_requests_full_reconciliation(
+    def test_unowned_pin_is_not_touched_and_the_revocation_is_finished(
             self, monkeypatch, fstate):
+        """P3a-2 item 4 (deliberate change): an unowned pin used to escalate into a full
+        reconciliation that then refused -- on every run, forever. It is now FINAL:
+        nothing deleted, SKIPPED_NOT_OWNED reported, no escalation."""
         drv = RevokeDriver()
         w, _c = _worker(monkeypatch, driver=drv, users=[])
         full_sync = MagicMock(return_value=True)
@@ -360,16 +363,13 @@ class TestImmediateAuthoritativeRevoke:
         telemetry = MagicMock()
         monkeypatch.setattr(ue._tel, "warn", telemetry)
 
-        assert w._run_standalone_member_revoke(34439) is False
+        assert w._run_standalone_member_revoke(34439) is True
 
         assert drv.delete_calls == []
         assert drv.push_calls == []
-        full_sync.assert_called_once_with(
-            reason="revoke-ownership-missing",
-            revoked_ids={34439},
-        )
+        full_sync.assert_not_called()
         assert any(
-            call.args and call.args[0] == "MEMBER_REVOKE_OWNERSHIP_MISSING"
+            call.args and call.args[0] == "MEMBER_REVOKE_SKIPPED_NOT_OWNED"
             for call in telemetry.call_args_list
         )
 
@@ -383,15 +383,13 @@ class TestImmediateAuthoritativeRevoke:
         full_sync = MagicMock(return_value=True)
         monkeypatch.setattr(w, "request_full_sync", full_sync)
 
-        assert w._run_standalone_member_revoke(34439) is False
+        # P3a-2 item 4: finished as SKIPPED_NOT_OWNED instead of an endless escalation.
+        assert w._run_standalone_member_revoke(34439) is True
 
         assert drv.delete_calls == []
         assert drv.push_calls == []
         assert "34439" in fstate.rows
-        full_sync.assert_called_once_with(
-            reason="revoke-ownership-missing",
-            revoked_ids={34439},
-        )
+        full_sync.assert_not_called()
 
     def test_total_failure_keeps_local_state_and_requests_full_reconciliation(
             self, monkeypatch, fstate, tracked_revocation_state):
@@ -486,16 +484,18 @@ class TestAuthoritativeFullSyncRetry:
 
     def test_full_reconcile_does_not_delete_pin_from_failed_first_push(
             self, monkeypatch, fstate):
+        """P3a-2 item 4 (deliberate change): this pass used to return before pushing
+        anything (and fail forever). The unowned pin is still never deleted, but it is
+        dropped from the pass as SKIPPED_NOT_OWNED and the rest of the roster is pushed."""
         drv = RevokeDriver()
         w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "active", "")])
         fstate.rows["34439"] = ("attempted-hash", False, None)
 
         result = _authoritative_full_sync(w, 34439)
 
-        self._assert_unconfirmed(result, 34439)
+        assert result["ok"] is True and "revoked_ids" not in result
         assert drv.delete_calls == []
-        assert drv.push_calls == []
-        assert "34439" in fstate.rows
+        assert {u["pin"] for c in drv.push_calls for u in c["users"]} == {"30001"}
 
     def test_bulk_safety_refusal_requeues_explicit_revocation_without_advancing_hash(
             self, monkeypatch, fstate):
@@ -567,14 +567,13 @@ class TestAuthoritativeFullSyncRetry:
             revoked_ids={34439},
         ) is True
         assert w._drain_full_sync_commands(limit=1) == 1
-        assert scheduler._drain_pending_sync_request() == (
-            None,
-            {34439},
-            {9},
-            "fast_patch_bundle",
-            False,
-        )
+        # P3a-2 item 4 (deliberate change): 34439 has no row -- not provably ours -- so
+        # the pass skips it (final) instead of failing and re-queueing it forever.
+        assert scheduler._drain_pending_sync_request() is None
+        assert scheduler._last_hash[9] == "blocked-hash"
+        assert drv.delete_calls == []
 
+        # A LATER revocation, once MonClub does own the pin, still removes it.
         fstate.rows["34439"] = ("old-hash", True, {0})
         assert w.request_member_revoke(34439) is True
         assert w.request_full_sync(
@@ -632,6 +631,9 @@ class TestAuthoritativeFullSyncRetry:
             driver=drv,
             users=[_user(30001, "active", ""), _user(34439, "revoked", "")],
         )
+        # Owned: an unowned pin would be SKIPPED_NOT_OWNED (final) since P3a-2 item 4,
+        # and this test is about redelivering a revocation that is still pending.
+        fstate.rows["34439"] = ("old-hash", True, {0})
         drv.push_roster = MagicMock(return_value={
             "ok": False,
             "pushed": 0,

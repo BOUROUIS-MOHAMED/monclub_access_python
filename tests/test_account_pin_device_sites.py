@@ -180,6 +180,9 @@ class TestTargetedPullSdkMemberSync:
         _cache(sqlite_db, [_ali_gym(), _sonia()])
         _cache(sqlite_db, [], valid_ids=[31000])          # Sonia's membership revoked
         assert sqlite_db.list_sync_users_by_active_membership_ids([5]) == []
+        # P3a-2 item 8: only a pin MonClub owns is deleted (this test used to delete 777
+        # with no ownership row at all -- see test_revoke_ownership_skip.py).
+        sqlite_db.save_device_sync_state(device_id=1, pin="777", desired_hash="h", ok=True, error=None)
         sdk = _sdk()
 
         _engine().sync_member_on_connected_sdk(

@@ -214,6 +214,17 @@ _FULL_REVOKE_ACTIVE = "active"
 _FULL_REVOKE_RETRY = "retry"
 
 
+def _revoke_skipped_not_owned(engine: Any) -> bool:
+    """True when DeviceSyncEngine's last targeted revoke was SKIPPED_NOT_OWNED.
+
+    That call returns False (nothing was removed, never a false success); this tells
+    the caller the False is FINAL -- MonClub cannot prove it wrote the pin, so no
+    retry could ever delete it -- rather than a failure to retry. An engine without
+    the marker (or any other outcome) keeps the old fail-closed retry.
+    """
+    return getattr(engine, "_last_member_sync_outcome", None) == _push_safety.SKIPPED_NOT_OWNED
+
+
 @dataclass(frozen=True)
 class _StandalonePinRemovalResult:
     """Affirmatively confirmed outcomes from one standalone removal pass."""
@@ -1182,6 +1193,25 @@ class UltraDeviceWorker(threading.Thread):
         with self._member_sync_lock:
             return set(member_ids) & getattr(self, "_confirmed_member_revoke_ids", set())
 
+    def _note_revoke_skipped(self, member_id: int) -> None:
+        """Remember a SKIPPED_NOT_OWNED revocation for the pass's push-batch note.
+
+        Report-only (P3a-2, item 9): the device-side telemetry was already emitted by
+        whoever decided the skip. Bounded so a long-running worker cannot grow it.
+        """
+        skipped = getattr(self, "_skipped_revoke_ids", None)
+        if skipped is None:
+            skipped = []
+            self._skipped_revoke_ids = skipped
+        if int(member_id) not in skipped:
+            skipped.append(int(member_id))
+            del skipped[:-50]
+
+    def _take_skipped_revokes(self) -> list[int]:
+        skipped = list(getattr(self, "_skipped_revoke_ids", None) or [])
+        self._skipped_revoke_ids = []
+        return skipped
+
     def _finalize_targeted_member_revoke(self, member_id: int, *, ok: bool) -> None:
         """Release targeted ACTIVE ownership or atomically restore queue ownership."""
         normalized_member_id = int(member_id)
@@ -1709,6 +1739,11 @@ class UltraDeviceWorker(threading.Thread):
                     if is_revocation:
                         if member_sync_ok:
                             self._finalize_targeted_member_revoke(member_id, ok=True)
+                        elif _revoke_skipped_not_owned(engine):
+                            # FINAL (P3a-2): MonClub cannot prove it wrote that pin, so it
+                            # will never delete it. Finished -- no re-queue, no full sync.
+                            self._note_revoke_skipped(member_id)
+                            self._finalize_targeted_member_revoke(member_id, ok=True)
                         else:
                             self._finalize_targeted_member_revoke(member_id, ok=False)
                             self.request_full_sync(
@@ -2155,46 +2190,37 @@ class UltraDeviceWorker(threading.Thread):
             revoked_pin_of = self._device_pins_for_members(
                 unconfirmed_revoked_ids, users=list(getattr(cache, "users", []) or []),
             )
+        # Ownership of the pins those revocations name (P3a-2 item 4, guide §3.4).
+        # Only an UNREADABLE state still refuses the pass before any device I/O: that
+        # is "cannot tell", never "not ours". A pin MonClub provably does not own --
+        # an unconfirmed row (a failed first push) or no row at all (a foreign or
+        # never-pushed user) -- used to refuse the whole pass here, or abort the whole
+        # revoke pass after the push, on every full sync, forever. It is now dropped
+        # from the pass as SKIPPED_NOT_OWNED once the desired roster is known (below).
+        owned_for_revokes: set[str] | None = None
+        revoke_rows_seen: set[str] = set()
         if unconfirmed_revoked_ids:
             try:
                 from app.core.db import list_device_sync_hashes_and_status
                 from app.core.db import list_confirmed_device_sync_pins
-                sync_state = list_device_sync_hashes_and_status(
-                    device_id=self._device_id,
-                ) or {}
-                confirmed_pins = list_confirmed_device_sync_pins(
-                    device_id=self._device_id,
-                ) or set()
+                revoke_rows_seen = {
+                    str(pin).strip()
+                    for pin in (list_device_sync_hashes_and_status(device_id=self._device_id) or {})
+                }
+                owned_for_revokes = {
+                    str(pin).strip()
+                    for pin in (list_confirmed_device_sync_pins(device_id=self._device_id) or set())
+                    if str(pin).strip()
+                }
             except Exception:
-                sync_state = None
-                confirmed_pins = None
+                owned_for_revokes = None
                 logger.warning(
                     "%s standalone full sync skipped: ownership state unreadable "
                     "for explicit revocation(s)",
                     self._prefix,
                     exc_info=True,
                 )
-            confirmed = (
-                {str(pin).strip() for pin in confirmed_pins}
-                if confirmed_pins is not None
-                else set()
-            )
-            missing_pins = {
-                pin
-                for pin in revoked_pin_of.values()
-                if (
-                    sync_state is None
-                    or pin in sync_state
-                )
-                and pin not in confirmed
-            }
-            if missing_pins:
-                logger.warning(
-                    "%s standalone full sync skipped: no MonClub ownership proof "
-                    "for explicit pin(s) %s",
-                    self._prefix,
-                    ",".join(sorted(missing_pins)),
-                )
+            if owned_for_revokes is None and revoked_pin_of:
                 error = "authoritative revocation ownership unconfirmed"
                 self._mark_full_sync_finished(
                     reason=reason,
@@ -2233,6 +2259,10 @@ class UltraDeviceWorker(threading.Thread):
         batch_attempted = 0
         skipped_unchanged = 0
         skipped_note = ""
+        # Explicit revocations of pins MonClub cannot prove it owns: dropped from this
+        # pass as SKIPPED_NOT_OWNED (final). {membership_id: pin}. P3a-2 item 4.
+        skipped_revokes: Dict[int, str] = {}
+        self._last_revoke_aborted = 0
         desired_pins: list[str] = []
         try:
             self._last_standalone_roster_stats = None
@@ -2240,6 +2270,18 @@ class UltraDeviceWorker(threading.Thread):
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
             _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
             roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
+            if unconfirmed_revoked_ids and owned_for_revokes is not None:
+                # A pin still in the desired roster is not a removal (ACCOUNT: the person
+                # keeps another plan and is re-pushed), so only a pin that LEFT it and is
+                # not owned is skipped. Decided before the push, so a failed push cannot
+                # turn it back into a retry.
+                _desired_set = {p for p in desired_pins if p}
+                for _m, _pin in sorted(revoked_pin_of.items()):
+                    if (_m in unconfirmed_revoked_ids and _pin not in _desired_set
+                            and _pin not in owned_for_revokes):
+                        skipped_revokes[_m] = _pin
+                if skipped_revokes:
+                    self._skip_unowned_revocations(skipped_revokes, revoke_rows_seen)
             # EnableDevice bracketing is DELIBERATELY OFF, including for an explicit
             # full reconcile. Plan decision D6 said the nightly/manual reconcile would
             # bracket, but it never once executed (the condition was a dead reason
@@ -2372,13 +2414,14 @@ class UltraDeviceWorker(threading.Thread):
                             desired_pins=desired_pins,
                             roster_count=len(users),
                             required_pins=self._required_revocation_pins(
-                                unconfirmed_revoked_ids, desired_pins, revoked_pin_of,
+                                unconfirmed_revoked_ids - set(skipped_revokes),
+                                desired_pins, revoked_pin_of,
                             ),
                         )
                     except Exception as exc:
                         logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
                         safe_to_prune = False
-                if unconfirmed_revoked_ids and not safe_to_prune:
+                if (unconfirmed_revoked_ids - set(skipped_revokes)) and not safe_to_prune:
                     sync_ok = False
                     sync_error = "authoritative revocation unconfirmed"
                 # Forget state for pins no longer desired, so a member who leaves and
@@ -2416,7 +2459,17 @@ class UltraDeviceWorker(threading.Thread):
                     duration_ms=int(duration_ms),
                     # A no-op reconcile would otherwise read "0/0 pins" with no
                     # explanation; say why nothing was sent.
-                    error_message=(sync_error or skipped_note or None),
+                    error_message=(_push_safety.join_notes(
+                        sync_error or skipped_note or "",
+                        _push_safety.outcome_note(
+                            _push_safety.REVOKE_ABORTED, self._last_revoke_aborted,
+                            "standalone_revoke",
+                        ) if getattr(self, "_last_revoke_aborted", 0) else "",
+                        _push_safety.outcome_note(
+                            _push_safety.SKIPPED_NOT_OWNED, len(skipped_revokes),
+                            "pins " + ",".join(sorted(skipped_revokes.values())[:20]),
+                        ) if skipped_revokes else "",
+                    ) or None),
                 )
             except Exception:
                 logger.debug("%s push-batch row not finalised", self._prefix, exc_info=True)
@@ -2425,9 +2478,12 @@ class UltraDeviceWorker(threading.Thread):
                    failed=result.get("failed"), skipped_unchanged=skipped_unchanged)
         self._mark_full_sync_finished(reason=reason, ok=sync_ok,
                                       duration_ms=duration_ms, error=sync_error)
+        # SKIPPED_NOT_OWNED ids were finalised when they were skipped; they must not go
+        # back to the scheduler for a retry that could never succeed.
+        effective_revoked_ids = normalized_revoked_ids - set(skipped_revokes)
         if not sync_ok:
             self._finalize_full_sync_revokes(
-                normalized_revoked_ids,
+                effective_revoked_ids,
                 ok=False,
                 excluded_ids=normalized_excluded_ids,
             )
@@ -2435,7 +2491,7 @@ class UltraDeviceWorker(threading.Thread):
             reason=reason, ok=sync_ok,
             fingerprint_hash=fingerprint_hash if sync_ok else None,
             duration_ms=duration_ms, error=sync_error,
-            revoked_ids=normalized_revoked_ids if not sync_ok else set(),
+            revoked_ids=effective_revoked_ids if not sync_ok else set(),
         )
         if sync_ok:
             self._finalize_full_sync_revokes(
@@ -2443,6 +2499,31 @@ class UltraDeviceWorker(threading.Thread):
                 ok=True,
                 excluded_ids=normalized_excluded_ids,
             )
+
+    def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> None:
+        """Drop explicit revocations of pins MonClub cannot prove it owns (FINAL).
+
+        Never deletes, never neutralises: those pins may be another system's users on a
+        shared terminal. The physical-revoke phase is finalised as done so no later
+        full sync retries it; the roster exclusion stays with the pass, so the member is
+        still never re-pushed from a stale snapshot. Contrast REVOKE_ABORTED (retryable).
+        """
+        for member_id, pin in sorted(skipped.items()):
+            row = "unconfirmed" if pin in rows_seen else "absent"
+            logger.critical(
+                "%s revocation SKIPPED_NOT_OWNED: membership %s pin %s (%s row) -- MonClub "
+                "has no proof it wrote this device user, so it is never deleted; the rest "
+                "of the pass continues",
+                self._prefix, member_id, pin, row,
+            )
+            try:
+                _tel.warn(
+                    "MEMBER_REVOKE_SKIPPED_NOT_OWNED", worker=self._tel_wid,
+                    member_id=member_id, pin=pin, row=row, protocol="ZK_STANDALONE",
+                )
+            except Exception:
+                pass
+        self._finalize_full_sync_revokes(set(skipped), ok=True, excluded_ids=set())
 
     def _member_row_in_db(self, member_id: int) -> list[Dict[str, Any]] | None:
         """The member's own row, read straight from sync_users. None = read failed.
@@ -2980,22 +3061,25 @@ class UltraDeviceWorker(threading.Thread):
             return False
 
         if pin not in owned:
+            # FINAL (P3a-2 item 4): MonClub cannot prove it wrote this pin, so it never
+            # deletes it -- on a shared terminal it may be another system's user. It used
+            # to escalate into a full sync that then refused (or aborted its whole revoke
+            # pass) on every run, forever. The revocation is finished and reported.
             logger.critical(
-                "%s member revoke refused: no MonClub ownership proof for pin %s",
+                "%s member revoke SKIPPED_NOT_OWNED: no MonClub ownership proof for pin %s "
+                "-- nothing deleted, revocation finished",
                 self._prefix,
                 pin,
             )
             _tel.warn(
-                "MEMBER_REVOKE_OWNERSHIP_MISSING",
+                "MEMBER_REVOKE_SKIPPED_NOT_OWNED",
                 worker=self._tel_wid,
                 member_id=member_id,
                 pin=pin,
+                protocol="ZK_STANDALONE",
             )
-            self.request_full_sync(
-                reason="revoke-ownership-missing",
-                revoked_ids={member_id},
-            )
-            return False
+            self._note_revoke_skipped(member_id)
+            return True
 
         outcome = self._remove_standalone_pins(
             pins=[pin],
@@ -3599,6 +3683,19 @@ class UltraDeviceWorker(threading.Thread):
                         revocation=True,
                     ):
                         self._mark_member_revoke_confirmed(member_id)
+                    elif _revoke_skipped_not_owned(engine):
+                        # FINAL (P3a-2): not ours, never deleted. "Confirmed" here means
+                        # "no physical work left" -- the pass must not fail for it, and the
+                        # scheduler must not re-queue it forever.
+                        self._note_revoke_skipped(member_id)
+                        self._mark_member_revoke_confirmed(member_id)
+                _skipped_now = self._take_skipped_revokes()
+                if _skipped_now:
+                    # Carried into this pass's push-batch note (push-history page).
+                    engine._extra_batch_notes = [_push_safety.outcome_note(
+                        _push_safety.SKIPPED_NOT_OWNED, len(_skipped_now),
+                        "memberships " + ",".join(str(m) for m in sorted(_skipped_now)[:20]),
+                    )]
                 sync_ok = bool(engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
