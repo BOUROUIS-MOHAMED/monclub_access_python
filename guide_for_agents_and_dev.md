@@ -1461,8 +1461,17 @@ Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit cod
 > tests in `test_access_history_unresolved_bound.py` left `list_device_pin_scheme_switches`
 > unpatched and passed only against an already-migrated — the installed — database, and
 > `test_sync_handlers_schedule_expected_trigger_metadata` ran `DELETE FROM sync_version_tokens`
-> on whatever database was active. Both are patched now (commit a87830b). Other tests may still
-> reach the default database; no sweep for them has been done. `[UNVERIFIED]`
+> on whatever database was active. Both are patched now (commit a87830b).
+>
+> **Many other test files still reach the default database.** Run one file at a time, each from
+> a fresh empty `MONCLUB_ACCESS_DATA_ROOT` (2026-09-18, branch `claude/access-loop-retry-fixes`),
+> 33 of the 121 `tests/test_*.py` files created `access/access.db` under that root — i.e. without
+> the variable they open the installed database. Among them: `test_authoritative_revocation_pipeline`,
+> `test_sync_observability` (`::test_main_app_initializes_scheduler_before_first_after`),
+> `test_fast_patch_runtime`, `test_pin_scheme_gate`, `test_ultra_engine`,
+> `test_ultra_sync_scheduler`, `test_zk_standalone_driver`, `test_device_sync_protocol_guard`,
+> `test_standalone_*`, `test_account_pin_*`. All 121 pass alone. Whether each one only reads, or
+> also writes, has not been established per test. `[TEST: the sweep; UNVERIFIED per-test writes]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
