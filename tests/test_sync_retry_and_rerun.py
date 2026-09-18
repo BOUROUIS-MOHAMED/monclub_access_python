@@ -564,7 +564,7 @@ def test_the_startup_schedule_uses_the_ensure_only_rearm() -> None:
 
 def test_a_short_healthy_interval_does_not_raise_the_outage_reconcile_rate(monkeypatch, tmp_path) -> None:
     """At agentSyncBackendRefreshMin=1 the retries run at the 60 s healthy interval, but the
-    offline reconcile keeps the old outage ceiling of one per 600 s."""
+    offline reconcile keeps the old outage cadence of one per 600 s."""
     h = _Harness(monkeypatch, tmp_path, refresh_min=1)
     engine = _with_device_mode_panel(monkeypatch, h)
     h.tick()
@@ -703,3 +703,23 @@ def test_an_explicit_request_replaces_a_waiting_automatic_one(harness) -> None:
                              trigger_hint={"hardReset": True})
 
     assert harness.app._pending_sync_context.run_type == "HARD_RESET"
+
+
+
+def test_at_30_min_an_outage_still_reconciles_every_600s_as_before(monkeypatch, harness) -> None:
+    """The gate is the old outage cadence, not the healthy interval: a retry tick 600 s after
+    the last reconcile reconciles, exactly when the old ~600 s failed ticks did."""
+    engine = _with_device_mode_panel(monkeypatch, harness)
+    harness.tick()
+    harness.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 1
+
+    harness.app._last_tick_device_reconcile_mono -= 599
+    harness.tick()
+    harness.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 1
+
+    harness.app._last_tick_device_reconcile_mono -= 2
+    harness.tick()
+    harness.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 2

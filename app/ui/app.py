@@ -125,10 +125,10 @@ WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 _SCHED_MAX_SLEEP_SEC = 0.05
 _SCHED_MIN_SLEEP_SEC = 0.001
 
-# After a failed getSyncData, the cached-roster DEVICE-mode reconcile runs no more often than
-# once per max(healthy interval, this): 600 s is the ceiling of the pre-2026-09-18 outage cadence,
-# so short healthy intervals do not raise the panels' outage load above what it was.
-_OFFLINE_RECONCILE_MIN_INTERVAL_SEC = 600
+# After a failed getSyncData, the cached-roster DEVICE-mode reconcile runs at most once per this
+# many seconds: the pre-2026-09-18 outage cadence (failed ticks every ~600 s), so the fast
+# failure retries neither raise nor lower the panels' outage load.
+_OFFLINE_RECONCILE_INTERVAL_SEC = 600
 
 # A mid-sync request's re-run waits until the ULTRA reconnect deferral the previous sync set
 # (_defer_ultra_reconnects, 20 s) has lapsed, plus this margin: a deferred ULTRA worker re-checks
@@ -2492,13 +2492,11 @@ class MainApp:
 
         Failed syncs retry fast (app.core.sync_retry), but the cached-roster reconcile each
         would dispatch opens a PullSDK session per DEVICE-mode panel (and wipes and re-pushes a
-        FULL_REPLACE panel). Keep that at the healthy cadence and never above the old outage
-        cadence: only when the tick that last dispatched it started at least
-        max(healthy interval, _OFFLINE_RECONCILE_MIN_INTERVAL_SEC) ago.
+        FULL_REPLACE panel). Keep that at the old outage cadence: only when the tick that last
+        dispatched it started at least _OFFLINE_RECONCILE_INTERVAL_SEC ago.
         """
         last = self._last_tick_device_reconcile_mono
-        interval = max(self._sync_base_interval_sec(), _OFFLINE_RECONCILE_MIN_INTERVAL_SEC)
-        return last is None or time.monotonic() - last >= interval
+        return last is None or time.monotonic() - last >= _OFFLINE_RECONCILE_INTERVAL_SEC
 
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).

@@ -1106,34 +1106,48 @@ DEVICE-mode panels from the cached roster (`DeviceSyncEngine.run_blocking(change
 per PullSDK panel a connect, a full Pin read and `SetDeviceParam` writes; a FULL_REPLACE panel is
 wiped and re-pushed. So the fast retries must not each do it: an *automatic* failed tick
 dispatches it only if the tick that last dispatched it **started** at least
-max(healthy interval, `_OFFLINE_RECONCILE_MIN_INTERVAL_SEC` = 600 s) ago
-(`_last_tick_device_reconcile_mono`). Timer ticks start one interval apart, so with the default
-30 min interval a failure on the next healthy tick still reconciles exactly as before. Explicit
-syncs (`is_explicit_user_sync`) and every successful tick are unchanged. During an outage the
-panels therefore see at most min(healthy rate, 6/h), never more than the old code's outage
-cadence (1800 s once, then ~600 s); simulated steady outage rates were 6.0/h at 1–2 min, 4.8/h at
-5–10 min, 3.4/h at 15 min, ~2/h at 30 min. The flip side, a behaviour change: at a 30 min interval
-the cached-roster reconcile runs every ~30 min during an outage instead of every ~10 min, and at
-1–5 min the first outage reconcile comes ~11–14 min after the last one instead of on the next
-tick. Anything that only a reconcile applies — e.g. a `VALID_ONLY` panel dropping a member whose
-membership expired while offline (`device_sync.py`, policy handling) — is correspondingly later
-during an outage, at the healthy cadence rather than faster than it. `[UNVERIFIED]` whether any
-gym relies on the old faster offline cadence. (A healthy tick with no
-member delta already runs this same full reconcile, so a short interval means that load anyway
-while online.) AGENT and ULTRA
-devices, ZK_STANDALONE terminals, RTLog and QR/TOTP rescue get no device I/O from a failed tick.
-`[CODE: app.py::_offline_device_reconcile_due and its call in _sync_tick's work()]`
+`_OFFLINE_RECONCILE_INTERVAL_SEC` = 600 s ago (`_last_tick_device_reconcile_mono`) — the old
+outage cadence, whatever the healthy interval. A healthy timer tick starts at least one interval
+after the previous tick, so with the 30 min default a failure on it still reconciles exactly as
+before. Explicit syncs (`is_explicit_user_sync`) and every successful tick are unchanged.
+AGENT and ULTRA devices, ZK_STANDALONE terminals, RTLog and QR/TOTP rescue get no device I/O from
+a failed tick. `[CODE: app.py::_offline_device_reconcile_due and its call in _sync_tick's work()]`
 `[TEST: ::test_retry_ticks_during_an_outage_do_not_repeat_the_device_reconcile,
 ::test_the_first_failed_healthy_tick_after_a_reconcile_still_reconciles,
-::test_an_explicit_sync_still_reconciles_while_the_backend_is_down,
-::test_a_short_healthy_interval_does_not_raise_the_outage_reconcile_rate]`
+::test_at_30_min_an_outage_still_reconciles_every_600s_as_before,
+::test_a_short_healthy_interval_does_not_raise_the_outage_reconcile_rate,
+::test_an_explicit_sync_still_reconciles_while_the_backend_is_down]`
 
-Backend traffic during an outage, per PC: one `getSyncData` per failed tick, plus one
+Simulated 6 h outage (virtual clock, the real `sync_retry_delay_sec`, 2 s per failed tick; old =
+the fecae45 formula), failed ticks/h and DEVICE reconciles/h:
+
+| `agentSyncBackendRefreshMin` | old ticks = reconciles | new ticks | new reconciles |
+|---|---|---|---|
+| 1 | 6.5/h | 58.3/h | 5.8/h |
+| 2 | 6.3/h | 30.0/h | 6.0/h |
+| 5–15 | 6.0–6.2/h | 13.2/h | 4.7/h |
+| 30 (all four gyms) | 5.7/h (4 in hour 1) | 13.2/h (16 in hour 1) | 4.7/h (5 in hour 1) |
+
+So panels see no more outage reconciles than before, at any setting. `[TEST: simulation, not in
+the repo; UNVERIFIED on hardware]`
+
+**Backend traffic during an outage, per PC:** one `getSyncData` per failed tick, plus one
 `POST /public/account/refresh` whenever the refresh deadline has passed (a failed refresh does
-not advance it, so every retry then pays both). At 30 min that is ~16 attempts in the first
-outage hour and ~12.6/h after, against 4 and ~6/h before; the rate never exceeds the healthy
-one, and at a 1-min interval it is ~60/h as when healthy (old: ~6.5/h). A revoked session (401)
-retries on the same schedule indefinitely, as it did at ~600 s before. `[CODE]`
+not advance it, so every retry then pays both). The retry delay never exceeds the healthy
+interval, so retries are never *slower* than healthy polling — and at 30 min they are faster:
+~16 attempts in the first outage hour, then ~12.6/h, against 4 and ~6/h before (at 1 min, ~60/h
+as when healthy, against ~6.5/h before). A revoked session (401) retries on the same schedule
+indefinitely, as it did at ~600 s before. `[CODE]`
+
+Against the backend's limits: the per-account `RateLimitFilter` bucket is 200 requests / 60 s
+(`application.yml` defaults), and the Hikari pool is 25 connections (`DB_HIKARI_MAX_POOL`
+default). The fleet is 5 devices on a handful of PCs (`[UNVERIFIED]` exact count). The busiest
+retry minute is the first one: ≤ 2 requests (sync + refresh) per PC at ~15 s, i.e. a gym with 3
+PCs sends ≤ 6 requests in that window — ~3 % of its bucket; steady state is ≤ 2 requests per PC
+per ~300 s. Each request holds a pool connection only while the backend handles it, so even if
+every PC of every gym retried at the same instant after a backend restart, that is ≤ 2 × the PC
+count concurrent connections, far below 25; the ±20 % jitter spreads the first retry over
+12–18 s. `[CODE: backend RateLimitProperties, application.yml; client sync_retry.py]`
 
 **A worker thread that cannot start** (`RuntimeError: can't start new thread` at the 32-bit
 ceiling) no longer leaves `_sync_work_running` True forever: the flag is cleared, the request
@@ -1469,7 +1483,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1846 passed** (2026-09-18,
+background-thread exceptions are promoted to failures. Last run: **1847 passed** (2026-09-18,
 branch `claude/access-loop-retry-fixes`: §3.6 loop and sync timer, §3.7 optional content; with
 the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
 Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). `[TEST]`
