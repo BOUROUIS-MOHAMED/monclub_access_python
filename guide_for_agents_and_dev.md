@@ -1722,10 +1722,14 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1847 passed** (2026-09-18,
-branch `claude/access-loop-retry-fixes`: §3.6 loop and sync timer, §3.7 optional content; with
-the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
-Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **1924 passed** (2026-09-18,
+branch `claude/p3a1-qr-door-history` at 2b25183: §3.1a door-open deadline, §3.1b QR roster check,
+§3.5 409 isolation — 1847 on its base `claude/access-loop-retry-fixes`; with the CLAUDE.md command
+`python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv` Python 3.11,
+`MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). `[TEST]`
+`tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`
+failed once in a reviewer's `-x` run and passed alone and in every full run; no `app/sdk` file
+changed on this branch. `[UNVERIFIED]` whether it is timing-flaky.
 
 > **Run the suite with `MONCLUB_ACCESS_DATA_ROOT` pointing at an empty scratch folder.** It
 > moves the whole data root (`app/core/utils.py::_candidate_data_roots`), so a test that forgets
