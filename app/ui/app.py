@@ -97,6 +97,7 @@ from access.api import LocalAccessApiServerV2
 from shared.api.monclub_api import MonClubApi, MonClubApiConflictError, MonClubApiHttpError
 from app.core.change_detector import ChangeDetectorService
 from app.core.log_sync_request_poller import LogSyncRequestPoller
+from app.core.sync_retry import sync_retry_delay_sec
 from app.core.sync_observability import (
     SyncTriggerContext,
     build_sync_response_summary,
@@ -606,7 +607,10 @@ class MainApp:
         self._sync_work_running = False
         self._pending_sync_context: SyncTriggerContext | None = None
         self._startup_sync_pending = True
-        self._sync_fail_count = 0  # consecutive sync failures for exponential backoff
+        self._sync_fail_count = 0  # consecutive getSyncData failures (drives the retry schedule)
+        self._sync_retry_after_sec: float | None = None  # backend Retry-After from the last failure
+        # Set when a sync is requested while one is running; the finishing sync re-runs once.
+        self._sync_rerun_requested = False
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -2393,7 +2397,12 @@ class MainApp:
             )
         self.after(50, self._sync_tick)
 
-    def reschedule_sync_timer(self):
+    def reschedule_sync_timer(self, *, after_failure: bool = False):
+        """Arm the one periodic sync timer.
+
+        Normally the healthy interval. With after_failure=True (the loop thread, once a failed
+        sync has finished) the failure-retry delay from app.core.sync_retry instead.
+        """
         if self._sync_after_id is not None:
             try:
                 self.after_cancel(self._sync_after_id)
@@ -2419,25 +2428,57 @@ class MainApp:
             interval_cfg = getattr(self.cfg, "sync_interval_sec", 60)
             base_interval = int(max(10, int(interval_cfg)))
 
-        # Exponential backoff on consecutive failures (cap at 10 min)
-        if self._sync_fail_count > 0:
-            import random
-            backoff = min(base_interval * (2 ** self._sync_fail_count), 600)
-            interval = int(backoff) + random.randint(0, 10)  # jitter
+        if after_failure:
+            interval = sync_retry_delay_sec(
+                self._sync_fail_count,
+                base_interval,
+                retry_after_sec=self._sync_retry_after_sec,
+            )
+            self._sync_after_id = self.after(int(interval * 1000), self._sync_tick)
+            self.logger.info(
+                "Sync retry in %.0fs (fails=%s, retry_after=%s, healthy=%ss)",
+                interval, self._sync_fail_count, self._sync_retry_after_sec, base_interval,
+            )
         else:
-            interval = base_interval
+            self._sync_after_id = self.after(base_interval * 1000, self._sync_tick)
+            self.logger.info(f"Sync scheduled every {base_interval} sec")
 
-        self._sync_after_id = self.after(interval * 1000, self._sync_tick)
+    def _on_sync_work_finished(self):
+        """Loop-thread follow-up to a finished sync worker (posted from its finally).
+
+        After a failure: re-arm the timer to the retry schedule. The pending request context,
+        if any, is kept for that retry tick. After a success: the healthy timer armed when the
+        tick started stands, and a sync requested while this one ran starts now -- once.
+        """
+        rerun = self._sync_rerun_requested
+        self._sync_rerun_requested = False
+        if self._sync_work_running:
+            # A newer sync started before this callback ran; its own completion decides.
+            return
         if self._sync_fail_count > 0:
-            self.logger.info(f"Sync scheduled in {interval}s (backoff, fails={self._sync_fail_count})")
-        else:
-            self.logger.info(f"Sync scheduled every {interval} sec")
+            self.reschedule_sync_timer(after_failure=True)
+            return
+        if rerun and self._pending_sync_context is not None:
+            self.logger.info(
+                "Sync re-run: requested while the previous sync was running (trigger=%s)",
+                self._pending_sync_context.trigger_source,
+            )
+            self.after(0, self._sync_tick)
 
     def _sync_tick(self):
         self.reschedule_sync_timer()
 
         if self._sync_work_running:
-            self.logger.debug("Sync skipped: previous sync tick still running")
+            if self._pending_sync_context is not None:
+                # A request (sync now, change detector, daily, fast patch...) arrived mid-sync.
+                # Its context stays pending; the running sync re-runs once when it finishes.
+                self._sync_rerun_requested = True
+                self.logger.info(
+                    "Sync requested while previous sync still running; will re-run when it finishes (trigger=%s)",
+                    self._pending_sync_context.trigger_source,
+                )
+            else:
+                self.logger.debug("Sync skipped: previous sync tick still running")
             return
 
         auth = load_auth_token()
@@ -2793,7 +2834,8 @@ class MainApp:
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = True
                 self._last_sync_error = None
-                self._sync_fail_count = 0  # reset backoff on success
+                self._sync_fail_count = 0  # reset the retry schedule on success
+                self._sync_retry_after_sec = None
 
             except Exception as ex:
                 self.logger.exception(f"getSyncData failed: {ex} (using cached data if available)")
@@ -2802,7 +2844,8 @@ class MainApp:
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = False
                 self._last_sync_error = sync_error_message
-                self._sync_fail_count = min(self._sync_fail_count + 1, 6)  # cap exponent
+                self._sync_fail_count = min(self._sync_fail_count + 1, 6)  # cap the counter
+                self._sync_retry_after_sec = getattr(ex, "retry_after_sec", None)
 
             # Device sync (DEVICE-mode devices only)
             try:
@@ -3197,8 +3240,19 @@ class MainApp:
                 except Exception as _fin_ex:
                     self.logger.warning("[SyncHistory] Safety-net finalization failed: %s", _fin_ex)
                 self._sync_work_running = False
+                # Timer re-arm and any re-run happen on the loop thread, not here.
+                self.after(0, self._on_sync_work_finished)
         self._sync_work_running = True
-        threading.Thread(target=_work_guarded, daemon=True).start()
+        try:
+            threading.Thread(target=_work_guarded, daemon=True).start()
+        except Exception:
+            # e.g. "can't start new thread" at the 32-bit address ceiling. Without this the
+            # flag would stay True and every later sync would be skipped for good.
+            self._sync_work_running = False
+            if self._pending_sync_context is None:
+                self._pending_sync_context = trigger_context
+            self.logger.exception("Sync worker thread could not start; retrying soon")
+            self.reschedule_sync_timer(after_failure=True)
 
     # ======================= Access rules =======================
     def _restriction_reasons(self) -> list[str]:

@@ -10,6 +10,7 @@ from urllib.parse import quote
 import requests
 
 from app.core import telemetry as _tel
+from app.core.sync_retry import parse_retry_after_sec
 
 
 @dataclass
@@ -353,7 +354,17 @@ class MonClubApi:
             extra = _extract_trace_info(txt)
             self.logger.info(extra)
             self.logger.debug("getSyncData response body: %s", txt[:500])
-            raise MonClubApiError(f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}{extra}")
+            # HttpError (a MonClubApiError) so the sync scheduler can see the status and, for a
+            # 429/503, the backend's Retry-After (app.core.sync_retry).
+            err = MonClubApiHttpError(
+                f"getSyncData failed: HTTP {r.status_code} -> {txt[:400]}{extra}",
+                status_code=r.status_code,
+                body=txt[:400],
+            )
+            err.retry_after_sec = None
+            if r.status_code in (429, 503):
+                err.retry_after_sec = parse_retry_after_sec((r.headers or {}).get("Retry-After"))
+            raise err
 
         try:
             data = r.json()
