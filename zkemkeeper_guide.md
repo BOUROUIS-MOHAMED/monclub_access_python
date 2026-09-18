@@ -548,8 +548,10 @@ zk.GetSysOption(1, "~ZKFPVersion", out)   # fingerprint ALGORITHM version, e.g. 
 zk.GetDeviceStatus(1, int(idx), box)      # occupancy / capacity
 ```
 Both try **two win32com shapes** (`VARIANT` ByRef, then a returned tuple) because the
-mapping differs across builds, and give up quietly. Best-effort diagnostics, never
-gates. `[CODE]`
+mapping differs across builds, and give up quietly. At connect they are best-effort
+diagnostics. Since P3a-2 the same reads also run in `read_capacity()` (indices 10, 11 and the
+version, one STA command) before a push that needs a new slot, and the engine GATES on them —
+only when readable: an unreadable value is never a refusal (`guide_for_agents_and_dev.md` §3.4d). `[CODE]`
 
 `_STATUS_FIELDS` has **FOURTEEN** entries — indices **1–12 and 21–22**. `[CODE]`
 
@@ -911,6 +913,7 @@ owns_event_source = True                            # [CODE]
 supports_device_params = False                      # [CODE]
 supports_open_door = _OPEN_DOOR_FAMILY_DEFAULT      # [CODE] True; re-resolved per instance — see below and §8
 supports_transaction_table = False                  # [CODE]
+supports_capacity_check = True                      # [CODE] P3a-2: read_capacity(), §3.4d of the main guide
 ```
 
 `supports_open_door` is **not a constant on this driver**. Every instance sets it in
@@ -1105,7 +1108,8 @@ From this file: `ZKEM_PUSH_DONE`, `ZKEM_PUSH_CHUNK`, `ZKEM_PUSH_FAILED_PINS`,
 `ZKEM_PUSH_TPL_REFUSED`, `ZKEM_TPL_VERSION_MISMATCH`, `ZKEM_PUSH_WEDGED`,
 `ZKEM_PUSH_RECONNECT`, `ZKEM_PUSH_ABANDONED`, `ZKEM_DEVICE_COUNTERS`,
 `ZKEM_DELETE_DONE`, `ZKEM_PIN_UNMAPPED`, `ZKEM_STA_WEDGED`, `ZKEM_EVT_SINK_DOWN`,
-`DOOR_OPEN`, `DOOR_OPEN_SWITCH`. All keyed `worker=ZKEM:<device id>`. `[CODE]`
+`DOOR_OPEN`, `DOOR_OPEN_SWITCH`, and (P3a-2) `TEMPLATE_VERSION_MISMATCH`. All keyed
+`worker=ZKEM:<device id>`. `[CODE]`
 
 **The push loop must not gain a per-member or per-finger telemetry line.** §2 is the
 reason: the STA loop services **one command with no COM pump for its duration**, and

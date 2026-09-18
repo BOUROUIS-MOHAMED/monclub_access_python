@@ -103,6 +103,27 @@ def _digits_only(v: Any) -> str:
     return "".join(ch for ch in str(v or "") if ch.isdigit())
 
 
+def _parse_version_int(v: Any) -> Optional[int]:
+    """The first integer in a version string ("10" -> 10, "ZKFinger VX10.0" -> 10);
+    None when there is none (an unreadable version gates nothing)."""
+    import re as _re
+    m = _re.search(r"\d+", str(v if v is not None else ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except ValueError:
+        return None
+
+
+def _versions_disagree(device_version: Optional[int], template_version: Any) -> bool:
+    """True only when BOTH versions are known and differ (P3a-2 item 7)."""
+    if device_version is None:
+        return False
+    tv = _parse_version_int(template_version)
+    return tv is not None and tv != device_version
+
+
 _OPEN_DOOR_ENV_VAR = "MONCLUB_ZK_STANDALONE_OPEN_DOOR"
 # Key under which the persisted per-device switch (db.device_local_settings, projected
 # by db.list_sync_devices_payload / get_sync_device_payload) travels in the device
@@ -323,6 +344,11 @@ class ZKStandaloneDevice:
     # get_table_count / delete_all_transaction_rows are all inert, so callers
     # must SKIP this device rather than act on their return values.
     supports_transaction_table = False
+    # P3a-2 item 7: read_capacity() reports free user / fingerprint slots and the
+    # fingerprint algorithm version, re-read before a push that adds users or
+    # fingers. PullSDKDevice has no such signal in this repo and does not declare it
+    # (callers read getattr(driver, "supports_capacity_check", False)).
+    supports_capacity_check = True
 
     def __init__(self, device_payload: Dict[str, Any], logger_inst: Any = None, *, logger: Any = None):
         # accept both kw spellings so get_driver(logger=...) works
@@ -740,6 +766,7 @@ class ZKStandaloneDevice:
         agg_tpl_ok = 0
         agg_del_attempted = 0
         agg_del_ok = 0
+        agg_tpl_version_skipped = 0
         consecutive_wedges = 0
         total = len(users)
         # Trace budgets span the WHOLE roster, not one chunk.
@@ -890,6 +917,7 @@ class ZKStandaloneDevice:
                 agg_tpl_ok += int(res.get("tpl_ok") or 0)
                 agg_del_attempted += int(res.get("del_attempted") or 0)
                 agg_del_ok += int(res.get("del_ok") or 0)
+                agg_tpl_version_skipped += int(res.get("tpl_version_skipped") or 0)
                 _tel.event(
                     "ZKEM_PUSH_CHUNK", worker=self._tel_wid, chunk=idx, chunks=len(chunks),
                     members=len(part),
@@ -950,6 +978,13 @@ class ZKStandaloneDevice:
                        op="del_user_tmp_ext",
                        del_attempted=agg_del_attempted, del_ok=agg_del_ok,
                        not_attempted=agg["not_attempted"] or None)
+            if agg_tpl_version_skipped:
+                # P3a-2 item 7: once per push, never per finger inside the STA loop.
+                _tel.warn(
+                    "TEMPLATE_VERSION_MISMATCH", worker=self._tel_wid,
+                    skipped=agg_tpl_version_skipped,
+                    device_fp_version=getattr(self, "_device_fp_version", "") or None,
+                )
             # WHICH pins did not land, and WHY. One line, so "was pin X pushed?"
             # is a single grep. A pin with no recorded reason came from a WEDGED
             # chunk -- nothing in that chunk was confirmed -- which is itself the
@@ -987,6 +1022,20 @@ class ZKStandaloneDevice:
         except Exception as exc:
             self.logger.warning("%s list_device_users failed: %s", self._prefix, exc)
             return {"ok": False, "users": [], "error": str(exc)}
+
+    def read_capacity(self, *, timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
+        """Free user / fingerprint slots and the fingerprint algorithm version, NOW.
+
+        The connect-time values can be hours old on a shared terminal another system
+        enrols on. One STA command: GetDeviceStatus 11 (users_free) and 10
+        (fingerprints_free) plus GetSysOption("~ZKFPVersion") -- 3 to 6 COM calls (each
+        read tries two win32com shapes). An index that does not read is None, never a
+        guessed capacity. Returns {"ok", "users_free", "fingerprints_free", "fp_version"}.
+        """
+        try:
+            return self._call("read_capacity", timeout=timeout_sec) or {"ok": False}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def sweep_finger_slots(self, pin: str, slots: List[int], *, refresh: bool = False,
                            timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
@@ -1228,6 +1277,11 @@ class ZKStandaloneDevice:
                                               "error": "not connected"}
                             else:
                                 cmd.result = self._do_delete_users(zk, cmd.args["pins"])
+                        elif cmd.op == "read_capacity":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "error": "not connected"}
+                            else:
+                                cmd.result = self._do_read_capacity(zk)
                         elif cmd.op == "sweep_fingers":
                             if zk is None or not connected:
                                 cmd.result = {"ok": False, "error": "not connected",
@@ -1398,23 +1452,45 @@ class ZKStandaloneDevice:
         """
         out: Dict[str, int] = {}
         for idx, name in self._STATUS_FIELDS.items():
-            for attempt in ("byref", "tuple"):
-                try:
-                    if attempt == "byref":
-                        from win32com.client import VARIANT  # type: ignore
-                        import pywintypes  # type: ignore
-                        box = VARIANT(pywintypes.VT_BYREF | pywintypes.VT_I4, 0)
-                        if bool(zk.GetDeviceStatus(1, int(idx), box)):
-                            out[name] = int(box.value)
-                            break
-                    else:
-                        res = zk.GetDeviceStatus(1, int(idx), 0)
-                        if isinstance(res, (tuple, list)) and len(res) >= 2 and res[0]:
-                            out[name] = int(res[1])
-                            break
-                except Exception:
-                    continue
+            value = self._read_status_index(zk, idx)
+            if value is not None:
+                out[name] = value
         return out
+
+    @staticmethod
+    def _read_status_index(zk: Any, idx: int) -> Optional[int]:
+        """One GetDeviceStatus index, trying both win32com shapes; None = unreadable."""
+        for attempt in ("byref", "tuple"):
+            try:
+                if attempt == "byref":
+                    from win32com.client import VARIANT  # type: ignore
+                    import pywintypes  # type: ignore
+                    box = VARIANT(pywintypes.VT_BYREF | pywintypes.VT_I4, 0)
+                    if bool(zk.GetDeviceStatus(1, int(idx), box)):
+                        return int(box.value)
+                else:
+                    res = zk.GetDeviceStatus(1, int(idx), 0)
+                    if isinstance(res, (tuple, list)) and len(res) >= 2 and res[0]:
+                        return int(res[1])
+            except Exception:
+                continue
+        return None
+
+    def _do_read_capacity(self, zk: Any) -> Dict[str, Any]:
+        """STA side of read_capacity. Refreshes the cached connect-time values it reads."""
+        users_free = self._read_status_index(zk, 11)
+        fps_free = self._read_status_index(zk, 10)
+        fp_version = self._read_fp_version(zk)
+        status = dict(getattr(self, "_device_status", None) or {})
+        if users_free is not None:
+            status["users_free"] = users_free
+        if fps_free is not None:
+            status["fingerprints_free"] = fps_free
+        self._device_status = status
+        if fp_version:
+            self._device_fp_version = fp_version
+        return {"ok": True, "users_free": users_free, "fingerprints_free": fps_free,
+                "fp_version": fp_version or ""}
 
     def _read_fp_version(self, zk: Any) -> str:
         """The terminal's fingerprint ALGORITHM version (~ZKFPVersion), e.g. "9"/"10".
@@ -1714,6 +1790,8 @@ class ZKStandaloneDevice:
         # A gap marks a refused clear; failed_pins identifies the affected pin.
         del_attempted = 0
         del_ok = 0
+        tpl_version_skipped = 0
+        device_ver = _parse_version_int(getattr(self, "_device_fp_version", "") or "")
 
         def _mark_failed(p: str, reason: str = "") -> None:
             if p and p not in _failed_seen:
@@ -1846,6 +1924,15 @@ class ZKStandaloneDevice:
                         finger_idx = int(tpl.get("fingerId") or 0)
                         tmp = str(tpl.get("templateData") or "")
                         if not tmp:
+                            continue
+                        # P3a-2 item 7: a template of another algorithm version cannot
+                        # match on this terminal. Only when BOTH versions are readable
+                        # and differ: the slot is left as it is (no delete-before-write,
+                        # no write) and the pin is reported, instead of uploading
+                        # something unusable. An unreadable device version gates nothing.
+                        if _versions_disagree(device_ver, tpl.get("templateVersion")):
+                            tpl_version_skipped += 1
+                            _mark_failed(pin, f"template_version_mismatch_f{finger_idx}")
                             continue
                         try:
                             # ZKTeco FAQ: upload requires the slot to be EMPTY --
@@ -2013,6 +2100,7 @@ class ZKStandaloneDevice:
                 "tpl_ok": tpl_ok,
                 "del_attempted": del_attempted,
                 "del_ok": del_ok,
+                "tpl_version_skipped": tpl_version_skipped,
                 "chunk_ms": round((time.monotonic() - t_start) * 1000.0),
                 "trace_members_left": members_left,
                 "trace_templates_left": templates_left}

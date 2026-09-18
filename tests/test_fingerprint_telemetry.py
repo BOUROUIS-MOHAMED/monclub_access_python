@@ -280,6 +280,10 @@ class TestTemplateRefusalTelemetry:
                 assert secret not in str(v), (args, kwargs)
 
     def test_version_mismatch_is_its_own_warn_event(self, tel):
+        """P3a-2 item 7: the mismatch is now caught BEFORE the write (the template is not
+        uploaded), reported once per push as TEMPLATE_VERSION_MISMATCH; the reactive
+        ZKEM_TPL_VERSION_MISMATCH (after a refusal) no longer fires for numeric versions
+        that differ, because such a template is never sent."""
         drv, zk = make_driver()
         zk.settmp_by[("55", 0)] = False
         assert drv.connect()
@@ -287,11 +291,11 @@ class TestTemplateRefusalTelemetry:
         drv.push_roster(_users("55"),
                         templates_by_pin={"55": [_tpl(0, version="10")]})
 
-        mm = tel_calls(tel, "ZKEM_TPL_VERSION_MISMATCH")
+        mm = tel_calls(tel, "TEMPLATE_VERSION_MISMATCH")
         assert len(mm) == 1
-        assert mm[0]["template_version"] == "10"
+        assert mm[0]["skipped"] == 1
         assert mm[0]["device_fp_version"] == "9"
-        assert mm[0]["pin"] == "55"
+        assert tel_calls(tel, "ZKEM_TPL_VERSION_MISMATCH") == []
 
     def test_no_mismatch_event_when_versions_agree(self, tel):
         drv, zk = make_driver()

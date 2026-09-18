@@ -1382,6 +1382,42 @@ by the retry backoff — and wrote it `ok=True`, so a refused member silently be
 was never retried. Backoff-held pins are now excluded.
 `[TEST: ::test_a_pin_in_retry_backoff_is_not_backfilled_as_ok]`
 
+### 3.4d Capacity and template-version checks (MB2000, P3a-2, 2026-09-18)
+
+**Before.** `_read_device_status` / `_read_fp_version` ran at connect only, as diagnostics
+(`_warn_if_device_full` logs); `push_roster` wrote every user and template unconditionally, and a
+version disagreement was noticed only after the terminal REFUSED a template — never when it
+accepted an unusable one. `[CODE]`
+
+**Capacity (`CAPACITY_FULL`).** Capability-gated (`supports_capacity_check`). Before a full-sync or
+targeted push that needs a NEW slot, `read_capacity()` re-reads `GetDeviceStatus` 11 (`users_free`)
+and 10 (`fingerprints_free`) — 3–6 COM calls in one STA command — because a connect-time value can
+be hours old on a terminal another system enrols on. `UltraDeviceWorker._capacity_admit` counts only
+writes needing a new slot: a pin MonClub does not own needs a user slot and one fingerprint slot per
+finger; an owned pin needs a fingerprint slot only for a finger not recorded on it (an unknown recorded
+set counts none — most likely replacements; a real refusal is still reported by the terminal). The
+free counts are a budget in push order; a pin that does not fit is not pushed, gets no state row
+(it stays pending), and is reported: `[T] CAPACITY_FULL worker users_free fingerprints_free
+need_users need_fingers skipped` + push-history note `CAPACITY_FULL=n (…)`. The pass is `ok` but
+withholds the roster hash, so the scheduler retries it; a targeted push is deferred to the full
+sync. Updates, replacements and every removal are never refused (removals run first, §3.4b, and are
+what free space). An unreadable status gates nothing. `[TEST: test_capacity_and_template_version.py]`
+`[UNVERIFIED]` that index 11 is `users_free` on the MB2000 beyond the 2026-09-06 arithmetic
+(`1838 + 1162 = 3000`), and that `SSR_SetUserInfo` on an existing pin consumes no new user slot.
+
+**Template version (`TEMPLATE_VERSION_MISMATCH`).** In `_do_push_roster`, a template whose
+`templateVersion` and the terminal's `~ZKFPVersion` BOTH parse to integers and differ is not uploaded:
+no delete-before-write, no write (whatever the slot held stays), the pin is failed with reason
+`template_version_mismatch_f<N>` (so it is retried under the upsert backoff, §3.4b) and one
+`[T] TEMPLATE_VERSION_MISMATCH worker skipped device_fp_version` per push (never per finger inside the
+STA loop, §10.3). An unreadable or non-numeric device version gates nothing. `templateVersion`
+defaults to 10 when the backend omits it (`_collect_templates_for_pin`), so a template really of v9
+but unlabelled would read as 10 — `[UNVERIFIED]`. FIELD-TEST before relying on it at gym 45: read the
+connect line `deviceFpVersion=` of devices 8 and 10 (the v1.4.26 run had no disagreement), and after
+deploy grep `TEMPLATE_VERSION_MISMATCH`: any hit names fingers that were never usable on that
+terminal. Whether a mismatched template can in fact never match is itself `[UNVERIFIED —
+HARDWARE-GATED]` ("template portability", module docstring).
+
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
@@ -1707,6 +1743,7 @@ itself:
 | `supports_open_door` | absent ⇒ callers default `True` | **per-device switch**, family default `True` `[CODE]` | Whether the driver may issue a door-open. On the standalone family it is resolved per instance: env `MONCLUB_ZK_STANDALONE_OPEN_DOOR` > persisted local switch (`db.device_local_settings`, projected as `openDoorEnabled`) > family default. See §5.1 and §7. |
 | `owns_event_source` | — | `True` `[CODE]` | Driver owns its own event delivery (push) rather than being polled. |
 | `supports_device_params` | — | `False` `[CODE]` | `get_device_param` / `set_device_param` are meaningful. |
+| `supports_capacity_check` | absent ⇒ callers default `False` | `True` `[CODE]` | `read_capacity()` reports free user/fingerprint slots and the algorithm version; the engine refuses writes needing a new slot when none is free (P3a-2, §3.4d). PullSDK has no such signal in this repo, so it is never gated. |
 
 Callers read these as `getattr(drv, "flag", True)` so a driver predating a flag keeps
 the old behaviour. `[CODE: device_attendance.py, ultra_engine.py,
@@ -1905,19 +1942,15 @@ the actual terminal.
 Declared in `zk_standalone.py`'s own module docstring: in-process COM viability, event
 field semantics, template portability, and the card-number space.
 
-### Why fingerprint templates were refused `[UNKNOWN]`
+### ~~Why fingerprint templates were refused~~ — RESOLVED (see zkemkeeper_guide §8)
 
-Two candidate causes, **neither proven**:
+This section used to list two unproven causes (a full store, an algorithm-version mismatch).
+`zkemkeeper_guide.md` §8 records the answer: a clean field run at v1.4.26 pushed 928 users and 853
+template sets with `templates_failed=0`, so neither was the cause; the refusals were a downstream
+symptom of the `SSR_DeleteEnrollData` hang. `[FIELD]` Kept consistent here so the two guides agree.
 
-1. The terminal's fingerprint store is full of enrolments carried over from the gym's
-   previous software (they were never deleted).
-2. Algorithm-version mismatch — a ZK9500 desk capture is v10.
-
-The driver now reports `deviceFpVersion`, `templateVersion` and `fpStore=used/capacity`
-on the connect line and on every refusal, which distinguishes the two.
-`[CODE: _read_fp_version, _read_device_status, _warn_if_device_full]`
-
-Until a connect line settles it, **do not state either as the cause.**
+Since P3a-2 both are checked BEFORE writing (§3.4d) — as a new rail for the shared-terminal
+scenario (a store another system fills), not as a re-diagnosis of that incident.
 
 ---
 
@@ -2097,6 +2130,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
+| `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped` (warn; writes needing a new slot refused, pins left pending, §3.4d) |
+| `TEMPLATE_VERSION_MISMATCH` | `zk_standalone.py::push_roster` | `worker skipped device_fp_version` (warn; templates of another algorithm version not uploaded, once per push, §3.4d) |
 | `FINGER_SWEEP` | `ultra_engine.py` | `worker pin source ok op cleared empty raised dur_ms` (`source` ∈ `targeted`, `daily`; `cleared` = slots that held a template, `empty` = already empty; §3.4c) |
 | `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
@@ -2138,8 +2173,9 @@ A grep on the wrong key finds nothing. `[CODE]`
 
 `ZKEM_PUSH_FAILED_PINS` reasons: `set_user_info_false`, `template_refused_f<N>`,
 `finger_remove_false_f<N>`, `finger_remove_exception_f<N>`, `exception:<Type>`,
-`chunk_wedged_or_unconfirmed`, and `not_attempted` (a chunk never sent because the loop
-stopped early, added 2026-09-18). `[CODE: _do_push_roster, push_roster]`
+`chunk_wedged_or_unconfirmed`, `not_attempted` (a chunk never sent because the loop
+stopped early, added 2026-09-18) and `template_version_mismatch_f<N>` (a template not uploaded
+because its algorithm version differs from the terminal's, §3.4d). `[CODE: _do_push_roster, push_roster]`
 
 ### 10.2a Door queue and QR roster check (added 2026-09-18)
 

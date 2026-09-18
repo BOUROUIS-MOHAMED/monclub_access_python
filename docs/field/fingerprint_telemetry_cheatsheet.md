@@ -171,6 +171,7 @@ grep -F "[T] ZKEM_PUSH_FAILED_PINS" app-*.log
 | `exception:<Type>` | the push raised part-way through that member |
 | `chunk_wedged_or_unconfirmed` | the whole chunk wedged; nothing in it was confirmed |
 | `not_attempted` | the push stopped early (3 wedges or a failed reconnect) before this member's chunk was sent — nothing was written |
+| `template_version_mismatch_fN` | finger **N**'s template is of another algorithm version than the terminal's (`~ZKFPVersion`), so it was NOT uploaded (P3a-2) — re-enrol that finger |
 
 A pin absent from every `ZKEM_PUSH_FAILED_PINS` line, in a push whose `ZKEM_PUSH_DONE`
 says `ok=True`, was pushed. `[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`
@@ -372,6 +373,16 @@ panel clear, `path=standalone_revoke` an MB2000's departed members. It repeats o
 cause is found (a truncated roster, a pin-scheme cutover that needs the manual wipe, or a real mass
 departure an operator must confirm). The push-history page shows it as `REVOKE_ABORTED=N (…)`.
 `[CODE: app/core/push_safety.py::check_bulk_removal]`
+
+---
+
+## 4b. Is the terminal full? Unusable templates? (P3a-2)
+
+```bash
+grep -E "\[T\] (CAPACITY_FULL|TEMPLATE_VERSION_MISMATCH)" app-*.log
+```
+
+`CAPACITY_FULL users_free=U fingerprints_free=F skipped=N` means the terminal reported no room, so N new members (or new fingers) were NOT written; they are retried at the next sync, and removals still ran. Free space on the terminal (for example the other system's old users) and they go through. `TEMPLATE_VERSION_MISMATCH skipped=N device_fp_version=V` means N fingerprints were recorded with a different algorithm version than the terminal uses and were not uploaded (they could not have matched); the connect line's `deviceFpVersion=` shows the terminal's version.
 
 ---
 

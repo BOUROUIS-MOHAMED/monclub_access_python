@@ -828,12 +828,16 @@ class TestSlotClearUsesTheProvenApi:
         )
 
     def test_refusal_names_the_version_gap(self, caplog):
-        """339 silent refusals taught us nothing. The message must name both versions."""
+        """339 silent refusals taught us nothing. The message must name both versions.
+
+        P3a-2 item 7: a template whose version DIFFERS from the terminal's is no longer
+        written at all (reason template_version_mismatch_f<N>), so the refusal message is
+        exercised with matching versions -- it must still name both."""
         class _Refusing(TestSlotClearUsesTheProvenApi._ZK):
             def SetUserTmpExStr(self, *a): return False
 
         drv = self._driver()
-        drv._device_fp_version = "9"
+        drv._device_fp_version = "10"
         with caplog.at_level(logging.WARNING, logger="zk-slot"):
             drv._do_push_roster(
                 _Refusing(),
@@ -843,8 +847,32 @@ class TestSlotClearUsesTheProvenApi:
                 ]},
                 bracket=False,
             )
-        assert "deviceFpVersion=9" in caplog.text
+        assert "deviceFpVersion=10" in caplog.text
         assert "templateVersion=10" in caplog.text
+
+    def test_a_version_gap_is_caught_before_the_write(self):
+        """P3a-2 item 7: device v9, template v10 -> never written, pin failed and named."""
+        calls = []
+
+        class _Recording(TestSlotClearUsesTheProvenApi._ZK):
+            def SetUserTmpExStr(self, *a):
+                calls.append(a)
+                return True
+
+        drv = self._driver()
+        drv._device_fp_version = "9"
+        res = drv._do_push_roster(
+            _Recording(),
+            users=[{"pin": "30519", "name": "M", "card": ""}],
+            templates_by_pin={"30519": [
+                {"fingerId": 0, "templateVersion": 10, "templateData": "x" * 960},
+            ]},
+            bracket=False,
+        )
+        assert calls == []
+        assert res["failed_pins"] == ["30519"]
+        assert res["failed_reasons"]["30519"] == "template_version_mismatch_f0"
+        assert res["tpl_version_skipped"] == 1
 
 
 class TestDeviceOccupancyIsReported:
