@@ -4365,6 +4365,36 @@ def _sync_credential_params(row: Dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _grant_id_set(raw_json: Any) -> frozenset[int] | None:
+    """The grant ids as a set, or None when they do not parse."""
+    try:
+        ids = json.loads(raw_json or "[]")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(ids, list):
+        return None
+    try:
+        # json.loads hands back int for the backend's Long ids; str() only for the rest.
+        return frozenset(gid if type(gid) is int else int(str(gid).strip()) for gid in ids)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sync_credential_grants_changed(stored_json: Any, incoming_json: str) -> bool:
+    """True when the granted membership ids differ as a SET.
+
+    Compared like the backend's credentials token (sorted, distinct): neither of its grant
+    queries has an ORDER BY, so an order-only difference is not a change -- comparing the
+    raw JSON would rewrite every multi-grant row on every sync. Only differing strings are
+    parsed, so an unchanged row costs one string comparison. Anything unparseable counts
+    as changed (the write is the safe side)."""
+    if stored_json == incoming_json:
+        return False
+    stored = _grant_id_set(stored_json)
+    incoming = _grant_id_set(incoming_json)
+    return stored is None or incoming is None or stored != incoming
+
+
 def _replace_sync_credentials(cur: sqlite3.Cursor, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     cur.execute("DELETE FROM sync_gym_access_credentials")
     if rows:
@@ -4418,9 +4448,10 @@ def _sync_gym_access_credentials_rows(
                 return _replace_sync_credentials(cur, normalized_rows)
             existing_key_set.add((int(gym_id), int(account_id)))
 
-    # Avoid full-row reads (granted_active_membership_ids_json can be huge).
-    # We diff using a lightweight field set; JSON changes that don't update
-    # these fields will not be detected.
+    # The diff covers every column, grants included. The backend rebuilds
+    # grantedActiveMembershipIds per request and never stores it on the credential row,
+    # so a renewal (new membership id) changes ONLY the grants; skipping them kept the
+    # old id here. Grants compare as a set (_sync_credential_grants_changed).
     #
     # P6: previously this used a chunked OR-of-AND predicate (200 ORs per chunk,
     # 8 chunks for 1600 credentials) which the SQLite planner couldn't index
@@ -4428,8 +4459,11 @@ def _sync_gym_access_credentials_rows(
     # production. For the gym's typical 1.5–3 k credentials the table is tiny,
     # so a single full-table scan filtered down to incoming keys in Python is
     # an order of magnitude faster (and gets simpler the bigger incoming gets).
+    # Reading the grants column in that scan costs no extra page reads: it is a
+    # plain SCAN of the table either way (no covering index), and SQLite stores a
+    # row's columns together unless the row outgrows its page (kilobytes; a grant
+    # list is tens of bytes).
     prefer_upsert_all = False
-    lite_diff = True
     existing_by_key: Dict[tuple[int, int], Dict[str, Any]] = {}
     if incoming_by_key:
         t_fetch = time.perf_counter()
@@ -4437,7 +4471,8 @@ def _sync_gym_access_credentials_rows(
             """
             SELECT
                 id, gym_id, account_id, secret_hex, enabled,
-                rotated_at, created_at, updated_at
+                rotated_at, created_at, updated_at,
+                granted_active_membership_ids_json
             FROM sync_gym_access_credentials
             """
         ).fetchall()
@@ -4464,7 +4499,12 @@ def _sync_gym_access_credentials_rows(
     to_upsert = [
         row
         for key, row in incoming_by_key.items()
-        if key not in existing_by_key or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
+        if key not in existing_by_key
+        or any(existing_by_key[key].get(field) != row.get(field) for field in fields)
+        or _sync_credential_grants_changed(
+            existing_by_key[key].get("granted_active_membership_ids_json"),
+            row["granted_active_membership_ids_json"],
+        )
     ]
     to_delete = [] if merge_only else [key for key in existing_key_set if key not in incoming_by_key]
     diff_ms = (time.perf_counter() - t_diff) * 1000.0
@@ -4516,7 +4556,6 @@ def _sync_gym_access_credentials_rows(
         "delete_ms": round(delete_ms, 3),
         "upsert_ms": round(upsert_ms, 3),
         "upsert_all": prefer_upsert_all,
-        "lite_diff": lite_diff,
     }
 
 
@@ -5583,7 +5622,6 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
             profile["credentials_delete_ms"] = creds_summary.get("delete_ms")
             profile["credentials_upsert_ms"] = creds_summary.get("upsert_ms")
             profile["credentials_upsert_all"] = creds_summary.get("upsert_all")
-            profile["credentials_lite_diff"] = creds_summary.get("lite_diff")
 
         # Conditional: settings (infrastructures)
         if refresh.get("settings", True):

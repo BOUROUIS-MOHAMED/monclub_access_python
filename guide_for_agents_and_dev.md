@@ -48,6 +48,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
+| What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -271,14 +272,50 @@ before. `roster_empty` exists because an empty list cannot be told apart from a 
 `load_local_state` turns a failed users query into `[]`, and `_get_cached_local_state` falls back
 to `({}, {}, {})` on a bad load. Enforcing then would refuse every QR code at every door. `[CODE]`
 
-`in_roster_by_account` exists because the PC's cached grants go stale. The backend recomputes
-`grantedActiveMembershipIds` on every request and never stores it on the credential row; on
-backend `main` (P1a) its credentials token digests the grants, so a grant-only change **is**
-delivered (`[UNVERIFIED]` whether that backend is what the gyms run) — but
-`db.py::_sync_gym_access_credentials_rows` diffs only `id gym_id account_id secret_hex enabled
-rotated_at created_at updated_at`, so the new grants are not written. A member who renews (a new
-`ActiveMembership`, a new id) keeps the old id in the local credential. Both ids are the same
-person: the credential's `accountId` is the `MainAccountModel` id found by the member's email,
+`in_roster_by_account` exists because the PC's cached grants can go stale. The backend
+recomputes `grantedActiveMembershipIds` on every request and never stores it on the credential
+row, so a renewal (a new `ActiveMembership`, a new id) changes **only** the grants of a
+credential that stays. Until 2026-09-18 the client dropped that change even when it arrived:
+`db.py::_sync_gym_access_credentials_rows` compared only `id gym_id account_id secret_hex
+enabled rotated_at created_at updated_at`, so the member kept the old id in the local
+credential, passed only through this second chance, and door history carried the old
+`activeMembershipId`. The diff now also reads `granted_active_membership_ids_json` in the same
+full-table scan and compares the grants **as a set** (`_sync_credential_grants_changed`) — the
+way backend `main`'s credentials token digests them (sorted, distinct). Neither grant query
+(`findAllValidForAccessByGymId` / `…ByGymFamilyName` for the main sync, `findAllValidNowByUserId`
+for the fast patch) has an `ORDER BY`, so an order-only difference is not written; a raw-string
+compare would rewrite every multi-grant row whenever the order moved. What is stored is the list
+as the backend sent it, never re-sorted: `verify_totp` walks it in order. A value that does not
+parse counts as changed. `[CODE: db.py::_sync_gym_access_credentials_rows,
+::_sync_credential_grants_changed; backend main GymAccessController::computeCredentialsVersion,
+ActiveMembershipRepository]` `[TEST: test_credential_grants_diff.py::test_a_grant_only_change_is_written,
+::test_a_grant_only_change_is_written_on_the_fast_patch_merge_path,
+::test_the_same_grants_in_another_order_write_nothing, ::test_grants_compare_as_a_set_and_write_when_in_doubt,
+::test_a_renewed_member_scans_in_on_the_new_membership_after_the_next_sync]`
+
+The cost, measured on the development PC with 2,000 credentials (old function against new,
+interleaved, 101 runs, paired median; 32-bit `.venv` Python 3.11 and Python 3.13): **+1 to +3 ms**
+per sync for fetch + diff when nothing or 5 % of the grants changed; the worst case, every row's
+grants reordered with 20 grants each (4,000 parses), +41 to +46 ms. P6's ~21 s (`[COMMENT]`
+in the function) came from the old OR-of-AND predicate's plan, not from reading the column: the
+scan is a plain `SCAN sync_gym_access_credentials` with or without the grants column (no index
+covers it), and SQLite stores a row's columns together unless the row outgrows its page
+(kilobytes; a grant list is tens of bytes), so the same pages are read — on a slow disk only
+the CPU time above is added. `[UNVERIFIED]` on a gym PC.
+
+Where grants can **still** be stale: on backend `main` a renewal reaches the PC with its new
+grants on both paths — the main sync builds `users[]` and the credentials from one list, and the
+client writes both sections in one `save_sync_cache_delta` transaction; the membership fast
+patch sends the member and a `CREDENTIALS` `UPSERT_ONLY` section in one bundle
+(`AccessPatchBundleService.buildMembershipBundle`). `[CODE: backend main; client db.py]` A
+backend whose credentials token does not digest the grants never sets `refreshCredentials` for
+a grant-only change, so the main sync does not re-send it (`[UNVERIFIED]` whether the gyms run
+backend `main`). So once a PC runs this build, an `in_roster_by_account` count that keeps
+growing points to grant changes not arriving — the only cause traced here; check which backend
+serves that gym before reading it any other way.
+
+The second chance is sound because the stale id and the listed one are the same person: the
+credential's `accountId` is the `MainAccountModel` id found by the member's email,
 the row's `mainAccountId` is `user.account.id`, and `UserModel.account` is unique (one user per
 account). `[CODE: backend main GymAccessController.getGymAccessUsers, ::computeCredentialsVersion;
 UserModel.account; client db.py]` A row with no `mainAccountId` never matches. The account ids
@@ -399,7 +436,8 @@ online and syncs. It closes the online gap only. `[CODE]`
 **Before switching a device to enforce** — known ways a valid member could still read as
 `not_in_roster` `[CODE]`, which is what the trial counts are for:
 - A renewal whose new membership sits on a row **without** `mainAccountId` (a user with no linked
-  main account) fails both the stale grant and the account second chance.
+  main account) fails both the stale grant and the account second chance — only while its grants
+  are stale (above); once a credentials sync writes the new grant it passes as `in_roster`.
 - The fast-patch path builds credentials with `AccessPatchBundleService.shouldExposeMembership`,
   which omits the photo (`blockAccessForUnphotographedMembers`) and unpaid-due
   (`allowEntryPastDueDate`) rules the main sync applies — so a fast-patch credential can grant a

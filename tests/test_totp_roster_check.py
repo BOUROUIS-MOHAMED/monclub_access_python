@@ -103,8 +103,8 @@ def test_an_empty_member_list_is_unevaluable_and_never_refuses(world):
 
 @pytest.mark.parametrize("account_value", [5002, "5002"])
 def test_a_renewed_member_with_stale_grants_passes_by_account(world, account_value):
-    # The PC's credential diff ignores grantedActiveMembershipIds, so after a renewal the
-    # cached credential still grants the OLD membership id (202) while the member list
+    # Until a credentials sync re-sends the grants after a renewal, the cached
+    # credential still grants the OLD membership id (202) while the member list
     # carries the new one (909) for the same main account (cred 2 -> accountId 5002).
     creds, users_by_am, _m, removed, _s = world
     roster = {**users_by_am, 909: _user(909, mainAccountId=account_value)}

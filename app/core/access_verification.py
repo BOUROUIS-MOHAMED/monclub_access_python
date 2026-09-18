@@ -731,10 +731,10 @@ def verify_totp(
         elif not users_by_am:
             roster_check = ROSTER_UNEVALUABLE
         elif _account_on_roster(account_id, users_by_am):
-            # The PC's cached grants can be stale: its credential diff ignores
-            # grantedActiveMembershipIds, so a member who renewed (new membership id)
-            # keeps the old id here. The same main account on a listed row is the
-            # same person with a valid membership (account<->user is 1:1).
+            # The PC's cached grants can be stale: a member who renewed (new membership
+            # id) keeps the old id here until a credentials sync re-sends the grants
+            # (guide §3.1b says when that does not happen). The same main account on a
+            # listed row is the same person with a valid membership (account<->user is 1:1).
             roster_check = ROSTER_IN_BY_ACCOUNT
         elif used_index and not roster_current:
             # The caller says its member list is older than the index, and the index
