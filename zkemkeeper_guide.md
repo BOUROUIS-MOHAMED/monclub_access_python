@@ -648,6 +648,13 @@ test_db_pushed_finger_ids.py]`
 push already taking 416 s, against a 600 s single-command deadline — while
 `EnableDevice(False)` is held, i.e. with the gym's sole verifier dead.
 
+**The sweep that does exist (P3a-2, `guide_for_agents_and_dev.md` §3.4c) is not that.** It
+clears the unused slots 0–9 of ONE owned, never-swept pin, in its own short STA commands
+(`sweep_finger_slots`, ≤ 3 slots each — never inside a push chunk), with the worker serving the
+door between commands: at once after a targeted push, otherwise ≤ 100 pins a day in the idle
+loop. There a `False` means "already empty" (§3) and is counted, not failed; only an exception or
+a wedge fails it. A full-roster push never sweeps.
+
 Whole-user removals use the field-proven backup number 12 (§3). An authoritative
 targeted revoke first requires ownership in `device_sync_state`; missing ownership
 makes no device call and schedules full reconciliation. `[CODE]` `[TEST:
@@ -1190,11 +1197,12 @@ grep -rn "zk\.SSR_DeleteEnrollData\|zk\.SSR_DelUserTmpExt" app/ --include=*.py
 ```
 
 **Expected, exactly three lines** (was two before the 2026-09-05 removal work):
-`zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))` **twice** in `_do_push_roster` — once
-clearing a **vacated** slot (before the template loop) and once as the
-delete-before-write of a **desired** slot (inside it) — and
+`zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))` **twice** — once in the helper
+`_clear_finger_slot` (used since P3a-2 by both the **vacated**-slot clear in `_do_push_roster`
+and the finger-slot **sweep** in `_do_sweep_fingers`) and once as the delete-before-write of a
+**desired** slot inside `_do_push_roster`'s template loop — and
 `zk.SSR_DeleteEnrollData(1, pin, 12)` — backup number **12**, the whole-user delete —
-in `_do_delete_users`. **Any `SSR_DeleteEnrollData` call with a finger index is the
+in `_do_delete_users`. `[TEST: test_finger_slot_sweep.py::test_the_must_not_call_grep_still_counts_three]` **Any `SSR_DeleteEnrollData` call with a finger index is the
 v1.4.25 hang being re-introduced.**
 
 Confirm the roster rule of the main guide (§3.2 there) — every call site must be in

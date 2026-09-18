@@ -223,6 +223,18 @@ _FULL_REVOKE_RETRY = "retry"
 _REMOVAL_RETRY_FIRST_SEC = 30.0
 _REMOVAL_RETRY_MAX_SEC = 300.0
 
+# P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
+# One sweep STA command clears at most this many slots: 3 x 71-171 ms (field-measured
+# per SSR_DelUserTmpExt, zkemkeeper_guide §3) = at most ~0.5 s during which the STA
+# thread pumps no event and opens no door; the worker serves both between commands.
+_SWEEP_SLOTS_PER_COMMAND = 3
+# The daily batch sweeps at most this many pins per device per local day: <= 100 x 10
+# calls x 171 ms ~= 171 s of terminal time a day, in <= 0.5 s slices, only while the
+# worker is idle. A fully unswept 928-pin terminal is done in ~10 days; every targeted
+# push sweeps its own pin at once regardless of this cap.
+_FINGER_SWEEP_DAILY_CAP = 100
+_ALL_FINGER_SLOTS = tuple(range(10))
+
 
 def _revoke_skipped_not_owned(engine: Any) -> bool:
     """True when DeviceSyncEngine's last targeted revoke was SKIPPED_NOT_OWNED.
@@ -1948,6 +1960,7 @@ class UltraDeviceWorker(threading.Thread):
 
         to_push: list[Dict[str, Any]] = []
         backoff_skipped = 0
+        self._last_backoff_pins: set[str] = set()
         for u in users:
             pin = str(u.get("pin") or "").strip()
             prev_hash, prev_ok = state.get(pin, ("", False))
@@ -1965,6 +1978,7 @@ class UltraDeviceWorker(threading.Thread):
                         if not DeviceSyncEngine._retry_due(fail_streak=_streak,
                                                            updated_at=_seen):
                             backoff_skipped += 1
+                            self._last_backoff_pins.add(pin)
                             continue
                 except Exception:
                     pass  # fail open: push it
@@ -2080,6 +2094,7 @@ class UltraDeviceWorker(threading.Thread):
         self, *, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str],
         result: Dict[str, Any],
         templates_by_pin: Dict[str, list] | None = None,
+        unknown_fingers_pins: set[str] | None = None,
     ) -> None:
         """Persist per-pin outcome of one push_roster call.
 
@@ -2110,6 +2125,10 @@ class UltraDeviceWorker(threading.Thread):
                 _encode_fingers(self._desired_fingers((templates_by_pin or {}).get(pin)))
                 if (ok and templates_by_pin is not None) else None
             )
+            if unknown_fingers_pins and pin in unknown_fingers_pins:
+                # P3a-2: its slots have not been swept yet, so what else the terminal
+                # holds at this pin is still UNKNOWN; recorded only after the sweep.
+                fingers = None
             rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err, fingers))
         try:
             from app.core.db import save_device_sync_state_batch
@@ -2181,6 +2200,164 @@ class UltraDeviceWorker(threading.Thread):
             if len(attempted - failed) > pushed + skipped_n:
                 return set(attempted)
         return failed
+
+    # ---------------------------------------------------------------- #
+    # Finger-slot sweep (P3a-2 item 5, guide §3.4c)
+    # ---------------------------------------------------------------- #
+    def _finger_sweep_plan(self, users: list[Dict[str, Any]],
+                           templates_by_pin: Dict[str, list] | None) -> Dict[str, Dict[str, Any]]:
+        """{pin: {slots, desired, unknown}} for pins about to be pushed that MonClub
+        ALREADY owns and has never swept. A first push (no row) or an unowned row is never
+        swept: on a shared terminal that pin may be another system's user, whose
+        fingerprints are not MonClub's to clear."""
+        if not bool(self._settings.get("fingerprint_enabled", False)):
+            return {}
+        if not callable(getattr(self._sdk, "sweep_finger_slots", None)):
+            return {}
+        plan: Dict[str, Dict[str, Any]] = {}
+        try:
+            from app.core.db import get_finger_sweep_state
+        except Exception:
+            return {}
+        for u in users or []:
+            pin = str(u.get("pin") or "").strip()
+            if not pin:
+                continue
+            try:
+                st = get_finger_sweep_state(device_id=self._device_id, pin=pin)
+            except Exception:
+                continue
+            if st is None:
+                continue
+            owned, swept, recorded = st
+            if not owned or swept:
+                continue
+            desired = self._desired_fingers((templates_by_pin or {}).get(pin))
+            plan[pin] = {"slots": [s for s in _ALL_FINGER_SLOTS if s not in desired],
+                         "desired": desired, "unknown": recorded is None}
+        return plan
+
+    def _sweep_pin(self, pin: str, slots: list[int], *, source: str) -> bool:
+        """Clear ``slots`` of one pin in short commands, serving the door in between.
+        True only when every command completed without an exception or a wedge."""
+        slots = list(slots or [])
+        totals = {"attempted": 0, "returned_true": 0, "returned_false": 0, "raised": 0}
+        ok = True
+        t0 = time.monotonic()
+        while True:
+            part, slots = slots[:_SWEEP_SLOTS_PER_COMMAND], slots[_SWEEP_SLOTS_PER_COMMAND:]
+            res = self._sdk.sweep_finger_slots(pin, part, refresh=not slots) if (part or not slots) else {}
+            if isinstance(res, dict):
+                for k in totals:
+                    totals[k] += int(res.get(k) or 0)
+            if not (isinstance(res, dict) and res.get("ok") is True):
+                ok = False
+                break
+            if not slots:
+                break
+            self._yield_during_device_work()
+        _tel.event("FINGER_SWEEP", worker=self._tel_wid, pin=pin, source=source, ok=ok,
+                   op="del_user_tmp_ext", cleared=totals["returned_true"],
+                   empty=totals["returned_false"], raised=totals["raised"],
+                   dur_ms=round((time.monotonic() - t0) * 1000))
+        return ok
+
+    def _mark_swept(self, pin: str, desired: set[int] | None) -> None:
+        try:
+            from app.core.db import mark_finger_slots_swept
+            mark_finger_slots_swept(device_id=self._device_id, pin=pin, finger_ids=desired)
+        except Exception:
+            logger.warning("%s finger sweep of pin %s not recorded", self._prefix, pin,
+                           exc_info=True)
+
+    def _yield_during_device_work(self) -> None:
+        """Between two commands of a long device job: let the door through.
+
+        Standalone events are already queued by the STA thread (poll_rtlog_once is a
+        queue drain, no COM call), so a QR/TOTP or staff-RFID rescue is decided and its
+        door opened here instead of after the whole job; queued operator opens run too.
+        Never on the STA thread (this runs on the worker, which is between commands).
+        """
+        if getattr(self._sdk, "owns_event_source", False) and self._connected:
+            try:
+                events = self._sdk.poll_rtlog_once()
+            except Exception:
+                events = []
+            for evt in events or []:
+                try:
+                    self._process_event(evt)
+                except Exception:
+                    logger.warning("%s event during device work failed", self._prefix,
+                                   exc_info=True)
+        try:
+            self._sync_yield_to_doors()
+        except Exception:
+            pass
+
+    def _drain_finger_sweep(self, today: str) -> None:
+        """The daily bounded batch: ONE short sweep command per run-loop iteration."""
+        if not bool(self._settings.get("fingerprint_enabled", False)):
+            return
+        if not callable(getattr(self._sdk, "sweep_finger_slots", None)):
+            return
+        st = getattr(self, "_sweep_state", None)
+        if st is None or st.get("day") != today:
+            try:
+                from app.core.db import list_finger_sweep_candidates
+                cands = list_finger_sweep_candidates(device_id=self._device_id) or {}
+            except Exception:
+                logger.warning("%s finger sweep candidates unreadable", self._prefix,
+                               exc_info=True)
+                return
+            desired_now = set(getattr(self, "_last_desired_pins", None) or ())
+            st = {"day": today, "queue": sorted(p for p in cands if p in desired_now),
+                  "done": 0, "current": None}
+            self._sweep_state = st
+        cur = st.get("current")
+        if cur is None:
+            if st["done"] >= _FINGER_SWEEP_DAILY_CAP:
+                return
+            grace = self._mirror_grace_pins()
+            while st["queue"]:
+                pin = st["queue"].pop(0)
+                if pin in grace:
+                    continue          # pushed moments ago: its targeted push sweeps it
+                try:
+                    from app.core.db import get_finger_sweep_state
+                    state = get_finger_sweep_state(device_id=self._device_id, pin=pin)
+                except Exception:
+                    continue
+                if state is None or not state[0] or state[1]:
+                    continue          # no longer owned, or already swept meanwhile
+                recorded = state[2]
+                snapshot = set((getattr(self, "_last_desired_fingers", None) or {}).get(pin) or ())
+                # Never clear a slot the member uses: desired at the morning snapshot OR
+                # recorded since (a targeted push may have added a finger after it).
+                keep = snapshot | set(recorded or ())
+                cur = {"pin": pin, "slots": [s for s in _ALL_FINGER_SLOTS if s not in keep],
+                       "record": snapshot if recorded is None else None, "ok": True,
+                       "t0": time.monotonic(), "cleared": 0, "empty": 0}
+                st["current"] = cur
+                break
+            if cur is None:
+                return
+        part = cur["slots"][:_SWEEP_SLOTS_PER_COMMAND]
+        cur["slots"] = cur["slots"][_SWEEP_SLOTS_PER_COMMAND:]
+        res = self._sdk.sweep_finger_slots(cur["pin"], part, refresh=not cur["slots"])
+        if isinstance(res, dict):
+            cur["cleared"] += int(res.get("returned_true") or 0)
+            cur["empty"] += int(res.get("returned_false") or 0)
+        if not (isinstance(res, dict) and res.get("ok") is True):
+            cur["ok"] = False
+            cur["slots"] = []
+        if not cur["slots"]:
+            if cur["ok"]:
+                self._mark_swept(cur["pin"], cur["record"])
+            _tel.event("FINGER_SWEEP", worker=self._tel_wid, pin=cur["pin"], source="daily",
+                       ok=cur["ok"], op="del_user_tmp_ext", cleared=cur["cleared"],
+                       empty=cur["empty"], dur_ms=round((time.monotonic() - cur["t0"]) * 1000))
+            st["current"] = None
+            st["done"] += 1
 
     # ---------------------------------------------------------------- #
     # Fast retry of a FAILED removal (P3a-2 item 2, guide §3.4b)
@@ -2596,8 +2773,13 @@ class UltraDeviceWorker(threading.Thread):
             # pins a baseline they would otherwise never get.
             pushed_fingers = self._load_pushed_fingers()
             _to_push_pins = {str(u.get("pin") or "").strip() for u in to_push}
+            # NOT the pins held back by the retry backoff (P3a-2): they were skipped because
+            # their push keeps FAILING, and the backfill writes ok=True -- it used to turn a
+            # refused member into "in sync" and stop it ever being retried.
+            _backoff_pins = set(getattr(self, "_last_backoff_pins", ()) or ())
             self._backfill_pushed_fingers(
-                skipped_pins=[p for p in desired_pins if p and p not in _to_push_pins],
+                skipped_pins=[p for p in desired_pins
+                              if p and p not in _to_push_pins and p not in _backoff_pins],
                 templates_by_pin=templates_by_pin,
                 hashes_by_pin=hashes_by_pin,
                 pushed_fingers=pushed_fingers,
@@ -2714,6 +2896,10 @@ class UltraDeviceWorker(threading.Thread):
             # worker is idle -- "after the morning removals", not at a fixed hour: most
             # gyms' PCs are off overnight. guide §3.4a.
             self._last_desired_pins = {p for p in desired_pins if p}
+            self._last_desired_fingers = {
+                p: self._desired_fingers((templates_by_pin or {}).get(p))
+                for p in self._last_desired_pins
+            }
             self._maintenance_ready_day = _local_day()
         except Exception as exc:
             sync_ok = False
@@ -2974,6 +3160,9 @@ class UltraDeviceWorker(threading.Thread):
                 # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
                 self._defer_member_sync(member_id, reason="push intent not recorded")
                 return
+            # P3a-2 item 5: an owned pin never swept -- read BEFORE the push, which may
+            # itself confer ownership -- has its unused slots cleared right after it.
+            sweep_plan = self._finger_sweep_plan(users, templates_by_pin)
             result = self._sdk.push_roster(users, templates_by_pin,
                                            remove_fingers_by_pin=removals)
             # Record this pin's outcome. On success the next hash-triggered full
@@ -2983,7 +3172,16 @@ class UltraDeviceWorker(threading.Thread):
             self._record_standalone_pin_state(
                 users=users, hashes_by_pin=hashes_by_pin, result=result,
                 templates_by_pin=templates_by_pin,
+                unknown_fingers_pins={p for p, plan in sweep_plan.items() if plan["unknown"]},
             )
+            if sweep_plan:
+                _failed = self._standalone_failed_pins_from_result(users=users, result=result)
+                for _pin, _plan in sorted(sweep_plan.items()):
+                    if _pin in _failed:
+                        continue
+                    self._yield_during_device_work()
+                    if self._sweep_pin(_pin, _plan["slots"], source="targeted"):
+                        self._mark_swept(_pin, _plan["desired"])
             if not result.get("ok"):
                 _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
                           member_id=member_id, err="push_roster")
@@ -3825,6 +4023,10 @@ class UltraDeviceWorker(threading.Thread):
                 except Exception:
                     logger.warning("%s intent read-back failed", self._prefix, exc_info=True)
             return
+        try:
+            self._drain_finger_sweep(today)
+        except Exception:
+            logger.warning("%s finger sweep step failed", self._prefix, exc_info=True)
 
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:

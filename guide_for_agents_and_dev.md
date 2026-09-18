@@ -43,6 +43,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
+| The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
@@ -1325,6 +1326,62 @@ member with no retry for two operating days; at 6 h a permanently refused pin co
 day (≈0.45 s per MB2000 member write, field 928/419 s; on PullSDK a firmware-cache clear plus a ≤10-call
 probe per finger). New content still bypasses the backoff. `[TEST: ::TestUpsertBackoffCap]`
 
+### 3.4c A deleted finger does not stay on the MB2000 — the slot sweep (P3a-2, 2026-09-18)
+
+**The gap.** The vacated-slot removal (2026-09-05) clears only slots it KNOWS a pin held
+(`device_sync_state.pushed_finger_ids`). An unknown set (NULL, or no row) yielded no removal at all
+(`ultra_engine._standalone_removals`). Worse, a "known" set can be wrong: the backfill
+(`_backfill_pushed_fingers`) and every successful push record the DESIRED set without clearing
+anything, so a finger deleted while the mirror was write-only (before 2026-09-05) can still be
+resident under a recorded set that omits it. `[CODE]` How many gym-45 pins are affected is
+`[UNVERIFIED]` — FIELD-TEST (read-only): `SELECT device_id, COUNT(*), SUM(pushed_finger_ids IS
+NULL) FROM device_sync_state WHERE device_id IN (8,10) AND ownership_confirmed=1 GROUP BY device_id`.
+
+**The flag.** `device_sync_state.finger_slots_swept` (0 for every existing row) marks an owned pin
+whose unused slots 0–9 were cleared once. Candidates are `ownership_confirmed=1 AND
+finger_slots_swept=0` — both the NULL and the possibly-wrong recorded sets.
+
+**The sweep.** `ZKStandaloneDevice.sweep_finger_slots(pin, slots)`: `SSR_DelUserTmpExt` per slot
+through the one helper `_clear_finger_slot` (never the finger-index `SSR_DeleteEnrollData`, §3 of
+the zkemkeeper guide), then `RefreshData`. An empty slot answers `False` (field-measured), so a
+`False` is counted, not a failure; only an exception or a wedge fails the sweep. It never goes
+through `remove_fingers_by_pin`, whose `False` means a refusal. ≤ `_SWEEP_SLOTS_PER_COMMAND` = 3
+slots per STA command: 3 × 71–171 ms ≈ ≤ 0.5 s without event pump or door, and the worker serves
+queued events (rescues) and operator opens between commands (`_yield_during_device_work`).
+
+| When | Which pins | Recorded |
+|---|---|---|
+| right after a **targeted** member push (`_run_standalone_member_sync`) | that pin, if MonClub owned it BEFORE the push and never swept it (`_finger_sweep_plan`); slots = 0–9 minus the member's fingers | swept=1; an UNKNOWN set is recorded (the desired set) only after the sweep succeeded — the push itself leaves it NULL |
+| the **daily batch** (`_drain_finger_sweep`), one command per run-loop iteration | owned, unswept, still-desired pins; ≤ `_FINGER_SWEEP_DAILY_CAP` = 100 pins a day | same |
+
+The daily batch runs in the daily maintenance slot (§3.4a): after the local day's first full sync
+has pushed and run its removal step ("after the morning removals" — the PC is usually off at 03:30),
+only while no door command, member update or full sync waits, and never during a push. It never
+clears a slot that is desired in the last full sync's snapshot OR recorded now (a targeted push may
+have added a finger since), and it skips a pin pushed in the last 10 min (the MIRROR grace window).
+Budget: ≤ 100 × 10 calls × 171 ms ≈ 171 s of terminal time a day, in ≤ 0.5 s slices; a fully
+unswept 928-pin terminal is done in ~10 days. `[T] FINGER_SWEEP worker pin source ok cleared empty
+raised dur_ms`.
+
+**Never a pin MonClub did not own before the push.** A first push (no row) or an unowned row is
+never swept: on gym 45's shared terminals that pin may hold another system's user, whose fingerprints
+are not MonClub's to delete. Residual `[UNVERIFIED]`: a MonClub pin that collided with a foreign
+user at its FIRST push keeps that user's fingers until the daily batch reaches it (it is owned after
+the push); whether any MonClub pin collides with a foreign pin on devices 8/10 is FIELD-TEST
+(enumerate the terminal read-only and compare).
+
+`[UNVERIFIED — HARDWARE-GATED]`: that a `False` from an OCCUPIED slot never happens (every field
+observation of `False` was an empty slot; 943/943 occupied clears returned `True`, §3), and whether
+`RefreshData` is needed for the matcher to drop a cleared template. FIELD-TEST on a bench MB2000:
+enrol fingers 0 and 3 on a test pin, mark it owned/unswept, sweep 1–9 → expect `True` only for 3,
+then confirm at the terminal that finger 3 no longer verifies and finger 0 still does.
+`[TEST: test_finger_slot_sweep.py]`
+
+**Also fixed here:** the backfill received every desired pin not pushed — including one held back
+by the retry backoff — and wrote it `ok=True`, so a refused member silently became "in sync" and
+was never retried. Backoff-held pins are now excluded.
+`[TEST: ::test_a_pin_in_retry_backoff_is_not_backfilled_as_ok]`
+
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
@@ -2040,6 +2097,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
+| `FINGER_SWEEP` | `ultra_engine.py` | `worker pin source ok op cleared empty raised dur_ms` (`source` ∈ `targeted`, `daily`; `cleared` = slots that held a template, `empty` = already empty; §3.4c) |
 | `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
 | `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms` (§3.4a; `ok=False` = the listing failed, nothing changed) |

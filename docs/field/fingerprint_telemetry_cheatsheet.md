@@ -375,6 +375,21 @@ departure an operator must confirm). The push-history page shows it as `REVOKE_A
 
 ---
 
+## 4a. Was a deleted finger cleared from the MB2000? (P3a-2)
+
+```bash
+grep -F "[T] FINGER_SWEEP" app-*.log
+```
+
+MonClub clears, once per member, every finger slot 0-9 the member does not use — right after a targeted
+push, or (up to 100 members a day) in the quiet moments after the morning sync. `cleared=N` slots held a
+template and were emptied (a finger deleted in the dashboard, or one left over from before 2026-09-05);
+`empty=N` were already empty (the terminal answers "no" for those — that is normal, not an error);
+`ok=False` means a call raised or the terminal stopped answering, and that member is tried again later.
+`source=targeted|daily`. Only members MonClub itself put on the terminal are ever swept.
+
+---
+
 ## 5. Did the terminal reject a finger?
 
 ```bash

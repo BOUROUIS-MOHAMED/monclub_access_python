@@ -1750,6 +1750,14 @@ def init_db() -> None:
                        "fail_streak INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "device_sync_state", "last_attempt_hash",
                        "last_attempt_hash TEXT")
+        # P3a-2 item 5: 1 once every finger slot 0-9 that the member does NOT use was
+        # cleared on the terminal (SSR_DelUserTmpExt). 0 for every existing row: the
+        # recorded pushed_finger_ids of a pre-2026-09-05 pin can be the desired set
+        # written WITHOUT any clear (the backfill), so a finger deleted in those days
+        # may still be resident. The MB2000 sweeps each owned pin once (targeted push,
+        # or the daily bounded batch) and sets this. guide §3.4c.
+        _ensure_column(conn, "device_sync_state", "finger_slots_swept",
+                       "finger_slots_swept INTEGER NOT NULL DEFAULT 0")
 
         # ---- P3a-2: write-ahead push intent (guide §3.4a) ----
         # One row per (device, pin) that MonClub is ABOUT to write, committed
@@ -7830,6 +7838,73 @@ def note_push_intent_misses(*, device_id: int, pins: "Iterable[str]") -> int:
         return n
 
     return int(_run_db_write_sync("note_push_intent_misses", _write))
+
+
+def _decode_finger_ids(raw: Any) -> "set[int] | None":
+    if raw is None:
+        return None
+    ids: set[int] = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            continue
+    return ids
+
+
+def list_finger_sweep_candidates(*, device_id: int) -> Dict[str, "set[int] | None"]:
+    """{pin: recorded finger ids (None = unknown)} for owned pins never swept (P3a-2)."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, pushed_finger_ids FROM device_sync_state "
+            "WHERE device_id=? AND ownership_confirmed=1 AND finger_slots_swept=0",
+            (did,),
+        ).fetchall()
+    return {
+        str(r["pin"]).strip(): _decode_finger_ids(r["pushed_finger_ids"])
+        for r in rows if str(r["pin"] or "").strip()
+    }
+
+
+def get_finger_sweep_state(*, device_id: int, pin: str) -> "tuple[bool, bool, set[int] | None] | None":
+    """(owned, swept, recorded fingers) for one pin, None when there is no row."""
+    did = int(device_id)
+    p = str(pin or "").strip()
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT ownership_confirmed, finger_slots_swept, pushed_finger_ids "
+            "FROM device_sync_state WHERE device_id=? AND pin=?",
+            (did, p),
+        ).fetchone()
+    if r is None:
+        return None
+    return (int(r["ownership_confirmed"] or 0) == 1, int(r["finger_slots_swept"] or 0) == 1,
+            _decode_finger_ids(r["pushed_finger_ids"]))
+
+
+def mark_finger_slots_swept(*, device_id: int, pin: str,
+                            finger_ids: "Iterable[int] | None") -> bool:
+    """Record a COMPLETED sweep of an owned pin: the terminal now holds exactly
+    ``finger_ids`` (when given, recorded as pushed_finger_ids). Returns False when the
+    pin has no owned row (nothing is invented)."""
+    did = int(device_id)
+    p = str(pin or "").strip()
+    encoded = encode_pushed_finger_ids(finger_ids) if finger_ids is not None else None
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> bool:
+        cur = conn.execute(
+            "UPDATE device_sync_state SET finger_slots_swept=1, "
+            "pushed_finger_ids=COALESCE(?, pushed_finger_ids), updated_at=? "
+            "WHERE device_id=? AND pin=? AND ownership_confirmed=1",
+            (encoded, now_iso(), did, p),
+        )
+        return int(cur.rowcount or 0) > 0
+
+    return bool(_run_db_write_sync("mark_finger_slots_swept", _write))
 
 
 @_tel.timed("DB_READ_device_sync_ownership_for_pin", slow_ms=200, warn_ms=2000)

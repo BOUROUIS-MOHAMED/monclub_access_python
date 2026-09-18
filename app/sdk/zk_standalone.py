@@ -988,6 +988,39 @@ class ZKStandaloneDevice:
             self.logger.warning("%s list_device_users failed: %s", self._prefix, exc)
             return {"ok": False, "users": [], "error": str(exc)}
 
+    def sweep_finger_slots(self, pin: str, slots: List[int], *, refresh: bool = False,
+                           timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
+        """Clear finger slots of ONE pin whose resident finger set is unknown (P3a-2).
+
+        One STA command: ``SSR_DelUserTmpExt`` per slot (via ``_clear_finger_slot``,
+        never the finger-index ``SSR_DeleteEnrollData`` that hangs this firmware), then
+        ``RefreshData`` when ``refresh``. Unlike ``remove_fingers_by_pin`` (slots KNOWN
+        to be occupied, where False is a refusal), a sweep targets slots that are
+        mostly EMPTY, and an empty slot answers False (field-measured, zkemkeeper_guide
+        §3) -- so False is counted, never a failure. Only an exception or a wedge is.
+        Keep ``slots`` short (a few per call): the command blocks the STA thread -- no
+        event pump, no door -- for 71-171 ms per slot.
+
+        Returns {"ok", "pin", "attempted", "returned_true", "returned_false", "raised"}
+        (+ "error"); ok is False on any exception, a wedge or no connection.
+        """
+        clean: List[int] = []
+        for s in slots or []:
+            try:
+                i = int(s)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i <= 9 and i not in clean:
+                clean.append(i)
+        try:
+            return self._call(
+                "sweep_fingers", args={"pin": str(pin), "slots": clean, "refresh": refresh},
+                timeout=timeout_sec,
+            ) or {"ok": False, "error": "no result"}
+        except Exception as exc:
+            return {"ok": False, "pin": str(pin), "error": str(exc), "attempted": 0,
+                    "returned_true": 0, "returned_false": 0, "raised": 0, "wedged": True}
+
     def delete_users(self, pins: List[str], *, timeout_sec: float = 300.0) -> Dict[str, Any]:
         """Delete whole users (fingers+card+password) from the terminal (MIRROR policy).
 
@@ -1195,6 +1228,16 @@ class ZKStandaloneDevice:
                                               "error": "not connected"}
                             else:
                                 cmd.result = self._do_delete_users(zk, cmd.args["pins"])
+                        elif cmd.op == "sweep_fingers":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "error": "not connected",
+                                              "attempted": 0, "returned_true": 0,
+                                              "returned_false": 0, "raised": 0}
+                            else:
+                                cmd.result = self._do_sweep_fingers(
+                                    zk, cmd.args["pin"], cmd.args["slots"],
+                                    refresh=bool(cmd.args.get("refresh")),
+                                )
                         else:
                             cmd.error = ValueError(f"unknown op {cmd.op!r}")
                     except BaseException as exc:  # noqa: BLE001 - captured for the caller
@@ -1559,6 +1602,46 @@ class ZKStandaloneDevice:
             except Exception:
                 pass
 
+    @staticmethod
+    def _clear_finger_slot(zk: Any, pin: str, finger_idx: Any) -> bool:
+        """Clear ONE finger slot. The proven call (zkemkeeper_guide §3): SSR_DelUserTmpExt.
+
+        NEVER SSR_DeleteEnrollData with a finger index -- it never returns on this
+        firmware. Returns the terminal's bool as-is and decides nothing: a False means
+        "refused" for a slot known to be occupied, and "already empty" for a swept
+        slot; the caller knows which. Exceptions propagate to the caller.
+        """
+        return bool(zk.SSR_DelUserTmpExt(1, pin, int(finger_idx)))
+
+    def _do_sweep_fingers(self, zk: Any, pin: str, slots: List[int], *,
+                          refresh: bool = False) -> Dict[str, Any]:
+        """STA side of sweep_finger_slots. See it for the contract."""
+        pin = str(pin or "").strip()
+        out: Dict[str, Any] = {"ok": True, "pin": pin, "attempted": 0,
+                               "returned_true": 0, "returned_false": 0, "raised": 0}
+        if not pin.isdigit() or len(pin) > _MAX_PIN_DIGITS:
+            out.update(ok=False, error="invalid pin")
+            return out
+        try:
+            for idx in slots or []:
+                out["attempted"] += 1
+                try:
+                    if self._clear_finger_slot(zk, pin, idx):
+                        out["returned_true"] += 1
+                    else:
+                        out["returned_false"] += 1
+                except Exception as exc:
+                    out["raised"] += 1
+                    out["ok"] = False
+                    out.setdefault("error", f"slot {idx}: {str(exc)[:120]}")
+        finally:
+            if refresh:
+                try:
+                    zk.RefreshData(1)
+                except Exception:
+                    pass
+        return out
+
     def _do_open_door(self, zk: Any, delay_ds: int) -> bool:
         return bool(zk.ACUnlock(1, int(delay_ds)))
 
@@ -1743,7 +1826,7 @@ class ZKStandaloneDevice:
                         # note in the template loop below.
                         del_attempted += 1
                         try:
-                            if bool(zk.SSR_DelUserTmpExt(1, pin, int(finger_idx))):
+                            if self._clear_finger_slot(zk, pin, finger_idx):
                                 del_ok += 1
                             else:
                                 _mark_failed(pin, f"finger_remove_false_f{finger_idx}")
