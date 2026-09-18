@@ -15,7 +15,9 @@ from app.core.access_verification import (
     EVENT_TIME_SANITY_BOUND_SEC as _EVENT_TIME_SANITY_BOUND_SEC,
     build_totp_index,
     load_local_state,
+    maybe_log_totp_roster_summary,
     parse_event_time_to_epoch,
+    record_totp_roster_check,
     verify_card,
     verify_totp_resilient,
     _totp_counter,
@@ -4368,6 +4370,16 @@ class UltraDeviceWorker(threading.Thread):
         _idx, _idx_gen = _get_shared_totp_index()
         totp_index = _idx if (_idx is not None and _idx_gen >= self._cached_state_gen) else None
 
+        # A newer index carries grants from a newer credential generation than this
+        # worker's member list. The roster check (verify_totp) compares the two, so a
+        # member added since this worker last refreshed would read as "not on the
+        # list". Check against the process-wide member list when it is at least as
+        # new as the index; it is published before the index is built from it.
+        if totp_index is not None and _idx_gen > self._cached_state_gen:
+            _shared, _shared_gen = _get_shared_local_state()
+            if _shared_gen >= _idx_gen and isinstance(_shared, (tuple, list)) and len(_shared) >= 3:
+                users_by_am = _shared[1]
+
         t0 = time.monotonic()
         result = verify_totp_resilient(
             scanned=code,
@@ -4379,6 +4391,7 @@ class UltraDeviceWorker(threading.Thread):
             totp_index=totp_index,
         )
         decision_ms = (time.monotonic() - t0) * 1000
+        record_totp_roster_check(result, source=self._tel_wid)
 
         allowed = result.get("allowed", False)
         reason = result.get("reason", "DENY_TOTP_FAILED")
@@ -5188,6 +5201,8 @@ class UltraDeviceWorker(threading.Thread):
                 self._maybe_rebuild_totp_index()
             except Exception:
                 pass
+            # Hourly QR roster-check totals (§3.1b); a no-op until due.
+            maybe_log_totp_roster_summary()
             # Every tick (≤5s): pre-warm the staff-ids + membership-brief caches
             # HERE on the bg thread (warm connection) so their 60s-TTL/gen DB
             # reload never fires INLINE on a scan's door/popup path. The hot path

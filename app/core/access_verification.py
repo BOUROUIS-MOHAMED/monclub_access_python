@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import logging
 import struct
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -135,6 +136,113 @@ def _safe_str(v: Any, default: str = "") -> str:
 
 
 # ===================== TOTP (QR) =====================
+
+# Roster check verdicts, carried in a matched QR result as ``rosterCheck``.
+ROSTER_IN = "in_roster"            # a granted membership is on the PC's member list
+ROSTER_IN_BY_ACCOUNT = "in_roster_by_account"  # no grant listed, but the same account is
+ROSTER_NOT_IN = "not_in_roster"    # neither: the member was removed from the list
+ROSTER_UNEVALUABLE = "roster_empty"  # the PC's member list is empty: nothing to check
+
+
+def _account_on_roster(account_id: Any, users_by_am: Dict[int, Dict[str, Any]]) -> bool:
+    """True when a row of the member list carries this credential's main account id.
+
+    Only reached when no granted membership is listed (rare), so the linear scan
+    never runs on an ordinary allow."""
+    acc = _safe_int(account_id, 0)
+    if acc <= 0:
+        return False
+    for u in users_by_am.values():
+        if isinstance(u, dict) and _safe_int(u.get("mainAccountId"), 0) == acc:
+            return True
+    return False
+
+# ``totp_roster_check_mode``: TRIAL records a would-be refusal and still allows;
+# ENFORCE refuses (DENY_NOT_IN_LOCAL_ROSTER). Anything else reads as TRIAL.
+ROSTER_MODE_TRIAL = "trial"
+ROSTER_MODE_ENFORCE = "enforce"
+
+
+def totp_roster_check_mode(settings: Dict[str, Any]) -> str:
+    raw = _safe_str(settings.get("totp_roster_check_mode"), "").strip().lower()
+    return ROSTER_MODE_ENFORCE if raw == ROSTER_MODE_ENFORCE else ROSTER_MODE_TRIAL
+
+
+# Process-wide counts of roster verdicts, one per scan. verify_totp stays pure (the
+# resilient wrapper can call it twice per scan, and tests call it freely); the two
+# engines record the FINAL result once, after verify_totp_resilient returns.
+# ``refused`` = not_in_roster scans actually denied (enforce mode).
+ROSTER_REFUSED = "refused"
+_roster_counts_lock = threading.Lock()
+_roster_counts: Dict[str, int] = {
+    ROSTER_IN: 0, ROSTER_IN_BY_ACCOUNT: 0, ROSTER_NOT_IN: 0, ROSTER_UNEVALUABLE: 0,
+    ROSTER_REFUSED: 0,
+}
+_roster_counts_since = datetime.now().astimezone().isoformat(timespec="seconds")
+
+# Hourly [T] QR_ROSTER_SUMMARY with the running totals, so the newest uploaded log
+# window always says where the counts stand (the owner reads it from the dashboard's
+# Access logs page). Gated process-wide: at most one line per interval.
+ROSTER_SUMMARY_INTERVAL_SEC = 3600.0
+_roster_summary_next_mono = time.monotonic() + ROSTER_SUMMARY_INTERVAL_SEC
+
+
+def record_totp_roster_check(result: Any, *, source: str = "") -> None:
+    """Count one scan's roster verdict; log a [T] line for every non-member verdict.
+
+    No member identity is logged or counted -- only the verdict, the mode and whether
+    the scan was allowed. Never raises.
+    """
+    try:
+        verdict = result.get("rosterCheck") if isinstance(result, dict) else None
+        if verdict not in (ROSTER_IN, ROSTER_IN_BY_ACCOUNT, ROSTER_NOT_IN, ROSTER_UNEVALUABLE):
+            return
+        allowed = bool(result.get("allowed"))
+        with _roster_counts_lock:
+            _roster_counts[verdict] += 1
+            if verdict == ROSTER_NOT_IN and not allowed:
+                _roster_counts[ROSTER_REFUSED] += 1
+        if verdict != ROSTER_IN:
+            _tel.event(
+                "QR_ROSTER_CHECK", source=source or None, verdict=verdict,
+                mode=result.get("rosterCheckMode"), allowed=allowed,
+            )
+        maybe_log_totp_roster_summary()
+    except Exception:
+        pass
+
+
+def totp_roster_check_counts() -> Dict[str, Any]:
+    """Counts since this process started:
+    ``{since, in_roster, in_roster_by_account, not_in_roster, roster_empty, refused}``."""
+    with _roster_counts_lock:
+        out: Dict[str, Any] = dict(_roster_counts)
+    out["since"] = _roster_counts_since
+    return out
+
+
+def maybe_log_totp_roster_summary(*, now_mono: Optional[float] = None) -> bool:
+    """Log ``[T] QR_ROSTER_SUMMARY`` once per ROSTER_SUMMARY_INTERVAL_SEC. Cheap when not
+    due (one lock, one comparison). Called after each recorded scan and from the ULTRA
+    background refresh loop, so a quiet hour still gets its line. Never raises."""
+    global _roster_summary_next_mono
+    try:
+        now = time.monotonic() if now_mono is None else float(now_mono)
+        with _roster_counts_lock:
+            if now < _roster_summary_next_mono:
+                return False
+            _roster_summary_next_mono = now + ROSTER_SUMMARY_INTERVAL_SEC
+            counts = dict(_roster_counts)
+        _tel.event(
+            "QR_ROSTER_SUMMARY", since=_roster_counts_since,
+            in_roster=counts[ROSTER_IN], in_roster_by_account=counts[ROSTER_IN_BY_ACCOUNT],
+            not_in_roster=counts[ROSTER_NOT_IN],
+            roster_empty=counts[ROSTER_UNEVALUABLE], refused=counts[ROSTER_REFUSED],
+        )
+        return True
+    except Exception:
+        return False
+
 
 def _totp_counter(unix_time: int, period: int) -> int:
     return int(unix_time) // int(period)
@@ -572,6 +680,7 @@ def verify_totp(
 
         user: Optional[Dict[str, Any]] = None
         chosen_am_id: Optional[int] = None
+        roster_hit = False
         for gid in grants:
             try:
                 am = int(str(gid).strip())
@@ -580,9 +689,46 @@ def verify_totp(
             if am in users_by_am:
                 user = users_by_am.get(am)
                 chosen_am_id = am
+                roster_hit = True
                 break
             if chosen_am_id is None:
                 chosen_am_id = am
+
+        # Roster check (2026-09-18). The code matched a credential; is any membership
+        # it grants on this PC's member list? Decided HERE, after the hits are
+        # resolved, so the TOTP index and the loop reach it with the same grants and
+        # the same users_by_am -- never in _iter_eligible_totp_creds, which the index
+        # shares. An empty member list cannot be told apart from a failed read
+        # (load_local_state swallows it), so it is ROSTER_UNEVALUABLE and always allows.
+        if roster_hit:
+            roster_check = ROSTER_IN
+        elif not users_by_am:
+            roster_check = ROSTER_UNEVALUABLE
+        elif _account_on_roster(account_id, users_by_am):
+            # The PC's cached grants can be stale: its credential diff ignores
+            # grantedActiveMembershipIds, so a member who renewed (new membership id)
+            # keeps the old id here. The same main account on a listed row is the
+            # same person with a valid membership (account<->user is 1:1).
+            roster_check = ROSTER_IN_BY_ACCOUNT
+        else:
+            roster_check = ROSTER_NOT_IN
+        roster_mode = totp_roster_check_mode(settings)
+
+        if roster_check == ROSTER_NOT_IN and roster_mode == ROSTER_MODE_ENFORCE:
+            return {
+                "allowed": False,
+                "reason": "DENY_NOT_IN_LOCAL_ROSTER",
+                "scanMode": "QR_TOTP",
+                "accountId": account_id,
+                "credId": cred_id,
+                "matchedCounter": matched_ctr,
+                "ageSeconds": age,
+                "activeMembershipId": chosen_am_id,
+                "rosterCheck": roster_check,
+                "rosterCheckMode": roster_mode,
+                "tookMs": (time.perf_counter() - t0) * 1000.0,
+                "user": None,
+            }
 
         return {
             "allowed": True,
@@ -593,6 +739,8 @@ def verify_totp(
             "matchedCounter": matched_ctr,
             "ageSeconds": age,
             "activeMembershipId": chosen_am_id,
+            "rosterCheck": roster_check,
+            "rosterCheckMode": roster_mode,
             "user": user,
             "tookMs": (time.perf_counter() - t0) * 1000.0,
         }
@@ -649,7 +797,14 @@ def verify_totp_resilient(
         totp_index=totp_index,
     )
     primary_clock = "scan" if now_unix is not None else "wall"
-    if primary.get("allowed") or now_unix is None:
+    # A roster refusal already matched a credential: the retry exists for clock skew
+    # (no match / expired) and would repeat the full verification for nothing. It could
+    # only differ if ANOTHER credential produced the same code in the wall-clock window.
+    if (
+        primary.get("allowed")
+        or now_unix is None
+        or primary.get("reason") == "DENY_NOT_IN_LOCAL_ROSTER"
+    ):
         primary["clockUsed"] = primary_clock
         return primary
 

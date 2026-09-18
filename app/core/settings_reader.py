@@ -218,6 +218,23 @@ def parse_fingerprint_template_version(capabilities: Any) -> Optional[int]:
     return iv if iv in (9, 10) else None
 
 
+def parse_totp_roster_check_mode(capabilities: Any) -> str:
+    """QR roster-check mode from the opaque deviceCapabilities payload (dict or JSON
+    string): ``{"totpRosterCheckMode": "enforce"}`` turns enforcement on for that
+    device. Anything else -- absent, malformed, another value -- is ``"trial"``
+    (guide §3.1b). Never raises."""
+    caps = capabilities
+    if isinstance(caps, str):
+        try:
+            caps = json.loads(caps.strip()) if caps.strip() else None
+        except Exception:
+            caps = None
+    if not isinstance(caps, dict):
+        return "trial"
+    raw = caps.get("totpRosterCheckMode")
+    return "enforce" if isinstance(raw, str) and raw.strip().lower() == "enforce" else "trial"
+
+
 def normalize_access_data_mode(v: Any) -> str:
     """Normalize accessDataMode to 'DEVICE', 'AGENT', or 'ULTRA'."""
     s = _safe_str(v, "DEVICE").strip().upper()
@@ -465,6 +482,11 @@ def normalize_device_settings(dev: Dict[str, Any], gs: Optional[Dict[str, Any]] 
         "totp_max_past_age_seconds": int(totp_max_past_age_seconds),
         "totp_max_future_skew_seconds": int(totp_max_future_skew_seconds),
         "totp_prefix": totp_prefix,
+        # QR roster check (guide §3.1b): "trial" counts would-be refusals and still
+        # allows; "enforce" refuses. Set per device in deviceCapabilities.
+        "totp_roster_check_mode": parse_totp_roster_check_mode(
+            dev.get("deviceCapabilities") or dev.get("device_capabilities")
+        ),
 
         "rfid_enabled": bool(rfid_enabled),
         "rfid_min_digits": int(rfid_min_digits),

@@ -400,6 +400,40 @@ grep -F "[T] DOOR_OPEN_SWITCH" app-*.log
 
 ---
 
+## 6a. QR codes from members who are no longer on the PC's list (trial counts)
+
+Since 2026-09-18 every QR code the PC checks gets a roster verdict (guide §3.1b). In the
+default **trial** mode nobody is refused; the would-be refusals are only counted.
+
+```bash
+# running totals, at most one line an hour
+grep -F "[T] QR_ROSTER_SUMMARY" app-*.log | tail -1
+
+# each scan that was not on the list (trial: still let in; enforce: refused)
+grep -F "[T] QR_ROSTER_CHECK" app-*.log
+```
+
+| Field | Meaning |
+|---|---|
+| `in_roster` | QR scans whose membership is on the PC's list |
+| `in_roster_by_account` | QR scans whose cached membership id is out of date (e.g. a renewal) but whose account is on the list — never refused |
+| `not_in_roster` | QR scans whose membership is **not** on the list — the would-be refusals in trial |
+| `roster_empty` | QR scans checked while the PC's list was empty — never refused, in any mode |
+| `refused` | QR scans actually refused (only in enforce mode) |
+| `since` | when the counts started — they restart with the app |
+
+To read it without visiting the gym: press "Sync logs now" in the dashboard header, wait
+up to ~10 min for the PC to upload, then open the newest window on the Access logs page and
+search `QR_ROSTER`. **The Access logs page needs a MonClub admin account** — a gym account
+sees only whether the upload happened, not the file. The first summary line appears an hour
+after the app starts. `[CODE: app/core/log_sync_request_poller.py, app/core/log_uploader.py;
+dashboard config-nav-dashboard.tsx]`
+
+To switch one device to enforce, its `deviceCapabilities` JSON must contain
+`"totpRosterCheckMode": "enforce"` (guide §3.1b). No dashboard field edits that JSON yet.
+
+---
+
 ## 7. One-liners
 
 ```bash

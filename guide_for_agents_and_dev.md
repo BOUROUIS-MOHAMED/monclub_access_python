@@ -42,6 +42,8 @@ This file is only useful while it is true. If you change any of the following, y
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
 | The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
+| The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
+| The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -221,6 +223,142 @@ Found while tracing this, **not changed** `[CODE]`:
 - `_handle_device_door_open` falls through from a failed AGENT open to a direct PullSDK
   connect for a device with no ULTRA worker; if the AGENT pulse was sent but reported False,
   the door can pulse twice.
+
+### 3.1b The QR/TOTP roster check — trial first, then enforce (2026-09-18)
+
+**The gap it closes.** A QR code opens the door through the PC: the ULTRA rescue
+(`_handle_totp_rescue`) or the AGENT decision (`DecisionService`), both via
+`verify_totp_resilient` → `verify_totp`. Until 2026-09-18 a code that matched a credential was
+allowed even when **none** of that credential's `grantedActiveMembershipIds` was a key of
+`users_by_am` — the PC's member list; it fell back to the first grant id with `user=None`. The
+eligibility filter (`_iter_eligible_totp_creds`) checks only `enabled`, the ids, the secret and a
+non-empty grant list. So a member dropped from the member list kept opening the door by QR
+until the credentials themselves were refreshed. `[CODE]`
+`[TEST: test_access_verification.py::test_totp_no_matching_user_in_users_by_am — still pins the
+allow, now as trial-mode behaviour]`
+
+**Where the check is.** In `verify_totp`'s final ALLOW step, after the hits are resolved — so
+the TOTP speed index and the full loop reach it with the same `grants` and the same
+`users_by_am`. **Never** in `_iter_eligible_totp_creds`: `build_totp_index` shares that filter,
+and a roster condition there would drop credentials from the index and break the
+index-equals-loop contract. Every matched QR result now carries `rosterCheck` and
+`rosterCheckMode`: `[CODE: access_verification.py::verify_totp]`
+
+| `rosterCheck` | Means | trial | enforce |
+|---|---|---|---|
+| `in_roster` | a granted membership is on the member list | allow | allow |
+| `in_roster_by_account` | no grant is listed, but a listed row carries the credential's `accountId` as `mainAccountId` | allow (counted) | allow (counted) |
+| `not_in_roster` | neither | allow (counted) | **deny** `DENY_NOT_IN_LOCAL_ROSTER`, `user=None` |
+| `roster_empty` | the member list is empty | allow (counted) | allow (counted) |
+
+Only the new fields change on an allow: `activeMembershipId` and `user` are resolved exactly as
+before. `roster_empty` exists because an empty list cannot be told apart from a failed read:
+`load_local_state` turns a failed users query into `[]`, and `_get_cached_local_state` falls back
+to `({}, {}, {})` on a bad load. Enforcing then would refuse every QR code at every door. `[CODE]`
+
+`in_roster_by_account` exists because the PC's cached grants go stale. The backend recomputes
+`grantedActiveMembershipIds` on every request and never stores it on the credential row; on
+backend `main` (P1a) its credentials token digests the grants, so a grant-only change **is**
+delivered (`[UNVERIFIED]` whether that backend is what the gyms run) — but
+`db.py::_sync_gym_access_credentials_rows` diffs only `id gym_id account_id secret_hex enabled
+rotated_at created_at updated_at`, so the new grants are not written. A member who renews (a new
+`ActiveMembership`, a new id) keeps the old id in the local credential. Both ids are the same
+person: the credential's `accountId` is the `MainAccountModel` id found by the member's email,
+the row's `mainAccountId` is `user.account.id`, and `UserModel.account` is unique (one user per
+account). `[CODE: backend main GymAccessController.getGymAccessUsers, ::computeCredentialsVersion;
+UserModel.account; client db.py]` A row with no `mainAccountId` never matches. The linear scan
+runs only when no grant is listed. `[TEST: ::test_a_renewed_member_with_stale_grants_passes_by_account,
+::test_the_account_second_chance_needs_the_same_account]`
+
+**Shared plans and staff.** In the main sync the backend derives `users[]` and every
+credential's grants from the **same** filtered list (`scoped`: dates, status, freezes, gym
+permission, unpaid-due and photo rules), so each granted id there is a listed row by
+construction. "Family/shared plan" in this codebase is one person's own membership honoured at
+the sister gyms of a chain (`gymFamilyAccess` + `sharedGyms`) — each person keeps their own
+`ActiveMembership` id; there is no owner/beneficiary split. Staff and coach plans are ordinary
+rows. A credential passes as soon as **any** of its grants is listed. `[CODE: backend main
+GymAccessController.getGymAccessUsers; MembershipModel.permitsGym]`
+`[TEST: ::test_a_shared_plan_credential_passes_when_any_grant_is_listed,
+::test_an_empty_member_list_is_unevaluable_and_never_refuses,
+::test_index_and_loop_reach_the_same_roster_verdict, ::test_the_index_itself_is_not_filtered_by_the_roster]`
+
+**One verification per refusal.** `verify_totp_resilient` returns a `DENY_NOT_IN_LOCAL_ROSTER`
+at once instead of re-running the full check against the wall clock: that retry exists for clock
+skew (no match, expired), and on the no-index path it would double the worker's time. It could
+only differ if another credential produced the same code in the other time window.
+`[TEST: ::test_an_enforced_roster_refusal_does_not_rerun_the_verification]`
+
+**The switch.** Per device, in the device's opaque `deviceCapabilities` JSON:
+`{"totpRosterCheckMode": "enforce"}`. `settings_reader.py::parse_totp_roster_check_mode` reads it
+into `normalize_device_settings()["totp_roster_check_mode"]`, which both engines use; anything
+else — absent, malformed, another value — is `trial`. It survives storage
+(`sync_devices.device_capabilities`) to the engine. `[TEST: ::test_the_mode_arrives_from_the_device_payload,
+::test_the_mode_survives_device_ingest_to_the_engine_settings]` The backend stores
+`deviceCapabilities` as free JSON and the dashboard's device form keeps unrelated keys on save
+(`deviceCapabilitiesRaw`), but **no dashboard input edits it** — today the key can only be set by
+an API call on the device. `[CODE: backend main GymDeviceDto; dashboard gym-devices-view.tsx]`
+
+**Newer index, older member list.** A worker uses the shared index when its generation is `>=`
+the worker's own, so the index can carry a credential for a member added after that worker's
+member list was loaded. `_handle_totp_rescue` then checks against the process-wide member list
+(`_get_shared_local_state`) when it is at least as new as the index — it is published by the
+refresh that the index is later built from. Without it, a brand-new member would read as
+`not_in_roster`: a false count in trial, a refusal in enforce. If the shared list is older
+than the index (a slower refresh overwrote it), the worker's own list is used. `[CODE:
+ultra_engine.py::_handle_totp_rescue]` `[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new]`
+
+**Counting.** `verify_totp` stays pure — `verify_totp_resilient` calls it twice on the denial
+path (scan clock, then wall clock) and tests call it freely. Each engine records the **final**
+result once: `record_totp_roster_check` in `_handle_totp_rescue` and in `DecisionService.run`.
+It adds one to an in-process counter and, for every verdict other than `in_roster`, logs
+`[T] QR_ROSTER_CHECK source=… verdict=… mode=… allowed=…` — no member id, name or credential.
+`totp_roster_check_counts()` returns the counts since the process started (they restart with the
+app). `maybe_log_totp_roster_summary` logs `[T] QR_ROSTER_SUMMARY` with the running totals at most
+once an hour, from each recorded scan and from the ULTRA background refresh loop; the first line
+comes an hour after start, and on a PC with no ULTRA worker it comes only with a scan. `[CODE]`
+`[TEST: ::test_verify_totp_itself_counts_nothing, ::test_record_counts_one_scan_and_logs_no_member_identity,
+::test_the_summary_line_is_logged_at_most_once_per_interval,
+::test_ultra_rescue_of_a_removed_member, ::test_agent_decision_for_a_removed_member]`
+
+**How the counts leave the PC — the log upload, not the heartbeat.** Every `[T]` line is in the
+app log, and `log_uploader.py` uploads each log window when it closes; the dashboard's "Sync logs
+now" button (fast path to 127.0.0.1, else a backend request the PC's `LogSyncRequestPoller` picks
+up within ~10 min) uploads the open window on demand. No backend change is needed. **Reading the
+files needs a MonClub admin account:** the dashboard's Access logs page and its API
+(`/protected/access/logs`) are ADMIN-only; a gym account sees upload status only. The PC heartbeat
+(`pc_identity.py::build_heartbeat_payload` → `/public/access/v1/pc/heartbeat`, every 300 s) was
+rejected as the carrier: the backend's `HeartbeatRequest` has no field for it, Jackson drops
+unknown properties, and `GymAccessPcService.heartbeat` reads four declared fields — showing counts
+on `/access-pcs` needs a DTO field, a column and a dashboard change. `[CODE: backend main
+AccessLogAdminController, AccessLogGymController, GymAccessPcDtos, GymAccessPcService; dashboard
+config-nav-dashboard.tsx, sync-logs-header-button.tsx]`
+
+**What does not change.** Card checks (`verify_card`), the staff-RFID rescue, and the staff QR
+re-entry exemption: the exemption reads `user["membershipId"]`, and `user` was already `None`
+for a code whose grants are not listed, so a staff member off the list got no exemption before
+either. The deny reason is free text on the backend (`GymAccessDoorHistoryDto.reason`,
+`GymAccessDoorHistory.reason`: plain `String`, no enum) and the uploaded row's type still comes
+from `scanMode`, so an enforce-mode refusal uploads as a QR row with that reason. `[CODE:
+backend main]` The Tauri popup shows it as « Aucun abonnement actif trouvé pour ce code ».
+`[CODE: tauri-ui/src/pages/PopupWindow.tsx]`
+
+**What it cannot do.** The check compares against the member list this PC last received. Without
+server-sent validity dates (planned with P2/P3b), an **offline** PC's list does not change, so a
+member whose membership ends during an internet outage keeps opening by QR until the PC is back
+online and syncs. It closes the online gap only. `[CODE]`
+
+**Before switching a device to enforce** — known ways a valid member could still read as
+`not_in_roster` `[CODE]`, which is what the trial counts are for:
+- A renewal whose new membership sits on a row **without** `mainAccountId` (a user with no linked
+  main account) fails both the stale grant and the account second chance.
+- The fast-patch path builds credentials with `AccessPatchBundleService.shouldExposeMembership`,
+  which omits the photo (`blockAccessForUnphotographedMembers`) and unpaid-due
+  (`allowEntryPastDueDate`) rules the main sync applies — so a fast-patch credential can grant a
+  membership the member list deliberately leaves out. Enforce refuses that member, which matches
+  the main sync's intent, but trial counts will include them.
+- Removed members still count as `not_in_roster` only until their credential is removed by a
+  sync; the counts measure the gap, not a steady state.
+`[UNVERIFIED]` How often any of these happens on a real gym — that is the trial's job.
 
 ### 3.2 The roster rule — the most operationally important fact in this file
 
@@ -1716,6 +1854,18 @@ A grep on the wrong key finds nothing. `[CODE]`
 `ZKEM_PUSH_FAILED_PINS` reasons: `set_user_info_false`, `template_refused_f<N>`,
 `finger_remove_false_f<N>`, `finger_remove_exception_f<N>`, `exception:<Type>`,
 `chunk_wedged_or_unconfirmed`. `[CODE: _do_push_roster]`
+
+### 10.2a Door queue and QR roster check (added 2026-09-18)
+
+| Event | Where | Carries |
+|---|---|---|
+| `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller's deadline, **not executed** (§3.1a) |
+| `QR_ROSTER_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict mode allowed` — one per QR scan whose verdict is not `in_roster`; no member id, name or credential (§3.1b) |
+| `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty refused` — running totals since the process started, at most once an hour (§3.1b) |
+
+`[TEST: test_door_open_deadline.py::test_an_expired_open_is_reported_expired_and_releases_its_waiter;
+test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identity,
+::test_the_summary_line_is_logged_at_most_once_per_interval]`
 
 ### 10.3 Three rules this instrumentation follows — keep them
 

@@ -30,6 +30,7 @@ from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
+    record_totp_roster_check,
     verify_totp_resilient,
     verify_card,
     load_local_state,
@@ -1169,6 +1170,7 @@ class DecisionService(threading.Thread):
                     scan_epoch=ev.event_epoch,
                 )
                 verify_ms = _now_ms() - t_verify
+                record_totp_roster_check(vr, source=f"AGENT:{ev.device_id}")
 
             allowed = bool(vr.get("allowed", False))
             reason = _safe_str(vr.get("reason", "DENY"))
