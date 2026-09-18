@@ -144,18 +144,37 @@ ROSTER_NOT_IN = "not_in_roster"    # neither: the member was removed from the li
 ROSTER_UNEVALUABLE = "roster_empty"  # the PC's member list is empty: nothing to check
 
 
+# (member-list object, its main account ids). The ULTRA member list is a long-lived,
+# read-only object between refreshes, so the set is built once per refresh; the
+# AGENT path hands a fresh copy per scan and rebuilds (~1 ms for ~1800 rows).
+_roster_account_ids_cache: tuple = (None, frozenset())
+
+
+def _roster_account_ids(users_by_am: Dict[int, Dict[str, Any]]) -> frozenset:
+    global _roster_account_ids_cache
+    cached = _roster_account_ids_cache
+    if cached[0] is users_by_am:
+        return cached[1]
+    ids = set()
+    for u in users_by_am.values():
+        if isinstance(u, dict):
+            acc = u.get("mainAccountId")
+            if type(acc) is not int:  # SQLite hands back int; coerce anything else
+                acc = _safe_int(acc, 0)
+            if acc > 0:
+                ids.add(acc)
+    result = frozenset(ids)
+    _roster_account_ids_cache = (users_by_am, result)
+    return result
+
+
 def _account_on_roster(account_id: Any, users_by_am: Dict[int, Dict[str, Any]]) -> bool:
     """True when a row of the member list carries this credential's main account id.
 
-    Only reached when no granted membership is listed (rare), so the linear scan
-    never runs on an ordinary allow."""
+    Only reached when no granted membership is listed (rare), never on an ordinary
+    allow."""
     acc = _safe_int(account_id, 0)
-    if acc <= 0:
-        return False
-    for u in users_by_am.values():
-        if isinstance(u, dict) and _safe_int(u.get("mainAccountId"), 0) == acc:
-            return True
-    return False
+    return acc > 0 and acc in _roster_account_ids(users_by_am)
 
 # ``totp_roster_check_mode``: TRIAL records a would-be refusal and still allows;
 # ENFORCE refuses (DENY_NOT_IN_LOCAL_ROSTER). Anything else reads as TRIAL.

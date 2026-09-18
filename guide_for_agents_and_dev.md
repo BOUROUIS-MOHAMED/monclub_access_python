@@ -266,8 +266,11 @@ rotated_at created_at updated_at`, so the new grants are not written. A member w
 person: the credential's `accountId` is the `MainAccountModel` id found by the member's email,
 the row's `mainAccountId` is `user.account.id`, and `UserModel.account` is unique (one user per
 account). `[CODE: backend main GymAccessController.getGymAccessUsers, ::computeCredentialsVersion;
-UserModel.account; client db.py]` A row with no `mainAccountId` never matches. The linear scan
-runs only when no grant is listed. `[TEST: ::test_a_renewed_member_with_stale_grants_passes_by_account,
+UserModel.account; client db.py]` A row with no `mainAccountId` never matches. The account ids
+are gathered only when no grant is listed, into a set cached per member-list object
+(`_roster_account_ids`): ULTRA reuses one object between refreshes, so it is built once
+(~0.45 ms for 1,800 rows on the development PC); AGENT's `_load_local_state` hands a fresh copy
+per scan and rebuilds it on each such scan. `[TEST: ::test_a_renewed_member_with_stale_grants_passes_by_account,
 ::test_the_account_second_chance_needs_the_same_account]`
 
 **Shared plans and staff.** In the main sync the backend derives `users[]` and every
