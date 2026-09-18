@@ -230,9 +230,17 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
 - **The worker took it first** → the open is being sent, so the caller does **not** answer
   "timeout". It waits up to `_DOOR_OPEN_IN_FLIGHT_WAIT_SEC` more (the 4 s `timeout_ms` the worker
   passes to the driver, plus 1 s — a chosen bound) and returns the worker's own answer, `ok=True`
-  on success. If that wait also runs out it returns `sent, no answer`, never `timeout`; the
-  local API answers 500 with "commande envoyée à l'appareil, sans réponse à temps — vérifier si
-  la porte s'est ouverte", not the generic "échec…".
+  on success. (If the worker finds itself disconnected after taking it, nothing is sent and
+  that answer is `not connected` → 500 "appareil non connecté", where the caller used to say
+  `timeout` → 503.) If the extra wait also runs out it returns `sent, no answer`, never
+  `timeout`; the local API answers 500 whose `error` is "commande envoyée à l'appareil, sans
+  réponse à temps — vérifier si la porte s'est ouverte", not the generic "échec…".
+  What the operator sees `[CODE]`: the Tauri pages' `post` throws that `error` as the
+  `ApiError` message, and the pages print it behind their own failure framing. That is
+  "Ouverture échouée: ApiError: …" on `DevicesPage`, "ApiError: …" on `FavoritesOverlayPage`, and
+  a "Door open failed" notice on `TrayPanelPage`. A favourite global shortcut reports only the
+  HTTP status (`lib.rs`, "HTTP 500 …"). The native tray item prints the `error` to stderr only
+  (`lib.rs::post_open_door`). Not changed here.
 
 `[CODE: ultra_engine.py::_DoorOpenClaim, ::request_door_open, ::_drain_commands;
 local_access_api_v2.py::_door_open_error_fr]` `[TEST: test_door_open_deadline.py::
@@ -258,7 +266,9 @@ sent), which keeps the local API on its 503 instead of a generic 500.
 What it does **not** change: the check is at dequeue, so an open taken inside the deadline still
 runs and its waiter gets the device's answer. The cost is time. When the worker takes an open
 at the very end of the caller's 2 s wait, `_handle_device_door_open` can take up to
-2 s + 5 s. The Tauri pages' `post` aborts after 15 s `[CODE: tauri-ui/src/api/client.ts::post]`;
+2 s + 5 s. That holds only its own request thread: the local API server is a
+`ThreadingHTTPServer` `[CODE: local_access_api_v2.py::_AppHTTPServerV2]`. The Tauri pages'
+`post` aborts after 15 s `[CODE: tauri-ui/src/api/client.ts::post]`;
 the tray and favourite-shortcut calls set no timeout of their own
 `[CODE: tauri-ui/src-tauri/src/lib.rs::post_open_door, the shortcut handler's reqwest call]`.
 How long the SDK call itself can take is driver-specific. The standalone driver gives up after
