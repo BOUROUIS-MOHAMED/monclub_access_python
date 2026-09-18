@@ -42,6 +42,7 @@ This file is only useful while it is true. If you change any of the following, y
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
 | The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
+| The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
 | The test / verification commands | §9 Verifying this guide |
@@ -584,7 +585,7 @@ every run, whereas the standalone full sync treats it as nothing to remove.
 departed. So, under ACCOUNT with withheld rows: the standalone full sync skips
 `_maybe_mirror_reconcile`, `_neutralise_revoked_pins` AND `prune_device_sync_state`
 (`safe_to_prune=False`, `[T] REVOKE_SKIP_INCOMPLETE_ROSTER`); the PullSDK full sync skips the
-stale-pin delete, the nuke and both prunes; and the two TARGETED removals
+stale-pin delete, the FULL_REPLACE table clear and both prunes; and the two TARGETED removals
 (`sync_member_on_connected_sdk`, `_account_member_revoke`) first check
 `device_sync.account_roster_withheld_for_device` over `db.list_sync_users_missing_main_account`,
 because a person's other membership row may be the one without the field. This neither mixes
@@ -596,12 +597,15 @@ window. `[CODE]` `[TEST: ::test_an_incomplete_roster_skips_the_revoke_pass_and_t
 ::test_no_delete_while_a_deliverable_row_has_no_main_account_id,
 ::test_no_removal_while_a_deliverable_row_has_no_main_account_id]`
 
-**The PullSDK nuke heuristic is off for any device that has switched scheme.** INCREMENTAL clears
-every table when stale pins outnumber desired ones. Right after a switch the old scheme's pins ARE
-that majority, so the heuristic would wipe the terminal automatically — other systems' users
-included. The procedure is a manual wipe (§3.2e), so `_sync_one_device` suppresses the heuristic
-when `device_pin_scheme_switch` has a row for the device; stale pins are still removed one by one.
-An explicit `FULL_REPLACE` policy is left as configured. `[CODE]`
+**The PullSDK nuke heuristic no longer exists (P3a-2, §3.2g).** INCREMENTAL used to clear every
+table when stale pins outnumbered desired ones; it was suppressed only for a device with a
+`device_pin_scheme_switch` row, which gym 58's C3-400s (pinScheme '') never have. Right after a
+switch the old scheme's pins ARE that majority, and the stale step now goes through the one
+removal ceiling, which refuses it (`REVOKE_ABORTED`, rows kept) instead of removing them one by
+one — the cutover stays a manual wipe (§3.2e). An explicit `FULL_REPLACE` clears only a panel
+whose rows fit under the same ceiling. `[CODE: device_sync.py::_sync_one_device]`
+`[TEST: test_account_pin_device_sites.py::test_a_device_with_scheme_history_is_never_nuked_by_the_heuristic,
+::test_the_nuke_heuristic_no_longer_fires_without_scheme_history]`
 
 **The fingerprint push report names the id the pin IS.** `report_fingerprint_push_result` posted
 every pin as `activeMembershipId`; the backend then runs
@@ -974,7 +978,7 @@ is written, so events stamped before it resolve under the unknown-scheme rule (�
 not as MEMBERSHIP. Hashes are still cleared (idempotent UPDATE). It logs WARNING when there was
 nothing to clear; CRITICAL (wipe) only when this PC already held sync state for the device, since
 those pins were pushed before any scheme was recorded, i.e. as membership pins. The row counts as
-history for the nuke suppression below. `[CODE: db.py::_record_device_pin_scheme_switch]`
+history for the scheme-aware readers (§3.2b inbound). `[CODE: db.py::_record_device_pin_scheme_switch]`
 `[TEST: test_pin_scheme_switch.py::test_a_first_sighting_on_account_is_not_a_switch_and_earlier_events_are_unknown,
 ::test_a_device_seen_on_membership_then_account_is_a_real_switch]`
 
@@ -1034,6 +1038,56 @@ Access desktop UI (`tauri-ui/src`) was grepped in this repo. `[CODE]`
 
 `[UNVERIFIED]` Whether any dashboard or UI screen calls `users/push` or `users/delete` with a pin: the
 dashboard sweep found those routes only in code comments, and `tauri-ui/src` has no caller.
+
+### 3.2g One removal ceiling, no automatic wipe (P3a-2, 2026-09-18)
+
+**The rule.** Every bulk removal from a terminal goes through ONE function,
+`push_safety.check_bulk_removal`: the MB2000 revoke pass (`path=standalone_revoke`), the PullSDK
+stale-pin delete (`path=stale`) and the PullSDK `FULL_REPLACE` table clear (`path=table_clear`,
+counted as every row on the panel, because `DeleteDeviceData(table, "", "")` deletes them all,
+foreign users included). The ceiling is the standalone revoke pass's own rule,
+`max(REVOKE_ABSOLUTE_FLOOR=10, desired_roster × MAX_DELETE_FRACTION=0.25)`, strictly greater is
+refused; an empty desired roster refuses any removal. `[CODE: app/core/push_safety.py]`
+`[TEST: test_push_safety_foundation.py::TestRemovalCeiling]`
+
+**Refused = `REVOKE_ABORTED`, retryable, never final.** Nothing is removed, the per-pin state is
+kept (the prune is skipped on both paths, so the kept pins stay reachable — the §3.2c invariant),
+`[T] REVOKE_ABORTED device_id protocol path count roster ceiling reason sample` is emitted and the
+push-batch row carries `REVOKE_ABORTED=n (...)` in `error_message` (`/api/v2/push-history`). The
+rest of the pass — the push of new/changed members, the door-parameter writes — still runs and
+the pass is not failed by it. An explicit revocation that needed the refused step stays
+unconfirmed (retried), exactly as before. It is deliberately NOT `SKIPPED_NOT_OWNED` (final): an
+abort that finalised a revocation would silently drop it. `[TEST: test_removal_ceiling_pullsdk.py]`
+
+**Why the INCREMENTAL wipe is simply gone.** Its trigger `stale > desired and stale > 10` is always
+above the ceiling: desired ≤ 40 → ceiling 10 < stale; desired > 40 → 0.25 × desired < desired <
+stale. So passing it through the ceiling could only ever refuse it; the code is removed.
+`[TEST: ::TestRemovalCeiling::test_the_old_nuke_trigger_is_always_above_the_ceiling]` It was armed on
+gym 58: `pushing_to_device_policy=1` resolves to INCREMENTAL (`_resolve_push_policy` has no integer
+mapping), and pinScheme '' writes no switch row, so its only suppression never applied. The ULTRA
+worker relabels the device `accessDataMode=DEVICE` before handing it to `DeviceSyncEngine` (§3.3), so
+no ULTRA-only branch is used: the rule is one code path, DEVICE mode included (no fleet device is
+DEVICE-mode). `[TEST: ::TestTheProductionUltraPath]` — both the worker full sync and the scheduler
+fallback relabel path. `[UNVERIFIED]` whether the wipe ever actually fired on gym 58: FIELD-TEST —
+grep that PC's logs for `NUKE-AND-REPAVE` / `ClearDeviceTable(table=`.
+
+**A failed delete keeps its row (PullSDK).** The stale step used to erase `device_sync_state` and
+the mirror for every attempted pin "regardless of SDK outcome", so a delete the panel refused left
+no trace: once the member had left the roster nothing ever tried again. Now only confirmed deletions
+are forgotten (`clear_device_revocation_state`: state, mirror and push intent in one transaction);
+a failed one keeps its row and ownership bit, the prune keeps it too, and the push-batch note says
+`REMOVAL_FAILED=n`. `[TEST: ::test_a_failed_stale_delete_keeps_its_state_for_the_retry]`
+
+**What stays different.** MIRROR keeps its own stricter, purely fractional floor (§3.2c) — merging it
+into the shared ceiling would RELAX it below 40 members. Single-pin removals (a targeted revoke)
+are count 1, always under the ceiling; they are gated by ownership instead (§3.4). The PullSDK
+stale set is still NOT ownership-gated (it is `known_server_pins ∪ device_sync_state rows`, §3.3);
+the ceiling is that path's rail.
+
+**Deliberate test inversions.** `test_batch_device_push.py::test_stale_exceeding_desired_never_clears_the_tables`
+and `::test_a_refused_stale_step_deletes_no_stale_pin_individually` (were: the nuke fires / the nuke
+avoids individual deletes), and `test_account_pin_device_sites.py`'s two scheme-history tests (were:
+12 stale pins against a roster of 2 are removed one by one / the nuke fires without history).
 
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 
@@ -1342,7 +1396,8 @@ durations and edit rates; the starvation regime was shown with a simulation, not
 
 **Offline DEVICE-mode reconcile gate.** A tick whose `getSyncData` failed still reconciles
 DEVICE-mode panels from the cached roster (`DeviceSyncEngine.run_blocking(changed_ids=None)`):
-per PullSDK panel a connect, a full Pin read and `SetDeviceParam` writes; a FULL_REPLACE panel is
+per PullSDK panel a connect, a full Pin read and `SetDeviceParam` writes; a FULL_REPLACE panel whose
+rows fit under the removal ceiling (§3.2g) is
 wiped and re-pushed. So the fast retries must not each do it: an *automatic* failed tick
 dispatches it only if the tick that last dispatched it **started** at least
 `_OFFLINE_RECONCILE_INTERVAL_SEC` = 600 s ago (`_last_tick_device_reconcile_mono`) — the old
@@ -1871,7 +1926,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MIRROR_ABORT_FLOOR` | `ultra_engine.py` | `worker extras roster max_frac` (warn) |
 | `MIRROR_PLAN` | `ultra_engine.py` | `worker would_delete sample armed` |
 | `REVOKE_DONE` | `ultra_engine.py` | `pins deleted neutralised slots ok` (confirmed outcomes only) |
-| `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` |
+| `REVOKE_ABORT_FLOOR` | `ultra_engine.py` | `revoked roster ceiling max_frac abs_floor` (kept next to `REVOKE_ABORTED` for existing greps) |
+| `REVOKE_ABORTED` | `push_safety.py::check_bulk_removal` | `worker device_id protocol path count roster ceiling max_frac abs_floor reason sample` (warn; P3a-2 — one removal step refused by the shared ceiling, nothing removed, state kept; `path` ∈ `standalone_revoke`, `stale`, `table_clear`; `reason` ∈ `above_ceiling`, `empty_roster`; §3.2g) |
 | `REVOKE_SKIP_EMPTY_ROSTER` | `ultra_engine.py` | (no fields) |
 | `REVOKE_SKIP_INCOMPLETE_ROSTER` | `ultra_engine.py` | `withheld` (warn; ACCOUNT rows without `mainAccountId` — MIRROR, revoke pass and prune skipped, §3.2b) |
 | `ZKEM_PUSH_FAILED_PINS` | `zk_standalone.py` | `count by_reason pins truncated` |

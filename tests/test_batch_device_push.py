@@ -70,8 +70,11 @@ def test_set_device_data_batch_chunks_rows(tmp_path, monkeypatch):
     assert ok == 7  # All 7 rows accounted for
 
 
-def test_nuke_and_repave_triggers_when_stale_exceeds_desired(tmp_path, monkeypatch):
-    """When stale_pins > desired_pins, nuke-and-repave clears all tables."""
+def test_stale_exceeding_desired_never_clears_the_tables(tmp_path, monkeypatch):
+    """P3a-2 (deliberate change, inverted): stale_pins > desired_pins used to trigger
+    nuke-and-repave -- DeleteDeviceData(table, "", "") on user and userauthorize, every
+    row, foreign users included. That heuristic is gone; 45 stale against 5 desired is
+    above the one removal ceiling max(10, 25 %), so nothing is removed (REVOKE_ABORTED)."""
     svc, db_module = make_engine(tmp_path, monkeypatch)
     # 50 pins on device. Device allowedMemberships restricts to only 5 users.
     # → desired=5, stale=45 > desired → nuke mode
@@ -91,15 +94,17 @@ def test_nuke_and_repave_triggers_when_stale_exceeds_desired(tmp_path, monkeypat
             default_door_id=15,
         )
 
-    # clear_device_table should have been called for 4 tables
-    clear_calls = sdk_inst.clear_device_table.call_args_list
-    cleared_tables = {c.kwargs.get("table") or c.args[0] for c in clear_calls}
-    assert "user" in cleared_tables
-    assert "userauthorize" in cleared_tables
+    assert sdk_inst.clear_device_table.call_args_list == []
+    stale_deletes = [c for c in sdk_inst.delete_device_data.call_args_list
+                     if any(('Pin=%d' % i) in str(c) for i in range(6, 51))]
+    assert stale_deletes == [] and not sdk_inst.delete_device_data_batch.called
 
 
-def test_nuke_mode_does_not_call_individual_deletes(tmp_path, monkeypatch):
-    """In nuke mode, individual delete_device_data should NOT be called for stale pins."""
+def test_a_refused_stale_step_deletes_no_stale_pin_individually(tmp_path, monkeypatch):
+    """P3a-2: the ceiling refuses the 45-pin stale step, so no stale pin (6..50) is
+    deleted one by one either. (This used to hold because the nuke cleared the tables.)
+    The 5 desired pins are still written; on the per-pin path (<= 5 pins) that write is
+    preceded by a delete of the SAME pin, which is not a removal."""
     svc, db_module = make_engine(tmp_path, monkeypatch)
     device_pins = [str(i) for i in range(1, 51)]
     all_users = [make_user(am_id=i) for i in range(1, 51)]
@@ -117,11 +122,9 @@ def test_nuke_mode_does_not_call_individual_deletes(tmp_path, monkeypatch):
             default_door_id=15,
         )
 
-    # Individual delete_device_data should NOT be called for stale pins
-    # (nuke mode clears everything via clear_device_table)
     delete_calls = [c for c in sdk_inst.delete_device_data.call_args_list
-                    if "Pin=" in str(c)]
-    assert len(delete_calls) == 0, f"Expected 0 individual deletes, got {len(delete_calls)}"
+                    if any(('Pin=%d' % i) in str(c) for i in range(6, 51))]
+    assert len(delete_calls) == 0, f"Expected 0 stale deletes, got {len(delete_calls)}"
 
 
 def test_batch_push_uses_set_device_data_batch(tmp_path, monkeypatch):

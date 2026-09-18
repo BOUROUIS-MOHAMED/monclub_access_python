@@ -3096,6 +3096,7 @@ class UltraDeviceWorker(threading.Thread):
         Returns True when it is safe to prune per-pin state, False when the pass
         aborted and the state must be kept so a later sync can retry.
         """
+        self._last_revoke_aborted = 0
         if roster_count <= 0:
             # A failed or half-built roster must never read as "everyone left".
             _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
@@ -3141,9 +3142,17 @@ class UltraDeviceWorker(threading.Thread):
 
         # Refuse an implausible bulk revocation rather than strip a gym's worth of
         # members off a turnstile. See _REVOKE_ABSOLUTE_FLOOR for why a fraction on
-        # its own is not enough here.
-        ceiling = max(_REVOKE_ABSOLUTE_FLOOR, roster_count * _MIRROR_MAX_DELETE_FRACTION)
-        if len(revoked) > ceiling:
+        # its own is not enough here. The ONE ceiling every removal path shares
+        # (push_safety, P3a-2); it emits REVOKE_ABORTED with the count.
+        _verdict = _push_safety.check_bulk_removal(
+            count=len(revoked), roster_count=roster_count, path="standalone_revoke",
+            device_id=self._device_id, protocol="ZK_STANDALONE", worker=self._tel_wid,
+            sample=revoked,
+        )
+        ceiling = _verdict.ceiling
+        if not _verdict.allowed:
+            self._last_revoke_aborted = len(revoked)
+            # Kept alongside REVOKE_ABORTED: existing operator greps key on it.
             _tel.warn("REVOKE_ABORT_FLOOR", worker=self._tel_wid,
                       revoked=len(revoked), roster=roster_count,
                       ceiling=round(ceiling, 1),

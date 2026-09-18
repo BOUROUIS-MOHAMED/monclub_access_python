@@ -329,8 +329,14 @@ class TestFullPullSdkSync:
     @pytest.mark.parametrize("history", ["switch", "first-sighting"])
     def test_a_device_with_scheme_history_is_never_nuked_by_the_heuristic(self, sqlite_db, history):
         """Review #18. Right after a switch the old scheme's owned pins outnumber the desired
-        roster -- exactly when INCREMENTAL's stale > desired && > 10 nuke fires. The cutover is
-        a manual wipe, so the heuristic is off for any device with scheme history."""
+        roster -- exactly when INCREMENTAL's stale > desired && > 10 nuke used to fire. The
+        cutover is a manual wipe.
+
+        P3a-2 (deliberate change): this test used to assert the 12 stale pins were then
+        "removed one by one instead". 12 removals against a desired roster of 2 is above the
+        one shared ceiling max(10, 25 %), so the step is now refused (REVOKE_ABORTED), nothing
+        is removed and the rows are kept -- the same rule the standalone revoke pass applies
+        after a switch (guide §3.2c)."""
         _record_schemes(sqlite_db, *(["MEMBERSHIP", "ACCOUNT"] if history == "switch" else ["ACCOUNT"]))
         old =[str(31000 + i) for i in range(12)]
         for pin in old:
@@ -340,19 +346,20 @@ class TestFullPullSdkSync:
                         device_pins=old + ["5", "777"])
 
         assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]] == []
-        assert set(old) <= _removed_pins(sdk), "stale pins are removed one by one instead"
+        assert not set(old) & _removed_pins(sdk), "above the ceiling: nothing removed"
+        assert set(old) <= set(sqlite_db.list_device_sync_pins(device_id=1)), "rows kept"
 
-    def test_the_nuke_heuristic_still_fires_without_scheme_history(self, sqlite_db):
-        """Control for the test above: the same roster with no history does reach the nuke.
-        No device row is written here, so there is no first-sighting row either -- in production
-        an ACCOUNT device always has one after its first write (guide §3.2e), which is what
-        keeps the heuristic off for it."""
+    def test_the_nuke_heuristic_no_longer_fires_without_scheme_history(self, sqlite_db):
+        """P3a-2 (deliberate change, inverted): the same roster with NO scheme history used to
+        reach the nuke -- the exact state of gym 58's C3-400s (pinScheme '', no switch row).
+        The heuristic is gone; the stale step goes through the ceiling and is refused."""
         old = [str(31000 + i) for i in range(12)]
         for pin in old:
             sqlite_db.save_device_sync_state(device_id=1, pin=pin, desired_hash="h-old", ok=True, error=None)
         sdk = self._run(sqlite_db, [_ali_gym(), _sonia()], _pullsdk_device(pinScheme="ACCOUNT"),
                         device_pins=old + ["5", "777"])
-        assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]]
+        assert [c for c in sdk.mock_calls if "clear_device_table" in c[0]] == []
+        assert not set(old) & _removed_pins(sdk)
 
     def test_full_replace_never_nukes_an_incomplete_account_roster(self, sqlite_db):
         """Review #19. FULL_REPLACE sets nuke_mode unconditionally, and the switched-device

@@ -21,6 +21,7 @@ from app.core.db import (
     save_device_sync_state,
     save_device_sync_state_batch,
     delete_device_sync_state,
+    clear_device_revocation_state,
     prune_device_sync_state,
     prune_fingerprint_push_status,
     upsert_fingerprint_push_status,
@@ -37,6 +38,7 @@ from app.core.settings_reader import (  # ✅ NEW: backend-driven settings (SQLi
     parse_fingerprint_template_version,
 )
 from app.core import telemetry as _tel
+from app.core import push_safety as _push_safety
 from app.core.utils import from_b64, from_hex, to_b64
 from app.sdk.pullsdk import STRUCTURAL_ERROR_CODES
 from app.sdk.pullsdk import PullSDK, PullSDKError
@@ -2684,6 +2686,13 @@ class DeviceSyncEngine:
         pins_sorted: List[str] = []
         pin_outcomes: Dict[str, Dict[str, Any]] = {}
         batch_error: str | None = None
+        # P3a-2 removal outcome of this pass: pins a refused removal step kept on the
+        # device (REVOKE_ABORTED), pins whose delete failed (kept for the retry), and
+        # the push-batch notes that carry both to /api/v2/push-history.
+        removal_aborted = 0
+        removal_notes: List[str] = []
+        failed_stale: List[str] = []
+        self._last_removal_report = {"aborted": 0, "failed": []}
 
         def _maybe_set_progress(**changes: Any) -> None:
             if report_progress:
@@ -2984,19 +2993,52 @@ class DeviceSyncEngine:
                 door_bitmask,
             )
 
-            # ── P1: Policy-driven nuke decision ──────────────────────────────
-            # FULL_REPLACE  → always clear all tables (policy mandate).
+            # ── P1: Policy-driven removal decisions (P3a-2: ONE ceiling, no automatic wipe) ──
+            # FULL_REPLACE  → clear all tables, but only when the rows on the panel fit
+            #                 under the shared removal ceiling: a clear deletes EVERY row,
+            #                 foreign users included. Above it the clear is refused
+            #                 (REVOKE_ABORTED path=table_clear) and the pass degrades to
+            #                 "push the whole roster, stale pins through the ceiling".
             # ADDITIVE_ONLY → never delete anything; skip stale-pin removal too.
-            # INCREMENTAL   → heuristic nuke when deleting > keeping (optimization).
+            # INCREMENTAL   → stale pins removed one by one, through the ceiling.
+            #
+            # The INCREMENTAL "nuke-and-repave" heuristic (clear every table when
+            # stale > desired and stale > 10) is GONE. That trigger is always above the
+            # ceiling max(10, 25 % of desired) -- desired <= 40: ceiling 10 < stale;
+            # desired > 40: 0.25 x desired < desired < stale -- so it could only ever run
+            # as an automatic wipe of the terminal, and on gym 58 (INCREMENTAL, pinScheme
+            # '' so no switch row) nothing suppressed it. guide §3.2g.
+            nuke_mode = False
+            stale_before_clear = list(stale_pins)
             if policy == _PUSH_POLICY_FULL_REPLACE:
-                nuke_mode = True
                 pins_to_sync = set(desired.keys())  # push entire roster
-                stale_pins = []                      # tables will be cleared anyway
-                self.logger.info(
-                    "[DeviceSync] Device id=%s: FULL_REPLACE policy — "
-                    "clearing all tables, pushing all %d members",
-                    dev_id, len(pins_to_sync),
-                )
+                if roster_incomplete:
+                    # Clearing the tables and re-pushing a roster that is missing people
+                    # would take those people off the device.
+                    self.logger.warning(
+                        "[DeviceSync] Device id=%s: FULL_REPLACE clear suppressed -- "
+                        "pinScheme=ACCOUNT roster is incomplete (%s row(s) withheld)", dev_id,
+                        filter_stats.get("withheld_missing_account"),
+                    )
+                else:
+                    _clear_verdict = _push_safety.check_bulk_removal(
+                        count=len(device_pins), roster_count=len(desired_pins),
+                        path="table_clear", device_id=did, protocol="ZK_PULLSDK",
+                    )
+                    if _clear_verdict.allowed:
+                        nuke_mode = True
+                        stale_pins = []                      # tables will be cleared anyway
+                        self.logger.info(
+                            "[DeviceSync] Device id=%s: FULL_REPLACE policy — "
+                            "clearing all tables (%d row(s), within the ceiling), pushing all %d members",
+                            dev_id, len(device_pins), len(pins_to_sync),
+                        )
+                    else:
+                        removal_aborted += _clear_verdict.count
+                        removal_notes.append(_push_safety.outcome_note(
+                            _push_safety.REVOKE_ABORTED, _clear_verdict.count,
+                            f"table_clear; ceiling {_clear_verdict.ceiling:.0f}",
+                        ))
             elif policy == _PUSH_POLICY_ADDITIVE_ONLY:
                 nuke_mode = False
                 _ignored_stale = len(stale_pins)
@@ -3007,43 +3049,11 @@ class DeviceSyncEngine:
                         "%d stale pin(s) left on device intentionally",
                         dev_id, _ignored_stale,
                     )
-            else:
-                # INCREMENTAL: heuristic nuke-and-repave
-                nuke_mode = (
-                    False if deletion_only_delta
-                    else len(stale_pins) > len(desired_pins) and len(stale_pins) > 10
-                )
-            if nuke_mode and roster_incomplete:
-                # Clearing the tables and re-pushing a roster that is missing people would
-                # take those people off the device.
-                self.logger.warning(
-                    "[DeviceSync] Device id=%s: nuke suppressed -- pinScheme=ACCOUNT roster is "
-                    "incomplete (%s row(s) withheld)", dev_id,
-                    filter_stats.get("withheld_missing_account"),
-                )
-                nuke_mode = False
-            if nuke_mode and policy != _PUSH_POLICY_FULL_REPLACE:
-                # The INCREMENTAL heuristic fires when stale > desired. Right after a pinScheme
-                # switch the old scheme's pins ARE that majority, so it would clear every
-                # table -- other systems' users included -- i.e. wipe the terminal
-                # automatically. The switch procedure is a MANUAL wipe (guide §3.2e), so the
-                # heuristic is off for any device that has ever switched. FULL_REPLACE is an
-                # explicit per-gym policy, not a heuristic, and is left as configured.
-                try:
-                    _switched = bool(list_device_pin_scheme_switches(device_id=did).get(did))
-                except Exception:
-                    _switched = True
-                if _switched:
-                    self.logger.warning(
-                        "[DeviceSync] Device id=%s: NUKE-AND-REPAVE heuristic suppressed -- this "
-                        "device has switched pinScheme; stale pins are removed one by one instead",
-                        dev_id,
-                    )
-                    nuke_mode = False
             if nuke_mode:
                 self.logger.info(
-                    "[DeviceSync] Device id=%s: NUKE-AND-REPAVE — clearing %d stale, re-pushing %d desired",
-                    dev_id, len(stale_pins), len(desired_pins),
+                    "[DeviceSync] Device id=%s: FULL_REPLACE table clear — %d row(s) on the "
+                    "panel, re-pushing %d desired",
+                    dev_id, len(device_pins), len(desired_pins),
                 )
                 # Template tables are optional (templatev10 vs template depends on firmware).
                 # P1 gate: skip entirely on devices without biometric storage (C3 panels)
@@ -3064,6 +3074,8 @@ class DeviceSyncEngine:
                     except PullSDKError as ex:
                         self.logger.warning("[DeviceSync] Device id=%s: clear %s failed: %s — falling back to individual delete", dev_id, tbl, ex)
                         nuke_mode = False
+                        # The stale pins go through the ceiling one by one instead.
+                        stale_pins = list(stale_before_clear)
                         break
                 if nuke_mode:
                     # Device is now empty — push ALL desired users
@@ -3087,6 +3099,23 @@ class DeviceSyncEngine:
             deleted = 0
             with _fsp.step("predelete"):
                 if stale_pins:
+                    # ONE ceiling for every bulk removal (P3a-2, guide §3.2g). Refused:
+                    # nothing is removed, the per-pin state is kept (the prune below is
+                    # skipped too) and the rest of the pass still runs.
+                    _stale_verdict = _push_safety.check_bulk_removal(
+                        count=len(stale_pins), roster_count=len(desired_pins),
+                        path="stale", device_id=did, protocol="ZK_PULLSDK",
+                        sample=stale_pins,
+                    )
+                    if not _stale_verdict.allowed:
+                        removal_aborted += _stale_verdict.count
+                        removal_notes.append(_push_safety.outcome_note(
+                            _push_safety.REVOKE_ABORTED, _stale_verdict.count,
+                            f"stale; ceiling {_stale_verdict.ceiling:.0f}",
+                        ))
+                        stale_pins = []
+                if stale_pins:
+                    failed_del: List[str] = list(stale_pins)
                     try:
                         ok_del, failed_del = self._bulk_delete_pins(
                             sdk=sdk,
@@ -3102,17 +3131,22 @@ class DeviceSyncEngine:
                             )
                     except Exception as ex:
                         self.logger.warning(f"[DeviceSync] Bulk delete of stale pins failed: {ex}")
-                    # Clean local mirror/sync-state for every pin that was attempted,
-                    # regardless of SDK outcome — keeps local state in sync with desired set.
+                    failed_stale = sorted({str(p) for p in (failed_del or [])})
+                    # Forget local state ONLY for pins actually removed. It used to be
+                    # erased "regardless of SDK outcome", which left a failed delete with
+                    # no row -- so once the member had left the roster nothing ever tried
+                    # again, and the credential stayed on the panel. The kept row (with
+                    # its ownership bit) is what the retry and the prune below need.
+                    _failed_set = set(failed_stale)
                     for p in stale_pins:
+                        if str(p) in _failed_set:
+                            continue
                         try:
-                            delete_device_sync_state(device_id=did, pin=p)
+                            clear_device_revocation_state(device_id=did, pin=p)
                         except Exception:
                             pass
-                        try:
-                            delete_device_mirror_pin(device_id=did, pin=p)
-                        except Exception:
-                            pass
+                    if failed_stale:
+                        removal_notes.append(f"REMOVAL_FAILED={len(failed_stale)}")
 
             pushed_users = 0
             pushed_templates = 0
@@ -3709,16 +3743,21 @@ class DeviceSyncEngine:
                         self.logger.warning(
                             "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
-            if roster_incomplete:
-                # The withheld people's pins are not in desired_pins; pruning would forget
-                # them (and their ownership evidence) while they may still be on the device.
+            if roster_incomplete or removal_aborted:
+                # roster_incomplete: the withheld people's pins are not in desired_pins;
+                # pruning would forget them (and their ownership evidence) while they may
+                # still be on the device. removal_aborted (P3a-2): the ceiling refused a
+                # removal step, so the pins it kept ARE still on the device -- pruning
+                # their rows would strand them there for good (guide §3.2c).
                 pruned = 0
             else:
-                pruned = prune_device_sync_state(device_id=did, keep_pins=desired_pins)
+                # A pin whose delete FAILED is still on the device: keep its row.
+                _keep = set(desired_pins) | set(failed_stale)
+                pruned = prune_device_sync_state(device_id=did, keep_pins=_keep)
                 # Same keep-set: a removed or revoked member must not linger in the push
                 # status cache and keep being reported upstream forever.
                 try:
-                    prune_fingerprint_push_status(device_id=did, keep_pins=desired_pins)
+                    prune_fingerprint_push_status(device_id=did, keep_pins=_keep)
                 except Exception:
                     pass
 
@@ -3774,8 +3813,10 @@ class DeviceSyncEngine:
                     dev_id, _af_ex,
                 )
 
+            self._last_removal_report = {"aborted": int(removal_aborted),
+                                         "failed": list(failed_stale)}
             self.logger.info(
-                f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned}"
+                f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned} removal_aborted={removal_aborted} removal_failed={len(failed_stale)}"
             )
 
         except Exception as ex:
@@ -3830,7 +3871,11 @@ class DeviceSyncEngine:
                     pins_failed=pins_failed,
                     status=batch_status,
                     duration_ms=duration_ms,
-                    error_message=batch_error,
+                    # P3a-2: removal outcomes ride in the same note the push-history
+                    # page already shows (REVOKE_ABORTED=n, REMOVAL_FAILED=n, ...).
+                    error_message=(
+                        _push_safety.join_notes(batch_error or "", *removal_notes) or None
+                    ),
                 )
                 # One FULL_SYNC_DEVICE summary line for the whole device sync, emitted
                 # on every outcome (success/partial/failed) so the audit trail always

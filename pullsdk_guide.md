@@ -436,8 +436,10 @@ def delete_device_data(self, *, table, data, options="") -> int
 ```
 
 `clear_device_table` deletes **every row** by calling `DeleteDeviceData(handle, table,
-"", "")` — an empty data string. `[CODE]` Used by nuke-and-repave. Be certain before
-calling it.
+"", "")` — an empty data string. `[CODE]` Since P3a-2 its only caller is an explicit
+`FULL_REPLACE` policy, and only when the panel's rows fit under the shared removal ceiling
+(`guide_for_agents_and_dev.md` §3.2g); the INCREMENTAL "nuke-and-repave" heuristic that used it
+automatically is gone. Be certain before calling it.
 
 #### ⛔ `set_device_data` redacts `Template=` before logging
 

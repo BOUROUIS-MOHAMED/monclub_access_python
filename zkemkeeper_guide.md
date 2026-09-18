@@ -829,7 +829,8 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   be touched. That is exactly what makes this safe where MIRROR is not.
   **Rails:** empty roster ⇒ skip (`REVOKE_SKIP_EMPTY_ROSTER`); more than
   `max(_REVOKE_ABSOLUTE_FLOOR=10, roster × 0.25)` pins ⇒ abort and KEEP the state
-  (`REVOKE_ABORT_FLOOR`); the MIRROR enrolment grace window and protected-pin
+  (`REVOKE_ABORT_FLOOR`, plus `REVOKE_ABORTED` from the shared ceiling every removal path uses
+  since P3a-2 — `guide_for_agents_and_dev.md` §3.2g); the MIRROR enrolment grace window and protected-pin
   allowlist are honoured; a failed push keeps the state for retry. Confirmed device
   removal clears `device_sync_state` and `device_content_mirror` in one SQLite
   transaction; a cleanup failure rolls both back and keeps the retry record.

@@ -259,7 +259,8 @@ Two things deliberately defeat the backoff, so a real fix is never delayed:
 
 - **a re-enrolment** — new content changes the desired hash, and the backoff only applies
   when the hash is byte-identical to the attempt that failed;
-- **a full or forced resync** (`FULL_REPLACE` / nuke), which rebuilds the push set wholesale.
+- **a full or forced resync** (`FULL_REPLACE`, which since P3a-2 clears the panel only when its
+  rows fit under the removal ceiling — see `REVOKE_ABORTED` below), which rebuilds the push set wholesale.
 
 **A push that stalled:**
 
@@ -332,6 +333,21 @@ confirmed outcomes. `ok=False` means at least one PIN or local-state cleanup rem
 for retry.
 `REVOKE_SKIP_INCOMPLETE_ROSTER withheld=N` means the pass did not run at all: N deliverable members on an
 ACCOUNT-pin device have no `mainAccountId`, so departed pins cannot be told apart from theirs.
+
+**Was a removal refused as too large?** (P3a-2, both SDKs)
+
+```bash
+grep -F "[T] REVOKE_ABORTED" app-*.log
+```
+
+`REVOKE_ABORTED path=… count=N roster=R ceiling=C reason=…` means one removal step would have taken N
+users off the terminal against a desired roster of R, above the one shared ceiling `max(10, 25 % of R)`
+(or R is 0: `reason=empty_roster`). Nothing was removed, the local record of those pins was kept, and the
+rest of the sync still ran. `path=stale` is a C3 panel's stale pins, `path=table_clear` a FULL_REPLACE
+panel clear, `path=standalone_revoke` an MB2000's departed members. It repeats on every sync until the
+cause is found (a truncated roster, a pin-scheme cutover that needs the manual wipe, or a real mass
+departure an operator must confirm). The push-history page shows it as `REVOKE_ABORTED=N (…)`.
+`[CODE: app/core/push_safety.py::check_bulk_removal]`
 
 ---
 
