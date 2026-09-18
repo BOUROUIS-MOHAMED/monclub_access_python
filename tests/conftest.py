@@ -19,10 +19,15 @@ deliberate:
   which re-executes ``_DB_PATH = None``; their ``monkeypatch`` then restores *that*
   ``None`` at teardown. Without the re-apply, every later test would open the default
   database again.
-* Left empty (no ``init_db()`` here): a pre-migrated shared file would hide unpatched
-  reads that only pass against an already-migrated database. Tests that need a schema
-  still patch ``_DB_PATH`` to their own ``tmp_path`` and call ``init_db()``; their
-  ``monkeypatch`` wins for the test and reverts to this path afterwards.
+* Created empty (no ``init_db()`` here), so a file run alone still fails on an unpatched
+  read of a missing table. In a full-suite run this does NOT hold: four files call
+  ``init_db()`` from a module-scoped fixture without their own override, which migrates
+  this shared file early in the session. The per-file sweep in guide §9 is what keeps
+  such reads detectable. Tests that need a schema still patch ``_DB_PATH`` to their own
+  ``tmp_path`` and call ``init_db()``; their ``monkeypatch`` wins for the test and
+  reverts to this path afterwards.
+
+This file guards only what is collected under ``tests/``.
 """
 from __future__ import annotations
 

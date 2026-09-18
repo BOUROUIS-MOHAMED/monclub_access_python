@@ -1337,10 +1337,13 @@ to an empty scratch folder; exit code 0; no database created under that folder).
 > further write paths. `[UNVERIFIED]`
 >
 > `tests/conftest.py` now points `_DB_PATH` at one empty temp file for the whole session.
-> It never calls `init_db()`, so an unpatched read of a missing table still fails loudly
-> instead of passing against an already-migrated file. That is how the 7 tests in
-> `test_access_history_unresolved_bound.py` hid an unpatched read until commit 86be8ea
-> (cherry-picked from a87830b). Two details are load-bearing. `[CODE]` **Session scope:**
+> It never calls `init_db()` itself. So a file run alone still fails on an unpatched read of a
+> missing table, the failure that the 7 tests in `test_access_history_unresolved_bound.py`
+> hid until commit 86be8ea (cherry-picked from a87830b). **A full-suite run does not catch
+> this.** Four files (above) call `init_db()` from a module-scoped fixture without their own
+> override, which migrates the shared session file early in the run. After a full run it held
+> 41 tables. `[TEST]` Only the per-file sweep below keeps such reads detectable. Two details
+> are load-bearing. `[CODE]` **Session scope:**
 > module-scoped `init_db()` fixtures run before any function-scoped override, and the db
 > writer, sync-cache loader and popup prefetch threads outlive single tests, so the path is
 > never reverted to `None`. **Re-applied around every test:** seven fixtures call
@@ -1358,7 +1361,9 @@ to an empty scratch folder; exit code 0; no database created under that folder).
 > Other files still land under the data root: `test_feedback_api` and `test_scan_session_api`
 > write `access/config.json`, `tv/config.json` and `shared/install.json`, and `test_ultra_engine`
 > writes an image under `access/cache/images/`. They are not databases and were not audited here.
-> Always run the suite with `MONCLUB_ACCESS_DATA_ROOT` set to a scratch folder. `[TEST]`
+> The conftest also guards only what is collected under `tests/`. A bare `pytest` from the repo
+> root also collects `totp_file_test.py`, which imports `app.core.db` and gets no guard. Always
+> run the suite with `MONCLUB_ACCESS_DATA_ROOT` set to a scratch folder. `[TEST]` / `[CODE]`
 
 ```bash
 python tools/check_sql_arity.py
