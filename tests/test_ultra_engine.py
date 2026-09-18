@@ -1708,7 +1708,7 @@ def _enqueue_sdk(worker, fn, label="op", deadline=None):
     box = {"ok": False, "result": None, "error": "timeout", "label": label}
     if deadline is None:
         deadline = time.monotonic() + 60.0  # far future -> will execute
-    worker._sdk_cmd_queue.put_nowait((fn, label, ev, box, deadline))
+    worker._sdk_cmd_queue.put_nowait((fn, label, ev, box, deadline, _ue._CommandClaim()))
     return ev, box
 
 

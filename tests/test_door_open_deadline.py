@@ -9,7 +9,7 @@ minutes after the desk had been told "device unreachable (command timed out)".
 
 The deadline alone could not keep that promise: ``Event.wait`` can end while
 ``time.monotonic()`` is still before the deadline. Since 2026-09-19 each entry carries a
-``_DoorOpenClaim`` that exactly one side takes -- the worker (it sends the open) or the
+``_CommandClaim`` that exactly one side takes -- the worker (it sends the open) or the
 caller (it answers "timeout") -- and the ordering tests below script the caller's wait
 instead of relying on sleeps or the clock.
 
@@ -168,12 +168,12 @@ def test_an_open_still_being_sent_after_the_in_flight_wait_is_not_called_a_timeo
 
 
 def test_a_queued_door_open_is_decided_once_by_its_worker_or_its_caller() -> None:
-    sent = ultra_engine._DoorOpenClaim()
+    sent = ultra_engine._CommandClaim()
     assert sent.take_for_worker() is True
     assert sent.give_up() is False          # an open being sent cannot become a "timeout"
     assert sent.take_for_worker() is True   # asking again does not change the owner
 
-    abandoned = ultra_engine._DoorOpenClaim()
+    abandoned = ultra_engine._CommandClaim()
     assert abandoned.give_up() is True
     assert abandoned.take_for_worker() is False  # an open its caller gave up is never sent
     assert abandoned.give_up() is True
@@ -190,7 +190,7 @@ def test_an_expired_open_is_reported_expired_and_releases_its_waiter() -> None:
     worker = _connected_worker()
     ev, box = threading.Event(), {"ok": False, "error": "timeout"}
     worker._cmd_queue.put_nowait(
-        (1, 3000, ev, box, time.monotonic() - 0.001, ultra_engine._DoorOpenClaim()))
+        (1, 3000, ev, box, time.monotonic() - 0.001, ultra_engine._CommandClaim()))
 
     with patch("app.core.ultra_engine._tel.event") as tel:
         worker._drain_commands()
@@ -250,7 +250,7 @@ def test_the_mid_push_door_yield_also_skips_an_expired_open() -> None:
     worker._settings["ultra_sync_yield_to_doors"] = True
     ev, box = threading.Event(), {"ok": False, "error": "timeout"}
     worker._cmd_queue.put_nowait(
-        (1, 3000, ev, box, time.monotonic() - 0.001, ultra_engine._DoorOpenClaim()))
+        (1, 3000, ev, box, time.monotonic() - 0.001, ultra_engine._CommandClaim()))
 
     worker._sync_yield_to_doors()
 
@@ -288,9 +288,9 @@ def test_the_mid_push_yield_event_counts_expired_opens_apart() -> None:
     worker = _connected_worker()
     worker._settings["ultra_sync_yield_to_doors"] = True
     worker._cmd_queue.put_nowait(
-        (1, 3000, threading.Event(), {}, time.monotonic() - 0.001, ultra_engine._DoorOpenClaim()))
+        (1, 3000, threading.Event(), {}, time.monotonic() - 0.001, ultra_engine._CommandClaim()))
     worker._cmd_queue.put_nowait(
-        (2, 3000, threading.Event(), {}, time.monotonic() + 60.0, ultra_engine._DoorOpenClaim()))
+        (2, 3000, threading.Event(), {}, time.monotonic() + 60.0, ultra_engine._CommandClaim()))
 
     with patch("app.core.ultra_engine._tel.event") as tel:
         worker._sync_yield_to_doors()

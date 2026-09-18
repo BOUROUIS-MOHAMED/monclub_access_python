@@ -45,7 +45,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
-| The ULTRA operator door-open queue, its deadline or its claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::_DoorOpenClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr`) | §3.1a |
+| The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
@@ -199,7 +199,7 @@ reaches no queue. `[CODE: mon_club_dashboard layout.tsx, LocalAccessService.ts;
 access/local_api_routes.py]`
 
 Each queued entry carries `deadline = time.monotonic() + timeout` — the caller's own wait — and
-a `_DoorOpenClaim` (below). `_drain_commands` (also reached mid-push through
+a `_CommandClaim` (below). `_drain_commands` (also reached mid-push through
 `_sync_yield_to_doors`) skips an entry whose caller has given up or whose deadline has passed:
 no SDK call, result `expired (not executed)`, a `CMD door_open EXPIRED` log line (with
 `reason=caller_gave_up` or `reason=deadline`) and `[T] DOOR_CMD_EXPIRED`. Before, nothing
@@ -221,7 +221,8 @@ immediate `_drain_commands`), looped 300 times with the 32-bit `.venv` Python 3.
 PC, opened the door 23/300 times, then 15, 8 and 15 /300 in three reruns on `d09f88f`; 0/300 in
 three runs with this change. It also failed once in a full-suite run.
 
-Now each entry carries a `_DoorOpenClaim`, a lock and an owner, taken once. The worker takes it
+Now each entry carries a `_CommandClaim` (named `_DoorOpenClaim` until the SDK queue below
+started using it too), a lock and an owner, taken once. The worker takes it
 before any SDK call and skips the entry if the caller already has it. The caller, when its wait
 runs out, takes it before answering "timeout". Whoever comes second is refused:
 
@@ -242,7 +243,7 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   HTTP status (`lib.rs`, "HTTP 500 …"). The native tray item prints the `error` to stderr only
   (`lib.rs::post_open_door`). Not changed here.
 
-`[CODE: ultra_engine.py::_DoorOpenClaim, ::request_door_open, ::_drain_commands;
+`[CODE: ultra_engine.py::_CommandClaim, ::request_door_open, ::_drain_commands;
 local_access_api_v2.py::_door_open_error_fr]` `[TEST: test_door_open_deadline.py::
 test_a_wait_that_ends_before_the_deadline_still_never_opens_later,
 ::test_an_open_the_worker_took_first_is_answered_with_its_result_not_timeout,
@@ -283,6 +284,54 @@ QR/TOTP and staff-RFID rescue opens call `self._sdk.open_door` directly on the w
 structures (`_pending_member_syncs`, the revoke-id sets, `_pending_full_sync_request`) and are
 deliberately re-queued — they have no deadline and must not get one (§3.4).
 
+**The control panel's SDK-call queue is decided the same way (2026-09-19).**
+`UltraDeviceWorker.request_run_sdk` is the only producer of `_sdk_cmd_queue`, and its only
+caller is `local_access_api_v2.py::_run_on_device_sdk`, used by the DevicesPage control panel:
+`GET /api/v2/devices/{id}/settings` (budget 15 s), `POST …/reentry` (5 s: `SetDeviceParam`
+`Door{n}Intertime`, then a read-back), `GET …/clock` (15 s) and `POST …/clock/sync` (25 s).
+`[CODE: access/local_api_routes.py; the four handlers]` `_drain_sdk_commands` skipped an
+abandoned entry only by `time.monotonic() > deadline`, the check the door queue outgrew.
+`[TEST: scratch probe, not committed]` 300 runs of `request_run_sdk(timeout=0.05)` followed at
+once by `_drain_sdk_commands`, with the 32-bit `.venv` Python 3.11 on the dev PC, ran the queued
+function after its caller had been answered "timeout" 25, 31 and 29 /300 times on `f1812e7`;
+0/300 in three runs with this change.
+
+Each entry now carries the same `_CommandClaim`, taken by the worker before `fn` runs and by
+the caller before it answers "timeout":
+
+- **The caller took it** → `fn` never runs; the caller answers `timeout` (503).
+- **The worker took it first** → `fn` is running and a write may be landing, so the caller
+  waits up to its own `timeout` again and returns the worker's answer. That bound is chosen,
+  not measured. It is the budget each handler already sized for its call (`clock_sync`'s
+  25 s covers the standalone driver's two 10 s STA waits, `zk_standalone.py::_call`,
+  `_DEFAULT_CMD_TIMEOUT_SEC`), so a call that fits its own budget gets its answer. How long a
+  PullSDK call can take is bounded only by the DLL. `[UNKNOWN]` If the extra wait also runs
+  out, the answer is `sent, no answer`, never `timeout`. `_run_on_device_sdk` returns it as
+  500, outside its 503 group (`timeout`, `device not connected`, `expired (not executed)`:
+  nothing was sent). This path has no French mapper: DevicesPage prints the raw `error` as
+  `ApiError: sent, no answer` (`String(e)`), as it already does for the other English
+  strings here. A worker that took the entry and finds itself disconnected answers
+  `device not connected` (503, as before).
+- **The worker's clock passes the deadline while the caller still waits** → the worker skips
+  the entry and the caller reads `expired (not executed)`. `_run_on_device_sdk` already
+  answers 503 for that string, so unlike the door queue it is not remapped to `timeout`.
+
+`request_run_sdk` returns a copy of the box (or a fresh dict for `timeout` and
+`sent, no answer`), and the worker writes each outcome in one `dict.update`; before, it used
+two or three item assignments. A skipped entry now logs `SDK_CMD op=… EXPIRED (not executed):
+reason=caller_gave_up|deadline late_by_ms=…`. `[T] SDK_CMD` still carries
+`ok=False expired=True` and is otherwise unchanged. The cost is time: a handler can hold its
+own request thread for twice its budget — 30 s for the settings and clock reads, 10 s for
+reentry, 50 s for a clock sync.
+`[CODE: ultra_engine.py::request_run_sdk, ::_drain_sdk_commands;
+local_access_api_v2.py::_run_on_device_sdk]` `[TEST: test_sdk_cmd_deadline.py::
+test_an_sdk_call_the_caller_gave_up_on_is_never_run_later,
+::test_an_sdk_call_the_worker_took_first_is_answered_with_its_result_not_timeout,
+::test_an_sdk_call_still_running_after_the_in_flight_wait_is_not_called_a_timeout,
+::test_the_worker_writes_each_outcome_in_one_update,
+::test_the_control_panel_does_not_call_an_unanswered_call_unreachable]` — the ordering tests
+script the caller's `Event.wait`, as the door tests do.
+
 Found while tracing this, **not changed** `[CODE]`:
 - AGENT has no queue — `DecisionService` and the local API call `DeviceWorker.open_door`
   synchronously — but `PullSDKDevice.open_door` waits on `_sdk_lock` with no timeout and
@@ -293,11 +342,13 @@ Found while tracing this, **not changed** `[CODE]`:
 - `_handle_device_door_open` falls through from a failed AGENT open to a direct PullSDK
   connect for a device with no ULTRA worker; if the AGENT pulse was sent but reported False,
   the door can pulse twice.
-- `request_run_sdk` / `_drain_sdk_commands` (the control panel's device reads and writes) still
-  skip an abandoned command only by `time.monotonic() > deadline`, the check the door queue just
-  outgrew. So a `SetDeviceParam` whose caller already got "timeout" can still be applied when
-  the wait ends before the deadline. `request_run_sdk` also returns the live result box, not a
-  copy.
+- `POST …/clock/sync` gives the worker 25 s, but the Tauri pages' `post` aborts after 15 s
+  (`tauri-ui/src/api/client.ts::post`, `timeoutMs = 15_000`; `hooks.ts` `syncClock` passes
+  none). A clock sync slower than 15 s therefore shows the page's own abort, not the server's
+  answer, and the write may still land. This was true before the SDK-queue claim and still is.
+  The `GET`s set no abort.
+- `[T] SDK_CMD` (`_drain_sdk_commands`) is not in the §10 table, so by §10's own rule it is
+  invisible to anyone reading only the table.
 
 ### 3.1b The QR/TOTP roster check — trial first, then enforce (2026-09-18)
 

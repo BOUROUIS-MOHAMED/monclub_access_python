@@ -288,14 +288,16 @@ _DOOR_OPEN_SDK_TIMEOUT_MS = 4000
 _DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
 
 
-class _DoorOpenClaim:
-    """Decides, once, who owns a queued door-open: its worker or its caller.
+class _CommandClaim:
+    """Decides, once, who owns a queued operator command: its worker or its caller.
 
-    The worker takes it before sending the open; the caller takes it when its wait
-    runs out, to answer "timeout". Whoever comes second is refused, so an open whose
-    caller answered "timeout" is never sent, and an open being sent is never answered
-    "timeout". A clock comparison cannot decide this: ``Event.wait`` is not timed by
-    ``time.monotonic``, and can end while ``monotonic()`` is still before the deadline.
+    Used by both operator queues: door-opens (``request_door_open``) and SDK calls
+    (``request_run_sdk``). The worker takes it before sending the command; the caller
+    takes it when its wait runs out, to answer "timeout". Whoever comes second is
+    refused, so a command whose caller answered "timeout" is never sent, and a command
+    being sent is never answered "timeout". A clock comparison cannot decide this:
+    ``Event.wait`` is not timed by ``time.monotonic``, and can end while
+    ``monotonic()`` is still before the deadline.
     """
 
     __slots__ = ("_lock", "_owner")
@@ -311,7 +313,7 @@ class _DoorOpenClaim:
             return self._owner == owner
 
     def take_for_worker(self) -> bool:
-        """True if the worker may send the open (its caller has not given up)."""
+        """True if the worker may send the command (its caller has not given up)."""
         return self._take("worker")
 
     def give_up(self) -> bool:
@@ -1249,7 +1251,7 @@ class UltraDeviceWorker(threading.Thread):
         A command still queued when the caller gives up is never executed later:
         without that, an open queued during an outage or a sync hand-off pulsed the
         relay on the next reconnect, minutes after the desk was told "timed out".
-        Each entry carries a ``_DoorOpenClaim``: when the wait runs out the caller
+        Each entry carries a ``_CommandClaim``: when the wait runs out the caller
         gives up only if the worker has not taken the entry; if it has, the open is
         being sent and the caller waits up to ``_DOOR_OPEN_IN_FLIGHT_WAIT_SEC`` more
         for its answer ("sent, no answer" if none comes -- never "timeout"). The entry
@@ -1270,7 +1272,7 @@ class UltraDeviceWorker(threading.Thread):
 
         result_event = threading.Event()
         result_box: Dict[str, Any] = {"ok": False, "error": "timeout"}
-        claim = _DoorOpenClaim()
+        claim = _CommandClaim()
         deadline = time.monotonic() + float(timeout)
         try:
             self._cmd_queue.put_nowait((door_id, pulse_ms, result_event, result_box, deadline, claim))
@@ -1307,22 +1309,37 @@ class UltraDeviceWorker(threading.Thread):
         its single connection — so the panel NEVER opens a second Connect.
         Returns {"ok", "result", "error"}. ``error`` carries the full SDK error
         string (e.g. PullSDKError with rc + PullLastError) for the UI popup.
+
+        A command still queued when the caller gives up is never executed later —
+        critical for WRITES: a SetDeviceParam that lingered through a device outage
+        must not silently apply on reconnect. Reads are harmless, but the rule is
+        uniform. Each entry carries a ``_CommandClaim``, as the door queue does: when
+        the wait runs out the caller gives up only if the worker has not taken the
+        entry; if it has, ``fn`` is running and the caller waits up to ``timeout``
+        more for its answer ("sent, no answer" if none comes -- never "timeout").
+        The entry also carries a monotonic deadline equal to ``timeout``.
         """
         result_event = threading.Event()
         result_box: Dict[str, Any] = {"ok": False, "result": None, "error": "timeout", "label": label}
-        # Deadline so a command the caller has already abandoned (timed out) is
-        # NOT executed when the worker drains it later — critical for WRITES: a
-        # SetDeviceParam that lingered through a device outage must not silently
-        # apply on reconnect. Reads are harmless, but the rule is uniform.
+        claim = _CommandClaim()
         deadline = time.monotonic() + float(timeout)
         try:
-            self._sdk_cmd_queue.put_nowait((fn, label, result_event, result_box, deadline))
+            self._sdk_cmd_queue.put_nowait((fn, label, result_event, result_box, deadline, claim))
             self._wake_evt.set()
         except queue.Full:
             return {"ok": False, "result": None, "error": "device busy (command queue full)", "label": label}
 
-        result_event.wait(timeout=timeout)
-        return result_box
+        if not result_event.wait(timeout=timeout):
+            if claim.give_up():
+                # The worker will skip it: nothing was, or will be, sent.
+                return {"ok": False, "result": None, "error": "timeout", "label": label}
+            # The worker took the entry before we gave up: fn is running, and a write
+            # may be landing. "timeout" would say nothing was done, so wait for its
+            # answer. ``timeout`` is the budget the handler chose for this very call.
+            if not result_event.wait(timeout=timeout):
+                return {"ok": False, "result": None, "error": "sent, no answer", "label": label}
+        # A copy: the handler must not share the live box with the worker.
+        return dict(result_box)
 
     def request_member_sync(self, member_id: int) -> bool:
         normalized_member_id = int(member_id)
@@ -1793,37 +1810,43 @@ class UltraDeviceWorker(threading.Thread):
 
         Drained between polls, like _drain_commands. Each command is independent
         (no last-write-wins): a read and a write are distinct, so we run each and
-        return its own result. Bounded by the single-event-per-call timeout on
-        the caller side. Never opens a second connection.
+        return its own result. Never opens a second connection.
+
+        An entry whose caller has given up (it answers "timeout" only after winning
+        the ``_CommandClaim``) or whose deadline has passed is skipped, never run late.
+        Each outcome is written in one ``dict.update``.
         """
         while not self._sdk_cmd_queue.empty():
             try:
-                fn, label, result_event, result_box, deadline = self._sdk_cmd_queue.get_nowait()
+                fn, label, result_event, result_box, deadline, claim = self._sdk_cmd_queue.get_nowait()
             except queue.Empty:
                 break
-            # Skip (do NOT execute) a command the caller already gave up on — a
-            # late write must never land. The caller has already returned its
-            # timeout box; setting the event here is harmless.
-            if deadline is not None and time.monotonic() > float(deadline):
-                result_box["ok"] = False
-                result_box["error"] = "expired (not executed)"
+            # Skip (do NOT execute) a command the caller already gave up on — a late
+            # write must never land. Once taken here, the caller cannot give up: it
+            # waits for this call's answer instead.
+            caller_gave_up = not claim.take_for_worker()
+            if caller_gave_up or time.monotonic() > float(deadline):
+                result_box.update({"ok": False, "error": "expired (not executed)"})
+                late_ms = round((time.monotonic() - float(deadline)) * 1000)
+                logger.warning(
+                    f"{self._prefix} SDK_CMD op={label} EXPIRED (not executed): "
+                    f"reason={'caller_gave_up' if caller_gave_up else 'deadline'} "
+                    f"late_by_ms={late_ms}"
+                )
                 _tel.event("SDK_CMD", worker=self._tel_wid, op=label, ok=False, expired=True)
                 result_event.set()
                 continue
             _t0 = time.monotonic()
             try:
                 if self._sdk is None or not self._connected:
-                    result_box["ok"] = False
-                    result_box["error"] = "device not connected"
+                    result_box.update({"ok": False, "error": "device not connected"})
                 else:
-                    result_box["result"] = fn(self._sdk)
-                    result_box["ok"] = True
-                    result_box["error"] = ""
+                    result = fn(self._sdk)
+                    result_box.update({"ok": True, "result": result, "error": ""})
             except Exception as e:
-                result_box["ok"] = False
                 # Full SDK error string (PullSDKError carries rc + PullLastError)
                 # so the control panel can show it in the error popup.
-                result_box["error"] = str(e)
+                result_box.update({"ok": False, "error": str(e)})
             finally:
                 _dur = round((time.monotonic() - _t0) * 1000)
                 _tel.event(

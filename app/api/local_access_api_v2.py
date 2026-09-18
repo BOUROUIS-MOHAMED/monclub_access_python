@@ -4411,6 +4411,8 @@ def _run_on_device_sdk(ctx: _Ctx, did: int, fn, *, label: str, timeout: float = 
             if res.get("ok"):
                 return {"ok": True, "result": res.get("result"), "error": "", "mode": "ultra", "status": 200}
             err = res.get("error") or "device command failed"
+            # 503 = nothing was sent. "sent, no answer" (the worker was already running
+            # fn when the wait ran out, guide §3.1a) may have been applied: not here.
             status = 503 if err in ("timeout", "device not connected", "expired (not executed)") else 500
             return {"ok": False, "result": None, "error": err, "mode": "ultra", "status": status}
 
