@@ -1376,17 +1376,23 @@ to an empty scratch folder; exit code 0; nothing created under that folder outsi
 > The fixes are two more session-scoped, never-reverted guards in `tests/conftest.py`. `[CODE]`
 > - **Config paths:** it repoints the `shared.desktop_paths` config-path globals, which
 >   `get_desktop_path_layout()` reads at call time, to a temp root. It stubs `ensure_dirs` inside
->   `shared.config` (`save_json` creates the parents it needs) and re-arms `_MIGRATION_DONE`.
->   The migration still runs and writes its defaults into the temp root.
+>   `shared.config` (`save_json` creates the parents it needs). The migration still runs, from
+>   the first test that reads config, and writes its defaults into the temp root. `[TEST]` The
+>   conftest also resets `_MIGRATION_DONE` to `False`. That is defensive only: it is already
+>   `False` after the whole suite is collected. `[TEST]`
 > - **Popup images:** it points `popup_image_cache._cache_dir_cached` at a temp folder and
 >   replaces its `requests` with a stub that raises. `fetch_and_cache` handles that like any
->   fetch error. Tests of the fetch still `patch.object(pic, "requests")`.
+>   fetch error, so a blocked prefetch also lands in the module's negative cache. Tests of the
+>   fetch still `patch.object(pic, "requests")` and clear that cache.
+>   **This stub covers `popup_image_cache` only.** Any other code that fetches over the network
+>   is not blocked, and a network call leaves no file under the root for the sweep to find.
 > - **The negcache test:** now points `access.storage.current_access_runtime_db_path` at
 >   `tmp_path` and asserts the exact resolved folder.
 >
 > After the change, no file among the 118 creates anything outside `data/` under the root:
-> no file, no folder. The traced run records no writes there and no outbound connection. The
-> only connect in the suite is `test_network_discovery` to `127.0.0.1`. `data/` itself is
+> no file, no folder. The same audit hook over the per-file runs *and* over one full-suite run
+> (1771 passed) records no writes there and only one `socket.connect`:
+> `test_network_discovery` to `127.0.0.1`. `data/` itself is
 > created at import by `_pick_data_root` and stayed empty in every per-file run. The full suite
 > left nothing outside `data/` either. `[TEST]` To re-run the sweep (expected output: nothing):
 >

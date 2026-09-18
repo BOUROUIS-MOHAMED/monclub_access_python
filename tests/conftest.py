@@ -40,8 +40,10 @@ files outside ``data/`` that the per-file sweep found under the data root:
   ``popup_image_cache.prefetch``, whose pool thread did a real ``requests.get`` against
   the production backend (sending the stored bearer token when one exists) and cached the
   reply under ``access/cache/images``. The cache dir is repointed and ``requests`` is
-  replaced by a stub that refuses; ``fetch_and_cache`` treats that like any fetch error.
-  Tests that exercise the fetch still ``patch.object(pic, "requests")`` themselves.
+  replaced by a stub that refuses; ``fetch_and_cache`` treats that like any fetch error,
+  so a blocked prefetch also puts its URL in the module's negative cache (transient
+  backoff). Tests that exercise the fetch still ``patch.object(pic, "requests")``
+  themselves and clear that cache.
 
 This file guards only what is collected under ``tests/``.
 """
@@ -88,8 +90,8 @@ def _never_write_the_default_config(tmp_path_factory):
     # The migration's ensure_dirs() only creates data-root folders (save_json makes the
     # parents it needs) and would copy a legacy ./data folder into the data root.
     shared_config.ensure_dirs = lambda: None
-    # Repoint first, then re-arm the one-shot guard, so the migration (if something ran it
-    # while test modules were being imported) runs again against the redirected paths.
+    # Defensive: re-arm the one-shot guard in case something ran the migration while test
+    # modules were imported. Not observed -- it is still False after collecting the suite.
     shared_config._MIGRATION_DONE = False
     yield
 
