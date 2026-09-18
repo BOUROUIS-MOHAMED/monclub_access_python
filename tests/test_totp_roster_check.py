@@ -130,6 +130,21 @@ def test_the_account_second_chance_needs_the_same_account(world, other_row):
     assert r["allowed"] is False and r["rosterCheck"] == av.ROSTER_NOT_IN
 
 
+def test_a_roster_refusal_found_on_the_wall_clock_retry_is_the_reported_verdict(world):
+    # Device RTC 5 min ahead (inside the 3600 s sanity bound): the scan-clock pass finds
+    # no match, the wall-clock retry matches the credential and refuses it on the
+    # roster. The reported reason -- and the count -- must be the roster refusal.
+    creds, users_by_am, _m, removed, _s = world
+    s = _settings(totp_roster_check_mode="enforce")
+    now = time.time()
+    r = av.verify_totp_resilient(
+        scanned=_code_for(removed, s, now), settings=s, creds_payload=creds,
+        users_by_am=users_by_am, users_by_card={}, scan_epoch=now + 300,
+    )
+    assert r["allowed"] is False and r["reason"] == "DENY_NOT_IN_LOCAL_ROSTER"
+    assert r["rosterCheck"] == av.ROSTER_NOT_IN and r["clockUsed"] == "wall"
+
+
 def test_an_enforced_roster_refusal_does_not_rerun_the_verification(world):
     # The wall-clock retry is for clock skew; a roster refusal already matched a
     # credential, so re-running the full HMAC loop would only double the worker's time.
@@ -387,6 +402,34 @@ def test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new(shared
         _ue._set_shared_local_state(None, -1)
     assert worker._sdk.open_door.called is opens
     assert rec.allowed is opens
+
+
+@pytest.mark.parametrize("who, opens", [("removed", False), ("member", True)])
+def test_ultra_never_adopts_an_empty_shared_member_list(world, who, opens):
+    # Another worker's refresh read the credentials but failed the users query:
+    # load_local_state returned (creds, {}, {}) and it was published at gen 6 with the
+    # index. Adopting that empty list would lose the member's name and turn an enforce
+    # refusal into roster_empty (open). The worker keeps its own list.
+    import app.core.ultra_engine as _ue
+    creds, users_by_am, member, removed, _s = world
+    s = {**_settings(), "totp_roster_check_mode": "enforce"}
+    worker = _ultra_worker(s, creds, users_by_am)
+    worker._cached_state_gen = 5
+    worker._get_cached_local_state = MagicMock(return_value=(creds, users_by_am, {}))
+    _ue._set_shared_totp_index(av.build_totp_index(creds, s, time.time(), margin=1), 6)
+    _ue._set_shared_local_state((creds, {}, {}), 6)
+    cred = removed if who == "removed" else member
+    try:
+        before = av.totp_roster_check_counts()
+        _ultra_scan(worker, _code_for(cred, s, time.time()))
+        req = worker._popup_q.get_nowait()
+    finally:
+        _ue._set_shared_totp_index(None, -1)
+        _ue._set_shared_local_state(None, -1)
+    assert worker._sdk.open_door.called is opens
+    assert _counts_delta(before, av.totp_roster_check_counts())[av.ROSTER_UNEVALUABLE] == 0
+    if who == "member":
+        assert req.user_full_name == "M101"
 
 
 # ---------------------------------------------------------------------------

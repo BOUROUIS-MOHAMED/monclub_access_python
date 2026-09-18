@@ -4375,9 +4375,17 @@ class UltraDeviceWorker(threading.Thread):
         # member added since this worker last refreshed would read as "not on the
         # list". Check against the process-wide member list when it is at least as
         # new as the index; it is published before the index is built from it.
+        # Never adopt an EMPTY shared list: load_local_state turns a failed users read
+        # into [] and the refresh still publishes it, so an empty list there says
+        # nothing about the members -- keeping our own list keeps names and the check.
         if totp_index is not None and _idx_gen > self._cached_state_gen:
             _shared, _shared_gen = _get_shared_local_state()
-            if _shared_gen >= _idx_gen and isinstance(_shared, (tuple, list)) and len(_shared) >= 3:
+            if (
+                _shared_gen >= _idx_gen
+                and isinstance(_shared, (tuple, list))
+                and len(_shared) >= 3
+                and _shared[1]
+            ):
                 users_by_am = _shared[1]
 
         t0 = time.monotonic()

@@ -834,7 +834,10 @@ def verify_totp_resilient(
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
         totp_index=totp_index,
     )
-    if fallback.get("allowed"):
+    # Allowed on the wall clock -- or refused there by the roster check, which means
+    # the code DID match a credential: report that verdict (and let it be counted),
+    # not the scan-clock pass's no-match/expired.
+    if fallback.get("allowed") or fallback.get("reason") == "DENY_NOT_IN_LOCAL_ROSTER":
         fallback["clockUsed"] = "wall"
         return fallback
 

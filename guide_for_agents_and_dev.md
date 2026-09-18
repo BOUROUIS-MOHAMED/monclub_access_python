@@ -288,8 +288,11 @@ GymAccessController.getGymAccessUsers; MembershipModel.permitsGym]`
 **One verification per refusal.** `verify_totp_resilient` returns a `DENY_NOT_IN_LOCAL_ROSTER`
 at once instead of re-running the full check against the wall clock: that retry exists for clock
 skew (no match, expired), and on the no-index path it would double the worker's time. It could
-only differ if another credential produced the same code in the other time window.
-`[TEST: ::test_an_enforced_roster_refusal_does_not_rerun_the_verification]`
+only differ if another credential produced the same code in the other time window. The other
+way round — the scan-clock pass finds nothing (device clock skewed), the wall-clock retry matches
+and refuses on the roster — the retry's `DENY_NOT_IN_LOCAL_ROSTER` is what is reported and
+counted. `[TEST: ::test_an_enforced_roster_refusal_does_not_rerun_the_verification,
+::test_a_roster_refusal_found_on_the_wall_clock_retry_is_the_reported_verdict]`
 
 **The switch.** Per device, in the device's opaque `deviceCapabilities` JSON:
 `{"totpRosterCheckMode": "enforce"}`. `settings_reader.py::parse_totp_roster_check_mode` reads it
@@ -307,8 +310,12 @@ member list was loaded. `_handle_totp_rescue` then checks against the process-wi
 (`_get_shared_local_state`) when it is at least as new as the index — it is published by the
 refresh that the index is later built from. Without it, a brand-new member would read as
 `not_in_roster`: a false count in trial, a refusal in enforce. If the shared list is older
-than the index (a slower refresh overwrote it), the worker's own list is used. `[CODE:
-ultra_engine.py::_handle_totp_rescue]` `[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new]`
+than the index (a slower refresh overwrote it), or **empty** — a refresh whose users query
+failed still publishes `(creds, {}, {})` — the worker's own list is used: adopting an empty one
+would drop member names from the popup and history and turn an enforce refusal into
+`roster_empty`. `[CODE: ultra_engine.py::_handle_totp_rescue]`
+`[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new,
+::test_ultra_never_adopts_an_empty_shared_member_list]`
 
 **Counting.** `verify_totp` stays pure — `verify_totp_resilient` calls it twice on the denial
 path (scan clock, then wall clock) and tests call it freely. Each engine records the **final**
