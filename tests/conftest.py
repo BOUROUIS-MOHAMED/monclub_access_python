@@ -27,6 +27,22 @@ deliberate:
   ``tmp_path`` and call ``init_db()``; their ``monkeypatch`` wins for the test and
   reverts to this path afterwards.
 
+Two more session guards follow the same rules (session-scoped, never reverted), for
+files outside ``data/`` that the per-file sweep found under the data root:
+
+* Split config. The first config read in a process runs
+  ``shared.config.migrate_split_config_if_needed``, which calls ``ensure_dirs()`` and
+  writes default ``access/config.json``, ``tv/config.json`` and ``shared/install.json``
+  when they are missing -- on a gym PC, into the installed app's folder. The config paths
+  are read from ``shared.desktop_paths`` module globals at call time, so repointing those
+  globals redirects every layout user.
+* Popup image cache. An allow event with a member image calls
+  ``popup_image_cache.prefetch``, whose pool thread did a real ``requests.get`` against
+  the production backend (sending the stored bearer token when one exists) and cached the
+  reply under ``access/cache/images``. The cache dir is repointed and ``requests`` is
+  replaced by a stub that refuses; ``fetch_and_cache`` treats that like any fetch error.
+  Tests that exercise the fetch still ``patch.object(pic, "requests")`` themselves.
+
 This file guards only what is collected under ``tests/``.
 """
 from __future__ import annotations
@@ -57,3 +73,38 @@ def _reapply_suite_db_path_after_reload(_suite_db_path):
     _apply_suite_db_path(_suite_db_path)
     yield
     _apply_suite_db_path(_suite_db_path)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _never_write_the_default_config(tmp_path_factory):
+    import shared.config as shared_config
+    import shared.desktop_paths as desktop_paths
+
+    root = tmp_path_factory.mktemp("suite-config-root")
+    desktop_paths.CONFIG_PATH = root / "data" / "config.json"  # legacy, read-only here
+    desktop_paths.ACCESS_CONFIG_PATH = root / "access" / "config.json"
+    desktop_paths.TV_CONFIG_PATH = root / "tv" / "config.json"
+    desktop_paths.SHARED_INSTALL_CONFIG_PATH = root / "shared" / "install.json"
+    # The migration's ensure_dirs() only creates data-root folders (save_json makes the
+    # parents it needs) and would copy a legacy ./data folder into the data root.
+    shared_config.ensure_dirs = lambda: None
+    # Repoint first, then re-arm the one-shot guard, so the migration (if something ran it
+    # while test modules were being imported) runs again against the redirected paths.
+    shared_config._MIGRATION_DONE = False
+    yield
+
+
+class _NoNetworkRequests:
+    """Stand-in for ``requests`` in popup_image_cache: tests never reach the backend."""
+
+    def get(self, url, *args, **kwargs):
+        raise RuntimeError(f"tests/conftest.py: popup image fetch of {url!r} blocked")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _never_fetch_or_cache_popup_images_in_the_data_root(tmp_path_factory):
+    import app.core.popup_image_cache as pic
+
+    pic._cache_dir_cached = str(tmp_path_factory.mktemp("suite-popup-images"))
+    pic.requests = _NoNetworkRequests()
+    yield

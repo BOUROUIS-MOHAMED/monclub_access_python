@@ -1301,9 +1301,9 @@ applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
 background-thread exceptions are promoted to failures. Last run: **1771 passed**
-(2026-09-18, branch `claude/test-db-isolation`, both this command and the CLAUDE.md command
+(2026-09-18, branch `claude/test-dataroot-files`, both this command and the CLAUDE.md command
 `python -m pytest tests/ -q --ignore=tests/_pydeps`, each with `MONCLUB_ACCESS_DATA_ROOT` set
-to an empty scratch folder; exit code 0; no database created under that folder). `[TEST]`
+to an empty scratch folder; exit code 0; nothing created under that folder outside `data/`). `[TEST]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
@@ -1352,16 +1352,49 @@ to an empty scratch folder; exit code 0; no database created under that folder).
 > database again. Tests that need a schema still patch `_DB_PATH` to their own `tmp_path` and
 > call `init_db()`. The conftest is a safety net, not a substitute for that. After the change
 > the same sweep finds **0 of 118** files creating a database, and all 118 pass alone. `[TEST]`
-> To re-run it (expected output: nothing):
+>
+> **Nor config files, the popup image cache, or the backend.** With the database guarded, the
+> sweep still found three files writing *outside* `data/` under the root (2026-09-18, traced
+> with a Python audit hook on file opens, renames and mkdirs, plus `socket.connect`). `[TEST]`
+> - `test_feedback_api` and `test_scan_session_api` wrote `access/config.json`, `tv/config.json`
+>   and `shared/install.json`. The first config read in a process (`serialize_access_config`,
+>   `load_access_app_config`) runs `shared.config.migrate_split_config_if_needed`. That calls
+>   `ensure_dirs()` and writes default component configs and `install.json` wherever they are
+>   missing. On a gym PC that is the installed app's folder.
+> - `test_ultra_engine` made a **real HTTPS request to the production backend**
+>   (`monclubwigo.tn:443`). An allow event carrying a member image (`"alice.jpg"`) reaches
+>   `popup_image_cache.prefetch`, whose pool thread runs `requests.get` on the URL joined to
+>   `MONCLUB_BASE_URL`. The server answered with a 950-byte HTML page, which was cached as
+>   `access/cache/images/<sha1>.jpg`. `fetch_and_cache` attaches `Authorization: Bearer` with
+>   whatever `load_auth_token()` returns `[CODE]`. Before the database guard, that token came
+>   from the installed database. Whether any past run actually sent a real gym token is
+>   `[UNVERIFIED]`.
+> - `test_popup_image_negcache::test_cache_dir_resolves_under_images_when_unmemoized` created
+>   the empty folders `access/cache/images` through the real
+>   `current_access_runtime_db_path()`.
+>
+> The fixes are two more session-scoped, never-reverted guards in `tests/conftest.py`. `[CODE]`
+> - **Config paths:** it repoints the `shared.desktop_paths` config-path globals, which
+>   `get_desktop_path_layout()` reads at call time, to a temp root. It stubs `ensure_dirs` inside
+>   `shared.config` (`save_json` creates the parents it needs) and re-arms `_MIGRATION_DONE`.
+>   The migration still runs and writes its defaults into the temp root.
+> - **Popup images:** it points `popup_image_cache._cache_dir_cached` at a temp folder and
+>   replaces its `requests` with a stub that raises. `fetch_and_cache` handles that like any
+>   fetch error. Tests of the fetch still `patch.object(pic, "requests")`.
+> - **The negcache test:** now points `access.storage.current_access_runtime_db_path` at
+>   `tmp_path` and asserts the exact resolved folder.
+>
+> After the change, no file among the 118 creates anything outside `data/` under the root:
+> no file, no folder. The traced run records no writes there and no outbound connection. The
+> only connect in the suite is `test_network_discovery` to `127.0.0.1`. `data/` itself is
+> created at import by `_pick_data_root` and stayed empty in every per-file run. The full suite
+> left nothing outside `data/` either. `[TEST]` To re-run the sweep (expected output: nothing):
 >
 > ```bash
-> for f in tests/test_*.py; do r=$(mktemp -d); MONCLUB_ACCESS_DATA_ROOT="$r" python -m pytest "$f" -q -p no:cacheprovider >/dev/null 2>&1; find "$r" -name '*.db*' | sed "s|^|$f: |"; rm -rf "$r"; done
+> for f in tests/test_*.py; do r=$(mktemp -d); MONCLUB_ACCESS_DATA_ROOT="$r" python -m pytest "$f" -q -p no:cacheprovider >/dev/null 2>&1; find "$r" -mindepth 1 -not -path "$r/data" -not -path "$r/data/*" | sed "s|^|$f: |"; rm -rf "$r"; done
 > ```
 >
-> Other files still land under the data root: `test_feedback_api` and `test_scan_session_api`
-> write `access/config.json`, `tv/config.json` and `shared/install.json`, and `test_ultra_engine`
-> writes an image under `access/cache/images/`. They are not databases and were not audited here.
-> The conftest also guards only what is collected under `tests/`. A bare `pytest` from the repo
+> The conftest guards only what is collected under `tests/`. A bare `pytest` from the repo
 > root also collects `totp_file_test.py`, which imports `app.core.db` and gets no guard. Always
 > run the suite with `MONCLUB_ACCESS_DATA_ROOT` set to a scratch folder. `[TEST]` / `[CODE]`
 
