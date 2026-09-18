@@ -784,8 +784,9 @@ test_a_cutover_sized_diff_aborts_mirror_before_any_plan_is_recorded]`
 
 **2. The revoke pass — aborts on its own floor, and that abort is protective.**
 
-`_neutralise_revoked_pins` is trigger-independent: it runs on every successful standalone full
-sync, and it is the only removal path a PRESERVE device has. Its candidate set is `owned` (pins
+`_neutralise_revoked_pins` is trigger-independent: it runs on every standalone full sync — since
+P3a-2 BEFORE the push and whatever the push then does (§3.4b) — and it is the only removal path a
+PRESERVE device has. Its candidate set is `owned` (pins
 with `ownership_confirmed=1` in `device_sync_state`) minus `keep` (the desired roster) minus the
 grace/allowlist. It refuses a bulk strip above
 `ceiling = max(_REVOKE_ABSOLUTE_FLOOR=10, roster_count * _MIRROR_MAX_DELETE_FRACTION=0.25)`.
@@ -1288,6 +1289,41 @@ reads that one pin (`_prove_pullsdk_intent`) and deletes it only if the card mat
 `CardNo` (padding, leading zeros are ignored in the comparison) and the MB2000's
 `SSR_GetAllUserInfo` tuple order (§7): a wrong order makes every comparison mismatch, which fails
 safe (nothing promoted) but leaves such pins unprovable.
+
+### 3.4b Removals first, and retried fast (P3a-2, 2026-09-18)
+
+**Order within a pass.** PullSDK already deleted stale pins before Phase A. The MB2000 full sync
+did the opposite: `push_roster` first, and the revoke pass only `if sync_ok` — so one unrelated
+member's refused finger meant no departed member was removed that pass. The revoke pass has no data
+dependency on the push (its candidates are owned pins NOT in the desired roster; a pin being pushed
+is desired by construction), so it now runs first; MIRROR still runs only after a successful push,
+and the prune last. An explicit revocation whose pin that step removed is confirmed at once and is
+not re-queued even if the push then fails. `[CODE: ultra_engine.py::_run_standalone_full_sync]`
+`[TEST: test_removals_first_and_retry.py::TestRemovalsFirst]` — deliberate inversion:
+`test_standalone_revoked_pin_removal.py::test_a_failed_push_no_longer_blocks_revocation`.
+
+**Retry of a FAILED removal (≤ 300 s).** The claim "delete and upsert retries both back off to 24 h"
+held for upserts only. A failed removal had no timer at all: the pass still reported success, the
+scheduler stamped the roster hash and skipped the device as "unchanged" until the roster changed; a
+refused PullSDK stale delete even erased its own state row, so it was never retried (§3.2g). Now a
+removal the device refused — the MB2000 revoke pass's `failed` set, a PullSDK stale delete, or an
+explicit PullSDK revocation still pending after its pass — arms the worker's own retry
+(`_update_removal_retry`): 30 s, doubling, capped at `_REMOVAL_RETRY_MAX_SEC` = 300 s; the run loop
+(`_maybe_request_removal_retry`) then requests a full sync `reason=removal-retry` whatever the
+roster hash says, and only while connected. A pass with no failed removal clears it. A refusal by the
+ceiling (`REVOKE_ABORTED`, §3.2g) is NOT a failure and is not fast-retried: nothing shrinks between
+passes. `[T] REMOVAL_RETRY_SCHEDULED worker pins delay_s streak`. Load: each retry is one pass — a
+roster build and state read, no device I/O for unchanged members — plus the failed removals only
+(`SSR_DeleteEnrollData(…, 12)` per pin, then the neutralise fallback; ≤ the ceiling): at the cap ≤ 12
+passes an hour, only while a removal keeps failing. `[TEST: ::TestFailedRemovalIsRetriedFast]`
+Targeted revocations were already re-queued at once (`request_full_sync(revoke-failed)`); unchanged.
+
+**Upsert retry cap 24 h → 6 h.** `device_sync._SYNC_RETRY_MAX_SEC = 21600` (both SDKs share
+`DeviceSyncEngine._retry_due`; free attempts and the 15-min doubling unchanged). The PC is on about
+06:00–23:00 and off overnight (door history, 2026-09-12 study), so a 24 h cap could leave a refused
+member with no retry for two operating days; at 6 h a permanently refused pin costs ≤ 4 retries a
+day (≈0.45 s per MB2000 member write, field 928/419 s; on PullSDK a firmware-cache clear plus a ≤10-call
+probe per finger). New content still bypasses the backoff. `[TEST: ::TestUpsertBackoffCap]`
 
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
@@ -2004,6 +2040,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
+| `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
 | `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms` (§3.4a; `ok=False` = the listing failed, nothing changed) |
 | `MEMBER_REVOKE_SKIPPED_NOT_OWNED` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id member_id pin protocol` (+ `row` on the full sync, `pin_scheme source` on PullSDK) (warn; P3a-2 — FINAL: MonClub cannot prove it wrote that pin, nothing deleted, revocation finished, §3.4). Replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`, which is no longer emitted |

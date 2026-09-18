@@ -831,7 +831,9 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   `max(_REVOKE_ABSOLUTE_FLOOR=10, roster × 0.25)` pins ⇒ abort and KEEP the state
   (`REVOKE_ABORT_FLOOR`, plus `REVOKE_ABORTED` from the shared ceiling every removal path uses
   since P3a-2 — `guide_for_agents_and_dev.md` §3.2g); the MIRROR enrolment grace window and protected-pin
-  allowlist are honoured; a failed push keeps the state for retry. Confirmed device
+  allowlist are honoured; since P3a-2 the pass runs BEFORE the push (a failed push no longer
+  blocks it) and a pin whose removal the terminal refused is retried by the worker within 300 s
+  (`guide_for_agents_and_dev.md` §3.4b). Confirmed device
   removal clears `device_sync_state` and `device_content_mirror` in one SQLite
   transaction; a cleanup failure rolls both back and keeps the retry record.
   A percentage alone was wrong here — one departure on a 3-member rig is 33 % and

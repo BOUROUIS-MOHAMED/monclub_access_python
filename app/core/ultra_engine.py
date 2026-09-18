@@ -213,6 +213,16 @@ _REVOKE_ABSOLUTE_FLOOR = _push_safety.REVOKE_ABSOLUTE_FLOOR
 _FULL_REVOKE_ACTIVE = "active"
 _FULL_REVOKE_RETRY = "retry"
 
+# P3a-2 item 2: a FAILED removal (the terminal refused the delete and the neutralise
+# fallback) is retried by the worker itself after 30 s, doubling, capped at 300 s --
+# independent of the roster hash. Each retry is one full-sync pass: one roster build
+# and state read (no device I/O for unchanged members) plus the failed removals only
+# (SSR_DeleteEnrollData(..., 12) per pin, then the neutralise fallback), bounded by
+# the removal ceiling. At the cap that is <= 12 passes an hour, and only while the
+# worker is connected and a removal keeps failing.
+_REMOVAL_RETRY_FIRST_SEC = 30.0
+_REMOVAL_RETRY_MAX_SEC = 300.0
+
 
 def _revoke_skipped_not_owned(engine: Any) -> bool:
     """True when DeviceSyncEngine's last targeted revoke was SKIPPED_NOT_OWNED.
@@ -739,6 +749,7 @@ class UltraDeviceWorker(threading.Thread):
                 # Drain commands again after processing events for minimal latency
                 self._drain_commands()
                 self._drain_member_sync_commands(limit=1)
+                self._maybe_request_removal_retry()
                 self._drain_full_sync_commands(limit=1)
                 self._drain_daily_maintenance()
                 self._drain_commands()
@@ -2172,6 +2183,42 @@ class UltraDeviceWorker(threading.Thread):
         return failed
 
     # ---------------------------------------------------------------- #
+    # Fast retry of a FAILED removal (P3a-2 item 2, guide §3.4b)
+    # ---------------------------------------------------------------- #
+    def _update_removal_retry(self, *, failed: list[str], errored: bool = False) -> None:
+        """Arm (failure) or clear (no failure) the worker's own removal retry.
+
+        A removal the device refused used to wait for an unrelated roster change: the
+        pass reported success, the scheduler stamped the roster hash and skipped the
+        device as unchanged. The worker now re-requests a pass itself, 30 s after the
+        first failure, doubling, never more than 300 s apart -- a member who left must
+        not keep opening the door for long. A refusal by the removal ceiling
+        (REVOKE_ABORTED) is not a failure: retrying it every few seconds changes nothing.
+        """
+        if failed or errored:
+            streak = int(getattr(self, "_removal_retry_streak", 0) or 0) + 1
+            delay = min(_REMOVAL_RETRY_MAX_SEC,
+                        _REMOVAL_RETRY_FIRST_SEC * (2 ** (streak - 1)))
+            self._removal_retry_streak = streak
+            self._removal_retry_at_mono = time.monotonic() + delay
+            _tel.warn("REMOVAL_RETRY_SCHEDULED", worker=self._tel_wid,
+                      pins=len(failed), delay_s=round(delay), streak=streak,
+                      errored=errored or None)
+        else:
+            self._removal_retry_streak = 0
+            self._removal_retry_at_mono = None
+
+    def _maybe_request_removal_retry(self) -> None:
+        """Run loop: when a failed removal's retry is due, ask for a pass."""
+        due = getattr(self, "_removal_retry_at_mono", None)
+        if due is None or not self._connected or time.monotonic() < due:
+            return
+        if self._pending_full_sync_request is not None:
+            return  # a pass is already queued; it retries the removal
+        self._removal_retry_at_mono = None
+        self.request_full_sync(reason="removal-retry")
+
+    # ---------------------------------------------------------------- #
     # Write-ahead ownership (P3a-2 item 3, guide §3.4a)
     # ---------------------------------------------------------------- #
     def _record_push_intents(self, users: list[Dict[str, Any]],
@@ -2458,6 +2505,8 @@ class UltraDeviceWorker(threading.Thread):
         # Explicit revocations of pins MonClub cannot prove it owns: dropped from this
         # pass as SKIPPED_NOT_OWNED (final). {membership_id: pin}. P3a-2 item 4.
         skipped_revokes: Dict[int, str] = {}
+        # Explicit revocations whose pin the removal step (which runs first) removed.
+        removed_revokes: set[int] = set()
         self._last_revoke_aborted = 0
         desired_pins: list[str] = []
         try:
@@ -2491,6 +2540,56 @@ class UltraDeviceWorker(threading.Thread):
             # Turning this on is a separate, hardware-gated decision, NOT a side
             # effect of repairing the MIRROR trigger. See guide §3.2c.
             bracket = False
+            # REMOVALS FIRST (P3a-2 item 2, guide §3.4b). The revoke pass used to run only
+            # after a SUCCESSFUL push, so one unrelated member's refused finger meant no
+            # departed member was removed that pass. It has no data dependency on the
+            # push: its candidates are pins MonClub owns that are not in the desired
+            # roster, and a pin this pass is about to push is by construction desired.
+            # MIRROR still runs after a successful push, and the prune last.
+            safe_to_prune = True
+            removal_attempt_failed = False
+            if roster_withheld:
+                # pinScheme=ACCOUNT rows without mainAccountId were withheld, so their
+                # people's pins are missing from `users`/`desired_pins` and would read as
+                # departed. MIRROR, the revoke pass and the prune all remove by that
+                # difference -- skip all three. safe_to_prune=False also keeps the
+                # ownership evidence (guide §3.2c).
+                logger.warning(
+                    "%s full sync: pinScheme=ACCOUNT roster INCOMPLETE (%d row(s) withheld, "
+                    "no mainAccountId) -- MIRROR reconcile, revoke pass and prune skipped",
+                    self._prefix, roster_withheld,
+                )
+                _tel.warn("REVOKE_SKIP_INCOMPLETE_ROSTER", worker=self._tel_wid,
+                          withheld=roster_withheld)
+                safe_to_prune = False
+            else:
+                # Strip credentials from pins WE pushed that have left the roster.
+                # Must run BEFORE the prune below, which deletes the very record of
+                # what we pushed to them.
+                try:
+                    safe_to_prune = self._neutralise_revoked_pins(
+                        desired_pins=desired_pins,
+                        roster_count=len(users),
+                        required_pins=self._required_revocation_pins(
+                            unconfirmed_revoked_ids - set(skipped_revokes),
+                            desired_pins, revoked_pin_of,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
+                    safe_to_prune = False
+                    removal_attempt_failed = True
+                # An explicit revocation whose pin that step removed is DONE, whatever the
+                # push does next: it must not be re-queued (and re-reported) as pending.
+                _removed_now = set(getattr(self, "_last_revoke_removed", ()) or ())
+                for _m in sorted(unconfirmed_revoked_ids - set(skipped_revokes)):
+                    if revoked_pin_of.get(_m) in _removed_now:
+                        removed_revokes.add(_m)
+                        self._mark_member_revoke_confirmed(_m)
+            self._update_removal_retry(
+                failed=list(getattr(self, "_last_revoke_removal_failed", ()) or ()),
+                errored=removal_attempt_failed,
+            )
             to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
             # Which finger slots this terminal currently holds per pin. Read ONCE
             # per sync; used both to name vacated slots below and to give unchanged
@@ -2590,43 +2689,14 @@ class UltraDeviceWorker(threading.Thread):
                 # incremental `to_push` subset -- MIRROR deletes device users absent
                 # from this list, so passing the subset would delete every unchanged
                 # member.
-                safe_to_prune = True
-                if roster_withheld:
-                    # pinScheme=ACCOUNT rows without mainAccountId were withheld, so their
-                    # people's pins are missing from `users`/`desired_pins` and would read as
-                    # departed. MIRROR, the revoke pass and the prune all remove by that
-                    # difference -- skip all three. safe_to_prune=False also keeps the
-                    # ownership evidence (guide §3.2c).
-                    logger.warning(
-                        "%s full sync: pinScheme=ACCOUNT roster INCOMPLETE (%d row(s) withheld, "
-                        "no mainAccountId) -- MIRROR reconcile, revoke pass and prune skipped",
-                        self._prefix, roster_withheld,
-                    )
-                    _tel.warn("REVOKE_SKIP_INCOMPLETE_ROSTER", worker=self._tel_wid,
-                              withheld=roster_withheld)
-                    safe_to_prune = False
-                else:
+                if not roster_withheld:
                     try:
                         self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
                                                      roster_users=users)
                     except Exception as exc:
                         logger.warning("%s MIRROR reconcile error (ignored): %s", self._prefix, exc)
-                    # Strip credentials from pins WE pushed that have left the roster.
-                    # Must run BEFORE the prune below, which deletes the very record of
-                    # what we pushed to them.
-                    try:
-                        safe_to_prune = self._neutralise_revoked_pins(
-                            desired_pins=desired_pins,
-                            roster_count=len(users),
-                            required_pins=self._required_revocation_pins(
-                                unconfirmed_revoked_ids - set(skipped_revokes),
-                                desired_pins, revoked_pin_of,
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
-                        safe_to_prune = False
-                if (unconfirmed_revoked_ids - set(skipped_revokes)) and not safe_to_prune:
+                if (unconfirmed_revoked_ids - set(skipped_revokes) - removed_revokes) \
+                        and not safe_to_prune:
                     sync_ok = False
                     sync_error = "authoritative revocation unconfirmed"
                 # Forget state for pins no longer desired, so a member who leaves and
@@ -2691,7 +2761,7 @@ class UltraDeviceWorker(threading.Thread):
                                       duration_ms=duration_ms, error=sync_error)
         # SKIPPED_NOT_OWNED ids were finalised when they were skipped; they must not go
         # back to the scheduler for a retry that could never succeed.
-        effective_revoked_ids = normalized_revoked_ids - set(skipped_revokes)
+        effective_revoked_ids = normalized_revoked_ids - set(skipped_revokes) - removed_revokes
         if not sync_ok:
             self._finalize_full_sync_revokes(
                 effective_revoked_ids,
@@ -3398,6 +3468,8 @@ class UltraDeviceWorker(threading.Thread):
         aborted and the state must be kept so a later sync can retry.
         """
         self._last_revoke_aborted = 0
+        self._last_revoke_removed: set[str] = set()
+        self._last_revoke_removal_failed: list[str] = []
         if roster_count <= 0:
             # A failed or half-built roster must never read as "everyone left".
             _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
@@ -3493,6 +3565,8 @@ class UltraDeviceWorker(threading.Thread):
                         exc_info=True,
                     )
         failed = set(outcome.failed) | cleanup_failed
+        self._last_revoke_removed = set(outcome.removed) - cleanup_failed
+        self._last_revoke_removal_failed = sorted(failed)
         confirmed_slots = sum(
             len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
         )
@@ -3958,6 +4032,13 @@ class UltraDeviceWorker(threading.Thread):
                 ))
                 unconfirmed_revoked_ids = (
                     revoked_ids - self._confirmed_member_revokes(revoked_ids)
+                )
+                # P3a-2 item 2: a stale delete the panel refused (its row is now kept) or an
+                # explicit revocation still pending re-requests a pass within 300 s.
+                _removal_report = getattr(engine, "_last_removal_report", None) or {}
+                self._update_removal_retry(
+                    failed=list(_removal_report.get("failed") or []),
+                    errored=bool(unconfirmed_revoked_ids),
                 )
                 if sync_ok and unconfirmed_revoked_ids:
                     sync_ok = False

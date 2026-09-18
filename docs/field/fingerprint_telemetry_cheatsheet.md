@@ -242,6 +242,14 @@ were refused). The parallel of `ZKEM_PUSH_TPL_REFUSED` above, for the other SDK.
 > A gym that has been quietly refusing templates for months will surface all of them on
 > the first sync after upgrading.
 
+**A departed member the terminal refused to delete:** (P3a-2)
+
+```bash
+grep -F "[T] REMOVAL_RETRY_SCHEDULED" app-*.log
+```
+
+`pins=N delay_s=D` means N removals failed and the worker will try again by itself in D seconds (30, then doubling, never more than 300) — it no longer waits for the roster to change. Removals are never subject to the push backoff below.
+
 **A member who keeps failing and then goes quiet:**
 
 ```bash
@@ -252,7 +260,7 @@ Because a refused template is now a real failure, a pin that can never succeed w
 re-pushed on **every** sync run forever — each retry costing a firmware-cache clear plus a
 ten-call probe per finger, inline on the worker with the door queue blocked. So after
 **3 free attempts** on unchanged content the retry backs off: 15 min, doubling, capped at
-24 h. `pins=` is how many were held back this run; the same count also appears as
+6 h (24 h before P3a-2). `pins=` is how many were held back this run; the same count also appears as
 `backoff_skipped=` on the `[DeviceSync] … DONE` summary line.
 
 Two things deliberately defeat the backoff, so a real fix is never delayed:

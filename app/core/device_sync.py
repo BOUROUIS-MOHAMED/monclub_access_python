@@ -123,7 +123,15 @@ MEMBER_SYNC_OWNERSHIP_UNREADABLE = "OWNERSHIP_UNREADABLE"  # retry: cannot tell 
 
 _SYNC_RETRY_FREE_ATTEMPTS = 3      # first 3 failures retry every run (unchanged behaviour)
 _SYNC_RETRY_BASE_SEC      = 900    # then 15 min, doubling
-_SYNC_RETRY_MAX_SEC       = 86400  # capped at 24 h
+# Capped at 6 h (was 24 h; P3a-2 item 2). The PC is on roughly 06:00-23:00 (door
+# history, 2026-09-12 study) and off overnight, so a 24 h cap could leave a refused
+# member without a single retry for two operating days. At 6 h a permanently refused
+# pin costs at most 4 retries a day -- one member write (~0.45 s on the MB2000, field
+# 928 members / 419 s) or, on PullSDK, a firmware-cache clear plus a <=10-call probe
+# per finger -- while new content still bypasses the backoff entirely.
+_SYNC_RETRY_MAX_SEC       = 21600
+# Removals do NOT use this backoff: a failed removal is retried by the ULTRA worker
+# within 300 s (ultra_engine._REMOVAL_RETRY_*), independent of the roster hash.
 
 
 def _parse_dt_any(s: str) -> datetime | None:

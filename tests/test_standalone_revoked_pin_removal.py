@@ -625,7 +625,10 @@ class TestAuthoritativeFullSyncRetry:
 
     def test_scheduler_redelivery_during_failure_callback_adopts_retry_state(
             self, monkeypatch, fstate):
-        drv = RevokeDriver()
+        # The delete of 34439 fails too (and so does its neutralise, via the failing
+        # push below): since P3a-2 removals run BEFORE the push, a successful removal
+        # would confirm the revocation and leave nothing pending to redeliver.
+        drv = RevokeDriver(fail_delete={"34439"})
         w, _c = _worker(
             monkeypatch,
             driver=drv,
@@ -775,8 +778,11 @@ class TestSafetyRails:
         assert drv.delete_calls == [], "an implausible bulk revocation must abort"
         assert "40000" in fstate.rows, "and the state must NOT be pruned after an abort"
 
-    def test_a_failed_push_does_not_trigger_revocation(self, monkeypatch, fstate):
-        """Revocation runs only after a SUCCESSFUL push, like MIRROR."""
+    def test_a_failed_push_no_longer_blocks_revocation(self, monkeypatch, fstate):
+        """P3a-2 item 2 (deliberate change, inverted). Revocation used to run only after a
+        SUCCESSFUL push, like MIRROR -- so one refused member stopped every departed
+        member's removal. The revoke pass now runs FIRST and has no dependency on the
+        push; MIRROR still waits for a successful push."""
         class _Failing(RevokeDriver):
             def push_roster(self, users, templates_by_pin=None, **kw):
                 super().push_roster(users, templates_by_pin, **kw)
@@ -790,7 +796,7 @@ class TestSafetyRails:
 
         _full_sync(w)
 
-        assert drv.delete_calls == []
+        assert drv.delete_calls == [["34439"]]
 
     def test_revoke_telemetry_counts_only_confirmed_outcomes(
             self, monkeypatch, fstate, tracked_revocation_state):
