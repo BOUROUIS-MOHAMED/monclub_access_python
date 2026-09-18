@@ -285,7 +285,8 @@ way backend `main`'s credentials token digests them (sorted, distinct). Neither 
 (`findAllValidForAccessByGymId` / `…ByGymFamilyName` for the main sync, `findAllValidNowByUserId`
 for the fast patch) has an `ORDER BY`, so an order-only difference is not written; a raw-string
 compare would rewrite every multi-grant row whenever the order moved. What is stored is the list
-as the backend sent it, never re-sorted: `verify_totp` walks it in order. A value that does not
+as the backend sent it when the row was last written — an order-only difference leaves that
+order in place — and it is never re-sorted: `verify_totp` walks it in order. A value that does not
 parse counts as changed. `[CODE: db.py::_sync_gym_access_credentials_rows,
 ::_sync_credential_grants_changed; backend main GymAccessController::computeCredentialsVersion,
 ActiveMembershipRepository]` `[TEST: test_credential_grants_diff.py::test_a_grant_only_change_is_written,
@@ -296,7 +297,9 @@ ActiveMembershipRepository]` `[TEST: test_credential_grants_diff.py::test_a_gran
 The cost, measured on the development PC with 2,000 credentials (old function against new,
 interleaved, 101 runs, paired median; 32-bit `.venv` Python 3.11 and Python 3.13): **+1 to +3 ms**
 per sync for fetch + diff when nothing or 5 % of the grants changed; the worst case, every row's
-grants reordered with 20 grants each (4,000 parses), +41 to +46 ms. P6's ~21 s (`[COMMENT]`
+grants reordered with 20 grants each (4,000 parses), +41 to +46 ms. `[TEST: re-run with
+tools/bench_credential_diff.py — a measurement, not a pass/fail test; the 1–3 grants per
+credential mix it assumes is not measured on a gym]` P6's ~21 s (`[COMMENT]`
 in the function) came from the old OR-of-AND predicate's plan, not from reading the column: the
 scan is a plain `SCAN sync_gym_access_credentials` with or without the grants column (no index
 covers it), and SQLite stores a row's columns together unless the row outgrows its page
@@ -442,7 +445,10 @@ online and syncs. It closes the online gap only. `[CODE]`
   which omits the photo (`blockAccessForUnphotographedMembers`) and unpaid-due
   (`allowEntryPastDueDate`) rules the main sync applies — so a fast-patch credential can grant a
   membership the member list deliberately leaves out. Enforce refuses that member, which matches
-  the main sync's intent, but trial counts will include them.
+  the main sync's intent, but trial counts will include them. Since 2026-09-18 such grants are
+  written even when they are a credential's only change (the next main sync writes its own back);
+  that allows nothing the member list does not: a grant allows only when it is listed, and the
+  account second chance does not read grants. `[CODE: access_verification.py::verify_totp]`
 - Removed members still count as `not_in_roster` only until their credential is removed by a
   sync; the counts measure the gap, not a steady state.
 `[UNVERIFIED]` How often any of these happens on a real gym — that is the trial's job.
@@ -2375,7 +2381,10 @@ tests below. `[TEST]`
 `tests/test_door_open_deadline.py::test_a_door_open_the_caller_gave_up_on_is_never_executed_later`
 is timing-flaky on the base too — runs of that file alone failed 13/52 on `d09f88f` (6/20, 5/12, and
 2/20 interleaved with this branch) and 16/60 on this branch (3/20, 8/20, 5/20 interleaved): the same
-rate; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]`
+rate; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]` The race behind it:
+`Event.wait(timeout)` can return while `time.monotonic()` has not passed the entry's deadline, so a
+drain right after the caller's `timeout` still sends the open (§3.1a); in isolation that scenario
+opened the door in 23 of 300 repetitions (2026-09-18, development PC, commit 75f2c7d). `[TEST]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
 failed once in a full base run and passed 20/20 alone on both. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`

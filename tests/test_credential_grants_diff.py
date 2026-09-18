@@ -10,7 +10,8 @@ old ``activeMembershipId``.
 
 Grants are compared as a set, like the backend token: neither of its grant queries has an
 ORDER BY, so an order-only difference must not rewrite every row on every sync. The stored
-list keeps the order the backend sent (``verify_totp`` walks it in order).
+list is the one the backend sent when the row was last written, never re-sorted
+(``verify_totp`` walks it in order).
 """
 
 from __future__ import annotations
