@@ -115,6 +115,13 @@ from app.core.utils import LOG_DIR
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
+# Headless event loop pacing (MainApp.mainloop). The loop sleeps until the next scheduled
+# callback is due, never longer than _SCHED_MAX_SLEEP_SEC (a safety bound: after() and a stop
+# wake it early), and never shorter than _SCHED_MIN_SLEEP_SEC, so a callback that re-schedules
+# itself with after(0, ...) cannot turn the loop into a busy spin.
+_SCHED_MAX_SLEEP_SEC = 0.05
+_SCHED_MIN_SLEEP_SEC = 0.001
+
 
 def _read_runtime_version_string() -> str:
     """Best-effort: read MonClub Access version from update.json / version.json.
@@ -565,9 +572,7 @@ class MainApp:
         self._update_status: Optional[UpdateStatus] = None
 
         self._stop_event = threading.Event()
-        self._scheduled: List[Tuple[float, int, Any]] = []  # (target_time, id, callback)
-        self._sched_lock = threading.Lock()
-        self._sched_id_counter = 0
+        self._init_scheduler()
 
         self._sync_after_id: int | None = None
         self._local_api: Optional[LocalAccessApiServerV2] = None
@@ -649,6 +654,16 @@ class MainApp:
         schedule_access_shell_startup(self)
 
     # ======================= Headless event loop =======================
+    def _init_scheduler(self) -> None:
+        self._scheduled: List[Tuple[float, int, Any]] = []  # (target_time, id, callback)
+        # A Condition (not a bare Lock) so after() and a stop can wake the sleeping loop.
+        self._sched_lock = threading.Condition(threading.Lock())
+        self._sched_id_counter = 0
+
+    def _wake_scheduler(self) -> None:
+        with self._sched_lock:
+            self._sched_lock.notify_all()
+
     def after(self, delay_ms: int, callback) -> int:
         """Schedule callback after delay_ms milliseconds. Returns an ID."""
         with self._sched_lock:
@@ -656,6 +671,7 @@ class MainApp:
             sid = self._sched_id_counter
             target = time.monotonic() + delay_ms / 1000.0
             self._scheduled.append((target, sid, callback))
+            self._sched_lock.notify_all()
         return sid
 
     def after_cancel(self, sid: int) -> None:
@@ -687,7 +703,16 @@ class MainApp:
                         if hasattr(self, "logger"):
                             self.logger.exception("Scheduled callback error")
 
-            self._stop_event.wait(timeout=0.05)
+                # Rest until the next callback is due. after() and a stop notify the
+                # condition, so this never delays new work or shutdown by the full bound.
+                with self._sched_lock:
+                    if self._stop_event.is_set():
+                        break
+                    timeout = _SCHED_MAX_SLEEP_SEC
+                    if self._scheduled:
+                        next_due = min(t for t, _sid, _cb in self._scheduled)
+                        timeout = min(timeout, next_due - time.monotonic())
+                    self._sched_lock.wait(timeout=max(_SCHED_MIN_SLEEP_SEC, timeout))
         except KeyboardInterrupt:
             if hasattr(self, "logger"):
                 self.logger.info("KeyboardInterrupt received, shutting down.")
@@ -695,6 +720,7 @@ class MainApp:
 
     def destroy(self) -> None:
         self._stop_event.set()
+        self._wake_scheduler()
         if self._change_detector is not None:
             try:
                 self._change_detector.stop()
@@ -722,6 +748,7 @@ class MainApp:
 
     def quit(self) -> None:
         self._stop_event.set()
+        self._wake_scheduler()
 
     # ======================= Update Manager =======================
     def _ensure_update_manager_started(self, *, check_now: bool) -> None:
