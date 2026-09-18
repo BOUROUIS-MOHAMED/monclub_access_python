@@ -144,6 +144,11 @@ def _install_state(monkeypatch, st: FakeState) -> FakeState:
     monkeypatch.setattr(dbmod, "prune_device_sync_state", st.prune)
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)
     monkeypatch.setattr(dbmod, "clear_device_revocation_state", st.delete, raising=False)
+    # P3a-2 write-ahead intents: faked like the rest of the per-pin state, so these
+    # tests never write an intent row into whatever database is active.
+    monkeypatch.setattr(dbmod, "record_push_intents",
+                        lambda *, device_id, rows, protocol: len(list(rows)), raising=False)
+    monkeypatch.setattr(dbmod, "list_push_intents", lambda **kw: {}, raising=False)
     return st
 
 

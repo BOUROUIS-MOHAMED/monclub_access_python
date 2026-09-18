@@ -842,6 +842,12 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   `True`, so the driver could write a member but never a DISABLED one, which left
   revocation with only the unproven whole-user delete. Absent key ⇒ `True`, so every
   existing caller is unchanged. `[CODE]`
+- **Write-ahead (P3a-2, `guide_for_agents_and_dev.md` §3.4a):** before `push_roster` the engine
+  commits a durable intent per pin (name[:24] and card digits exactly as sent); each chunk's result
+  is recorded as soon as it returns (`push_roster(on_chunk=…)`), so a crash loses at most the chunk
+  in flight. An intent-only pin that left the roster is proven by one `list_device_users` in the
+  daily maintenance slot and then removed like any owned pin; a different user at that pin is never
+  touched.
 - **Safety direction:** a state *read* failure ⇒ push everything; a state *write*
   failure ⇒ logged and ignored. MIRROR always receives the **full desired roster**,
   never the incremental subset (passing the subset would delete every unchanged

@@ -337,6 +337,19 @@ for retry.
 `REVOKE_SKIP_INCOMPLETE_ROSTER withheld=N` means the pass did not run at all: N deliverable members on an
 ACCOUNT-pin device have no `mainAccountId`, so departed pins cannot be told apart from theirs.
 
+**Did a crash leave a member MonClub could not prove it owned?** (P3a-2, both SDKs)
+
+```bash
+grep -E "\[T\] PUSH_INTENT_(FAILED|READBACK)" app-*.log
+```
+
+Before every push MonClub records what it is about to write (the "intent"). `PUSH_INTENT_FAILED` means
+that record could not be written, so NOTHING was pushed that pass. `PUSH_INTENT_READBACK` is the check,
+once a day on an MB2000 (after the morning sync) or inside a C3 sync, of pushes that were never confirmed
+for members who have since left: `promoted=` were found on the terminal exactly as MonClub wrote them and
+will be removed; `dropped=` never reached it; `mismatched=` hold a different user and are left alone.
+`ok=False` means the terminal listing failed and nothing changed.
+
 **Was a removal refused as too large?** (P3a-2, both SDKs)
 
 ```bash

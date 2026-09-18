@@ -43,6 +43,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
+| The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
 | The test / verification commands | §9 Verifying this guide |
@@ -1225,6 +1226,69 @@ installed MB2000/standalone firmware and wiring. They remain
 `[UNVERIFIED — HARDWARE-GATED]`; there is deliberately **no `[FIELD]` claim** until that
 site validation is recorded.
 
+### 3.4a Write-ahead ownership — the push intent (P3a-2, 2026-09-18)
+
+**The defect.** `ownership_confirmed` is set only after a push is confirmed, and it used to be
+written once per roster, after `push_roster` returned (MB2000), or in Phase D after phases A–C
+(PullSDK). A crash or power cut in between — most gyms cut the power overnight and the PC boots
+while members arrive — left members on the terminal with no row; once one of them left the roster
+nothing could ever remove it (the revoke pass removes only owned pins; §3.4). The same happened
+with no crash at all when a user row landed and its finger was refused (the pin is "failed", so not
+owned). `[TEST: test_push_write_ahead.py — red on bea2978, green after]`
+
+**The intent.** Table `device_push_intent(device_id, pin, intent_name, intent_card, intent_hash,
+protocol, created_at, updated_at, readback_misses)`, one row per pin MonClub is ABOUT to write,
+with the name and card exactly as the wire carries them (MB2000: name cut at 24, card digits —
+`ultra_engine._standalone_wire_identity`; PullSDK: the `Name`/`CardNo` values). Kept OUT of
+`device_sync_state` on purpose: `last_ok` defaults to 1 there and the every-start migration promotes
+`last_ok=1` rows to owned, and the prune deletes rows — either would turn an unconfirmed write into
+ownership or erase it. `[CODE: db.py::init_db, ::record_push_intents …]`
+
+**Order and durability.** The intents of a push are committed in ONE durable job BEFORE its first
+device write: `_run_standalone_full_sync`, `_run_standalone_member_sync` and the ACCOUNT re-push on
+the MB2000 (`_record_push_intents`); before Phase A and before a single-pin push on PullSDK. If the
+intent cannot be recorded, nothing is written that pass (`[T] PUSH_INTENT_FAILED` on MB2000; the
+PullSDK pass fails before any write). The job runs with `PRAGMA synchronous=FULL`
+(`_run_db_write_sync(durable=True)`): every connection here is WAL + `synchronous=NORMAL`, under
+which a commit is not fsynced and can roll back after a power loss; FULL syncs the WAL on commit.
+SQLite refuses to change the level inside a transaction (measured on the bundled 3.38.4: "Safety
+level may not be changed inside a transaction"), so the writer sets it before `BEGIN IMMEDIATE`
+and restores NORMAL after; only intents use it (one extra fsync per push call). Whether the gym PC's
+disk honours the flush is `[UNVERIFIED]` — FIELD-TEST: commit an intent and cut power within 1–5 s.
+
+**Resolution.** A confirmed state write (`ok=1`, which sets `ownership_confirmed`) deletes the pin's
+intent in the same transaction; so does a removal (`clear_device_revocation_state`,
+`delete_device_sync_state`). Nothing else prunes the table. On the MB2000 each chunk's result is
+recorded as soon as the chunk returns (`push_roster(on_chunk=…)` → `_push_with_chunk_recording`),
+so a crash loses at most the chunk in flight — which its intent covers. `[TEST:
+::test_every_member_on_the_terminal_is_owned_or_intended]` (power cut after chunk 2 of 5: chunk 1
+owned, chunk 2 intent-only, a foreign user untouched).
+
+**Read-back promotion — never a foreign user.** An intent pin that LEFT the desired roster is
+settled by reading the terminal:
+
+| Found at the pin | Result |
+|---|---|
+| exactly the name + card MonClub wrote (PullSDK: the card; an empty intent card proves nothing) | promoted: `ownership_confirmed=1, last_ok=0`, intent deleted — the next removal step removes it (through the ceiling, §3.2g) |
+| nothing (a successful listing) | intent dropped: the write never landed |
+| anything else | intent kept, `readback_misses+1`, never deleted |
+| listing failed | nothing changes |
+
+MB2000 (`_promote_intents_by_readback`): one `list_device_users` (a whole-terminal enumeration in ONE
+STA command — no RTLog pump, no door service for its duration; ~1,860 users on gym 45, duration
+`[UNVERIFIED]` — FIELD-TEST, 60 s timeout). So it runs only in the **daily maintenance slot**
+(`_drain_daily_maintenance`): once per local day, after that day's first full sync has pushed and run
+its removal step ("after the morning removals" — the PC is usually off at night, so there is no fixed
+hour), only while no door command, member update or full sync is waiting, never during a push, and
+only when intents of departed members exist. A promotion requests a full sync so the removal follows
+at once. PullSDK (`_settle_pullsdk_intents`): inside every full sync, one extra `Pin\tCardNo` read of
+the user table, only when such an intent is on the panel; a targeted revoke of an intent-only pin
+reads that one pin (`_prove_pullsdk_intent`) and deletes it only if the card matches.
+`[TEST: ::TestReadBackPromotion, ::TestPullSdkWriteAhead]` `[UNVERIFIED]` how the C3-400 returns
+`CardNo` (padding, leading zeros are ignored in the comparison) and the MB2000's
+`SSR_GetAllUserInfo` tuple order (§7): a wrong order makes every comparison mismatch, which fails
+safe (nothing promoted) but leaves such pins unprovable.
+
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
@@ -1940,6 +2004,8 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
+| `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
+| `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms` (§3.4a; `ok=False` = the listing failed, nothing changed) |
 | `MEMBER_REVOKE_SKIPPED_NOT_OWNED` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id member_id pin protocol` (+ `row` on the full sync, `pin_scheme source` on PullSDK) (warn; P3a-2 — FINAL: MonClub cannot prove it wrote that pin, nothing deleted, revocation finished, §3.4). Replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`, which is no longer emitted |
 | `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
 | `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |

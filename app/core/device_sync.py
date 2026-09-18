@@ -19,6 +19,12 @@ from app.core.db import (
     list_device_sync_retry_state,
     get_device_sync_hash_for_pin,
     get_device_sync_ownership_for_pin,
+    record_push_intents,
+    list_push_intents,
+    get_push_intent,
+    promote_push_intents,
+    drop_push_intents,
+    note_push_intent_misses,
     save_device_sync_state,
     save_device_sync_state_batch,
     delete_device_sync_state,
@@ -1151,6 +1157,12 @@ class DeviceSyncEngine:
         auth_err: str | None = None
 
         try:
+            # WRITE-AHEAD (P3a-2): durable before the first device write below; if it
+            # cannot be recorded this raises into the failure path and nothing is written.
+            record_push_intents(
+                device_id=device_id, protocol="ZK_PULLSDK",
+                rows=[(pin, full_name, _normalize_device_card(card), desired_hash)],
+            )
             self._delete_pin_unconditional(
                 sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
             )
@@ -1412,6 +1424,10 @@ class DeviceSyncEngine:
                 )
                 return False
             if not owned:
+                # A push MonClub never got to confirm (crash, refused authorize) leaves a
+                # write-ahead intent; the card on the panel proves it (P3a-2 item 3).
+                owned = self._prove_pullsdk_intent(sdk=sdk, did=did, pin=pin)
+            if not owned:
                 self._last_member_sync_outcome = MEMBER_SYNC_SKIPPED_NOT_OWNED
                 self.logger.critical(
                     "[DeviceSync] targeted member delete SKIPPED_NOT_OWNED: device_id=%s "
@@ -1509,6 +1525,126 @@ class DeviceSyncEngine:
             template_version_override=self._resolve_template_version_override(normalized_device),
             pin_source=(filter_stats.get("pin_sources") or {}).get(pin),
         )
+
+    # ---------------------------------------------------------------- #
+    # P3a-2 write-ahead intents on the PullSDK path (guide §3.4a)
+    # ---------------------------------------------------------------- #
+    @staticmethod
+    def _same_card(want: str, got: str) -> bool:
+        """Card equality as the panel stores it: digits, leading zeros ignored.
+
+        An empty intent card proves nothing (a C3-400 card turnstile cannot admit a
+        card-less member anyway), so it never matches. [UNVERIFIED] how the C3-400
+        returns CardNo (padding, leading zeros) -- FIELD-TEST."""
+        w = "".join(ch for ch in str(want or "") if ch.isdigit()).lstrip("0")
+        g = "".join(ch for ch in str(got or "") if ch.isdigit()).lstrip("0")
+        return bool(w) and w == g
+
+    def _read_panel_cards(self, sdk: PullSDK, *, pin: str | None = None) -> Dict[str, str] | None:
+        """{pin: CardNo} from the panel's user table (one pin, or all). None = read failed."""
+        try:
+            rows = sdk.get_device_data_rows(
+                table="user", fields="Pin\tCardNo",
+                filter_expr=(f"Pin={pin}" if pin else ""), options="",
+                initial_size=self._sdk_read_initial_bytes(),
+            )
+        except Exception as ex:
+            self.logger.warning("[DeviceSync] intent read-back: user table read failed: %s", ex)
+            return None
+        out: Dict[str, str] = {}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            p = _pin_str(r.get("Pin") or r.get("pin") or "")
+            if p:
+                out[p] = _pin_str(r.get("CardNo") or r.get("cardno") or "")
+        return out
+
+    def _settle_pullsdk_intents(
+        self, *, sdk: PullSDK, did: int, desired_pins: Set[str], device_pins: Set[str],
+    ) -> Set[str]:
+        """Settle the intents of pins that LEFT the roster; return the pins proven ours.
+
+        Absent from the panel (the full Pin read just done): the write never landed,
+        the intent is dropped. Present with the card MonClub wrote: promoted to
+        ownership. Present with another card: another user holds that pin -- intent
+        kept, miss counted, never deleted. One extra read (Pin + CardNo), only when
+        such an intent is present on the panel.
+        """
+        try:
+            intents = list_push_intents(device_id=did) or {}
+        except Exception:
+            self.logger.warning("[DeviceSync] Device id=%s intents unreadable", did, exc_info=True)
+            return set()
+        cands = {
+            p: it for p, it in intents.items()
+            if p not in desired_pins and str(it.get("protocol") or "") in ("", "ZK_PULLSDK")
+        }
+        if not cands:
+            return set()
+        absent = sorted(p for p in cands if p not in device_pins)
+        present = {p: it for p, it in cands.items() if p in device_pins}
+        promoted: List[str] = []
+        mismatched: List[str] = []
+        if present:
+            cards = self._read_panel_cards(sdk)
+            if cards is not None:
+                for p, it in sorted(present.items()):
+                    if p not in cards:
+                        continue
+                    if self._same_card(it.get("card") or "", cards.get(p) or ""):
+                        promoted.append(p)
+                    elif str(it.get("card") or "").strip():
+                        mismatched.append(p)
+        try:
+            if absent:
+                drop_push_intents(device_id=did, pins=absent)
+            if promoted:
+                promote_push_intents(device_id=did, pins=promoted)
+            if mismatched:
+                note_push_intent_misses(device_id=did, pins=mismatched)
+        except Exception:
+            self.logger.warning("[DeviceSync] Device id=%s intent settlement not recorded", did,
+                                exc_info=True)
+            return set()
+        try:
+            _tel.event("PUSH_INTENT_READBACK", device_id=did, protocol="ZK_PULLSDK", ok=True,
+                       candidates=len(cands), promoted=len(promoted), dropped=len(absent),
+                       mismatched=len(mismatched))
+        except Exception:
+            pass
+        return set(promoted)
+
+    def _prove_pullsdk_intent(self, *, sdk: PullSDK, did: int, pin: str) -> bool:
+        """A targeted revoke found no ownership: is this pin a push MonClub never got to
+        confirm (an intent) whose card is on the panel? One filtered read."""
+        try:
+            intent = get_push_intent(device_id=did, pin=pin)
+        except Exception:
+            return False
+        if not intent or str(intent.get("protocol") or "") not in ("", "ZK_PULLSDK"):
+            return False
+        if not str(intent.get("card") or "").strip():
+            return False
+        cards = self._read_panel_cards(sdk, pin=pin)
+        if cards is None:
+            return False
+        try:
+            if pin not in cards:
+                drop_push_intents(device_id=did, pins=[pin])
+                return False
+            if self._same_card(intent.get("card") or "", cards.get(pin) or ""):
+                promote_push_intents(device_id=did, pins=[pin])
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s Pin=%s proven MonClub's by read-back (write-ahead "
+                    "intent, card on the panel) -- removal proceeds", did, pin,
+                )
+                return True
+            note_push_intent_misses(device_id=did, pins=[pin])
+        except Exception:
+            self.logger.warning("[DeviceSync] Device id=%s Pin=%s intent proof not recorded",
+                                did, pin, exc_info=True)
+        return False
 
     def _global_defaults(self) -> Dict[str, Any]:
         """
@@ -3020,8 +3156,14 @@ class DeviceSyncEngine:
                                 fingerprint_enabled=fingerprint_enabled,
                             )
 
+            # P3a-2 write-ahead: an intent pin that LEFT the roster is settled here -- absent
+            # from the panel: dropped; present with the card MonClub wrote: proven MonClub's,
+            # so it joins the tracked set and leaves through the stale step (ceiling applies).
+            promoted_intents = self._settle_pullsdk_intents(
+                sdk=sdk, did=did, desired_pins=desired_pins, device_pins=device_pins,
+            )
             # stale pins: only delete pins that are known-from-server but no longer desired for this device
-            tracked_server_pins = set(known_server_pins) | set(prev_state.keys())
+            tracked_server_pins = set(known_server_pins) | set(prev_state.keys()) | promoted_intents
             stale_pins = sorted([p for p in device_pins if p in tracked_server_pins and p not in desired_pins])
             if roster_incomplete:
                 if stale_pins:
@@ -3211,6 +3353,25 @@ class DeviceSyncEngine:
             # In normal mode we pre-delete pins individually before batch push.
             use_batch = nuke_mode or len(pins_to_sync) > 5
             pins_sorted = sorted(pins_to_sync)
+
+            # WRITE-AHEAD (P3a-2 item 3, guide §3.4a): durable BEFORE the first write of
+            # this pass. Phase D records state (and clears these) only after phases A-C,
+            # so a crash between Phase A and D used to leave users on the panel with no
+            # row at all. Raises -- failing the pass before any write -- when it cannot
+            # be recorded: no record, no write.
+            if pins_sorted:
+                record_push_intents(
+                    device_id=did, protocol="ZK_PULLSDK",
+                    rows=[
+                        (
+                            _p,
+                            _safe_one_line((desired.get(_p) or {}).get("fullName") or "") or f"U{_p}",
+                            _normalize_device_card(_pin_str((desired.get(_p) or {}).get("firstCardId") or "")),
+                            desired_hashes.get(_p, ""),
+                        )
+                        for _p in pins_sorted
+                    ],
+                )
 
             # Expose live progress for the frontend banner.
             # Phase C pushes templates in a SECOND pass over the same pins, so the

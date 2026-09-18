@@ -660,6 +660,7 @@ class ZKStandaloneDevice:
         remove_fingers_by_pin: Dict[str, List[int]] | None = None,
         bracket_enable_device: bool = False,
         timeout_sec: float = 600.0,
+        on_chunk: "Callable[[List[Dict[str, Any]], Dict[str, Any] | None], None] | None" = None,
     ) -> Dict[str, Any]:
         """Push users (+ fingerprint templates) to the terminal (D6).
 
@@ -669,6 +670,12 @@ class ZKStandaloneDevice:
         (the protocol-neutral output of DeviceSyncEngine._collect_templates_for_pin).
         bracket_enable_device: ONLY the 22:00/manual full reconcile may set this —
         EnableDevice(False) locks the terminal UI and it is the gym's sole verifier.
+        on_chunk: called on the CALLER's thread after every chunk that was sent, with
+        that chunk's members and its result dict (None when the chunk wedged: nothing
+        in it was confirmed). P3a-2: lets the engine record ownership per chunk, so a
+        crash between chunks never leaves an unrecorded member on the terminal.
+        Exceptions from it are logged and swallowed; a chunk never sent (after a
+        `break`) is not reported here -- it is in the aggregate's failed_pins.
         """
         users = list(users or [])
         templates_by_pin = templates_by_pin or {}
@@ -687,6 +694,17 @@ class ZKStandaloneDevice:
             if not part:
                 return "?"
             return f"{part[0].get('pin')}..{part[-1].get('pin')}"
+
+        def report_chunk(part: List[Dict[str, Any]], res: Dict[str, Any] | None) -> None:
+            if on_chunk is None:
+                return
+            try:
+                on_chunk(part, res)
+            except Exception as exc:
+                self.logger.warning(
+                    "%s push_roster on_chunk callback failed (ignored): %s",
+                    self._prefix, str(exc),
+                )
 
         def mark_not_attempted(remaining: List[List[Dict[str, Any]]]) -> None:
             # The loop is about to stop with these chunks never sent. Before P3a-2
@@ -776,6 +794,7 @@ class ZKStandaloneDevice:
                     _p = str(_u.get("pin") or "").strip()
                     if _p and _p not in agg["failed_pins"]:
                         agg["failed_pins"].append(_p)
+                report_chunk(part, None)
                 if len(agg["errors"]) < 5:
                     agg["errors"].append(f"chunk {idx}/{len(chunks)} (pins {chunk_pins(part)}): {exc}")
                 self.logger.warning(
@@ -860,6 +879,7 @@ class ZKStandaloneDevice:
                 _p = str(_p or "").strip()
                 if _p and _p not in agg["failed_pins"]:
                     agg["failed_pins"].append(_p)
+            report_chunk(part, res)
             # One telemetry line per chunk (~93 for a full 928-member roster), which
             # is where per-pin detail is aggregated to. Per-pin lines are deliberately
             # NOT emitted inside the member loop: see the note in _do_push_roster.

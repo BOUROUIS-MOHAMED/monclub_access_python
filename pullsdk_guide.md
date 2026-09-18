@@ -530,6 +530,15 @@ unmatchable.
 
 `[TEST: tests/test_template_wire_encoding.py]`
 
+#### The user-table read-back (P3a-2)
+
+Besides the per-sync `Pin` read, the write-ahead intent (`guide_for_agents_and_dev.md` §3.4a) reads
+`fields="Pin\tCardNo"` — the whole table once, only when an intent of a departed member is on the
+panel, or `filter_expr="Pin=N"` for one pin on a targeted revoke — to prove a push MonClub never got
+to confirm. `[UNVERIFIED]` on a C3-400: that `CardNo` is returned for this read and in what form
+(the comparison ignores leading zeros), and that the `Pin=N` filter is honoured. FIELD-TEST before
+relying on it; a failed read changes nothing.
+
 ### Batched writes
 
 ```python

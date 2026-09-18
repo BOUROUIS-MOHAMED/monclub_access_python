@@ -248,6 +248,38 @@ def _encode_fingers(finger_ids: Any) -> str:
     return ",".join(str(int(f)) for f in sorted(set(finger_ids or ())))
 
 
+def _standalone_wire_identity(entry: Dict[str, Any]) -> tuple[str, str]:
+    """(name, card) exactly as ZKStandaloneDevice._do_push_roster writes them:
+    the name cut at 24 characters, the card reduced to its digits. The write-ahead
+    intent records these, and a read-back compares like with like."""
+    return (
+        str(entry.get("name") or "")[:24],
+        "".join(ch for ch in str(entry.get("card") or "") if ch.isdigit()),
+    )
+
+
+def _local_day() -> str:
+    """The PC's local calendar day (the daily maintenance slot's key)."""
+    return time.strftime("%Y-%m-%d")
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True when ``fn`` takes keyword ``name`` (explicitly or through **kwargs).
+
+    New driver hooks (on_chunk, between_chunks, sweep...) are passed only to a driver
+    that can take them, so an older driver or a test double keeps working unchanged.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _standalone_pin_hash(entry: Dict[str, Any], templates: Any) -> str:
     """Change-detection hash of EXACTLY what push_roster hands the terminal for one pin.
 
@@ -708,6 +740,7 @@ class UltraDeviceWorker(threading.Thread):
                 self._drain_commands()
                 self._drain_member_sync_commands(limit=1)
                 self._drain_full_sync_commands(limit=1)
+                self._drain_daily_maintenance()
                 self._drain_commands()
                 # Operator SDK calls (control panel): read/write a param, sync clock.
                 self._drain_sdk_commands()
@@ -2138,6 +2171,169 @@ class UltraDeviceWorker(threading.Thread):
                 return set(attempted)
         return failed
 
+    # ---------------------------------------------------------------- #
+    # Write-ahead ownership (P3a-2 item 3, guide §3.4a)
+    # ---------------------------------------------------------------- #
+    def _record_push_intents(self, users: list[Dict[str, Any]],
+                             hashes_by_pin: Dict[str, str] | None) -> bool:
+        """Durably record, BEFORE any device write, what this push will write.
+
+        False = not recorded; the caller must not write the terminal this pass (a
+        member written without a record is exactly the unprovable orphan this exists
+        to prevent).
+        """
+        rows: list[tuple] = []
+        for u in users or []:
+            pin = str(u.get("pin") or "").strip()
+            if not pin:
+                continue
+            name, card = _standalone_wire_identity(u)
+            rows.append((pin, name, card, (hashes_by_pin or {}).get(pin, "")))
+        if not rows:
+            return True
+        try:
+            from app.core.db import record_push_intents
+            record_push_intents(device_id=self._device_id, rows=rows, protocol="ZK_STANDALONE")
+            return True
+        except Exception as exc:
+            logger.error(
+                "%s write-ahead push intent NOT recorded for %d pin(s) (%s) -- nothing is "
+                "written to the terminal this pass", self._prefix, len(rows), exc,
+            )
+            _tel.warn("PUSH_INTENT_FAILED", worker=self._tel_wid, pins=len(rows),
+                      err=type(exc).__name__)
+            return False
+
+    def _push_with_chunk_recording(
+        self,
+        users: list[Dict[str, Any]],
+        templates_by_pin: Dict[str, list],
+        hashes_by_pin: Dict[str, str],
+        *,
+        removals: Dict[str, list[int]],
+        bracket: bool,
+    ) -> Dict[str, Any]:
+        """push_roster, recording each chunk's outcome as soon as the chunk returns.
+
+        Recording once per roster (after push_roster returned) meant a crash or power
+        cut mid-push lost every confirmation of the chunks already on the terminal.
+        A driver without the ``on_chunk`` hook (or pins never sent after an early
+        stop) is recorded from the aggregate result afterwards, as before.
+        """
+        wanted = {str(u.get("pin") or "").strip() for u in users}
+        recorded: set[str] = set()
+
+        def _on_chunk(part: list[Dict[str, Any]], res: Dict[str, Any] | None) -> None:
+            part_users = [u for u in (part or []) if str(u.get("pin") or "").strip() in wanted]
+            if not part_users:
+                return
+            self._record_standalone_pin_state(
+                users=part_users, hashes_by_pin=hashes_by_pin,
+                # A wedged chunk confirmed nothing.
+                result=res if isinstance(res, dict) else {"ok": False, "error": "chunk wedged"},
+                templates_by_pin=templates_by_pin,
+            )
+            recorded.update(str(u.get("pin") or "").strip() for u in part_users)
+
+        kwargs: Dict[str, Any] = {"remove_fingers_by_pin": removals,
+                                  "bracket_enable_device": bracket}
+        if _accepts_kwarg(self._sdk.push_roster, "on_chunk"):
+            kwargs["on_chunk"] = _on_chunk
+        result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
+        remaining = [u for u in users if str(u.get("pin") or "").strip() not in recorded]
+        if remaining:
+            self._record_standalone_pin_state(
+                users=remaining, hashes_by_pin=hashes_by_pin, result=result,
+                templates_by_pin=templates_by_pin,
+            )
+        return result
+
+    def _promote_intents_by_readback(self, *, desired_pins: set[str]) -> Dict[str, list] | None:
+        """Turn intent-only pins into ownership when the terminal holds what we wrote.
+
+        Candidates are intent pins that LEFT the desired roster (a still-desired one is
+        confirmed by its next ordinary push, no enumeration needed). One enumeration of
+        the terminal (``list_device_users``; on gym 45 about 1,860 users, duration
+        UNVERIFIED -- FIELD-TEST) then decides per pin:
+
+        - present with exactly the name (24 chars) and card digits MonClub wrote
+          -> promoted to ownership (the next revoke pass removes it);
+        - absent from a SUCCESSFUL listing -> the write never landed, intent dropped;
+        - present with anything else -> not ours (another system's user, or our write
+          never landed): intent kept, miss counted, never deleted.
+
+        A failed or malformed listing changes nothing. Returns None when nothing was
+        read, else {"promoted", "dropped", "mismatched"} pin lists.
+        """
+        try:
+            from app.core.db import list_push_intents
+            intents = list_push_intents(device_id=self._device_id) or {}
+        except Exception:
+            logger.warning("%s intent read-back: intents unreadable", self._prefix, exc_info=True)
+            return None
+        desired = {str(p).strip() for p in (desired_pins or ())}
+        cands = {
+            p: it for p, it in intents.items()
+            if p not in desired and str(it.get("protocol") or "") in ("", "ZK_STANDALONE")
+        }
+        if not cands:
+            return None
+        lister = getattr(self._sdk, "list_device_users", None)
+        if not callable(lister):
+            return None
+        t0 = time.monotonic()
+        listing = lister()
+        dur_ms = round((time.monotonic() - t0) * 1000)
+        if not isinstance(listing, dict) or listing.get("ok") is not True \
+                or not isinstance(listing.get("users"), list):
+            logger.warning("%s intent read-back: terminal listing failed -- nothing changed (%s)",
+                           self._prefix, (listing or {}).get("error") if isinstance(listing, dict) else listing)
+            _tel.warn("PUSH_INTENT_READBACK", worker=self._tel_wid, ok=False,
+                      candidates=len(cands), dur_ms=dur_ms)
+            return None
+        on_device: Dict[str, tuple[str, str]] = {}
+        for u in listing["users"]:
+            if not isinstance(u, dict):
+                continue
+            pin = str(u.get("pin") or "").strip()
+            if pin:
+                on_device[pin] = _standalone_wire_identity(u)
+        promoted: list[str] = []
+        dropped: list[str] = []
+        mismatched: list[str] = []
+        for pin, it in sorted(cands.items()):
+            if pin not in on_device:
+                dropped.append(pin)
+                continue
+            want_name = str(it.get("name") or "")[:24].strip()
+            want_card = "".join(ch for ch in str(it.get("card") or "") if ch.isdigit())
+            got_name, got_card = on_device[pin]
+            if (want_name or want_card) and got_name.strip() == want_name and got_card == want_card:
+                promoted.append(pin)
+            else:
+                mismatched.append(pin)
+        try:
+            from app.core.db import drop_push_intents, note_push_intent_misses, promote_push_intents
+            if promoted:
+                promote_push_intents(device_id=self._device_id, pins=promoted)
+            if dropped:
+                drop_push_intents(device_id=self._device_id, pins=dropped)
+            if mismatched:
+                note_push_intent_misses(device_id=self._device_id, pins=mismatched)
+        except Exception:
+            logger.warning("%s intent read-back: result not recorded", self._prefix, exc_info=True)
+            return None
+        _tel.event("PUSH_INTENT_READBACK", worker=self._tel_wid, ok=True,
+                   candidates=len(cands), listed=len(on_device), promoted=len(promoted),
+                   dropped=len(dropped), mismatched=len(mismatched), dur_ms=dur_ms)
+        if promoted:
+            logger.warning(
+                "%s intent read-back: %d pin(s) proven MonClub's (%s) -- the next revoke pass "
+                "removes the departed ones", self._prefix, len(promoted), ",".join(promoted[:20]),
+            )
+            self.request_full_sync(reason="intent-promoted")
+        return {"promoted": promoted, "dropped": dropped, "mismatched": mismatched}
+
     def _run_standalone_full_sync(
         self,
         *,
@@ -2361,21 +2557,30 @@ class UltraDeviceWorker(threading.Thread):
                     logger.info("%s clearing %d vacated finger slot(s) across %d pin(s)",
                                 self._prefix, sum(len(v) for v in removals.values()),
                                 len(removals))
-                result = self._sdk.push_roster(to_push, templates_to_push,
-                                               remove_fingers_by_pin=removals,
-                                               bracket_enable_device=bracket)
-                sync_ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
-                    users=to_push, result=result,
-                )
-                sync_error = "" if sync_ok else str(
-                    (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
-                )
-                # Record per-pin outcome BEFORE mirror/prune so a failed pin is
-                # remembered as failed even if a later step raises.
-                self._record_standalone_pin_state(
-                    users=to_push, hashes_by_pin=hashes_by_pin, result=result,
-                    templates_by_pin=templates_to_push,
-                )
+                # WRITE-AHEAD (P3a-2 item 3): the intent is durable BEFORE the first
+                # device write; a pass that cannot record it writes nothing.
+                if not self._record_push_intents(to_push, hashes_by_pin):
+                    result = {"ok": False, "pushed": 0, "failed": len(to_push),
+                              "templates_failed": 0, "skipped_pin": 0, "chunks_wedged": 0,
+                              "errors": ["push intent not recorded"],
+                              "failed_pins": [str(u.get("pin") or "").strip() for u in to_push]}
+                    sync_ok = False
+                    sync_error = "push intent not recorded"
+                else:
+                    # Per-pin outcome is recorded per CHUNK (inside), BEFORE mirror/
+                    # prune, so a failed pin is remembered as failed even if a later
+                    # step raises -- and a crash between chunks loses at most the
+                    # chunk in flight, which its intent still covers.
+                    result = self._push_with_chunk_recording(
+                        to_push, templates_to_push, hashes_by_pin,
+                        removals=removals, bracket=bracket,
+                    )
+                    sync_ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
+                        users=to_push, result=result,
+                    )
+                    sync_error = "" if sync_ok else str(
+                        (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
+                    )
             # MIRROR pushing policy: after a SUCCESSFUL full push, optionally delete
             # device users not in the app roster. Heavily guarded + dry-run by default;
             # a no-op for PRESERVE (the default) and for PullSDK drivers. Never allowed
@@ -2434,6 +2639,12 @@ class UltraDeviceWorker(threading.Thread):
                         prune_device_sync_state(device_id=self._device_id, keep_pins=desired_pins)
                     except Exception:
                         logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
+            # This pass built the roster, pushed and ran its removal step: the day's
+            # maintenance slot (intent read-back, finger-slot sweep) may open once the
+            # worker is idle -- "after the morning removals", not at a fixed hour: most
+            # gyms' PCs are off overnight. guide §3.4a.
+            self._last_desired_pins = {p for p in desired_pins if p}
+            self._maintenance_ready_day = _local_day()
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
@@ -2689,6 +2900,10 @@ class UltraDeviceWorker(threading.Thread):
                 logger.info("%s member sync: clearing %d vacated finger slot(s) for pin(s) %s",
                             self._prefix, sum(len(v) for v in removals.values()),
                             ",".join(sorted(removals)))
+            if not self._record_push_intents(users, hashes_by_pin):
+                # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
+                self._defer_member_sync(member_id, reason="push intent not recorded")
+                return
             result = self._sdk.push_roster(users, templates_by_pin,
                                            remove_fingers_by_pin=removals)
             # Record this pin's outcome. On success the next hash-triggered full
@@ -2996,6 +3211,8 @@ class UltraDeviceWorker(threading.Thread):
                 to_push=[entry], templates_by_pin=templates,
                 pushed_fingers=self._load_pushed_fingers(),
             )
+            if not self._record_push_intents([entry], hashes_by_pin):
+                raise RuntimeError("push intent not recorded")
             result = self._sdk.push_roster([entry], templates, remove_fingers_by_pin=removals)
             self._record_standalone_pin_state(
                 users=[entry], hashes_by_pin=hashes_by_pin, result=result,
@@ -3498,6 +3715,42 @@ class UltraDeviceWorker(threading.Thread):
                 )
             except Exception:
                 logger.debug("%s MIRROR batch row not finalised", self._prefix, exc_info=True)
+
+    def _maintenance_idle(self) -> bool:
+        """No door command, member update or full sync is waiting (lock-free peeks)."""
+        try:
+            if not self._cmd_queue.empty():
+                return False
+        except Exception:
+            return False
+        if self._pending_member_syncs or self._pending_full_sync_request is not None:
+            return False
+        return True
+
+    def _drain_daily_maintenance(self) -> None:
+        """Once per local day, after the day's first completed full sync, when idle.
+
+        Standalone (MB2000) only: the intent read-back enumerates the whole terminal
+        in one STA command -- no RTLog pump, no door service for its duration -- so it
+        runs at most once a day, never during a push, only when intents of departed
+        members exist, and only while nothing else is waiting. guide §3.4a.
+        """
+        if not getattr(self._sdk, "owns_event_source", False) or not self._connected:
+            return
+        today = _local_day()
+        if getattr(self, "_maintenance_ready_day", None) != today:
+            return
+        if not self._maintenance_idle():
+            return
+        if getattr(self, "_readback_done_day", None) != today:
+            self._readback_done_day = today
+            desired = getattr(self, "_last_desired_pins", None)
+            if desired is not None:
+                try:
+                    self._promote_intents_by_readback(desired_pins=set(desired))
+                except Exception:
+                    logger.warning("%s intent read-back failed", self._prefix, exc_info=True)
+            return
 
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:

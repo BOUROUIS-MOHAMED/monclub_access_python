@@ -317,6 +317,11 @@ def _standalone_worker(monkeypatch, *, users, policy="PRESERVE"):
     monkeypatch.setattr(dbmod, "delete_device_sync_state", st.delete)
     monkeypatch.setattr(dbmod, "clear_device_revocation_state", st.delete, raising=False)
     monkeypatch.setattr(dbmod, "list_device_pushed_fingers", lambda **kw: {}, raising=False)
+    # P3a-2 write-ahead intents: faked like the rest of the per-pin state, so these
+    # tests never write an intent row into whatever database is active.
+    monkeypatch.setattr(dbmod, "record_push_intents",
+                        lambda *, device_id, rows, protocol: len(list(rows)), raising=False)
+    monkeypatch.setattr(dbmod, "list_push_intents", lambda **kw: {}, raising=False)
 
     import app.core.device_sync as ds
     monkeypatch.setattr(ds.DeviceSyncEngine, "_build_local_fp_index_for_pins",

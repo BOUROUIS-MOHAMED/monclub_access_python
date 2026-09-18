@@ -509,6 +509,11 @@ def _make_sync_worker(monkeypatch, driver=None, users=None):
     monkeypatch.setattr(_db, "save_device_sync_state_batch", lambda **kw: 0)
     monkeypatch.setattr(_db, "prune_device_sync_state", lambda **kw: 0)
     monkeypatch.setattr(_db, "delete_device_sync_state", lambda **kw: None)
+    # P3a-2 write-ahead intents: faked like the rest of the per-pin state, so these
+    # tests never write an intent row into whatever database is active.
+    monkeypatch.setattr(_db, "record_push_intents",
+                        lambda *, device_id, rows, protocol: len(list(rows)), raising=False)
+    monkeypatch.setattr(_db, "list_push_intents", lambda **kw: {}, raising=False)
     import app.core.device_sync as _ds
     monkeypatch.setattr(_ds.DeviceSyncEngine, "_build_local_fp_index_for_pins",
                         lambda self, *, pins, fingerprint_enabled: {}, raising=True)
