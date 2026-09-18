@@ -40,7 +40,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
-| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_sync_tick`; `app/core/sync_retry.py`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
+| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -1003,15 +1003,22 @@ not read from a client queue.
 ### 3.6 The sync timer and the headless loop (2026-09-18)
 
 **The headless loop.** `MainApp.mainloop` runs every `after()` callback on the process main
-thread (`run_app` / `access.bootstrap.run_access_app`). It sleeps on a `threading.Condition`
-(`_sched_lock`) until the earliest deadline, at most `_SCHED_MAX_SLEEP_SEC` (50 ms) and at least
-`_SCHED_MIN_SLEEP_SEC` (1 ms). `after()`, `quit()` and `destroy()` notify it, so new work and a
-stop do not wait for the bound, and a callback that re-schedules itself with `after(0, …)` gets
-at most ~1000 passes/s instead of a busy spin. Callbacks due in the same pass still run in
+thread (`run_app` / `access.bootstrap.run_access_app`). While nothing is due it waits on a
+`threading.Condition` (`_sched_lock`) until the earliest deadline, asking for at most
+`_SCHED_MAX_SLEEP_SEC` (50 ms); `after()`, `quit()` and `destroy()` notify it, so work posted from
+another thread and a stop are picked up in well under a millisecond, not at the bound. When a
+callback is already due — typically one a callback just posted with `after(0, …)`, whose notify
+nobody was waiting for — it yields with `time.sleep(_SCHED_MIN_SLEEP_SEC)` instead. On this
+Windows build a `Condition.wait` rounds up to the ~15.6 ms timer tick (`wait(0.001)` measured
+median 15.5 ms, `wait(0.05)` ~62 ms) while `time.sleep(0.001)` sleeps ~1.6 ms (CPython ≥ 3.11
+uses a high-resolution timer); `time.monotonic` itself is `GetTickCount64`, 15.6 ms resolution,
+so a timed callback can run up to about one tick late, as before. The sleep floor caps a callback
+that re-schedules itself with `after(0, …)` at a few hundred passes/s — no busy spin. Callbacks due in the same pass still run in
 insertion order, outside the lock; a raising callback is logged and skipped. Deadlines use
 `time.monotonic()`, so wall-clock jumps do not move them (the daily 22:00 check,
 `_daily_sync_check`, reads the wall clock itself, once a minute). `[CODE: app.py::mainloop,
-::after, ::_init_scheduler, ::_wake_scheduler]` `[TEST: test_mainloop_scheduler.py]`
+::after, ::_init_scheduler, ::_wake_scheduler]` `[TEST: test_mainloop_scheduler.py, incl.
+::test_after_zero_from_inside_a_callback_runs_within_a_few_ms]`
 
 Before 2026-09-18 the loop's only wait sat after its `while`, so it re-scanned continuously:
 ~97–99 % of one core when idle, and — through the GIL — another Python thread's 1 ms sleep woke
@@ -1024,12 +1031,24 @@ test_mainloop_scheduler.py::test_idle_loop_does_not_spin — < 0.2 s CPU per 1 s
 **The periodic sync timer.** One timer, `_sync_after_id`. Every `_sync_tick` first re-arms it to
 the healthy interval (`_sync_base_interval_sec`: `agentSyncBackendRefreshMin` × 60, else
 `sync_interval_sec`, floor 10 s). The worker's `finally` posts `_on_sync_work_finished` to the
-loop thread, which decides the rest `[CODE: app.py::_sync_tick, ::_on_sync_work_finished]`:
+loop thread, which decides the rest `[CODE: app.py::_sync_tick, ::_on_sync_work_finished]`.
+Startup arms it through `_ensure_sync_timer` (`access/runtime.py`, 500 ms), which only arms when
+nothing is armed: a plain re-arm there used to replace the ~15 s retry of a startup tick that had
+already failed fast (no network yet at boot) with a full 30 min wait.
+`[TEST: ::test_the_startup_rearm_does_not_replace_a_fast_failure_retry]`
+
+`_sync_fail_count` counts consecutive failed sync *attempts*: `getSyncData` itself, **or** any
+step after it inside the same fetch-and-apply `try` in `work()` (`save_sync_cache_delta`, the
+member shadow sync, `save_version_tokens`, `_request_running_ultra_sync` …). A post-fetch local
+error therefore also runs the fast schedule. Such a retry re-sends the un-advanced version
+tokens and re-asks the running ULTRA workers for a sync, which skip each device while its roster
+fingerprint is unchanged (`ultra_engine.py` `_sync_all`, "fingerprint unchanged") — local CPU,
+no device I/O. `[CODE]` The table below says "failed" in that sense:
 
 | Outcome of the finished sync | Timer | Re-run |
 |---|---|---|
-| `getSyncData` failed (`_sync_fail_count` > 0) | re-armed to `sync_retry_delay_sec` | none now; the pending request rides the retry tick |
-| succeeded | the healthy timer armed at the tick's start stands | once, if a request arrived mid-sync |
+| the attempt failed (`_sync_fail_count` > 0) | re-armed to `sync_retry_delay_sec` | none now; the pending request rides the retry tick |
+| succeeded | the healthy timer armed at the tick's start stands | once, if a request arrived mid-sync — after the ULTRA reconnect deferral, below |
 | a newer sync already started before the callback ran | untouched | untouched |
 
 **Failure-retry schedule** (`app/core/sync_retry.py`): after 1, 2, 3, 4, ≥ 5 consecutive failures
@@ -1045,7 +1064,9 @@ timer was re-armed at tick start from the *previous* tick's count). `[CODE]`
 message) with `status_code`, and for 429/503 `retry_after_sec` parsed as delta-seconds (the
 HTTP-date form is ignored). The backend's `RateLimitFilter` sends 429 with integer
 `Retry-After` (per-account bucket, 200 requests / 60 s by default). A `Retry-After` longer than
-the scheduled step wins, up to the healthy interval. `[CODE: monclub_api.py::get_sync_data;
+the scheduled step wins, up to the healthy interval. Only ASCII digits are accepted (`str.isdigit`
+also passes `²`, which `int()` rejects); 10+ digits count as "very long" and clamp to the
+healthy interval, so a malformed header can never replace the HTTP error with a `ValueError`. `[CODE: monclub_api.py::get_sync_data;
 backend RateLimitFilter.write429]` `[TEST: ::test_get_sync_data_429_carries_status_and_retry_after,
 ::test_a_429_retry_after_stretches_the_retry]`
 
@@ -1054,6 +1075,16 @@ pending request context (sync now, change detector, daily 22:00, fast patch, aut
 reset) sets `_sync_rerun_requested`; the context stays in `_pending_sync_context` and the one
 re-run consumes it — the latest request wins, exactly as `request_sync_now`'s preserve rule
 already decided. A plain timer tick sets nothing. Never two workers. `[CODE]`
+The re-run does not start inside the previous sync's ULTRA reconnect deferral: a successful
+`SYNC_NOW_API` / `CHANGE_DETECTOR` / `FAST_PATCH_BUNDLE` sync defers a *disconnected* ULTRA
+worker's reconnect by 20 s (`_defer_ultra_reconnects`), and back-to-back re-runs during a stream
+of dashboard edits would re-defer it for the whole stream — no PC-side RTLog or QR/TOTP rescue at
+that terminal meanwhile. So the re-run waits until `_ultra_defer_until_mono` +
+`_RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC` (5 s; the worker re-checks its connect deadline at least
+once a second). A new request arriving in that gap still starts a sync at once, as before this
+change. `[TEST: ::test_a_rerun_waits_for_the_previous_syncs_ultra_reconnect_deferral,
+::test_a_rerun_after_an_expired_deferral_starts_at_once]` `[UNVERIFIED]` Field delta-sync
+durations and edit rates; the starvation regime was shown with a simulation, not on hardware.
 `[TEST: ::test_a_request_during_a_running_sync_reruns_when_it_finishes,
 ::test_many_rapid_requests_coalesce_into_one_rerun, ::test_a_rerun_after_a_failed_sync_waits_for_the_retry]`
 
@@ -1061,16 +1092,28 @@ already decided. A plain timer tick sets nothing. Never two workers. `[CODE]`
 DEVICE-mode panels from the cached roster (`DeviceSyncEngine.run_blocking(changed_ids=None)`):
 per PullSDK panel a connect, a full Pin read and `SetDeviceParam` writes; a FULL_REPLACE panel is
 wiped and re-pushed. So the fast retries must not each do it: an *automatic* failed tick
-dispatches it only if the tick that last dispatched it **started** at least one healthy interval
-ago (`_last_tick_device_reconcile_mono`). Timer ticks start one interval apart, so a failure on
-the next healthy tick still reconciles exactly as before. Explicit syncs (`is_explicit_user_sync`)
-and every successful tick are unchanged. During an outage the panels therefore see at most the
-healthy rate (2/h at 30 min) — fewer than the ~6/h the old 600 s retries caused. AGENT and ULTRA
+dispatches it only if the tick that last dispatched it **started** at least
+max(healthy interval, `_OFFLINE_RECONCILE_MIN_INTERVAL_SEC` = 600 s) ago
+(`_last_tick_device_reconcile_mono`). Timer ticks start one interval apart, so with the default
+30 min interval a failure on the next healthy tick still reconciles exactly as before. Explicit
+syncs (`is_explicit_user_sync`) and every successful tick are unchanged. During an outage the
+panels therefore see at most min(healthy rate, 6/h) — 2/h at 30 min, 6/h at 1–10 min — never
+more than the old code's outage cadence (1800 s once, then ~600 s). (A healthy tick with no
+member delta already runs this same full reconcile, so a short interval means that load anyway
+while online.) AGENT and ULTRA
 devices, ZK_STANDALONE terminals, RTLog and QR/TOTP rescue get no device I/O from a failed tick.
 `[CODE: app.py::_offline_device_reconcile_due and its call in _sync_tick's work()]`
 `[TEST: ::test_retry_ticks_during_an_outage_do_not_repeat_the_device_reconcile,
 ::test_the_first_failed_healthy_tick_after_a_reconcile_still_reconciles,
-::test_an_explicit_sync_still_reconciles_while_the_backend_is_down]`
+::test_an_explicit_sync_still_reconciles_while_the_backend_is_down,
+::test_a_short_healthy_interval_does_not_raise_the_outage_reconcile_rate]`
+
+Backend traffic during an outage, per PC: one `getSyncData` per failed tick, plus one
+`POST /public/account/refresh` whenever the refresh deadline has passed (a failed refresh does
+not advance it, so every retry then pays both). At 30 min that is ~16 attempts in the first
+outage hour and ~12.6/h after, against 4 and ~6/h before; the rate never exceeds the healthy
+one, and at a 1-min interval it is ~60/h as when healthy (old: ~6.5/h). A revoked session (401)
+retries on the same schedule indefinitely, as it did at ~600 s before. `[CODE]`
 
 **A worker thread that cannot start** (`RuntimeError: can't start new thread` at the 32-bit
 ceiling) no longer leaves `_sync_work_running` True forever: the flag is cleared, the request
@@ -1406,7 +1449,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **1826 passed** (2026-09-18,
+background-thread exceptions are promoted to failures. Last run: **1841 passed** (2026-09-18,
 branch `claude/access-loop-retry-fixes`: §3.6 loop and sync timer, §3.7 optional content; with
 the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
 Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). `[TEST]`

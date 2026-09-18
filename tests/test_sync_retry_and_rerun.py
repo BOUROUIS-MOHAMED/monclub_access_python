@@ -96,6 +96,7 @@ class _Harness:
         app._sync_retry_after_sec = None
         app._sync_rerun_requested = False
         app._last_tick_device_reconcile_mono = None
+        app._ultra_defer_until_mono = None
         app._last_sync_at = None
         app._last_sync_ok = False
         app._last_sync_error = None
@@ -120,7 +121,8 @@ class _Harness:
         with self.app._sched_lock:
             entries = [(t, sid) for t, sid, cb in self.app._scheduled if sid == self.app._sync_after_id]
         assert len(entries) == 1
-        return entries[0][0] - time.monotonic()
+        # Rounded: deadline minus now is float arithmetic (300.00000000000006 for 300 s).
+        return round(entries[0][0] - time.monotonic(), 3)
 
     def pending_callbacks(self) -> List[Tuple[float, Any]]:
         now = time.monotonic()
@@ -197,7 +199,11 @@ def test_retry_after_is_honoured_up_to_the_healthy_interval() -> None:
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("42", 42.0), (" 7 ", 7.0), ("0", 0.0), (None, None), ("", None), ("-3", None), ("soon", None),
-     ("Wed, 21 Oct 2015 07:28:00 GMT", None)],
+     ("Wed, 21 Oct 2015 07:28:00 GMT", None),
+     # str.isdigit() is True for these; int() rejects or mis-reads them.
+     ("\u00b2", None), ("1\u00b2", None), ("\u0661\u0662\u0660", None),
+     # Too long for int()/float(): still "wait long" (clamped to the healthy interval later).
+     ("9" * 400, 999_999_999.0), ("9" * 5000, 999_999_999.0)],
 )
 def test_parse_retry_after(raw: Optional[str], expected: Optional[float]) -> None:
     assert parse_retry_after_sec(raw) == expected
@@ -511,3 +517,120 @@ def test_an_explicit_sync_still_reconciles_while_the_backend_is_down(monkeypatch
     harness.finish_worker(fail=True)
 
     assert engine.run_blocking.call_count == 2
+
+
+
+def test_get_sync_data_malformed_retry_after_still_raises_the_http_error() -> None:
+    for header in ("\u00b2", "9" * 5000):
+        with pytest.raises(MonClubApiHttpError) as info:
+            _api_returning(429, {"Retry-After": header}).get_sync_data(token="t")
+        assert info.value.status_code == 429
+
+
+# ── Review fixes (2026-09-18) ───────────────────────────────────────────────────────
+
+
+def test_the_startup_rearm_does_not_replace_a_fast_failure_retry(harness) -> None:
+    """access/runtime.py's after(500, ...) used to re-arm the healthy interval after the
+    250 ms startup tick had already failed fast and armed a ~15 s retry."""
+    harness.tick()  # MainApp.__init__'s after(250, _sync_tick)
+    harness.finish_worker(fail=True)
+    harness.run_due()
+    assert 12 - 0.5 <= harness.armed_sync_timer_sec() <= 18
+
+    MainApp._ensure_sync_timer(harness.app)  # access/runtime.py's after(500, ...)
+
+    assert 12 - 0.5 <= harness.armed_sync_timer_sec() <= 18
+
+
+def test_ensure_sync_timer_arms_the_healthy_interval_when_nothing_is_armed(harness) -> None:
+    MainApp._ensure_sync_timer(harness.app)
+
+    assert harness.armed_sync_timer_sec() == pytest.approx(HEALTHY_30_MIN, abs=1)
+
+
+def test_the_startup_schedule_uses_the_ensure_only_rearm() -> None:
+    from access.runtime import schedule_access_shell_startup
+
+    calls: List[Tuple[int, Any]] = []
+    app = MagicMock()
+    app.after.side_effect = lambda delay, cb: calls.append((delay, cb))
+    schedule_access_shell_startup(app)
+
+    assert (500, app._ensure_sync_timer) in calls
+    assert all(cb is not app.reschedule_sync_timer for _delay, cb in calls)
+
+
+def test_a_short_healthy_interval_does_not_raise_the_outage_reconcile_rate(monkeypatch, tmp_path) -> None:
+    """At agentSyncBackendRefreshMin=1 the retries run at the 60 s healthy interval, but the
+    offline reconcile keeps the old outage ceiling of one per 600 s."""
+    h = _Harness(monkeypatch, tmp_path, refresh_min=1)
+    engine = _with_device_mode_panel(monkeypatch, h)
+    h.tick()
+    h.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 1
+
+    h.app._last_tick_device_reconcile_mono -= 61  # one healthy interval later
+    h.tick()
+    h.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 1
+
+    h.app._last_tick_device_reconcile_mono -= 600
+    h.tick()
+    h.finish_worker(fail=True)
+    assert engine.run_blocking.call_count == 2
+
+
+def test_a_rerun_waits_for_the_previous_syncs_ultra_reconnect_deferral(harness) -> None:
+    """Back-to-back re-runs each deferring ULTRA reconnects by 20 s would keep a disconnected
+    ULTRA worker (RTLog, QR/TOTP rescue) from reconnecting for a whole stream of edits."""
+    harness.tick()
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"n": 1})
+    time.sleep(0.06)
+    harness.run_due()
+    harness.app._ultra_defer_until_mono = time.monotonic() + 20.0  # set by the running sync
+
+    _succeed(harness)
+
+    reruns = [  # every _sync_tick queued besides the armed healthy timer (~1800 s)
+        (delay, cb) for delay, cb in harness.pending_callbacks()
+        if _is_sync_tick(cb, harness.app) and delay < 1000
+    ]
+    assert len(reruns) == 1
+    assert 24.5 <= reruns[0][0] <= 25.1  # the 20 s window + the 5 s margin
+    assert _CapturedThread.started == []
+
+
+def test_a_rerun_after_an_expired_deferral_starts_at_once(harness) -> None:
+    harness.tick()
+    MainApp.request_sync_now(harness.app, trigger_source="SYNC_NOW_API", trigger_hint={"n": 1})
+    time.sleep(0.06)
+    harness.run_due()
+    harness.app._ultra_defer_until_mono = time.monotonic() - 30.0
+
+    _succeed(harness)
+
+    reruns = [  # every _sync_tick queued besides the armed healthy timer (~1800 s)
+        (delay, cb) for delay, cb in harness.pending_callbacks()
+        if _is_sync_tick(cb, harness.app) and delay < 1000
+    ]
+    assert len(reruns) == 1 and reruns[0][0] <= 0.1
+
+
+def test_defer_ultra_reconnects_records_when_the_deferral_ends(harness) -> None:
+    harness.app._ultra_engine = MagicMock(running=True)
+    harness.app._ultra_engine.defer_reconnects.return_value = 1
+
+    before = time.monotonic()
+    MainApp._defer_ultra_reconnects(harness.app, trigger_source="SYNC_NOW_API", duration_sec=20.0)
+
+    assert before + 20.0 <= harness.app._ultra_defer_until_mono <= time.monotonic() + 20.0
+
+
+def test_no_deferral_recorded_when_no_worker_was_deferred(harness) -> None:
+    harness.app._ultra_engine = MagicMock(running=True)
+    harness.app._ultra_engine.defer_reconnects.return_value = 0
+
+    MainApp._defer_ultra_reconnects(harness.app, trigger_source="SYNC_NOW_API", duration_sec=20.0)
+
+    assert harness.app._ultra_defer_until_mono is None

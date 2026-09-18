@@ -116,12 +116,25 @@ from app.core.utils import LOG_DIR
 
 WINDOWS_STARTUP_ARG = "--monclub-windows-startup"
 
-# Headless event loop pacing (MainApp.mainloop). The loop sleeps until the next scheduled
-# callback is due, never longer than _SCHED_MAX_SLEEP_SEC (a safety bound: after() and a stop
-# wake it early), and never shorter than _SCHED_MIN_SLEEP_SEC, so a callback that re-schedules
-# itself with after(0, ...) cannot turn the loop into a busy spin.
+# Headless event loop pacing (MainApp.mainloop). The loop waits on a Condition until the next
+# scheduled callback is due, never longer than _SCHED_MAX_SLEEP_SEC (a safety bound: after() and
+# a stop wake it early). When a callback is already due (e.g. one a callback just posted with
+# after(0, ...)) it yields with time.sleep(_SCHED_MIN_SLEEP_SEC) instead: on Windows a Condition
+# wait rounds up to the ~15.6 ms timer tick, time.sleep (Python >= 3.11) does not, and the floor
+# keeps a callback that re-schedules itself with after(0, ...) from becoming a busy spin.
 _SCHED_MAX_SLEEP_SEC = 0.05
 _SCHED_MIN_SLEEP_SEC = 0.001
+
+# After a failed getSyncData, the cached-roster DEVICE-mode reconcile runs no more often than
+# once per max(healthy interval, this): 600 s is the ceiling of the pre-2026-09-18 outage cadence,
+# so short healthy intervals do not raise the panels' outage load above what it was.
+_OFFLINE_RECONCILE_MIN_INTERVAL_SEC = 600
+
+# A mid-sync request's re-run waits until the ULTRA reconnect deferral the previous sync set
+# (_defer_ultra_reconnects, 20 s) has lapsed, plus this margin: a deferred ULTRA worker re-checks
+# its connect deadline at least once a second (ultra_engine.py _wait_for_work(min(wait, 1.0))),
+# so back-to-back re-runs cannot keep re-deferring a disconnected worker.
+_RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC = 5.0
 
 
 def _read_runtime_version_string() -> str:
@@ -607,12 +620,16 @@ class MainApp:
         self._sync_work_running = False
         self._pending_sync_context: SyncTriggerContext | None = None
         self._startup_sync_pending = True
-        self._sync_fail_count = 0  # consecutive getSyncData failures (drives the retry schedule)
+        # Consecutive failed sync attempts (drives the retry schedule): getSyncData itself, or any
+        # step after it inside the same fetch-and-apply try block in _sync_tick's work().
+        self._sync_fail_count = 0
         self._sync_retry_after_sec: float | None = None  # backend Retry-After from the last failure
         # Set when a sync is requested while one is running; the finishing sync re-runs once.
         self._sync_rerun_requested = False
         # Start time (monotonic) of the last sync tick that dispatched the DEVICE-mode reconcile
         self._last_tick_device_reconcile_mono: float | None = None
+        # monotonic time the last ULTRA reconnect deferral (_defer_ultra_reconnects) ends
+        self._ultra_defer_until_mono: float | None = None
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
@@ -718,7 +735,11 @@ class MainApp:
                     if self._scheduled:
                         next_due = min(t for t, _sid, _cb in self._scheduled)
                         timeout = min(timeout, next_due - time.monotonic())
-                    self._sched_lock.wait(timeout=max(_SCHED_MIN_SLEEP_SEC, timeout))
+                    if timeout > 0:
+                        self._sched_lock.wait(timeout=timeout)
+                        continue
+                # A callback is already due: yield briefly (see _SCHED_MIN_SLEEP_SEC).
+                time.sleep(_SCHED_MIN_SLEEP_SEC)
         except KeyboardInterrupt:
             if hasattr(self, "logger"):
                 self.logger.info("KeyboardInterrupt received, shutting down.")
@@ -1083,6 +1104,7 @@ class MainApp:
                     or 0
                 )
             if deferred > 0:
+                self._ultra_defer_until_mono = time.monotonic() + float(duration_sec or 0.0)
                 self.logger.info(
                     "[ULTRA] deferred reconnect attempts during sync: workers=%d trigger_source=%s duration_sec=%.1f",
                     deferred,
@@ -2428,6 +2450,16 @@ class MainApp:
             self._sync_after_id = self.after(base_interval * 1000, self._sync_tick)
             self.logger.info(f"Sync scheduled every {base_interval} sec")
 
+    def _ensure_sync_timer(self):
+        """Arm the healthy sync timer only if none is armed (startup, access/runtime.py).
+
+        The startup sync tick (after(250) in __init__) already arms it; a plain
+        reschedule_sync_timer() here would replace a fast failure retry that the first tick's
+        failure had just armed with a full healthy interval.
+        """
+        if self._sync_after_id is None:
+            self.reschedule_sync_timer()
+
     def _sync_base_interval_sec(self) -> int:
         """The healthy sync interval in seconds."""
         # Use backend-driven agentSyncBackendRefreshMin (in minutes) if available,
@@ -2452,11 +2484,13 @@ class MainApp:
 
         Failed syncs retry fast (app.core.sync_retry), but the cached-roster reconcile each
         would dispatch opens a PullSDK session per DEVICE-mode panel (and wipes and re-pushes a
-        FULL_REPLACE panel). Keep that at the healthy cadence: only when the tick that last
-        dispatched it started at least one healthy interval ago.
+        FULL_REPLACE panel). Keep that at the healthy cadence and never above the old outage
+        cadence: only when the tick that last dispatched it started at least
+        max(healthy interval, _OFFLINE_RECONCILE_MIN_INTERVAL_SEC) ago.
         """
         last = self._last_tick_device_reconcile_mono
-        return last is None or time.monotonic() - last >= self._sync_base_interval_sec()
+        interval = max(self._sync_base_interval_sec(), _OFFLINE_RECONCILE_MIN_INTERVAL_SEC)
+        return last is None or time.monotonic() - last >= interval
 
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).
@@ -2474,11 +2508,18 @@ class MainApp:
             self.reschedule_sync_timer(after_failure=True)
             return
         if rerun and self._pending_sync_context is not None:
+            delay = 0.0
+            if self._ultra_defer_until_mono is not None:
+                delay = max(
+                    0.0,
+                    self._ultra_defer_until_mono + _RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC - time.monotonic(),
+                )
             self.logger.info(
-                "Sync re-run: requested while the previous sync was running (trigger=%s)",
+                "Sync re-run in %.1fs: requested while the previous sync was running (trigger=%s)",
+                delay,
                 self._pending_sync_context.trigger_source,
             )
-            self.after(0, self._sync_tick)
+            self.after(int(delay * 1000), self._sync_tick)
 
     def _sync_tick(self):
         self.reschedule_sync_timer()

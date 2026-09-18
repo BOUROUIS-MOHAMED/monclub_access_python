@@ -41,7 +41,8 @@ def schedule_access_shell_startup(app: Any) -> None:
 
     app.after(200, app._poll_logs)
     app.after(400, app.start_local_api_server)
-    app.after(500, app.reschedule_sync_timer)
+    # Only arms the timer if the startup tick has not: re-arming would replace a fast retry.
+    app.after(500, app._ensure_sync_timer)
     app.after(650, lambda: app._ensure_update_manager_started(check_now=True))
     app.after(700, app.evaluate_access_and_redirect)
     app.after(1500, app._launch_tauri_ui)

@@ -14,6 +14,7 @@ from typing import Callable, Optional
 SYNC_RETRY_STEPS_SEC = (15, 30, 60, 120, 300)
 SYNC_RETRY_CAP_SEC = 300
 SYNC_RETRY_JITTER_FRACTION = 0.20
+_RETRY_AFTER_MAX_SEC = 999_999_999.0
 
 
 def sync_retry_delay_sec(
@@ -40,6 +41,11 @@ def parse_retry_after_sec(value: Optional[str]) -> Optional[float]:
     it is ignored and the normal retry schedule applies.
     """
     text = str(value or "").strip()
-    if not text.isdigit():
+    # ASCII digits only: str.isdigit also accepts e.g. "²", which int() rejects.
+    if not (text.isascii() and text.isdigit()):
         return None
+    # Bounded before int(): a huge value still means "wait long", and sync_retry_delay_sec
+    # clamps it to the healthy interval; 10+ digits would overflow float or int() limits.
+    if len(text) > 9:
+        return _RETRY_AFTER_MAX_SEC
     return float(int(text))
