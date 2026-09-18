@@ -428,6 +428,10 @@ def test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots(monke
         ]
     )
     monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: cached)
+    monkeypatch.setattr(
+        "app.core.access_verification.totp_roster_check_counts",
+        lambda: dict(_ROSTER_COUNTS),
+    )
     app = SimpleNamespace(
         _last_sync_at="2026-09-06T10:00:00Z",
         _last_sync_ok=True,
@@ -451,6 +455,120 @@ def test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots(monke
             {"gymDeviceId": 2, "reachable": False, "failedPins": 2, "mode": "ULTRA"},
             {"gymDeviceId": 3, "reachable": False, "failedPins": 0, "mode": "DEVICE"},
         ],
+        "qrRosterCheck": {
+            "since": "2026-09-18T07:30:00Z",
+            "inRoster": 40,
+            "inRosterByAccount": 3,
+            "notInRoster": 2,
+            "rosterEmpty": 0,
+            "rosterBehind": 1,
+            "refused": 1,
+        },
+    }
+
+
+# totp_roster_check_counts() as it returns them: `since` is the local wall clock
+# with its offset (access_verification._roster_counts_since).
+_ROSTER_COUNTS = {
+    "since": "2026-09-18T08:30:00+01:00",
+    "in_roster": 40,
+    "in_roster_by_account": 3,
+    "not_in_roster": 2,
+    "roster_empty": 0,
+    "roster_behind": 1,
+    "refused": 1,
+}
+
+
+def _bare_app():
+    return SimpleNamespace(
+        _last_sync_at=None,
+        _last_sync_ok=False,
+        _update_manager=SimpleNamespace(get_current_version=lambda: "1.4.34"),
+        _agent_engine=SimpleNamespace(get_status_snapshot=lambda: {}),
+        _ultra_engine=SimpleNamespace(get_status=lambda: {"devices": {}}),
+    )
+
+
+def test_heartbeat_qr_roster_report_is_verdict_counts_only(monkeypatch) -> None:
+    # The report carries the verdict counts and when they started — nothing that
+    # could identify a member (guide §3.1b).
+    identity = _identity_module()
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    monkeypatch.setattr(
+        "app.core.access_verification.totp_roster_check_counts",
+        lambda: dict(_ROSTER_COUNTS, memberId=77, name="Someone"),
+    )
+
+    report = identity.build_heartbeat_payload(_bare_app())["qrRosterCheck"]
+
+    assert set(report) == {
+        "since",
+        "inRoster",
+        "inRosterByAccount",
+        "notInRoster",
+        "rosterEmpty",
+        "rosterBehind",
+        "refused",
+    }
+    assert all(type(report[key]) is int for key in report if key != "since")
+
+
+def test_heartbeat_qr_roster_since_is_sent_as_utc(monkeypatch) -> None:
+    # The backend binds the heartbeat's other timestamp (lastSyncAt) from this
+    # exact shape; an offset like +01:00 is not what it has been sent before.
+    identity = _identity_module()
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    monkeypatch.setattr(
+        "app.core.access_verification.totp_roster_check_counts",
+        lambda: dict(_ROSTER_COUNTS, since="2026-09-18T23:30:00-02:00"),
+    )
+
+    report = identity.build_heartbeat_payload(_bare_app())["qrRosterCheck"]
+
+    assert report["since"] == "2026-09-19T01:30:00Z"
+
+
+def test_heartbeat_reads_the_real_roster_counters(monkeypatch) -> None:
+    identity = _identity_module()
+    from app.core import access_verification
+
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    counts = access_verification.totp_roster_check_counts()
+
+    report = identity.build_heartbeat_payload(_bare_app())["qrRosterCheck"]
+
+    assert report["inRoster"] == counts["in_roster"]
+    assert report["notInRoster"] == counts["not_in_roster"]
+    assert report["refused"] == counts["refused"]
+    assert report["since"].endswith("Z")
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        lambda: (_ for _ in ()).throw(RuntimeError("counter lock")),
+        lambda: dict(_ROSTER_COUNTS, since="not a date"),
+        lambda: dict(_ROSTER_COUNTS, refused=None),
+        lambda: {k: v for k, v in _ROSTER_COUNTS.items() if k != "in_roster"},
+    ],
+    ids=["raises", "bad-since", "non-int-count", "missing-count"],
+)
+def test_heartbeat_without_readable_roster_counts_leaves_the_key_out(monkeypatch, counts) -> None:
+    # Liveness must not depend on the QR counters: an unreadable report is left
+    # out whole, never sent half-filled, and the rest of the payload is intact.
+    identity = _identity_module()
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    monkeypatch.setattr("app.core.access_verification.totp_roster_check_counts", counts)
+
+    payload = identity.build_heartbeat_payload(_bare_app())
+
+    assert "qrRosterCheck" not in payload
+    assert payload == {
+        "appVersion": "1.4.34",
+        "lastSyncAt": None,
+        "lastSyncOk": False,
+        "turnstiles": [],
     }
 
 

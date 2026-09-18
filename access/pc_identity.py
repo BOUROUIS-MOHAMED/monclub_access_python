@@ -479,6 +479,44 @@ def _device_mode(device: Mapping[str, Any], default: str = "DEVICE") -> str:
     return value if value in {"DEVICE", "AGENT", "ULTRA"} else default
 
 
+# totp_roster_check_counts() key -> heartbeat key. Verdict counts only (guide §3.1b).
+_QR_ROSTER_REPORT_KEYS = (
+    ("in_roster", "inRoster"),
+    ("in_roster_by_account", "inRosterByAccount"),
+    ("not_in_roster", "notInRoster"),
+    ("roster_empty", "rosterEmpty"),
+    ("roster_behind", "rosterBehind"),
+    ("refused", "refused"),
+)
+
+
+def _qr_roster_check_report() -> dict[str, Any] | None:
+    """The QR roster-check counts since this process started, for the heartbeat.
+
+    Only the verdict counts and when they started -- no member id, name or credential.
+    ``since`` goes out in UTC ``Z`` form, the shape the heartbeat's ``lastSyncAt`` has
+    always had. Anything unreadable returns None and the key is left out whole.
+    """
+    try:
+        from app.core.access_verification import totp_roster_check_counts
+
+        counts = totp_roster_check_counts()
+        since = datetime.fromisoformat(str(counts["since"]))
+        if since.tzinfo is None:
+            since = since.astimezone()
+        report: dict[str, Any] = {
+            "since": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        for source_key, wire_key in _QR_ROSTER_REPORT_KEYS:
+            value = counts[source_key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            report[wire_key] = value
+        return report
+    except Exception:
+        return None
+
+
 def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     """Build telemetry only from existing in-memory app snapshots."""
 
@@ -537,12 +575,16 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     except Exception:
         pass
 
-    return {
+    payload: dict[str, Any] = {
         "appVersion": app_version,
         "lastSyncAt": getattr(app, "_last_sync_at", None),
         "lastSyncOk": bool(getattr(app, "_last_sync_ok", False)),
         "turnstiles": [devices[device_id] for device_id in sorted(devices)],
     }
+    qr_roster_check = _qr_roster_check_report()
+    if qr_roster_check is not None:
+        payload["qrRosterCheck"] = qr_roster_check
+    return payload
 
 
 class PcHeartbeatWorker:

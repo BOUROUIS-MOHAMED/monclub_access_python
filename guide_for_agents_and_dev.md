@@ -47,7 +47,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
-| The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
+| The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -356,8 +356,17 @@ else — absent, malformed, another value — is `trial`. It survives storage
 (`sync_devices.device_capabilities`) to the engine. `[TEST: ::test_the_mode_arrives_from_the_device_payload,
 ::test_the_mode_survives_device_ingest_to_the_engine_settings]` The backend stores
 `deviceCapabilities` as free JSON and the dashboard's device form keeps unrelated keys on save
-(`deviceCapabilitiesRaw`), but **no dashboard input edits it** — today the key can only be set by
-an API call on the device. `[CODE: backend main GymDeviceDto; dashboard gym-devices-view.tsx]`
+(`deviceCapabilitiesRaw`). `[CODE: backend main GymDeviceDto; dashboard gym-devices-view.tsx]` On
+dashboard `main` no input edits the key — it can only be set by an API call on the device. Dashboard
+branch `claude/qr-roster-check-mode` (caa3c2f0) adds a per-device **"Contrôle QR de la liste des
+membres"** select, Essai / Appliquer, in the Reader group: Enforce writes lowercase `"enforce"`,
+Trial **removes** the key (as AUTO does for `fingerprintTemplateVersion`), unrelated keys survive,
+and a saved value is read as this parser reads it (trimmed, case-insensitive `enforce`), so a device
+set to `"ENFORCE"` by API loads as Enforce and an unrelated save does not switch it off.
+`[CODE: dashboard claude/qr-roster-check-mode gym-devices-capabilities.ts]`
+`[TEST: dashboard tests/gym-devices-capabilities.test.ts]` `[UNVERIFIED]` merged or deployed — the
+branch was not pushed. An Access build without this section's code ignores the key: it has no
+roster check at all.
 
 **Newer index, older member list.** A worker uses the shared index when its generation is `>=`
 the worker's own, so the index can carry a credential for a member added after that worker's
@@ -406,21 +415,51 @@ comes an hour after start, and on a PC with no ULTRA worker it comes only with a
 ::test_the_summary_line_is_logged_at_most_once_per_interval,
 ::test_ultra_rescue_of_a_removed_member, ::test_agent_decision_for_a_removed_member]`
 
-**How the counts leave the PC — the log upload, not the heartbeat.** Every `[T]` line is in the
+**How the counts leave the PC — the log upload, and the heartbeat.** Every `[T]` line is in the
 app log, and `log_uploader.py` uploads each log window when it closes; the dashboard's "Sync logs
 now" button (fast path to 127.0.0.1, else a backend request the PC's `LogSyncRequestPoller` picks
 up within ~10 min) uploads the open window on demand. No backend change is needed. **In the
 dashboard, only a MonClub admin can open the files:** its Access logs page is in the ADMIN-only
 menu and calls the ADMIN-only `/protected/access/logs`; a gym account's dashboard shows upload
 status only. The backend also serves each gym its own files at `/api/v1/gym/access/logs` and
-`…/download-url` (GYM role, gym taken from the token), but no dashboard page calls them yet. The PC heartbeat
-(`pc_identity.py::build_heartbeat_payload` → `/public/access/v1/pc/heartbeat`, every 300 s) was
-rejected as the carrier: the backend's `HeartbeatRequest` has no field for it, Jackson drops
-unknown properties, and `GymAccessPcService.heartbeat` reads four declared fields — showing counts
-on `/access-pcs` needs a DTO field, a column and a dashboard change. `[CODE: backend main
-AccessLogAdminController, AccessLogGymController.resolveScopedGym, SecurityConfiguration,
-GymAccessPcDtos, GymAccessPcService; dashboard
-config-nav-dashboard.tsx, sync-logs-header-button.tsx]`
+`…/download-url` (GYM role, gym taken from the token), but no dashboard page calls them yet.
+`[CODE: backend main AccessLogAdminController, AccessLogGymController.resolveScopedGym,
+SecurityConfiguration; dashboard config-nav-dashboard.tsx, sync-logs-header-button.tsx]`
+
+The PC heartbeat (`pc_identity.py::build_heartbeat_payload` → `/public/access/v1/pc/heartbeat`,
+every 300 s) also carries them, as `qrRosterCheck`: `{since, inRoster, inRosterByAccount,
+notInRoster, rosterEmpty, rosterBehind, refused}` from `totp_roster_check_counts()`, with `since`
+converted to UTC `…Z` — the shape `lastSyncAt` has always had. Verdict counts only; a counter
+that cannot be read, a bad `since`, or any non-integer count leaves the key out whole and the
+rest of the heartbeat unchanged. The counts are **per PC** (process-wide, every device and both
+modes together), not per device, and restart with the app. `[CODE: pc_identity.py::_qr_roster_check_report]`
+`[TEST: test_pc_identity.py::test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots,
+::test_heartbeat_qr_roster_report_is_verdict_counts_only, ::test_heartbeat_qr_roster_since_is_sent_as_utc,
+::test_heartbeat_reads_the_real_roster_counters, ::test_heartbeat_without_readable_roster_counts_leaves_the_key_out]`
+A backend without the field ignores the key. On backend `main` (e40f8648, 2026-09-19)
+`HeartbeatRequest` declares four fields (`appVersion lastSyncAt lastSyncOk turnstiles`):
+`GymAccessPcService.heartbeat` reads the first three and counts `turnstiles`, and since R0 (d9d82d68)
+`AccessDeviceStatusService.storeTurnstiles` stores `turnstiles[]` — nothing reads another key. Nothing
+enables `FAIL_ON_UNKNOWN_PROPERTIES` (no `spring.jackson.*` property, no `ObjectMapper` bean; `JacksonConfig`
+only customises `LocalDateTime`), so Spring Boot's default applies and Jackson drops the key; the
+pre-R0 heartbeat (d10ba08b, da4a6d18) has the same DTO and the same `JacksonConfig`. `[CODE: backend main
+GymAccessPcDtos, GymAccessPcController.heartbeat, GymAccessPcService.heartbeat,
+AccessDeviceStatusService.storeTurnstiles, JacksonConfig, application*.yml]` `[UNVERIFIED]` by a live
+request, and no backend test pins it (`GymAccessPcAdditiveContractTest` covers paths and JWT, not unknown
+keys): a backend that enabled `FAIL_ON_UNKNOWN_PROPERTIES` would answer 400 to every heartbeat of this
+build. That is a visibility loss, not a door one: `PcIdentityService.heartbeat_once` changes state only
+on `ACCESS_PC_REVOKED`, `ACCESS_PC_INVALID_CREDENTIALS`, `ACCESS_PC_TOKEN_INVALID` and 429; any other
+rejection is logged and retried at the next beat. `[CODE: pc_identity.py::heartbeat_once]` Backend branch `claude/qr-roster-heartbeat` adds
+`HeartbeatRequest.qrRosterCheck` (`since` bound as text, so an unreadable one cannot 400 the
+heartbeat), keeps the latest report per PC in eight nullable `gym_access_pc.qr_roster_*` columns
+through a compare-and-set update after the liveness write (a heartbeat without the key leaves the
+last report; adoption clears it; hand-run `V112`), and returns it as `PcSummary.qrRosterCheck`.
+Dashboard branch `claude/access-pcs-qr-roster-counts` shows it on `/access-pcs` as a caption under
+the state chip, with the breakdown in a tooltip. `[TEST: backend GymAccessPcServiceHeartbeatTest,
+GymAccessPcHeartbeatJsonBindingTest, GymAccessPcHeartbeatUpdateJpaTest, GymAccessPcServiceAdoptTest;
+dashboard tests/gym-access-pc-qr-roster.test.ts, tests/gym-access-pc-model.test.ts]` `[UNVERIFIED]`
+none of the three branches is merged or deployed, and no PC has yet been seen sending the key to a
+backend that stores it.
 
 **What does not change.** Card checks (`verify_card`), the staff-RFID rescue, and the staff QR
 re-entry exemption: the exemption reads `user["membershipId"]`, and `user` was already `None`
