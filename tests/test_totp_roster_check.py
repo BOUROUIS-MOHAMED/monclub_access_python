@@ -471,8 +471,43 @@ def test_an_empty_member_list_is_not_newer_information():
         _ue._set_shared_local_state(full, 6)
         _ue._set_shared_local_state(empty, 5)
         assert _ue._get_shared_local_state() == (full, 6)
+        _ue._set_shared_local_state(empty, 6)  # same generation, strictly less information
+        assert _ue._get_shared_local_state() == (full, 6)
+        _ue._set_shared_local_state(empty, 7)  # a real drop to zero comes with a bump
+        assert _ue._get_shared_local_state() == (empty, 7)
     finally:
         _ue._set_shared_local_state(None, -1)
+
+
+def test_a_refresh_landing_mid_read_never_makes_an_old_list_look_current():
+    # The refresh thread stores _cached_state, then _cached_state_gen, without a lock.
+    # Here it lands while the rescue reads: the rescue gets the OLD gen-5 list, and the
+    # generation reads 6 right after. Trusting that 6 would check new member N against
+    # the old list and refuse N; the rescue must treat the list as gen 5 and use the
+    # shared gen-6 list, which has N.
+    import app.core.ultra_engine as _ue
+    rng = random.Random(21)
+    member, newbie = _cred(1, [101], rng), _cred(9, [505], rng)
+    s = {**_settings(), "totp_roster_check_mode": "enforce"}
+    old_state = ([member], {101: _user(101)}, {})
+    new_state = ([member, newbie], {101: _user(101), 505: _user(505)}, {})
+    worker = _ultra_worker(s, *old_state[:2])
+    worker._cached_state_gen = 5
+
+    def _read_then_refresh_lands():
+        worker._cached_state_gen = 6
+        return old_state
+
+    worker._get_cached_local_state = _read_then_refresh_lands
+    _ue._set_shared_totp_index(av.build_totp_index(new_state[0], s, time.time(), margin=1), 6)
+    _ue._set_shared_local_state(new_state, 6)
+    try:
+        rec = _ultra_scan(worker, _code_for(newbie, s, time.time()))
+    finally:
+        _ue._set_shared_totp_index(None, -1)
+        _ue._set_shared_local_state(None, -1)
+    worker._sdk.open_door.assert_called_once()
+    assert rec.allowed is True
 
 
 def test_a_cold_worker_that_adopts_an_empty_list_refreshes_itself():

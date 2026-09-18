@@ -314,18 +314,23 @@ def _snapshot_has_members(value) -> bool:
 def _set_shared_local_state(value, gen) -> None:
     """Publish the process-wide member snapshot. MONOTONIC like the TOTP index: a
     refresh whose slow load finished after a newer one must not put an older list
-    back (the QR roster check compares it with the index, guide §3.1b). A stored
-    snapshot with NO members is not newer information -- load_local_state returns
-    an empty list when its users read fails -- so an older complete one may replace
-    it. A clear (value=None) is always allowed."""
+    back (the QR roster check compares it with the index, guide §3.1b). A snapshot
+    with NO members is not newer information -- load_local_state returns an empty
+    list when its users read fails -- so an older complete one may replace a stored
+    empty one, and an empty one never replaces a complete one at the same
+    generation. An empty one at a HIGHER generation still goes through: a gym that
+    really drops to zero members always comes with a generation bump. A clear
+    (value=None) is always allowed."""
     try:
         g = int(gen)
         with _SHARED_LOCAL_STATE_LOCK:
             stored = _SHARED_LOCAL_STATE["value"]
-            if value is not None and stored is not None \
-                    and g < int(_SHARED_LOCAL_STATE["gen"]) \
-                    and _snapshot_has_members(stored):
-                return
+            stored_gen = int(_SHARED_LOCAL_STATE["gen"])
+            if value is not None and stored is not None and _snapshot_has_members(stored):
+                if g < stored_gen:
+                    return
+                if g == stored_gen and not _snapshot_has_members(value):
+                    return
             _SHARED_LOCAL_STATE["value"] = value
             _SHARED_LOCAL_STATE["gen"] = g
     except Exception:
@@ -4386,7 +4391,14 @@ class UltraDeviceWorker(threading.Thread):
         from the window) or the wall clock (covers a skewed device clock), so
         neither a processing delay nor a single bad clock alone can reject it.
         """
+        # The refresh thread stores _cached_state, THEN _cached_state_gen, with no
+        # lock. Reading the generation before and after the state and keeping the
+        # lower one never labels this list newer than it is (the roster check below
+        # would trust an old list); a refresh landing mid-read can only make it look
+        # older -- roster_behind, i.e. no refusal -- for that one scan.
+        _gen_before = self._cached_state_gen
         creds, users_by_am, users_by_card = self._get_cached_local_state()
+        own_list_gen = min(_gen_before, self._cached_state_gen)
 
         # Use the precomputed O(1) index ONLY when it was built from the exact
         # Use the shared index if it was built from a credential generation that
@@ -4410,8 +4422,8 @@ class UltraDeviceWorker(threading.Thread):
         # Never adopt an EMPTY shared list: load_local_state turns a failed users read
         # into [] and the refresh still publishes it, so an empty list there says
         # nothing about the members -- keeping our own list keeps names and the check.
-        roster_gen = self._cached_state_gen
-        if totp_index is not None and _idx_gen > self._cached_state_gen:
+        roster_gen = own_list_gen
+        if totp_index is not None and _idx_gen > own_list_gen:
             _shared, _shared_gen = _get_shared_local_state()
             if (
                 _shared_gen >= _idx_gen

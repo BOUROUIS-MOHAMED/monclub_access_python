@@ -320,14 +320,20 @@ refresh that the index is later built from. Without it, a brand-new member would
 an older complete list back over a newer one (`_set_shared_local_state` ignores a lower
 generation; a clear is always allowed). A snapshot with **no members** is not newer information
 — `load_local_state` returns `(creds, {}, {})` when its users read fails — so an older complete
-list may replace it, the rescue never adopts it, and a cold worker that adopts one in
+list may replace it, it never replaces a complete list at the **same** generation (at a higher
+one it does: a gym that really drops to zero members comes with a generation bump), the rescue
+never adopts it, and a cold worker that adopts one in
 `_get_cached_local_state` starts its own refresh at once (at the current generation nothing else
 would reload it before the 300 s TTL). When no non-empty list at least as new as the index
 exists, the rescue checks the worker's own (older) list and passes `roster_current=False`; if the
 **index** is what matched, a "not listed" code is then `roster_behind` — counted, **never
 refused** — because the member may simply be newer than the list. If `verify_totp` fell back to
 the loop (the index did not cover the scan's window), the worker's own credentials matched,
-from the same load as its list, and the verdict stands. `[CODE: ultra_engine.py::_handle_totp_rescue,
+from the same load as its list, and the verdict stands. The worker's own list and its generation
+are written by the refresh thread without a lock (list first, then generation), so the rescue
+reads the generation before and after taking the list and keeps the **lower**: a list is never
+labelled newer than it is; a refresh landing mid-read can only make it look older (one scan of
+`roster_behind`, no refusal). `[CODE: ultra_engine.py::_handle_totp_rescue,
 ::_set_shared_local_state, ::_get_cached_local_state; access_verification.py::verify_totp]`
 `[TEST: ::test_ultra_checks_a_newer_index_against_a_member_list_at_least_as_new,
 ::test_ultra_never_adopts_an_empty_shared_member_list,
@@ -335,7 +341,8 @@ from the same load as its list, and the verdict stands. `[CODE: ultra_engine.py:
 ::test_an_empty_member_list_is_not_newer_information,
 ::test_a_cold_worker_that_adopts_an_empty_list_refreshes_itself,
 ::test_a_list_older_than_the_index_that_matched_never_refuses,
-::test_roster_current_only_qualifies_an_index_match, ::test_ultra_loop_fallback_keeps_a_trustworthy_refusal]`
+::test_roster_current_only_qualifies_an_index_match, ::test_ultra_loop_fallback_keeps_a_trustworthy_refusal,
+::test_a_refresh_landing_mid_read_never_makes_an_old_list_look_current]`
 
 **Counting.** `verify_totp` stays pure — `verify_totp_resilient` calls it twice on the denial
 path (scan clock, then wall clock) and tests call it freely. Each engine records the **final**
