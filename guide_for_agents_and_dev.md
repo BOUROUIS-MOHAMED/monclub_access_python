@@ -322,7 +322,13 @@ two or three item assignments. A skipped entry now logs `SDK_CMD op=… EXPIRED 
 reason=caller_gave_up|deadline late_by_ms=…`. `[T] SDK_CMD` still carries
 `ok=False expired=True` and is otherwise unchanged. The cost is time: a handler can hold its
 own request thread for twice its budget — 30 s for the settings and clock reads, 10 s for
-reentry, 50 s for a clock sync.
+reentry, 50 s for a clock sync. Unlike the door queue, this queue has **no mid-push yield**:
+`_drain_sdk_commands` has one call site, once per connected poll-loop iteration, after the
+inline member and full syncs. It is not reached during a `pause_for_sync` hand-off, while
+disconnected, or inside a push (`_sync_yield_to_doors` drains only `_cmd_queue`). A
+control-panel call issued then waits; if its caller's wait runs out first, the caller takes
+the claim and the call is skipped, never run late. `[CODE: ultra_engine.py::run (its one
+_drain_sdk_commands call), ::_sync_yield_to_doors]`
 `[CODE: ultra_engine.py::request_run_sdk, ::_drain_sdk_commands;
 local_access_api_v2.py::_run_on_device_sdk]` `[TEST: test_sdk_cmd_deadline.py::
 test_an_sdk_call_the_caller_gave_up_on_is_never_run_later,
