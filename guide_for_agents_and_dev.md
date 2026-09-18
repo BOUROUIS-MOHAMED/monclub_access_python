@@ -950,12 +950,32 @@ happens to its retryable list is new.
 | Named in `failedIds` (any `_RETRY_TOKEN_KEYS` key) | `FAILED_RETRYABLE` via `mark_access_history_unresolved`: `backend_unresolved_count` +1, delay `300 s × 2^(n−1)` capped at `UNRESOLVED_RETRY_MAX_SECONDS` (24 h) | **yes** |
 | Retryable but **not named** (`ok` false with no lists; rows left over when `failedCount` > 0) | `FAILED_RETRYABLE`, fixed 300 s | no |
 | Named in `terminalFailedIds` | `FAILED_TERMINAL` | — |
-| HTTP 400 | per-row isolation, then the rows above apply per row | as above |
-| 5xx, timeout, network | `FAILED_RETRYABLE`, fixed 300 s | **no** |
+| HTTP 400 or 409 (`_ROW_VERDICT_HTTP_STATUSES`) | per-row isolation: each row is posted alone; a row that gets 400 or 409 alone is `FAILED_TERMINAL`, with the real status in `backend_last_error`; the other rows as above | as above |
+| any other status (401, 403, 422, 5xx), timeout, network | `FAILED_RETRYABLE`, fixed 300 s | **no** |
 
-`[CODE: device_attendance.py::_mark_retryable, ::_named_retry_row_ids;
+`[CODE: device_attendance.py::_mark_retryable, ::_named_retry_row_ids, ::_isolate_rejected_rows;
 db.py::mark_access_history_unresolved]`
-`[TEST: test_access_history_unresolved_bound.py]`
+`[TEST: test_access_history_unresolved_bound.py; test_access_history_400_isolation.py]`
+
+**Why 409 is isolated like 400 (2026-09-18).** Both are one verdict on a whole batch for a
+fault in one row. 400: the backend's Jackson mapping of the array fails on one element
+(`GymAccessController.normalizeBulkSaveGymAccessHistoryPayload`). 409: the backend's
+`GlobalExceptionHandler.handleDataIntegrity` maps a `DataIntegrityViolationException` to
+`409 CONFLICT`, and one bad row in `bulkSaveGymAccessHistory`'s `saveAll` rolls back the whole
+batch. Before this, a 409 fell into the whole-batch retry and the same 200 rows were re-sent
+every tick forever. Isolation is unchanged otherwise: sequential, at most one request per row of
+the batch (≤ `UPLOAD_BATCH_SIZE`), and it stops at the first row that fails any other way
+(that row and the rest stay retryable). A single-row batch is quarantined without a second
+request. `[CODE: backend GlobalExceptionHandler.handleDataIntegrity, identical on backend
+`main` and `claude/r0-turnstile-status`]` `[TEST: test_access_history_400_isolation.py::
+test_http_409_isolates_the_poison_row_like_400, ::test_single_row_409_is_quarantined_without_a_second_request,
+::test_a_row_409d_alone_during_a_400_isolation_is_quarantined_and_isolation_continues,
+::test_http_422_still_keeps_the_whole_batch_retryable]` `[UNVERIFIED]` No 409 from this endpoint
+has been observed in a field log. The backend's own unit test
+(`GymAccessHistoryIdentityResolutionTest::saveAllFailurePropagatesRatherThanReportingSuccess`)
+calls the controller directly, without Spring's dispatcher, so its comment "the client sees a
+5xx" is not evidence; the handler mapping above says 409. The P1b backend change (duplicates
+always succeed) removes the most likely cause; this client rule covers old/new server mismatches.
 
 `backend_unresolved_count` is a separate column because `backend_attempt_count` and
 `backend_failure_count` both rise on outages too — a bound on either would expire real events

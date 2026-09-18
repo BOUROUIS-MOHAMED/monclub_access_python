@@ -47,6 +47,15 @@ UNRESOLVED_RETRY_MAX_SECONDS = 24 * 3600
 # (the first three are >= 300 s and 600 s of backoff apart) before it is given up on. POLICY.
 UNRESOLVED_MIN_VERDICTS_TO_EXPIRE = 3
 
+# HTTP statuses that are a batch-level verdict for a row-level fault: one bad row fails
+# the whole request. The batch is isolated row by row, and a row that gets one of these
+# ALONE is quarantined as terminal. 400: the backend's Jackson mapping of the array fails
+# on one element (GymAccessController.normalizeBulkSaveGymAccessHistoryPayload). 409: its
+# GlobalExceptionHandler maps a DataIntegrityViolationException escaping saveAll to 409
+# CONFLICT, and saveAll rolls back the whole batch. Every other status (401/403/422/5xx)
+# and every network failure is not the rows' fault and keeps the whole-batch retry.
+_ROW_VERDICT_HTTP_STATUSES = frozenset({400, 409})
+
 # Response keys whose tokens are per-row RETRYABLE verdicts. Shared by _parse_upload_response
 # and _named_retry_row_ids so the two can never disagree about what counts as a verdict.
 _RETRY_TOKEN_KEYS = (
@@ -1045,16 +1054,17 @@ class DeviceAttendanceMaintenanceEngine:
         row_ids_by_local: Dict[str, int],
         attempted_at: str,
         batch_error: str,
+        batch_status: int = 400,
     ) -> Dict[str, Any]:
-        """After a batch HTTP 400, post each row alone to find the one(s) the backend
-        cannot map.
+        """After a batch HTTP 400 or 409 (``_ROW_VERDICT_HTTP_STATUSES``), post each row
+        alone to find the one(s) the backend refuses.
 
         - A row that succeeds alone is marked synced.
-        - A row that is 400'd alone IS a poison row: it is marked TERMINAL (it leaves
-          the retry queue for good) and logged in full so the cause is visible. The
-          backend's reason -- which names the offending field since 2026-09-02 -- is
-          stored on the row.
-        - Any other failure mid-way (network, 5xx) is not the rows' fault: that row
+        - A row that gets a 400 or 409 alone IS a poison row: it is marked TERMINAL (it
+          leaves the retry queue for good) and logged in full so the cause is visible.
+          The backend's reason -- which names the offending field since 2026-09-02 -- is
+          stored on the row, with the real status.
+        - Any other failure mid-way (network, 5xx, 422) is not the rows' fault: that row
           and every row not yet attempted are marked retryable and the loop stops,
           so a flapping backend is never hammered with N requests.
 
@@ -1074,15 +1084,15 @@ class DeviceAttendanceMaintenanceEngine:
             )
             failed = mark_access_history_sync_failure(
                 row_ids=[only_id] if only_id > 0 else attempted_ids,
-                error=f"rejected by backend (HTTP 400): {batch_error}",
+                error=f"rejected by backend (HTTP {batch_status}): {batch_error}",
                 retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
                 terminal=True,
                 attempted_at=attempted_at,
             )
             return {"uploaded": 0, "failed": failed}
         self.logger.warning(
-            "[DeviceAttendance] batch of %d rejected with HTTP 400 -- isolating the poison row(s): %s",
-            len(items), batch_error,
+            "[DeviceAttendance] batch of %d rejected with HTTP %s -- isolating the poison row(s): %s",
+            len(items), batch_status, batch_error,
         )
         uploaded = 0
         failed = 0
@@ -1096,7 +1106,8 @@ class DeviceAttendanceMaintenanceEngine:
             try:
                 response = api.sync_access_history(token=token, payload=[item], timeout=15)
             except MonClubApiHttpError as row_exc:
-                if getattr(row_exc, "status_code", None) == 400:
+                row_status = getattr(row_exc, "status_code", None)
+                if row_status in _ROW_VERDICT_HTTP_STATUSES:
                     # This row alone is refused: quarantine it and say exactly what it was.
                     self.logger.error(
                         "[DeviceAttendance] access history row REJECTED by backend (quarantined, "
@@ -1105,7 +1116,7 @@ class DeviceAttendanceMaintenanceEngine:
                     )
                     failed += mark_access_history_sync_failure(
                         row_ids=[row_id],
-                        error=f"rejected by backend (HTTP 400): {row_exc}",
+                        error=f"rejected by backend (HTTP {row_status}): {row_exc}",
                         retry_after_seconds=UPLOAD_FAILURE_RETRY_SECONDS,
                         terminal=True,
                         attempted_at=attempted_at,
@@ -1237,14 +1248,18 @@ class DeviceAttendanceMaintenanceEngine:
             # meant the same poisoned batch was re-sent, and re-rejected, every 300s,
             # so one bad row silenced the gym's entire door history indefinitely
             # (OXYGENE_FIT, 2026-08-30: upload_failed=28, recurring). Isolate instead.
+            # HTTP 409 is the same shape -- one row's constraint violation rolls back the
+            # whole saveAll -- and is isolated the same way (_ROW_VERDICT_HTTP_STATUSES).
             #
-            # Any OTHER status (401/403/5xx) is not the rows' fault: keep the old
+            # Any OTHER status (401/403/422/5xx) is not the rows' fault: keep the old
             # whole-batch retry.
-            if getattr(exc, "status_code", None) == 400:
+            batch_status = getattr(exc, "status_code", None)
+            if batch_status in _ROW_VERDICT_HTTP_STATUSES:
                 return self._isolate_rejected_rows(
                     api=api, token=token_value, items=items, attempted_ids=attempted_ids,
                     row_ids_by_event=row_ids_by_event, row_ids_by_local=row_ids_by_local,
                     attempted_at=attempted_at, batch_error=str(exc),
+                    batch_status=int(batch_status),
                 )
             mark_access_history_sync_failure(
                 row_ids=attempted_ids,

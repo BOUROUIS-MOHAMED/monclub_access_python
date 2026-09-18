@@ -171,6 +171,80 @@ def test_isolation_stops_on_non_400_and_leaves_the_rest_retryable() -> None:
     assert result == {"uploaded": 1, "failed": 1}
 
 
+def test_http_409_isolates_the_poison_row_like_400() -> None:
+    # The backend's GlobalExceptionHandler answers 409 CONFLICT for a
+    # DataIntegrityViolationException escaping saveAll -- one bad row rolls back the
+    # whole batch, exactly the batch-level-verdict-for-a-row-level-fault shape of 400.
+    # Before 2026-09-18 a 409 fell into the whole-batch retry and the same 200 rows
+    # were re-sent forever.
+    good, bad = _row(41, "evt-41"), _row(43, "evt-43")
+    fake_api = MagicMock()
+
+    def _post(*, token, payload, timeout=15):
+        ids = [it["localRowId"] for it in payload]
+        if len(ids) > 1 or ids == [43]:
+            raise _http(409, '{"code":"DATA_INTEGRITY","message":"Data integrity violation"}')
+        return {"ok": True}
+
+    fake_api.sync_access_history.side_effect = _post
+    result, synced, failed = _run_upload([good, bad], fake_api)
+
+    assert fake_api.sync_access_history.call_count == 3, "batch + one request per row"
+    assert synced.call_args.kwargs["row_ids"] == [41]
+    kw = failed.call_args.kwargs
+    assert kw["row_ids"] == [43] and kw["terminal"] is True
+    assert "409" in kw["error"] and "400" not in kw["error"], "the stored reason names the real status"
+    assert result == {"uploaded": 1, "failed": 1}
+
+
+def test_single_row_409_is_quarantined_without_a_second_request() -> None:
+    fake_api = MagicMock()
+    fake_api.sync_access_history.side_effect = _http(409, "Data integrity violation")
+    result, synced, failed = _run_upload([_row(41, "evt-41")], fake_api)
+
+    assert fake_api.sync_access_history.call_count == 1, "the batch IS the row; no re-post"
+    synced.assert_not_called()
+    kw = failed.call_args.kwargs
+    assert kw["row_ids"] == [41] and kw["terminal"] is True
+    assert "409" in kw["error"] and "400" not in kw["error"]
+    assert result == {"uploaded": 0, "failed": 1}
+
+
+def test_a_row_409d_alone_during_a_400_isolation_is_quarantined_and_isolation_continues() -> None:
+    rows = [_row(41, "evt-41"), _row(43, "evt-43"), _row(45, "evt-45")]
+    fake_api = MagicMock()
+
+    def _post(*, token, payload, timeout=15):
+        ids = [it["localRowId"] for it in payload]
+        if len(ids) > 1:
+            raise _http(400, "Invalid access history payload.")
+        if ids == [43]:
+            raise _http(409, "Data integrity violation")
+        return {"ok": True}
+
+    fake_api.sync_access_history.side_effect = _post
+    result, synced, failed = _run_upload(rows, fake_api)
+
+    assert fake_api.sync_access_history.call_count == 4, "batch, 41, 43, 45"
+    assert [c.kwargs["row_ids"] for c in synced.call_args_list] == [[41], [45]]
+    kw = failed.call_args.kwargs
+    assert kw["row_ids"] == [43] and kw["terminal"] is True
+    assert result == {"uploaded": 2, "failed": 1}
+
+
+def test_http_422_still_keeps_the_whole_batch_retryable() -> None:
+    # Only 400 and 409 are row-shaped verdicts. Everything else keeps the old rule.
+    rows = [_row(41, "evt-41"), _row(43, "evt-43")]
+    fake_api = MagicMock()
+    fake_api.sync_access_history.side_effect = _http(422, "unprocessable")
+    result, synced, failed = _run_upload(rows, fake_api)
+
+    assert fake_api.sync_access_history.call_count == 1
+    kw = failed.call_args.kwargs
+    assert kw["row_ids"] == [41, 43] and kw["terminal"] is False
+    assert result == {"uploaded": 0, "failed": 2}
+
+
 def test_unparseable_event_time_uses_fallback_instead_of_forwarding_junk() -> None:
     # Junk (month 00) is no longer forwarded for the backend's LocalDateTime to choke on.
     assert _normalize_datetime_text("2026-00-30 13:51:31", fallback="2026-08-30 14:01:00") == "2026-08-30T14:01:00"
