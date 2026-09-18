@@ -39,6 +39,7 @@ from app.core.db import (
 )
 from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
+from app.core import push_safety as _push_safety
 from app.sdk.pullsdk import PullSDKDevice
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
@@ -190,7 +191,8 @@ _ZKEM_INVALID_EVENT_TYPE = "zkem_invalid"
 # for lives in `trigger_hint`, and `sync_observability.is_explicit_user_sync`
 # already folds it into one predicate; the app layer evaluates that predicate once
 # and the answer travels with the request.
-_MIRROR_MAX_DELETE_FRACTION = 0.25
+# Single source since P3a-2: app/core/push_safety.py (one ceiling for every removal).
+_MIRROR_MAX_DELETE_FRACTION = _push_safety.MAX_DELETE_FRACTION
 _MIRROR_RESERVED_PIN_FLOOR = 90000
 _MIRROR_ENROLL_GRACE_SEC = 600.0
 
@@ -203,7 +205,7 @@ _MIRROR_ENROLL_GRACE_SEC = 600.0
 # once the roster is big enough for it to be the larger figure (>40 members).
 # Together they still refuse the case that matters: a truncated roster presenting
 # hundreds of members as departed.
-_REVOKE_ABSOLUTE_FLOOR = 10
+_REVOKE_ABSOLUTE_FLOOR = _push_safety.REVOKE_ABSOLUTE_FLOOR
 
 # Per-member ownership while an authoritative revoke crosses a full-sync
 # attempt. RETRY is deliberately inert: it protects against ordinary-sync

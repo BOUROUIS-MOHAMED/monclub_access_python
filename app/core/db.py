@@ -283,6 +283,9 @@ class _DbWriteJob:
     result: Any = None
     error: BaseException | None = None
     profile: Dict[str, Any] | None = None
+    # Commit with PRAGMA synchronous=FULL (see _run_db_write_sync). Only the
+    # write-ahead push intents use it.
+    durable: bool = False
 
 
 def _record_db_write_profile(label: str, profile: Dict[str, Any]) -> None:
@@ -370,6 +373,14 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
                 "writer_thread": threading.current_thread().name,
             }
             try:
+                if job.durable:
+                    # SQLite refuses to change the safety level inside a transaction
+                    # ("Safety level may not be changed inside a transaction"), so it
+                    # is set here, before BEGIN, and put back in the finally below.
+                    # A failure raises into the except: the caller is told the write
+                    # failed rather than getting a silently non-durable commit.
+                    conn.execute("PRAGMA synchronous=FULL")
+                    profile["durable"] = True
                 begin_started = time.perf_counter()
                 conn.execute("BEGIN IMMEDIATE")
                 profile["begin_wait_ms"] = round((time.perf_counter() - begin_started) * 1000.0, 3)
@@ -395,6 +406,11 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
                 profile["error"] = repr(exc)
                 job.error = exc
             finally:
+                if job.durable:
+                    try:
+                        conn.execute("PRAGMA synchronous=NORMAL")
+                    except Exception:
+                        pass
                 _record_db_write_profile(job.label, profile)
                 # Log if processing was slow OR if the job waited long in queue.
                 # queue_wait_ms is NOT included in total_ms, so we check both.
@@ -448,8 +464,24 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
 def _run_db_write_sync(
     label: str,
     operation: Callable[[sqlite3.Connection, Dict[str, Any]], Any],
+    *,
+    durable: bool = False,
 ) -> Any:
+    """Run ``operation`` in one transaction on the DbWriter thread.
+
+    ``durable=True`` commits with ``PRAGMA synchronous=FULL`` for this job only.
+    Every connection here runs WAL with ``synchronous=NORMAL``: in that mode a
+    commit is not fsynced and can roll back after a power loss (the database stays
+    consistent; the last transactions are lost). Most gyms cut the power overnight,
+    so a record that must survive a power cut -- the write-ahead push intent, which
+    is committed BEFORE a device write and is the only proof that MonClub may have
+    put that member on the turnstile -- needs FULL, which syncs the WAL on commit.
+    A durable job cannot be nested inside another write job (the safety level
+    cannot change inside a transaction), so the inline path below refuses it.
+    """
     if getattr(_db_writer_local, "ident", None) == threading.get_ident():
+        if durable:
+            raise RuntimeError(f"durable DB write '{label}' cannot run inside another write job")
         conn = getattr(_db_writer_local, "connection", None)
         if conn is None:
             raise RuntimeError("DB writer thread missing active connection")
@@ -468,7 +500,7 @@ def _run_db_write_sync(
         return result
 
     work_q = _ensure_db_writer()
-    job = _DbWriteJob(label=str(label), operation=operation)
+    job = _DbWriteJob(label=str(label), operation=operation, durable=bool(durable))
     work_q.put(job)
     if not job.done.wait(timeout=60.0):
         raise TimeoutError(f"Timed out waiting for DB writer job '{label}'")
@@ -1718,6 +1750,38 @@ def init_db() -> None:
                        "fail_streak INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "device_sync_state", "last_attempt_hash",
                        "last_attempt_hash TEXT")
+
+        # ---- P3a-2: write-ahead push intent (guide §3.4a) ----
+        # One row per (device, pin) that MonClub is ABOUT to write, committed
+        # durably (synchronous=FULL) BEFORE the device write. ownership_confirmed is
+        # only set after a push is confirmed, so a crash or power cut between the
+        # device write and that confirmation used to leave a member on the turnstile
+        # that MonClub could never prove it owned -- and so never remove. The intent
+        # records what we wrote (name/card as sent on the wire); a read-back that
+        # finds exactly that at the pin turns it into ownership.
+        #
+        # Deliberately NOT a state on device_sync_state: last_ok defaults to 1 there
+        # and the migration below promotes last_ok=1 rows to owned on every start,
+        # which would turn an unconfirmed intent into ownership with no proof; and
+        # prune_device_sync_state would erase it. Nothing prunes this table; a row
+        # leaves only when the pin is confirmed (ok=1 state write), removed, dropped
+        # because a read-back proved the pin absent, or promoted by a read-back.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_push_intent (
+                device_id INTEGER NOT NULL,
+                pin TEXT NOT NULL,
+                intent_name TEXT NOT NULL DEFAULT '',
+                intent_card TEXT NOT NULL DEFAULT '',
+                intent_hash TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                readback_misses INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (device_id, pin)
+            );
+            """
+        )
 
         # ---- F11: per-finger push outcome, so a gym can SEE a fingerprint that
         # never reached the door. device_sync_state is per-PIN; lastPushError on the
@@ -7463,6 +7527,14 @@ def save_device_sync_state_batch(
             """,
             params_list,
         )
+        # A confirmed push (ok=1 sets ownership_confirmed=1 above) resolves the
+        # write-ahead intent of that pin, in the same transaction.
+        confirmed = [(did, p[1]) for p in params_list if p[3] == 1]
+        if confirmed:
+            conn.executemany(
+                "DELETE FROM device_push_intent WHERE device_id=? AND pin=?",
+                confirmed,
+            )
         profile["rows"] = len(params_list)
         return len(params_list)
 
@@ -7513,6 +7585,11 @@ def save_device_sync_state(*, device_id: int, pin: str, desired_hash: str | None
             """,
             (did, p, dh, ok_i, err, now_iso(), ok_i, 0 if ok_i else 1, dh),
         )
+        if ok_i:
+            # Confirmed: the write-ahead intent of this pin is resolved.
+            conn.execute(
+                "DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p),
+            )
 
     _run_db_write_sync("save_device_sync_state", _write)
 
@@ -7524,6 +7601,8 @@ def delete_device_sync_state(*, device_id: int, pin: str) -> None:
         return
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute("DELETE FROM device_sync_state WHERE device_id=? AND pin=?", (did, p))
+        # Every caller removed the pin from the device first; its intent is moot.
+        conn.execute("DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p))
 
     _run_db_write_sync("delete_device_sync_state", _write)
 
@@ -7544,10 +7623,233 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
             "DELETE FROM device_content_mirror WHERE device_id=? AND pin=?",
             (did, p),
         )
+        intent_cur = conn.execute(
+            "DELETE FROM device_push_intent WHERE device_id=? AND pin=?",
+            (did, p),
+        )
         profile["sync_rows"] = max(0, int(sync_cur.rowcount or 0))
         profile["mirror_rows"] = max(0, int(mirror_cur.rowcount or 0))
+        profile["intent_rows"] = max(0, int(intent_cur.rowcount or 0))
 
     _run_db_write_sync("clear_device_revocation_state", _write)
+
+
+# ----------------------------------------------------------------------------- #
+# P3a-2 write-ahead push intent (guide §3.4a). Table created in init_db.
+# ----------------------------------------------------------------------------- #
+
+def record_push_intents(
+    *,
+    device_id: int,
+    rows: "Iterable[tuple[str, str, str, str]]",
+    protocol: str,
+) -> int:
+    """Durably record that MonClub is about to write these pins to this device.
+
+    ``rows`` are ``(pin, name, card, desired_hash)`` exactly as the device write
+    will carry them (the standalone driver's 24-char name and digits-only card;
+    PullSDK's Name/CardNo values), so a later read-back can compare like with like.
+    Committed with ``synchronous=FULL`` BEFORE the device write. Raises on failure:
+    a caller that cannot record the intent must not write the device.
+    """
+    did = int(device_id)
+    now = now_iso()
+    params: list[tuple] = []
+    seen: set[str] = set()
+    for row in rows or []:
+        pin = str(row[0] if row[0] is not None else "").strip()
+        if not pin or pin in seen:
+            continue
+        seen.add(pin)
+        params.append((
+            did, pin,
+            str(row[1] if len(row) > 1 and row[1] is not None else ""),
+            str(row[2] if len(row) > 2 and row[2] is not None else ""),
+            str(row[3] if len(row) > 3 and row[3] is not None else ""),
+            str(protocol or ""),
+            now, now,
+        ))
+    if not params:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            """
+            INSERT INTO device_push_intent
+                (device_id, pin, intent_name, intent_card, intent_hash, protocol,
+                 created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, pin) DO UPDATE SET
+                intent_name = excluded.intent_name,
+                intent_card = excluded.intent_card,
+                intent_hash = excluded.intent_hash,
+                protocol = excluded.protocol,
+                updated_at = excluded.updated_at,
+                readback_misses = 0
+            """,
+            params,
+        )
+        profile["rows"] = len(params)
+        return len(params)
+
+    return int(_run_db_write_sync("record_push_intents", _write, durable=True))
+
+
+def list_push_intents(*, device_id: int) -> Dict[str, Dict[str, Any]]:
+    """{pin: {name, card, hash, protocol, created_at, updated_at, readback_misses}}."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, intent_name, intent_card, intent_hash, protocol, created_at, "
+            "updated_at, readback_misses FROM device_push_intent WHERE device_id=?",
+            (did,),
+        ).fetchall()
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        p = str(r["pin"] or "").strip()
+        if not p:
+            continue
+        out[p] = {
+            "name": str(r["intent_name"] or ""),
+            "card": str(r["intent_card"] or ""),
+            "hash": str(r["intent_hash"] or ""),
+            "protocol": str(r["protocol"] or ""),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "readback_misses": int(r["readback_misses"] or 0),
+        }
+    return out
+
+
+def get_push_intent(*, device_id: int, pin: str) -> "Dict[str, Any] | None":
+    """One pin's intent (primary-key lookup), or None."""
+    did = int(device_id)
+    p = str(pin or "").strip()
+    if not p:
+        return None
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT intent_name, intent_card, intent_hash, protocol, readback_misses "
+            "FROM device_push_intent WHERE device_id=? AND pin=?",
+            (did, p),
+        ).fetchone()
+    if r is None:
+        return None
+    return {
+        "name": str(r["intent_name"] or ""),
+        "card": str(r["intent_card"] or ""),
+        "hash": str(r["intent_hash"] or ""),
+        "protocol": str(r["protocol"] or ""),
+        "readback_misses": int(r["readback_misses"] or 0),
+    }
+
+
+def promote_push_intents(*, device_id: int, pins: "Iterable[str]") -> int:
+    """A read-back found what MonClub wrote at these pins: they are MonClub's.
+
+    One transaction per call: each pin gets ownership_confirmed=1 with last_ok=0 (so
+    a still-desired member is re-pushed and a departed one is a normal removal
+    candidate), and its intent row is deleted. Only pins that still HAVE an intent
+    are promoted, so a stale caller cannot mint ownership for an arbitrary pin.
+    """
+    did = int(device_id)
+    wanted = sorted({str(p).strip() for p in (pins or []) if str(p or "").strip()})
+    if not wanted:
+        return 0
+    now = now_iso()
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        promoted = 0
+        for p in wanted:
+            has_intent = conn.execute(
+                "SELECT 1 FROM device_push_intent WHERE device_id=? AND pin=?", (did, p),
+            ).fetchone()
+            if not has_intent:
+                continue
+            conn.execute(
+                """
+                INSERT INTO device_sync_state
+                    (device_id, pin, desired_hash, last_ok, last_error, updated_at,
+                     pushed_finger_ids, ownership_confirmed, fail_streak, last_attempt_hash)
+                VALUES (?, ?, '', 0, 'ownership proven by read-back', ?, NULL, 1, 0, '')
+                ON CONFLICT(device_id, pin) DO UPDATE SET
+                    ownership_confirmed = 1,
+                    last_ok = 0,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                """,
+                (did, p, now),
+            )
+            conn.execute(
+                "DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p),
+            )
+            promoted += 1
+        profile["promoted"] = promoted
+        return promoted
+
+    return int(_run_db_write_sync("promote_push_intents", _write))
+
+
+def drop_push_intents(*, device_id: int, pins: "Iterable[str]") -> int:
+    """Forget intents a successful read-back proved moot (pin absent on the device)."""
+    did = int(device_id)
+    wanted = sorted({str(p).strip() for p in (pins or []) if str(p or "").strip()})
+    if not wanted:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        n = 0
+        for p in wanted:
+            cur = conn.execute(
+                "DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p),
+            )
+            n += max(0, int(cur.rowcount or 0))
+        profile["dropped"] = n
+        return n
+
+    return int(_run_db_write_sync("drop_push_intents", _write))
+
+
+def note_push_intent_misses(*, device_id: int, pins: "Iterable[str]") -> int:
+    """A read-back found a DIFFERENT user at these pins: keep the intent, count it."""
+    did = int(device_id)
+    wanted = sorted({str(p).strip() for p in (pins or []) if str(p or "").strip()})
+    if not wanted:
+        return 0
+    now = now_iso()
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        n = 0
+        for p in wanted:
+            cur = conn.execute(
+                "UPDATE device_push_intent SET readback_misses = readback_misses + 1, "
+                "updated_at=? WHERE device_id=? AND pin=?",
+                (now, did, p),
+            )
+            n += max(0, int(cur.rowcount or 0))
+        return n
+
+    return int(_run_db_write_sync("note_push_intent_misses", _write))
+
+
+@_tel.timed("DB_READ_device_sync_ownership_for_pin", slow_ms=200, warn_ms=2000)
+def get_device_sync_ownership_for_pin(*, device_id: int, pin: str) -> bool:
+    """True when MonClub has AFFIRMATIVELY written this pin to this device.
+
+    Primary-key point query (a targeted revoke must not read the whole device's
+    state). No row, or ownership_confirmed=0, is False. A database error RAISES, so
+    the caller can tell "not owned" (final) from "cannot tell" (retry) -- guide §3.4.
+    """
+    did = int(device_id)
+    p = str(pin or "").strip()
+    if not p:
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT ownership_confirmed FROM device_sync_state WHERE device_id=? AND pin=?",
+            (did, p),
+        ).fetchone()
+    return bool(row is not None and int(row["ownership_confirmed"] or 0) == 1)
 
 
 def upsert_fingerprint_push_status(
