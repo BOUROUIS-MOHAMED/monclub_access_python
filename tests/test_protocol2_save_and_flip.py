@@ -687,7 +687,7 @@ def test_gym_date_status_says_when_a_flip_is_needed_without_writing(db):
     _seed_full_v2(db)
     s = db.gym_date_status(pc_now_epoch=_epoch("2026-09-19T12:00:00+01:00"))
     assert s == {"gym_date": "2026-09-19", "applied_date": None, "suspect": False, "reason": "",
-                 "needs_flip": True}
+                 "needs_flip": True, "grace_days": 0}
     assert db.get_access_v2_state()["applied_date"] is None          # read-only
     _flip(db, "2026-09-19T12:00:00+01:00")
     assert db.gym_date_status(pc_now_epoch=_epoch("2026-09-19T15:00:00+01:00"))["needs_flip"] is False

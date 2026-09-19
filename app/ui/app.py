@@ -1698,20 +1698,34 @@ class MainApp:
         except Exception:
             self.logger.warning("[DATE] first-day credentials sync request failed", exc_info=True)
 
+    def _date_flip_needed(self, status: Dict[str, Any] | None) -> bool:
+        """The precheck's verdict, plus a change of the offline grace setting since the last
+        flip (a config PATCH writes self.cfg only; without this it would wait for the next day)."""
+        status = status or {}
+        if status.get("needs_flip"):
+            return True
+        applied_grace = status.get("grace_days")
+        if applied_grace is None:
+            return False
+        from app.core.config import offline_revoke_grace_days
+
+        return int(applied_grace) != offline_revoke_grace_days(self.cfg)
+
     def _maybe_apply_date_flips(self, source: str) -> None:
         """The cheap trigger (sync tick, heartbeat, 00:00:05): a read-only precheck, then a flip
-        only when the gym date or the clock verdict moved. Never raises."""
+        only when the gym date, the clock verdict or the grace setting moved. Never raises."""
         from app.core import db as _db
 
         try:
             status = _db.gym_date_status(pc_now_epoch=self._date_flip_now())
+            needed = self._date_flip_needed(status)
         except Exception as ex:
             try:
                 self.logger.debug("[DATE] precheck failed (source=%s): %s", source, ex)
             except Exception:
                 pass
             return None
-        if (status or {}).get("needs_flip"):
+        if needed:
             self._apply_date_flips(source)
         return None
 
@@ -1741,7 +1755,7 @@ class MainApp:
                 status = _db.gym_date_status(pc_now_epoch=self._date_flip_now())
             except Exception as ex:
                 self.logger.debug("[DATE] tick precheck failed: %s", ex)
-            if (status or {}).get("needs_flip"):
+            if status is not None and self._date_flip_needed(status):
                 self._spawn_date_flip_thread("tick", lambda: self._apply_date_flips("tick"))
         except Exception:
             self.logger.warning("[DATE] tick failed", exc_info=True)

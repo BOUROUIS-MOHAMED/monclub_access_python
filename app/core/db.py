@@ -1554,6 +1554,8 @@ def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
     """Read-only precheck for the frequent triggers: would apply_local_date_flips change
     anything? ``needs_flip`` when a state row exists and the evaluated gym date differs from
     applied_date, or the evaluated clock verdict (suspect, reason) from the persisted one.
+    ``grace_days`` is the offline grace the last flip applied (None without a state row): the
+    caller compares it with the configured one, which this module does not read.
     Writes nothing; a read error propagates to the caller."""
     from app.core import access_dates as _ad
 
@@ -1562,7 +1564,7 @@ def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
         state = dict(row) if row is not None else None
     if state is None:
         return {"gym_date": None, "applied_date": None, "suspect": False, "reason": "",
-                "needs_flip": False}
+                "needs_flip": False, "grace_days": None}
     g = _ad.evaluate_gym_date(clock_state_from_row(state), float(pc_now_epoch))
     gym_iso = _iso_or_none(g.gym_date)
     applied = state.get("applied_date")
@@ -1574,6 +1576,7 @@ def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
         "suspect": evaluated[0],
         "reason": evaluated[1],
         "needs_flip": gym_iso != applied or evaluated != persisted,
+        "grace_days": _to_int_or_none(state.get("grace_days")),
     }
 
 
