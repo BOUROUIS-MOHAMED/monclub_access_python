@@ -15,7 +15,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from access.storage import current_access_runtime_db_path
 from app.core import telemetry as _tel
@@ -766,6 +766,325 @@ def _refresh_member_account_links(cur: Any) -> None:
         """,
         (now_iso(),),
     )
+    _refresh_member_person_links(cur)
+
+
+def _refresh_member_person_links(cur: Any) -> None:
+    """Record every cached (activeMembershipId -> userId, mainAccountId) in member_person_link.
+
+    P3b-1 renewal ordering (guide §3.4f): when a MEMBERSHIP-pin turnstile loses a person's old
+    pin in the pass that writes their new one, the old pin's row is usually gone already, so its
+    person is read from here. Keyed on userId with NO mainAccountId filter: MEMBERSHIP-pin gyms
+    are exactly where main_account_id can still be NULL (§3.2d). Never deleted; a plain upsert.
+    A database without the table (one built without init_db) is skipped, never failed: this
+    runs inside every member write, which must not roll back over a missing side table.
+    """
+    try:
+        _refresh_member_person_links_sql(cur)
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        logging.getLogger(__name__).debug(
+            "[DB] member_person_link absent -- person links not recorded (%s)", exc)
+
+
+def _refresh_member_person_links_sql(cur: Any) -> None:
+    cur.execute(
+        """
+        INSERT INTO member_person_link (active_membership_id, user_id, main_account_id, updated_at)
+        SELECT active_membership_id, user_id, main_account_id, ?
+        FROM sync_users
+        WHERE active_membership_id IS NOT NULL AND user_id IS NOT NULL
+        ON CONFLICT(active_membership_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            main_account_id = excluded.main_account_id,
+            updated_at = excluded.updated_at
+        WHERE member_person_link.user_id IS NOT excluded.user_id
+           OR member_person_link.main_account_id IS NOT excluded.main_account_id
+        """,
+        (now_iso(),),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sync protocol 2 (P3b-1, guide §3.8): validity windows, the upcoming list, held rows, the clock
+# ---------------------------------------------------------------------------
+# The columns of sync_users_held beyond the sync_users row it keeps.
+_HELD_EXTRA_COLUMNS: tuple[str, ...] = ("held_reason", "held_for_date", "held_at")
+
+
+def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
+    """The P3b-1 tables. Called inside init_db's single transaction, after sync_users exists.
+
+    * access_v2_state -- ONE row: the last syncMeta, whether the stored windows are trusted,
+      the clock measurements and the gym date last applied. NOT cleared by clear_version_tokens:
+      logout/hard reset drop the lists (and ``trusted``), never the clock floor.
+    * member_access_window -- the window of every membership of today's set, replaced whole on
+      every members section.
+    * sync_upcoming_users / sync_upcoming_credentials -- upcoming[] and upcomingCredentials exactly
+      as last sent (the contract: replaced atomically, never edited by the PC).
+    * sync_users_held -- rows of today's set the PC took off its roster for a later gym date
+      (expired, a freeze day). Same columns as sync_users (_SYNC_USER_COLUMNS) plus
+      _HELD_EXTRA_COLUMNS: a hold/restore is a column-for-column copy, never a re-encode.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS access_v2_state (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            trusted           INTEGER NOT NULL DEFAULT 0,
+            server_today      TEXT,
+            horizon_days      INTEGER,
+            horizon_end       TEXT,
+            server_time       TEXT,
+            server_epoch      REAL,
+            utc_offset_sec    INTEGER,
+            snapshot_at       TEXT,
+            reconcile_sec     INTEGER,
+            capabilities_json TEXT,
+            pc_epoch_at_sync  REAL,
+            skew_sec          REAL,
+            floor_date        TEXT,
+            max_pc_epoch      REAL,
+            applied_date      TEXT,
+            grace_days        INTEGER NOT NULL DEFAULT 0,
+            clock_suspect     INTEGER NOT NULL DEFAULT 0,
+            clock_reason      TEXT,
+            updated_at        TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS member_access_window (
+            active_membership_id    INTEGER PRIMARY KEY,
+            access_from             TEXT    NOT NULL,
+            access_until            TEXT    NOT NULL,
+            off_days_json           TEXT    NOT NULL DEFAULT '[]',
+            off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_upcoming_users (
+            active_membership_id    INTEGER PRIMARY KEY,
+            payload_json            TEXT    NOT NULL,
+            access_from             TEXT    NOT NULL,
+            access_until            TEXT    NOT NULL,
+            off_days_json           TEXT    NOT NULL DEFAULT '[]',
+            off_days_beyond_horizon INTEGER NOT NULL DEFAULT 0,
+            qr_account_id           INTEGER
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_upcoming_credentials (
+            id INTEGER,
+            gym_id INTEGER,
+            account_id INTEGER,
+            secret_hex TEXT,
+            enabled INTEGER,
+            rotated_at TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            granted_active_membership_ids_json TEXT
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_users_held (
+            user_id INTEGER,
+            active_membership_id INTEGER PRIMARY KEY,
+            membership_id INTEGER,
+            full_name TEXT,
+            phone TEXT,
+            email TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            first_card_id TEXT,
+            second_card_id TEXT,
+            image TEXT,
+            fingerprints_json TEXT,
+            face_id TEXT,
+            account_username_id TEXT,
+            qr_code_payload TEXT,
+            birthday TEXT,
+            image_source TEXT,
+            user_image_status TEXT,
+            user_profile_image TEXT,
+            main_account_id INTEGER,
+            held_reason TEXT,
+            held_for_date TEXT,
+            held_at TEXT
+        );
+        """
+    )
+
+
+def get_access_v2_state() -> Dict[str, Any]:
+    """The access_v2_state row as a dict ({} when there is none yet or it cannot be read).
+
+    Booleans are real bools; ``capabilities`` is decoded from ``capabilities_json``.
+    """
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT * FROM access_v2_state WHERE id = 1").fetchone()
+    except Exception:
+        return {}
+    if row is None:
+        return {}
+    d = dict(row)
+    d["trusted"] = bool(d.get("trusted"))
+    d["clock_suspect"] = bool(d.get("clock_suspect"))
+    try:
+        caps = json.loads(d.get("capabilities_json") or "[]")
+        d["capabilities"] = caps if isinstance(caps, list) else []
+    except Exception:
+        d["capabilities"] = []
+    return d
+
+
+def clock_state_from_row(row: Mapping[str, Any]):
+    """access_dates.ClockState from an access_v2_state row (missing fields are None)."""
+    from app.core import access_dates as _ad
+
+    def _f(key):
+        v = row.get(key) if row else None
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    off = row.get("utc_offset_sec") if row else None
+    try:
+        off = int(off) if off is not None else None
+    except (TypeError, ValueError):
+        off = None
+    return _ad.ClockState(
+        server_today=_ad.parse_iso_date(row.get("server_today")) if row else None,
+        server_epoch=_f("server_epoch"),
+        utc_offset_sec=off,
+        skew_sec=_f("skew_sec"),
+        floor_date=_ad.parse_iso_date(row.get("floor_date")) if row else None,
+        max_pc_epoch=_f("max_pc_epoch"),
+    )
+
+
+def _window_from_columns(access_from, access_until, off_days_json, beyond):
+    from app.core import access_dates as _ad
+    try:
+        off = json.loads(off_days_json or "[]")
+    except Exception:
+        return None
+    return _ad.parse_window({"accessFrom": access_from, "accessUntil": access_until,
+                             "offDays": off, "offDaysBeyondHorizon": bool(beyond)})
+
+
+def _read_protocol2_windows(conn: Any) -> tuple[Dict[int, Any], Dict[int, Any], Dict[int, int]]:
+    """(today_windows, upcoming_windows, upcoming_qr_account) from the stored tables."""
+    today: Dict[int, Any] = {}
+    for r in conn.execute(
+        "SELECT active_membership_id, access_from, access_until, off_days_json, "
+        "off_days_beyond_horizon FROM member_access_window"
+    ).fetchall():
+        w = _window_from_columns(r[1], r[2], r[3], r[4])
+        if w is not None:
+            today[int(r[0])] = w
+    upcoming: Dict[int, Any] = {}
+    qr: Dict[int, int] = {}
+    for r in conn.execute(
+        "SELECT active_membership_id, access_from, access_until, off_days_json, "
+        "off_days_beyond_horizon, qr_account_id FROM sync_upcoming_users"
+    ).fetchall():
+        w = _window_from_columns(r[1], r[2], r[3], r[4])
+        if w is not None:
+            upcoming[int(r[0])] = w
+            if r[5] is not None:
+                qr[int(r[0])] = int(r[5])
+    return today, upcoming, qr
+
+
+def load_access_days_snapshot():
+    """access_dates.AccessDaysSnapshot for the QR check: the gym date LAST APPLIED by a flip
+    (never a date the roster does not reflect yet), today's windows and the upcoming list.
+
+    Returns None when nothing can be read. An untrusted state yields a snapshot whose
+    ``active`` is False, i.e. no date check (a v1 PC's behaviour).
+    """
+    from app.core import access_dates as _ad
+    try:
+        with get_conn() as conn:
+            row = conn.execute("SELECT * FROM access_v2_state WHERE id = 1").fetchone()
+            state = dict(row) if row is not None else {}
+            today, upcoming, qr = _read_protocol2_windows(conn)
+    except Exception:
+        return None
+    windows = dict(upcoming)
+    windows.update(today)          # a membership in both is today's
+    try:
+        grace = max(0, int(state.get("grace_days") or 0))
+    except (TypeError, ValueError):
+        grace = 0
+    return _ad.AccessDaysSnapshot(
+        trusted=bool(state.get("trusted")),
+        gym_date=_ad.parse_iso_date(state.get("applied_date")),
+        server_today=_ad.parse_iso_date(state.get("server_today")),
+        horizon_end=_ad.parse_iso_date(state.get("horizon_end")),
+        grace_days=grace,
+        windows=windows,
+        upcoming_qr_account=qr,
+    )
+
+
+def list_sync_upcoming_credentials() -> List[Dict[str, Any]]:
+    """upcomingCredentials as last stored, in the same camelCase shape as
+    list_sync_gym_access_credentials, plus ``notYetValid: True``. Stored disabled."""
+    try:
+        with get_conn() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM sync_upcoming_credentials").fetchall()]
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        c = _coerce_gym_access_credential_row_to_payload(_expand_gym_access_credential_json_fields(r))
+        c["notYetValid"] = True
+        out.append(c)
+    return out
+
+
+def count_member_cache_rows() -> int:
+    """sync_users + sync_users_held: what the server still counts as delivered to this PC.
+
+    Every check that compares the local member cache with the server's count must use this,
+    not count_sync_users(): a held row is still in the server's list (P3b-1).
+    """
+    return _count_rows("sync_users") + _count_rows("sync_users_held")
+
+
+def get_member_person_user_ids(
+    active_membership_ids: List[int] | set[int] | tuple[int, ...],
+) -> Dict[int, int]:
+    """activeMembershipId -> userId from member_person_link (answers after the row is gone)."""
+    normalized = sorted({int(m) for m in (active_membership_ids or []) if m is not None})
+    if not normalized:
+        return {}
+    out: Dict[int, int] = {}
+    try:
+        with get_conn() as conn:
+            for i in range(0, len(normalized), 500):
+                chunk = normalized[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for r in conn.execute(
+                    f"SELECT active_membership_id, user_id FROM member_person_link "
+                    f"WHERE active_membership_id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall():
+                    out[int(r[0])] = int(r[1])
+    except Exception:
+        return {}
+    return out
 
 
 def _sync_users_has_legacy_fingerprint(conn: sqlite3.Connection) -> bool:
@@ -2217,6 +2536,33 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_mal_account ON member_account_link(main_account_id);"
         )
+        # P3b-1: activeMembershipId -> the PERSON (userId, and mainAccountId when known), for
+        # renewal ordering on MEMBERSHIP-pin turnstiles (guide §3.4f). Same lifetime as
+        # member_account_link; written by _refresh_member_person_links. Back-filled from the
+        # rows already cached, once per start (INSERT OR IGNORE: a no-op when present).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS member_person_link (
+                active_membership_id INTEGER PRIMARY KEY,
+                user_id              INTEGER NOT NULL,
+                main_account_id      INTEGER,
+                updated_at           TEXT    NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mpl_user ON member_person_link(user_id);"
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO member_person_link
+                (active_membership_id, user_id, main_account_id, updated_at)
+            SELECT active_membership_id, user_id, main_account_id, ?
+            FROM sync_users
+            WHERE active_membership_id IS NOT NULL AND user_id IS NOT NULL
+            """,
+            (now_iso(),),
+        )
 
         # -----------------------------
         # sync observability
@@ -2297,6 +2643,8 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_push_pin_history_batch_id "
             "ON push_pin_history(batch_id);"
         )
+
+        _create_protocol2_tables(conn)
 
         conn.commit()
 
