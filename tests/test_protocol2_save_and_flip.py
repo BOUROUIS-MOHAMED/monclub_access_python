@@ -512,6 +512,32 @@ def test_a_hold_and_restore_round_trip_preserves_every_sync_users_column(db):
     assert _ids("sync_users_held") == set()
 
 
+def test_a_fast_patch_revocation_also_removes_the_held_row(db):
+    # A member held for a freeze day, then revoked by a fast-patch ENTITY_DELETE (one of the two
+    # authoritative sources, guide §3.4), must not come back with the next day's flip.
+    _seed_full_v2(db)
+    _flip(db, "2026-09-20T07:30:00+01:00")          # 2 is held: frozen on the 20th
+    assert 2 in _ids("sync_users_held")
+    db.apply_fast_patch_bundle({"bundleId": "b-del-2", "generatedAt": "2026-09-20T08:00:00Z",
+                                "items": [{"kind": "ENTITY_DELETE", "entityType": "ACTIVE_MEMBERSHIP",
+                                           "entityId": 2, "revision": "2026-09-20T08:00:00Z"}]})
+    assert 2 not in _ids("sync_users_held")
+    r = _flip(db, "2026-09-21T07:30:00+01:00")
+    assert r["restored"] == 0 and 2 not in _ids("sync_users")
+
+
+def test_a_held_id_a_fast_patch_put_back_keeps_the_fresher_row_at_the_next_delta(db):
+    _seed_full_v2(db)
+    _hold(2)
+    db.apply_fast_patch_bundle({"bundleId": "b-up-2", "generatedAt": "2026-09-19T11:00:00Z",
+                                "items": [{"kind": "ENTITY_UPSERT", "entityType": "ACTIVE_MEMBERSHIP",
+                                           "entityId": 2, "revision": "2026-09-19T11:00:00Z",
+                                           "payload": {"member": _row(2, fullName="FRESH")}}]})
+    db.save_sync_cache_delta(_v2([], delta=True, valid=[1, 2, 5]), MEMBERS_ONLY)
+    assert _user_row(2)["full_name"] == "FRESH"
+    assert _ids("sync_users_held") == set()
+
+
 def test_the_generation_moves_only_when_something_moved(db):
     _seed_full_v2(db)
     _flip(db, "2026-09-20T07:30:00+01:00")
