@@ -563,7 +563,7 @@ grep -F "[T] RENEWAL_HOLD" app-*.log
 | `DATE_FLIP` | `source` / `ultra` / `skipped` | what ran it (`startup`, `midnight`, `tick`, `sync-tick`, `save`, `fast-patch`, `heartbeat`) / `True` = the turnstiles were asked to update (never in manual sync mode) / at start-up only: why nothing could move (`no_state` = no protocol-2 sync yet, `untrusted` = the last answer was v1 or refused) |
 | `DATE_FLIP_FAILED` | `err` | the date change failed (e.g. database busy); nothing changed, the next minute retries |
 | `CLOCK_SUSPECT` | `reason` | `behind`: the PC clock is earlier than a time it already saw (flat battery, wrong manual change); `ahead`: more than a day ahead of the server at the last sync. The day then stays at the last known one; nobody is re-admitted |
-| `RENEWAL_HOLD` | `held` / `removed_after_push` / `kept` | old pins of renewing members set aside / removed once the new pin landed / still kept (the new pin failed or waits — the member still enters) |
+| `RENEWAL_HOLD` | `held` / `removed_after_push` / `kept` | old pins of renewing members set aside / removed once the new pin landed / still kept (the new pin failed or waits, or too many removals this pass — then `REVOKE_ABORTED path=renewal_release`; the member still enters, a later pass removes it) |
 
 The Access UI shows « Horloge du PC suspecte » while the clock is suspect; fix the Windows date and
 time. `[CODE: app/core/db.py::apply_local_date_flips; access_dates.py::evaluate_gym_date]`
