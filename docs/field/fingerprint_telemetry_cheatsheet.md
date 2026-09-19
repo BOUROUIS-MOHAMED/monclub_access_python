@@ -512,8 +512,16 @@ grep -F "[T] QR_ROSTER_CHECK" app-*.log
 | `not_in_roster` | QR scans whose membership is **not** on the list — the would-be refusals in trial |
 | `roster_empty` | QR scans checked while the PC's list was empty — never refused, in any mode |
 | `roster_behind` | QR scans not on the list, but the list was older than the codes being checked (a refresh was catching up) — never refused |
-| `refused` | QR scans actually refused (only in enforce mode) |
+| `refused` | QR scans actually refused by the list check (only in enforce mode) |
+| `not_today` | QR scans refused because none of the code's memberships may enter today (expired, a freeze day, not started) — **in both modes**, once protocol 2 is on (P3b-1, guide §3.1b "Allowed days") |
 | `since` | when the counts started — they restart with the app |
+
+```bash
+# each QR scan refused on the allowed days (no member name or id in the line)
+grep -F "[T] QR_DATE_CHECK" app-*.log
+```
+
+The popup then reads « Abonnement non valable aujourd'hui ». `[CODE: access_verification.py::record_totp_roster_check]`
 
 To read it without visiting the gym: press "Sync logs now" in the dashboard header, wait
 up to ~10 min for the PC to upload, then open the newest window on the Access logs page and
@@ -526,6 +534,36 @@ config-nav-dashboard.tsx; backend AccessLogGymController]`
 
 To switch one device to enforce, its `deviceCapabilities` JSON must contain
 `"totpRosterCheckMode": "enforce"` (guide §3.1b). No dashboard field edits that JSON yet.
+
+---
+
+## 6b. Power-on dates, the PC clock, renewals (P3b-1)
+
+Once the server sends protocol 2 (switch `monclub.access.v2.enabled`), the PC applies the members'
+days itself — at start-up before any turnstile work, at midnight, and after every sync (guide §3.8).
+
+```bash
+# was protocol 2 refused (malformed answer)? the PC then behaves as before (no date changes)
+grep -F "[T] SYNC_V2_REJECTED" app-*.log
+
+# every date change the PC applied: who left (held), came back (restored), started (promoted)
+grep -F "[T] DATE_FLIP" app-*.log
+
+# the PC clock: suspect (behind the last sync, or more than a day ahead) and back to normal
+grep -E "\[T\] (CLOCK_SUSPECT|CLOCK_OK)" app-*.log
+
+# a renewing member's old pin kept until the new one was written (MEMBERSHIP pins)
+grep -F "[T] RENEWAL_HOLD" app-*.log
+```
+
+| Line | Field | Meaning |
+|---|---|---|
+| `DATE_FLIP` | `held` / `restored` / `promoted` | members taken off the list for the day (expired, freeze day) / put back (freeze over) / added (first day of a pre-sold plan) |
+| `CLOCK_SUSPECT` | `reason` | `behind`: the PC clock is earlier than a time it already saw (flat battery, wrong manual change); `ahead`: more than a day ahead of the server at the last sync. The day then stays at the last known one; nobody is re-admitted |
+| `RENEWAL_HOLD` | `held` / `removed_after_push` / `kept` | old pins of renewing members set aside / removed once the new pin landed / still kept (the new pin failed or waits — the member still enters) |
+
+The Access UI shows « Horloge du PC suspecte » while the clock is suspect; fix the Windows date and
+time. `[CODE: app/core/db.py::apply_local_date_flips; access_dates.py::evaluate_gym_date]`
 
 ---
 
