@@ -5595,6 +5595,10 @@ def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> None:
     if kind == "ENTITY_DELETE" and entity_type == "ACTIVE_MEMBERSHIP":
         active_membership_id = _to_int_or_none(item.get("entityId"))
         cur.execute("DELETE FROM sync_users WHERE active_membership_id = ?", (active_membership_id,))
+        # P3b-1: the same authoritative removal reaches a row the date flip had held (a freeze
+        # day, an expiry), or the next flip would restore a revoked member.
+        # [TEST: tests/test_protocol2_save_and_flip.py::test_a_fast_patch_revocation_also_removes_the_held_row]
+        cur.execute("DELETE FROM sync_users_held WHERE active_membership_id = ?", (active_membership_id,))
         return
 
     if kind == "ENTITY_UPSERT" and entity_type == "GYM_DEVICE":
