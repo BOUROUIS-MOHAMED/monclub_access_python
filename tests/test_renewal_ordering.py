@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import time
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -420,6 +421,55 @@ class TestStandaloneCeilingAndFailures:
         assert str(OLD) not in term.users, "no blank user written back at the pin"
         assert str(OLD) not in _state(db)
 
+    def test_a_new_pin_left_to_the_continuation_keeps_the_old_one_until_it_is_written(
+            self, db, monkeypatch, events):
+        """The per-pass cap (§3.4e) leaves the new pin for the next pass: never sent, so
+        never confirmed -- the old pin stays until the continuation writes the new one."""
+        monkeypatch.setattr(ue, "_FULL_SYNC_MAX_PINS_PER_PASS", 2)
+        term = RenewalTerminal()
+        _owned_on_terminal(db, term, OLD)
+        others = [_row(30002 + i, 901 + i, f"M{i}", str(800 + i)) for i in range(2)]
+        _flipped(db, [_row(OLD, PERSON)], others + [_row(NEW, PERSON)])
+        drv, w = _setup(monkeypatch, term, others + [_row(NEW, PERSON)])
+        try:
+            _pass(w)
+            assert _written(term, NEW) is None, "capped out: left to the continuation"
+            assert _deleted(term, OLD) is None and str(OLD) in _state(db)
+            [hold] = _named(events, "RENEWAL_HOLD")
+            assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
+            assert w._pending_full_sync_request is not None, "the continuation is queued"
+            mark = len(term.calls)
+            assert w._drain_full_sync_commands(limit=1) == 1
+        finally:
+            drv.disconnect()
+        written = _written(term, NEW, after=mark - 1)
+        deleted = _deleted(term, OLD, after=mark - 1)
+        assert written is not None and deleted is not None and written < deleted
+        assert str(OLD) not in term.users and str(OLD) not in _state(db)
+
+    def test_a_pass_that_stops_before_the_post_push_step_reports_its_removal_step_once(
+            self, db, monkeypatch, events):
+        """The removal step's report waits for the post-push removal of the holds; a pass
+        that raises in between still reports it, once. Without that report the drain read
+        the pass as one that never reported and re-armed the pending retry (errored)."""
+        term = RenewalTerminal()
+        _owned_on_terminal(db, term, OLD)
+        _flipped(db, [_row(OLD, PERSON)], [_row(NEW, PERSON)])
+        drv, w = _setup(monkeypatch, term, [_row(NEW, PERSON)])
+        w._removal_retry_streak = 1                  # a retry from an earlier pass is pending
+        w._removal_retry_at_mono = time.monotonic() + 30
+
+        def _boom(**_kw):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(w, "_backfill_pushed_fingers", _boom)
+        _run(drv, w)
+        assert w._on_full_sync_finished.call_args.kwargs["ok"] is False
+        assert _deleted(term, OLD) is None and str(OLD) in _state(db)
+        assert (w._removal_retry_at_mono, w._removal_retry_streak) == (None, 0), (
+            "the step ran and nothing it attempted failed: one report, which clears it")
+        [hold] = _named(events, "RENEWAL_HOLD")
+        assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
+
 
 # ═════════════════════════════ PullSDK (C3 panels) ═════════════════════════════
 
@@ -678,6 +728,60 @@ class TestPullSdkRenewal:
         deleted, written = _pull_delete_idx(sdk, OLD), _pull_write_idx(sdk, 5)
         assert deleted is not None and written is not None and deleted < written
         assert not _named(events, "RENEWAL_HOLD")
+
+    def test_the_batch_branch_deletes_the_old_pin_after_the_user_batch(self, sqlite_db, events):
+        """More than 5 pins: Phase A writes the user rows in a batch; Phase D sets the outcome."""
+        others = [_m(30002 + i, 901 + i, f"M{i}") for i in range(5)]
+        _flipped(sqlite_db, [_m(OLD, PERSON)], [_m(NEW, PERSON)] + others)
+        _tracked(sqlite_db, OLD)
+        sdk = _pull_sdk([str(OLD)])
+        _pull_pass([_m(NEW, PERSON)] + others, sdk)
+        written, deleted = _pull_write_idx(sdk, NEW), _pull_delete_idx(sdk, OLD)
+        assert written is not None and deleted is not None and written < deleted
+        assert sdk.mock_calls[written][0] == "set_device_data_batch"
+        assert str(OLD) not in _pull_state(sqlite_db)
+        [hold] = _named(events, "RENEWAL_HOLD")
+        assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 1, 0)
+
+    def test_the_batch_branch_keeps_the_old_pin_when_the_new_user_row_is_refused(
+            self, sqlite_db, events):
+        others = [_m(30002 + i, 901 + i, f"M{i}") for i in range(5)]
+        _flipped(sqlite_db, [_m(OLD, PERSON)], [_m(NEW, PERSON)] + others)
+        _tracked(sqlite_db, OLD)
+        sdk = _pull_sdk([str(OLD)])
+        rx = _pin_re(NEW)
+
+        def _batch(*, table, rows, chunk_size, progress_cb=None):
+            bad = [r for r in rows if table == "user" and rx.search(str(r))]
+            return (len(rows) - len(bad), bad)
+        sdk.set_device_data_batch.side_effect = _batch
+        _refuse_user_write(sdk, NEW)            # and the per-row fallback is refused too
+        eng = _pull_pass([_m(NEW, PERSON)] + others, sdk)
+        assert _pull_delete_idx(sdk, OLD) is None, "the person would have had neither pin"
+        assert str(OLD) in _pull_state(sqlite_db)
+        assert eng._last_removal_report["failed"] == []
+        [hold] = _named(events, "RENEWAL_HOLD")
+        assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
+
+    def test_a_pass_that_raises_after_the_stale_step_keeps_the_hold(
+            self, sqlite_db, monkeypatch, events):
+        import app.core.device_sync as ds
+
+        def _no_intent(**_kw):
+            raise RuntimeError("intent not recorded")
+        monkeypatch.setattr(ds, "record_push_intents", _no_intent)
+        _flipped(sqlite_db, [_m(OLD, PERSON)], [_m(NEW, PERSON)])
+        _tracked(sqlite_db, OLD)
+        sdk = _pull_sdk([str(OLD)])
+        eng = _engine()
+        with pytest.raises(RuntimeError):
+            _pull_pass([_m(NEW, PERSON)], sdk, engine=eng)
+        assert _pull_write_idx(sdk, NEW) is None and _pull_delete_idx(sdk, OLD) is None
+        assert str(OLD) in _pull_state(sqlite_db)
+        assert eng._last_removal_report["complete"] is False, (
+            "a pass that stopped early keeps a pending removal retry armed (R1-06)")
+        [hold] = _named(events, "RENEWAL_HOLD")
+        assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
 
     def test_a_pass_without_holds_is_unchanged(self, sqlite_db, events):
         """No person link: the stale step deletes before the push, exactly as before."""
