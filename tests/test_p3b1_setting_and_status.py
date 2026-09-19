@@ -5,6 +5,7 @@ generic PATCH handler, and _build_status_payload_uncached's session block.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,10 +14,12 @@ import pytest
 
 import app.core.config as cfgmod
 import app.core.db as dbmod
+import shared.config as shared_config_mod
 from access.config import load_access_app_config, save_access_app_config, serialize_access_config
 from app.api import local_access_api_v2
 from app.core.config import AppConfig
 from shared.config import ACCESS_CONFIG_FIELDS
+from shared.desktop_paths import get_desktop_path_layout
 
 
 # ============================================================================== fixtures
@@ -89,7 +92,16 @@ def test_access_config_section_carries_a_non_default_value() -> None:
     assert serialized["offline_revoke_grace_days"] == 9
 
 
-def test_offline_revoke_grace_days_round_trips_through_save_and_load() -> None:
+def test_offline_revoke_grace_days_round_trips_through_save_and_load(tmp_path, monkeypatch) -> None:
+    # save_access_app_config/load_access_app_config write real JSON through
+    # shared.config's module-level DesktopPathLayout (computed once at import time
+    # from MONCLUB_ACCESS_DATA_ROOT, so it cannot be redirected by re-pointing that
+    # env var mid-test). Point only access_config_path at a tmp_path file instead --
+    # this is the file this test actually exercises, and it never touches whatever
+    # real access config the running process resolved at import time.
+    fake_layout = replace(get_desktop_path_layout(), access_config_path=tmp_path / "access_config.json")
+    monkeypatch.setattr(shared_config_mod, "get_desktop_path_layout", lambda: fake_layout)
+
     cfg = load_access_app_config()
     cfg.offline_revoke_grace_days = 3
     save_access_app_config(cfg)
