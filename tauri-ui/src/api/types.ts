@@ -20,6 +20,15 @@ export interface SessionBlock {
   contractDaysRemaining: number | null;
   /** True if contract expires within 10 days */
   contractWarning: boolean;
+  /** P3b-1: true when the PC clock is suspect (behind/ahead of the last known-good time).
+   * The applied gym date is pinned to the last known-good date until this clears. */
+  clockSuspectWarning?: boolean;
+  /** "behind" | "ahead" | null -- why the clock is suspect (null when not suspect). */
+  clockSuspectReason?: string | null;
+  /** The gym date (ISO yyyy-MM-dd) last applied by the local date-flip job, or null. */
+  gymDate?: string | null;
+  /** True once a protocol-2 sync answer has been trusted (windows/upcoming lists valid). */
+  accessDatesTrusted?: boolean;
 }
 
 export interface ModeBlock {
@@ -221,6 +230,9 @@ export interface AppConfig {
   max_login_age_minutes: number;
   device_sync_enabled: boolean;
   agent_realtime_enabled: boolean;
+  /** P3b-1: days a membership stays deliverable past accessUntil while offline. 0 = expire
+   * on time even offline. */
+  offline_revoke_grace_days: number;
   template_version: number;
   template_encoding: string;
   plcomm_dll_path: string;

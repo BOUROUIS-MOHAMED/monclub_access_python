@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Literal, Optional
 
 from app.core.config import AppConfig as LegacyAppConfig
+from app.core.config import offline_revoke_grace_days as _offline_revoke_grace_days
 from app.core.utils import load_json, save_json
 from shared.api.monclub_api import ApiEndpoints
 from shared.component_identity import get_component_identity
@@ -74,6 +75,8 @@ ACCESS_CONFIG_FIELDS = (
     # Favorites overlay
     "favorites_overlay_anchor",
     "favorites_overlay_show_all_presets",
+    # Protocol 2 offline date flips (P3b-1)
+    "offline_revoke_grace_days",
 )
 
 TV_CONFIG_FIELDS = (
@@ -160,6 +163,7 @@ class AccessConfigSection:
     scan_shortcut: str = "CTRL_CAPSLOCK"   # Global shortcut to trigger SCR100 card scan
     favorites_overlay_anchor: str = "right-center"
     favorites_overlay_show_all_presets: bool = False
+    offline_revoke_grace_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -422,6 +426,7 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         scan_shortcut=str(getattr(cfg, "scan_shortcut", "CTRL_CAPSLOCK") or "CTRL_CAPSLOCK"),
         favorites_overlay_anchor=str(getattr(cfg, "favorites_overlay_anchor", "right-center") or "right-center"),
         favorites_overlay_show_all_presets=bool(getattr(cfg, "favorites_overlay_show_all_presets", False)),
+        offline_revoke_grace_days=_offline_revoke_grace_days(cfg),
     )
 
 
