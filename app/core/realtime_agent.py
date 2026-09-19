@@ -30,6 +30,7 @@ from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
+    current_access_days,
     record_totp_roster_check,
     verify_totp_resilient,
     verify_card,
@@ -1101,7 +1102,7 @@ class DecisionService(threading.Thread):
         return verify_card(scanned=scanned, settings=settings, users_by_card=users_by_card)
 
     def _verify_totp(self, *, scanned: str, settings: Dict[str, Any], creds_payload: List[Dict[str, Any]], users_by_am: Dict[int, Dict[str, Any]], users_by_card: Dict[str, List[Dict[str, Any]]], scan_epoch: Optional[float] = None) -> Dict[str, Any]:
-        return verify_totp_resilient(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card, scan_epoch=scan_epoch)
+        return verify_totp_resilient(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card, scan_epoch=scan_epoch, access_days=current_access_days())
 
     def run(self) -> None:
         while not self.stop_event.is_set():
