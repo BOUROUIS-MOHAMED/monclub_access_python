@@ -302,10 +302,12 @@ def maybe_log_totp_roster_summary(*, now_mono: Optional[float] = None) -> bool:
 
 
 # The allowed-days snapshot (P3b-1) the QR check uses: the gym date the last flip applied
-# and the windows. Loaded once per local-state generation -- the flip and every sync that
-# changes members/credentials bump it -- and warmed by load_local_state, so a scan normally
-# pays one lock and one comparison. (db path, generation, snapshot); the db path is part of
-# the key because tests swap db._DB_PATH at one generation (None in production).
+# and the windows. Loaded once per local-state generation (a sync that changes members or
+# credentials bumps it; so does a flip that moves a row, plan §4) and warmed by
+# load_local_state, so a scan normally pays one lock and one comparison. A change of the
+# stored dates that comes with no bump is not seen until the next one.
+# (db path, generation, snapshot); the db path is part of the key because tests swap
+# db._DB_PATH at one generation (None in production).
 _access_days_lock = threading.Lock()
 _access_days_cache: tuple = (None, -1, None)
 
