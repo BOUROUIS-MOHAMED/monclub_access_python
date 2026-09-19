@@ -1375,6 +1375,197 @@ def _apply_protocol2_save(
     return out
 
 
+# ---------------------------------------------------------------------------
+# P3b-1: the date flip (plan §4) -- one write job, recomputed from the full stored state
+# ---------------------------------------------------------------------------
+def _iso_or_none(d: Any) -> Optional[str]:
+    return d.isoformat() if d is not None else None
+
+
+def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str) -> Dict[str, Any]:
+    """Make sync_users the members deliverable on the gym date, offline (plan §4, §5).
+
+    ONE write job (read-compute-write in one BEGIN IMMEDIATE), idempotent:
+      * the gym date G = access_dates.evaluate_gym_date(state, pc_now_epoch); floor_date,
+        max_pc_epoch, clock_suspect/clock_reason, grace_days (clamped >= 0) and applied_date=G
+        are persisted whenever a state row exists -- also when nothing may move, so the
+        60 s precheck (gym_date_status) settles instead of asking again every tick;
+      * nothing moves without a state row (skipped="no_state"), with untrusted windows
+        (skipped="untrusted") or without a gym date (skipped="no_gym_date");
+      * else access_dates.plan_flip over sync_users / sync_users_held and the stored windows:
+        hold -> the row is copied column for column into sync_users_held and deleted from
+        sync_users; restore -> the reverse; promote -> the upcoming row (payload_json, as sent)
+        is written by _upsert_sync_user_row. The upcoming list itself is never changed (the
+        contract: "a PC that does change the stored list must also drop its windowsVersion").
+        member_shadow is NOT touched (plan §4).
+    After the job, when anything moved: the local-state generation is bumped and the sync
+    cache expired. Waking the engines is the caller's (app wiring).
+
+    Returns gym_date / pc_date / applied_before (ISO or None), held / restored / promoted /
+    moved counts, hold_reasons {reason: n}, starters (upcoming ids starting on G),
+    clock_suspect, clock_reason, clock_changed (the persisted clock verdict changed),
+    trusted, skipped.
+    """
+    from app.core import access_dates as _ad
+
+    try:
+        grace = max(0, int(grace_days or 0))
+    except (TypeError, ValueError):
+        grace = 0
+    now_epoch = float(pc_now_epoch)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, Any]:
+        profile["flip_source"] = str(source)
+        cur = conn.cursor()
+        out: Dict[str, Any] = {
+            "gym_date": None, "pc_date": None, "applied_before": None,
+            "held": 0, "restored": 0, "promoted": 0, "moved": 0,
+            "hold_reasons": {}, "starters": [],
+            "clock_suspect": False, "clock_reason": "", "clock_changed": False,
+            "trusted": False, "skipped": None,
+        }
+        row = cur.execute("SELECT * FROM access_v2_state WHERE id = 1").fetchone()
+        if row is None:
+            out["skipped"] = "no_state"
+            return out
+        state = dict(row)
+        g = _ad.evaluate_gym_date(clock_state_from_row(state), now_epoch)
+        gym_iso = _iso_or_none(g.gym_date)
+        clock_before = (bool(state.get("clock_suspect")), str(state.get("clock_reason") or ""))
+        clock_after = (bool(g.suspect), str(g.reason or ""))
+        cur.execute(
+            """
+            UPDATE access_v2_state SET
+                floor_date = ?, max_pc_epoch = ?, clock_suspect = ?, clock_reason = ?,
+                grace_days = ?, applied_date = ?, updated_at = ?
+            WHERE id = 1
+            """,
+            (
+                _iso_or_none(g.new_floor_date), g.new_max_pc_epoch,
+                1 if clock_after[0] else 0, clock_after[1],
+                grace, gym_iso, now_iso(),
+            ),
+        )
+        out.update(
+            gym_date=gym_iso,
+            pc_date=_iso_or_none(g.pc_date),
+            applied_before=state.get("applied_date"),
+            clock_suspect=clock_after[0],
+            clock_reason=clock_after[1],
+            clock_changed=clock_after != clock_before,
+            trusted=bool(state.get("trusted")),
+        )
+        if not out["trusted"]:
+            out["skipped"] = "untrusted"
+            return out
+        if g.gym_date is None:
+            out["skipped"] = "no_gym_date"
+            return out
+
+        active_ids = [int(r[0]) for r in cur.execute(
+            "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL"
+        ).fetchall()]
+        held_ids = [int(r[0]) for r in cur.execute(
+            "SELECT active_membership_id FROM sync_users_held"
+        ).fetchall()]
+        today_windows, upcoming_windows, _qr = _read_protocol2_windows(conn)
+        plan = _ad.plan_flip(
+            gym_date=g.gym_date,
+            server_today=_ad.parse_iso_date(state.get("server_today")),
+            horizon_end=_ad.parse_iso_date(state.get("horizon_end")),
+            grace_days=grace,
+            active_ids=active_ids,
+            held_ids=held_ids,
+            today_windows=today_windows,
+            upcoming_windows=upcoming_windows,
+        )
+        out["starters"] = list(plan.starters)
+
+        # Column for column (_SYNC_USER_COLUMNS on both sides): a hold/restore is a copy,
+        # never a re-encode. [TEST: tests/test_protocol2_save_and_flip.py::
+        # test_a_hold_and_restore_round_trip_preserves_every_sync_users_column]
+        cols = ", ".join(_SYNC_USER_COLUMNS)
+        if plan.hold:
+            held_at = now_iso()
+            cur.executemany(
+                f"INSERT OR REPLACE INTO sync_users_held ({cols}, held_reason, held_for_date, held_at) "
+                f"SELECT {cols}, ?, ?, ? FROM sync_users WHERE active_membership_id = ?",
+                [(reason, gym_iso, held_at, am) for am, reason in plan.hold.items()],
+            )
+            cur.executemany(
+                "DELETE FROM sync_users WHERE active_membership_id = ?",
+                [(am,) for am in plan.hold],
+            )
+        if plan.restore:
+            cur.executemany(
+                f"INSERT OR REPLACE INTO sync_users ({cols}) "
+                f"SELECT {cols} FROM sync_users_held WHERE active_membership_id = ?",
+                [(am,) for am in plan.restore],
+            )
+            cur.executemany(
+                "DELETE FROM sync_users_held WHERE active_membership_id = ?",
+                [(am,) for am in plan.restore],
+            )
+        promoted = 0
+        for am in plan.promote:
+            prow = cur.execute(
+                "SELECT payload_json FROM sync_upcoming_users WHERE active_membership_id = ?", (am,),
+            ).fetchone()
+            payload = json.loads(prow[0]) if prow is not None and prow[0] else None
+            if not isinstance(payload, dict):
+                continue      # written by _replace_sync_upcoming from a dict: not expected
+            _upsert_sync_user_row(cur, payload)
+            promoted += 1
+        if plan.restore or promoted:
+            _refresh_member_account_links(cur)
+
+        reasons: Dict[str, int] = {}
+        for reason in plan.hold.values():
+            reasons[reason] = reasons.get(reason, 0) + 1
+        out.update(
+            held=len(plan.hold),
+            restored=len(plan.restore),
+            promoted=promoted,
+            moved=len(plan.hold) + len(plan.restore) + promoted,
+            hold_reasons=reasons,
+        )
+        profile["flip_moved"] = out["moved"]
+        return out
+
+    out = _run_db_write_sync("apply_local_date_flips", _write)
+    if out.get("moved"):
+        bump_local_state_generation()
+        invalidate_sync_cache()
+    return out
+
+
+def gym_date_status(*, pc_now_epoch: float) -> Dict[str, Any]:
+    """Read-only precheck for the frequent triggers: would apply_local_date_flips change
+    anything? ``needs_flip`` when a state row exists and the evaluated gym date differs from
+    applied_date, or the evaluated clock verdict (suspect, reason) from the persisted one.
+    Writes nothing; a read error propagates to the caller."""
+    from app.core import access_dates as _ad
+
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM access_v2_state WHERE id = 1").fetchone()
+        state = dict(row) if row is not None else None
+    if state is None:
+        return {"gym_date": None, "applied_date": None, "suspect": False, "reason": "",
+                "needs_flip": False}
+    g = _ad.evaluate_gym_date(clock_state_from_row(state), float(pc_now_epoch))
+    gym_iso = _iso_or_none(g.gym_date)
+    applied = state.get("applied_date")
+    evaluated = (bool(g.suspect), str(g.reason or ""))
+    persisted = (bool(state.get("clock_suspect")), str(state.get("clock_reason") or ""))
+    return {
+        "gym_date": gym_iso,
+        "applied_date": applied,
+        "suspect": evaluated[0],
+        "reason": evaluated[1],
+        "needs_flip": gym_iso != applied or evaluated != persisted,
+    }
+
+
 def _sync_users_has_legacy_fingerprint(conn: sqlite3.Connection) -> bool:
     cols = _table_columns(conn, "sync_users")
     return "fingerprint" in cols
