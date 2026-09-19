@@ -7891,6 +7891,20 @@ def get_finger_sweep_state(*, device_id: int, pin: str) -> "tuple[bool, bool, se
             _decode_finger_ids(r["pushed_finger_ids"]))
 
 
+def get_pin_sync_status(*, device_id: int, pin: str) -> "tuple[str, bool] | None":
+    """(desired_hash, last_ok) of one pin (primary-key lookup), None when there is no row."""
+    did = int(device_id)
+    p = str(pin or "").strip()
+    with get_conn() as conn:
+        r = conn.execute(
+            "SELECT desired_hash, last_ok FROM device_sync_state WHERE device_id=? AND pin=?",
+            (did, p),
+        ).fetchone()
+    if r is None:
+        return None
+    return (str(r["desired_hash"] or ""), int(r["last_ok"] or 0) == 1)
+
+
 def mark_finger_slots_swept(*, device_id: int, pin: str,
                             finger_ids: "Iterable[int] | None") -> bool:
     """Record a COMPLETED sweep of an owned pin: the terminal now holds exactly

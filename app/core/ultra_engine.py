@@ -2587,29 +2587,31 @@ class UltraDeviceWorker(threading.Thread):
         if cur is None:
             if st["done"] >= _FINGER_SWEEP_DAILY_CAP:
                 return
-            grace = self._mirror_grace_pins()
             while st["queue"]:
                 pin = st["queue"].pop(0)
-                if pin in grace:
-                    continue          # pushed moments ago: its targeted push sweeps it
-                try:
-                    from app.core.db import get_finger_sweep_state
-                    state = get_finger_sweep_state(device_id=self._device_id, pin=pin)
-                except Exception:
+                check = self._sweep_check(pin)
+                if check is None:
                     continue
-                if state is None or not state[0] or state[1]:
-                    continue          # no longer owned, or already swept meanwhile
-                recorded = state[2]
-                snapshot = set((getattr(self, "_last_desired_fingers", None) or {}).get(pin) or ())
-                # Never clear a slot the member uses: desired at the morning snapshot OR
-                # recorded since (a targeted push may have added a finger after it).
-                keep = snapshot | set(recorded or ())
+                keep, record = check
                 cur = {"pin": pin, "slots": [s for s in _ALL_FINGER_SLOTS if s not in keep],
-                       "record": snapshot if recorded is None else None, "ok": True,
+                       "keep": keep, "record": record, "ok": True,
                        "t0": time.monotonic(), "cleared": 0, "empty": 0}
                 st["current"] = cur
                 break
             if cur is None:
+                return
+        else:
+            # Re-checked before EVERY command (review R1-18/R1-27): a push may have run
+            # between two commands -- a targeted one served by the run loop, or a full
+            # sync -- and written a finger into a slot this plan was about to clear. The
+            # plan is dropped (not marked swept) when anything it was built on moved.
+            check = self._sweep_check(cur["pin"])
+            if check is None or check[0] != cur["keep"]:
+                _tel.event("FINGER_SWEEP", worker=self._tel_wid, pin=cur["pin"],
+                           source="daily", ok=False, abandoned=True, op="del_user_tmp_ext",
+                           cleared=cur["cleared"], empty=cur["empty"],
+                           dur_ms=round((time.monotonic() - cur["t0"]) * 1000))
+                st["current"] = None
                 return
         part = cur["slots"][:_SWEEP_SLOTS_PER_COMMAND]
         cur["slots"] = cur["slots"][_SWEEP_SLOTS_PER_COMMAND:]
@@ -2628,6 +2630,40 @@ class UltraDeviceWorker(threading.Thread):
                        empty=cur["empty"], dur_ms=round((time.monotonic() - cur["t0"]) * 1000))
             st["current"] = None
             st["done"] += 1
+
+    def _sweep_check(self, pin: str) -> tuple[set[int], set[int] | None] | None:
+        """(keep, record) when the daily batch may sweep ``pin`` now; None when it may not.
+
+        It may only when the terminal is known to hold exactly the member's desired
+        fingers of the last COMPLETE roster: the pin is in that roster, owned, not yet
+        swept, not pushed moments ago, and its state is confirmed (last_ok=1) with the
+        very hash of that roster. Then ``keep`` = those desired fingers | the recorded
+        set, and ``record`` = the fingers to record after the sweep (only when the
+        recorded set is unknown). Anything else -- a failed push, a newer push, a pin
+        missing from the snapshot -- skips the pin today (review R1-18/19/27: a stale
+        plan cleared a finger written in between, and a pin absent from an incomplete
+        later roster had every slot cleared).
+        """
+        if pin in self._mirror_grace_pins():
+            return None
+        desired = getattr(self, "_last_desired_pins", None) or set()
+        fingers = (getattr(self, "_last_desired_fingers", None) or {}).get(pin)
+        snap_hash = (getattr(self, "_last_desired_hashes", None) or {}).get(pin)
+        if pin not in desired or fingers is None or not snap_hash:
+            return None
+        try:
+            from app.core.db import get_finger_sweep_state, get_pin_sync_status
+            state = get_finger_sweep_state(device_id=self._device_id, pin=pin)
+            status = get_pin_sync_status(device_id=self._device_id, pin=pin)
+        except Exception:
+            return None
+        if state is None or not state[0] or state[1]:
+            return None               # no longer owned, or already swept meanwhile
+        if status is None or not status[1] or status[0] != snap_hash:
+            return None               # not confirmed with this roster's content
+        recorded = state[2]
+        keep = set(fingers) | set(recorded or ())
+        return keep, (set(fingers) if recorded is None else None)
 
     # ---------------------------------------------------------------- #
     # Fast retry of a FAILED removal (P3a-2 item 2, guide §3.4b)
@@ -3300,12 +3336,21 @@ class UltraDeviceWorker(threading.Thread):
             # maintenance slot (intent read-back, finger-slot sweep) may open once the
             # worker is idle -- "after the morning removals", not at a fixed hour: most
             # gyms' PCs are off overnight. guide §3.4a.
-            self._last_desired_pins = {p for p in desired_pins if p}
-            self._last_desired_fingers = {
-                p: self._desired_fingers((templates_by_pin or {}).get(p))
-                for p in self._last_desired_pins
-            }
-            self._maintenance_ready_day = _local_day()
+            # Only from a COMPLETE roster (review R1-19): an incomplete one (ACCOUNT rows
+            # withheld, an empty roster, a removal step the ceiling refused) would drop
+            # members from the snapshot, and the batch then cleared their every slot; the
+            # read-back would also take their intents for departures.
+            if (not roster_withheld and getattr(self, "_last_revoke_step", None) == "ran"
+                    and not getattr(self, "_last_revoke_aborted", 0)):
+                self._last_desired_pins = {p for p in desired_pins if p}
+                self._last_desired_fingers = {
+                    p: self._desired_fingers((templates_by_pin or {}).get(p))
+                    for p in self._last_desired_pins
+                }
+                self._last_desired_hashes = {
+                    p: (hashes_by_pin or {}).get(p, "") for p in self._last_desired_pins
+                }
+                self._maintenance_ready_day = _local_day()
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)

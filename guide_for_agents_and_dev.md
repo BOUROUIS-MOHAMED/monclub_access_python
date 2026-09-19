@@ -1397,7 +1397,21 @@ clears a slot that is desired in the last full sync's snapshot OR recorded now (
 have added a finger since), and it skips a pin pushed in the last 10 min (the MIRROR grace window).
 Budget: ≤ 100 × 10 calls × 171 ms ≈ 171 s of terminal time a day, in ≤ 0.5 s slices; a fully
 unswept 928-pin terminal is done in ~10 days. `[T] FINGER_SWEEP worker pin source ok cleared empty
-raised dur_ms`.
+raised dur_ms` (`abandoned=True` when a plan was dropped mid-way, below).
+
+*Review round 1 (R1-18/R1-19/R1-27).* A pin's plan was built once and resumed across run-loop
+iterations: a targeted push or a full sync served between two of its commands could write a finger
+into a slot the plan still meant to clear, and the batch cleared it while the state said it was there
+(never re-pushed). And the snapshot the batch reads was rewritten by every pass, including one with an
+incomplete roster, so a member missing from it had EVERY slot cleared and `''` recorded. Now
+`_sweep_check` runs before every command: the pin must be in the last COMPLETE roster's snapshot
+(`_last_desired_*`, written only when the roster was not withheld and the removal step ran without a
+ceiling refusal), owned, unswept, outside the 10-min grace window, and confirmed (`last_ok=1`) with
+exactly that snapshot's hash (`db.get_pin_sync_status`) — i.e. the terminal is known to hold exactly
+those desired fingers. If anything moved, the plan is dropped, not marked swept; the pin is tried again
+another day (or swept by its next targeted push). A failed push is therefore never swept by the
+batch, and the snapshot is only recorded for a pin whose last push confirmed it.
+`[TEST: test_finger_slot_sweep.py::TestDailyBatchReviewRoundOne]`
 
 **Never a pin MonClub did not own before the push.** A first push (no row) or an unowned row is
 never swept: on gym 45's shared terminals that pin may hold another system's user, whose fingerprints

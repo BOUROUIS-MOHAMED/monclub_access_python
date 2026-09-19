@@ -253,6 +253,86 @@ class TestDailyBatch:
         assert 7 in term.fingers_of("30001")
 
 
+class TestDailyBatchReviewRoundOne:
+    """R1-18/R1-19/R1-27: the batch planned a pin's slots once and resumed that plan
+    across run-loop iterations -- after pushes in between, and after a later pass with an
+    incomplete roster had rewritten the desired snapshot."""
+
+    def _morning(self, db, monkeypatch, n):
+        term = TerminalZkem()
+        users = []
+        for i in range(n):
+            pin = 30001 + i
+            term.add_user(str(pin), f"M{i}", str(i), fingers=(0, 7))     # 7 = a stale finger
+            users.append(_user(pin, f"M{i}", str(i), fps=[_tpl(0, "AAAA")]))
+        drv = _make_driver(term)
+        w, cache = _worker(monkeypatch, driver=drv, users=users)
+        w._cmd_queue = queue.Queue()
+        w._run_standalone_full_sync(reason="startup", fingerprint_hash="h")
+        return term, drv, w, cache
+
+    def _until_sweeping(self, w, term, pin):
+        """Drain until the BATCH has cleared this pin's first slice (the morning push's
+        own delete-before-write of slot 0 does not count)."""
+        mark = len(term.calls)
+        for _ in range(10):
+            w._drain_daily_maintenance()
+            if any(c[0] == "SSR_DelUserTmpExt" and str(c[2]) == pin
+                   for c in term.calls[mark:]):
+                return
+        raise AssertionError("the batch never started on " + pin)
+
+    def test_a_targeted_push_between_two_sweep_commands_is_never_undone(self, db, monkeypatch):
+        term, drv, w, _cache = self._morning(db, monkeypatch, 1)
+        monkeypatch.setattr(w, "_member_row_in_db", lambda m: [
+            _user(30001, "M0", "0", fps=[_tpl(0, "AAAA"), _tpl(5, "FFFF")])])
+        try:
+            self._until_sweeping(w, term, "30001")          # slots 1,2,3 cleared
+            w._run_standalone_member_sync(30001)             # the member enrols finger 5
+            assert 5 in term.fingers_of("30001")
+            for _ in range(10):
+                w._drain_daily_maintenance()
+        finally:
+            drv.disconnect()
+        assert 5 in term.fingers_of("30001"), "the batch resumed its old plan and cleared it"
+
+    def test_a_full_sync_between_two_sweep_commands_is_never_undone(self, db, monkeypatch):
+        term, drv, w, cache = self._morning(db, monkeypatch, 1)
+        try:
+            self._until_sweeping(w, term, "30001")
+            cache.users[:] = [_user(30001, "M0", "0", fps=[_tpl(0, "AAAA"), _tpl(5, "FFFF")])]
+            w._run_standalone_full_sync(reason="timer", fingerprint_hash="h2")
+            assert 5 in term.fingers_of("30001")
+            for _ in range(10):
+                w._drain_daily_maintenance()
+        finally:
+            drv.disconnect()
+        assert 5 in term.fingers_of("30001")
+
+    def test_a_later_incomplete_roster_never_empties_a_members_fingers(self, db, monkeypatch):
+        term, drv, w, cache = self._morning(db, monkeypatch, 2)
+        with dbmod.get_conn() as conn:                        # its targeted sweep had failed
+            conn.execute("UPDATE device_sync_state SET pushed_finger_ids=NULL "
+                         "WHERE device_id=9 AND pin='30002'")
+            conn.commit()
+        orig = w._build_standalone_roster
+
+        def withheld(*a, **k):
+            out = orig(*a, **k)
+            w._last_standalone_roster_stats = {"withheld_missing_account": 1}
+            return out
+        try:
+            self._until_sweeping(w, term, "30001")           # the day's queue holds 30002
+            cache.users[:] = [u for u in cache.users if u["activeMembershipId"] == 30001]
+            monkeypatch.setattr(w, "_build_standalone_roster", withheld)
+            w._run_standalone_full_sync(reason="timer", fingerprint_hash="h2")
+            for _ in range(20):
+                w._drain_daily_maintenance()
+        finally:
+            drv.disconnect()
+        assert 0 in term.fingers_of("30002"), "a paying member's finger was wiped"
+
+
 class TestBackoffHeldPinsAreNotStampedSynced:
 
     def test_a_pin_in_retry_backoff_is_not_backfilled_as_ok(self, db, monkeypatch):
