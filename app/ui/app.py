@@ -1636,7 +1636,10 @@ class MainApp:
         from app.core import db as _db
 
         try:
-            _db.invalidate_sync_cache()
+            # Drop the pre-flip snapshot, not just expire it: load_sync_cache would serve it
+            # while the reload runs, and the ULTRA pass requested below would push the pre-flip
+            # roster (review R1). A load already in flight is discarded by the invalidation.
+            _db.invalidate_sync_cache(clear_cached=True)
             _db.refresh_sync_cache_async()
         except Exception:
             self.logger.warning("[DATE] sync cache refresh after the flip failed", exc_info=True)

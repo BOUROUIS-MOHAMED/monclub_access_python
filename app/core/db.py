@@ -7271,6 +7271,10 @@ def list_optional_deals() -> List[Dict[str, Any]]:
 _sync_cache_lock = threading.Lock()
 _sync_cache_entry: tuple[float, "SyncCacheState | None"] = (0.0, None)
 _sync_cache_loading: "threading.Event | None" = None  # None = no load in progress
+# Bumped by every invalidate_sync_cache: a load that started under an older epoch may have read
+# the database before the change that invalidated it, so it is never installed (P3b-1 review R1:
+# a date flip's ULTRA pass must not be handed the pre-flip roster).
+_sync_cache_epoch = 0
 _SYNC_CACHE_TTL = 5.0  # seconds
 
 
@@ -7279,23 +7283,24 @@ def _finish_sync_cache_load(
     evt: threading.Event,
     result: "SyncCacheState | None" = None,
     success: bool,
+    epoch: Optional[int] = None,
 ) -> None:
     global _sync_cache_entry, _sync_cache_loading
     with _sync_cache_lock:
-        if success:
+        if success and (epoch is None or epoch == _sync_cache_epoch):
             _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
         if _sync_cache_loading is evt:
             _sync_cache_loading = None
     evt.set()
 
 
-def _load_sync_cache_background(evt: threading.Event) -> None:
+def _load_sync_cache_background(evt: threading.Event, epoch: Optional[int] = None) -> None:
     try:
         result = _load_sync_cache_db()
     except Exception:
-        _finish_sync_cache_load(evt=evt, success=False)
+        _finish_sync_cache_load(evt=evt, success=False, epoch=epoch)
         return
-    _finish_sync_cache_load(evt=evt, result=result, success=True)
+    _finish_sync_cache_load(evt=evt, result=result, success=True, epoch=epoch)
 
 
 def refresh_sync_cache_async() -> bool:
@@ -7306,9 +7311,10 @@ def refresh_sync_cache_async() -> bool:
             return False
         evt = threading.Event()
         _sync_cache_loading = evt
+        epoch = _sync_cache_epoch
     threading.Thread(
         target=_load_sync_cache_background,
-        args=(evt,),
+        args=(evt, epoch),
         name="SyncCacheRefresh",
         daemon=True,
     ).start()
@@ -7316,15 +7322,32 @@ def refresh_sync_cache_async() -> bool:
 
 
 def invalidate_sync_cache(*, clear_cached: bool = False) -> None:
-    """Expire the sync cache; optionally drop the stale snapshot entirely."""
-    global _sync_cache_entry
+    """Expire the sync cache; optionally drop the stale snapshot entirely.
+
+    A load already in flight may have read the database before the change that calls this: it
+    is not installed (epoch), and the in-flight marker is released so a new load can start now.
+    """
+    global _sync_cache_entry, _sync_cache_epoch, _sync_cache_loading
     with _sync_cache_lock:
         _, cached = _sync_cache_entry
         _sync_cache_entry = (0.0, None if clear_cached else cached)
+        _sync_cache_epoch += 1
+        _sync_cache_loading = None
 
 
 @_tel.timed("DB_READ_load_sync_cache", slow_ms=50, warn_ms=1000)
 def load_sync_cache() -> "SyncCacheState | None":
+    for _attempt in range(3):
+        state, retry = _load_sync_cache_once()
+        if not retry:
+            return state
+    return state
+
+
+def _load_sync_cache_once() -> "tuple[SyncCacheState | None, bool]":
+    """One pass of load_sync_cache: (state, retry). ``retry`` when this call waited for a load
+    that an invalidation then made unusable -- the entry is still empty and the caller loads
+    again rather than report no cache."""
     global _sync_cache_entry, _sync_cache_loading
     now = time.monotonic()
     cached_snapshot: "SyncCacheState | None" = None
@@ -7335,8 +7358,9 @@ def load_sync_cache() -> "SyncCacheState | None":
     with _sync_cache_lock:
         expires, cached = _sync_cache_entry
         if now < expires and cached is not None:
-            return cached
+            return cached, False
         cached_snapshot = cached
+        epoch = _sync_cache_epoch
 
         if _sync_cache_loading is not None:
             evt = _sync_cache_loading
@@ -7352,28 +7376,29 @@ def load_sync_cache() -> "SyncCacheState | None":
     if start_background and evt is not None:
         threading.Thread(
             target=_load_sync_cache_background,
-            args=(evt,),
+            args=(evt, epoch),
             name="SyncCacheRefresh",
             daemon=True,
         ).start()
-        return cached_snapshot
+        return cached_snapshot, False
 
     if not load_inline:
         if cached_snapshot is not None:
-            return cached_snapshot
+            return cached_snapshot, False
         assert evt is not None
         evt.wait(timeout=10.0)
         with _sync_cache_lock:
             _, cached = _sync_cache_entry
-        return cached
+            invalidated_meanwhile = _sync_cache_epoch != epoch
+        return cached, cached is None and invalidated_meanwhile
 
     assert evt is not None
     try:
         result = _load_sync_cache_db()
-        _finish_sync_cache_load(evt=evt, result=result, success=True)
-        return result
+        _finish_sync_cache_load(evt=evt, result=result, success=True, epoch=epoch)
+        return result, False
     except Exception:
-        _finish_sync_cache_load(evt=evt, success=False)
+        _finish_sync_cache_load(evt=evt, success=False, epoch=epoch)
         raise
 
 

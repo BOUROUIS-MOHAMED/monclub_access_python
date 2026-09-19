@@ -13,7 +13,7 @@
    the date moves.
 4. A flip that moved rows hands the running ULTRA engine a roster reloaded after the flip: the
    cached pre-flip snapshot is dropped, and a load already in flight (it may predate the flip's
-   commit) is waited for and replaced.
+   commit) is never installed; a reader that waited for it loads again.
 
 Real temp SQLite through the ``app.core.db._DB_PATH`` override; no network.
 """
@@ -298,30 +298,51 @@ def test_an_unchanged_grace_setting_does_not_flip_again(db):
 
 
 # ================================================================== 4. the roster ULTRA reloads
-def test_reload_sync_cache_now_replaces_a_load_that_was_in_flight(db, monkeypatch):
-    _seed_full_v2(db)
+def _slow_stale_load(monkeypatch):
+    """A background load that reads the database, then stalls until released."""
     real = dbmod._load_sync_cache_db
     started, release = threading.Event(), threading.Event()
 
-    def slow_stale_load():
-        result = real()                       # read BEFORE the change below
+    def slow():
+        result = real()                       # reads BEFORE the caller's change
         started.set()
         release.wait(5)
         return result
 
-    monkeypatch.setattr(dbmod, "_load_sync_cache_db", slow_stale_load)
+    monkeypatch.setattr(dbmod, "_load_sync_cache_db", slow)
     dbmod.invalidate_sync_cache(clear_cached=True)
     assert dbmod.refresh_sync_cache_async() is True
     assert started.wait(5)
     monkeypatch.setattr(dbmod, "_load_sync_cache_db", real)
-    _exec("DELETE FROM sync_users WHERE active_membership_id = 5")      # the flip's commit
-    t = threading.Thread(target=dbmod.reload_sync_cache_now, daemon=True)
-    t.start()
+    return release
+
+
+def _cached_ams():
+    return {u.get("activeMembershipId") for u in dbmod.load_sync_cache().users}
+
+
+def test_a_load_in_flight_before_an_invalidation_is_never_installed(db, monkeypatch):
+    _seed_full_v2(db)
+    release = _slow_stale_load(monkeypatch)
+    _exec("DELETE FROM sync_users WHERE active_membership_id = 5")      # a flip's commit ...
+    dbmod.invalidate_sync_cache(clear_cached=True)                       # ... and its invalidation
+    release.set()                                                        # the stale load lands late
+    time.sleep(0.3)
+    assert 5 not in _cached_ams()
+
+
+def test_a_reader_waiting_on_a_discarded_load_loads_again(db, monkeypatch):
+    _seed_full_v2(db)
+    release = _slow_stale_load(monkeypatch)
+    got = {}
+    reader = threading.Thread(target=lambda: got.setdefault("ams", _cached_ams()), daemon=True)
+    reader.start()                            # waits on the stale load in flight
     time.sleep(0.1)
-    release.set()                             # the stale load lands first ...
-    t.join(10)
-    ams = {u.get("activeMembershipId") for u in dbmod.load_sync_cache().users}
-    assert 5 not in ams                       # ... and is replaced by a fresh one
+    _exec("DELETE FROM sync_users WHERE active_membership_id = 5")
+    dbmod.invalidate_sync_cache(clear_cached=True)
+    release.set()
+    reader.join(10)
+    assert got["ams"] is not None and 5 not in got["ams"]
 
 
 def test_a_flip_that_moved_rows_reloads_the_roster_before_asking_ultra(db, monkeypatch):
@@ -339,12 +360,3 @@ def test_a_flip_that_moved_rows_reloads_the_roster_before_asking_ultra(db, monke
     out = app._apply_date_flips("midnight", pc_now=_epoch("2026-09-20T00:00:05+01:00"))
     assert out["held"] >= 1
     assert 1 not in seen["ams"] and 3 in seen["ams"]      # the post-flip roster
-
-
-def test_the_startup_flip_does_not_load_the_roster_synchronously(db, monkeypatch):
-    _seed_full_v2(db)
-    reload_now = MagicMock()
-    monkeypatch.setattr(dbmod, "reload_sync_cache_now", reload_now)
-    app = _grace_app(db, 0)                   # the engine is not running yet at start-up
-    app._apply_date_flips("startup", pc_now=_epoch("2026-09-20T07:30:00+01:00"))
-    reload_now.assert_not_called()
