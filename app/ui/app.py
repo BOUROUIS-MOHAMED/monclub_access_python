@@ -1677,7 +1677,18 @@ class MainApp:
         from app.core import access_dates
 
         hh, mm, ss = _FIRST_DAY_SYNC_GYM_TIME
-        remaining = (hh * 3600 + mm * 60 + ss) - access_dates.gym_seconds_of_day(now_epoch, offset)
+        # 00:17 on the SERVER's clock: a PC clock that was fast at the last sync (skew_sec > 0,
+        # under a day so not suspect) reaches 00:17 before the server's 00:16 job has run, and
+        # the sync would bring nothing (review R2). A slow clock only makes it later.
+        ahead = 0.0
+        try:
+            from app.core import db as _db
+
+            ahead = max(0.0, float((_db.get_access_v2_state() or {}).get("skew_sec") or 0.0))
+        except Exception:
+            ahead = 0.0
+        remaining = ((hh * 3600 + mm * 60 + ss) + ahead
+                     - access_dates.gym_seconds_of_day(now_epoch, offset))
         if remaining <= 0:
             return
         with self._date_flip_state_lock:

@@ -108,3 +108,47 @@ def test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_
     assert str(OLD) not in term.users
     assert (term.users.get(str(NEW)) or {}).get("card") == "777"
     assert not [f for n, f in events if n == "CAPACITY_FULL"]
+
+
+# ================================================================== 3. 00:17 on the server's clock
+@pytest.mark.parametrize(("skew", "expected"), [(121.0, 1015 + 121), (-60.0, 1015), (None, 1015)])
+def test_the_first_day_sync_waits_for_00_17_on_the_servers_clock(tests_flip_app, monkeypatch,
+                                                                 skew, expected):
+    app, _ = tests_flip_app
+    state = {"utc_offset_sec": 3600}
+    if skew is not None:
+        state["skew_sec"] = skew
+    monkeypatch.setattr("app.core.db.get_access_v2_state", lambda: dict(state))
+    app._arm_first_day_credentials_sync({"starters": [3]}, _flip_epoch("2026-09-20T00:00:05+01:00"))
+    [delay] = _scheduled(app, app._run_first_day_credentials_sync)
+    assert delay == pytest.approx(expected, abs=1)
+
+
+def _flip_epoch(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def _scheduled(app, callback):
+    import time as _time
+    now = _time.monotonic()
+    with app._sched_lock:
+        return [t - now for t, _sid, cb in app._scheduled if cb == callback]
+
+
+@pytest.fixture
+def tests_flip_app(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from app.ui.app import MainApp
+
+    monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "r2_0017.db"), raising=False)
+    app = object.__new__(MainApp)
+    app.logger = MagicMock()
+    app.cfg = SimpleNamespace(offline_revoke_grace_days=0)
+    app._stop_event = threading.Event()
+    MainApp._init_scheduler(app)
+    MainApp._init_date_flip_state(app)
+    app.request_sync_now = MagicMock()
+    return app, None
