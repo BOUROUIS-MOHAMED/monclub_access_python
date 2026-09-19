@@ -96,11 +96,12 @@ class TestStaticallyReadOnly:
         found = sorted(n for n in WRITE_CALLS if re.search(rf"\b{re.escape(n)}\b", code))
         assert not found, f"{path.name} names {found} in code"
 
-    def test_no_dynamic_invocation_on_the_com_object(self):
-        code = "\n".join(_code_lines(SCRIPT))
+    @pytest.mark.parametrize("path", [SCRIPT, COMMON], ids=lambda p: p.name)
+    def test_no_dynamic_invocation_on_the_com_object(self, path: Path):
+        code = "\n".join(_code_lines(path))
         for pattern in (r"\$zk\.\$", r"InvokeMember", r"Invoke-Expression", r"\biex\b",
                         r"\$zk\.PSObject", r"\$zk\.psbase"):
-            assert not re.search(pattern, code, re.I), f"dynamic COM access ({pattern}) in the export script"
+            assert not re.search(pattern, code, re.I), f"dynamic COM access ({pattern}) in {path.name}"
 
     def test_the_com_object_is_never_handed_anywhere_else(self):
         """Outside ``$zk.<Method>(`` the object may only be created by Connect-Zkem and
@@ -111,10 +112,21 @@ class TestStaticallyReadOnly:
                 for _ in re.finditer(r"\$zk\b(?!\.)", line)]
         assert bare == ["$zk = Connect-Zkem $cfg", "Disconnect-Zkem $zk"], bare
 
+    def test_common_only_creates_returns_and_closes_the_com_object(self):
+        """_common.ps1 is shared with the pack's WRITING scripts; any new use of $zk
+        there (a helper, an alias) would reach script 14 too."""
+        bare = [line.strip() for line in _code_lines(COMMON)
+                for _ in re.finditer(r"\$zk\b(?!\.)", line)]
+        assert bare == ["$zk = New-Zkem", "return $zk", "function Disconnect-Zkem { param($zk)"], bare
+
     def test_only_common_is_dot_sourced(self):
         code = "\n".join(_code_lines(SCRIPT))
         sourced = re.findall(r"^\s*\.\s+['\"]?([^'\"\s]+)", code, re.M)
         assert sourced == ["$PSScriptRoot\\_common.ps1"], sourced
+
+    def test_common_dot_sources_nothing(self):
+        code = "\n".join(_code_lines(COMMON))
+        assert not re.findall(r"^\s*\.\s+['\"]?([^'\"\s]+)", code, re.M)
 
 
 pwsh = shutil.which("powershell") or shutil.which("pwsh")

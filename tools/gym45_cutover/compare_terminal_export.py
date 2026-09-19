@@ -140,13 +140,19 @@ class Slot:
 
 @dataclass
 class TerminalUser:
-    pin: str
+    pin: str                     # as the terminal returned it (shown in the detail CSV)
     name: str
     card: str
     privilege: int
     enabled: bool
     has_password: bool
     slots: Optional[List[Slot]]  # None = finger slots were not read
+
+    @property
+    def key(self) -> str:
+        """The pin as every comparison uses it (norm_pin), whatever padding the terminal
+        returned it with."""
+        return norm_pin(self.pin)
 
 
 @dataclass
@@ -326,12 +332,12 @@ def load_access_db(path: str) -> AccessDb:
             for dev, pin, owned, pushed, last_ok in conn.execute(
                 f"SELECT device_id, pin, ownership_confirmed, {pf}, last_ok FROM device_sync_state"
             ):
-                ownership[int(dev)][str(pin)] = OwnState(bool(owned), pushed, bool(last_ok))
+                ownership[int(dev)][norm_pin(pin)] = OwnState(bool(owned), pushed, bool(last_ok))
             ownership = dict(ownership)
         intents: Dict[int, Set[str]] = defaultdict(set)
         if "device_id" in _columns(conn, "device_push_intent"):
             for dev, pin in conn.execute("SELECT device_id, pin FROM device_push_intent"):
-                intents[int(dev)].add(str(pin))
+                intents[int(dev)].add(norm_pin(pin))
         pin_scheme: Dict[int, Optional[str]] = {}
         if "pin_scheme" in _columns(conn, "sync_devices"):
             for dev, scheme in conn.execute("SELECT id, pin_scheme FROM sync_devices"):
@@ -558,14 +564,14 @@ def sha_self_check(
     for ex in exports:
         own = ownership.get(ex.device_id, {}) if ownership is not None else None
         for u in ex.users:
-            if u.pin not in by_pin:
+            if u.key not in by_pin:
                 continue
             if own is not None:
-                st = own.get(u.pin)
+                st = own.get(u.key)
                 if not (st and st.ownership_confirmed):
                     continue
             for s in u.slots or []:
-                mine = by_pin[u.pin].get(s.finger_id)
+                mine = by_pin[u.key].get(s.finger_id)
                 if s.sha256 and mine:
                     out["compared"] += 1
                     out["equal"] += int(s.sha256 == mine)
@@ -657,26 +663,27 @@ def analyse(
         intents = access.intents.get(ex.device_id, set()) if access is not None else set()
         classes: Counter = Counter()
         leftover = Counter()
-        pins_on_terminal = {u.pin for u in ex.users}
+        pins_on_terminal = {u.key for u in ex.users}
+        dev["pins_not_in_canonical_form"] = sum(1 for u in ex.users if u.key != u.pin.strip())
         for u in ex.users:
-            person = pin_to_person.get(u.pin)
+            person = pin_to_person.get(u.key)
             if own is None:
                 owned = None
                 cls = "member" if person is not None else None
             else:
-                st = own.get(u.pin)
+                st = own.get(u.key)
                 owned = bool(st and st.ownership_confirmed)
                 if person is not None:
                     cls = "member_owned" if owned else "member_not_owned"
                 elif owned:
                     cls = "departed_owned"
-                elif u.pin in intents:
+                elif u.key in intents:
                     cls = "intent_only"
                 else:
                     cls = None
             if cls is None:
                 if (backend is not None and scheme == "MEMBERSHIP"
-                        and _int_or_none(u.pin) in backend.membership_ids):
+                        and _int_or_none(u.key) in backend.membership_ids):
                     cls = "past_membership"
                 else:
                     cls = "leftover"
@@ -695,11 +702,11 @@ def analyse(
             if use_sha:
                 found["template"] = set().union(*[sha_to_persons.get(s.sha256, set()) for s in slots if s.sha256]) \
                     if slots else set()
-            acct = gms.get(norm_pin(u.pin)) if gms else None
+            acct = gms.get(u.key) if gms else None
             found["gms_id"] = {f"A{acct}"} & set(persons) if acct is not None else set()
             c = norm_card(u.card)
             found["card"] = set(card_to_persons.get(c, set())) if c else set()
-            pc = norm_card(u.pin)
+            pc = norm_card(u.key)
             found["pin_is_card"] = set(card_to_persons.get(pc, set())) if pc else set()
             strong = {k: v for k, v in found.items() if v}
             if not strong and names:

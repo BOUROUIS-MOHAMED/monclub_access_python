@@ -531,3 +531,17 @@ class TestVerifyingThePushUnderAccount:
         db, ex = self._after_the_switch(tmp_path)
         report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)), scheme="ACCOUNT")
         assert report["devices"]["8"]["pc_pin_scheme"] == "ACCOUNT"
+
+
+class TestPinFormats:
+    def test_a_zero_padded_terminal_pin_is_still_the_members_pin(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_db(db)
+        ex = _export(tmp_path / "t8.json", [_u("0011", "Alpha Person", slots=[_slot(0, A0), _slot(5, A5)])])
+        report, details = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
+        dev = report["devices"]["8"]
+        assert dev["classes"] == {"member_owned": 1}
+        assert dev["pins_not_in_canonical_form"] == 1
+        assert report["people"]["terminal_only_via_own_pin"] == 1
+        row = next(d for d in details if d.kind == "member_terminal_only_finger")
+        assert row.fingers == "8:0011:f5", "the detail keeps the pin as the terminal wrote it"
