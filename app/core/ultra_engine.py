@@ -648,6 +648,10 @@ class UltraDeviceWorker(threading.Thread):
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
         self._cached_state_gen: int = -1
+        # (state, generation) in ONE attribute, assigned in one statement by every writer after
+        # the two fields above: a reader that finds its state object in it has that state's
+        # exact generation (P3b-1: the QR date snapshot must match the list it checks).
+        self._cached_pair: tuple = (None, -1)
         self._CACHE_TTL_SEC: float = 300.0  # safety net only; real refresh is generation-driven
         self._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
         self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 120.0))
@@ -6188,8 +6192,16 @@ class UltraDeviceWorker(threading.Thread):
         # would trust an old list); a refresh landing mid-read can only make it look
         # older -- roster_behind, i.e. no refusal -- for that one scan.
         _gen_before = self._cached_state_gen
-        creds, users_by_am, users_by_card = self._get_cached_local_state()
+        _state = self._get_cached_local_state()
+        creds, users_by_am, users_by_card = _state
         own_list_gen = min(_gen_before, self._cached_state_gen)
+        # _cached_pair names the state object with its exact generation. The min() above is
+        # only the fallback for a refresh landing mid-read: _get_cached_local_state can itself
+        # adopt the shared list (after a cache reset, e.g. every date flip), and then the
+        # generation read before the call is older than the list it returned (review R1).
+        _pair = getattr(self, "_cached_pair", None)
+        if isinstance(_pair, tuple) and len(_pair) == 2 and _pair[0] is _state:
+            own_list_gen = int(_pair[1])
 
         # Use the precomputed O(1) index ONLY when it was built from the exact
         # Use the shared index if it was built from a credential generation that
@@ -6239,10 +6251,14 @@ class UltraDeviceWorker(threading.Thread):
             scan_epoch=scan_epoch,
             totp_index=totp_index,
             roster_current=roster_current,
-            # The date snapshot of this worker's own list generation: a newer day checked
-            # against an older list (the seconds before the refresh after a flip) refuses a
-            # renewing member whose old plan ended yesterday (P3b-1, guide §3.1b).
-            access_days=current_access_days(max_generation=own_list_gen),
+            # The date snapshot of the generation of the data this scan matches against: the
+            # shared index's when it is used (the grants come from it), else this worker's own
+            # list's. Never a newer day than those grants -- that refuses a renewing member
+            # whose old plan ended yesterday -- and never an older one -- that refuses a starter
+            # and, in trial, admits an ex-member (P3b-1, guide §3.1b; review R1).
+            access_days=current_access_days(
+                max_generation=_idx_gen if totp_index is not None else own_list_gen
+            ),
         )
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
@@ -7034,6 +7050,7 @@ class UltraDeviceWorker(threading.Thread):
                         self._cached_state = result
                         self._cached_state_ts = time.monotonic()
                         self._cached_state_gen = _gen_at_load
+                        self._cached_pair = (result, _gen_at_load)
                         _set_shared_local_state(result, _gen_at_load)
                         creds, uam, ucard = result
                         _tel.event(
@@ -7193,6 +7210,7 @@ class UltraDeviceWorker(threading.Thread):
             self._cached_state = shared_value
             self._cached_state_ts = now
             self._cached_state_gen = shared_gen
+            self._cached_pair = (shared_value, shared_gen)
             try:
                 _tel.event("CACHE_ADOPTED_SHARED", worker=self._tel_wid, creds=len(shared_value[0]))
             except Exception:
@@ -7218,6 +7236,7 @@ class UltraDeviceWorker(threading.Thread):
             _set_shared_local_state(result, _gen_at_load)
         self._cached_state_ts = now
         self._cached_state_gen = _gen_at_load
+        self._cached_pair = (self._cached_state, _gen_at_load)
         creds, users_by_am, users_by_card = self._cached_state
         _tel.event(
             "CACHE_SYNC_LOAD_DONE", worker=self._tel_wid,
