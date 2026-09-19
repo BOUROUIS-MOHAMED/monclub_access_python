@@ -2301,9 +2301,11 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   outage; registering it on the client PC was part of the remedy]`
 - **Backend base URL** is a single constant, `app/core/app_const.py::MONCLUB_BASE_URL`.
   Not runtime-configurable and not editable from the UI. `[CODE]`
-- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 12 scripts — COM
+- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 14 scripts — COM
   registration, device info, ZK9500 enrol, push, live monitor, unlock, backup/restore,
-  portability test, force-open). Use these to establish ground truth on hardware
+  portability test, force-open, inspect-and-clear, and the read-only export of script 14,
+  whose read-only property is pinned by `tests/test_mb2000_export_readonly.py`). Use these to
+  establish ground truth on hardware
   **before** changing driver code. `[CODE]`
 
 ---
