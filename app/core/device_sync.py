@@ -306,6 +306,88 @@ def account_roster_withheld_for_device(engine: "DeviceSyncEngine", device: Dict[
     return int(stats.get("withheld_missing_account") or 0)
 
 
+# ── RENEWAL ORDERING (P3b-1, plan §7) ───────────────────────────────────────────────────
+#
+# Under pinScheme=MEMBERSHIP a person who bought ANOTHER plan gets a new activeMembershipId,
+# hence a new pin, and P3b-1's date flip makes the old pin leave and the new one arrive in the
+# SAME full-sync pass. Removals run first (guide §3.4b), so the old pin was deleted before the
+# new one was written, and a failed write left the person with neither (guide §7 R3-21). Both
+# full syncs now HOLD such a pin: removed only after the push confirmed every desired pin of
+# that person, kept otherwise. ACCOUNT never holds: a renewal keeps the account pin.
+
+
+def renewal_person_id(value: Any) -> int | None:
+    """A userId as an int, None when absent or not a number."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def renewal_holds(
+    departed_pins: Iterable[Any],
+    *,
+    pending_persons: Iterable[int],
+    exempt: Iterable[str] = (),
+) -> Dict[str, int]:
+    """{departed pin: person} of the MEMBERSHIP pins a full sync must HOLD this pass.
+
+    ``departed_pins``: pins this pass would remove (they left the desired roster).
+    ``pending_persons``: the userIds of the desired pins NOT confirmed on the device at the
+    start of the pass (new, changed, last push failed, or held back by the retry backoff).
+    A departed pin is held when ``member_person_link`` names its person -- under MEMBERSHIP
+    the pin is the activeMembershipId, whose row is usually gone by now -- and that person is
+    pending. Not held, i.e. removed exactly as before: an ``exempt`` pin (an explicit
+    revocation of this pass), a pin with no link row, or every pin when the link cannot be
+    read (``get_member_person_user_ids`` answers {} then).
+    """
+    pending = {int(p) for p in (pending_persons or ()) if p is not None}
+    if not pending:
+        return {}
+    skip = {str(p).strip() for p in (exempt or ())}
+    cands = [
+        pin for pin in (str(p if p is not None else "").strip() for p in (departed_pins or ()))
+        if pin.isdigit() and pin not in skip
+    ]
+    if not cands:
+        return {}
+    try:
+        from app.core import db as _db  # attribute lookup at call time (patchable)
+
+        person_of = _db.get_member_person_user_ids([int(p) for p in cands]) or {}
+    except Exception:
+        return {}
+    out: Dict[str, int] = {}
+    for pin in cands:
+        who = renewal_person_id(person_of.get(int(pin)))
+        if who is not None and who in pending:
+            out[pin] = who
+    return out
+
+
+def renewal_hold_released(
+    person: int | None,
+    *,
+    person_by_pin: Dict[str, Any],
+    unconfirmed: Iterable[str],
+    confirmed_now: Iterable[str],
+) -> bool:
+    """True when every desired pin of ``person`` is confirmed on the device now: either it
+    was not pending at the start of the pass, or this pass pushed it successfully.
+    ``person_by_pin`` maps each DESIRED pin to its userId."""
+    if person is None:
+        return False
+    pending = {str(p) for p in (unconfirmed or ())}
+    done = {str(p) for p in (confirmed_now or ())}
+    return all(
+        pin not in pending or pin in done
+        for pin, who in (person_by_pin or {}).items()
+        if renewal_person_id(who) == person
+    )
+
+
 def reach_of(u: Dict[str, Any]):
     """How far into the future a roster row stays valid — the tie-break when several
     memberships collapse onto one device pin.
