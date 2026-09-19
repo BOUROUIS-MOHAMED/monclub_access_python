@@ -14,6 +14,7 @@ from app.core.access_types import HistoryRecord, NotificationRequest
 from app.core.access_verification import (
     EVENT_TIME_SANITY_BOUND_SEC as _EVENT_TIME_SANITY_BOUND_SEC,
     build_totp_index,
+    current_access_days,
     load_local_state,
     maybe_log_totp_roster_summary,
     parse_event_time_to_epoch,
@@ -6032,6 +6033,7 @@ class UltraDeviceWorker(threading.Thread):
             scan_epoch=scan_epoch,
             totp_index=totp_index,
             roster_current=roster_current,
+            access_days=current_access_days(),
         )
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
