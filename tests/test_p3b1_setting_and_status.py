@@ -5,6 +5,7 @@ generic PATCH handler, and _build_status_payload_uncached's session block.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -225,6 +226,36 @@ def test_status_session_normalises_an_empty_clock_reason_to_null(db) -> None:
     assert payload["session"]["clockSuspectReason"] is None
     assert payload["session"]["clockSuspectWarning"] is False
     assert payload["session"]["accessDatesTrusted"] is False
+
+
+# ============================================================================== 4. tauri-ui (text-level only)
+# No node_modules / typecheck command available offline (see report) -- these confirm the
+# four strings the task asks for actually landed, the way test_config_page_save_button.py
+# text-asserts on the same files.
+def test_tauri_ui_carries_the_new_status_fields_and_pill_copy() -> None:
+    types_ts = Path("tauri-ui/src/api/types.ts").read_text(encoding="utf-8")
+    assert "clockSuspectWarning" in types_ts
+    assert "clockSuspectReason" in types_ts
+    assert "gymDate" in types_ts
+    assert "accessDatesTrusted" in types_ts
+    assert "offline_revoke_grace_days: number" in types_ts
+
+    main_layout = Path("tauri-ui/src/layouts/MainLayout.tsx").read_text(encoding="utf-8")
+    assert "Horloge du PC suspecte" in main_layout
+    assert "clockSuspectWarning" in main_layout
+
+
+def test_tauri_ui_config_page_carries_the_grace_days_input() -> None:
+    config_page = Path("tauri-ui/src/pages/ConfigPage.tsx").read_text(encoding="utf-8")
+    assert "offline_revoke_grace_days" in config_page
+    assert "Délai de grâce hors ligne (jours)" in config_page
+    assert "0 = les abonnements expirent à l'heure même sans internet" in config_page
+
+
+def test_tauri_ui_popup_window_carries_the_not_allowed_today_reason() -> None:
+    popup_window = Path("tauri-ui/src/pages/PopupWindow.tsx").read_text(encoding="utf-8")
+    assert "DENY_NOT_ALLOWED_TODAY" in popup_window
+    assert "Abonnement non valable aujourd'hui" in popup_window
 
 
 def test_status_session_never_500s_when_the_v2_state_read_fails(monkeypatch) -> None:
