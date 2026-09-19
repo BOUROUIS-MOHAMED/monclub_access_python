@@ -140,8 +140,10 @@ the same flip, so the same full-sync pass must write the new pin and remove the 
 `verify_totp(..., access_days=None)`. When given and trusted: the credential opens only if
 (a) one of its grants has a window deliverable on the applied G, or (b) a grant is on the roster
 with no window (v1 row), or (c) the by-account second chance finds a roster row of the same
-account (a renewal with stale grants). Otherwise `DENY_NOT_ALLOWED_TODAY` (both roster modes;
-`dateCheck` field on every QR result). A date refusal is final in `verify_totp_resilient` (no
+account (a renewal with stale grants). When every grant has a window that is not deliverable on G:
+`DENY_NOT_ALLOWED_TODAY` (both roster modes; `dateCheck` field on every QR result). A grant with no
+window and no roster row is `unchecked` -- the roster check and its trial/enforce switch decide it
+(review round 2: refusing it by date refused, in trial, a renewal whose stored grants are stale). A date refusal is final in `verify_totp_resilient` (no
 wall-clock re-run). Never in `_iter_eligible_totp_creds` / `build_totp_index`.
 `load_local_state` augments the credential list (same list feeds the loop and the index):
 upcoming credentials whose grants are deliverable on G are added enabled; a main credential gains
