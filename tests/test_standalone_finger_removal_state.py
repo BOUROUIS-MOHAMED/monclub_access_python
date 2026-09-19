@@ -85,8 +85,11 @@ class FingerState:
     def list_hashes(self, *, device_id):
         return {p: (h, ok) for p, (h, ok, _f) in self.rows.items()}
 
-    def list_fingers(self, *, device_id):
-        return {p: (None if f is None else set(f)) for p, (_h, _ok, f) in self.rows.items()}
+    def list_fingers(self, *, device_id, pins=None):
+        # pins: the real function's optional point-read filter (P3a-2 review R4-05)
+        want = None if pins is None else {str(p) for p in pins}
+        return {p: (None if f is None else set(f)) for p, (_h, _ok, f) in self.rows.items()
+                if want is None or p in want}
 
     def list_owned(self, *, device_id):
         # Direct test seeds with last_ok=True model installed confirmed rows.

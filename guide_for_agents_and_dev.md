@@ -1324,7 +1324,8 @@ settled by reading the terminal:
 | nothing (a successful listing) | intent dropped: the write never landed — only on a NON-EMPTY listing: an empty one (an empty terminal, or a read that returned nothing) drops nothing, on the MB2000 (review R2-06) as on PullSDK, where an empty one-pin answer on a targeted revoke drops nothing either (R1-30) |
 | anything else | intent kept, `readback_misses+1`, never deleted |
 | listing failed | nothing changes |
-| a listing that shows NONE of the pins MonClub owns on that terminal (MB2000; e.g. a wrong out-param order putting names in the pin field) | not trusted: nothing changes, `PUSH_INTENT_READBACK ok=False reason=no_owned_pin_listed` (review R3-20) |
+| a listing that shows NONE of the pins MonClub owns on that terminal (MB2000; e.g. a wrong out-param order putting names in the pin field) | not trusted: nothing changes, `PUSH_INTENT_READBACK ok=False reason=no_owned_pin_listed` (review R3-20); the same when MonClub's ownership state cannot be read (R4-04) |
+| a listing that misses ANY pin MonClub owns (MB2000; e.g. an enumeration cut short, which the driver cannot tell from its end) | promotions and misses still count, but nothing is DROPPED: absence from an incomplete listing is not proof the write never landed (review R4-06) |
 
 MB2000 (`_promote_intents_by_readback`): one `list_device_users` (a whole-terminal enumeration in ONE
 STA command — no RTLog pump, no door service for its duration; ~1,860 users on gym 45, duration
@@ -1397,7 +1398,9 @@ pending. `[TEST: test_review_round2.py]` `[CODE: device_sync.MEMBER_SYNC_DEFERRE
 at all (it stopped before `_sync_one_device`) is not "complete" and does not clear a pending retry
 (R3-04); an MB2000 revocation whose pin the removal step removed is released at once even when the
 rest of the pass fails — left ACTIVE, it excluded the member from every later roster until a restart,
-even after a restored membership (R3-14). `[TEST: test_review_round3.py]` Load note: on PullSDK every
+even after a restored membership (R3-14). Only the revocation is released: the member's ROSTER EXCLUSION
+moves to RETRY with the rest and clears on the next successful pass, so a capped continuation built from a
+stale cache cannot push them back (round 4, R4-11). `[TEST: test_review_round3.py]` Load note: on PullSDK every
 retry pass also re-writes the door parameters (`DoorNDrivertime`, `DoorNIntertime`/anti-passback), like
 any full pass (R3-09).
 
@@ -1526,7 +1529,7 @@ pin's state write is "not in sync", which keeps its previous `pushed_finger_ids`
 WERE cleared and its other fingers written, so every retry cleared an already-empty slot, read the
 `False` as a refusal and failed for good; what is resident is now recorded
 (`db.set_device_pushed_fingers`, R3-12 — on the full sync per chunk and on the targeted push). A
-targeted push (≤ 10 pins) admits with primary-key reads, not
+targeted push (≤ 10 pins) admits — and reads its pins' finger state (R4-05) — with primary-key reads, not
 three whole-device tables (R3-24). `[TEST: test_review_round3.py]`
 `[UNVERIFIED]` that index 11 is `users_free` on the MB2000 beyond the 2026-09-06 arithmetic
 (`1838 + 1162 = 3000`), and that `SSR_SetUserInfo` on an existing pin consumes no new user slot.
@@ -1605,12 +1608,13 @@ command, the daily read-back's enumeration — makes the driver abandon its STA 
 `is_connected`; the worker never looked (its only reconnect trigger is a poll returning None, and this
 driver's poll never fails), so nothing pumped events or opened the door until an unrelated push or the
 30-min refresh. `UltraDeviceWorker._push_link_lost` now checks once per loop iteration and reconnects:
-`[T] WORKER_LINK_LOST`. `[TEST: test_worker_link_recovery.py]` *Rounds 2–3:* the scans the driver had
-already queued are CARRIED over the reconnect and decided first on the rebuilt link (`_take_carried_events`;
-R2-13 decided them on the dead link, where a rescue could not open and its cooldown then dropped the
-member's re-scan — R3-19) — but only if at most `_CARRY_MAX_AGE_SEC` = 10 s old: a rescue decided after
-a long backoff could open the door for nobody; older ones are dropped, `[T] CARRIED_EVENTS_DROPPED`
-(a design bound, `[UNVERIFIED]` against real reconnect times). The first loss reconnects at once; a loss within `_LINK_STABLE_SEC` = 60 s
+`[T] WORKER_LINK_LOST`. `[TEST: test_worker_link_recovery.py]` *Rounds 2–4:* the scans the driver had
+already queued are decided before it is torn down, so none is lost (history, popup; R2-13) — a rescue
+among them cannot open the door on the dead link, exactly as before P3a-2, and the member re-scans after
+the reconnect (accepted, R3-19). Carrying them over the reconnect was tried in round 3 and withdrawn in
+round 4: aged from the wrong clock it could open the door a minute after the scan, and its age bound
+dropped terminal-decided scans from the history (R4-01/07/08/09). A full-sync pass is not run on a link
+the driver reports dead — it waits, queued, for the reconnect (R4-10). The first loss reconnects at once; a loss within `_LINK_STABLE_SEC` = 60 s
 after the reconnect that followed the PREVIOUS loss waits 2, 4, 8 … s up to the connect backoff cap, so
 a flapping terminal is not a connect loop (R2-12) — measured from that loss, so a routine 30-min refresh
 never inherits an old streak (R3-01) — and such a wait starts the outage clock, so the desk's Open
@@ -2283,8 +2287,8 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2093 passed** (2026-09-19,
-branch `claude/p3a2-push-engine`, P3a-2 push engine + three adversarial review rounds; both this
+background-thread exceptions are promoted to failures. Last run: **2097 passed** (2026-09-19,
+branch `claude/p3a2-push-engine`, P3a-2 push engine + four adversarial review rounds; both this
 command and the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
 Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). Its base
 `d09f88f` (1924 tests) measured 1922–1923 passed, 1–2 failed in repeated runs: the two known flaky
@@ -2431,8 +2435,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped withheld_fingers withheld_pins` (warn; `skipped` = new members not pushed, no user slot; `withheld_*` = fingers not written, no fingerprint slot — the member itself was pushed; §3.4d) |
 | `TEMPLATE_VERSION_MISMATCH` | `zk_standalone.py::push_roster` | `worker skipped device_fp_version` (warn; templates of another algorithm version not uploaded, once per push, §3.4d) |
 | `PUSH_YIELD` | `ultra_engine.py::_standalone_push_yield` | `worker member_updates pins dur_ms` — a member update or revoke served between two push chunks; `pins` = pins it handled, dropped from the rest of the push. Emitted only when one was served (§3.4e) |
-| `WORKER_LINK_LOST` | `ultra_engine.py::_push_link_lost` | `worker streak delay_s` (warn; a push driver reported its link down — an abandoned STA thread or a dead event pump — and the worker reconnects after `delay_s`, absent on the first loss; `streak` counts losses within 60 s of each reconnect; review R1-21/R2-12, §3.4e) |
-| `CARRIED_EVENTS_DROPPED` | `ultra_engine.py::_take_carried_events` | `worker count max_age_s` (warn; scans carried over a link loss that were older than 10 s when the link came back — not decided, §3.4e) |
+| `WORKER_LINK_LOST` | `ultra_engine.py::_push_link_lost` | `worker streak delay_s` (warn; a push driver reported its link down — an abandoned STA thread or a dead event pump — and the worker reconnects after `delay_s`, absent on the first loss; `streak` counts consecutive losses, each within 60 s after the reconnect that followed the previous one; review R1-21/R2-12/R3-01, §3.4e) |
 | `MAINTENANCE_SKIPPED` | `ultra_engine.py::_drain_daily_maintenance` | `worker reason` (warn, once a day; `reason=no_complete_roster`: no complete roster since the worker started, so no finger sweep and no intent read-back; review R2-05, §3.4c) |
 | `FULL_SYNC_CAPPED` | `ultra_engine.py::_run_standalone_full_sync` | `worker cap pushing left` — this pass pushes `pushing` pins and leaves `left` for its continuation (§3.4e) |
 | `ZKEM_PUSH_DONE` | `zk_standalone.py::push_roster` | `pushed failed skipped_pin ok chunks tpl_attempted tpl_ok tpl_failed op del_attempted del_ok not_attempted superseded` — `superseded` (2026-09-19) = pins the between-chunks caller handled itself and dropped (§3.4e) |

@@ -96,16 +96,17 @@ def test_r3_03_the_run_loop_spends_no_member_update_on_a_dead_link(db, monkeypat
     assert list(w._pending_member_syncs) == [30005]
 
 
-def test_r3_19_scans_queued_on_a_dead_link_are_decided_after_the_reconnect(db, monkeypatch):
+def test_r3_19_accepted_scans_are_decided_before_the_teardown_and_never_lost(db, monkeypatch):
+    """R3-19 (a rescue decided on the dead link cannot open) is accepted as base
+    behaviour: carrying scans over the reconnect was tried and withdrawn in round 4
+    (R4-01/07/08/09). They are still decided -- history and popup -- never lost."""
     evt = {"eventId": "e1", "cardNo": "123"}
     w = _link_worker(monkeypatch, _DeadLink(events=[evt]))
     w._connected = True
     seen = []
     w._process_event = lambda e: seen.append(e)
     assert w._push_link_lost() is True
-    assert seen == [], "decided on a link that cannot open the door"
-    assert w._take_carried_events() == [evt]
-    assert w._take_carried_events() == []
+    assert seen == [evt]
 
 
 # ═══════════════ removal retry (R3-04/17/27, R3-16, R3-14) ═══════════════
@@ -160,7 +161,8 @@ def test_r3_14_a_removed_revocation_is_released_when_its_pass_fails(monkeypatch,
     with w._full_sync_lock:
         assert 34439 not in w._full_sync_revocation_phases_locked(), (
             "left ACTIVE: excluded from every later roster until a restart")
-    assert w.request_member_sync(34439) is True
+    # The roster exclusion outlives the failed pass and clears on the next successful one:
+    # test_review_round4.py::test_r4_11_...
 
 
 # ═══════════════ ownership, grace, capacity, read-back (R3-06, R3-11, R3-12, R3-20, R3-24) ═════
@@ -273,19 +275,3 @@ def test_r3_12_the_targeted_push_records_a_withheld_pins_resident_fingers(db, mo
         drv.disconnect()
     assert term.fingers_of("30002") == {0, 5}
     assert db.list_device_pushed_fingers(device_id=9)["30002"] == {0, 5}
-
-
-def test_a_scan_carried_over_a_long_outage_is_not_decided_late(db, monkeypatch):
-    """A rescue decided minutes after the member scanned would open the door for nobody."""
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(ue.time, "monotonic", lambda: clock["t"])
-    evt = {"eventId": "e1", "cardNo": "123"}
-    w = _link_worker(monkeypatch, _DeadLink(events=[evt]))
-    w._connected = True
-    w._push_link_lost()
-    clock["t"] += ue._CARRY_MAX_AGE_SEC + 1.0
-    assert w._take_carried_events() == []
-    w._sdk, w._connected = _DeadLink(events=[evt]), True
-    w._push_link_lost()
-    clock["t"] += 1.0
-    assert w._take_carried_events() == [evt], "a quick reconnect still decides it"

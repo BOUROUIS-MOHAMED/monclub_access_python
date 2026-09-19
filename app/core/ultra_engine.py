@@ -232,11 +232,6 @@ _REMOVAL_RETRY_PARKED_SEC = 1800.0
 # reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
 # stable link reconnects at once -- that is the door path.
 _LINK_STABLE_SEC = 60.0
-# Scans carried over a link loss are decided after the reconnect only if they are at most
-# this old: a QR/TOTP or staff-RFID rescue decided later could open the door for nobody
-# (review, after round 3). A design bound, not a measurement: a member who got no answer
-# has re-scanned or left by then. [UNVERIFIED] field-tune if reconnects take longer.
-_CARRY_MAX_AGE_SEC = 10.0
 
 # P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
 # One sweep STA command clears at most this many slots: 3 x 71-171 ms (field-measured
@@ -773,10 +768,6 @@ class UltraDeviceWorker(threading.Thread):
                     # Watchdog timeout or error -> reconnect
                     self._disconnect()
                     continue
-                # Scans carried over a link loss go first (review R3-19).
-                _carried = self._take_carried_events()
-                if _carried:
-                    events = _carried + list(events or [])
 
                 if events:
                     self._empty_sleep_ms = float(self._empty_min)
@@ -1068,17 +1059,22 @@ class UltraDeviceWorker(threading.Thread):
         if up:
             return False
         # Scans the terminal handed over before the link died are already queued in the
-        # driver. They are CARRIED over the reconnect and decided first thing after it
-        # (review R2-13, R3-19): decided on this dead link, a rescue could not open the
-        # door and its cooldown then dropped the member's re-scan.
+        # driver: decide them before it is torn down, or they are lost -- no history row,
+        # no popup (review R2-13). A rescue among them cannot open the door on this link,
+        # exactly as before P3a-2; the member re-scans after the reconnect. (Carrying them
+        # over the reconnect was tried in round 3 and withdrawn in round 4: aged from the
+        # wrong clock it could open the door a minute late, and its age bound dropped
+        # terminal-decided scans from the history -- R4-01/07/08/09.)
         try:
             events = sdk.poll_rtlog_once() or []
         except Exception:
             events = []
+        for evt in events:
+            try:
+                self._process_event(evt)
+            except Exception:
+                logger.warning("%s event before link loss failed", self._prefix, exc_info=True)
         now = time.monotonic()
-        if events:
-            carried = list(getattr(self, "_carried_events", None) or []) + [(now, e) for e in events]
-            self._carried_events = carried[-256:]
         # Flapping = the link did not stay up _LINK_STABLE_SEC after the reconnect that
         # followed the PREVIOUS loss -- measured from that loss, not from the last connect,
         # so a routine CONN_REFRESH reconnect never inherits an old streak (review R3-01).
@@ -1107,23 +1103,6 @@ class UltraDeviceWorker(threading.Thread):
             self._connect_down_since_mono = now
             self._connect_down_since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return True
-
-    def _take_carried_events(self) -> list:
-        """Events carried over a link loss (see _push_link_lost), at most _CARRY_MAX_AGE_SEC
-        old; older ones are dropped (logged). Emptied by the call."""
-        carried = list(getattr(self, "_carried_events", None) or [])
-        self._carried_events = []
-        if not carried:
-            return []
-        now = time.monotonic()
-        fresh = [e for t, e in carried if (now - float(t)) <= _CARRY_MAX_AGE_SEC]
-        dropped = len(carried) - len(fresh)
-        if dropped:
-            logger.warning("%s %d scan(s) carried over a link loss were too old to decide "
-                           "(> %.0fs) -- dropped", self._prefix, dropped, _CARRY_MAX_AGE_SEC)
-            _tel.warn("CARRIED_EVENTS_DROPPED", worker=self._tel_wid, count=dropped,
-                      max_age_s=round(_CARRY_MAX_AGE_SEC))
-        return fresh
 
     @_tel.timed("CONN_DISCONNECT", slow_ms=200)
     def _disconnect(self):
@@ -2144,10 +2123,17 @@ class UltraDeviceWorker(threading.Thread):
                 continue
         return out
 
-    def _load_pushed_fingers(self) -> Dict[str, Any]:
-        """{pin: set[int] | None} — None is UNKNOWN, never empty. See db.py."""
+    def _load_pushed_fingers(self, pins=None) -> Dict[str, Any]:
+        """{pin: set[int] | None} — None is UNKNOWN, never empty. See db.py.
+
+        ``pins``: only those rows (primary-key reads) -- a targeted push, often served
+        between two push chunks, must not read the whole device table (review R4-05)."""
         try:
             from app.core.db import list_device_pushed_fingers
+            if pins is not None:
+                return dict(list_device_pushed_fingers(
+                    device_id=self._device_id,
+                    pins=[str(p).strip() for p in pins if str(p or "").strip()]) or {})
             return dict(list_device_pushed_fingers(device_id=self._device_id) or {})
         except Exception:
             # Fail SAFE, not fail-open: with no state we cannot name a vacated
@@ -3044,16 +3030,23 @@ class UltraDeviceWorker(threading.Thread):
             pin = str(u.get("pin") or "").strip()
             if pin:
                 on_device[pin] = _standalone_wire_identity(u)
+        drops_allowed = True
         if on_device:
             # A listing that shows NONE of the pins MonClub owns on this terminal is not
             # trusted (a wrong out-param order would put names in the pin field): it would
-            # drop every departed intent (review R3-20). Nothing changes.
+            # drop every departed intent (review R3-20). Nothing changes. An unreadable
+            # ownership state is "cannot check", never "nothing to check" (review R4-04).
             try:
                 from app.core.db import list_confirmed_device_sync_pins
                 owned_now = {str(p).strip() for p in
                              (list_confirmed_device_sync_pins(device_id=self._device_id) or ())}
             except Exception:
-                owned_now = set()
+                logger.warning("%s intent read-back: ownership unreadable -- nothing changed",
+                               self._prefix, exc_info=True)
+                return None
+            # Absence proves "the write never landed" only on a COMPLETE listing: one that
+            # misses any pin MonClub owns (a listing cut short) drops nothing (review R4-06).
+            drops_allowed = owned_now <= set(on_device)
             if owned_now and not (owned_now & set(on_device)):
                 logger.warning("%s intent read-back: the listing shows none of MonClub's %d "
                                "owned pins -- not trusted, nothing changed", self._prefix,
@@ -3067,8 +3060,9 @@ class UltraDeviceWorker(threading.Thread):
         for pin, it in sorted(cands.items()):
             if pin not in on_device:
                 # An EMPTY listing cannot tell an empty terminal from a read that returned
-                # nothing: drop no intent on it (review R2-06, as R1-30 on PullSDK).
-                if on_device:
+                # nothing: drop no intent on it (review R2-06, as R1-30 on PullSDK); nor an
+                # incomplete one (R4-06).
+                if on_device and drops_allowed:
                     dropped.append(pin)
                 continue
             want_name = str(it.get("name") or "")[:24].strip()
@@ -3614,11 +3608,14 @@ class UltraDeviceWorker(threading.Thread):
         # back to the scheduler for a retry that could never succeed.
         effective_revoked_ids = normalized_revoked_ids - set(skipped_revokes) - removed_revokes
         if not sync_ok and removed_revokes:
-            # Their physical revoke is DONE (removals run first): release them now, before
-            # the rest go to RETRY -- left ACTIVE they excluded the member from every later
-            # roster until a restart, even after a restored membership (review R3-14).
+            # Their physical revoke is DONE (removals run first): release the revocation now
+            # -- left ACTIVE it excluded the member from every later roster until a restart,
+            # even after a restored membership (review R3-14). The ROSTER EXCLUSION is not
+            # released here: the call below moves it to RETRY, so the next pass (a capped
+            # continuation, the scheduler's retry) still leaves the member out of a stale
+            # cache, and a pass that succeeds clears it (review R4-11).
             self._finalize_full_sync_revokes(
-                set(removed_revokes), ok=True, excluded_ids=set(removed_revokes),
+                set(removed_revokes), ok=True, excluded_ids=set(),
             )
         if not sync_ok:
             self._finalize_full_sync_revokes(
@@ -3833,7 +3830,7 @@ class UltraDeviceWorker(threading.Thread):
             # Same vacated-slot removal as the full sync. This path runs seconds
             # after a dashboard change, so without it a revoked finger stays live
             # until the next full sync happens to pick the pin up.
-            pushed_fingers = self._load_pushed_fingers()
+            pushed_fingers = self._load_pushed_fingers(pins=[u.get("pin") for u in users])
             removals = self._standalone_removals(
                 to_push=users, templates_by_pin=templates_by_pin,
                 pushed_fingers=pushed_fingers,
@@ -4193,7 +4190,7 @@ class UltraDeviceWorker(threading.Thread):
         try:
             removals = self._standalone_removals(
                 to_push=[entry], templates_by_pin=templates,
-                pushed_fingers=self._load_pushed_fingers(),
+                pushed_fingers=self._load_pushed_fingers(pins=[acct]),
             )
             if not self._record_push_intents([entry], hashes_by_pin):
                 raise RuntimeError("push intent not recorded")
@@ -4291,7 +4288,7 @@ class UltraDeviceWorker(threading.Thread):
 
         outcome = self._remove_standalone_pins(
             pins=[pin],
-            pushed_fingers=self._load_pushed_fingers(),
+            pushed_fingers=self._load_pushed_fingers(pins=[pin]),
         )
         if pin in outcome.removed and pin not in outcome.failed:
             from app.core.db import clear_device_revocation_state
@@ -4860,7 +4857,12 @@ class UltraDeviceWorker(threading.Thread):
 
             self._removal_retry_reported = False
             try:
-                if self._sdk is None or not self._connected:
+                if self._sdk is None or not self._connected or (
+                        getattr(self._sdk, "owns_event_source", False)
+                        and not bool(getattr(self._sdk, "is_connected", True))):
+                    # Also a push driver that reports its link dead: the pass would fail
+                    # every removal and escalate the retry for nothing; it is re-queued for
+                    # the reconnected link (review R4-10).
                     self._finalize_full_sync_revokes(
                         revoked_ids, ok=False, excluded_ids=excluded_ids
                     )

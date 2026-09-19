@@ -7356,7 +7356,8 @@ def list_confirmed_device_sync_pins(*, device_id: int) -> "set[str]":
 
 
 @_tel.timed("DB_READ_list_device_pushed_fingers", slow_ms=50, warn_ms=1000)
-def list_device_pushed_fingers(*, device_id: int) -> Dict[str, "set[int] | None"]:
+def list_device_pushed_fingers(*, device_id: int,
+                               pins: "Iterable[str] | None" = None) -> Dict[str, "set[int] | None"]:
     """Return {pin: finger ids last pushed to this device}.
 
     ``None`` means UNKNOWN -- a row written before this column existed, or one
@@ -7370,10 +7371,21 @@ def list_device_pushed_fingers(*, device_id: int) -> Dict[str, "set[int] | None"
     """
     did = int(device_id)
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT pin, pushed_finger_ids FROM device_sync_state WHERE device_id=?",
-            (did,),
-        ).fetchall()
+        if pins is not None:
+            # Primary-key reads for a few pins (a targeted push) -- P3a-2 review R4-05.
+            rows = []
+            for p in pins:
+                r = conn.execute(
+                    "SELECT pin, pushed_finger_ids FROM device_sync_state "
+                    "WHERE device_id=? AND pin=?", (did, str(p).strip()),
+                ).fetchone()
+                if r is not None:
+                    rows.append(r)
+        else:
+            rows = conn.execute(
+                "SELECT pin, pushed_finger_ids FROM device_sync_state WHERE device_id=?",
+                (did,),
+            ).fetchall()
         out: Dict[str, "set[int] | None"] = {}
         for r in rows:
             p = str(r["pin"] or "")

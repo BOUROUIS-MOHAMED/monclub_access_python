@@ -70,8 +70,9 @@ def test_an_abandoned_sta_thread_is_rebuilt_by_the_worker(db, monkeypatch):
                 pass
 
 
-def test_a_scan_queued_when_the_link_died_is_decided_on_the_new_link(db, monkeypatch):
-    """Review R3-19: carried over the reconnect, decided on the rebuilt link."""
+def test_a_scan_queued_when_the_link_died_is_decided_not_lost(db, monkeypatch):
+    """Review R2-13: a scan queued on the driver when its link died is decided before the
+    driver is torn down (history, popup) -- not lost with its queue."""
     drivers = []
 
     def factory(device_payload=None, logger=None):
@@ -97,9 +98,8 @@ def test_a_scan_queued_when_the_link_died_is_decided_on_the_new_link(db, monkeyp
             [] if first.is_connected else real_poll(max_events))
         first._evt_queue.put_nowait({"eventId": "carried-1", "cardNo": "123"})
         first._abandon_sta_thread("test: a COM call never returned")
-        assert _wait(lambda: any(e == "carried-1" for e, _s in decided))
-        [(_e, on)] = [d for d in decided if d[0] == "carried-1"]
-        assert on is drivers[-1] and on is not drivers[0], "decided on the dead link"
+        assert _wait(lambda: any(e == "carried-1" for e, _s in decided)), "lost with the driver"
+        assert _wait(lambda: len(drivers) >= 2 and w._connected), "and the link is rebuilt"
     finally:
         stop.set()
         w.join(10)

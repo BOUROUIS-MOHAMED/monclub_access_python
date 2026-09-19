@@ -357,7 +357,9 @@ that record could not be written, so NOTHING was pushed that pass. `PUSH_INTENT_
 once a day on an MB2000 (after the morning sync) or inside a C3 sync, of pushes that were never confirmed
 for members who have since left: `promoted=` were found on the terminal exactly as MonClub wrote them and
 will be removed; `dropped=` never reached it; `mismatched=` hold a different user and are left alone.
-`ok=False` means the terminal listing failed and nothing changed.
+`ok=False` means the terminal listing failed, or was not trusted (`reason=no_owned_pin_listed`: it showed none
+of MonClub's own members), and nothing changed. A listing that misses any of MonClub's members still
+promotes exact matches but drops nothing.
 
 **Was a removal refused as too large?** (P3a-2, both SDKs)
 
@@ -399,7 +401,7 @@ push. `FULL_SYNC_CAPPED pushing=50 left=N` means the terminal needed more than 5
 50 now, the rest in the next passes, one after another (the push-history page says
 `PUSH_CAPPED=N`). `WORKER_STALL state=full_sync` should now appear only if ONE group of 10 members
 takes more than 25 s — a real problem, not a long push. `ZKEM_DELETE_DONE dur_ms=` is how long a
-removal kept the door waiting (removals still go in one command). `WORKER_LINK_LOST` means the PC lost its link to the terminal (a command never answered) and rebuilt it — at once the first time; if the link keeps dying right after each reconnect it waits 2, 4, 8 s … (`delay_s=`, `streak=`), and meanwhile the desk's Open answers "device unreachable". Scans made just before the loss are handled right after the reconnect. Before, QR codes and the desk button could stay dead for up to 30 minutes after such a loss. The desk's Open button can still
+removal kept the door waiting (removals still go in one command). `WORKER_LINK_LOST` means the PC lost its link to the terminal (a command never answered) and rebuilt it — at once the first time; if the link keeps dying right after each reconnect it waits 2, 4, 8 s … (`delay_s=`, `streak=`), and meanwhile the desk's Open answers "device unreachable". Scans made just before the loss are still recorded (history, popup); a QR code scanned at that very moment may not open the door and the member scans again. Before, QR codes and the desk button could stay dead for up to 30 minutes after such a loss. The desk's Open button can still
 answer "timed out" when pressed during a push; the door is then NOT opened later.
 
 ---
