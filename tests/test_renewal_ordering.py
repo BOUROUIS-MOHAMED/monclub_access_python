@@ -93,6 +93,42 @@ def _flipped(db, gone_rows, kept_rows) -> None:
     db.delete_users_by_am_ids({int(r["activeMembershipId"]) for r in gone_rows})
 
 
+# ═════════════════════════════ the two shared rules ═════════════════════════════
+
+class TestRules:
+
+    def test_a_hold_waits_for_every_desired_pin_of_its_person(self):
+        from app.core.device_sync import renewal_released_holds
+
+        persons = {"30001": PERSON, "30005": PERSON, "30002": 901}
+        free = renewal_released_holds(
+            {str(OLD): PERSON, "34440": 901}, person_by_pin=persons,
+            unconfirmed={"30001", "30005", "30002"}, confirmed_now={"30001", "30002"},
+        )
+        assert free == {"34440"}, "30005 still waits: the person's old pin stays"
+        assert renewal_released_holds(
+            {str(OLD): PERSON}, person_by_pin=persons,
+            unconfirmed={"30001"}, confirmed_now={"30001"},
+        ) == {str(OLD)}, "30005 was confirmed before the pass: not waited for"
+
+    def test_an_unreadable_person_link_holds_nothing(self, monkeypatch):
+        import app.core.device_sync as ds
+
+        def _broken(_ids):
+            raise RuntimeError("database locked")
+        monkeypatch.setattr(dbmod, "get_member_person_user_ids", _broken)
+        assert ds.renewal_holds([str(OLD)], pending_persons={PERSON}) == {}, (
+            "removed first, exactly as before")
+
+    def test_exempt_and_unlinked_pins_are_never_held(self, db):
+        from app.core.device_sync import renewal_holds
+
+        _flipped(db, [_row(OLD, PERSON), _row(LEAVER, 901)], [_row(NEW, PERSON)])
+        assert renewal_holds([str(OLD), str(LEAVER), "55555"], pending_persons={PERSON}) \
+            == {str(OLD): PERSON}
+        assert renewal_holds([str(OLD)], pending_persons={PERSON}, exempt={str(OLD)}) == {}
+
+
 # ═════════════════════════════ MB2000 (ZK_STANDALONE) ═════════════════════════════
 
 class RenewalTerminal(TerminalZkem):

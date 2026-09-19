@@ -4828,17 +4828,12 @@ class UltraDeviceWorker(threading.Thread):
         failure: state kept, fast retry); ``errored`` = ownership unreadable, nothing
         attempted. Emits one ``RENEWAL_HOLD`` line.
         """
-        from app.core.device_sync import renewal_hold_released
+        from app.core.device_sync import renewal_released_holds
 
-        kept: set[str] = set()
-        released: list[str] = []
-        for pin, person in sorted(holds.items()):
-            if pin in touched or not renewal_hold_released(
-                    person, person_by_pin=pin_persons, unconfirmed=unconfirmed,
-                    confirmed_now=confirmed_now):
-                kept.add(pin)
-            else:
-                released.append(pin)
+        free = renewal_released_holds(holds, person_by_pin=pin_persons,
+                                      unconfirmed=unconfirmed, confirmed_now=confirmed_now)
+        released = sorted(p for p in free if p not in touched)
+        kept = set(holds) - set(released)
         failed: set[str] = set()
         errored = False
         removed = 0

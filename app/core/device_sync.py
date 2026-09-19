@@ -367,25 +367,27 @@ def renewal_holds(
     return out
 
 
-def renewal_hold_released(
-    person: int | None,
+def renewal_released_holds(
+    holds: Dict[str, int],
     *,
     person_by_pin: Dict[str, Any],
     unconfirmed: Iterable[str],
     confirmed_now: Iterable[str],
-) -> bool:
-    """True when every desired pin of ``person`` is confirmed on the device now: either it
-    was not pending at the start of the pass, or this pass pushed it successfully.
-    ``person_by_pin`` maps each DESIRED pin to its userId."""
-    if person is None:
-        return False
-    pending = {str(p) for p in (unconfirmed or ())}
+) -> Set[str]:
+    """The held pins whose person's desired pins are ALL confirmed on the device now: each
+    was either confirmed at the start of the pass (not in ``unconfirmed``) or pushed
+    successfully by this pass (``confirmed_now``). ``holds``: {held pin: person};
+    ``person_by_pin``: {DESIRED pin: userId}. One walk over the desired pins."""
     done = {str(p) for p in (confirmed_now or ())}
-    return all(
-        pin not in pending or pin in done
-        for pin, who in (person_by_pin or {}).items()
-        if renewal_person_id(who) == person
-    )
+    waiting = {str(p) for p in (unconfirmed or ())} - done
+    blocked: Set[int] = set()
+    for pin, who in (person_by_pin or {}).items():
+        if str(pin) in waiting:
+            person = renewal_person_id(who)
+            if person is not None:
+                blocked.add(person)
+    return {pin for pin, person in (holds or {}).items()
+            if person is not None and person not in blocked}
 
 
 def reach_of(u: Dict[str, Any]):
@@ -4120,18 +4122,15 @@ class DeviceSyncEngine:
                 # deleted, by the same delete as the stale step; the rest stay on the panel
                 # (their rows kept, not a removal failure) until a later pass confirms the
                 # new pin. A failed delete is a normal removal failure (REMOVAL_FAILED).
-                _person_by_pin = {p: (desired.get(p) or {}).get("userId") for p in desired_pins}
-                _confirmed_now = {p for p, o in pin_outcomes.items()
-                                  if (o or {}).get("status") == "SUCCESS"}
-                _released = []
-                for p, who in sorted(renewal_held.items()):
-                    if renewal_hold_released(
-                            who, person_by_pin=_person_by_pin,
-                            unconfirmed=_unconfirmed_pins | pins_to_sync,
-                            confirmed_now=_confirmed_now):
-                        _released.append(p)
-                    else:
-                        renewal_kept.add(p)
+                _free = renewal_released_holds(
+                    renewal_held,
+                    person_by_pin={p: (desired.get(p) or {}).get("userId") for p in desired_pins},
+                    unconfirmed=_unconfirmed_pins | pins_to_sync,
+                    confirmed_now={p for p, o in pin_outcomes.items()
+                                   if (o or {}).get("status") == "SUCCESS"},
+                )
+                _released = sorted(_free)
+                renewal_kept = set(renewal_held) - _free
                 _removed_after = 0
                 if _released:
                     self.logger.info(
