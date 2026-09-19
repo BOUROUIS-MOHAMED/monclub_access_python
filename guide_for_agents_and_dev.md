@@ -1402,9 +1402,11 @@ even after a restored membership (R3-14). Its roster exclusion is released with 
 (round 4) refused a membership restored meanwhile, and the next successful pass then left that paying
 member off the terminal while reporting the roster in sync (R5-03). What the exclusion protected against —
 a capped continuation built from a stale cache pushing the departed member back (R4-11) — is covered by a
-database guard instead: for `_REMOVED_MEMBER_GUARD_SEC` = 10 min after MonClub removed a revoked member —
-by the removal step, or by the targeted revoke (the usual route, R6-05) — every pass excludes them if their
-row is gone from the database, and a restored member is pushed normally. The check is ONE query per pass for
+database guard instead: for `_REMOVED_MEMBER_GUARD_SEC` = 10 min after MonClub finished a revocation — the
+removal step removed the pin, or the targeted revoke (the usual route, R6-05) returned done: deleted or
+neutralised the pin, re-pushed the person's other plans (ACCOUNT), or skipped a pin MonClub does not own —
+every pass excludes that membership's rows if they are gone from the database, and a restored membership is
+pushed normally. The check is ONE query per pass for
 all guarded members (R6-07): a scan of `sync_users`, whose indexes cannot serve `active_membership_id` alone
 (`EXPLAIN QUERY PLAN`: `SCAN sync_users`). Measured on this development PC, synthetic 2,000-row table:
 median 0.2–0.5 ms for 1–10 guarded members, 3.3 ms (rows without fingers/photo) to 16 ms (2 fingers + a
@@ -1631,7 +1633,11 @@ the first 64 (R5-06), and so are the scans queued when the 30-min connection ref
 tears the driver down (`_decide_queued_events`, R5-07 — those teardowns used to drop them undecided,
 before P3a-2 too), including the ones the STA thread's last event pump queues while it stops:
 `disconnect()` sets its stop flag and joins it, and the thread pumps once more before it looks at the flag
-(`_close_link_deciding_scans`, R6-01; those get their history row and popup, the door is closed by then). A full-sync pass is not run on a link the driver reports dead — it waits, queued, for
+(`_close_link_deciding_scans`, R6-01). Those get their history row and popup, but the connection is closed
+by then: a rescue among them is recorded `DOOR_CMD_FAILED`, as on a link loss, and the member re-scans
+(deciding it after the reconnect could open the door long after the scan, R4-01). Not on a link loss: a
+thread abandoned inside a COM call is not joined, and a scan it pumps when that call finally returns lands in
+the discarded queue — no history row, no popup, as before P3a-2 (residual). A full-sync pass is not run on a link the driver reports dead — it waits, queued, for
 the reconnect (R4-10). The first loss reconnects at once; a loss within `_LINK_STABLE_SEC` = 60 s
 after the reconnect that followed the PREVIOUS loss waits 2, 4, 8 … s up to the connect backoff cap, so
 a flapping terminal is not a connect loop (R2-12) — measured from that loss, so a routine 30-min refresh
@@ -2253,10 +2259,11 @@ with MonClub's membership ids before relying on removals there.
 
 Round 6 left two things as they are. **A MonClub member deleted from a shared MB2000 by another system
 stays off it** — MonClub still believes the pin is its own and in sync, so no pass pushes it; base behaved
-the same. The daily read-back now REPORTS such pins (`PUSH_INTENT_READBACK missing_owned=N`, a WARNING
-line) but re-adding them is loss detection, outside P3a-2 (round 5 flagged them for a re-push; withdrawn, R6-02/03/04).
-While one exists the listing never looks complete, so no departed intent is dropped and the read-back runs
-every day — one whole-terminal listing, a single STA command during which no door command is served, of
+the same. The daily read-back REPORTS such pins (`PUSH_INTENT_READBACK missing_owned=N`, a WARNING
+line) — but only on the days it runs, i.e. while departed-member intents exist (§3.4a); no line does NOT
+mean nothing is missing. Re-adding them is loss detection, outside P3a-2 (round 5 flagged them for a
+re-push; withdrawn, R6-02/03/04). While one exists the listing never looks complete, so no departed intent
+is dropped and the read-back runs every day for as long as those intents remain — one whole-terminal listing, a single STA command during which no door command is served, of
 `[UNVERIFIED]` duration (R5-01; FIELD-TEST at gym 45: `grep -F "[T] PUSH_INTENT_READBACK"` — `dur_ms` is the
 door-blind time, `missing_owned` the members to check on the terminal). **On a C3-400 (gym 58)** a
 revoked member deleted by a full pass that then fails keeps a RETRY roster exclusion until a pass succeeds,
@@ -2320,14 +2327,17 @@ applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
 background-thread exceptions are promoted to failures. Last run: **2109 passed** (2026-09-19,
-branch `claude/p3a2-push-engine`, P3a-2 push engine + six adversarial review rounds; both this
-command and the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
-Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). Its base
+branch `claude/p3a2-push-engine`, P3a-2 push engine + six adversarial review rounds; the CLAUDE.md
+command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv` Python 3.11,
+`MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). This command: 2109 passed on
+the round-6 fix, then twice 2108 passed + 1 failed on the final text-only follow-up — the door-timing
+test below, whose two functions are byte-identical to the base. Its base
 `d09f88f` (1924 tests) measured 1922–1923 passed, 1–2 failed in repeated runs: the two known flaky
 tests below. `[TEST]`
 `tests/test_door_open_deadline.py::test_a_door_open_the_caller_gave_up_on_is_never_executed_later`
-is timing-flaky on the base too — failed in 6/20 and 5/12 runs of that file alone on `d09f88f`, 3/20 on
-this branch; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]`
+is timing-flaky on the base too — runs of that file alone failed 13/52 on `d09f88f` (6/20, 5/12, and
+2/20 interleaved with this branch) and 16/60 on this branch (3/20, 8/20, 5/20 interleaved): the same
+rate; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
 failed once in a full base run and passed 20/20 alone on both. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`

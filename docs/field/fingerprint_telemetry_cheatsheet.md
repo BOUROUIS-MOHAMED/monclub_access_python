@@ -362,8 +362,9 @@ of MonClub's own members), and nothing changed. A listing that misses any of Mon
 promotes exact matches but drops nothing. `missing_owned=N` counts MonClub members that are NOT on the
 terminal although MonClub thinks they are (deleted there by another system, or the listing was cut
 short; the WARNING line just before names up to 20 pins). MonClub does not push them back by itself:
-check those pins on the terminal and report them to support. While any exist, this check runs every
-day; `dur_ms` is how long the door waited for it.
+check those pins on the terminal and report them to support. This check runs only while some departed
+member's write is unconfirmed, so NO line does not mean nothing is missing; while missing members and
+such writes both exist, it runs every day. `dur_ms` is how long the door waited for it.
 
 **Was a removal refused as too large?** (P3a-2, both SDKs)
 

@@ -232,9 +232,11 @@ _REMOVAL_RETRY_PARKED_SEC = 1800.0
 # reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
 # stable link reconnects at once -- that is the door path.
 _LINK_STABLE_SEC = 60.0
-# For this long after MonClub removed an explicitly revoked member from the terminal (the
-# full sync's removal step, or the targeted revoke -- review R6-05), every pass checks the
-# DATABASE before trusting the sync cache about that member: gone there -> excluded from
+# For this long after MonClub FINISHED an explicit revocation -- the full sync's removal
+# step removed the pin, or the targeted revoke returned done (review R6-05: it deleted or
+# neutralised the pin, re-pushed the person's other plans under ACCOUNT, or skipped a pin
+# MonClub does not own) -- every pass checks the DATABASE before trusting the sync cache
+# about that membership: its row gone there -> excluded from
 # the pass, so a stale cache snapshot (a background load taken before the revocation
 # committed) cannot push them back (review R4-11, R5-03). A restored membership is present
 # again and is pushed normally. 10 min: the cache's TTL is 5 s and a whole load was
@@ -1079,8 +1081,12 @@ class UltraDeviceWorker(threading.Thread):
                        self._prefix, delay)
         _tel.warn("WORKER_LINK_LOST", worker=self._tel_wid, streak=streak,
                   delay_s=round(delay) or None)
+        # No second drain after this close (unlike _close_link_deciding_scans): a thread
+        # abandoned inside a COM call is not joined, and a dead pump pumps no more, so the
+        # old queue is empty here. A scan the abandoned thread pumps when its call finally
+        # returns lands in that discarded queue (no history row, no popup), as before
+        # P3a-2 (guide §3.4e, residual of R6-01).
         self._disconnect()
-        self._decide_queued_events(sdk=sdk)   # what its STA thread queued on the way out (R6-01)
         # A link that dies right after every reconnect must not become a connect loop
         # (review R2-12): each flap doubles the wait, the first loss reconnects at once.
         self._next_connect_at_mono = now + delay
@@ -1123,7 +1129,10 @@ class UltraDeviceWorker(threading.Thread):
         decide what its STA thread queued on the way out. disconnect() only SETS the
         thread's stop flag and joins it, and the thread runs one more event pump before it
         looks at that flag: scans from that pump were discarded with the driver (review
-        R6-01). Those get their history row and popup; the door is closed by then."""
+        R6-01). Those get their history row and popup, but the connection is closed by
+        then: a rescue among them cannot open the door and is recorded DOOR_CMD_FAILED,
+        as on a link loss (the member re-scans after the reconnect). Deciding it later
+        instead could open the door long after the scan (R4-01)."""
         old = self._sdk
         self._decide_queued_events()
         self._disconnect()
@@ -3111,8 +3120,9 @@ class UltraDeviceWorker(threading.Thread):
             # roster after a cut-short listing and reset the retry clock of pins in backoff
             # (review R6-02, R6-03); re-adding members another system removed is loss
             # detection, outside P3a-2. While such a pin exists the listing is incomplete,
-            # so no intent is dropped and the read-back runs again the next day (R5-01,
-            # guide §7).
+            # so no intent is dropped and the read-back runs again the next day for the
+            # intents it could not settle (R5-01, guide §7). It is reported only on days
+            # the read-back runs at all -- only while departed-member intents exist.
             logger.warning("%s intent read-back: %d owned pin(s) absent from the terminal "
                            "listing -- reported only, nothing changed (%s)", self._prefix,
                            len(missing_owned), ",".join(missing_owned[:20]))
@@ -3742,8 +3752,10 @@ class UltraDeviceWorker(threading.Thread):
                                    full_reconcile=full_reconcile)
 
     def _arm_removed_member_guard(self, member_ids) -> None:
-        """MonClub just removed these members' pins: for _REMOVED_MEMBER_GUARD_SEC the
-        passes check the database before a (possibly stale) cache may push them back."""
+        """MonClub just finished revoking these memberships (see _REMOVED_MEMBER_GUARD_SEC:
+        not always a deleted pin): for that long the passes check the database before a
+        (possibly stale) cache may push them back. Only rows of THESE membership ids are
+        ever excluded, and only while the database no longer has them."""
         guard = getattr(self, "_recent_removed_members", None)
         if guard is None:
             guard = self._recent_removed_members = {}
