@@ -3345,12 +3345,13 @@ class UltraDeviceWorker(threading.Thread):
         self._last_revoke_step = None
         self._last_revoke_grace = set()
         self._last_revoke_holds = set()
+        self._last_revoke_hold_person = {}
         desired_pins: list[str] = []
         # RENEWAL ORDERING (P3b-1, plan §7): departed pins held back by the removal step
-        # until the push confirms their person's new pin, those still kept after the push,
-        # and the removal step's outcome while its report to the removal retry waits for
-        # the post-push removal (one report per pass).
-        renewal_holds: set[str] = set()
+        # until the push confirms their person's new pin ({pin: person}), those still kept
+        # after the push, and the removal step's outcome while its report to the removal
+        # retry waits for the post-push removal (one report per pass).
+        renewal_holds: Dict[str, int] = {}
         kept_holds: set[str] = set()
         deferred_retry: tuple[list[str], bool] | None = None
         try:
@@ -3459,7 +3460,8 @@ class UltraDeviceWorker(threading.Thread):
                     logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
                     safe_to_prune = False
                     removal_attempt_failed = True
-                    self._last_revoke_holds = set()
+                    # Nothing held: the step's outcome is unknown, its state kept (no prune).
+                    self._last_revoke_hold_person = {}
                 # An explicit revocation whose pin that step removed is DONE, whatever the
                 # push does next: it must not be re-queued (and re-reported) as pending.
                 _removed_now = set(getattr(self, "_last_revoke_removed", ()) or ())
@@ -3467,7 +3469,7 @@ class UltraDeviceWorker(threading.Thread):
                     if revoked_pin_of.get(_m) in _removed_now:
                         removed_revokes.add(_m)
                         self._mark_member_revoke_confirmed(_m)
-                renewal_holds = set(getattr(self, "_last_revoke_holds", ()) or ())
+                renewal_holds = dict(getattr(self, "_last_revoke_hold_person", None) or {})
             _step = getattr(self, "_last_revoke_step", None)
             if renewal_holds:
                 # Reported ONCE, after the post-push removal of the holds (or by the
@@ -4729,14 +4731,61 @@ class UltraDeviceWorker(threading.Thread):
             )
             return False
 
+        # RENEWAL HOLDS (P3b-1): counted by the ceiling above, removed by the caller after
+        # the push. Only the rest -- the real leavers -- go now.
+        if hold_persons:
+            from app.core.device_sync import renewal_holds
+
+            self._last_revoke_hold_person = renewal_holds(
+                revoked, pending_persons=hold_persons,
+                exempt=required | {str(p).strip() for p in (hold_exempt or ())},
+            )
+            self._last_revoke_holds = set(self._last_revoke_hold_person)
+        if self._last_revoke_holds:
+            logger.info(
+                "%s revoke pass: %d departed pin(s) held until the push confirms their "
+                "person's new pin: %s", self._prefix, len(self._last_revoke_holds),
+                ",".join(sorted(self._last_revoke_holds)[:20]),
+            )
+        revoked = [p for p in revoked if p not in self._last_revoke_holds]
+        if not revoked:
+            return True
+
         logger.warning(
             "%s revoking %d pin(s) no longer in the roster: %s",
             self._prefix, len(revoked), ",".join(revoked[:20]),
         )
 
+        outcome, failed, pushed_fingers = self._remove_departed_pins(revoked)
+        self._last_revoke_removed = set(outcome.removed) - failed
+        self._last_revoke_removal_failed = sorted(failed)
+        confirmed_slots = sum(
+            len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
+        )
+        _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
+                   deleted=len(outcome.deleted), neutralised=len(outcome.neutralised),
+                   slots=confirmed_slots, ok=not failed)
+        if failed:
+            # Keep the state so the next sync retries rather than forgetting that
+            # these pins still hold credentials.
+            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
+                           self._prefix)
+            return False
+        return outcome.removed == frozenset(revoked)
+
+    def _remove_departed_pins(
+        self, pins: list[str],
+    ) -> tuple[_StandalonePinRemovalResult, set[str], Dict[str, Any]]:
+        """Remove owned departed pins and forget the state of each one confirmed removed.
+
+        Shared by the revoke pass and the post-push removal of the renewal holds (P3b-1).
+        Returns ``(outcome, failed, pushed_fingers)``: ``failed`` = pins the terminal did not
+        confirm removed, plus confirmed ones whose local state could not be cleared -- both
+        keep their state for the retry.
+        """
         pushed_fingers = self._load_pushed_fingers()
         outcome = self._remove_standalone_pins(
-            pins=revoked,
+            pins=pins,
             pushed_fingers=pushed_fingers,
         )
         cleanup_failed: set[str] = set()
@@ -4754,22 +4803,72 @@ class UltraDeviceWorker(threading.Thread):
                         pin,
                         exc_info=True,
                     )
-        failed = set(outcome.failed) | cleanup_failed
-        self._last_revoke_removed = set(outcome.removed) - cleanup_failed
-        self._last_revoke_removal_failed = sorted(failed)
-        confirmed_slots = sum(
-            len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
-        )
-        _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
-                   deleted=len(outcome.deleted), neutralised=len(outcome.neutralised),
-                   slots=confirmed_slots, ok=not failed)
-        if failed:
-            # Keep the state so the next sync retries rather than forgetting that
-            # these pins still hold credentials.
-            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
-                           self._prefix)
-            return False
-        return outcome.removed == frozenset(revoked)
+        return outcome, set(outcome.failed) | cleanup_failed, pushed_fingers
+
+    def _remove_released_holds(
+        self,
+        *,
+        holds: Dict[str, int],
+        pin_persons: Dict[str, Any],
+        unconfirmed: set[str],
+        confirmed_now: set[str],
+        touched: set[str],
+    ) -> tuple[set[str], set[str], bool]:
+        """Second half of renewal ordering (P3b-1, plan §7): after the push, remove the
+        holds whose person's desired pins are ALL confirmed on the terminal now.
+
+        ``holds``: {held pin: person} from the removal step. ``pin_persons``: {desired pin:
+        userId}. ``unconfirmed``: desired pins not confirmed at the start of the pass;
+        ``confirmed_now``: those this pass's push confirmed. A hold is removed through the
+        same removal as the revoke pass, and only while MonClub still owns it: a targeted
+        revoke served between two push chunks may have removed it already (``touched``
+        pins are left to that targeted path). Returns ``(kept, failed, errored)``: ``kept``
+        = holds left on the terminal on purpose (their person still waits for a pin);
+        ``failed`` = released holds the terminal did not confirm removed (a normal removal
+        failure: state kept, fast retry); ``errored`` = ownership unreadable, nothing
+        attempted. Emits one ``RENEWAL_HOLD`` line.
+        """
+        from app.core.device_sync import renewal_hold_released
+
+        kept: set[str] = set()
+        released: list[str] = []
+        for pin, person in sorted(holds.items()):
+            if pin in touched or not renewal_hold_released(
+                    person, person_by_pin=pin_persons, unconfirmed=unconfirmed,
+                    confirmed_now=confirmed_now):
+                kept.add(pin)
+            else:
+                released.append(pin)
+        failed: set[str] = set()
+        errored = False
+        removed = 0
+        if released:
+            try:
+                from app.core.db import list_confirmed_device_sync_pins
+
+                owned = {str(p).strip() for p in
+                         (list_confirmed_device_sync_pins(device_id=self._device_id) or ())}
+            except Exception:
+                logger.warning("%s renewal holds: ownership unreadable -- none removed this "
+                               "pass", self._prefix, exc_info=True)
+                owned = None
+                errored = True
+            released = [p for p in released if owned is not None and p in owned]
+            if released:
+                logger.warning(
+                    "%s removing %d renewed member(s)' previous pin(s) now that the new pin "
+                    "is confirmed: %s", self._prefix, len(released), ",".join(released[:20]),
+                )
+                try:
+                    outcome, failed, _ = self._remove_departed_pins(released)
+                    removed = len(set(outcome.removed) - failed)
+                except Exception:
+                    logger.warning("%s renewal holds: removal error", self._prefix,
+                                   exc_info=True)
+                    failed = set(released)
+        _tel.event("RENEWAL_HOLD", worker=self._tel_wid, held=len(holds),
+                   removed_after_push=removed, kept=len(kept))
+        return kept, failed, errored
 
     def _mirror_grace_pins(self) -> set[str]:
         m = getattr(self, "_recent_member_push", None) or {}
