@@ -48,6 +48,9 @@ This file is only useful while it is true. If you change any of the following, y
 | The ULTRA operator door-open queue or its deadline (`ultra_engine.py::request_door_open`, `::_drain_commands`) | §3.1a |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice) | §3.1b, §10.2a |
+| Sync protocol 2 on the PC — what the request sends, what the save stores (`db.py::_apply_protocol2_save`, `_reconcile_held_rows`, `_create_protocol2_tables`), the flip and the gym date/clock rules (`db.py::apply_local_date_flips`, `::gym_date_status`, `app/core/access_dates.py`), or when the flip runs (`app.py::_apply_date_flips` and its triggers, `pc_identity.py::_heartbeat_payload_after_date_check`) | §3.8, §10.2b |
+| The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
+| Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -2061,6 +2064,11 @@ every PC of every gym retried at the same instant after a backend restart, that 
 count concurrent connections, far below 25; the ±20 % jitter spreads the first retry over
 12–18 s. `[CODE: backend RateLimitProperties, application.yml; client sync_retry.py]`
 
+**Date flips (P3b-1).** `work()` runs the date precheck before the fetch and a date flip after
+each save; a separate 60 s timer (`_date_flip_tick`) and a 00:00:05 one-shot run the same check
+on their own. None of them touches `_sync_after_id` or the retry schedule, and a flip never
+requests a backend sync (only the one 00:17 first-day sync does). See §3.8 "When the flip runs".
+
 **A worker thread that cannot start** (`RuntimeError: can't start new thread` at the 32-bit
 ceiling) no longer leaves `_sync_work_running` True forever: the flag is cleared, the request
 context restored and a retry armed. `[TEST: ::test_a_worker_that_cannot_start_does_not_wedge_the_sync]`
@@ -2204,9 +2212,48 @@ day applied since the last v2 sync (reset to S by every v2 save).
 `[TEST: tests/test_access_dates.py::TestGymDate;
 tests/test_protocol2_save_and_flip.py::test_a_flat_battery_after_a_day_was_applied_neither_rewinds_nor_restores]`
 The verdict is on `/api/v2/status` (`session.clockSuspectWarning`, `clockSuspectReason`, `gymDate`,
-`accessDatesTrusted`) and the Access UI shows an amber « Horloge du PC suspecte » pill.
-`[TEST: tests/test_p3b1_setting_and_status.py]` The heartbeat carries nothing new: the backend's
-`HeartbeatRequest` has no field for it (§3.1b), and a parallel branch edits `build_heartbeat_payload`.
+`accessDatesTrusted`) and the Access UI shows an amber « Horloge du PC suspecte » pill; the log
+gets `[T] CLOCK_SUSPECT` / `[T] CLOCK_OK` when the verdict changes (§10.2b).
+`[TEST: tests/test_p3b1_setting_and_status.py]` The heartbeat payload carries nothing new: the
+backend's `HeartbeatRequest` has no field for it (§3.1b), and a parallel branch edits
+`build_heartbeat_payload`.
+
+**When the flip runs** (`app.py`, `MainApp._apply_date_flips` and its triggers). Every trigger
+goes through `_apply_date_flips(source)`, serialised by `_date_flip_lock` and never raising (a
+failure logs `[T] DATE_FLIP_FAILED` and returns None):
+
+| Trigger (`source`) | How |
+|---|---|
+| start-up (`startup`) | synchronously in `MainApp.__init__`, after the engines are constructed and before `after(250, _sync_tick)` is even scheduled. Every ULTRA / AGENT / DEVICE worker is started from a sync tick's `work()`, so none starts before it. `[TEST: tests/test_p3b1_app_wiring.py::test_init_applies_the_startup_flip_before_the_first_sync_tick]` |
+| every 60 s (`tick`) | `_date_flip_tick` on the loop thread runs the read-only precheck `db.gym_date_status`; only when it says `needs_flip` does a daemon thread run the flip — never two such threads. Catches sleep/hibernate, a clock change, a missed one-shot |
+| 00:00:05 gym time (`midnight`) | a one-shot (`_arm_midnight_date_flip`, armed at start-up or by the first tick once the gym offset is known), precheck + flip on a daemon thread, re-armed for the next day |
+| every sync (`sync-tick`, `save`) | `work()` runs the precheck **before** the fetch (so an offline tick still applies a new day) and a flip after **each** `save_sync_cache_delta` (the main one and the forced member follow-up) |
+| enrolment fallback (`save`) | after its tokenless `save_sync_cache` |
+| fast patch (`fast-patch`) | after a non-duplicate `db.apply_fast_patch_bundle`, before anything is dispatched — an upsert can put a held membership back on `sync_users` |
+| heartbeat (`heartbeat`) | `pc_identity.py::_heartbeat_payload_after_date_check` runs the precheck (and a flip if needed) before building each payload; a failure there never costs the heartbeat |
+
+A flip that moved rows expires the sync cache, resets the AGENT and ULTRA fast-patch caches (in
+every mode — the PC's own decisions move) and, unless manual sync mode is on (§3.6, the turnstiles
+change only when the admin syncs), asks a *running* ULTRA engine for a full pass
+(`request_sync_now(changed_ids=None, reason="date-flip")`, removals first per §3.4b). It never asks
+the backend for a sync, so a flip cannot start a sync loop. `[TEST: tests/test_p3b1_app_wiring.py]`
+
+**The first-day sync at 00:17.** A new membership's QR credential is enabled by the server's 00:16
+job (backend `DailyScheduleService`, cron `0 16 0 * * *`); until then the PC holds it disabled
+(`upcomingCredentials`). When a flip reports `starters` (upcoming memberships starting on the
+applied day) before 00:17:00 gym time, it arms ONE `request_sync_now(trigger_source="DATE_FLIP",
+trigger_hint={"reason": "first-day-credentials"})` at 00:17:00; a later flip replaces it, so there
+are never two. From 00:17 on nothing is armed: the next ordinary sync brings the credential. The
+hint strips no version token (`sync_scope.apply_trigger_hint_to_version_tokens` acts only on
+`entityType` / `forceDeviceRefresh`). `[TEST: tests/test_p3b1_app_wiring.py — the 00:17 tests]`
+Why it is needed although the PC enables a stored upcoming credential itself on its first day
+(`access_dates.effective_credentials`): a sync between 00:00 and 00:16 already answers with the
+new day, so the starter is in today's set, no longer in `upcomingCredentials`, and its credential
+is still disabled on the server — its QR is refused until a sync after 00:16. Without network at
+00:17 it waits for the next successful sync; the card and the fingerprint are not affected (the
+row itself was promoted). `[CODE: access_dates.py::effective_credentials; plan §9]`
+`[TEST: local e2e 2026-09-19 — "a new member's QR came back disabled from the sync before the
+00:16 job and opened after it"]`
 
 **QR codes** — see §3.1b "Allowed days". **Renewals** on MEMBERSHIP-pin turnstiles — see §3.4f.
 
@@ -2799,6 +2846,23 @@ because its algorithm version differs from the terminal's, §3.4d). `[CODE: _do_
 `[TEST: test_door_open_deadline.py::test_an_expired_open_is_reported_expired_and_releases_its_waiter;
 test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identity,
 ::test_the_summary_line_is_logged_at_most_once_per_interval]`
+
+### 10.2b Date flips, the clock, QR days and renewals (P3b-1, added 2026-09-19)
+
+| Event | Where | Carries |
+|---|---|---|
+| `DATE_FLIP` | `app.py::_apply_date_flips` | `source gym_date applied_before held restored promoted moved starters reasons trusted skipped ultra dur_ms` — one per flip that moved rows, and always one at start-up (with `skipped=no_state|untrusted|no_gym_date` when nothing could move). `reasons` = `hold reason:count,…`; `ultra` = a running ULTRA engine was asked for a full pass (§3.8) |
+| `DATE_FLIP_FAILED` (warn) | `app.py::_apply_date_flips` | `source err` — the flip raised; nothing was applied, the next trigger retries |
+| `CLOCK_SUSPECT` (warn) | `app.py::_apply_date_flips` | `reason gym_date pc_date` — the clock verdict turned suspect (`reason=behind|ahead`, §3.8) |
+| `CLOCK_OK` | `app.py::_apply_date_flips` | `gym_date` — the verdict turned back to normal |
+| `SYNC_V2_REJECTED` (warn) | `db.py::_apply_protocol2_save` | `reason` — a malformed protocol-2 part; the windows stop being trusted until the next good v2 answer (§3.8) |
+| `QR_DATE_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict=not_today` — a QR refused for its days (§3.1b "Allowed days"); no member identity. `QR_ROSTER_SUMMARY` gains `not_today` |
+| `RENEWAL_HOLD` | `ultra_engine.py` (`worker=`), `device_sync.py` (`device_id=`) | `held removed_after_push kept` — one per pass that held a renewing member's old pin until the new one was written (§3.4f). `kept>0` = old pins left for a later pass because the new pin was not confirmed |
+
+`REVOKE_DONE pins` now counts only what the removal step removed first; held old pins removed after
+the push are in `RENEWAL_HOLD removed_after_push` (§3.4f).
+`[TEST: tests/test_p3b1_app_wiring.py, tests/test_qr_allowed_days.py, tests/test_renewal_ordering.py,
+tests/test_protocol2_save_and_flip.py]`
 
 ### 10.3 Three rules this instrumentation follows — keep them
 

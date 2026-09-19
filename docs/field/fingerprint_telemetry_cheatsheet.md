@@ -540,7 +540,8 @@ To switch one device to enforce, its `deviceCapabilities` JSON must contain
 ## 6b. Power-on dates, the PC clock, renewals (P3b-1)
 
 Once the server sends protocol 2 (switch `monclub.access.v2.enabled`), the PC applies the members'
-days itself — at start-up before any turnstile work, at midnight, and after every sync (guide §3.8).
+days itself — at start-up before any turnstile work, at 00:00:05, every minute when the date
+moved, and after every sync (guide §3.8).
 
 ```bash
 # was protocol 2 refused (malformed answer)? the PC then behaves as before (no date changes)
@@ -559,6 +560,8 @@ grep -F "[T] RENEWAL_HOLD" app-*.log
 | Line | Field | Meaning |
 |---|---|---|
 | `DATE_FLIP` | `held` / `restored` / `promoted` | members taken off the list for the day (expired, freeze day) / put back (freeze over) / added (first day of a pre-sold plan) |
+| `DATE_FLIP` | `source` / `ultra` / `skipped` | what ran it (`startup`, `midnight`, `tick`, `sync-tick`, `save`, `fast-patch`, `heartbeat`) / `True` = the turnstiles were asked to update (never in manual sync mode) / at start-up only: why nothing could move (`no_state` = no protocol-2 sync yet, `untrusted` = the last answer was v1 or refused) |
+| `DATE_FLIP_FAILED` | `err` | the date change failed (e.g. database busy); nothing changed, the next minute retries |
 | `CLOCK_SUSPECT` | `reason` | `behind`: the PC clock is earlier than a time it already saw (flat battery, wrong manual change); `ahead`: more than a day ahead of the server at the last sync. The day then stays at the last known one; nobody is re-admitted |
 | `RENEWAL_HOLD` | `held` / `removed_after_push` / `kept` | old pins of renewing members set aside / removed once the new pin landed / still kept (the new pin failed or waits — the member still enters) |
 
