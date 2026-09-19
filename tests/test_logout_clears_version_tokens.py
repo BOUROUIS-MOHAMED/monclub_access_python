@@ -213,7 +213,8 @@ def test_after_the_fix_the_post_login_sync_carries_no_version_tokens(db):
     assert hinted is None
 
     captured = _capture_sync_request_params(MonClubApi, MonClubApiError, hinted)
-    assert set(captured) == {"lastCheckTimeStamp"}
+    # ``protocol`` is the protocol the client speaks (P3b-1), not a version token.
+    assert set(captured) == {"lastCheckTimeStamp", "protocol"}
 
 
 def test_logout_is_loud_but_still_completes_when_token_clear_fails(db, monkeypatch):
