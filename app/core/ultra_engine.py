@@ -232,6 +232,15 @@ _REMOVAL_RETRY_PARKED_SEC = 1800.0
 # reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
 # stable link reconnects at once -- that is the door path.
 _LINK_STABLE_SEC = 60.0
+# For this long after the removal step removed an explicitly revoked member, every pass
+# checks the DATABASE (primary-key read) before trusting the sync cache about that member:
+# gone there -> excluded from the pass, so a stale cache snapshot (a background load taken
+# before the revocation committed) cannot push them back (review R4-11, R5-03). A restored
+# membership is present again and is pushed normally. 10 min: the cache's TTL is 5 s and a
+# whole load was measured at ~7 s on the live worker (the _member_row_in_db docstring);
+# the guard only ever excludes members the database no longer has, so a long window costs
+# nothing but a few point reads.
+_REMOVED_MEMBER_GUARD_SEC = 600.0
 
 # P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
 # One sweep STA command clears at most this many slots: 3 x 71-171 ms (field-measured
@@ -724,6 +733,7 @@ class UltraDeviceWorker(threading.Thread):
                         logger.info(
                             f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
                         )
+                        self._decide_queued_events()   # not lost with the driver (R5-07)
                         self._disconnect()
                     _tel.set_state(self._tel_wid, "sync_handoff_paused")
                     _tel.event("SYNC_HANDOFF_PAUSE_ACK", worker=self._tel_wid)
@@ -821,23 +831,7 @@ class UltraDeviceWorker(threading.Thread):
                 # showed only ~4 real poll failures in 26h vs 13,465 proactive
                 # disconnects, so holding is safe and removes ~99.7% of the leak.
                 if bool(self._settings.get("ultra_persistent_connection", True)):
-                    refresh_sec = float(
-                        self._settings.get("ultra_connection_refresh_sec", 1800.0)
-                    )
-                    if (
-                        refresh_sec > 0
-                        and self._connected
-                        and self._connected_since_mono > 0.0
-                        and (time.monotonic() - self._connected_since_mono) >= refresh_sec
-                    ):
-                        _age = time.monotonic() - self._connected_since_mono
-                        logger.info(
-                            "%s persistent connection: safety refresh after %.0fs",
-                            self._prefix, _age,
-                        )
-                        _tel.event("CONN_REFRESH", worker=self._tel_wid, age_s=round(_age))
-                        self._disconnect()
-                        self._empty_polls_since_event = 0
+                    self._maybe_refresh_connection()
                     # else: HOLD the connection (no idle disconnect). This is the
                     # change that eliminates the reconnect-driven leak.
                 elif (
@@ -1065,15 +1059,7 @@ class UltraDeviceWorker(threading.Thread):
         # over the reconnect was tried in round 3 and withdrawn in round 4: aged from the
         # wrong clock it could open the door a minute late, and its age bound dropped
         # terminal-decided scans from the history -- R4-01/07/08/09.)
-        try:
-            events = sdk.poll_rtlog_once() or []
-        except Exception:
-            events = []
-        for evt in events:
-            try:
-                self._process_event(evt)
-            except Exception:
-                logger.warning("%s event before link loss failed", self._prefix, exc_info=True)
+        self._decide_queued_events()
         now = time.monotonic()
         # Flapping = the link did not stay up _LINK_STABLE_SEC after the reconnect that
         # followed the PREVIOUS loss -- measured from that loss, not from the last connect,
@@ -1102,6 +1088,50 @@ class UltraDeviceWorker(threading.Thread):
             # "device unreachable" at once instead of timing out (review R3-02).
             self._connect_down_since_mono = now
             self._connect_down_since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return True
+
+    def _decide_queued_events(self) -> int:
+        """Before tearing a push driver down, decide EVERY scan already in its queue
+        (history, popup, a rescue if the link still works) -- the driver and its queue are
+        discarded with it. Not only the first 64 (review R5-06); used by the link-loss,
+        connection-refresh and sync-pause teardowns (R5-07). A queue drain, no COM call."""
+        sdk = self._sdk
+        if sdk is None or not getattr(sdk, "owns_event_source", False):
+            return 0
+        decided = 0
+        for _ in range(64):                  # <= 64 x 64 = 4096, the driver queue's size
+            try:
+                batch = sdk.poll_rtlog_once() or []
+            except Exception:
+                break
+            if not batch:
+                break
+            for evt in batch:
+                try:
+                    self._process_event(evt)
+                except Exception:
+                    logger.warning("%s queued event before teardown failed", self._prefix,
+                                   exc_info=True)
+                decided += 1
+        return decided
+
+    def _maybe_refresh_connection(self) -> bool:
+        """The persistent connection's slow safety refresh (see the run loop). True when
+        the connection was closed. Queued scans are decided first (review R5-07)."""
+        refresh_sec = float(self._settings.get("ultra_connection_refresh_sec", 1800.0))
+        if not (
+            refresh_sec > 0
+            and self._connected
+            and self._connected_since_mono > 0.0
+            and (time.monotonic() - self._connected_since_mono) >= refresh_sec
+        ):
+            return False
+        _age = time.monotonic() - self._connected_since_mono
+        logger.info("%s persistent connection: safety refresh after %.0fs", self._prefix, _age)
+        _tel.event("CONN_REFRESH", worker=self._tel_wid, age_s=round(_age))
+        self._decide_queued_events()
+        self._disconnect()
+        self._empty_polls_since_event = 0
         return True
 
     @_tel.timed("CONN_DISCONNECT", slow_ms=200)
@@ -3031,6 +3061,8 @@ class UltraDeviceWorker(threading.Thread):
             if pin:
                 on_device[pin] = _standalone_wire_identity(u)
         drops_allowed = True
+        missing_owned: list[str] = []
+        owned_now: set[str] = set()
         if on_device:
             # A listing that shows NONE of the pins MonClub owns on this terminal is not
             # trusted (a wrong out-param order would put names in the pin field): it would
@@ -3047,6 +3079,7 @@ class UltraDeviceWorker(threading.Thread):
             # Absence proves "the write never landed" only on a COMPLETE listing: one that
             # misses any pin MonClub owns (a listing cut short) drops nothing (review R4-06).
             drops_allowed = owned_now <= set(on_device)
+            missing_owned = sorted(owned_now - set(on_device))
             if owned_now and not (owned_now & set(on_device)):
                 logger.warning("%s intent read-back: the listing shows none of MonClub's %d "
                                "owned pins -- not trusted, nothing changed", self._prefix,
@@ -3054,6 +3087,23 @@ class UltraDeviceWorker(threading.Thread):
                 _tel.warn("PUSH_INTENT_READBACK", worker=self._tel_wid, ok=False,
                           candidates=len(cands), dur_ms=dur_ms, reason="no_owned_pin_listed")
                 return None
+        if on_device and missing_owned and (owned_now & set(on_device)):
+            # A pin MonClub believes it wrote is not on the terminal (deleted by someone
+            # else, or the listing was cut short): flag it NOT in sync so the next pass
+            # pushes it again -- a member who cannot enter, or at worst one idempotent
+            # re-push. Otherwise one such pin blocked every intent drop, and so the daily
+            # enumeration, for good (review R5-01). The empty hash is a deferral: no
+            # retry-backoff penalty.
+            try:
+                from app.core.db import save_device_sync_state_batch
+                save_device_sync_state_batch(device_id=self._device_id, rows=[
+                    (p, "", False, "absent from the terminal listing", None) for p in missing_owned])
+            except Exception:
+                logger.warning("%s intent read-back: absent owned pins not flagged", self._prefix,
+                               exc_info=True)
+            logger.warning("%s intent read-back: %d owned pin(s) absent from the terminal "
+                           "listing -- flagged for a push (%s)", self._prefix, len(missing_owned),
+                           ",".join(missing_owned[:20]))
         promoted: list[str] = []
         dropped: list[str] = []
         mismatched: list[str] = []
@@ -3085,7 +3135,8 @@ class UltraDeviceWorker(threading.Thread):
             return None
         _tel.event("PUSH_INTENT_READBACK", worker=self._tel_wid, ok=True,
                    candidates=len(cands), listed=len(on_device), promoted=len(promoted),
-                   dropped=len(dropped), mismatched=len(mismatched), dur_ms=dur_ms)
+                   dropped=len(dropped), mismatched=len(mismatched), dur_ms=dur_ms,
+                   missing_owned=len(missing_owned) or None)
         if promoted:
             logger.warning(
                 "%s intent read-back: %d pin(s) proven MonClub's (%s) -- the next revoke pass "
@@ -3198,7 +3249,9 @@ class UltraDeviceWorker(threading.Thread):
                     revoked_ids=normalized_revoked_ids,
                 )
                 return
-        cache = _sync_cache_without_revoked_ids(cache, normalized_excluded_ids)
+        cache = _sync_cache_without_revoked_ids(
+            cache, normalized_excluded_ids | self._recently_removed_still_gone(),
+        )
 
         self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
         self._notify_full_sync_started(reason=reason)
@@ -3607,15 +3660,23 @@ class UltraDeviceWorker(threading.Thread):
         # SKIPPED_NOT_OWNED ids were finalised when they were skipped; they must not go
         # back to the scheduler for a retry that could never succeed.
         effective_revoked_ids = normalized_revoked_ids - set(skipped_revokes) - removed_revokes
+        if removed_revokes:
+            # A stale cache snapshot must not push them back: the next passes check the
+            # database for these members for _REMOVED_MEMBER_GUARD_SEC (review R4-11).
+            _guard = getattr(self, "_recent_removed_members", None)
+            if _guard is None:
+                _guard = self._recent_removed_members = {}
+            for _m in removed_revokes:
+                _guard[int(_m)] = time.monotonic()
         if not sync_ok and removed_revokes:
-            # Their physical revoke is DONE (removals run first): release the revocation now
-            # -- left ACTIVE it excluded the member from every later roster until a restart,
-            # even after a restored membership (review R3-14). The ROSTER EXCLUSION is not
-            # released here: the call below moves it to RETRY, so the next pass (a capped
-            # continuation, the scheduler's retry) still leaves the member out of a stale
-            # cache, and a pass that succeeds clears it (review R4-11).
+            # Their physical revoke is DONE (removals run first): release the revocation and
+            # its roster exclusion now. Left ACTIVE they excluded the member from every later
+            # roster until a restart (R3-14); kept at RETRY they refused a membership restored
+            # meanwhile, and the next successful pass left that paying member off the terminal
+            # while reporting the roster in sync (R5-03). The stale-cache risk is covered by
+            # the database guard above instead.
             self._finalize_full_sync_revokes(
-                set(removed_revokes), ok=True, excluded_ids=set(),
+                set(removed_revokes), ok=True, excluded_ids=set(removed_revokes),
             )
         if not sync_ok:
             self._finalize_full_sync_revokes(
@@ -3642,6 +3703,27 @@ class UltraDeviceWorker(threading.Thread):
         if capped_out and int((result or {}).get("pushed") or 0) > 0:
             self.request_full_sync(reason="push-capped", fingerprint_hash=fingerprint_hash,
                                    full_reconcile=full_reconcile)
+
+    def _recently_removed_still_gone(self) -> set[int]:
+        """Members the removal step removed within _REMOVED_MEMBER_GUARD_SEC that the
+        DATABASE still does not have: excluded from this pass, whatever the (possibly stale)
+        cache says (review R4-11). A member present again (a restored membership) leaves the
+        guard. An unreadable row counts as gone (never re-push on doubt)."""
+        guard = getattr(self, "_recent_removed_members", None) or {}
+        if not guard:
+            return set()
+        now = time.monotonic()
+        out: set[int] = set()
+        for member_id, at in list(guard.items()):
+            if now - float(at) > _REMOVED_MEMBER_GUARD_SEC:
+                guard.pop(member_id, None)
+                continue
+            rows = self._member_row_in_db(member_id)
+            if rows:
+                guard.pop(member_id, None)
+                continue
+            out.add(int(member_id))
+        return out
 
     def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> None:
         """Drop explicit revocations of pins MonClub cannot prove it owns (FINAL).
@@ -4862,7 +4944,9 @@ class UltraDeviceWorker(threading.Thread):
                         and not bool(getattr(self._sdk, "is_connected", True))):
                     # Also a push driver that reports its link dead: the pass would fail
                     # every removal and escalate the retry for nothing; it is re-queued for
-                    # the reconnected link (review R4-10).
+                    # the reconnected link (review R4-10), and it reports nothing to the
+                    # removal retry -- the re-queued pass will (review R5-04).
+                    self._removal_retry_reported = True
                     self._finalize_full_sync_revokes(
                         revoked_ids, ok=False, excluded_ids=excluded_ids
                     )

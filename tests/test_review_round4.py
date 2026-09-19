@@ -24,10 +24,12 @@ def db(tmp_path, monkeypatch):
     dbmod._shutdown_db_writer_for_tests()
 
 
-def test_r4_11_a_removed_revocation_keeps_its_roster_exclusion_until_a_pass_succeeds(
+def test_r4_11_a_removed_revocation_is_fully_released_and_guarded_from_the_database(
         monkeypatch, fstate):
-    """R3-14 released the revocation AND its roster exclusion when the pass failed, so a
-    capped continuation built from a stale cache could push the departed member back."""
+    """R4-11 (a capped continuation built from a stale cache could push a removed member
+    back) was first fixed by KEEPING the roster exclusion; round 5 (R5-03) showed that
+    refused a membership restored meanwhile. Now both markers are released and the stale
+    cache is guarded from the database: test_review_round5.py covers both outcomes."""
     from tests.test_removals_first_and_retry import OrderDriver
     from tests.test_standalone_revoked_pin_removal import _authoritative_full_sync
     drv = OrderDriver(fail_push=True)
@@ -35,15 +37,9 @@ def test_r4_11_a_removed_revocation_keeps_its_roster_exclusion_until_a_pass_succ
     fstate.rows["34439"] = ("old-hash", True, {0})
     _authoritative_full_sync(w, 34439)
     with w._full_sync_lock:
-        assert 34439 not in w._full_sync_revocation_phases_locked()   # R3-14 still holds
-        assert w._full_sync_exclusion_phases_locked().get(34439) == ue._FULL_REVOKE_RETRY, (
-            "the exclusion must outlive the failed pass")
-    drv.fail_push = False                                # the next pass succeeds ...
-    w.request_full_sync(reason="timer", fingerprint_hash="h2")
-    assert w._drain_full_sync_commands(limit=1) == 1
-    with w._full_sync_lock:
-        assert 34439 not in w._full_sync_exclusion_phases_locked()   # ... and clears it
-    assert w.request_member_sync(34439) is True
+        assert 34439 not in w._full_sync_revocation_phases_locked()
+        assert 34439 not in w._full_sync_exclusion_phases_locked()
+    assert 34439 in w._recent_removed_members
 
 
 class _DeadLink:
