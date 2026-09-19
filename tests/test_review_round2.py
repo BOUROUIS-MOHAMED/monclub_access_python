@@ -169,14 +169,17 @@ def test_r2_12_a_link_that_keeps_dying_backs_off(db, monkeypatch):
     assert max(0, round(w._next_connect_at_mono - clock["t"])) == 0
 
 
-def test_r2_13_scans_queued_before_the_link_died_are_still_decided(db, monkeypatch):
+def test_r2_13_scans_queued_before_the_link_died_are_not_lost(db, monkeypatch):
+    """Round 2 decided them before the teardown; round 3 (R3-19) showed that on the dead
+    link a rescue could not open and its cooldown then dropped the member's re-scan. They
+    are carried over the reconnect instead (test_worker_link_recovery.py drives that)."""
     evt = {"eventId": "e1", "cardNo": "123"}
     w = _link_worker(monkeypatch, _DeadLink(events=[evt]))
     w._connected = True
     seen = []
     w._process_event = lambda e: seen.append(e)
     assert w._push_link_lost() is True
-    assert seen == [evt]
+    assert seen == [] and w._take_carried_events() == [evt]
 
 
 def test_r2_14_the_push_yield_serves_no_member_update_on_a_dead_link(db, monkeypatch):

@@ -382,7 +382,7 @@ departure an operator must confirm). The push-history page shows it as `REVOKE_A
 grep -E "\[T\] (CAPACITY_FULL|TEMPLATE_VERSION_MISMATCH)" app-*.log
 ```
 
-`CAPACITY_FULL users_free=U fingerprints_free=F skipped=N withheld_fingers=K` means the terminal reported no room: N new members were NOT written at all (no free user slot), and K fingers were not written (no free fingerprint slot) — those members DID get their card and name, so they can badge in; only the missing fingers wait. Both are retried at the next sync, and removals still ran. Free space on the terminal (for example the other system's old users) and they go through. `TEMPLATE_VERSION_MISMATCH skipped=N device_fp_version=V` means N fingerprints were recorded with a different algorithm version than the terminal uses and were not uploaded (they could not have matched); the connect line's `deviceFpVersion=` shows the terminal's version.
+`CAPACITY_FULL users_free=U fingerprints_free=F skipped=N withheld_fingers=K` means the terminal reported no room: N new members were NOT written at all (no free user slot), and K fingers were not written (no free fingerprint slot) — those members DID get their card and name, so they can badge in; only the missing fingers wait. Both are retried at the next sync, and removals still ran. To make room, remove users that are no longer needed — on gym 45's shared terminals the other system's users belong to its operator: never delete them without that operator's agreement (MonClub itself never deletes them). `TEMPLATE_VERSION_MISMATCH skipped=N device_fp_version=V` means N fingerprints were recorded with a different algorithm version than the terminal uses and were not uploaded (they could not have matched); the connect line's `deviceFpVersion=` shows the terminal's version.
 
 ---
 
@@ -399,7 +399,7 @@ push. `FULL_SYNC_CAPPED pushing=50 left=N` means the terminal needed more than 5
 50 now, the rest in the next passes, one after another (the push-history page says
 `PUSH_CAPPED=N`). `WORKER_STALL state=full_sync` should now appear only if ONE group of 10 members
 takes more than 25 s — a real problem, not a long push. `ZKEM_DELETE_DONE dur_ms=` is how long a
-removal kept the door waiting (removals still go in one command). `WORKER_LINK_LOST` means the PC lost its link to the terminal (a command never answered) and rebuilt it at once; before, QR codes and the desk button could stay dead for up to 30 minutes after that. The desk's Open button can still
+removal kept the door waiting (removals still go in one command). `WORKER_LINK_LOST` means the PC lost its link to the terminal (a command never answered) and rebuilt it — at once the first time; if the link keeps dying right after each reconnect it waits 2, 4, 8 s … (`delay_s=`, `streak=`), and meanwhile the desk's Open answers "device unreachable". Scans made just before the loss are handled right after the reconnect. Before, QR codes and the desk button could stay dead for up to 30 minutes after such a loss. The desk's Open button can still
 answer "timed out" when pressed during a push; the door is then NOT opened later.
 
 ---

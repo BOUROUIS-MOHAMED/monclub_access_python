@@ -7891,6 +7891,25 @@ def get_finger_sweep_state(*, device_id: int, pin: str) -> "tuple[bool, bool, se
             _decode_finger_ids(r["pushed_finger_ids"]))
 
 
+def set_device_pushed_fingers(*, device_id: int, rows: "Iterable[tuple[str, str]]") -> int:
+    """Record the finger ids resident on the terminal for existing rows, whatever last_ok says:
+    [(pin, encoded ids)]. For a pin whose push confirmed its vacated-slot clears and some
+    fingers but withheld others (CAPACITY_FULL) -- review R3-12. Returns rows updated."""
+    did = int(device_id)
+    params = [(str(enc), did, str(p).strip()) for p, enc in (rows or []) if str(p or "").strip()]
+    if not params:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        cur = conn.executemany(
+            "UPDATE device_sync_state SET pushed_finger_ids=? WHERE device_id=? AND pin=?",
+            params,
+        )
+        return int(cur.rowcount or 0)
+
+    return int(_run_db_write_sync("set_device_pushed_fingers", _write))
+
+
 def get_pin_sync_status(*, device_id: int, pin: str) -> "tuple[str, bool] | None":
     """(desired_hash, last_ok) of one pin (primary-key lookup), None when there is no row."""
     did = int(device_id)

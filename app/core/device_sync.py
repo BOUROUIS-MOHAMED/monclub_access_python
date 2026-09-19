@@ -4002,7 +4002,9 @@ class DeviceSyncEngine:
                 pruned = 0
             else:
                 # A pin whose delete FAILED is still on the device: keep its row.
-                _keep = set(desired_pins) | set(failed_stale)
+                # + every pin still on the panel: its row is MonClub's only proof of
+                # ownership there (ADDITIVE_ONLY never removes it; review R3-06).
+                _keep = set(desired_pins) | set(failed_stale) | set(device_pins)
                 pruned = prune_device_sync_state(device_id=did, keep_pins=_keep)
                 # Same keep-set: a removed or revoked member must not linger in the push
                 # status cache and keep being reported upstream forever.

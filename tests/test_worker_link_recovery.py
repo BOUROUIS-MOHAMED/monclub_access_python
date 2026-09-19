@@ -68,3 +68,43 @@ def test_an_abandoned_sta_thread_is_rebuilt_by_the_worker(db, monkeypatch):
                 d.disconnect()
             except Exception:
                 pass
+
+
+def test_a_scan_queued_when_the_link_died_is_decided_on_the_new_link(db, monkeypatch):
+    """Review R3-19: carried over the reconnect, decided on the rebuilt link."""
+    drivers = []
+
+    def factory(device_payload=None, logger=None):
+        drv, _zk = _make_driver()
+        drivers.append(drv)
+        return drv
+
+    monkeypatch.setattr(ue, "get_driver", factory)
+    stop = threading.Event()
+    device = {"id": 9, "name": "Entree 1", "ipAddress": "192.168.9.10", "portNumber": 4370,
+              "deviceProtocol": "ZK_STANDALONE", "accessDataMode": "ULTRA"}
+    w = ue.UltraDeviceWorker(device, {}, queue.Queue(), queue.Queue(), stop)
+    decided = []
+    w._process_event = lambda evt: decided.append((evt.get("eventId"), w._sdk))
+    w.start()
+    try:
+        assert _wait(lambda: w._connected and len(drivers) == 1)
+        # The STA thread dies with a scan already queued that the worker had not polled
+        # yet. Deterministic: this driver hands queued scans over only once it is down.
+        first = drivers[0]
+        real_poll = first.poll_rtlog_once
+        first.poll_rtlog_once = lambda max_events=64: (
+            [] if first.is_connected else real_poll(max_events))
+        first._evt_queue.put_nowait({"eventId": "carried-1", "cardNo": "123"})
+        first._abandon_sta_thread("test: a COM call never returned")
+        assert _wait(lambda: any(e == "carried-1" for e, _s in decided))
+        [(_e, on)] = [d for d in decided if d[0] == "carried-1"]
+        assert on is drivers[-1] and on is not drivers[0], "decided on the dead link"
+    finally:
+        stop.set()
+        w.join(10)
+        for d in drivers:
+            try:
+                d.disconnect()
+            except Exception:
+                pass

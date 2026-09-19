@@ -1085,7 +1085,10 @@ the mirror for every attempted pin "regardless of SDK outcome", so a delete the 
 no trace: once the member had left the roster nothing ever tried again. Now only confirmed deletions
 are forgotten (`clear_device_revocation_state`: state, mirror and push intent in one transaction);
 a failed one keeps its row and ownership bit, the prune keeps it too, and the push-batch note says
-`REMOVAL_FAILED=n`. `[TEST: ::test_a_failed_stale_delete_keeps_its_state_for_the_retry]`
+`REMOVAL_FAILED=n`. `[TEST: ::test_a_failed_stale_delete_keeps_its_state_for_the_retry]` The prune also
+keeps the row of every pin still on the panel: under `ADDITIVE_ONLY` (no stale removal) it used to drop
+it, and the member's later explicit revocation then found no ownership and was skipped for good
+(review R3-06). `[TEST: test_review_round3.py]`
 
 **Accepted consequence: an above-ceiling departure is not removed, and says so once** (review round 1,
 R1-04/05/13 — this is the rule working as specified, not a defect). A step refused by the ceiling stays
@@ -1201,7 +1204,9 @@ for every confirmed push. Precondition to check before trusting a shared termina
 gym 45 — compare MonClub's membership-id range with the other system's user ids on devices 8/10 (§7).
 `[TEST: test_user_row_ownership.py]` Such a pin also gets the 10-min enrolment grace a clean targeted
 push gets (a removals-first pass built from a cache that does not list the member yet would delete it,
-review R2-24), and the prune keeps every pin inside that grace window (R2-09).
+review R2-24), and the prune keeps every pin inside that grace window (R2-09) — the very set the
+removal step spared, even when the window expires between the two (R3-11). The ACCOUNT revoke re-push
+gets the same grace (R3-13).
 Force-resync commands invalidate content hashes and retry status without deleting
 ownership or pushed-finger evidence, so a later full pass can still reconcile stale
 revoked credentials.
@@ -1319,6 +1324,7 @@ settled by reading the terminal:
 | nothing (a successful listing) | intent dropped: the write never landed — only on a NON-EMPTY listing: an empty one (an empty terminal, or a read that returned nothing) drops nothing, on the MB2000 (review R2-06) as on PullSDK, where an empty one-pin answer on a targeted revoke drops nothing either (R1-30) |
 | anything else | intent kept, `readback_misses+1`, never deleted |
 | listing failed | nothing changes |
+| a listing that shows NONE of the pins MonClub owns on that terminal (MB2000; e.g. a wrong out-param order putting names in the pin field) | not trusted: nothing changes, `PUSH_INTENT_READBACK ok=False reason=no_owned_pin_listed` (review R3-20) |
 
 MB2000 (`_promote_intents_by_readback`): one `list_device_users` (a whole-terminal enumeration in ONE
 STA command — no RTLog pump, no door service for its duration; ~1,860 users on gym 45, duration
@@ -1387,6 +1393,13 @@ retry forever, R2-23); the latter parks. And the stale step's failed deletes are
 the step ends (`_last_removal_report`, `complete=False` until the end of the pass), so a later step
 that raises no longer loses them (R2-21). ≤ 48 parked re-checks a day, only while such a removal is
 pending. `[TEST: test_review_round2.py]` `[CODE: device_sync.MEMBER_SYNC_DEFERRED]`
+*Round 3:* parking never postpones a sooner retry (R3-16); a PullSDK pass that left no removal report
+at all (it stopped before `_sync_one_device`) is not "complete" and does not clear a pending retry
+(R3-04); an MB2000 revocation whose pin the removal step removed is released at once even when the
+rest of the pass fails — left ACTIVE, it excluded the member from every later roster until a restart,
+even after a restored membership (R3-14). `[TEST: test_review_round3.py]` Load note: on PullSDK every
+retry pass also re-writes the door parameters (`DoorNDrivertime`, `DoorNIntertime`/anti-passback), like
+any full pass (R3-09).
 
 **Upsert retry cap 24 h → 6 h.** `device_sync._SYNC_RETRY_MAX_SEC = 21600` (both SDKs share
 `DeviceSyncEngine._retry_due`; free attempts and the 15-min doubling unchanged). The PC is on about
@@ -1508,7 +1521,12 @@ the write) counted as a new user. All four are covered by tests.
 `[TEST: test_capacity_and_template_version.py::TestFingerLevelRefusal]` *Round 2 (R2-01):* marking the
 withheld pins failed turned a WEDGED chunk's result (which names no pin: nothing confirmed) into one
 naming only them, so every other member of that chunk was recorded written and owned; the marking now
-applies only to a result that lists its failed pins. `[TEST: test_review_round2.py]`
+applies only to a result that lists its failed pins. `[TEST: test_review_round2.py]` *Round 3:* such a
+pin's state write is "not in sync", which keeps its previous `pushed_finger_ids` — but its vacated slots
+WERE cleared and its other fingers written, so every retry cleared an already-empty slot, read the
+`False` as a refusal and failed for good; what is resident is now recorded
+(`db.set_device_pushed_fingers`, R3-12). A targeted push (≤ 10 pins) admits with primary-key reads, not
+three whole-device tables (R3-24). `[TEST: test_review_round3.py]`
 `[UNVERIFIED]` that index 11 is `users_free` on the MB2000 beyond the 2026-09-06 arithmetic
 (`1838 + 1162 = 3000`), and that `SSR_SetUserInfo` on an existing pin consumes no new user slot.
 
@@ -1586,11 +1604,15 @@ command, the daily read-back's enumeration — makes the driver abandon its STA 
 `is_connected`; the worker never looked (its only reconnect trigger is a poll returning None, and this
 driver's poll never fails), so nothing pumped events or opened the door until an unrelated push or the
 30-min refresh. `UltraDeviceWorker._push_link_lost` now checks once per loop iteration and reconnects:
-`[T] WORKER_LINK_LOST`. `[TEST: test_worker_link_recovery.py]` *Round 2:* the scans the driver had
-already queued are decided before it is torn down (R2-13); the first loss reconnects at once, but a
-link that dies again within `_LINK_STABLE_SEC` = 60 s of its reconnect waits 2, 4, 8 … s up to the
-connect backoff cap, so a flapping terminal is not a connect loop (R2-12); the push yield serves no
-member update on a link the driver reports dead (R2-14). (`CONN_DISCONNECT` timing stays on
+`[T] WORKER_LINK_LOST`. `[TEST: test_worker_link_recovery.py]` *Rounds 2–3:* the scans the driver had
+already queued are CARRIED over the reconnect and decided first on the rebuilt link (`_take_carried_events`;
+R2-13 decided them on the dead link, where a rescue could not open and its cooldown then dropped the
+member's re-scan — R3-19). The first loss reconnects at once; a loss within `_LINK_STABLE_SEC` = 60 s
+after the reconnect that followed the PREVIOUS loss waits 2, 4, 8 … s up to the connect backoff cap, so
+a flapping terminal is not a connect loop (R2-12) — measured from that loss, so a routine 30-min refresh
+never inherits an old streak (R3-01) — and such a wait starts the outage clock, so the desk's Open
+answers "device unreachable" at once instead of timing out (R3-02). Neither the push yield nor the run
+loop's member drain spends a member update on a link the driver reports dead (R2-14, R3-03). (`CONN_DISCONNECT` timing stays on
 `_disconnect` — the round-1 insertion had moved the decorator onto the new method, R2-11.) It does not shorten the command itself:
 while the read-back's single enumeration runs (duration on 1,860 users `[UNVERIFIED]`), no scan is
 decided and no door opens.
@@ -2181,6 +2203,22 @@ with that worker, while the scheduler keeps the stamped roster hash (the thread 
 catches `Exception` — R2-08); an intent re-recorded with a new name/card before its new write lands
 replaces the identity of an earlier write that did land, so the read-back can never match it (R2-10).
 
+Round 3 added: **a renewal under pinScheme=MEMBERSHIP can lock the member out until the next pass**
+— the renewal is a new membership id, hence a new pin; removals run first (§3.4b), so the old pin is
+deleted before the new one is written, and if that write fails (a refused user row, a wedge, a crash)
+the person has neither until a later pass pushes the new pin (base pushed first and removed only after
+a successful push, R3-21; FIELD-TEST: watch renewals at gym 45 for `SKIPPED`/failed new pins). The
+finger-slot sweep clears fingers enrolled DIRECTLY on the MB2000 for a MonClub member (base never touched
+unrecorded slots, R3-25) — enrol through MonClub. A PullSDK revocation of a pin MonClub has no record of
+(never pushed to that panel, or already removed) is reported `SKIPPED_NOT_OWNED` at CRITICAL like a
+foreign user (R3-05); a scheduler replay of a revocation the fast retry already completed logs a false
+`SKIPPED_NOT_OWNED` (R3-15). A PullSDK revocation that failed for a reason other than a failed delete or
+unreadable ownership (e.g. a failed ACCOUNT re-push) is parked, not fast-retried (R3-07); an exception in
+the PullSDK revoke pre-pass loses the fast retry of the revocations it had tried (the scheduler still
+re-queues them, R3-08). When a revoke-pass guard trips, the pass stores no roster snapshot, so that day's
+read-back uses the previous one (R3-10). The `push_roster` STA op's event pump runs inside the chunk's
+deadline, so a hung `ReadRTLog` turns a written chunk into a wedged one (its members are retried, R3-23).
+
 A MonClub membership id that collides with another system's user id on a shared MB2000 (gym 45):
 MonClub's write overwrites that user's name and card, and since review round 1 the pin is MonClub's
 as soon as that user row lands (§3.4), so a departure deletes the whole user; the finger-slot sweep
@@ -2392,7 +2430,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `FINGER_SWEEP` | `ultra_engine.py` | `worker pin source ok op cleared empty raised dur_ms` (`source` ∈ `targeted`, `daily`; `cleared` = slots that held a template, `empty` = already empty; §3.4c) |
 | `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored parked` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300; `parked=True`: a pending removal this pass could not attempt, re-checked after 1800 s, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
-| `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms` (§3.4a; `ok=False` = the listing failed, nothing changed) |
+| `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms reason` (§3.4a; `ok=False` = the listing failed or was not trusted, nothing changed; `reason=no_owned_pin_listed` when it showed none of MonClub's pins) |
 | `MEMBER_REVOKE_SKIPPED_NOT_OWNED` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id member_id pin protocol` (+ `row` on the full sync, `pin_scheme source` on PullSDK) (warn; P3a-2 — FINAL: MonClub cannot prove it wrote that pin, nothing deleted, revocation finished, §3.4). Replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`, which is no longer emitted |
 | `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
 | `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |
