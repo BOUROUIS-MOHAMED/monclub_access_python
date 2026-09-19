@@ -1398,16 +1398,29 @@ accepted an unusable one. `[CODE]`
 **Capacity (`CAPACITY_FULL`).** Capability-gated (`supports_capacity_check`). Before a full-sync or
 targeted push that needs a NEW slot, `read_capacity()` re-reads `GetDeviceStatus` 11 (`users_free`)
 and 10 (`fingerprints_free`) — 3–6 COM calls in one STA command — because a connect-time value can
-be hours old on a terminal another system enrols on. `UltraDeviceWorker._capacity_admit` counts only
-writes needing a new slot: a pin MonClub does not own needs a user slot and one fingerprint slot per
-finger; an owned pin needs a fingerprint slot only for a finger not recorded on it (an unknown recorded
-set counts none — most likely replacements; a real refusal is still reported by the terminal). The
-free counts are a budget in push order; a pin that does not fit is not pushed, gets no state row
-(it stays pending), and is reported: `[T] CAPACITY_FULL worker users_free fingerprints_free
-need_users need_fingers skipped` + push-history note `CAPACITY_FULL=n (…)`. The pass is `ok` but
-withholds the roster hash, so the scheduler retries it; a targeted push is deferred to the full
-sync. Updates, replacements and every removal are never refused (removals run first, §3.4b, and are
-what free space). An unreadable status gates nothing. `[TEST: test_capacity_and_template_version.py]`
+be hours old on a terminal another system enrols on. `UltraDeviceWorker._capacity_admit` refuses
+only the write that has no slot, never more:
+
+- **A member certainly not on the terminal** (no state row AND no push intent — a row or an intent
+  means it may already be there, and an update needs no new user slot) is refused whole when no
+  user slot is free: not pushed, no state row, it stays pending. A targeted push of it is deferred.
+- **A finger** that needs a new fingerprint slot (a recorded finger rewritten is a replacement and
+  needs none; an owned pin with an unknown recorded set counts none) is withheld when none is free.
+  The member itself IS pushed — user row, card, replacements, and the clear of its vacated slots,
+  which count as free from that pin on (they are cleared before its templates are written). The pin
+  is recorded NOT in sync, so the withheld finger is retried.
+
+The free counts are a budget in push order. Reported as `[T] CAPACITY_FULL worker users_free
+fingerprints_free need_users need_fingers skipped withheld_fingers withheld_pins` + push-history note
+`CAPACITY_FULL=n (…)`. The pass is `ok` but withholds the roster hash, so the scheduler retries it.
+Updates and every removal are never refused. An unreadable status gates nothing. The admission runs
+before the targeted push's intent, so a refused push never rewrites what the intent records.
+
+*Review round 1 (R1-10/11/17/29):* the first version refused the whole member when fingerprint slots
+were short — a new member got no card at all (base wrote the card and let the terminal refuse the
+templates), and an owned member's deleted finger was never cleared; an intent-only pin (a crash after
+the write) counted as a new user. All four are covered by tests.
+`[TEST: test_capacity_and_template_version.py::TestFingerLevelRefusal]`
 `[UNVERIFIED]` that index 11 is `users_free` on the MB2000 beyond the 2026-09-06 arithmetic
 (`1838 + 1162 = 3000`), and that `SSR_SetUserInfo` on an existing pin consumes no new user slot.
 
@@ -2233,7 +2246,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `MEMBER_REVOKE_REQUESTED` | `ultra_engine.py` | `member_id pin` |
 | `MEMBER_REVOKE_DONE` | `ultra_engine.py` | `member_id pin mode ok` (`mode=deleted|neutralised|repushed`; `repushed` = ACCOUNT pin kept, collapsed row re-pushed, §3.2b) |
 | `MEMBER_REVOKE_FAILED` | `ultra_engine.py` | `member_id pin` |
-| `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped` (warn; writes needing a new slot refused, pins left pending, §3.4d) |
+| `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped withheld_fingers withheld_pins` (warn; `skipped` = new members not pushed, no user slot; `withheld_*` = fingers not written, no fingerprint slot — the member itself was pushed; §3.4d) |
 | `TEMPLATE_VERSION_MISMATCH` | `zk_standalone.py::push_roster` | `worker skipped device_fp_version` (warn; templates of another algorithm version not uploaded, once per push, §3.4d) |
 | `PUSH_YIELD` | `ultra_engine.py::_standalone_push_yield` | `worker member_updates pins dur_ms` — a member update or revoke served between two push chunks; `pins` = pins it handled, dropped from the rest of the push. Emitted only when one was served (§3.4e) |
 | `FULL_SYNC_CAPPED` | `ultra_engine.py::_run_standalone_full_sync` | `worker cap pushing left` — this pass pushes `pushing` pins and leaves `left` for its continuation (§3.4e) |

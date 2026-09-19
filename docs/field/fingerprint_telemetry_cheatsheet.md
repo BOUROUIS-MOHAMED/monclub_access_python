@@ -382,7 +382,7 @@ departure an operator must confirm). The push-history page shows it as `REVOKE_A
 grep -E "\[T\] (CAPACITY_FULL|TEMPLATE_VERSION_MISMATCH)" app-*.log
 ```
 
-`CAPACITY_FULL users_free=U fingerprints_free=F skipped=N` means the terminal reported no room, so N new members (or new fingers) were NOT written; they are retried at the next sync, and removals still ran. Free space on the terminal (for example the other system's old users) and they go through. `TEMPLATE_VERSION_MISMATCH skipped=N device_fp_version=V` means N fingerprints were recorded with a different algorithm version than the terminal uses and were not uploaded (they could not have matched); the connect line's `deviceFpVersion=` shows the terminal's version.
+`CAPACITY_FULL users_free=U fingerprints_free=F skipped=N withheld_fingers=K` means the terminal reported no room: N new members were NOT written at all (no free user slot), and K fingers were not written (no free fingerprint slot) — those members DID get their card and name, so they can badge in; only the missing fingers wait. Both are retried at the next sync, and removals still ran. Free space on the terminal (for example the other system's old users) and they go through. `TEMPLATE_VERSION_MISMATCH skipped=N device_fp_version=V` means N fingerprints were recorded with a different algorithm version than the terminal uses and were not uploaded (they could not have matched); the connect line's `deviceFpVersion=` shows the terminal's version.
 
 ---
 

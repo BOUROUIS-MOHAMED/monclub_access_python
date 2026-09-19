@@ -2227,80 +2227,148 @@ class UltraDeviceWorker(threading.Thread):
         users: list[Dict[str, Any]],
         templates_by_pin: Dict[str, list] | None,
         recorded_fingers: Dict[str, Any] | None,
-    ) -> tuple[list[Dict[str, Any]], list[str]]:
-        """Keep only the writes the terminal has room for; (admitted, skipped pins).
+    ) -> tuple[list[Dict[str, Any]], list[str], Dict[str, set[int]]]:
+        """Refuse only the writes the terminal has no slot for: (admitted, skipped, withheld).
 
-        Only a write that needs a NEW slot is counted: a pin MonClub does not own
-        needs a user slot and one fingerprint slot per finger; an owned pin needs a
-        fingerprint slot only for a finger not recorded on it (an unknown recorded set
-        counts none -- those fingers are most likely replacements, and the terminal's
-        own refusal is still reported). Updates, replacements and every removal are
-        never refused: removals are what free space. The status is re-read NOW
-        (read_capacity); an unreadable one gates nothing. Capability-gated: a driver
-        without ``supports_capacity_check`` (PullSDK) is never gated.
+        ``skipped``: pins refused whole -- only a member certainly NOT on the terminal
+        (no state row and no push intent: a row or an intent means it may already be
+        there, and an update needs no new user slot) when no user slot is free.
+        ``withheld``: {pin: finger ids} not written this pass because no fingerprint
+        slot is free. The member itself IS pushed: user row, card, finger replacements
+        and the clear of its vacated slots all land (review round 1, R1-10/11/17: the
+        first version refused the whole member, so a new member got no card, and a
+        deleted finger was never cleared). A replacement (a recorded finger rewritten)
+        needs no new slot; an owned pin with an unknown recorded set counts none (most
+        likely replacements; the terminal's own refusal is still reported). A pin's
+        vacated slots are cleared before its templates are written, so they count as
+        free from that pin on. The caller must record a pin with withheld fingers as
+        NOT in sync. The status is re-read now (read_capacity); an unreadable value
+        gates nothing. Capability-gated: PullSDK is never gated.
         """
+        none: Dict[str, set[int]] = {}
         if not users or not getattr(self._sdk, "supports_capacity_check", False):
-            return list(users or []), []
+            return list(users or []), [], none
         reader = getattr(self._sdk, "read_capacity", None)
         if not callable(reader):
-            return list(users), []
+            return list(users), [], none
         try:
-            from app.core.db import list_confirmed_device_sync_pins
+            from app.core.db import (
+                list_confirmed_device_sync_pins,
+                list_device_sync_hashes_and_status,
+                list_push_intents,
+            )
             owned = {str(p).strip() for p in (list_confirmed_device_sync_pins(device_id=self._device_id) or ())}
+            known = {str(p).strip() for p in (list_device_sync_hashes_and_status(device_id=self._device_id) or {})}
+            known |= {str(p).strip() for p in (list_push_intents(device_id=self._device_id) or {})}
         except Exception:
-            return list(users), []
+            return list(users), [], none
         recorded = recorded_fingers or {}
-        needs: list[tuple[Dict[str, Any], str, bool, int]] = []
+        needs: list[tuple[Dict[str, Any], str, bool, list[int], int]] = []
         any_need = False
         for u in users:
             pin = str(u.get("pin") or "").strip()
             desired = self._desired_fingers((templates_by_pin or {}).get(pin))
-            if pin not in owned:
-                new_user, new_fingers = True, len(desired)
+            rec = recorded.get(pin)
+            new_user = pin not in owned and pin not in known
+            if rec is not None:
+                new_fingers = sorted(desired - set(rec))
+                vacated = len(set(rec) - desired)
+            elif pin in owned:
+                new_fingers, vacated = [], 0
             else:
-                rec = recorded.get(pin)
-                new_user = False
-                new_fingers = 0 if rec is None else len(desired - set(rec))
-            needs.append((u, pin, new_user, new_fingers))
-            any_need = any_need or new_user or new_fingers > 0
+                new_fingers, vacated = sorted(desired), 0
+            needs.append((u, pin, new_user, new_fingers, vacated))
+            any_need = any_need or new_user or bool(new_fingers)
         if not any_need:
-            return list(users), []
+            return list(users), [], none
         cap = reader() or {}
         if not (isinstance(cap, dict) and cap.get("ok") is True):
-            return list(users), []
+            return list(users), [], none
         users_free = cap.get("users_free")
         fps_free = cap.get("fingerprints_free")
         if users_free is None and fps_free is None:
-            return list(users), []
+            return list(users), [], none
         admitted: list[Dict[str, Any]] = []
         skipped: list[str] = []
+        withheld: Dict[str, set[int]] = {}
         u_left = users_free
         f_left = fps_free
         need_users = need_fps = 0
-        for u, pin, new_user, new_fingers in needs:
+        for u, pin, new_user, new_fingers, vacated in needs:
             need_users += int(new_user)
-            need_fps += new_fingers
+            need_fps += len(new_fingers)
             if new_user and u_left is not None and u_left <= 0:
-                skipped.append(pin)
-                continue
-            if new_fingers and f_left is not None and new_fingers > f_left:
                 skipped.append(pin)
                 continue
             admitted.append(u)
             if new_user and u_left is not None:
                 u_left -= 1
-            if new_fingers and f_left is not None:
-                f_left -= new_fingers
-        if skipped:
+            if f_left is None:
+                continue
+            f_left += vacated
+            room = max(0, f_left)
+            if len(new_fingers) > room:
+                withheld[pin] = set(new_fingers[room:])
+            f_left -= min(len(new_fingers), room)
+        if skipped or withheld:
             logger.warning(
                 "%s CAPACITY_FULL: terminal reports users_free=%s fingerprints_free=%s -- %d "
-                "pin(s) needing a new slot NOT pushed this pass (%s); removals still run",
+                "new member(s) NOT pushed (%s), %d finger(s) of %d member(s) not written (%s); "
+                "cards, updates and removals still go through",
                 self._prefix, users_free, fps_free, len(skipped), ",".join(skipped[:20]),
+                sum(len(v) for v in withheld.values()), len(withheld),
+                ",".join(sorted(withheld)[:20]),
             )
             _tel.warn(_push_safety.CAPACITY_FULL, worker=self._tel_wid,
                       users_free=users_free, fingerprints_free=fps_free,
-                      need_users=need_users, need_fingers=need_fps, skipped=len(skipped))
-        return admitted, skipped
+                      need_users=need_users, need_fingers=need_fps, skipped=len(skipped),
+                      withheld_fingers=sum(len(v) for v in withheld.values()),
+                      withheld_pins=len(withheld))
+        return admitted, skipped, withheld
+
+    @staticmethod
+    def _without_withheld(templates_by_pin: Dict[str, list] | None,
+                          withheld: Dict[str, set[int]] | None) -> Dict[str, list]:
+        """templates_by_pin minus the fingers capacity admission withheld."""
+        if not withheld:
+            return dict(templates_by_pin or {})
+        out: Dict[str, list] = {}
+        for pin, tpls in (templates_by_pin or {}).items():
+            drop = withheld.get(pin)
+            if not drop:
+                out[pin] = tpls
+                continue
+            kept = []
+            for t in tpls or []:
+                try:
+                    if isinstance(t, dict) and int(t.get("fingerId")) in drop:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                kept.append(t)
+            out[pin] = kept
+        return out
+
+    @staticmethod
+    def _with_withheld_failed(result: Any, pins, withheld: Dict[str, set[int]] | None) -> Any:
+        """The result to RECORD: a pushed pin whose fingers were withheld is not in sync.
+
+        Only for the state write -- the pass itself is not failed by it (it is pending,
+        like a refused new member: the roster hash is withheld and it is retried).
+        """
+        if not withheld or not isinstance(result, dict):
+            return result
+        hit = [p for p in (str(x or "").strip() for x in pins) if p in withheld]
+        if not hit:
+            return result
+        out = dict(result)
+        failed = list(out.get("failed_pins") or [])
+        for p in hit:
+            if p not in failed:
+                failed.append(p)
+        out["failed_pins"] = failed
+        out["ok"] = False
+        return out
 
     # ---------------------------------------------------------------- #
     # Finger-slot sweep (P3a-2 item 5, guide §3.4c)
@@ -2633,6 +2701,7 @@ class UltraDeviceWorker(threading.Thread):
         removals: Dict[str, list[int]],
         bracket: bool,
         between_chunks: "Callable[[], Any] | None" = None,
+        withheld: Dict[str, set[int]] | None = None,
     ) -> Dict[str, Any]:
         """push_roster, recording each chunk's outcome as soon as the chunk returns.
 
@@ -2650,8 +2719,12 @@ class UltraDeviceWorker(threading.Thread):
                 return
             self._record_standalone_pin_state(
                 users=part_users, hashes_by_pin=hashes_by_pin,
-                # A wedged chunk confirmed nothing.
-                result=res if isinstance(res, dict) else {"ok": False, "error": "chunk wedged"},
+                # A wedged chunk confirmed nothing. A pin whose fingers capacity admission
+                # withheld is not in sync either (P3a-2, review round 1).
+                result=self._with_withheld_failed(
+                    res if isinstance(res, dict) else {"ok": False, "error": "chunk wedged"},
+                    (u.get("pin") for u in part_users), withheld,
+                ),
                 templates_by_pin=templates_by_pin,
             )
             recorded.update(str(u.get("pin") or "").strip() for u in part_users)
@@ -2675,7 +2748,9 @@ class UltraDeviceWorker(threading.Thread):
                      and str(u.get("pin") or "").strip() not in superseded]
         if remaining:
             self._record_standalone_pin_state(
-                users=remaining, hashes_by_pin=hashes_by_pin, result=result,
+                users=remaining, hashes_by_pin=hashes_by_pin,
+                result=self._with_withheld_failed(
+                    result, (u.get("pin") for u in remaining), withheld),
                 templates_by_pin=templates_by_pin,
             )
         return result
@@ -2895,6 +2970,7 @@ class UltraDeviceWorker(threading.Thread):
         # does not stamp the device as in sync and the rest is pushed later.
         pass_incomplete = False
         capacity_skipped: list[str] = []
+        capacity_withheld: Dict[str, set[int]] = {}
         # Explicit revocations whose pin the removal step (which runs first) removed.
         removed_revokes: set[int] = set()
         # P3a-2 item 6: pins left for the pass's own continuation (the per-pass cap), and
@@ -3011,10 +3087,10 @@ class UltraDeviceWorker(threading.Thread):
                 to_push = self._prioritise_for_cap(to_push, templates_by_pin, pushed_fingers)
             # P3a-2 item 7: a write that needs a NEW user or fingerprint slot is refused
             # when the terminal reports none free (CAPACITY_FULL); the pin stays pending.
-            to_push, capacity_skipped = self._capacity_admit(
+            to_push, capacity_skipped, capacity_withheld = self._capacity_admit(
                 to_push, templates_by_pin, pushed_fingers,
             )
-            if capacity_skipped:
+            if capacity_skipped or capacity_withheld:
                 pass_incomplete = True
             if len(to_push) > _cap:
                 # Only to_push is cut -- never users/desired_pins, which MIRROR, the
@@ -3078,6 +3154,9 @@ class UltraDeviceWorker(threading.Thread):
                 to_push_pins = {str(u.get("pin") or "").strip() for u in to_push}
                 templates_to_push = {p: t for p, t in (templates_by_pin or {}).items()
                                      if p in to_push_pins}
+                # Removals are computed from the FULL desired set below (a withheld
+                # finger is still desired -- it must not read as vacated); only the
+                # writes leave the withheld fingers out.
                 # Slots this member used to have and no longer does. Without this
                 # the mirror is write-only and a revoked fingerprint keeps opening
                 # the turnstile (Oxyfit, 2026-09-05).
@@ -3110,9 +3189,12 @@ class UltraDeviceWorker(threading.Thread):
                     self._pass_served_members = set()
                     try:
                         result = self._push_with_chunk_recording(
-                            to_push, templates_to_push, hashes_by_pin,
+                            to_push,
+                            self._without_withheld(templates_to_push, capacity_withheld),
+                            hashes_by_pin,
                             removals=removals, bracket=bracket,
                             between_chunks=self._standalone_push_yield,
+                            withheld=capacity_withheld,
                         )
                     finally:
                         self._pass_touched_pins = None
@@ -3219,9 +3301,12 @@ class UltraDeviceWorker(threading.Thread):
                             "pins " + ",".join(sorted(skipped_revokes.values())[:20]),
                         ) if skipped_revokes else "",
                         _push_safety.outcome_note(
-                            _push_safety.CAPACITY_FULL, len(capacity_skipped),
-                            "pins " + ",".join(capacity_skipped[:20]),
-                        ) if capacity_skipped else "",
+                            _push_safety.CAPACITY_FULL,
+                            len(capacity_skipped) + len(capacity_withheld),
+                            "pins " + ",".join((capacity_skipped + sorted(capacity_withheld))[:20])
+                            + (f"; fingers withheld for {len(capacity_withheld)}"
+                               if capacity_withheld else ""),
+                        ) if (capacity_skipped or capacity_withheld) else "",
                         _push_safety.outcome_note(
                             _push_safety.PUSH_CAPPED, len(capped_out),
                             f"{_FULL_SYNC_MAX_PINS_PER_PASS} per pass; the rest next pass",
@@ -3459,28 +3544,35 @@ class UltraDeviceWorker(threading.Thread):
                 logger.info("%s member sync: clearing %d vacated finger slot(s) for pin(s) %s",
                             self._prefix, sum(len(v) for v in removals.values()),
                             ",".join(sorted(removals)))
-            if not self._record_push_intents(users, hashes_by_pin):
-                # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
-                self._defer_member_sync(member_id, reason="push intent not recorded")
-                return
-            # P3a-2 item 7: no free slot for a NEW user/finger -> not pushed, flagged.
-            users, _cap_skipped = self._capacity_admit(
+            # P3a-2 item 7: a member certainly not on the terminal gets no write when no
+            # user slot is free; fingers without a free slot are withheld. Decided BEFORE
+            # the intent (review R1-29): a refused push must not rewrite what the intent
+            # says MonClub put on the terminal.
+            users, _cap_skipped, cap_withheld = self._capacity_admit(
                 users, templates_by_pin, self._load_pushed_fingers(),
             )
             if not users:
                 self._defer_member_sync(member_id, reason="CAPACITY_FULL")
                 return
+            if not self._record_push_intents(users, hashes_by_pin):
+                # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
+                self._defer_member_sync(member_id, reason="push intent not recorded")
+                return
             # P3a-2 item 5: an owned pin never swept -- read BEFORE the push, which may
             # itself confer ownership -- has its unused slots cleared right after it.
             sweep_plan = self._finger_sweep_plan(users, templates_by_pin)
-            result = self._sdk.push_roster(users, templates_by_pin,
+            result = self._sdk.push_roster(users,
+                                           self._without_withheld(templates_by_pin, cap_withheld),
                                            remove_fingers_by_pin=removals)
             # Record this pin's outcome. On success the next hash-triggered full
             # sync sees it as already-synced and skips it -- this is what stops an
             # enrolment from cascading into a whole-roster push. On failure it is
-            # recorded ok=False so that full sync retries exactly this pin.
+            # recorded ok=False so that full sync retries exactly this pin. A pin whose
+            # fingers were withheld (CAPACITY_FULL) is not in sync either.
             self._record_standalone_pin_state(
-                users=users, hashes_by_pin=hashes_by_pin, result=result,
+                users=users, hashes_by_pin=hashes_by_pin,
+                result=self._with_withheld_failed(
+                    result, (u.get("pin") for u in users), cap_withheld),
                 templates_by_pin=templates_by_pin,
                 unknown_fingers_pins={p for p, plan in sweep_plan.items() if plan["unknown"]},
             )
