@@ -245,6 +245,7 @@ class TestClassification:
         report, details = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
         ppl = report["people"]
         assert ppl["deliverable_people"] == 3 and ppl["deliverable_rows"] == 4
+        assert ppl["delivered_templates_version_10"] == 3
         # Alpha: f5 only on the terminal, under Alpha's own pin. Beta: f3 only under the
         # old leftover pin 5000 (tied by card) - and Beta has no MonClub template at all.
         assert ppl["people_with_terminal_only_finger"] == 2
@@ -466,3 +467,48 @@ class TestNormPin:
     def test_numeric_pins_lose_leading_zeros(self):
         assert cte.norm_pin("0042") == "42" and cte.norm_pin(" 5000 ") == "5000"
         assert cte.norm_pin("A1") == "A1"
+
+
+class TestVerifyingThePushUnderAccount:
+    """The plan's post-push check runs the comparison with --scheme ACCOUNT against the
+    terminal MonClub has just filled with account pins. It must read them as members --
+    run with the default MEMBERSHIP it would call every one of them a leftover."""
+
+    def _after_the_switch(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM device_sync_state")                 # the retire
+        for pin in ("500", "600", "700"):                               # the ACCOUNT push
+            conn.execute("INSERT INTO device_sync_state (device_id, pin, updated_at, ownership_confirmed, "
+                         "pushed_finger_ids) VALUES (8, ?, 'x', 1, '')", (pin,))
+        conn.execute("UPDATE sync_devices SET pin_scheme = 'ACCOUNT'")
+        conn.commit()
+        conn.close()
+        terminal = [
+            _u("500", "Alpha Person", slots=[_slot(0, A0), _slot(1, A1)]),
+            _u("600", "Beta Person"),
+            _u("700", "Gamma Person", slots=[_slot(2, C2)]),           # two plans, one pin
+            _u("1", "Admin", priv=14),                                  # an admin the wipe kept
+        ]
+        return db, _export(tmp_path / "after.json", terminal)
+
+    def test_account_pins_read_as_owned_members(self, tmp_path):
+        db, ex = self._after_the_switch(tmp_path)
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)), scheme="ACCOUNT")
+        dev = report["devices"]["8"]
+        assert dev["classes"] == {"leftover": 1, "member_owned": 3}
+        assert dev["privileged"] == 1
+        assert report["sha_self_check"] == {"compared": 3, "equal": 3, "rate": 1.0}
+        assert "people_with_terminal_only_finger" not in report["people"]
+        assert report["people"]["deliverable_people"] == 3
+
+    def test_the_same_terminal_read_under_membership_looks_like_leftovers(self, tmp_path):
+        db, ex = self._after_the_switch(tmp_path)
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)), scheme="MEMBERSHIP")
+        assert report["devices"]["8"]["classes"].get("member_owned", 0) == 0
+
+    def test_the_report_shows_the_scheme_the_pc_recorded(self, tmp_path):
+        db, ex = self._after_the_switch(tmp_path)
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)), scheme="ACCOUNT")
+        assert report["devices"]["8"]["pc_pin_scheme"] == "ACCOUNT"

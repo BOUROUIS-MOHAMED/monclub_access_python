@@ -645,6 +645,10 @@ def analyse(
             dev["users_with_slots"] = sum(1 for u in ex.users if u.slots)
             dev["slots"] = sum(len(u.slots or []) for u in ex.users)
             dev["slots_not_base64"] = sum(1 for u in ex.users for s in (u.slots or []) if s.hashed_as != "base64")
+        if access is not None:
+            # what this PC last recorded for the device: None = the column or the value is
+            # absent (an old client, or a backend that does not send pinScheme)
+            dev["pc_pin_scheme"] = access.pin_scheme.get(ex.device_id)
         own = ownership.get(ex.device_id, {}) if ownership is not None else None
         intents = access.intents.get(ex.device_id, set()) if access is not None else set()
         classes: Counter = Counter()
@@ -742,6 +746,9 @@ def analyse(
     ppl["rows_without_main_account"] = sum(1 for r in rows if r.main_account_id is None)
     ppl["people_with_monclub_template"] = sum(1 for k in persons if person_fingers[k])
     ppl["people_without_monclub_template"] = sum(1 for k in persons if not person_fingers[k])
+    # what MonClub will push, by algorithm version -- compare with each terminal's fp_version
+    for v, n in Counter(t.template_version for r in rows for t in r.templates).items():
+        ppl[f"delivered_templates_version_{v}"] += n
     if fingers_read:
         for key, slots in linked_slots.items():
             mine_sha = person_shas.get(key, set())
@@ -819,6 +826,8 @@ def render(report: Dict[str, Any]) -> str:
         lines.append(f"   terminal users {d['terminal_users']}  privileged {d['privileged']}  disabled {d['disabled']}  with card {d['with_card']}")
         if d.get("fingers_read"):
             lines.append(f"   users with slots {d['users_with_slots']}  slots {d['slots']}  (not base64: {d['slots_not_base64']})")
+        if "pc_pin_scheme" in d:
+            lines.append(f"   pin scheme recorded by the PC: {d['pc_pin_scheme']}")
         lines.append(f"   counters {d['counters']}")
         lines.append(f"   classes {d['classes']}")
         lines.append(f"   leftovers {d['leftovers']}")
