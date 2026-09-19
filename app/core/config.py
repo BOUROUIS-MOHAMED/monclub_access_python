@@ -111,6 +111,25 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
     return x
 
 
+def offline_revoke_grace_days(cfg: Any) -> int:
+    """``cfg.offline_revoke_grace_days`` normalised to a non-negative int.
+
+    0 for anything that is not a plain non-negative integer: a bool (Python's
+    ``isinstance(True, int)`` is True, so it must be rejected explicitly, same as
+    ``access_dates.py::_positive_int``), ``None``, a missing attribute, or a
+    non-numeric value. Never raises -- callers (readers of the flip job, the
+    status/config payloads) use this instead of touching the raw config value.
+    """
+    value = getattr(cfg, "offline_revoke_grace_days", None)
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
+
+
 def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:
     x = _safe_float(v, default)
     if x < lo:
@@ -183,6 +202,14 @@ class AppConfig:
 
     # Enable controller sync engine (DEVICE mode only)
     device_sync_enabled: bool = True
+
+    # -------------------------
+    # Protocol 2 offline date flips (P3b-1)
+    # -------------------------
+    # Days a membership stays deliverable PAST its accessUntil while the PC is offline
+    # (gym_date > server_today). 0 = expire on time even offline -- the owner's default.
+    # Read through the offline_revoke_grace_days(cfg) normaliser below, never raw.
+    offline_revoke_grace_days: int = 0
 
     # -------------------------
     # AGENT realtime RTLog engine (AGENT mode only)
@@ -498,6 +525,9 @@ class AppConfig:
 
         # device_sync_enabled
         cfg.device_sync_enabled = bool(cfg.device_sync_enabled) if cfg.device_sync_enabled is not None else True
+
+        # offline_revoke_grace_days -- via the shared normaliser (bool/None/non-numeric -> 0)
+        cfg.offline_revoke_grace_days = offline_revoke_grace_days(cfg)
 
         # agent realtime
         cfg.agent_realtime_enabled = bool(cfg.agent_realtime_enabled) if cfg.agent_realtime_enabled is not None else True
