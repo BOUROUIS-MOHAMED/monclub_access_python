@@ -101,8 +101,10 @@ def window_status(
         return "not_started"
     if day > w.access_until:
         g = max(0, int(grace_days or 0))
+        # A day count, not access_until + timedelta(days=g): a huge grace ("never expire
+        # offline") overflowed the date and made every offline flip and QR check raise (review R2).
         if (g > 0 and server_today is not None and day > server_today
-                and day <= w.access_until + timedelta(days=g)):
+                and (day - w.access_until).days <= g):
             return "grace"
         return "expired"
     if day in w.off_days:
