@@ -115,6 +115,16 @@ def test_a_fast_patch_delete_of_a_pre_sale_is_never_promoted_again(db):
     assert 3 not in _upcoming_ids() and _token() is None
 
 
+def test_a_cancelled_pre_sales_stored_credential_is_not_enabled_on_its_first_day(db):
+    # The upcoming credential (account 55, grant 3) stays stored; with 3's upcoming row gone
+    # nothing makes grant 3 deliverable, so the PC never enables it (effective_credentials).
+    _seed_full_v2(db)
+    _patch(db, "b-del-3", "ENTITY_DELETE", 3)
+    _flip(db, "2026-09-20T07:30:00+01:00")
+    creds, _users, _cards = av.load_local_state()
+    assert not [c for c in creds if int(c.get("accountId") or 0) == 55 and c.get("enabled")]
+
+
 def test_a_fast_patch_that_forgets_dates_moves_the_generation(db):
     _seed_full_v2(db)
     gen = db.get_local_state_generation()
