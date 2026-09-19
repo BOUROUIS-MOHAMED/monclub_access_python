@@ -1087,6 +1087,294 @@ def get_member_person_user_ids(
     return out
 
 
+# ---------------------------------------------------------------------------
+# P3b-1: the save of a protocol-2 answer -- runs INSIDE the sync write transaction
+# ---------------------------------------------------------------------------
+# The token the request sends back as ``windowsVersion``. It lives in sync_version_tokens (so
+# logout / hard reset drop it with the others) but is written and deleted only here, in the same
+# transaction as the windows and the upcoming lists: the contract stores them "together or not
+# at all" (backend ActiveMemberResponseV2). It is NOT in app.py's new_tokens mapping.
+_WINDOWS_VERSION_KEY = "windowsVersion"
+
+
+def _client_received_epoch(data: Any) -> float:
+    """The PC time the answer arrived (``_clientReceivedAtEpoch``, stamped by the API client),
+    else now. Read BEFORE the write job is queued, so a DbWriter backlog is not counted as skew."""
+    value = data.get("_clientReceivedAtEpoch") if isinstance(data, Mapping) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+        return float(value)
+    return time.time()
+
+
+def _window_columns(w: Any) -> tuple:
+    """(access_from, access_until, off_days_json, off_days_beyond_horizon) of an AccessWindow."""
+    return (
+        w.access_from.isoformat(),
+        w.access_until.isoformat(),
+        json.dumps(sorted(d.isoformat() for d in w.off_days)),
+        1 if w.off_days_beyond_horizon else 0,
+    )
+
+
+def _set_windows_version(cur: Any, value: Optional[str]) -> None:
+    if value is None:
+        cur.execute("DELETE FROM sync_version_tokens WHERE key = ?", (_WINDOWS_VERSION_KEY,))
+        return
+    cur.execute(
+        "INSERT INTO sync_version_tokens (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (_WINDOWS_VERSION_KEY, str(value)),
+    )
+
+
+def _set_protocol2_untrusted(cur: Any) -> None:
+    """trusted=0, every other column kept (the clock floor survives a v1 answer and a logout)."""
+    cur.execute(
+        "INSERT INTO access_v2_state (id, trusted, updated_at) VALUES (1, 0, ?) "
+        "ON CONFLICT(id) DO UPDATE SET trusted = 0, updated_at = excluded.updated_at",
+        (now_iso(),),
+    )
+
+
+def _replace_member_access_windows(cur: Any, windows: Mapping[int, Any]) -> None:
+    """member_access_window := exactly ``windows`` (today's set: users[] windows + memberWindows)."""
+    cur.execute("DELETE FROM member_access_window")
+    if windows:
+        cur.executemany(
+            """
+            INSERT INTO member_access_window (
+                active_membership_id, access_from, access_until, off_days_json,
+                off_days_beyond_horizon
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [(int(am),) + _window_columns(w) for am, w in windows.items()],
+        )
+
+
+def _replace_sync_upcoming(cur: Any, p: Any) -> None:
+    """sync_upcoming_users / sync_upcoming_credentials := upcoming[] / upcomingCredentials.
+
+    The row is kept exactly as sent (payload_json) -- a promotion replays it through
+    _upsert_sync_user_row. The credentials use the sync_gym_access_credentials layout and are
+    stored disabled: the server sends them ``enabled=false`` whatever the database row says
+    (backend UpcomingGymAccessCredentialDto), and only access_dates.effective_credentials may
+    enable a copy on a day one of its grants is deliverable.
+    """
+    from app.core import access_dates as _ad
+
+    cur.execute("DELETE FROM sync_upcoming_users")
+    rows = []
+    for row in p.upcoming_rows or []:
+        # parse_v2_payload accepted the list whole: every row has an id and a window.
+        am = _ad._positive_int(row.get("activeMembershipId"))
+        rows.append(
+            (am, json.dumps(row, ensure_ascii=False))
+            + _window_columns(p.upcoming_windows[am])
+            + (p.upcoming_qr_account.get(am),)
+        )
+    if rows:
+        cur.executemany(
+            """
+            INSERT INTO sync_upcoming_users (
+                active_membership_id, payload_json, access_from, access_until,
+                off_days_json, off_days_beyond_horizon, qr_account_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    cur.execute("DELETE FROM sync_upcoming_credentials")
+    creds = []
+    for c in p.upcoming_credentials or []:
+        normalized = _normalize_sync_credential_payload_row(c)
+        normalized["enabled"] = 0
+        creds.append(_sync_credential_params(normalized))
+    if creds:
+        cur.executemany(
+            """
+            INSERT INTO sync_upcoming_credentials (
+                id, gym_id, account_id, secret_hex, enabled,
+                rotated_at, created_at, updated_at,
+                granted_active_membership_ids_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            creds,
+        )
+
+
+def _reconcile_held_rows(
+    cur: Any,
+    *,
+    full_mode: bool,
+    valid_ids: Optional[set],
+    incoming_ids: set,
+) -> Dict[str, int]:
+    """Settle sync_users_held against a members section applied with a valid authority.
+
+    Delta: a held row whose id is still in validMemberIds and not in users[] goes back to
+    sync_users -- the server still counts it as delivered and will not resend it; the flip that
+    follows the save holds it again if its date says so. A held id that is back on sync_users
+    already (a fast patch re-added it after the hold) keeps that fresher row. Every other held
+    row is dropped: an id outside validMemberIds is the same authoritative removal the cache
+    deletion just applied (guide §3.4), and a users[] row supersedes its held copy.
+    Full: every held row is dropped -- the full list supersedes them.
+    A delta without validMemberIds proves nothing and never reaches here (members_applied).
+    """
+    # active_membership_id is the table's INTEGER PRIMARY KEY: never NULL.
+    held = [int(r[0]) for r in cur.execute(
+        "SELECT active_membership_id FROM sync_users_held"
+    ).fetchall()]
+    total = len(held)
+    if not total:
+        return {"restored": 0, "dropped": 0}
+    restore: List[int] = []
+    if not full_mode and valid_ids is not None:
+        on_roster = {int(r[0]) for r in cur.execute(
+            "SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL"
+        ).fetchall()}
+        restore = sorted(
+            am for am in held
+            if am in valid_ids and am not in incoming_ids and am not in on_roster
+        )
+    cols = ", ".join(_SYNC_USER_COLUMNS)
+    for i in range(0, len(restore), 500):
+        chunk = restore[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        # Column for column: a restore is a copy, never a re-encode of the row.
+        cur.execute(
+            f"INSERT OR REPLACE INTO sync_users ({cols}) SELECT {cols} FROM sync_users_held "
+            f"WHERE active_membership_id IN ({placeholders})",
+            chunk,
+        )
+    cur.execute("DELETE FROM sync_users_held")
+    if restore:
+        _refresh_member_account_links(cur)
+    return {"restored": len(restore), "dropped": total - len(restore)}
+
+
+def _apply_protocol2_save(
+    cur: Any,
+    data: Mapping[str, Any],
+    *,
+    members_applied: bool,
+    full_mode: bool,
+    valid_ids: Optional[set],
+    incoming_ids: set,
+    pc_received_epoch: Optional[float],
+) -> Dict[str, Any]:
+    """The protocol-2 step of a sync save (plan §3). Called inside the caller's transaction,
+    after its members/devices/credentials/settings writes: an exception here rolls the WHOLE
+    save back, so the windows, the upcoming lists and windowsVersion are never stored apart from
+    the member rows they describe.
+
+    ``members_applied``: the members section was written with a valid authority -- not refused by
+    H-006, the authority valid and (delta) validMemberIds present. It is the same outcome the
+    cache deletion consumed (guide §3.4); nothing here re-judges it.
+
+    * v1 answer (no syncMeta) or a malformed protocol-2 part: trusted=0, windowsVersion
+      dropped, the stored lists kept (unused while untrusted); ``[T] SYNC_V2_REJECTED`` for a
+      malformed one.
+    * v2: the syncMeta state is stored and the clock measured; floor_date resets to the server's
+      day (its authority), max_pc_epoch to the PC time when the skew is sane, else to the server
+      time. applied_date / grace_days / clock_suspect are the flip's, never touched here.
+      A members section applied -> windows replaced, the upcoming lists replaced when sent,
+      windowsVersion stored, trusted=1. Present but not applied -> trusted=0, token dropped.
+      Skipped -> lists and trust kept (the server skips it only when the PC's windowsVersion is
+      current: backend GymAccessController, protocol 2).
+    * Held rows, for ANY protocol, when the members section was applied: _reconcile_held_rows.
+    """
+    from app.core import access_dates as _ad
+
+    try:
+        p, err = _ad.parse_v2_payload(data)
+    except Exception as exc:  # parse_v2_payload validates, it is not expected to raise
+        p, err = None, f"parse_error: {exc!r}"
+
+    if p is None:
+        _set_protocol2_untrusted(cur)
+        _set_windows_version(cur, None)
+        if err is not None:
+            _tel.warn("SYNC_V2_REJECTED", reason=err)
+        out: Dict[str, Any] = {
+            "protocol": "rejected" if err is not None else "v1",
+            "reason": err,
+            "trusted": False,
+            "members_section": bool(data.get("refreshMembers", True)),
+            "clock_at_sync": "",
+        }
+    else:
+        meta = p.meta
+        pc_epoch = float(pc_received_epoch) if pc_received_epoch is not None else time.time()
+        skew, at_sync = _ad.clock_at_sync(meta.server_epoch, pc_epoch)
+        now = now_iso()
+        cur.execute(
+            """
+            INSERT INTO access_v2_state (
+                id, trusted, server_today, horizon_days, horizon_end, server_time,
+                server_epoch, utc_offset_sec, snapshot_at, reconcile_sec, capabilities_json,
+                pc_epoch_at_sync, skew_sec, floor_date, max_pc_epoch, updated_at
+            ) VALUES (1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                server_today = excluded.server_today,
+                horizon_days = excluded.horizon_days,
+                horizon_end = excluded.horizon_end,
+                server_time = excluded.server_time,
+                server_epoch = excluded.server_epoch,
+                utc_offset_sec = excluded.utc_offset_sec,
+                snapshot_at = excluded.snapshot_at,
+                reconcile_sec = excluded.reconcile_sec,
+                capabilities_json = excluded.capabilities_json,
+                pc_epoch_at_sync = excluded.pc_epoch_at_sync,
+                skew_sec = excluded.skew_sec,
+                floor_date = excluded.floor_date,
+                max_pc_epoch = excluded.max_pc_epoch,
+                updated_at = excluded.updated_at
+            """,
+            (
+                meta.today.isoformat(), meta.horizon_days, meta.horizon_end.isoformat(),
+                meta.server_time, meta.server_epoch, meta.utc_offset_sec, meta.snapshot_at,
+                meta.reconcile_sec, json.dumps(list(meta.capabilities)),
+                pc_epoch, skew, meta.today.isoformat(),
+                pc_epoch if at_sync == "" else meta.server_epoch,
+                now,
+            ),
+        )
+        members_section = p.today_windows is not None
+        if members_section and members_applied:
+            _replace_member_access_windows(cur, p.today_windows)
+            if p.upcoming_rows is not None:
+                _replace_sync_upcoming(cur, p)
+            _set_windows_version(cur, p.windows_version)
+            trusted = True
+        elif members_section:
+            _set_windows_version(cur, None)
+            trusted = False
+        else:
+            if p.windows_version is not None:
+                _set_windows_version(cur, p.windows_version)
+            row = cur.execute("SELECT trusted FROM access_v2_state WHERE id = 1").fetchone()
+            trusted = bool(row[0]) if row is not None else False
+        if members_section:
+            cur.execute("UPDATE access_v2_state SET trusted = ? WHERE id = 1", (1 if trusted else 0,))
+        out = {
+            "protocol": "v2",
+            "reason": None,
+            "trusted": trusted,
+            "members_section": members_section,
+            "clock_at_sync": at_sync,
+        }
+
+    if members_applied:
+        held = _reconcile_held_rows(
+            cur, full_mode=full_mode, valid_ids=valid_ids, incoming_ids=set(incoming_ids or ()),
+        )
+        if held["restored"] or held["dropped"]:
+            logging.getLogger(__name__).info(
+                "[DB] held rows settled by the members section: restored=%d dropped=%d (full=%s)",
+                held["restored"], held["dropped"], full_mode,
+            )
+    return out
+
+
 def _sync_users_has_legacy_fingerprint(conn: sqlite3.Connection) -> bool:
     cols = _table_columns(conn, "sync_users")
     return "fingerprint" in cols
@@ -4340,6 +4628,16 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             cur.execute("DELETE FROM sync_gym_access_credentials")
             cur.execute("DELETE FROM sync_device_door_presets")
             # keep sync_access_software_settings row (it is "settings", not "cache json")
+            # P3b-1 (plan §1): the protocol-2 lists go with the cache and the windows stop being
+            # trusted; the clock columns of access_v2_state (the floor) are kept.
+            cur.execute("DELETE FROM sync_users_held")
+            cur.execute("DELETE FROM member_access_window")
+            cur.execute("DELETE FROM sync_upcoming_users")
+            cur.execute("DELETE FROM sync_upcoming_credentials")
+            cur.execute(
+                "UPDATE access_v2_state SET trusted = 0, updated_at = ? WHERE id = 1", (now_iso(),),
+            )
+            _set_windows_version(cur, None)
             conn.commit()
         return
 
@@ -4356,6 +4654,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     devices = data.get("devices") or []
     infrastructures = data.get("infrastructures") or data.get("infrastructure") or []
     gym_access_credentials = data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []
+    pc_received_epoch = _client_received_epoch(data)
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -4389,12 +4688,23 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         # If backend returns empty user list but we had >10 users before,
         # this is likely a backend error — refuse to wipe local cache.
         if not users:
-            old_count = cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+            # P3b-1: held rows are still in the server's list and this full replace drops them
+            # all, so they count too. [TEST: tests/test_protocol2_save_and_flip.py::test_h006_full_save_counts_held_rows]
+            old_count = (
+                cur.execute("SELECT COUNT(*) FROM sync_users").fetchone()[0]
+                + cur.execute("SELECT COUNT(*) FROM sync_users_held").fetchone()[0]
+            )
             if old_count > 10:
                 import logging as _log
                 _log.getLogger(__name__).error(
                     f"[DB] save_sync_cache: backend returned 0 users but local cache has {old_count}. "
                     "Refusing to clear — likely backend error. Skipping normalized table update."
+                )
+                # Refused: the windows no longer describe what the answer said -- stop trusting
+                # them (the held rows stay, the lists stay).
+                _apply_protocol2_save(
+                    cur, data, members_applied=False, full_mode=True, valid_ids=None,
+                    incoming_ids=set(), pc_received_epoch=pc_received_epoch,
                 )
                 conn.commit()
                 return
@@ -4669,6 +4979,23 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     json.dumps(granted_ids, ensure_ascii=False),
                 ),
             )
+
+        # P3b-1 (plan §3): the protocol-2 parts in the same transaction as the users. A full
+        # list: every held row is dropped. Reached by the enrolment fallback (no tokens).
+        _apply_protocol2_save(
+            cur,
+            data,
+            members_applied=True,
+            full_mode=True,
+            valid_ids=None,
+            incoming_ids={
+                am for am in (
+                    _canonical_positive_member_id(u.get("activeMembershipId"))
+                    for u in users if isinstance(u, dict)
+                ) if am is not None
+            },
+            pc_received_epoch=pc_received_epoch,
+        )
 
         conn.commit()
 
@@ -5648,8 +5975,13 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     )
     raw_users = data.get("users") if isinstance(data.get("users"), list) else []
     safe_users = [raw_users[index] for index in accepted_member_user_indexes]
+    pc_received_epoch = _client_received_epoch(data)
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, Any]:
         cur = conn.cursor()
+        # P3b-1: the members outcome the protocol-2 step consumes -- the same authority the
+        # cache deletion below uses (guide §3.4). Set inside the members branches only.
+        p2_members_applied = False
+        p2_full_mode = False
         profile["members_refresh"] = bool(refresh.get("members", True))
         profile["devices_refresh"] = bool(refresh.get("devices", True))
         profile["credentials_refresh"] = bool(refresh.get("credentials", True))
@@ -5769,9 +6101,18 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                         # No ratio guard on a NON-empty validMemberIds: a legitimate mass
                         # revocation refused would keep ex-members' cards admitted, which
                         # is fail-open. [TEST: tests/test_delta_user_cache.py]
-                        if not valid_set and len(ids_list) > _H006_MIN_CACHE_ROWS:
+                        # P3b-1: a held row (sync_users_held) is still in the server's list,
+                        # and an empty validMemberIds drops every one of them too (the held
+                        # reconciliation after this section), so they count toward the blast
+                        # radius. Read only on an empty validMemberIds.
+                        # [TEST: tests/test_protocol2_save_and_flip.py::test_h006_delta_counts_the_held_rows_it_would_drop]
+                        held_drop_count = (
+                            int(cur.execute("SELECT COUNT(*) FROM sync_users_held").fetchone()[0])
+                            if not valid_set else 0
+                        )
+                        if not valid_set and len(ids_list) + held_drop_count > _H006_MIN_CACHE_ROWS:
                             delete_refused = True
-                            delete_refused_count = len(ids_list)
+                            delete_refused_count = len(ids_list) + held_drop_count
                             ids_list = []
                             _logger.error(
                                 "[DB] save_sync_cache_delta: backend returned 0 validMemberIds "
@@ -5795,6 +6136,12 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                                 chunk,
                             )
                         members_delete_ms = (time.perf_counter() - t_delete) * 1000.0
+                    # Applied with a valid authority: validMemberIds present, valid, and the
+                    # deletion it drives not refused. A delta without validMemberIds (the
+                    # backend always sends it in delta mode) deletes nothing and proves nothing.
+                    p2_members_applied = bool(
+                        authoritative_ids_valid and valid_ids is not None and not delete_refused
+                    )
                     profile["members_upserted"] = upserted_count
                     profile["members_deleted"] = deleted_count
                     profile["members_delete_refused"] = delete_refused
@@ -5837,12 +6184,19 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                             authoritative_ids_error,
                         )
                     elif not authoritative_ids:
-                        if old_count > _H006_MIN_CACHE_ROWS:
+                        # P3b-1: held rows are still in the server's list and an applied full
+                        # section drops them all, so they count toward H-006 too (plan §1: an
+                        # empty payload must not slip under H-006 because rows were held).
+                        # [TEST: tests/test_protocol2_save_and_flip.py::
+                        #        test_h006_full_members_refresh_of_the_delta_writer_counts_held_rows_too]
+                        held_count = int(cur.execute("SELECT COUNT(*) FROM sync_users_held").fetchone()[0])
+                        if old_count + held_count > _H006_MIN_CACHE_ROWS:
                             full_refresh_refused = True
-                            full_refresh_refused_count = old_count
+                            full_refresh_refused_count = old_count + held_count
                             _logger.error(
                                 f"[DB] save_sync_cache_delta: backend returned 0 users (refreshMembers=True) "
-                                f"but local cache has {old_count}. Refusing to clear — likely backend error."
+                                f"but local cache has {old_count} (+{held_count} held). "
+                                f"Refusing to clear — likely backend error."
                             )
                         else:
                             _logger.warning(
@@ -5852,6 +6206,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                             )
                     profile["members_full_refresh_refused"] = full_refresh_refused
                     profile["members_full_refresh_refused_count"] = full_refresh_refused_count
+                    # full_refresh_refused covers an invalid authority and H-006 alike.
+                    p2_full_mode = True
+                    p2_members_applied = not full_refresh_refused
 
                     if full_refresh_refused and users:
                         # Malformed authority blocks removals, not safe row upserts.
@@ -5941,6 +6298,21 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                     (data.get("infrastructures") or data.get("infrastructure") or []),
                 )
 
+        # P3b-1 (plan §3): the protocol-2 parts, in THIS transaction -- a failure rolls the whole
+        # save back, so the windows / upcoming lists / windowsVersion never part from the rows.
+        # [TEST: tests/test_protocol2_save_and_flip.py::test_a_failure_inside_the_v2_step_rolls_back_the_whole_save]
+        with _profile_write_step(profile, "protocol2_ms"):
+            protocol2 = _apply_protocol2_save(
+                cur,
+                data,
+                members_applied=p2_members_applied,
+                full_mode=p2_full_mode,
+                valid_ids=set(authoritative_ids) if authoritative_ids is not None else None,
+                incoming_ids=set(accepted_member_ids),
+                pc_received_epoch=pc_received_epoch,
+            )
+        profile["protocol2"] = protocol2.get("protocol")
+
         return {
             "credentials": creds_summary,
             "members_delete_refused": bool(
@@ -5952,6 +6324,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
             "authoritative_member_ids_error": authoritative_ids_error,
             "accepted_member_user_indexes": accepted_member_user_indexes,
             "accepted_member_ids": accepted_member_ids,
+            "protocol2": protocol2,
         }
 
     result = _run_db_write_sync("save_sync_cache_delta", _write) or {}
