@@ -3423,29 +3423,15 @@ class DeviceSyncEngine:
             # the SDK on chunk failure.
             deleted = 0
             with _fsp.step("predelete"):
-                if stale_pins:
-                    # ONE ceiling for every bulk removal (P3a-2, guide §3.2g). Refused:
-                    # nothing is removed, the per-pin state is kept (the prune below is
-                    # skipped too) and the rest of the pass still runs.
-                    _stale_verdict = _push_safety.check_bulk_removal(
-                        count=len(stale_pins), roster_count=len(desired_pins),
-                        path="stale", device_id=did, protocol="ZK_PULLSDK",
-                        sample=stale_pins,
-                    )
-                    if not _stale_verdict.allowed:
-                        removal_aborted += _stale_verdict.count
-                        removal_notes.append(_push_safety.outcome_note(
-                            _push_safety.REVOKE_ABORTED, _stale_verdict.count,
-                            f"stale; ceiling {_stale_verdict.ceiling:.0f}",
-                        ))
-                        stale_pins = []
                 if stale_pins and pin_scheme != PIN_SCHEME_ACCOUNT:
                     # RENEWAL ORDERING (P3b-1, plan §7). A stale pin whose PERSON still has
-                    # a desired pin not confirmed on the panel is HELD: counted by the
-                    # ceiling above, deleted only after the push confirmed that person's
-                    # desired pins (below). Deleting it first left a renewed member with
-                    # neither pin when the new pin's write failed (guide §7 R3-21).
-                    # MEMBERSHIP only: under ACCOUNT a renewal keeps the account pin.
+                    # a desired pin not confirmed on the panel is HELD: deleted only after the
+                    # push confirmed that person's desired pins (below), and not counted by
+                    # the ceiling here, which judges what this step deletes -- the real
+                    # leavers (review R1: a kept hold must not push them over it). Deleting it
+                    # first left a renewed member with neither pin when the new pin's write
+                    # failed (guide §7 R3-21). MEMBERSHIP only: under ACCOUNT a renewal keeps
+                    # the account pin.
                     _pending_persons = {
                         who for who in (
                             renewal_person_id((desired.get(p) or {}).get("userId"))
@@ -3462,6 +3448,22 @@ class DeviceSyncEngine:
                             "confirms their person's new pin: %s",
                             dev_id, len(renewal_held), sorted(renewal_held)[:10],
                         )
+                if stale_pins:
+                    # ONE ceiling for every bulk removal (P3a-2, guide §3.2g). Refused:
+                    # nothing is removed, the per-pin state is kept (the prune below is
+                    # skipped too) and the rest of the pass still runs.
+                    _stale_verdict = _push_safety.check_bulk_removal(
+                        count=len(stale_pins), roster_count=len(desired_pins),
+                        path="stale", device_id=did, protocol="ZK_PULLSDK",
+                        sample=stale_pins,
+                    )
+                    if not _stale_verdict.allowed:
+                        removal_aborted += _stale_verdict.count
+                        removal_notes.append(_push_safety.outcome_note(
+                            _push_safety.REVOKE_ABORTED, _stale_verdict.count,
+                            f"stale; ceiling {_stale_verdict.ceiling:.0f}",
+                        ))
+                        stale_pins = []
                 if stale_pins:
                     failed_del: List[str] = list(stale_pins)
                     try:
@@ -4130,6 +4132,23 @@ class DeviceSyncEngine:
                                    if (o or {}).get("status") == "SUCCESS"},
                 )
                 _released = sorted(_free)
+                if _released:
+                    # Within the one ceiling together with what the stale step deleted this
+                    # pass (review R1): a pass never deletes more than the ceiling allows.
+                    _release_verdict = _push_safety.check_bulk_removal(
+                        count=int(deleted or 0) + len(_released),
+                        roster_count=len(desired_pins), path="renewal_release",
+                        device_id=did, protocol="ZK_PULLSDK", sample=_released,
+                    )
+                    if not _release_verdict.allowed:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s: %d renewed member(s)' previous pin(s) "
+                            "kept -- with the %d deleted first they exceed the removal "
+                            "ceiling (%.0f)", dev_id, len(_released), int(deleted or 0),
+                            _release_verdict.ceiling,
+                        )
+                        _free = set()
+                        _released = []
                 renewal_kept = set(renewal_held) - _free
                 _removed_after = 0
                 if _released:

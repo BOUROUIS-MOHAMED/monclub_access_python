@@ -366,21 +366,59 @@ class TestStandaloneCeilingAndFailures:
             rows.append(_row(pin, 7000 + i, f"L{i}", str(7000 + i)))
         return rows
 
-    def test_the_ceiling_counts_holds_and_refuses_the_whole_set(self, db, monkeypatch, events):
+    def test_the_ceiling_judges_the_leavers_and_a_release_beyond_it_waits(
+            self, db, monkeypatch, events):
+        # Review R1 (inverts the P3b-1 part-E rule "the ceiling counts holds"): the removals-
+        # first step removes only the leavers, so its ceiling judges them; the released hold
+        # would make 11 removals in the pass (> 10), so it waits for the next pass -- a pass
+        # never removes more than the ceiling allows, as when the old pin went first.
         term = RenewalTerminal()
         _owned_on_terminal(db, term, OLD)
-        leavers = self._leavers(db, term, 10)          # 10 + 1 hold = 11 > ceiling 10
+        leavers = self._leavers(db, term, 10)          # 10 leavers = ceiling 10: allowed
         _flipped(db, [_row(OLD, PERSON)] + leavers, [_row(NEW, PERSON)])
         drv, w = _setup(monkeypatch, term, [_row(NEW, PERSON)])
-        _run(drv, w)
-        assert not [c for c in term.calls if c[0] == "SSR_DeleteEnrollData"], (
-            "refused: nothing removed, before the push or after it")
-        assert str(OLD) in term.users and all(str(r["activeMembershipId"]) in term.users
-                                                 for r in leavers)
-        [abort] = _named(events, "REVOKE_ABORTED")
-        assert abort["count"] == 11 and abort["ceiling"] == 10
-        assert str(OLD) in _state(db)
-        assert not _named(events, "RENEWAL_HOLD")
+        try:
+            _pass(w)
+            written = _written(term, NEW)
+            assert all(_deleted(term, r["activeMembershipId"]) < written for r in leavers)
+            assert _deleted(term, OLD) is None and str(OLD) in term.users
+            assert str(OLD) in _state(db), "kept: owned, removed by a later pass"
+            [abort] = _named(events, "REVOKE_ABORTED")
+            assert abort["path"] == "renewal_release" and abort["count"] == 11
+            [hold] = _named(events, "RENEWAL_HOLD")
+            assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
+
+            mark = len(term.calls)
+            _pass(w)                                   # nothing else to remove: it fits now
+        finally:
+            drv.disconnect()
+        assert _deleted(term, OLD, after=mark - 1) is not None
+        assert str(OLD) not in term.users and str(NEW) in term.users
+
+    def test_a_kept_hold_does_not_push_the_next_days_leavers_over_the_ceiling(
+            self, db, monkeypatch, events):
+        # Review R1: day D the renewed member's new pin is refused, so the old one is kept;
+        # day D+1 ten other plans end. Base had removed the old pin on day D and removed the
+        # ten on D+1; counting the kept hold made 11 > 10 and left the ten on the turnstile.
+        term = RenewalTerminal()
+        term.refuse_user = {str(NEW)}
+        _owned_on_terminal(db, term, OLD)
+        leavers = self._leavers(db, term, 10)
+        _flipped(db, [_row(OLD, PERSON)], [_row(NEW, PERSON)] + leavers)
+        drv, w = _setup(monkeypatch, term, [_row(NEW, PERSON)] + leavers)
+        try:
+            _pass(w)                                   # day D: the old pin is kept
+            assert str(OLD) in term.users
+            _flipped(db, leavers, [_row(NEW, PERSON)])  # day D+1: the ten plans end
+            ue.load_sync_cache().users[:] = [_row(NEW, PERSON)]
+            events.clear()
+            _pass(w)
+        finally:
+            drv.disconnect()
+        assert not [a for a in _named(events, "REVOKE_ABORTED")
+                    if a.get("path") == "standalone_revoke"]
+        assert not any(str(r["activeMembershipId"]) in term.users for r in leavers)
+        assert str(OLD) in term.users, "the renewed member still enters with the old pin"
 
     def test_under_the_ceiling_leavers_go_first_and_the_hold_after_the_push(
             self, db, monkeypatch, events):
@@ -575,6 +613,19 @@ def _tracked(db, *pins) -> None:
                                   ok=True, error=None)
 
 
+def _refuse_user_batch(sdk, pin) -> None:
+    """A batched user write reports ``pin``'s row failed (the others written)."""
+    rx = _pin_re(pin)
+
+    def _side(*_a, **kw):
+        rows = list(kw.get("rows") or [])
+        if kw.get("table") == "user":
+            bad = [r for r in rows if rx.search(str(r))]
+            return (len(rows) - len(bad), bad)
+        return (len(rows), [])
+    sdk.set_device_data_batch.side_effect = _side
+
+
 def _refuse_user_write(sdk, pin) -> None:
     rx = _pin_re(pin)
 
@@ -668,18 +719,44 @@ class TestPullSdkRenewal:
         [hold] = _named(events, "RENEWAL_HOLD")
         assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 0)
 
-    def test_the_ceiling_counts_holds(self, sqlite_db, events):
+    def test_the_ceiling_judges_the_leavers_and_a_release_beyond_it_waits(self, sqlite_db, events):
+        # Review R1 (inverts "the ceiling counts holds"), as on the MB2000.
         leavers = [_m(LEAVER + i, 7000 + i, f"L{i}") for i in range(10)]
         _flipped(sqlite_db, [_m(OLD, PERSON)] + leavers, [_m(NEW, PERSON)])
         pins = [str(OLD)] + [str(LEAVER + i) for i in range(10)]
         _tracked(sqlite_db, *pins)
         sdk = _pull_sdk(pins)
         _pull_pass([_m(NEW, PERSON)], sdk)
-        assert all(_pull_delete_idx(sdk, p) is None for p in pins), "refused: nothing removed"
-        [abort] = [a for a in _named(events, "REVOKE_ABORTED") if a.get("path") == "stale"]
+        written = _pull_write_idx(sdk, NEW)
+        assert all(_pull_delete_idx(sdk, LEAVER + i) < written for i in range(10))
+        assert _pull_delete_idx(sdk, OLD) is None, "11 removals would exceed the ceiling"
+        assert not [a for a in _named(events, "REVOKE_ABORTED") if a.get("path") == "stale"]
+        [abort] = [a for a in _named(events, "REVOKE_ABORTED") if a.get("path") == "renewal_release"]
         assert abort["count"] == 11
-        assert set(pins) <= _pull_state(sqlite_db)
-        assert not _named(events, "RENEWAL_HOLD")
+        assert str(OLD) in _pull_state(sqlite_db)
+        [hold] = _named(events, "RENEWAL_HOLD")
+        assert (hold["held"], hold["removed_after_push"], hold["kept"]) == (1, 0, 1)
+
+    def test_a_kept_hold_does_not_push_the_next_days_leavers_over_the_ceiling(
+            self, sqlite_db, events):
+        leavers = [_m(LEAVER + i, 7000 + i, f"L{i}") for i in range(10)]
+        _flipped(sqlite_db, [_m(OLD, PERSON)], [_m(NEW, PERSON)] + leavers)
+        pins = [str(OLD)] + [str(LEAVER + i) for i in range(10)]
+        _tracked(sqlite_db, *pins)
+        sdk = _pull_sdk(pins)
+        _refuse_user_write(sdk, NEW)
+        _refuse_user_batch(sdk, NEW)
+        eng = _pull_pass([_m(NEW, PERSON)] + leavers, sdk)         # day D: old pin kept
+        assert _pull_delete_idx(sdk, OLD) is None
+        _flipped(sqlite_db, leavers, [_m(NEW, PERSON)])             # day D+1: ten plans end
+        events.clear()
+        sdk2 = _pull_sdk(pins)
+        _refuse_user_write(sdk2, NEW)
+        _refuse_user_batch(sdk2, NEW)
+        _pull_pass([_m(NEW, PERSON)], sdk2, engine=eng)
+        assert not [a for a in _named(events, "REVOKE_ABORTED") if a.get("path") == "stale"]
+        assert all(_pull_delete_idx(sdk2, LEAVER + i) is not None for i in range(10))
+        assert _pull_delete_idx(sdk2, OLD) is None, "the renewed member keeps the old pin"
 
     def test_under_the_ceiling_leavers_first_and_the_hold_after(self, sqlite_db, events):
         leavers = [_m(LEAVER + i, 7000 + i, f"L{i}") for i in range(9)]

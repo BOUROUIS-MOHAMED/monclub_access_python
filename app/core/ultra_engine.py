@@ -3662,7 +3662,8 @@ class UltraDeviceWorker(threading.Thread):
                 kept_holds, _hold_failed, _hold_errored = self._remove_released_holds(
                     holds=renewal_holds, pin_persons=_pin_persons,
                     unconfirmed=unconfirmed_at_start, confirmed_now=_confirmed_now,
-                    touched=pass_touched,
+                    touched=pass_touched, roster_count=len(users),
+                    removed_first=len(getattr(self, "_last_revoke_removed", ()) or ()),
                 )
                 if _hold_failed or _hold_errored:
                     safe_to_prune = False     # as for a failed removal in the step above
@@ -4642,11 +4643,13 @@ class UltraDeviceWorker(threading.Thread):
         RENEWAL HOLDS (P3b-1, plan §7). ``hold_persons``: the userIds whose desired pins are
         not all confirmed on the terminal at the start of the pass (MEMBERSHIP only; the
         caller passes none under ACCOUNT). A departed pin of such a person -- named by
-        member_person_link -- is HELD: counted by the ceiling like any other, but not
-        removed here; the caller removes it after the push once that person's desired pins
-        are confirmed (``_remove_released_holds``). A required pin (an explicit revocation)
-        or a ``hold_exempt`` pin is never held. The held pins are left in
-        ``_last_revoke_holds``; they are neither failures nor a ceiling refusal.
+        member_person_link -- is HELD: not removed here and not counted by this step's
+        ceiling, which judges what this step removes (the real leavers); the caller removes
+        it after the push once that person's desired pins are confirmed, within the same
+        ceiling together with this step's removals (``_remove_released_holds``). A required
+        pin (an explicit revocation) or a ``hold_exempt`` pin is never held. The held pins
+        are left in ``_last_revoke_holds`` (also when the step is refused); they are neither
+        failures nor a ceiling refusal.
 
         Returns True when it is safe to prune per-pin state, False when the pass
         aborted and the state must be kept so a later sync can retry.
@@ -4710,6 +4713,30 @@ class UltraDeviceWorker(threading.Thread):
         if not revoked:
             return True
 
+        # RENEWAL HOLDS (P3b-1) first: they are not removed by this step, so they are not what
+        # its ceiling judges. Counting them let one renewal whose new pin keeps failing push a
+        # later day's leavers over the ceiling -- REVOKE_ABORTED, the ex-members left on the
+        # turnstile -- where base, which had removed the old pin on the first day, removed
+        # them (review R1). The caller removes released holds after the push, within the same
+        # ceiling together with this step's removals.
+        if hold_persons:
+            from app.core.device_sync import renewal_holds
+
+            self._last_revoke_hold_person = renewal_holds(
+                revoked, pending_persons=hold_persons,
+                exempt=required | {str(p).strip() for p in (hold_exempt or ())},
+            )
+            self._last_revoke_holds = set(self._last_revoke_hold_person)
+        if self._last_revoke_holds:
+            logger.info(
+                "%s revoke pass: %d departed pin(s) held until the push confirms their "
+                "person's new pin: %s", self._prefix, len(self._last_revoke_holds),
+                ",".join(sorted(self._last_revoke_holds)[:20]),
+            )
+        revoked = [p for p in revoked if p not in self._last_revoke_holds]
+        if not revoked:
+            return True
+
         # Refuse an implausible bulk revocation rather than strip a gym's worth of
         # members off a turnstile. See _REVOKE_ABSOLUTE_FLOOR for why a fraction on
         # its own is not enough here. The ONE ceiling every removal path shares
@@ -4735,26 +4762,6 @@ class UltraDeviceWorker(threading.Thread):
                 self._prefix, len(revoked), roster_count, ceiling,
             )
             return False
-
-        # RENEWAL HOLDS (P3b-1): counted by the ceiling above, removed by the caller after
-        # the push. Only the rest -- the real leavers -- go now.
-        if hold_persons:
-            from app.core.device_sync import renewal_holds
-
-            self._last_revoke_hold_person = renewal_holds(
-                revoked, pending_persons=hold_persons,
-                exempt=required | {str(p).strip() for p in (hold_exempt or ())},
-            )
-            self._last_revoke_holds = set(self._last_revoke_hold_person)
-        if self._last_revoke_holds:
-            logger.info(
-                "%s revoke pass: %d departed pin(s) held until the push confirms their "
-                "person's new pin: %s", self._prefix, len(self._last_revoke_holds),
-                ",".join(sorted(self._last_revoke_holds)[:20]),
-            )
-        revoked = [p for p in revoked if p not in self._last_revoke_holds]
-        if not revoked:
-            return True
 
         logger.warning(
             "%s revoking %d pin(s) no longer in the roster: %s",
@@ -4818,9 +4825,16 @@ class UltraDeviceWorker(threading.Thread):
         unconfirmed: set[str],
         confirmed_now: set[str],
         touched: set[str],
+        roster_count: int = 0,
+        removed_first: int = 0,
     ) -> tuple[set[str], set[str], bool]:
         """Second half of renewal ordering (P3b-1, plan §7): after the push, remove the
         holds whose person's desired pins are ALL confirmed on the terminal now.
+
+        Within the one removal ceiling: ``removed_first`` (pins the revoke step removed this
+        pass) plus the released holds must fit ``check_bulk_removal`` for ``roster_count``,
+        or every released hold is kept for a later pass (review R1) -- a pass never removes
+        more than the ceiling allows, as when the old pins were removed first.
 
         ``holds``: {held pin: person} from the removal step. ``pin_persons``: {desired pin:
         userId}. ``unconfirmed``: desired pins not confirmed at the start of the pass;
@@ -4854,6 +4868,20 @@ class UltraDeviceWorker(threading.Thread):
                 owned = None
                 errored = True
             released = [p for p in released if owned is not None and p in owned]
+            if released:
+                _verdict = _push_safety.check_bulk_removal(
+                    count=int(removed_first or 0) + len(released), roster_count=roster_count,
+                    path="renewal_release", device_id=self._device_id,
+                    protocol="ZK_STANDALONE", worker=self._tel_wid, sample=released,
+                )
+                if not _verdict.allowed:
+                    logger.warning(
+                        "%s renewal holds: %d released previous pin(s) kept -- with the %d "
+                        "removed first they exceed the removal ceiling (%.0f)", self._prefix,
+                        len(released), int(removed_first or 0), _verdict.ceiling,
+                    )
+                    kept |= set(released)
+                    released = []
             if released:
                 logger.warning(
                     "%s removing %d renewed member(s)' previous pin(s) now that the new pin "
