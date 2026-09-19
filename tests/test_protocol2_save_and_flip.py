@@ -236,6 +236,15 @@ def test_a_v2_answer_with_the_members_section_skipped_keeps_every_list(db):
     assert _token() == "p2.7.a.b"
 
 
+def test_a_skipped_members_section_stores_a_sent_windows_version_and_keeps_it_when_absent(db):
+    _seed_full_v2(db)
+    db.save_sync_cache_delta(_v2([], refresh_members=False, windows_version="p2.7.skip"), NOTHING)
+    assert _token() == "p2.7.skip"
+    out = db.save_sync_cache_delta(_v2([], refresh_members=False, windows_version=None), NOTHING)
+    assert out["protocol2"]["trusted"] is True
+    assert _token() == "p2.7.skip"
+
+
 def test_a_malformed_v2_part_is_rejected_whole_like_a_v1_answer(db, monkeypatch):
     _seed_full_v2(db)
     warned = []
@@ -289,6 +298,21 @@ def test_a_failure_inside_the_v2_step_rolls_back_the_whole_save(db, monkeypatch)
             _v2([_row(8)], delta=True, valid=[1, 2, 5, 8], windows_version="p2.new", meta=later),
             MEMBERS_ONLY,
         )
+    after = (_ids("sync_users"), _windows(), _token(), db.get_access_v2_state()["server_time"])
+    assert after == before
+
+
+def test_a_failure_inside_the_v2_step_of_the_full_replace_save_rolls_the_users_back(db, monkeypatch):
+    db.save_sync_cache(_v2([_row(1), _row(2)]))
+    before = (_ids("sync_users"), _windows(), _token(), db.get_access_v2_state()["server_time"])
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(dbmod, "_replace_member_access_windows", _boom)
+    later = _meta(server_time="2026-09-19T12:00:00.000+01:00")
+    with pytest.raises(RuntimeError, match="disk full"):
+        db.save_sync_cache(_v2([_row(8)], windows_version="p2.new", meta=later))
     after = (_ids("sync_users"), _windows(), _token(), db.get_access_v2_state()["server_time"])
     assert after == before
 
@@ -544,6 +568,40 @@ def test_the_generation_moves_only_when_something_moved(db):
     gen = db.get_local_state_generation()
     r = _flip(db, "2026-09-20T15:00:00+01:00")
     assert r["moved"] == 0
+    assert db.get_local_state_generation() == gen
+
+
+def test_a_flip_that_moves_expires_the_sync_cache_and_one_that_does_not_leaves_it(db, monkeypatch):
+    _seed_full_v2(db)
+    calls = []
+    original = dbmod.invalidate_sync_cache
+
+    def _spy(*a, **k):
+        calls.append((a, k))
+        return original(*a, **k)
+
+    monkeypatch.setattr(dbmod, "invalidate_sync_cache", _spy)
+    assert _flip(db, "2026-09-20T07:30:00+01:00")["moved"] == 3
+    assert len(calls) == 1
+    assert _flip(db, "2026-09-20T15:00:00+01:00")["moved"] == 0
+    assert len(calls) == 1
+
+
+def test_a_failure_inside_the_flip_moves_nothing_and_persists_nothing(db, monkeypatch):
+    # One write job: the holds already written and the state update roll back with the failed
+    # promotion.
+    _seed_full_v2(db)
+    gen = db.get_local_state_generation()
+    state_before = db.get_access_v2_state()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(dbmod, "_upsert_sync_user_row", _boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        _flip(db, "2026-09-20T07:30:00+01:00")
+    assert _ids("sync_users") == {1, 2, 5} and _ids("sync_users_held") == set()
+    assert db.get_access_v2_state() == state_before
     assert db.get_local_state_generation() == gen
 
 
