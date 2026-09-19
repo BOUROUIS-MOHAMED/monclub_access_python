@@ -38,6 +38,10 @@ def test_r5_03_a_restored_member_is_accepted_at_once(monkeypatch, fstate):
     """R4-11 kept the removed member's roster exclusion after a failed pass; a membership
     restored meanwhile was then refused and could stay off the terminal."""
     drv, w, cache = _removed_in_a_failed_pass(monkeypatch, fstate)
+    # The restored membership is back in the database (the targeted read and, since
+    # round 6, the guard's one-query read both go through this function).
+    monkeypatch.setattr(dbmod, "list_sync_users_by_active_membership_ids",
+                        lambda ids: [_user(34439, "Back", "9")] if 34439 in set(ids) else [])
     monkeypatch.setattr(w, "_member_row_in_db", lambda m: [_user(34439, "Back", "9")])
     assert w.request_member_sync(34439) is True
     cache.users.append(_user(34439, "Back", "9"))       # the cache has caught up
@@ -120,9 +124,12 @@ def test_r5_07_the_connection_refresh_decides_queued_scans_first(db, monkeypatch
     assert seen == [evt], "the 30-min refresh dropped a queued scan undecided"
 
 
-def test_r5_01_an_owned_pin_missing_from_the_terminal_is_flagged_for_a_push(db, monkeypatch):
-    """One owned pin absent from the listing blocked every intent drop for good (R4-06
-    gate); it is a member MonClub believes is on the terminal and is not -- re-push it."""
+def test_r5_01_an_owned_pin_missing_from_the_terminal_is_reported(db, monkeypatch):
+    """One owned pin absent from the listing blocks every intent drop (R4-06 gate). Round 5
+    flagged it for a re-push; round 6 withdrew that (R6-02/03/04, loss detection is out of
+    scope): it is REPORTED, and changes nothing -- see test_review_round6."""
+    events = []
+    monkeypatch.setattr(ue._tel, "event", lambda name, **kw: events.append((name, kw)))
     term = TerminalZkem()
     drv = _make_driver(term)
     w, _c = _worker(monkeypatch, driver=drv, users=[])
@@ -137,5 +144,7 @@ def test_r5_01_an_owned_pin_missing_from_the_terminal_is_flagged_for_a_push(db, 
     finally:
         drv.disconnect()
     state = db.list_device_sync_hashes_and_status(device_id=9)
-    assert state["30002"][1] is False, "not on the terminal: must be pushed again"
+    assert state["30002"][1] is True, "reported only: no state change"
+    [readback] = [kw for name, kw in events if name == "PUSH_INTENT_READBACK"]
+    assert readback["missing_owned"] == 1 and readback["dropped"] == 0
     assert "30099" in db.list_push_intents(device_id=9), "still no drop on an incomplete listing"

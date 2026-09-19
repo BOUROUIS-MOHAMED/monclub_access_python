@@ -1325,7 +1325,7 @@ settled by reading the terminal:
 | anything else | intent kept, `readback_misses+1`, never deleted |
 | listing failed | nothing changes |
 | a listing that shows NONE of the pins MonClub owns on that terminal (MB2000; e.g. a wrong out-param order putting names in the pin field) | not trusted: nothing changes, `PUSH_INTENT_READBACK ok=False reason=no_owned_pin_listed` (review R3-20); the same when MonClub's ownership state cannot be read (R4-04) |
-| a listing that misses ANY pin MonClub owns (MB2000; e.g. an enumeration cut short, which the driver cannot tell from its end) | promotions and misses still count, but nothing is DROPPED: absence from an incomplete listing is not proof the write never landed (review R4-06); the missing owned pins are flagged NOT in sync so the next pass pushes them again — a member MonClub believes is on the terminal and is not, or at worst one idempotent re-push (R5-01, `missing_owned=`). Residual: a listing cut off after the last owned pin, or one on a terminal where MonClub owns no pin, still reads as complete (R5-02) |
+| a listing that misses ANY pin MonClub owns (MB2000; e.g. an enumeration cut short, which the driver cannot tell from its end) | promotions and misses still count, but nothing is DROPPED: absence from an incomplete listing is not proof the write never landed (review R4-06); the missing owned pins are REPORTED only (`missing_owned=`, a WARNING log line), nothing changes — round 5 flagged them for a re-push, which after a cut-short listing re-pushed most of the roster and reset the retry clock of pins in backoff (R6-02, R6-03), and re-adding members another system removed is loss detection, outside P3a-2 (§7, R5-01). Residual: a listing cut off after the last owned pin, or one on a terminal where MonClub owns no pin, still reads as complete (R5-02) |
 
 MB2000 (`_promote_intents_by_readback`): one `list_device_users` (a whole-terminal enumeration in ONE
 STA command — no RTLog pump, no door service for its duration; ~1,860 users on gym 45, duration
@@ -1402,9 +1402,17 @@ even after a restored membership (R3-14). Its roster exclusion is released with 
 (round 4) refused a membership restored meanwhile, and the next successful pass then left that paying
 member off the terminal while reporting the roster in sync (R5-03). What the exclusion protected against —
 a capped continuation built from a stale cache pushing the departed member back (R4-11) — is covered by a
-database guard instead: for `_REMOVED_MEMBER_GUARD_SEC` = 10 min after the removal step removed a revoked
-member, every pass excludes them if their row is gone from the database (a primary-key read; an unreadable
-row counts as gone), and a restored member is pushed normally. A pass re-queued because the link is dead
+database guard instead: for `_REMOVED_MEMBER_GUARD_SEC` = 10 min after MonClub removed a revoked member —
+by the removal step, or by the targeted revoke (the usual route, R6-05) — every pass excludes them if their
+row is gone from the database, and a restored member is pushed normally. The check is ONE query per pass for
+all guarded members (R6-07): a scan of `sync_users`, whose indexes cannot serve `active_membership_id` alone
+(`EXPLAIN QUERY PLAN`: `SCAN sync_users`). Measured on this development PC, synthetic 2,000-row table:
+median 0.2–0.5 ms for 1–10 guarded members, 3.3 ms (rows without fingers/photo) to 16 ms (2 fingers + a
+22 KB photo per row) for 225, the removal ceiling on a 900-member roster; `[UNVERIFIED]` on the gym PCs.
+Nothing is measured before P3a-2: the guard is new. If the read fails, the pass does nothing and fails, so
+the scheduler retries it: excluding on doubt could DELETE a restored member (the removal step takes owned
+pins missing from the roster) and report the roster in sync; trusting the cache could re-enrol a departed
+one (R6-06). `[TEST: test_review_round6.py]` A pass re-queued because the link is dead
 reports nothing to the removal retry (R5-04). `[TEST: test_review_round5.py]` `[TEST: test_review_round3.py]` Load note: on PullSDK every
 retry pass also re-writes the door parameters (`DoorNDrivertime`, `DoorNIntertime`/anti-passback), like
 any full pass (R3-09).
@@ -1621,7 +1629,9 @@ round 4: aged from the wrong clock it could open the door a minute after the sca
 dropped terminal-decided scans from the history (R4-01/07/08/09). EVERY queued scan is decided, not only
 the first 64 (R5-06), and so are the scans queued when the 30-min connection refresh or a sync hand-off
 tears the driver down (`_decide_queued_events`, R5-07 — those teardowns used to drop them undecided,
-before P3a-2 too). A full-sync pass is not run on a link the driver reports dead — it waits, queued, for
+before P3a-2 too), including the ones the STA thread's last event pump queues while it stops:
+`disconnect()` sets its stop flag and joins it, and the thread pumps once more before it looks at the flag
+(`_close_link_deciding_scans`, R6-01; those get their history row and popup, the door is closed by then). A full-sync pass is not run on a link the driver reports dead — it waits, queued, for
 the reconnect (R4-10). The first loss reconnects at once; a loss within `_LINK_STABLE_SEC` = 60 s
 after the reconnect that followed the PREVIOUS loss waits 2, 4, 8 … s up to the connect backoff cap, so
 a flapping terminal is not a connect loop (R2-12) — measured from that loss, so a routine 30-min refresh
@@ -2241,6 +2251,20 @@ as soon as that user row lands (§3.4), so a departure deletes the whole user; t
 list devices 8/10's users (`GET /api/v2/devices/{id}/users`) and compare the other system's pins
 with MonClub's membership ids before relying on removals there.
 
+Round 6 left two things as they are. **A MonClub member deleted from a shared MB2000 by another system
+stays off it** — MonClub still believes the pin is its own and in sync, so no pass pushes it; base behaved
+the same. The daily read-back now REPORTS such pins (`PUSH_INTENT_READBACK missing_owned=N`, a WARNING
+line) but re-adding them is loss detection, outside P3a-2 (round 5 flagged them for a re-push; withdrawn, R6-02/03/04).
+While one exists the listing never looks complete, so no departed intent is dropped and the read-back runs
+every day — one whole-terminal listing, a single STA command during which no door command is served, of
+`[UNVERIFIED]` duration (R5-01; FIELD-TEST at gym 45: `grep -F "[T] PUSH_INTENT_READBACK"` — `dur_ms` is the
+door-blind time, `missing_owned` the members to check on the terminal). **On a C3-400 (gym 58)** a
+revoked member deleted by a full pass that then fails keeps a RETRY roster exclusion until a pass succeeds,
+so a membership restored meanwhile is refused by the targeted sync and left out of that pass (R6-08). This
+is base behaviour on the PullSDK path, unchanged by P3a-2 (the MB2000 path releases it, R5-03); not
+reproduced here — the step not traced is what the scheduler's `_sync_device` fallback pushes for that
+member meanwhile. FIELD-TEST at gym 58: after a restored membership, check the member opens the door.
+
 From P3a-2 (§3.4e), measured only on a fake terminal: whether the MB2000 hands over at a chunk's
 end the events of scans made during it; the duration of `RefreshData(1)` (what a smaller chunk
 would cost); the per-pin duration of the whole-user delete (`ZKEM_DELETE_DONE dur_ms`); the gym
@@ -2295,8 +2319,8 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2103 passed** (2026-09-19,
-branch `claude/p3a2-push-engine`, P3a-2 push engine + five adversarial review rounds; both this
+background-thread exceptions are promoted to failures. Last run: **2109 passed** (2026-09-19,
+branch `claude/p3a2-push-engine`, P3a-2 push engine + six adversarial review rounds; both this
 command and the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv`
 Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). Its base
 `d09f88f` (1924 tests) measured 1922–1923 passed, 1–2 failed in repeated runs: the two known flaky
@@ -2451,7 +2475,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `FINGER_SWEEP` | `ultra_engine.py` | `worker pin source ok op cleared empty raised dur_ms` (`source` ∈ `targeted`, `daily`; `cleared` = slots that held a template, `empty` = already empty; §3.4c) |
 | `REMOVAL_RETRY_SCHEDULED` | `ultra_engine.py` | `worker pins delay_s streak errored parked` (warn; a removal failed — the worker re-requests a pass after `delay_s` ≤ 300; `parked=True`: a pending removal this pass could not attempt, re-checked after 1800 s, §3.4b) |
 | `PUSH_INTENT_FAILED` | `ultra_engine.py` | `worker pins err` (warn; the write-ahead intent could not be recorded — nothing was written that pass, §3.4a) |
-| `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms reason missing_owned` (§3.4a; `missing_owned` = owned pins absent from the listing, flagged for a push; `ok=False` = the listing failed or was not trusted, nothing changed; `reason=no_owned_pin_listed` when it showed none of MonClub's pins) |
+| `PUSH_INTENT_READBACK` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id protocol ok candidates listed promoted dropped mismatched dur_ms reason missing_owned` (§3.4a; `missing_owned` = owned pins absent from the listing, reported only — nothing is re-pushed (R6-02); `ok=False` = the listing failed or was not trusted, nothing changed; `reason=no_owned_pin_listed` when it showed none of MonClub's pins) |
 | `MEMBER_REVOKE_SKIPPED_NOT_OWNED` | `ultra_engine.py`, `device_sync.py` | `worker`/`device_id member_id pin protocol` (+ `row` on the full sync, `pin_scheme source` on PullSDK) (warn; P3a-2 — FINAL: MonClub cannot prove it wrote that pin, nothing deleted, revocation finished, §3.4). Replaces `MEMBER_REVOKE_OWNERSHIP_MISSING`, which is no longer emitted |
 | `MEMBER_REVOKE_PIN_UNKNOWN` | `ultra_engine.py` | `member_id` (warn; pinScheme=ACCOUNT, the person's pin cannot be named — nothing removed, §3.2b) |
 | `MIRROR_SKIP_NOT_FULL_RECONCILE` | `ultra_engine.py` | `worker` (was `MIRROR_SKIP_REASON`; see §3.2c) |

@@ -359,8 +359,11 @@ for members who have since left: `promoted=` were found on the terminal exactly 
 will be removed; `dropped=` never reached it; `mismatched=` hold a different user and are left alone.
 `ok=False` means the terminal listing failed, or was not trusted (`reason=no_owned_pin_listed`: it showed none
 of MonClub's own members), and nothing changed. A listing that misses any of MonClub's members still
-promotes exact matches but drops nothing, and those missing members (`missing_owned=N`) are pushed
-again at the next sync — MonClub thought they were on the terminal and they were not.
+promotes exact matches but drops nothing. `missing_owned=N` counts MonClub members that are NOT on the
+terminal although MonClub thinks they are (deleted there by another system, or the listing was cut
+short; the WARNING line just before names up to 20 pins). MonClub does not push them back by itself:
+check those pins on the terminal and report them to support. While any exist, this check runs every
+day; `dur_ms` is how long the door waited for it.
 
 **Was a removal refused as too large?** (P3a-2, both SDKs)
 

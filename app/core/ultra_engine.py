@@ -232,14 +232,15 @@ _REMOVAL_RETRY_PARKED_SEC = 1800.0
 # reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
 # stable link reconnects at once -- that is the door path.
 _LINK_STABLE_SEC = 60.0
-# For this long after the removal step removed an explicitly revoked member, every pass
-# checks the DATABASE (primary-key read) before trusting the sync cache about that member:
-# gone there -> excluded from the pass, so a stale cache snapshot (a background load taken
-# before the revocation committed) cannot push them back (review R4-11, R5-03). A restored
-# membership is present again and is pushed normally. 10 min: the cache's TTL is 5 s and a
-# whole load was measured at ~7 s on the live worker (the _member_row_in_db docstring);
-# the guard only ever excludes members the database no longer has, so a long window costs
-# nothing but a few point reads.
+# For this long after MonClub removed an explicitly revoked member from the terminal (the
+# full sync's removal step, or the targeted revoke -- review R6-05), every pass checks the
+# DATABASE before trusting the sync cache about that member: gone there -> excluded from
+# the pass, so a stale cache snapshot (a background load taken before the revocation
+# committed) cannot push them back (review R4-11, R5-03). A restored membership is present
+# again and is pushed normally. 10 min: the cache's TTL is 5 s and a whole load was
+# measured at ~7 s on the live worker (the _member_row_in_db docstring). The check is ONE
+# query per pass for every guarded member together -- a scan of sync_users, whose indexes
+# cannot serve active_membership_id alone (review R6-07); see guide §3.4b for its cost.
 _REMOVED_MEMBER_GUARD_SEC = 600.0
 
 # P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
@@ -733,8 +734,7 @@ class UltraDeviceWorker(threading.Thread):
                         logger.info(
                             f"{self._prefix} sync pause requested — disconnecting for TCP handoff"
                         )
-                        self._decide_queued_events()   # not lost with the driver (R5-07)
-                        self._disconnect()
+                        self._close_link_deciding_scans()   # none lost (R5-07, R6-01)
                     _tel.set_state(self._tel_wid, "sync_handoff_paused")
                     _tel.event("SYNC_HANDOFF_PAUSE_ACK", worker=self._tel_wid)
                     self._sync_paused_ack.set()
@@ -1080,6 +1080,7 @@ class UltraDeviceWorker(threading.Thread):
         _tel.warn("WORKER_LINK_LOST", worker=self._tel_wid, streak=streak,
                   delay_s=round(delay) or None)
         self._disconnect()
+        self._decide_queued_events(sdk=sdk)   # what its STA thread queued on the way out (R6-01)
         # A link that dies right after every reconnect must not become a connect loop
         # (review R2-12): each flap doubles the wait, the first loss reconnects at once.
         self._next_connect_at_mono = now + delay
@@ -1090,12 +1091,13 @@ class UltraDeviceWorker(threading.Thread):
             self._connect_down_since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         return True
 
-    def _decide_queued_events(self) -> int:
+    def _decide_queued_events(self, sdk: Any = None) -> int:
         """Before tearing a push driver down, decide EVERY scan already in its queue
         (history, popup, a rescue if the link still works) -- the driver and its queue are
         discarded with it. Not only the first 64 (review R5-06); used by the link-loss,
-        connection-refresh and sync-pause teardowns (R5-07). A queue drain, no COM call."""
-        sdk = self._sdk
+        connection-refresh and sync-pause teardowns (R5-07). A queue drain, no COM call.
+        ``sdk``: a driver already closed (default: the current one) -- see R6-01."""
+        sdk = self._sdk if sdk is None else sdk
         if sdk is None or not getattr(sdk, "owns_event_source", False):
             return 0
         decided = 0
@@ -1115,6 +1117,19 @@ class UltraDeviceWorker(threading.Thread):
                 decided += 1
         return decided
 
+    def _close_link_deciding_scans(self) -> None:
+        """Close the connection without losing a scan: decide the push driver's queue
+        while the link still works (a rescue can still open the door), close it, then
+        decide what its STA thread queued on the way out. disconnect() only SETS the
+        thread's stop flag and joins it, and the thread runs one more event pump before it
+        looks at that flag: scans from that pump were discarded with the driver (review
+        R6-01). Those get their history row and popup; the door is closed by then."""
+        old = self._sdk
+        self._decide_queued_events()
+        self._disconnect()
+        if old is not None:
+            self._decide_queued_events(sdk=old)
+
     def _maybe_refresh_connection(self) -> bool:
         """The persistent connection's slow safety refresh (see the run loop). True when
         the connection was closed. Queued scans are decided first (review R5-07)."""
@@ -1129,8 +1144,7 @@ class UltraDeviceWorker(threading.Thread):
         _age = time.monotonic() - self._connected_since_mono
         logger.info("%s persistent connection: safety refresh after %.0fs", self._prefix, _age)
         _tel.event("CONN_REFRESH", worker=self._tel_wid, age_s=round(_age))
-        self._decide_queued_events()
-        self._disconnect()
+        self._close_link_deciding_scans()
         self._empty_polls_since_event = 0
         return True
 
@@ -1881,6 +1895,9 @@ class UltraDeviceWorker(threading.Thread):
                     if is_revocation:
                         revoke_ok = self._run_standalone_member_revoke(member_id)
                         if revoke_ok:
+                            # A capped continuation may still read a snapshot that
+                            # predates this revocation (review R6-05).
+                            self._arm_removed_member_guard([member_id])
                             self._finalize_targeted_member_revoke(member_id, ok=True)
                         else:
                             self._finalize_targeted_member_revoke(member_id, ok=False)
@@ -3088,22 +3105,17 @@ class UltraDeviceWorker(threading.Thread):
                           candidates=len(cands), dur_ms=dur_ms, reason="no_owned_pin_listed")
                 return None
         if on_device and missing_owned and (owned_now & set(on_device)):
-            # A pin MonClub believes it wrote is not on the terminal (deleted by someone
-            # else, or the listing was cut short): flag it NOT in sync so the next pass
-            # pushes it again -- a member who cannot enter, or at worst one idempotent
-            # re-push. Otherwise one such pin blocked every intent drop, and so the daily
-            # enumeration, for good (review R5-01). The empty hash is a deferral: no
-            # retry-backoff penalty.
-            try:
-                from app.core.db import save_device_sync_state_batch
-                save_device_sync_state_batch(device_id=self._device_id, rows=[
-                    (p, "", False, "absent from the terminal listing", None) for p in missing_owned])
-            except Exception:
-                logger.warning("%s intent read-back: absent owned pins not flagged", self._prefix,
-                               exc_info=True)
+            # A pin MonClub believes it wrote is not in the listing: deleted on the terminal
+            # by someone else, or the listing was cut short -- the two cannot be told apart
+            # here. REPORTED ONLY. Flagging them for a push (round 5) re-pushed most of the
+            # roster after a cut-short listing and reset the retry clock of pins in backoff
+            # (review R6-02, R6-03); re-adding members another system removed is loss
+            # detection, outside P3a-2. While such a pin exists the listing is incomplete,
+            # so no intent is dropped and the read-back runs again the next day (R5-01,
+            # guide §7).
             logger.warning("%s intent read-back: %d owned pin(s) absent from the terminal "
-                           "listing -- flagged for a push (%s)", self._prefix, len(missing_owned),
-                           ",".join(missing_owned[:20]))
+                           "listing -- reported only, nothing changed (%s)", self._prefix,
+                           len(missing_owned), ",".join(missing_owned[:20]))
         promoted: list[str] = []
         dropped: list[str] = []
         mismatched: list[str] = []
@@ -3249,8 +3261,37 @@ class UltraDeviceWorker(threading.Thread):
                     revoked_ids=normalized_revoked_ids,
                 )
                 return
+        _guarded_gone = self._recently_removed_still_gone()
+        if _guarded_gone is None:
+            # The database could not say whether recently removed members are still gone.
+            # Excluding them could DELETE a restored paying member (the removal step takes
+            # owned pins missing from the roster) and report the roster in sync; trusting
+            # the cache could re-enrol a departed one. Neither: this pass does nothing and
+            # fails, so the scheduler retries it (review R6-06).
+            error = "recently removed members unreadable"
+            logger.warning("%s standalone full sync skipped: %s", self._prefix, error)
+            self._mark_full_sync_finished(
+                reason=reason,
+                ok=False,
+                duration_ms=0.0,
+                error=error,
+            )
+            self._finalize_full_sync_revokes(
+                normalized_revoked_ids,
+                ok=False,
+                excluded_ids=normalized_excluded_ids,
+            )
+            self._notify_full_sync_finished(
+                reason=reason,
+                ok=False,
+                fingerprint_hash=None,
+                duration_ms=0.0,
+                error=error,
+                revoked_ids=normalized_revoked_ids,
+            )
+            return
         cache = _sync_cache_without_revoked_ids(
-            cache, normalized_excluded_ids | self._recently_removed_still_gone(),
+            cache, normalized_excluded_ids | _guarded_gone,
         )
 
         self._mark_full_sync_started(reason=reason, engine=None, started_at=started_iso)
@@ -3663,11 +3704,7 @@ class UltraDeviceWorker(threading.Thread):
         if removed_revokes:
             # A stale cache snapshot must not push them back: the next passes check the
             # database for these members for _REMOVED_MEMBER_GUARD_SEC (review R4-11).
-            _guard = getattr(self, "_recent_removed_members", None)
-            if _guard is None:
-                _guard = self._recent_removed_members = {}
-            for _m in removed_revokes:
-                _guard[int(_m)] = time.monotonic()
+            self._arm_removed_member_guard(removed_revokes)
         if not sync_ok and removed_revokes:
             # Their physical revoke is DONE (removals run first): release the revocation and
             # its roster exclusion now. Left ACTIVE they excluded the member from every later
@@ -3704,26 +3741,47 @@ class UltraDeviceWorker(threading.Thread):
             self.request_full_sync(reason="push-capped", fingerprint_hash=fingerprint_hash,
                                    full_reconcile=full_reconcile)
 
-    def _recently_removed_still_gone(self) -> set[int]:
-        """Members the removal step removed within _REMOVED_MEMBER_GUARD_SEC that the
-        DATABASE still does not have: excluded from this pass, whatever the (possibly stale)
-        cache says (review R4-11). A member present again (a restored membership) leaves the
-        guard. An unreadable row counts as gone (never re-push on doubt)."""
+    def _arm_removed_member_guard(self, member_ids) -> None:
+        """MonClub just removed these members' pins: for _REMOVED_MEMBER_GUARD_SEC the
+        passes check the database before a (possibly stale) cache may push them back."""
+        guard = getattr(self, "_recent_removed_members", None)
+        if guard is None:
+            guard = self._recent_removed_members = {}
+        now = time.monotonic()
+        for member_id in member_ids or ():
+            guard[int(member_id)] = now
+
+    def _recently_removed_still_gone(self) -> set[int] | None:
+        """Members MonClub removed within _REMOVED_MEMBER_GUARD_SEC that the DATABASE still
+        does not have: excluded from this pass, whatever the (possibly stale) cache says
+        (review R4-11). A member present again (a restored membership) leaves the guard.
+        ONE query for all of them (review R6-07). None = the read failed: the caller must
+        not decide either way (review R6-06)."""
         guard = getattr(self, "_recent_removed_members", None) or {}
         if not guard:
             return set()
         now = time.monotonic()
-        out: set[int] = set()
         for member_id, at in list(guard.items()):
             if now - float(at) > _REMOVED_MEMBER_GUARD_SEC:
                 guard.pop(member_id, None)
+        if not guard:
+            return set()
+        try:
+            from app.core.db import list_sync_users_by_active_membership_ids
+            rows = list_sync_users_by_active_membership_ids(sorted(guard)) or []
+        except Exception:
+            logger.warning("%s recently removed members: database read failed", self._prefix,
+                           exc_info=True)
+            return None
+        present: set[int] = set()
+        for row in rows:
+            try:
+                present.add(int(row.get("activeMembershipId")))
+            except (TypeError, ValueError, AttributeError):
                 continue
-            rows = self._member_row_in_db(member_id)
-            if rows:
-                guard.pop(member_id, None)
-                continue
-            out.add(int(member_id))
-        return out
+        for member_id in present:
+            guard.pop(member_id, None)
+        return {int(m) for m in guard}
 
     def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> None:
         """Drop explicit revocations of pins MonClub cannot prove it owns (FINAL).
@@ -3756,7 +3814,9 @@ class UltraDeviceWorker(threading.Thread):
         Deliberately NOT the process-wide sync cache. That snapshot is shared, has a
         5 s TTL, is served STALE while a background refresh runs, and a full scan of
         it cost 7 s on the live worker in the field. For a decision about ONE member
-        it is both slower and less truthful than an indexed lookup.
+        it is both slower and less truthful than this direct read -- which is itself a
+        scan of sync_users, NOT an indexed lookup: no index serves active_membership_id
+        alone (EXPLAIN QUERY PLAN; P3a-2 review R6-07, guide §3.4b for its measured cost).
         """
         try:
             from app.core.db import list_sync_users_by_active_membership_ids
@@ -3821,7 +3881,8 @@ class UltraDeviceWorker(threading.Thread):
         # WHY the roster was empty, not just THAT it was. Reading the field log of
         # 2026-09-06 there was no way to tell "the row was deleted" from "a filter
         # rejected it" -- two completely different bugs behind one message. It cost
-        # hours. in_db is that discriminator, and it is one indexed lookup:
+        # hours. in_db is that discriminator, and it is one read of sync_users (a table
+        # scan, not an indexed lookup -- see _member_row_in_db):
         #   in_db=False -> the sync_users row is GONE (the signature of the backend
         #                  emitting an ACTIVE_MEMBERSHIP delete for a credential
         #                  deletion, fixed in monclub_backend a933338d)
