@@ -250,7 +250,7 @@ class OwnState:
 @dataclass
 class AccessDb:
     rows: List[MonClubRow]
-    ownership: Dict[int, Dict[str, OwnState]]
+    ownership: Optional[Dict[int, Dict[str, OwnState]]]  # None: this client version records none
     intents: Dict[int, Set[str]]
     pin_scheme: Dict[int, Optional[str]]
     rows_without_account: int
@@ -316,14 +316,18 @@ def load_access_db(path: str) -> AccessDb:
                 cards={c for c in (norm_card(c1), norm_card(c2)) if c},
                 templates=templates,
             ))
-        ownership: Dict[int, Dict[str, OwnState]] = defaultdict(dict)
+        # A client older than the ownership bit (ownership_confirmed) records none: that is
+        # "unknown", never "nobody owns anything".
+        ownership: Optional[Dict[int, Dict[str, OwnState]]] = None
         dcols = _columns(conn, "device_sync_state")
-        oc = "ownership_confirmed" if "ownership_confirmed" in dcols else "0"
-        pf = "pushed_finger_ids" if "pushed_finger_ids" in dcols else "NULL"
-        for dev, pin, owned, pushed, last_ok in conn.execute(
-            f"SELECT device_id, pin, {oc}, {pf}, last_ok FROM device_sync_state"
-        ):
-            ownership[int(dev)][str(pin)] = OwnState(bool(owned), pushed, bool(last_ok))
+        if "ownership_confirmed" in dcols:
+            ownership = defaultdict(dict)
+            pf = "pushed_finger_ids" if "pushed_finger_ids" in dcols else "NULL"
+            for dev, pin, owned, pushed, last_ok in conn.execute(
+                f"SELECT device_id, pin, ownership_confirmed, {pf}, last_ok FROM device_sync_state"
+            ):
+                ownership[int(dev)][str(pin)] = OwnState(bool(owned), pushed, bool(last_ok))
+            ownership = dict(ownership)
         intents: Dict[int, Set[str]] = defaultdict(set)
         if "device_id" in _columns(conn, "device_push_intent"):
             for dev, pin in conn.execute("SELECT device_id, pin FROM device_push_intent"):
@@ -333,7 +337,7 @@ def load_access_db(path: str) -> AccessDb:
             for dev, scheme in conn.execute("SELECT id, pin_scheme FROM sync_devices"):
                 if dev is not None:
                     pin_scheme[int(dev)] = scheme
-        return AccessDb(rows, dict(ownership), dict(intents), pin_scheme, without_account)
+        return AccessDb(rows, ownership, dict(intents), pin_scheme, without_account)
     finally:
         conn.close()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -790,7 +794,8 @@ def analyse(
     if access is None and backend is None:
         report["notes"].append("no --access-db and no backend: members and finger coverage are not evaluated")
     if ownership is None and (access is not None or backend is not None):
-        report["notes"].append("ownership unknown (no --access-db): members are not split into owned / not owned")
+        report["notes"].append("ownership unknown (no --access-db, or a client version that records none): "
+                               "members are not split into owned / not owned")
     if ppl["rows_without_main_account"] and scheme == "ACCOUNT":
         report["notes"].append(
             f"{ppl['rows_without_main_account']} delivered rows have no main_account_id: under ACCOUNT they are withheld"

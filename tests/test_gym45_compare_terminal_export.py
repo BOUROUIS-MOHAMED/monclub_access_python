@@ -208,6 +208,25 @@ class TestAccessDbIsReadOnly:
         conn.commit(); conn.close()
         acc = cte.load_access_db(str(db))
         assert acc.rows[0].main_account_id is None and acc.rows_without_account == 1
+        assert acc.ownership is None, "no ownership column means unknown, not 'nobody owns'"
+
+    def test_an_old_client_database_classifies_members_without_an_ownership_split(self, tmp_path):
+        db = tmp_path / "old.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            "CREATE TABLE sync_users (user_id INTEGER, active_membership_id INTEGER, full_name TEXT,"
+            " first_card_id TEXT, second_card_id TEXT, fingerprints_json TEXT);"
+            "CREATE TABLE device_sync_state (device_id INTEGER, pin TEXT, desired_hash TEXT, last_ok INTEGER,"
+            " last_error TEXT, updated_at TEXT);"
+            "CREATE TABLE device_push_intent (x INTEGER); CREATE TABLE sync_devices (id INTEGER);"
+            "INSERT INTO sync_users VALUES (1, 11, 'A', '', '', '[]');"
+            "INSERT INTO device_sync_state VALUES (8, '11', 'h', 1, NULL, 'x');"
+        )
+        conn.commit(); conn.close()
+        ex = _export(tmp_path / "t.json", [_u("11"), _u("5000")])
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
+        assert report["ownership_known"] is False
+        assert report["devices"]["8"]["classes"] == {"leftover": 1, "member": 1}
 
 
 class TestClassification:
