@@ -311,8 +311,14 @@ class TestQrDateVerdict:
     def test_a_windowless_roster_row_opens(self):
         assert ad.qr_date_verdict(_snap(), grants=[5], users_by_am={5: {}}) == "ok"
 
-    def test_a_stale_grant_with_no_window_and_no_roster_row_does_not_open(self):
-        assert ad.qr_date_verdict(_snap(), grants=[5], users_by_am={9: {}}) == "not_today"
+    def test_a_grant_with_no_window_and_no_roster_row_is_left_to_the_roster_check(self):
+        # Review R2 (inverts the part-D rule): no stored window = no date the PC knows.
+        assert ad.qr_date_verdict(_snap(), grants=[5], users_by_am={9: {}}) == "unchecked"
+
+    def test_a_windowed_grant_still_refuses_beside_a_windowless_one_that_is_listed(self):
+        s = _snap(windows={1: _w(until="2026-09-19")})
+        assert ad.qr_date_verdict(s, grants=[1, 5], users_by_am={5: {}}) == "ok"
+        assert ad.qr_date_verdict(s, grants=[1], users_by_am={5: {}}) == "not_today"
 
     def test_a_renewal_with_stale_grants_opens_by_account(self):
         s = _snap(windows={1: _w(until="2026-09-19")})

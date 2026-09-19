@@ -464,9 +464,12 @@ def qr_date_verdict(
     ``ok``: a grant is deliverable today by its window, or a grant is on the (date-flipped)
     roster with no window (a fast patch, a v1 row), or the account second chance found a roster
     row of the same account (a renewal whose grants are stale). ``not_today``: every grant is
-    provably not deliverable today -- by its window, or by having no window and no row on a
-    CURRENT, non-empty roster. ``unchecked``: no trusted windows, or a grant with no window when
-    the roster cannot be read or is older than the credential index -- nothing can be proven.
+    provably not deliverable today BY ITS WINDOW. ``unchecked``: no trusted windows, or a grant
+    with no window and no roster row -- the PC knows no date for it, and whether such a code may
+    open is the roster check's question (its trial/enforce switch), not this one's. The first
+    version called that last case ``not_today`` on a current list, which refused in trial mode a
+    renewing member whose stored grants are stale (review R2). ``roster_current`` is kept for the
+    callers; it no longer changes the answer.
     """
     if snapshot is None or not snapshot.active:
         return "unchecked"
@@ -482,7 +485,7 @@ def qr_date_verdict(
             unknown = True
     if account_on_roster:
         return "ok"
-    if unknown and (not users_by_am or not roster_current):
+    if unknown:
         return "unchecked"
     return "not_today"
 

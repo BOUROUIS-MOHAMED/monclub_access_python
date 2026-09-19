@@ -167,16 +167,19 @@ def test_a_stale_grant_of_a_renewed_member_opens_by_account(world, mode):
     assert r["activeMembershipId"] == 606 and r["user"] is None      # unchanged allow
 
 
-def test_a_code_in_neither_the_windows_nor_the_list_is_refused_in_trial(world):
-    # Trusted windows cover today's whole set: a grant with no window and no row is not
-    # deliverable today. This is the one case where a trial-mode roster verdict
-    # (not_in_roster, allowed) becomes a refusal -- by the date check, not the roster.
+def test_a_code_in_neither_the_windows_nor_the_list_is_the_roster_checks_question(world):
+    # Review R2 (inverts the part-D rule): a grant with no stored window and no row carries no
+    # date the PC knows. Refusing it by date turned trial mode into enforce for exactly the
+    # members the roster trial counts -- e.g. a renewal whose stored grants are stale.
     c, creds, users, snap = world
-    s = _settings()
     now = time.time()
+    s = _settings()
     r = _check(_code_for(c["stale"], s, now), s, creds, users, now, snap)
-    assert r["allowed"] is False and r["reason"] == "DENY_NOT_ALLOWED_TODAY"
-    assert r["rosterCheck"] == av.ROSTER_NOT_IN
+    assert r["allowed"] is True and r["rosterCheck"] == av.ROSTER_NOT_IN
+    assert r["dateCheck"] == "unchecked"
+    s = _settings(totp_roster_check_mode="enforce")
+    r = _check(_code_for(c["stale"], s, now), s, creds, users, now, snap)
+    assert r["allowed"] is False and r["reason"] == "DENY_NOT_IN_LOCAL_ROSTER"
 
 
 def test_an_empty_member_list_cannot_refuse_a_windowless_grant(world):
@@ -209,17 +212,18 @@ def test_a_list_older_than_the_index_that_matched_leaves_a_windowless_grant_unch
     assert r["dateCheck"] == "unchecked"
 
 
-def test_the_behind_rule_qualifies_only_an_index_match(world):
-    # Mirrors test_totp_roster_check.py::test_roster_current_only_qualifies_an_index_match:
-    # on the loop the caller's own credentials matched, from the same load as its list.
+def test_a_windowless_grant_is_unchecked_whatever_the_roster_currency(world):
+    # Review R2: the date check no longer judges a grant it has no window for, so the list's
+    # currency (the behind rule) cannot change its answer -- on the loop or a stale index.
     c, creds, users, snap = world
     s = _settings()
     now = time.time()
     stale_idx = av.build_totp_index(creds, s, now - 3600, margin=1)   # does not cover now
     for idx in (None, stale_idx):
-        r = _check(_code_for(c["stale"], s, now), s, creds, users, now, snap, idx=idx,
-                   roster_current=False)
-        assert r["allowed"] is False and r["dateCheck"] == "not_today"
+        for current in (True, False):
+            r = _check(_code_for(c["stale"], s, now), s, creds, users, now, snap, idx=idx,
+                       roster_current=current)
+            assert r["allowed"] is True and r["dateCheck"] == "unchecked"
 
 
 def test_a_listed_grant_does_not_make_a_behind_list_prove_a_windowless_one_absent(world):
