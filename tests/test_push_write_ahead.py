@@ -141,9 +141,13 @@ class TestACrashMidPushLeavesNothingUnprovable:
         assert term.users == {}, "a write MonClub could not first record must not happen"
         assert w._on_full_sync_finished.call_args.kwargs["ok"] is False
 
-    def test_a_refused_template_leaves_an_intent_not_an_orphan(self, db, monkeypatch):
+    def test_a_refused_template_leaves_an_owned_member_not_an_orphan(self, db, monkeypatch):
         """No crash needed: the row lands, the finger is refused, the pin is 'failed' --
-        before P3a-2 that member was on the terminal with no ownership at all."""
+        before P3a-2 that member was on the terminal with no ownership at all.
+
+        Review round 1 (R1-14/R1-26): it first left only an intent (settled by the next
+        day's read-back, so a departure in between was SKIPPED_NOT_OWNED). The terminal
+        accepted the user row, so the pin is now owned at once and the intent resolved."""
         term = TerminalZkem()
         term.settmp_ok = False
         drv = _make_driver(term)
@@ -155,7 +159,9 @@ class TestACrashMidPushLeavesNothingUnprovable:
         finally:
             drv.disconnect()
         assert "30001" in term.users
-        assert "30001" in db.list_push_intents(device_id=9)
+        assert "30001" in set(db.list_confirmed_device_sync_pins(device_id=9))
+        assert db.list_device_sync_hashes_and_status(device_id=9)["30001"][1] is False
+        assert "30001" not in db.list_push_intents(device_id=9)
 
 
 class TestReadBackPromotion:

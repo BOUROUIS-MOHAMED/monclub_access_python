@@ -2129,6 +2129,11 @@ class UltraDeviceWorker(threading.Thread):
         if failed_set:
             errs = result.get("errors") or []
             err = str(errs[0]) if errs else str(result.get("error") or "push_roster failed")
+        # Pins whose user row the terminal accepted (SSR_SetUserInfo -> True). They are
+        # MonClub's even if a finger then failed: the member can badge in, so a departure
+        # must be able to remove them (review R1-14/R1-26). A wedged chunk names none.
+        written = result.get("user_written") if isinstance(result, dict) else None
+        written_set = {str(p).strip() for p in written} if isinstance(written, list) else set()
         rows: list[tuple] = []
         for u in users:
             pin = str(u.get("pin") or "").strip()
@@ -2147,7 +2152,8 @@ class UltraDeviceWorker(threading.Thread):
                 # P3a-2: its slots have not been swept yet, so what else the terminal
                 # holds at this pin is still UNKNOWN; recorded only after the sweep.
                 fingers = None
-            rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err, fingers))
+            rows.append((pin, hashes_by_pin.get(pin, ""), ok, None if ok else err, fingers,
+                         pin in written_set))
         try:
             from app.core.db import save_device_sync_state_batch
             save_device_sync_state_batch(device_id=self._device_id, rows=rows)

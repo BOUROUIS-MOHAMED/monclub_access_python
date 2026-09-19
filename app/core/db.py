@@ -7461,12 +7461,17 @@ def save_device_sync_state_batch(
         # 4-tuples (pin, desired_hash, ok, error) are the long-standing shape and
         # still the only one the PullSDK caller uses. A 5th element carries the
         # pushed finger ids (already encoded, or None for "leave unknown as-is").
+        # A 6th (P3a-2 review R1-14/R1-26) says the terminal ACCEPTED MonClub's user
+        # row for this pin even though the push is not confirmed (a finger failed):
+        # it confers ownership without touching last_ok/desired_hash.
         pin, desired_hash, ok, error = row[0], row[1], row[2], row[3]
         fingers = row[4] if len(row) > 4 else None
+        user_written = bool(row[5]) if len(row) > 5 else False
         p = str(pin or "").strip()
         if not p:
             continue
         ok_i = 1 if bool(ok) else 0
+        owned_i = 1 if (ok_i or user_written) else 0
         params_list.append((
             did,
             p,
@@ -7475,7 +7480,7 @@ def save_device_sync_state_batch(
             (str(error or "")[:1000]) if error else None,
             updated_at,
             fingers,
-            ok_i,
+            owned_i,
             # fail_streak seed for a brand-new row; the UPSERT branch below
             # recomputes it from the stored value.
             0 if ok_i else 1,
@@ -7535,9 +7540,9 @@ def save_device_sync_state_batch(
             """,
             params_list,
         )
-        # A confirmed push (ok=1 sets ownership_confirmed=1 above) resolves the
-        # write-ahead intent of that pin, in the same transaction.
-        confirmed = [(did, p[1]) for p in params_list if p[3] == 1]
+        # Ownership (a confirmed push, or a user row the terminal accepted) resolves
+        # the write-ahead intent of that pin, in the same transaction.
+        confirmed = [(did, p[1]) for p in params_list if p[7] == 1]
         if confirmed:
             conn.executemany(
                 "DELETE FROM device_push_intent WHERE device_id=? AND pin=?",

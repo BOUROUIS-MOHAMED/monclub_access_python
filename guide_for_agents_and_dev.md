@@ -1158,13 +1158,30 @@ Only confirmed deletion or complete neutralisation atomically clears that PIN's
 test_zk_standalone_template_removal.py]`
 
 Ownership is a safety boundary. A `device_sync_state` row alone is **not** ownership
-proof: ownership requires the durable `ownership_confirmed=1` bit, set only after an
-affirmatively successful MonClub push and sticky across later failed updates. On
+proof: ownership requires the durable `ownership_confirmed=1` bit, sticky across later failed
+updates and never cleared (only a removal deletes the row). It is set by an affirmatively
+successful MonClub push, by the read-back promotion (§3.4a), and — **since P3a-2 review round 1
+(R1-14/R1-26), on the MB2000 — by a user row the terminal ACCEPTED** (`SSR_SetUserInfo` → True,
+reported by the driver as `user_written`) even when a finger of that push then failed. On
 installed databases, `last_ok=1` or a recorded `pushed_finger_ids` set is conservative
-migration evidence; ambiguous legacy rows remain unconfirmed. A failed first push
-therefore cannot authorize deletion or neutralisation of a colliding manually managed
-user on a shared MB2000. Without this affirmative proof, the worker makes **no
-destructive SDK call** — on either protocol.
+migration evidence; ambiguous legacy rows remain unconfirmed. A push whose user row was NOT
+accepted (refused, a wedged chunk, a member never sent) confers nothing. Without this
+affirmative proof, the worker makes **no destructive SDK call** — on either protocol.
+
+*The inversion, and what it costs (review round 1).* This sentence used to read "a failed first
+push cannot authorize deletion of a colliding manually managed user". But a member whose card
+landed and whose finger was refused — or whose template `TEMPLATE_VERSION_MISMATCH` skips on every
+push (§3.4d) — can badge in, and on departure was `SKIPPED_NOT_OWNED` until the next day's
+read-back, or for good if the read-back did not match. `SSR_SetUserInfo` creates AND overwrites, so
+the bit proves MonClub wrote AT the pin, not that the pin was free: **residual** — at a pin where a
+MonClub membership id collides with another system's user id on a shared terminal, that user is now
+owned at the first write whose user row lands (before: at the first fully confirmed push, or the
+read-back), and a departure deletes it whole, its fingers included. The read-back's "anything else →
+never deleted" branch does not guard such a pin, and nothing re-checks the terminal's identity before
+that delete — a pin the other system later rewrote back is deleted too. Base had the same exposure
+for every confirmed push. Precondition to check before trusting a shared terminal: FIELD-TEST on
+gym 45 — compare MonClub's membership-id range with the other system's user ids on devices 8/10 (§7).
+`[TEST: test_user_row_ownership.py]`
 Force-resync commands invalidate content hashes and retry status without deleting
 ownership or pushed-finger evidence, so a later full pass can still reconcile stale
 revoked credentials.
@@ -1264,8 +1281,9 @@ level may not be changed inside a transaction"), so the writer sets it before `B
 and restores NORMAL after; only intents use it (one extra fsync per push call). Whether the gym PC's
 disk honours the flush is `[UNVERIFIED]` — FIELD-TEST: commit an intent and cut power within 1–5 s.
 
-**Resolution.** A confirmed state write (`ok=1`, which sets `ownership_confirmed`) deletes the pin's
-intent in the same transaction; so does a removal (`clear_device_revocation_state`,
+**Resolution.** A state write that sets `ownership_confirmed` (a confirmed push, or — MB2000, review
+R1-14/R1-26 — a user row the terminal accepted, §3.4) deletes the pin's intent in the same
+transaction; so does a removal (`clear_device_revocation_state`,
 `delete_device_sync_state`). Nothing else prunes the table. On the MB2000 each chunk's result is
 recorded as soon as the chunk returns (`push_roster(on_chunk=…)` → `_push_with_chunk_recording`),
 so a crash loses at most the chunk in flight — which its intent covers. `[TEST:
@@ -2052,6 +2070,13 @@ the actual terminal.
 
 Declared in `zk_standalone.py`'s own module docstring: in-process COM viability, event
 field semantics, template portability, and the card-number space.
+
+A MonClub membership id that collides with another system's user id on a shared MB2000 (gym 45):
+MonClub's write overwrites that user's name and card, and since review round 1 the pin is MonClub's
+as soon as that user row lands (§3.4), so a departure deletes the whole user; the finger-slot sweep
+(§3.4c) likewise clears its unused slots. Whether any id collides is `[UNVERIFIED]` — FIELD-TEST:
+list devices 8/10's users (`GET /api/v2/devices/{id}/users`) and compare the other system's pins
+with MonClub's membership ids before relying on removals there.
 
 From P3a-2 (§3.4e), measured only on a fake terminal: whether the MB2000 hands over at a chunk's
 end the events of scans made during it; the duration of `RefreshData(1)` (what a smaller chunk

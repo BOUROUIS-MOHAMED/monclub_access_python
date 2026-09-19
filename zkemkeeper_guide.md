@@ -727,7 +727,9 @@ Keys: `ok`, `pushed`, `failed`, `templates_failed`, `skipped_pin`, `chunks_wedge
 `errors`, **`failed_pins`**, **`del_attempted` / `del_ok`** (added 2026-09-05),
 **`not_attempted`** (added 2026-09-18: pins of chunks never sent after a `break`), and
 **`superseded_pins`** (added 2026-09-19: pins the `between_chunks` caller dropped — not
-pushed, not failed). `[CODE]`
+pushed, not failed), and **`user_written`** (added 2026-09-19: every pin whose
+`SSR_SetUserInfo` returned True, whatever its fingers did after; the engine records those
+as owned — `guide_for_agents_and_dev.md` §3.4). `[CODE]`
 
 `del_attempted` counts every `SSR_DelUserTmpExt` issued — both the delete-before-write
 of a desired slot and the removal of a vacated one. `del_ok` counts the ones the

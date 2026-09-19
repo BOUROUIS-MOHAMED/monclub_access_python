@@ -777,7 +777,10 @@ class ZKStandaloneDevice:
                                "not_attempted": 0,
                                # Dropped from the chunks not yet sent because the
                                # between_chunks caller wrote/removed them itself.
-                               "superseded_pins": []}
+                               "superseded_pins": [],
+                               # Pins whose user row the terminal accepted, from the
+                               # chunks that answered (a wedged chunk names none).
+                               "user_written": []}
         superseded: set = set()
         # Telemetry-only accumulators (never read by the engine).
         agg_failed_reasons: Dict[str, str] = {}
@@ -952,6 +955,10 @@ class ZKStandaloneDevice:
                 _p = str(_p or "").strip()
                 if _p and _p not in agg["failed_pins"]:
                     agg["failed_pins"].append(_p)
+            for _p in (res.get("user_written") or []):
+                _p = str(_p or "").strip()
+                if _p and _p not in agg["user_written"]:
+                    agg["user_written"].append(_p)
             report_chunk(part, res)
             # One telemetry line per chunk (~93 for a full 928-member roster), which
             # is where per-pin detail is aggregated to. Per-pin lines are deliberately
@@ -1853,6 +1860,10 @@ class ZKStandaloneDevice:
         del_ok = 0
         tpl_version_skipped = 0
         device_ver = _parse_version_int(getattr(self, "_device_fp_version", "") or "")
+        # Pins whose user row the terminal ACCEPTED (SSR_SetUserInfo -> True), whatever
+        # happened to their fingers after. The engine records these as MonClub's even
+        # when the push is not confirmed (P3a-2 review R1-14/R1-26).
+        user_written: List[str] = []
 
         def _mark_failed(p: str, reason: str = "") -> None:
             if p and p not in _failed_seen:
@@ -1940,6 +1951,8 @@ class ZKStandaloneDevice:
                         if len(errors) < 5:
                             errors.append(f"SSR_SetUserInfo pin={pin}")
                         continue
+                    if pin not in user_written:
+                        user_written.append(pin)
                     # Slots this member USED to have and no longer does.
                     #
                     # The field bug this closes: the clear below used to exist ONLY
@@ -2154,6 +2167,7 @@ class ZKStandaloneDevice:
                 "templates_failed": templates_failed,
                 "skipped_pin": skipped_pin, "errors": errors,
                 "failed_pins": failed_pins,
+                "user_written": user_written,
                 # Telemetry-only additions. Nothing decides on these; push_roster
                 # folds them into ZKEM_PUSH_CHUNK / ZKEM_PUSH_FAILED_PINS.
                 "failed_reasons": failed_reasons,
