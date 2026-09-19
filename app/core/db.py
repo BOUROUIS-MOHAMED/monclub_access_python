@@ -1284,6 +1284,8 @@ def _apply_protocol2_save(
     """
     from app.core import access_dates as _ad
 
+    _prior = cur.execute("SELECT trusted FROM access_v2_state WHERE id = 1").fetchone()
+    prior_trusted = bool(_prior[0]) if _prior is not None else False
     try:
         p, err = _ad.parse_v2_payload(data)
     except Exception as exc:  # parse_v2_payload validates, it is not expected to raise
@@ -1363,6 +1365,9 @@ def _apply_protocol2_save(
             "clock_at_sync": at_sync,
         }
 
+    # The caller bumps the local-state generation on a change of trust: the QR date snapshot
+    # is cached per generation. [TEST: tests/test_p3b1_integration_fixes.py]
+    out["trust_changed"] = bool(out["trusted"]) != prior_trusted
     if members_applied:
         held = _reconcile_held_rows(
             cur, full_mode=full_mode, valid_ids=valid_ids, incoming_ids=set(incoming_ids or ()),
@@ -1536,6 +1541,12 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
     if out.get("moved"):
         bump_local_state_generation()
         invalidate_sync_cache()
+    elif out.get("trusted") and out.get("gym_date") != out.get("applied_before"):
+        # The applied day moved with no row: the QR date snapshot (cached per generation,
+        # access_verification.current_access_days) must still see the new day. (Untrusted,
+        # the snapshot checks nothing, so its day does not matter.)
+        # [TEST: tests/test_p3b1_integration_fixes.py::test_a_flip_that_only_advances_the_date_bumps_the_generation]
+        bump_local_state_generation()
     return out
 
 
@@ -3971,6 +3982,16 @@ def delete_users_by_am_ids(am_ids: set[int]) -> None:
             f"DELETE FROM sync_users WHERE active_membership_id IN ({placeholders})",
             list(am_ids),
         )
+        # P3b-1: a held copy of a deleted member must go too, or the next date flip would
+        # restore it (same rule as the fast-patch delete).
+        try:
+            conn.execute(
+                f"DELETE FROM sync_users_held WHERE active_membership_id IN ({placeholders})",
+                list(am_ids),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
         conn.commit()
 
 
@@ -4806,7 +4827,19 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     """
     Persist ActiveMemberResponse payload and normalized tables.
     If data is None/empty, clears cached sync tables (best-effort).
+
+    Every exit advances the local-state generation (P3b-1): a full replace or a logout
+    rewrites the members, the credentials and the protocol-2 trust, and the engines' caches
+    and the QR date snapshot are keyed on the generation. It used to bump nothing.
+    [TEST: tests/test_p3b1_integration_fixes.py::test_logout_and_a_full_replace_bump_the_generation]
     """
+    try:
+        _save_sync_cache(data)
+    finally:
+        bump_local_state_generation()
+
+
+def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     if not data:
         with get_conn() as conn:
             cur = conn.cursor()
@@ -6534,7 +6567,12 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
     # If members/credentials changed, advance the local-state generation so the
     # ULTRA workers reload their (creds, users) cache once — instead of re-reading
     # the 1798-row table on every TTL tick.
-    if refresh.get("members") or refresh.get("credentials"):
+    # P3b-1: so does a change of trust in the protocol-2 windows (a v1 answer, a malformed or
+    # refused one, the first v2 one): the QR date snapshot is cached per generation
+    # (access_verification.current_access_days), and a trust change can come with no section.
+    # [TEST: tests/test_p3b1_integration_fixes.py::test_a_v1_answer_that_drops_trust_bumps_the_generation_even_without_sections]
+    if (refresh.get("members") or refresh.get("credentials")
+            or (result.get("protocol2") or {}).get("trust_changed")):
         bump_local_state_generation()
     _creds_summary = result.get("credentials")
     if _creds_summary:

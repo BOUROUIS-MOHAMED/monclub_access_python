@@ -302,52 +302,85 @@ def maybe_log_totp_roster_summary(*, now_mono: Optional[float] = None) -> bool:
 
 
 # The allowed-days snapshot (P3b-1) the QR check uses: the gym date the last flip applied
-# and the windows. Loaded once per local-state generation (a sync that changes members or
-# credentials bumps it; so does a flip that moves a row, plan §4) and warmed by
-# load_local_state, so a scan normally pays one lock and one comparison. A change of the
-# stored dates that comes with no bump is not seen until the next one.
-# (db path, generation, snapshot); the db path is part of the key because tests swap
-# db._DB_PATH at one generation (None in production).
+# and the windows. Loaded once per local-state generation -- every change of what it holds
+# bumps it: a sync that changes members or credentials, a change of trust, a full replace
+# or logout, a flip that moves a row or advances the day -- and warmed by load_local_state,
+# so a scan normally pays one lock and one comparison.
+#
+# The last few generations are kept, keyed by db path (tests swap db._DB_PATH at one
+# generation; None in production): a worker's member list and credentials can be one
+# generation OLDER than the newest snapshot for the seconds before its refresh lands, and
+# checking that list's grants against the newer day refuses a renewing member whose old plan
+# ended yesterday (review of P3b-1 part D). The caller passes the generation of the list it
+# checks as ``max_generation`` and gets the snapshot of that generation.
+#
+# Labels: a snapshot is labelled with the generation read BEFORE its load, and a load the
+# generation moved under is redone once, so a snapshot is never labelled newer than its data
+# (that would keep yesterday's day -- an expired member's QR code opening -- until the next
+# bump). Residual: a flip commits, then bumps; a load that reads the new rows AND finishes in
+# that gap is labelled one generation too old -- the transient false refusal above, for
+# lists of that one generation, until they reload.
+_ACCESS_DAYS_KEEP = 4
 _access_days_lock = threading.Lock()
-_access_days_cache: tuple = (None, -1, None)
+_access_days_hist: Dict[Any, List[tuple]] = {}      # path -> [(generation, snapshot)] ascending
 
 
-def current_access_days() -> Optional[AccessDaysSnapshot]:
-    """The access_dates.AccessDaysSnapshot of the current local-state generation.
-
-    Reloaded when the generation moved. A failed load returns the previous snapshot of the
-    same database, else None (None = no date check, a v1 PC's behaviour). Never raises.
-    """
-    global _access_days_cache
-    try:
-        gen = get_local_state_generation()
-        path = _db._DB_PATH
-        with _access_days_lock:
-            c_path, c_gen, c_snap = _access_days_cache
-        if c_snap is not None and c_path == path and c_gen == gen:
-            return c_snap
-        # Read outside the lock: a scan must not wait behind another thread's load.
+def _load_access_days_labelled() -> tuple:
+    """(generation, snapshot or None): the snapshot and the generation it belongs to."""
+    gen = get_local_state_generation()
+    snap = None
+    for _attempt in range(2):
         try:
             snap = load_access_days_snapshot()
         except Exception:
             snap = None
+        after = get_local_state_generation()
+        if after == gen:
+            return gen, snap
+        gen = after                   # the generation moved during the load: redo it
+    return None, snap                 # still moving: usable once, never stored
+
+
+def current_access_days(max_generation: Optional[int] = None) -> Optional[AccessDaysSnapshot]:
+    """The access_dates.AccessDaysSnapshot for the QR date check. Never raises.
+
+    ``max_generation`` None: the snapshot of the current local-state generation (reloaded
+    when the generation moved). Else the newest snapshot of a generation at or below it --
+    the one that matches a member list of that generation -- and None (no date check) when
+    none is kept. A failed load returns the newest kept snapshot of the same database within
+    the bound, else None (None = no date check, a v1 PC's behaviour).
+    """
+    try:
+        path = _db._DB_PATH
+        gen_now = get_local_state_generation()
         with _access_days_lock:
-            c_path, c_gen, c_snap = _access_days_cache
-            same_db = c_snap is not None and c_path == path
-            if snap is None:
-                return c_snap if same_db else None
-            if same_db and c_gen > gen:
-                return c_snap        # a newer generation was stored while this one loaded
-            _access_days_cache = (path, gen, snap)
-            return snap
+            hist = list(_access_days_hist.get(path) or [])
+        if not hist or hist[-1][0] < gen_now:
+            # Read outside the lock: a scan must not wait behind another thread's load.
+            label, snap = _load_access_days_labelled()
+            if snap is not None and label is not None:
+                with _access_days_lock:
+                    cur = [e for e in (_access_days_hist.get(path) or []) if e[0] != label]
+                    cur.append((label, snap))
+                    cur.sort(key=lambda e: e[0])
+                    _access_days_hist[path] = cur[-_ACCESS_DAYS_KEEP:]
+                    hist = list(_access_days_hist[path])
+            elif snap is not None and max_generation is None:
+                return snap
+        bound = gen_now if max_generation is None else int(max_generation)
+        for g, s in reversed(hist):
+            if g <= bound:
+                return s
+        if max_generation is None and hist:
+            return hist[-1][1]
+        return None
     except Exception:
         return None
 
 
 def _reset_access_days_cache_for_tests() -> None:
-    global _access_days_cache
     with _access_days_lock:
-        _access_days_cache = (None, -1, None)
+        _access_days_hist.clear()
 
 
 def _totp_counter(unix_time: int, period: int) -> int:

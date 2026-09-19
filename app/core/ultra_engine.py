@@ -6239,7 +6239,10 @@ class UltraDeviceWorker(threading.Thread):
             scan_epoch=scan_epoch,
             totp_index=totp_index,
             roster_current=roster_current,
-            access_days=current_access_days(),
+            # The date snapshot of this worker's own list generation: a newer day checked
+            # against an older list (the seconds before the refresh after a flip) refuses a
+            # renewing member whose old plan ended yesterday (P3b-1, guide §3.1b).
+            access_days=current_access_days(max_generation=own_list_gen),
         )
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)

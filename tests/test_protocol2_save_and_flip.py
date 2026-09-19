@@ -137,8 +137,11 @@ def _flip(db, iso, grace=0):
 # ================================================================== the save
 def test_a_v2_full_members_section_stores_the_windows_upcoming_lists_token_and_clock(db):
     out = _seed_full_v2(db)
+    # trust_changed (integration fix, tests/test_p3b1_integration_fixes.py): the first v2
+    # answer turns trust on, so the caller bumps the local-state generation.
     assert out["protocol2"] == {"protocol": "v2", "reason": None, "trusted": True,
-                                "members_section": True, "clock_at_sync": ""}
+                                "members_section": True, "clock_at_sync": "",
+                                "trust_changed": True}
     st = db.get_access_v2_state()
     assert st["trusted"] is True
     assert st["server_today"] == "2026-09-19" and st["horizon_end"] == "2026-09-26"
@@ -482,7 +485,13 @@ def test_a_flip_on_the_server_day_moves_nothing_and_records_the_day(db):
     assert r["gym_date"] == "2026-09-19" and r["moved"] == 0 and r["skipped"] is None
     assert r["applied_before"] is None and r["trusted"] is True
     assert db.get_access_v2_state()["applied_date"] == "2026-09-19"
-    assert db.get_local_state_generation() == gen
+    # Deliberate inversion (integration fix): recording the day is a change the QR date
+    # snapshot must see, so the generation moves even though no row did; a second flip on the
+    # same day moves nothing and bumps nothing.
+    assert db.get_local_state_generation() > gen
+    gen = db.get_local_state_generation()
+    r = _flip(db, "2026-09-19T12:05:00+01:00")
+    assert r["moved"] == 0 and db.get_local_state_generation() == gen
 
 
 def test_power_on_the_next_day_holds_the_expiry_and_the_freeze_and_promotes_the_starter(db):
