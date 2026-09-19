@@ -409,8 +409,14 @@ Every matched QR result carries `dateCheck`:
 | `dateCheck` | Means | Result |
 |---|---|---|
 | `ok` | a grant is deliverable on the applied gym date by its window; or a grant is on the list with no window (a fast patch, a v1 row); or `rosterCheck` is `in_roster_by_account` (a renewal whose grants are stale) | allowed as before |
-| `not_today` | every grant is provably not deliverable today — by its window, or with no window and no row on a current, non-empty list | **refused `DENY_NOT_ALLOWED_TODAY`, in BOTH roster modes** |
-| `unchecked` | no trusted windows (`access_days` None, `trusted=0`, no applied date), or a windowless grant against an empty list or a list older than the index that matched (the `roster_behind` rule) | allowed as before |
+| `not_today` | every grant is provably not deliverable today BY ITS WINDOW | **refused `DENY_NOT_ALLOWED_TODAY`, in BOTH roster modes** |
+| `unchecked` | no trusted windows (`access_days` None, `trusted=0`, no applied date), or a grant with no stored window and no row on the list — the PC knows no date for it; whether it opens is the roster check's question (trial counts it, enforce refuses it) | allowed as before |
+
+The first version also called a grant with no window and no row on a current list `not_today`: that
+turned trial mode into enforce for exactly the members the trial counts — e.g. a renewal whose stored
+credential grants are stale and whose row has no `mainAccountId` (review round 2, reproduced against
+base: base allowed, the branch refused). `[TEST: test_access_dates.py::TestQrDateVerdict,
+test_qr_allowed_days.py::test_a_code_in_neither_the_windows_nor_the_list_is_the_roster_checks_question]`
 
 So with trusted windows, trial mode no longer allows every `not_in_roster` code: a code whose
 memberships are all out of their windows is refused. `[TEST: test_qr_allowed_days.py]` The popup
@@ -448,7 +454,11 @@ scan. `[TEST: tests/test_p3b1_review_r1.py — the ULTRA rescue tests]` A snapsh
 and reloaded when the generation moved during the load, so none is labelled newer than its data.
 `[TEST: tests/test_p3b1_integration_fixes.py]` Residual: a flip commits, then bumps; a load that
 reads the new rows and finishes inside that gap is labelled one generation too old (the transient
-false refusal, for that one generation's lists). `[CODE]` A reload on the scan path (the first scan
+false refusal, for that one generation's lists). Same class: an ULTRA background refresh whose load
+straddles a row-moving flip installs post-flip rows labelled with the pre-flip generation, so until
+the next refresh (the next scan sees the generation moved and triggers it) that list is checked
+against the pre-flip day — in trial an ex-member held that night is admitted, which base also did
+(no date check). Reported in review round 2; not changed. `[CODE]` A reload on the scan path (the first scan
 after a bump, before the refresh warms it) cost 35 ms median on the development PC with 1,860
 synthetic windows; a cached call 1.2 µs. `[measured, dev PC; gym PC UNKNOWN]`
 
@@ -1804,7 +1814,14 @@ link (a membership never cached on this database, a read failure) → no hold: r
   A failed post-push removal is a normal removal failure (fast retry, `REMOVAL_FAILED`).
 - The rest are KEPT: never removed that pass, state rows kept (prune keep set), MIRROR treats them as
   roster; not a failure, not a ceiling refusal. The person keeps entering through the old pin until
-  the new one lands (a retry, the next capped pass).
+  the new one lands (a retry, the next capped pass) — or until the server's own revocation of the
+  old plan arrives with the next sync, which removes it first (below, "Not covered").
+- **No hold on a full terminal** (MB2000): a hold keeps the old pin's user and finger slots, and
+  capacity admission (§3.4d) refused the new pin on every pass while they were taken — it never
+  landed (review round 2, reproduced against base). When there are holds, the full sync dry-runs the
+  same admission first (`_capacity_admit(report=False)`, a live capacity read); a person whose new
+  pin the terminal has no room for right now is not held — the old pin goes first, as before P3b-1.
+  `[TEST: tests/test_p3b1_review_r2.py::test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_lands]`
 - One removal-retry report per pass: with holds, the removal step's own result and the post-push
   failures are reported together after the push (the exception handler reports if the pass raises
   in between). One `[T] RENEWAL_HOLD worker|device_id held removed_after_push kept` per pass that
@@ -1827,9 +1844,14 @@ memberships its revoke pre-pass handled (`engine._full_sync_revoked_pins`, set i
 
 **Not covered.** A server revocation of the old plan served by the TARGETED path
 (`_run_standalone_member_revoke`, `sync_member_on_connected_sdk`) still removes it first, whatever
-the new pin's state — outside "the same pass". The date-driven case is served by the flip's full
-sync before any server revocation arrives. A new pin superseded mid-push counts as unconfirmed for
-that pass. `[CODE]` `[UNVERIFIED — HARDWARE-GATED]` whether an MB2000 or a C3-400 accepts a second
+the new pin's state — outside "the same pass"; so does the full pass for a pin the server
+revoked explicitly (required, never held). The date-driven case is served by the flip's full sync
+before any server revocation arrives — when the new pin lands in that pass. When it does not (the
+hold is kept), the next successful sync brings the server's revocation of the old plan (the flip
+never touches `member_shadow`, so the diff names it) and the old pin is removed first while the new
+one is still refused: the member then has neither pin until the new one lands, as in base. The hold
+protects a kept renewal only while the PC is offline (review round 2). A new pin superseded mid-push
+counts as unconfirmed for that pass. `[CODE]` `[UNVERIFIED — HARDWARE-GATED]` whether an MB2000 or a C3-400 accepts a second
 user carrying a card number another user on the device holds: the backend keeps cards unique across
 a gym's memberships (`cardInUseInGym`, no status filter), but an old pin's device row can still carry
 a card later moved to the new membership. If the terminal refuses the duplicate, the new pin fails
@@ -2216,7 +2238,8 @@ flagged `offDaysBeyondHorizon` is **kept inside its window** there (the end date
 This is a PC policy — the server states no default — and an **owner decision**; memberships
 starting or unfreezing after `horizonEnd` are in no list and wait for a sync.
 `[CODE: access_dates.py::window_status]` **Offline grace** (`offline_revoke_grace_days`, Access
-config, default 0): on a day AFTER the last server day only, a membership past its `accessUntil`
+config, default 0; compared as a day count, so any value is safe — a date sum overflowed past ~2.9
+million days, review round 2): on a day AFTER the last server day only, a membership past its `accessUntil`
 stays that many days (never a freeze day or a future start). `[TEST: ::TestWindows]`
 
 **The gym date and the clock** (`access_dates.evaluate_gym_date`). P = the PC's date in Tunis time
@@ -2283,8 +2306,9 @@ next day. `[TEST: tests/test_p3b1_app_wiring.py, tests/test_p3b1_review_r1.py]`
 job (backend `DailyScheduleService`, cron `0 16 0 * * *`); until then the PC holds it disabled
 (`upcomingCredentials`). When a flip reports `starters` (upcoming memberships starting on the
 applied day) before 00:17:00 gym time, it arms ONE `request_sync_now(trigger_source="DATE_FLIP",
-trigger_hint={"reason": "first-day-credentials"})` at 00:17:00; a later flip replaces it, so there
-are never two. From 00:17 on nothing is armed: the next ordinary sync brings the credential. The
+trigger_hint={"reason": "first-day-credentials"})` at 00:17:00 on the server's clock — the PC time
+plus the PC-ahead skew measured at the last sync (a PC two minutes fast fired it before the 00:16
+job and brought nothing, review round 2); a later flip replaces it, so there are never two. From 00:17 on nothing is armed: the next ordinary sync brings the credential. The
 hint strips no version token (`sync_scope.apply_trigger_hint_to_version_tokens` acts only on
 `entityType` / `forceDeviceRefresh`). `[TEST: tests/test_p3b1_app_wiring.py — the 00:17 tests]`
 Why it is needed although the PC enables a stored upcoming credential itself on its first day
