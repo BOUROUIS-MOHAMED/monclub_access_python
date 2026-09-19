@@ -2388,8 +2388,13 @@ class UltraDeviceWorker(threading.Thread):
         users: list[Dict[str, Any]],
         templates_by_pin: Dict[str, list] | None,
         recorded_fingers: Dict[str, Any] | None,
+        *,
+        report: bool = True,
     ) -> tuple[list[Dict[str, Any]], list[str], Dict[str, set[int]]]:
         """Refuse only the writes the terminal has no slot for: (admitted, skipped, withheld).
+
+        ``report=False``: a dry run (the renewal-hold decision) -- same answer, no log line
+        and no CAPACITY_FULL telemetry.
 
         ``skipped``: pins refused whole -- only a member certainly NOT on the terminal
         (no state row and no push intent: a row or an intent means it may already be
@@ -2490,7 +2495,7 @@ class UltraDeviceWorker(threading.Thread):
             if len(new_fingers) > room:
                 withheld[pin] = set(new_fingers[room:])
             f_left -= min(len(new_fingers), room)
-        if skipped or withheld:
+        if (skipped or withheld) and report:
             logger.warning(
                 "%s CAPACITY_FULL: terminal reports users_free=%s fingerprints_free=%s -- %d "
                 "new member(s) NOT pushed (%s), %d finger(s) of %d member(s) not written (%s); "
@@ -3427,6 +3432,30 @@ class UltraDeviceWorker(threading.Thread):
                     _who = renewal_person_id(_pin_persons.get(_p))
                     if _who is not None:
                         hold_persons.add(_who)
+                if hold_persons:
+                    # A hold keeps the old pin's user and finger slots until the new pin is
+                    # confirmed. On a terminal with no free slot the new pin is then refused
+                    # CAPACITY_FULL on every pass and never lands (review R2; a card moved to
+                    # the new plan then opens nothing). So the people whose new pin the
+                    # terminal has no room for right now are NOT held: their old pin goes
+                    # first, as before P3b-1, and frees the slot the new pin needs. A dry run
+                    # of the same admission (a live capacity read; only when there are holds).
+                    try:
+                        _dry_skipped, _dry_withheld = self._capacity_admit(
+                            to_push, templates_by_pin, self._load_pushed_fingers(),
+                            report=False,
+                        )[1:]
+                    except Exception:
+                        logger.warning("%s renewal holds: capacity dry run failed -- holding as "
+                                       "usual", self._prefix, exc_info=True)
+                        _dry_skipped, _dry_withheld = [], {}
+                    for _p in list(_dry_skipped) + list(_dry_withheld):
+                        _who = renewal_person_id(_pin_persons.get(str(_p)))
+                        if _who is not None and _who in hold_persons:
+                            hold_persons.discard(_who)
+                            logger.info("%s renewal hold skipped for person %s: no room on the "
+                                        "terminal for the new pin %s -- old pin removed first",
+                                        self._prefix, _who, _p)
             safe_to_prune = True
             removal_attempt_failed = False
             if roster_withheld:
