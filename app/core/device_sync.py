@@ -2991,6 +2991,15 @@ class DeviceSyncEngine:
         # e.g. SKIPPED_NOT_OWNED, so they land on the same push-batch row.
         removal_notes: List[str] = list(getattr(self, "_extra_batch_notes", None) or [])
         self._extra_batch_notes = []
+        # ... and the pins its full sync revokes (P3b-1): an explicit revocation is never
+        # held back by renewal ordering, even when its pre-pass delete failed.
+        revoked_pins: Set[str] = {
+            str(p).strip() for p in (getattr(self, "_full_sync_revoked_pins", None) or ())
+        }
+        self._full_sync_revoked_pins = set()
+        # RENEWAL ORDERING (P3b-1, plan §7): {stale pin held until the push: person}.
+        renewal_held: Dict[str, int] = {}
+        renewal_reported = False
         failed_stale: List[str] = []
         # "complete" is set only when the pass reaches its end: a pass that stopped
         # early must not clear the worker's removal retry (review R1-06).
@@ -3123,6 +3132,10 @@ class DeviceSyncEngine:
         # CPU half of the steady-state freeze — measure it so a 1-member change
         # that stalls minutes names its own cost instead of leaving us to infer it.
         _backoff_skipped = 0
+        # RENEWAL ORDERING (P3b-1): the desired pins not confirmed on the panel at the start
+        # of the pass -- they need a push (new, changed, failed) or the retry backoff holds
+        # them back. Read by the stale step, whatever the delta hint later prunes.
+        _unconfirmed_pins: Set[str] = set()
         with _tel.span("SYNC_HASH_DESIRED", device_id=dev_id, n=len(desired)):
             _hash_i = 0
             for pin, u in desired.items():
@@ -3143,6 +3156,8 @@ class DeviceSyncEngine:
                     prev_state.get(pin, ("", True, 0, None, None))
                 # Sync if: hash changed OR previous attempt failed
                 needs_push = prev_hash != dh or not prev_ok
+                if needs_push:
+                    _unconfirmed_pins.add(pin)
                 # ... except a pin that has already failed repeatedly on THIS
                 # EXACT desired state. prev_attempt_hash == dh is what proves
                 # "same content, already tried and refused" -- if the member was
@@ -3422,6 +3437,29 @@ class DeviceSyncEngine:
                             f"stale; ceiling {_stale_verdict.ceiling:.0f}",
                         ))
                         stale_pins = []
+                if stale_pins and pin_scheme != PIN_SCHEME_ACCOUNT:
+                    # RENEWAL ORDERING (P3b-1, plan §7). A stale pin whose PERSON still has
+                    # a desired pin not confirmed on the panel is HELD: counted by the
+                    # ceiling above, deleted only after the push confirmed that person's
+                    # desired pins (below). Deleting it first left a renewed member with
+                    # neither pin when the new pin's write failed (guide §7 R3-21).
+                    # MEMBERSHIP only: under ACCOUNT a renewal keeps the account pin.
+                    _pending_persons = {
+                        who for who in (
+                            renewal_person_id((desired.get(p) or {}).get("userId"))
+                            for p in (_unconfirmed_pins | pins_to_sync)
+                        ) if who is not None
+                    }
+                    renewal_held = renewal_holds(
+                        stale_pins, pending_persons=_pending_persons, exempt=revoked_pins,
+                    )
+                    if renewal_held:
+                        stale_pins = [p for p in stale_pins if p not in renewal_held]
+                        self.logger.info(
+                            "[DeviceSync] Device id=%s: %d stale pin(s) held until the push "
+                            "confirms their person's new pin: %s",
+                            dev_id, len(renewal_held), sorted(renewal_held)[:10],
+                        )
                 if stale_pins:
                     failed_del: List[str] = list(stale_pins)
                     try:
@@ -4075,6 +4113,72 @@ class DeviceSyncEngine:
                         self.logger.warning(
                             "[DeviceSync] Device id=%s Pin=%s sync FAILED: %s", dev_id, pin, ex)
 
+            renewal_kept: Set[str] = set()
+            if renewal_held:
+                # RENEWAL ORDERING, second half: a hold whose person's desired pins are ALL
+                # confirmed now -- pushed with SUCCESS this pass, or never unconfirmed -- is
+                # deleted, by the same delete as the stale step; the rest stay on the panel
+                # (their rows kept, not a removal failure) until a later pass confirms the
+                # new pin. A failed delete is a normal removal failure (REMOVAL_FAILED).
+                _person_by_pin = {p: (desired.get(p) or {}).get("userId") for p in desired_pins}
+                _confirmed_now = {p for p, o in pin_outcomes.items()
+                                  if (o or {}).get("status") == "SUCCESS"}
+                _released = []
+                for p, who in sorted(renewal_held.items()):
+                    if renewal_hold_released(
+                            who, person_by_pin=_person_by_pin,
+                            unconfirmed=_unconfirmed_pins | pins_to_sync,
+                            confirmed_now=_confirmed_now):
+                        _released.append(p)
+                    else:
+                        renewal_kept.add(p)
+                _removed_after = 0
+                if _released:
+                    self.logger.info(
+                        "[DeviceSync] Device id=%s: deleting %d renewed member(s)' previous "
+                        "pin(s) now that the new pin is confirmed: %s",
+                        dev_id, len(_released), _released[:10],
+                    )
+                    _failed_held: List[str] = list(_released)
+                    try:
+                        _ok_held, _failed_held = self._bulk_delete_pins(
+                            sdk=sdk,
+                            pins=_released,
+                            device_id=int(did) if did is not None else 0,
+                            fingerprint_enabled=fingerprint_enabled,
+                        )
+                        deleted += _ok_held
+                    except Exception as ex:
+                        self.logger.warning(
+                            f"[DeviceSync] Bulk delete of renewed members' previous pins failed: {ex}")
+                    _failed_held_set = {str(p) for p in (_failed_held or [])}
+                    for p in _released:
+                        if str(p) in _failed_held_set:
+                            continue
+                        _removed_after += 1
+                        try:
+                            clear_device_revocation_state(device_id=did, pin=p)
+                        except Exception:
+                            pass
+                    if _failed_held_set:
+                        self.logger.warning(
+                            "[DeviceSync] Device id=%s: %d previous pin(s) failed to delete: %s",
+                            dev_id, len(_failed_held_set), sorted(_failed_held_set)[:10],
+                        )
+                        failed_stale = sorted(set(failed_stale) | _failed_held_set)
+                        removal_notes = [n for n in removal_notes
+                                         if not str(n).startswith("REMOVAL_FAILED=")]
+                        removal_notes.append(f"REMOVAL_FAILED={len(failed_stale)}")
+                    self._last_removal_report = {"aborted": int(removal_aborted),
+                                                 "failed": list(failed_stale),
+                                                 "complete": False}
+                renewal_reported = True
+                try:
+                    _tel.event("RENEWAL_HOLD", device_id=did, held=len(renewal_held),
+                               removed_after_push=_removed_after, kept=len(renewal_kept))
+                except Exception:
+                    pass
+
             if roster_incomplete or removal_aborted:
                 # roster_incomplete: the withheld people's pins are not in desired_pins;
                 # pruning would forget them (and their ownership evidence) while they may
@@ -4086,7 +4190,9 @@ class DeviceSyncEngine:
                 # A pin whose delete FAILED is still on the device: keep its row.
                 # + every pin still on the panel: its row is MonClub's only proof of
                 # ownership there (ADDITIVE_ONLY never removes it; review R3-06).
-                _keep = set(desired_pins) | set(failed_stale) | set(device_pins)
+                # + the renewal holds kept for a later pass (on the panel, so already in
+                # device_pins; named for the reader, P3b-1).
+                _keep = set(desired_pins) | set(failed_stale) | set(device_pins) | renewal_kept
                 pruned = prune_device_sync_state(device_id=did, keep_pins=_keep)
                 # Same keep-set: a removed or revoked member must not linger in the push
                 # status cache and keep being reported upstream forever.
@@ -4157,6 +4263,14 @@ class DeviceSyncEngine:
 
         except Exception as ex:
             batch_error = str(ex)
+            if renewal_held and not renewal_reported:
+                # The pass stopped before the post-push delete: every hold is still on the
+                # panel with its row (no prune ran); a later pass removes it.
+                try:
+                    _tel.event("RENEWAL_HOLD", device_id=did, held=len(renewal_held),
+                               removed_after_push=0, kept=len(renewal_held))
+                except Exception:
+                    pass
             raise
         finally:
             if batch_id is not None:

@@ -5344,6 +5344,12 @@ class UltraDeviceWorker(threading.Thread):
                         _push_safety.SKIPPED_NOT_OWNED, len(_skipped_now),
                         "memberships " + ",".join(str(m) for m in sorted(_skipped_now)[:20]),
                     )]
+                # Renewal ordering (P3b-1) never holds back an explicit revocation: a pin the
+                # pre-pass above failed to delete is still removed first by the stale step.
+                # Named as MEMBERSHIP pins -- the only scheme that holds.
+                engine._full_sync_revoked_pins = {
+                    str(int(m)) for m in (revoked_ids | excluded_ids)
+                }
                 sync_ok = bool(engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
