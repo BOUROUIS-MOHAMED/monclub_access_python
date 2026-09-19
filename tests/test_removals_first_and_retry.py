@@ -184,9 +184,14 @@ class TestRetryReviewRoundOne:
         w._update_removal_retry(failed=["1"])
         assert w._removal_retry_at_mono is not None and w._removal_retry_streak == 1031
 
-    def test_a_pass_that_skips_its_removal_step_does_not_rearm_from_the_last_one(
-            self, monkeypatch, fstate):
+    def test_a_pass_that_skips_its_removal_step_parks_the_retry(self, monkeypatch, fstate):
+        """R1-22: it used to re-arm at <= 300 s from the stale list, forever. Round 1 then
+        dropped it -- but when the skipped pass is the retry pass itself, that stranded the
+        failed removal (review R2-17). Now it is parked: re-checked every 30 min, streak
+        unchanged."""
+        clock = {"t": 5000.0}
         w = self._armed(monkeypatch, fstate)
+        monkeypatch.setattr(ue.time, "monotonic", lambda: clock["t"])
         orig = w._build_standalone_roster
 
         def withheld(*a, **k):
@@ -194,9 +199,10 @@ class TestRetryReviewRoundOne:
             w._last_standalone_roster_stats = {"withheld_missing_account": 1}
             return out
         monkeypatch.setattr(w, "_build_standalone_roster", withheld)
+        streak = w._removal_retry_streak
         assert w._drain_full_sync_commands(limit=1) == 1
-        assert w._removal_retry_at_mono is None, (
-            "no removal was attempted: a stale failure list must not re-arm it every 300 s")
+        assert w._removal_retry_at_mono == pytest.approx(5000.0 + ue._REMOVAL_RETRY_PARKED_SEC)
+        assert w._removal_retry_streak == streak, "parked, not escalated"
 
     def test_a_retry_pass_that_errors_before_its_removal_step_stays_armed(
             self, monkeypatch, fstate):

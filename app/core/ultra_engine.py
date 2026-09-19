@@ -222,6 +222,16 @@ _FULL_REVOKE_RETRY = "retry"
 # worker is connected and a removal keeps failing.
 _REMOVAL_RETRY_FIRST_SEC = 30.0
 _REMOVAL_RETRY_MAX_SEC = 300.0
+# A pending removal a pass could NOT attempt -- the roster was incomplete, or a safety
+# guard held the removal step back (review round 2, R2-17/R2-20/R2-23) -- is parked: re-checked
+# every 30 min, the streak unchanged. Dropping it stranded the member until an unrelated
+# roster change; re-arming it at 300 s ran a useless full pass 288 times a day (R1-22). At
+# 30 min that is <= 48 passes a day, only while such a removal is pending.
+_REMOVAL_RETRY_PARKED_SEC = 1800.0
+# A push-driver link that dies within this long of its reconnect is "flapping": the next
+# reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
+# stable link reconnects at once -- that is the door path.
+_LINK_STABLE_SEC = 60.0
 
 # P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
 # One sweep STA command clears at most this many slots: 3 x 71-171 ms (field-measured
@@ -1028,7 +1038,6 @@ class UltraDeviceWorker(threading.Thread):
             self._connected = False
             self._sdk = None
 
-    @_tel.timed("CONN_DISCONNECT", slow_ms=200)
     def _push_link_lost(self) -> bool:
         """True -- and the worker disconnects, so the loop reconnects -- when a push driver
         (MB2000) reports its link down.
@@ -1049,11 +1058,37 @@ class UltraDeviceWorker(threading.Thread):
             up = True
         if up:
             return False
-        logger.warning("%s push driver reports its link down -- reconnecting", self._prefix)
-        _tel.warn("WORKER_LINK_LOST", worker=self._tel_wid)
+        # Scans the terminal handed over before the link died are already queued in the
+        # driver: decide them before the driver is torn down (review R2-13).
+        try:
+            events = sdk.poll_rtlog_once() or []
+        except Exception:
+            events = []
+        for evt in events:
+            try:
+                self._process_event(evt)
+            except Exception:
+                logger.warning("%s event before link loss failed", self._prefix, exc_info=True)
+        now = time.monotonic()
+        since = float(getattr(self, "_connected_since_mono", 0.0) or 0.0)
+        flapping = since > 0.0 and (now - since) < _LINK_STABLE_SEC
+        streak = int(getattr(self, "_link_lost_streak", 0) or 0) + 1 if flapping else 1
+        self._link_lost_streak = streak
+        delay = 0.0 if streak <= 1 else min(
+            float(self._connect_retry_max_sec),
+            float(self._connect_retry_base_sec) * (2 ** min(streak - 2, 16)),
+        )
+        logger.warning("%s push driver reports its link down -- reconnecting in %.0fs",
+                       self._prefix, delay)
+        _tel.warn("WORKER_LINK_LOST", worker=self._tel_wid, streak=streak,
+                  delay_s=round(delay) or None)
         self._disconnect()
+        # A link that dies right after every reconnect must not become a connect loop
+        # (review R2-12): each flap doubles the wait, the first loss reconnects at once.
+        self._next_connect_at_mono = now + delay
         return True
 
+    @_tel.timed("CONN_DISCONNECT", slow_ms=200)
     def _disconnect(self):
         if self._connected or self._sdk:
             logger.debug(f"{self._prefix} disconnect: was_connected={self._connected}")
@@ -2393,6 +2428,11 @@ class UltraDeviceWorker(threading.Thread):
         """
         if not withheld or not isinstance(result, dict):
             return result
+        if not isinstance(result.get("failed_pins"), list):
+            # A result that names no failed pin (a wedged chunk) confirms NOTHING; adding
+            # the withheld pins would make it name exactly those, and every other pin of
+            # the chunk would be recorded written and owned (review R2-01).
+            return result
         hit = [p for p in (str(x or "").strip() for x in pins) if p in withheld]
         if not hit:
             return result
@@ -2540,7 +2580,10 @@ class UltraDeviceWorker(threading.Thread):
             served_ids = getattr(self, "_pass_served_members", None)
             with self._member_sync_lock:
                 nxt = self._pending_member_syncs[0] if self._pending_member_syncs else None
-            if nxt is not None and (served_ids is None or int(nxt) not in served_ids):
+            # Not onto a link the driver reports dead: the update would be used up for
+            # nothing (review R2-14); it waits for the run loop's reconnect.
+            link_up = bool(getattr(self._sdk, "is_connected", True))
+            if nxt is not None and link_up and (served_ids is None or int(nxt) not in served_ids):
                 if served_ids is not None:
                     served_ids.add(int(nxt))
                 self._push_yield_pins = touched
@@ -2716,6 +2759,13 @@ class UltraDeviceWorker(threading.Thread):
         """
         self._removal_retry_reported = True
         if skipped:
+            # The step could not run. A removal still pending is PARKED, not dropped: it
+            # used to be lost when the skipped pass was itself the retry pass (R2-17).
+            if int(getattr(self, "_removal_retry_streak", 0) or 0) > 0:
+                self._removal_retry_at_mono = time.monotonic() + _REMOVAL_RETRY_PARKED_SEC
+                _tel.warn("REMOVAL_RETRY_SCHEDULED", worker=self._tel_wid, pins=0,
+                          delay_s=round(_REMOVAL_RETRY_PARKED_SEC),
+                          streak=self._removal_retry_streak, parked=True)
             return
         if failed or errored:
             streak = int(getattr(self, "_removal_retry_streak", 0) or 0) + 1
@@ -2907,7 +2957,10 @@ class UltraDeviceWorker(threading.Thread):
         mismatched: list[str] = []
         for pin, it in sorted(cands.items()):
             if pin not in on_device:
-                dropped.append(pin)
+                # An EMPTY listing cannot tell an empty terminal from a read that returned
+                # nothing: drop no intent on it (review R2-06, as R1-30 on PullSDK).
+                if on_device:
+                    dropped.append(pin)
                 continue
             want_name = str(it.get("name") or "")[:24].strip()
             want_card = "".join(ch for ch in str(it.get("card") or "") if ch.isdigit())
@@ -3360,9 +3413,12 @@ class UltraDeviceWorker(threading.Thread):
                         from app.core.db import prune_device_sync_state
                         # + the pins a mid-push targeted update wrote: not in this
                         # snapshot, but their rows are MonClub's ownership proof.
+                        # + pins pushed moments ago (the enrolment grace window): their
+                        # member may not be in this cache yet (review R2-09).
                         prune_device_sync_state(
                             device_id=self._device_id,
-                            keep_pins=list(desired_pins) + sorted(pass_touched),
+                            keep_pins=(list(desired_pins) + sorted(pass_touched)
+                                       + sorted(self._mirror_grace_pins())),
                         )
                     except Exception:
                         logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
@@ -3384,7 +3440,10 @@ class UltraDeviceWorker(threading.Thread):
                 self._last_desired_hashes = {
                     p: (hashes_by_pin or {}).get(p, "") for p in self._last_desired_pins
                 }
-                self._maintenance_ready_day = _local_day()
+            # The slot opens after every pass that pushed, whatever its roster: the batch and
+            # the read-back use the last COMPLETE snapshot, re-checked per pin (_sweep_check),
+            # so an always-incomplete roster no longer suspends them silently (review R2-05).
+            self._maintenance_ready_day = _local_day()
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
@@ -3697,7 +3756,14 @@ class UltraDeviceWorker(threading.Thread):
                 unknown_fingers_pins={p for p, plan in sweep_plan.items() if plan["unknown"]},
             )
             if sweep_plan:
-                _failed = self._standalone_failed_pins_from_result(users=users, result=result)
+                # The outcome as RECORDED: a pin whose fingers capacity withheld is not in
+                # sync, so it is not swept either -- the sweep would record the withheld
+                # finger as resident (review R2-02).
+                _failed = self._standalone_failed_pins_from_result(
+                    users=users,
+                    result=self._with_withheld_failed(
+                        result, (u.get("pin") for u in users), cap_withheld),
+                )
                 for _pin, _plan in sorted(sweep_plan.items()):
                     if _pin in _failed:
                         continue
@@ -3707,6 +3773,10 @@ class UltraDeviceWorker(threading.Thread):
             if not result.get("ok"):
                 _tel.warn("MEMBER_SYNC_FAILED", worker=self._tel_wid,
                           member_id=member_id, err="push_roster")
+                # A user row that landed makes the pin MonClub's (review R1-14): it needs the
+                # same enrolment grace as a clean push, or a removals-first pass built from
+                # a cache that does not list the member yet deletes them (review R2-24).
+                self._note_recent_pushes(result.get("user_written") or [])
             else:
                 # grace window: mark these pins as just-pushed so a MIRROR full sync
                 # racing this enroll/change can't delete them before the roster catches up.
@@ -4209,7 +4279,9 @@ class UltraDeviceWorker(threading.Thread):
             logger.warning("%s revoke pass: per-pin state unreadable -- skipping",
                            self._prefix, exc_info=True)
             return False
-        self._last_revoke_step = "ran"
+        # The guards below hold the WHOLE step back: nothing is attempted, so a pending
+        # retry is parked, not cleared (review R2-20). "ran" is set after them.
+        self._last_revoke_step = "skipped"
 
         keep = {str(p).strip() for p in (desired_pins or set())}
         required = {str(p).strip() for p in (required_pins or set()) if str(p).strip()}
@@ -4238,6 +4310,7 @@ class UltraDeviceWorker(threading.Thread):
                 ",".join(sorted(required & grace)),
             )
             return False
+        self._last_revoke_step = "ran"
         revoked = sorted(p for p in owned if p not in keep and p not in grace)
         if not revoked:
             return True
@@ -4540,8 +4613,21 @@ class UltraDeviceWorker(threading.Thread):
         """
         if not getattr(self._sdk, "owns_event_source", False) or not self._connected:
             return
+        if not bool(getattr(self._sdk, "is_connected", True)):
+            return          # a dead link: never use up the day's read-back on it (R2-16)
         today = _local_day()
         if getattr(self, "_maintenance_ready_day", None) != today:
+            return
+        if getattr(self, "_last_desired_pins", None) is None:
+            # No complete roster since this worker started (a latched removal ceiling, or
+            # ACCOUNT rows without mainAccountId on every pass): nothing to compare against.
+            # Said once a day instead of silently (review R2-05).
+            if getattr(self, "_maintenance_skip_day", None) != today:
+                self._maintenance_skip_day = today
+                logger.warning("%s daily maintenance skipped: no complete roster yet",
+                               self._prefix)
+                _tel.warn("MAINTENANCE_SKIPPED", worker=self._tel_wid,
+                          reason="no_complete_roster")
             return
         if not self._maintenance_idle():
             return
@@ -4733,6 +4819,10 @@ class UltraDeviceWorker(threading.Thread):
                     "FULL_SYNC_START", worker=self._tel_wid, reason=reason,
                     users=len(getattr(filtered_cache, "users", []) or []),
                 )
+                # Revocations a fast retry can change (the delete failed, ownership was
+                # unreadable) vs those it cannot (deferred: an incomplete ACCOUNT roster, an
+                # unnameable pin) -- the latter used to re-arm the 300 s retry forever (R2-23).
+                _retryable_revokes: set[int] = set()
                 for member_id in sorted(
                     revoked_ids - self._confirmed_member_revokes(revoked_ids)
                 ):
@@ -4744,6 +4834,9 @@ class UltraDeviceWorker(threading.Thread):
                         revocation=True,
                     ):
                         self._mark_member_revoke_confirmed(member_id)
+                    elif getattr(engine, "_last_member_sync_outcome", None) in (
+                            "DELETE_FAILED", "OWNERSHIP_UNREADABLE"):
+                        _retryable_revokes.add(member_id)
                     elif _revoke_skipped_not_owned(engine):
                         # FINAL (P3a-2): not ours, never deleted. "Confirmed" here means
                         # "no physical work left" -- the pass must not fail for it, and the
@@ -4770,14 +4863,19 @@ class UltraDeviceWorker(threading.Thread):
                 # P3a-2 item 2: a stale delete the panel refused (its row is now kept) or an
                 # explicit revocation still pending re-requests a pass within 300 s.
                 _removal_report = getattr(engine, "_last_removal_report", None) or {}
-                if _removal_report.get("complete", True):
-                    self._update_removal_retry(
-                        failed=list(_removal_report.get("failed") or []),
-                        errored=bool(unconfirmed_revoked_ids),
-                    )
-                elif unconfirmed_revoked_ids:
-                    self._update_removal_retry(failed=[], errored=True)
-                # else: the pass stopped before its removal report -- the drain's
+                _failed_stale = list(_removal_report.get("failed") or [])
+                _hard = unconfirmed_revoked_ids & _retryable_revokes
+                if _failed_stale or _hard:
+                    # A removal the panel refused -- known even when the pass failed after
+                    # its stale step (review R2-21) -- is retried fast.
+                    self._update_removal_retry(failed=_failed_stale, errored=bool(_hard))
+                elif _removal_report.get("stale_skipped") or (
+                        unconfirmed_revoked_ids - _retryable_revokes):
+                    # Nothing a fast retry can change: a pending removal is parked.
+                    self._update_removal_retry(failed=[], skipped=True)
+                elif _removal_report.get("complete", True):
+                    self._update_removal_retry(failed=[])
+                # else: the pass stopped before its stale step -- the drain's
                 # _keep_pending_removal_retry keeps a pending retry armed (R1-06).
                 if sync_ok and unconfirmed_revoked_ids:
                     sync_ok = False

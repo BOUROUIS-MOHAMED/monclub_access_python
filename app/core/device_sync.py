@@ -120,6 +120,8 @@ MEMBER_SYNC_DELETED = "DELETED"
 MEMBER_SYNC_DELETE_FAILED = "DELETE_FAILED"
 MEMBER_SYNC_SKIPPED_NOT_OWNED = "SKIPPED_NOT_OWNED"      # final: never ours to delete
 MEMBER_SYNC_OWNERSHIP_UNREADABLE = "OWNERSHIP_UNREADABLE"  # retry: cannot tell yet
+MEMBER_SYNC_DEFERRED = "DEFERRED"   # cannot be decided now (incomplete roster, unnameable
+                                    # pin); a fast retry changes nothing (review R2-23)
 
 _SYNC_RETRY_FREE_ATTEMPTS = 3      # first 3 failures retry every run (unchanged behaviour)
 _SYNC_RETRY_BASE_SEC      = 900    # then 15 min, doubling
@@ -1369,6 +1371,7 @@ class DeviceSyncEngine:
                     "full sync reconciles. source=%s",
                     did, dev_name, member_id, source,
                 )
+                self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
                 return False
             pin = acct
         else:
@@ -1412,6 +1415,7 @@ class DeviceSyncEngine:
                 "roster incomplete (rows without mainAccountId) -- not deleting. source=%s",
                 did, pin, source,
             )
+            self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
             return False
 
         if not isinstance(desired_user, dict):
@@ -1669,8 +1673,11 @@ class DeviceSyncEngine:
                 return True
             note_push_intent_misses(device_id=did, pins=[pin])
         except Exception:
+            # The card matched but the promotion could not be written: "cannot tell yet",
+            # a retry -- never the final skip (review R2-18).
             self.logger.warning("[DeviceSync] Device id=%s Pin=%s intent proof not recorded",
                                 did, pin, exc_info=True)
+            return None
         return False
 
     def _global_defaults(self) -> Dict[str, Any]:
@@ -3366,6 +3373,11 @@ class DeviceSyncEngine:
                             pass
                     if failed_stale:
                         removal_notes.append(f"REMOVAL_FAILED={len(failed_stale)}")
+                    # Published NOW, not only at the end of the pass: a later step that
+                    # raises must not lose a refused delete (review R2-21).
+                    self._last_removal_report = {"aborted": int(removal_aborted),
+                                                 "failed": list(failed_stale),
+                                                 "complete": False}
 
             pushed_users = 0
             pushed_templates = 0
@@ -4053,7 +4065,8 @@ class DeviceSyncEngine:
 
             self._last_removal_report = {"aborted": int(removal_aborted),
                                          "failed": list(failed_stale),
-                                         "complete": True}
+                                         "complete": True,
+                                         "stale_skipped": bool(roster_incomplete)}
             self.logger.info(
                 f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned} removal_aborted={removal_aborted} removal_failed={len(failed_stale)}"
             )

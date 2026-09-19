@@ -537,7 +537,9 @@ Besides the per-sync `Pin` read, the write-ahead intent (`guide_for_agents_and_d
 panel, or `filter_expr="Pin=N"` for one pin on a targeted revoke — to prove a push MonClub never got
 to confirm. `[UNVERIFIED]` on a C3-400: that `CardNo` is returned for this read and in what form
 (the comparison ignores leading zeros), and that the `Pin=N` filter is honoured. FIELD-TEST before
-relying on it; a failed read changes nothing.
+relying on it. A failed read changes nothing and, on a targeted revoke, is a retry
+(`OWNERSHIP_UNREADABLE`), never the final `SKIPPED_NOT_OWNED`; an empty answer — to the one-pin read,
+or a whole-table read with no rows — drops no intent (review round 1, R1-12/R1-30).
 
 ### Batched writes
 
