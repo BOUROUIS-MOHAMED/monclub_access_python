@@ -5612,7 +5612,37 @@ def _replace_sync_infrastructures(cur: sqlite3.Cursor, infrastructures: List[Dic
         )
 
 
-def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> None:
+def _forget_protocol2_membership(cur: sqlite3.Cursor, active_membership_id: Optional[int]) -> bool:
+    """A fast patch of this membership is newer than its stored protocol-2 data (P3b-1).
+
+    The backend sends an ACTIVE_MEMBERSHIP upsert only for a membership deliverable today
+    (AccessPatchBundleService.shouldExposeMembership) and a delete otherwise, so the stored
+    window, upcoming row and held copy of that membership describe an older state: a flip
+    judging the patched row by them would hold a member the server just admitted, or promote
+    one it just removed. They are dropped -- the row is windowless, and never moved by a flip,
+    until the next members section -- and so is windowsVersion when a stored list changed (the
+    contract: a PC that changes the stored lists drops its token), which makes the next sync
+    serve that section. Returns whether anything was dropped.
+    [TEST: tests/test_p3b1_review_r1.py -- the fast-patch tests]
+    """
+    if active_membership_id is None:
+        return False
+    dropped = 0
+    for table in ("member_access_window", "sync_upcoming_users", "sync_users_held"):
+        try:
+            dropped += cur.execute(
+                f"DELETE FROM {table} WHERE active_membership_id = ?", (active_membership_id,)
+            ).rowcount or 0
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+    if dropped:
+        _set_windows_version(cur, None)
+    return dropped > 0
+
+
+def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> bool:
+    """Apply one fast-patch item; returns whether it dropped stored protocol-2 data."""
     kind = str(item.get("kind") or "").strip().upper()
     entity_type = str(item.get("entityType") or "").strip().upper()
     payload = item.get("payload") or {}
@@ -5623,16 +5653,18 @@ def _apply_fast_patch_item(cur: sqlite3.Cursor, item: Dict[str, Any]) -> None:
         if not isinstance(member, dict):
             raise ValueError("ACTIVE_MEMBERSHIP upsert requires payload.member")
         _upsert_sync_user_row(cur, member)
-        return
+        return _forget_protocol2_membership(
+            cur, _to_int_or_none(member.get("activeMembershipId") or item.get("entityId"))
+        )
 
     if kind == "ENTITY_DELETE" and entity_type == "ACTIVE_MEMBERSHIP":
         active_membership_id = _to_int_or_none(item.get("entityId"))
         cur.execute("DELETE FROM sync_users WHERE active_membership_id = ?", (active_membership_id,))
         # P3b-1: the same authoritative removal reaches a row the date flip had held (a freeze
-        # day, an expiry), or the next flip would restore a revoked member.
+        # day, an expiry) and the stored upcoming row, or the next flip would restore or
+        # promote a revoked membership.
         # [TEST: tests/test_protocol2_save_and_flip.py::test_a_fast_patch_revocation_also_removes_the_held_row]
-        cur.execute("DELETE FROM sync_users_held WHERE active_membership_id = ?", (active_membership_id,))
-        return
+        return _forget_protocol2_membership(cur, active_membership_id)
 
     if kind == "ENTITY_UPSERT" and entity_type == "GYM_DEVICE":
         device = payload.get("device")
@@ -5698,6 +5730,7 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
     applied = 0
     skipped = 0
     applied_item_indexes: List[int] = []
+    forgot_protocol2 = False
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -5732,7 +5765,7 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
                 skipped += 1
                 continue
 
-            _apply_fast_patch_item(cur, item)
+            forgot_protocol2 = bool(_apply_fast_patch_item(cur, item)) or forgot_protocol2
             cur.execute(
                 """
                 INSERT INTO fast_patch_revisions (patch_key, revision, updated_at)
@@ -5748,6 +5781,11 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
 
         _refresh_member_account_links(cur)
         conn.commit()
+
+    if forgot_protocol2:
+        # The QR date snapshot (access_verification.current_access_days) is keyed on the
+        # local-state generation; the engines' own resets bump it too, but not on every mode.
+        bump_local_state_generation()
 
     return {
         "applied": applied,
