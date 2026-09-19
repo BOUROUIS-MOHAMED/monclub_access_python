@@ -1343,6 +1343,18 @@ roster build and state read, no device I/O for unchanged members — plus the fa
 passes an hour, only while a removal keeps failing. `[TEST: ::TestFailedRemovalIsRetriedFast]`
 Targeted revocations were already re-queued at once (`request_full_sync(revoke-failed)`); unchanged.
 
+*Review round 1 (R1-06/07/08/22) — the retry follows what the removal step actually did.* Each pass
+reports once (`_update_removal_retry` marks it): a step that RAN clears or re-arms from its own
+failure list; a step SKIPPED because the roster is incomplete (`roster_withheld`, an empty roster)
+leaves the retry as it is (it used to re-arm from the previous pass's list — a useless pass every
+300 s for as long as the roster stayed incomplete); a step that could not be evaluated (ownership
+state unreadable) re-arms. A pass that never reported — it raised, returned early, or (PullSDK)
+stopped before its removal report, `_last_removal_report["complete"]` False — keeps a pending retry
+armed (`_keep_pending_removal_retry`, run after every drained pass); it used to clear it, and the
+roster hash already stamped then stranded the failed removal. The delay's exponent is clamped:
+`30.0 * 2 ** 1024` raised `OverflowError` after ~85 h of one failing removal, before the streak was
+stored, so every later MB2000 pass raised before its push. `[TEST: ::TestRetryReviewRoundOne]`
+
 **Upsert retry cap 24 h → 6 h.** `device_sync._SYNC_RETRY_MAX_SEC = 21600` (both SDKs share
 `DeviceSyncEngine._retry_due`; free attempts and the 15-min doubling unchanged). The PC is on about
 06:00–23:00 and off overnight (door history, 2026-09-12 study), so a 24 h cap could leave a refused

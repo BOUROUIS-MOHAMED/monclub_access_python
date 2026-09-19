@@ -2632,7 +2632,8 @@ class UltraDeviceWorker(threading.Thread):
     # ---------------------------------------------------------------- #
     # Fast retry of a FAILED removal (P3a-2 item 2, guide §3.4b)
     # ---------------------------------------------------------------- #
-    def _update_removal_retry(self, *, failed: list[str], errored: bool = False) -> None:
+    def _update_removal_retry(self, *, failed: list[str], errored: bool = False,
+                              skipped: bool = False) -> None:
         """Arm (failure) or clear (no failure) the worker's own removal retry.
 
         A removal the device refused used to wait for an unrelated roster change: the
@@ -2641,11 +2642,23 @@ class UltraDeviceWorker(threading.Thread):
         first failure, doubling, never more than 300 s apart -- a member who left must
         not keep opening the door for long. A refusal by the removal ceiling
         (REVOKE_ABORTED) is not a failure: retrying it every few seconds changes nothing.
+
+        ``skipped``: the pass did not run its removal step (an incomplete roster) -- the
+        retry is left exactly as it is; re-arming from the LAST pass's failure list meant a
+        useless full pass every 300 s for as long as the roster stayed incomplete (review
+        R1-08/R1-22). Every call marks the pass as having reported (see
+        ``_keep_pending_removal_retry``).
         """
+        self._removal_retry_reported = True
+        if skipped:
+            return
         if failed or errored:
             streak = int(getattr(self, "_removal_retry_streak", 0) or 0) + 1
+            # The exponent is clamped: 30.0 * 2 ** 1024 raised OverflowError at streak
+            # 1025 (~85 h of one failing removal), before the streak was stored, so every
+            # later pass raised too -- on the MB2000 before its push (review R1-07).
             delay = min(_REMOVAL_RETRY_MAX_SEC,
-                        _REMOVAL_RETRY_FIRST_SEC * (2 ** (streak - 1)))
+                        _REMOVAL_RETRY_FIRST_SEC * (2 ** min(streak - 1, 16)))
             self._removal_retry_streak = streak
             self._removal_retry_at_mono = time.monotonic() + delay
             _tel.warn("REMOVAL_RETRY_SCHEDULED", worker=self._tel_wid,
@@ -2654,6 +2667,19 @@ class UltraDeviceWorker(threading.Thread):
         else:
             self._removal_retry_streak = 0
             self._removal_retry_at_mono = None
+
+    def _keep_pending_removal_retry(self) -> None:
+        """After a pass that never reported its removal step: keep a pending retry armed.
+
+        A retry pass that raised, returned early or stopped before its removal step used
+        to clear the retry (its timer is cleared when the pass is requested), and the
+        roster hash the scheduler had already stamped then stranded the failed removal
+        (review R1-06).
+        """
+        if getattr(self, "_removal_retry_reported", True):
+            return
+        if int(getattr(self, "_removal_retry_streak", 0) or 0) > 0:
+            self._update_removal_retry(failed=[], errored=True)
 
     def _maybe_request_removal_retry(self) -> None:
         """Run loop: when a failed removal's retry is due, ask for a pass."""
@@ -2986,6 +3012,10 @@ class UltraDeviceWorker(threading.Thread):
         pass_touched: set[str] = set()
         pushed_users: list[Dict[str, Any]] = []
         self._last_revoke_aborted = 0
+        # What THIS pass's removal step did: "ran", "skipped" (incomplete roster) or
+        # "errored". A stale list from the previous pass must never be read (R1-08/22).
+        self._last_revoke_removal_failed = []
+        self._last_revoke_step = None
         desired_pins: list[str] = []
         try:
             self._last_standalone_roster_stats = None
@@ -3040,6 +3070,7 @@ class UltraDeviceWorker(threading.Thread):
                 _tel.warn("REVOKE_SKIP_INCOMPLETE_ROSTER", worker=self._tel_wid,
                           withheld=roster_withheld)
                 safe_to_prune = False
+                self._last_revoke_step = "skipped"
             else:
                 # Strip credentials from pins WE pushed that have left the roster.
                 # Must run BEFORE the prune below, which deletes the very record of
@@ -3064,10 +3095,14 @@ class UltraDeviceWorker(threading.Thread):
                     if revoked_pin_of.get(_m) in _removed_now:
                         removed_revokes.add(_m)
                         self._mark_member_revoke_confirmed(_m)
-            self._update_removal_retry(
-                failed=list(getattr(self, "_last_revoke_removal_failed", ()) or ()),
-                errored=removal_attempt_failed,
-            )
+            _step = getattr(self, "_last_revoke_step", None)
+            if _step == "skipped":
+                self._update_removal_retry(failed=[], skipped=True)
+            else:
+                self._update_removal_retry(
+                    failed=list(getattr(self, "_last_revoke_removal_failed", ()) or ()),
+                    errored=removal_attempt_failed or _step != "ran",
+                )
             to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
             # Which finger slots this terminal currently holds per pin. Read ONCE
             # per sync; used both to name vacated slots below and to give unchanged
@@ -4080,9 +4115,13 @@ class UltraDeviceWorker(threading.Thread):
         self._last_revoke_aborted = 0
         self._last_revoke_removed: set[str] = set()
         self._last_revoke_removal_failed: list[str] = []
+        # For the removal retry (R1-06/08/22): "skipped" = nothing to attempt until the
+        # roster changes; "errored" = could not evaluate, a pending retry stays armed.
+        self._last_revoke_step = "errored"
         if roster_count <= 0:
             # A failed or half-built roster must never read as "everyone left".
             _tel.warn("REVOKE_SKIP_EMPTY_ROSTER", worker=self._tel_wid)
+            self._last_revoke_step = "skipped"
             return False
         try:
             from app.core.db import list_confirmed_device_sync_pins
@@ -4091,6 +4130,7 @@ class UltraDeviceWorker(threading.Thread):
             logger.warning("%s revoke pass: per-pin state unreadable -- skipping",
                            self._prefix, exc_info=True)
             return False
+        self._last_revoke_step = "ran"
 
         keep = {str(p).strip() for p in (desired_pins or set())}
         required = {str(p).strip() for p in (required_pins or set()) if str(p).strip()}
@@ -4523,6 +4563,7 @@ class UltraDeviceWorker(threading.Thread):
             revoked_ids = request_revoked_ids
             excluded_ids = request_excluded_ids
 
+            self._removal_retry_reported = False
             try:
                 if self._sdk is None or not self._connected:
                     self._finalize_full_sync_revokes(
@@ -4650,10 +4691,15 @@ class UltraDeviceWorker(threading.Thread):
                 # P3a-2 item 2: a stale delete the panel refused (its row is now kept) or an
                 # explicit revocation still pending re-requests a pass within 300 s.
                 _removal_report = getattr(engine, "_last_removal_report", None) or {}
-                self._update_removal_retry(
-                    failed=list(_removal_report.get("failed") or []),
-                    errored=bool(unconfirmed_revoked_ids),
-                )
+                if _removal_report.get("complete", True):
+                    self._update_removal_retry(
+                        failed=list(_removal_report.get("failed") or []),
+                        errored=bool(unconfirmed_revoked_ids),
+                    )
+                elif unconfirmed_revoked_ids:
+                    self._update_removal_retry(failed=[], errored=True)
+                # else: the pass stopped before its removal report -- the drain's
+                # _keep_pending_removal_retry keeps a pending retry armed (R1-06).
                 if sync_ok and unconfirmed_revoked_ids:
                     sync_ok = False
                     sync_error = "authoritative revocation unconfirmed"
@@ -4713,6 +4759,8 @@ class UltraDeviceWorker(threading.Thread):
                     error=str(exc),
                     revoked_ids=revoked_ids,
                 )
+            finally:
+                self._keep_pending_removal_retry()
             drained += 1
         return drained
 

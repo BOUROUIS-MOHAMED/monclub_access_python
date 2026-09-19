@@ -162,6 +162,95 @@ class TestFailedRemovalIsRetriedFast:
         assert w._removal_retry_at_mono is not None
 
 
+class TestRetryReviewRoundOne:
+    """R1-06/07/08/22: the retry must follow what the removal step actually did."""
+
+    def _armed(self, monkeypatch, fstate):
+        drv = FailingFallbackDriver(fail_delete={"34439"})
+        w, _c = _worker(monkeypatch, driver=drv, users=[_user(30001, "a", "")])
+        fstate.rows["34439"] = ("old-hash", True, {0})
+        _full_sync(w)                                        # the removal fails: armed
+        assert w._removal_retry_at_mono is not None
+        w._removal_retry_at_mono = 0.0                       # due now
+        w._maybe_request_removal_retry()
+        assert w._pending_full_sync_request["reason"] == "removal-retry"
+        return w
+
+    def test_a_long_failing_streak_never_overflows(self, monkeypatch):
+        """30.0 * 2 ** 1024 raised OverflowError -- on the MB2000 inside the pass, before
+        the push, so after ~85 h of one failing removal nothing reached the terminal."""
+        w, _c = _worker(monkeypatch, driver=RevokeDriver(), users=[])
+        w._removal_retry_streak = 1030
+        w._update_removal_retry(failed=["1"])
+        assert w._removal_retry_at_mono is not None and w._removal_retry_streak == 1031
+
+    def test_a_pass_that_skips_its_removal_step_does_not_rearm_from_the_last_one(
+            self, monkeypatch, fstate):
+        w = self._armed(monkeypatch, fstate)
+        orig = w._build_standalone_roster
+
+        def withheld(*a, **k):
+            out = orig(*a, **k)
+            w._last_standalone_roster_stats = {"withheld_missing_account": 1}
+            return out
+        monkeypatch.setattr(w, "_build_standalone_roster", withheld)
+        assert w._drain_full_sync_commands(limit=1) == 1
+        assert w._removal_retry_at_mono is None, (
+            "no removal was attempted: a stale failure list must not re-arm it every 300 s")
+
+    def test_a_retry_pass_that_errors_before_its_removal_step_stays_armed(
+            self, monkeypatch, fstate):
+        w = self._armed(monkeypatch, fstate)
+
+        def boom(*a, **k):
+            raise RuntimeError("roster build failed")
+        monkeypatch.setattr(w, "_build_standalone_roster", boom)
+        assert w._drain_full_sync_commands(limit=1) == 1
+        assert w._removal_retry_at_mono is not None, "the failed removal was never retried"
+
+    def test_an_unreadable_ownership_state_keeps_the_retry_armed(self, monkeypatch, fstate):
+        import app.core.db as dbmod
+        w = self._armed(monkeypatch, fstate)
+
+        def unreadable(**kw):
+            raise RuntimeError("database is locked")
+        monkeypatch.setattr(dbmod, "list_confirmed_device_sync_pins", unreadable)
+        assert w._drain_full_sync_commands(limit=1) == 1
+        assert w._removal_retry_at_mono is not None
+
+    def test_a_pullsdk_pass_that_stops_before_its_report_keeps_the_retry_armed(
+            self, monkeypatch):
+        import queue
+        import threading
+
+        class _Engine:
+            def __init__(self, cfg, logger):
+                self._last_single_device_error = "user table read failed"
+                self._last_removal_report = {"aborted": 0, "failed": [], "complete": False}
+
+            def sync_member_on_connected_sdk(self, **kw):
+                return True
+
+            def run_one_device_on_connected_sdk(self, **kw):
+                return False
+
+        w = ue.UltraDeviceWorker(
+            device={"id": 5, "name": "Door", "ipAddress": "10.0.0.5", "portNumber": 4370},
+            settings={}, popup_q=queue.Queue(), history_q=queue.Queue(),
+            stop_event=threading.Event(),
+        )
+        w._connected = True
+        w._sdk = SimpleNamespace(owns_event_source=False, _sdk="raw")
+        w._on_full_sync_finished = MagicMock()
+        w._removal_retry_streak = 1                          # a failed stale delete pending
+        monkeypatch.setattr(ue, "load_sync_cache",
+                            lambda: SimpleNamespace(users=[{"activeMembershipId": 1}], devices=[]))
+        monkeypatch.setattr("app.core.device_sync.DeviceSyncEngine", _Engine)
+        w.request_full_sync(reason="removal-retry", fingerprint_hash="h")
+        assert w._drain_full_sync_commands(limit=1) == 1
+        assert w._removal_retry_at_mono is not None
+
+
 class TestUpsertBackoffCap:
 
     def test_the_cap_is_six_hours(self):

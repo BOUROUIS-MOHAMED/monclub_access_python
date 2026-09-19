@@ -2884,7 +2884,9 @@ class DeviceSyncEngine:
         removal_notes: List[str] = list(getattr(self, "_extra_batch_notes", None) or [])
         self._extra_batch_notes = []
         failed_stale: List[str] = []
-        self._last_removal_report = {"aborted": 0, "failed": []}
+        # "complete" is set only when the pass reaches its end: a pass that stopped
+        # early must not clear the worker's removal retry (review R1-06).
+        self._last_removal_report = {"aborted": 0, "failed": [], "complete": False}
 
         def _maybe_set_progress(**changes: Any) -> None:
             if report_progress:
@@ -4031,7 +4033,8 @@ class DeviceSyncEngine:
                 )
 
             self._last_removal_report = {"aborted": int(removal_aborted),
-                                         "failed": list(failed_stale)}
+                                         "failed": list(failed_stale),
+                                         "complete": True}
             self.logger.info(
                 f"[DeviceSync] Device id={dev_id} name={dev_name!r} DONE: stale_deleted={deleted} synced_ok={ok_synced} synced_fail={failed_synced} pushed_users={pushed_users} pushed_templates={pushed_templates} warn_templates_users={warn_templates_users} state_pruned={pruned} removal_aborted={removal_aborted} removal_failed={len(failed_stale)}"
             )
