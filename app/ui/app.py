@@ -1770,6 +1770,12 @@ class MainApp:
         return True
 
     def _midnight_date_flip(self) -> None:
+        # This run's entry is spent: forget it, so that if the re-arm below cannot run (no
+        # offset any more) the 60 s tick arms a fresh one instead of trusting a dead id.
+        with self._date_flip_state_lock:
+            spent, self._date_flip_midnight_after_id = self._date_flip_midnight_after_id, None
+        if spent is not None:
+            self.after_cancel(spent)
         try:
             self._spawn_date_flip_thread("midnight", lambda: self._maybe_apply_date_flips("midnight"))
         except Exception:
