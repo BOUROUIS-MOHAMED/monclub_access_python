@@ -1087,6 +1087,24 @@ are forgotten (`clear_device_revocation_state`: state, mirror and push intent in
 a failed one keeps its row and ownership bit, the prune keeps it too, and the push-batch note says
 `REMOVAL_FAILED=n`. `[TEST: ::test_a_failed_stale_delete_keeps_its_state_for_the_retry]`
 
+**Accepted consequence: an above-ceiling departure is not removed, and says so once** (review round 1,
+R1-04/05/13 — this is the rule working as specified, not a defect). A step refused by the ceiling stays
+refused on every later pass until the count falls under the ceiling or the roster grows; the pass
+itself is `ok`, so the scheduler stamps the roster hash and the refusal is re-reported only when the
+roster changes. Triggers seen by the reviewers: 11 members of a 40-member door removed at once
+(`allowedMemberships` edited to drop a plan — they stay active members, so no revocation is sent);
+more than 25 % of a C3 panel's roster leaving between two passes (e.g. the PC off during a closure);
+a pinScheme cutover without the manual wipe (§3.2e: before P3a-2 the PullSDK stale step removed the
+old-scheme pins one by one; now the ceiling refuses them). Those members keep their cards on that door
+until an operator acts. The operator-confirmed override this needs does not exist
+(`[UNKNOWN — not built; needs a decision]`, as §3.2e already records for the MB2000).
+**Two more consequences:** a `FULL_REPLACE` panel's clear counts every panel row, so on an established
+panel it is refused on every pass (and the prune skipped) — no deployed gym is known to use
+`FULL_REPLACE`; and the PullSDK ULTRA full sync's **explicit-revocation pre-pass** removes each revoked
+member through the ownership-gated targeted path with no ceiling (unchanged from base; the MB2000 routes
+the same revocations through its ceiling-gated revoke pass) — so "every bulk removal goes through one
+ceiling" does not cover explicit PullSDK revocations. `[CODE: ultra_engine.py::_drain_full_sync_commands]`
+
 **What stays different.** MIRROR keeps its own stricter, purely fractional floor (§3.2c) — merging it
 into the shared ceiling would RELAX it below 40 members. Single-pin removals (a targeted revoke)
 are count 1, always under the ceiling; they are gated by ownership instead (§3.4). The PullSDK
@@ -1198,7 +1216,7 @@ as a retry:
 |---|---|---|
 | `ultra_engine.py::_run_standalone_member_revoke` (targeted, MB2000) | nothing deleted, `[T] MEMBER_REVOKE_SKIPPED_NOT_OWNED`, returns True (revocation finished), no full sync | False + `request_full_sync(revoke-failed)` (unchanged) |
 | `ultra_engine.py::_run_standalone_full_sync` (explicit revocations, MB2000) | once the desired roster is known, a revoked pin that LEFT it and is not owned is dropped from the pass (`_skip_unowned_revocations`): its physical-revoke phase is finalised, it is removed from the required pins, the rest of the roster is pushed and the other departed owned pins are removed; the pass is not failed and the id is never sent back to the scheduler. ACCOUNT: a person pin still desired is re-pushed, not skipped | the pass is refused before device I/O (unchanged) |
-| `device_sync.py::sync_member_on_connected_sdk` (PullSDK, targeted and the ULTRA full sync's revoke pre-pass) | nothing deleted, `engine._last_member_sync_outcome="SKIPPED_NOT_OWNED"`, returns False (never a false success); both ULTRA callers read the marker and treat it as finished (`_revoke_skipped_not_owned`) | `OWNERSHIP_UNREADABLE`, False, retried as before |
+| `device_sync.py::sync_member_on_connected_sdk` (PullSDK, targeted and the ULTRA full sync's revoke pre-pass) | nothing deleted, `engine._last_member_sync_outcome="SKIPPED_NOT_OWNED"`, returns False (never a false success); both ULTRA callers read the marker and treat it as finished (`_revoke_skipped_not_owned`) | `OWNERSHIP_UNREADABLE`, False, retried as before — also when the write-ahead intent proof (§3.4a) cannot be read: the intent row or the panel read failed (review R1-12: that was reported as the FINAL skip) |
 
 `[CODE: those symbols; db.py::get_device_sync_ownership_for_pin]` `[TEST: test_revoke_ownership_skip.py]`
 The PullSDK gate is **scheme-independent**: before P3a-2 that path deleted with no check at all,
@@ -1296,7 +1314,7 @@ settled by reading the terminal:
 | Found at the pin | Result |
 |---|---|
 | exactly the name + card MonClub wrote (PullSDK: the card; an empty intent card proves nothing) | promoted: `ownership_confirmed=1, last_ok=0`, intent deleted — the next removal step removes it (through the ceiling, §3.2g) |
-| nothing (a successful listing) | intent dropped: the write never landed |
+| nothing (a successful listing) | intent dropped: the write never landed — PullSDK: only on a NON-EMPTY whole-table read; an empty one (an empty panel, or a read that returned nothing) and an empty one-pin answer on a targeted revoke drop nothing (review R1-30) |
 | anything else | intent kept, `readback_misses+1`, never deleted |
 | listing failed | nothing changes |
 
@@ -1528,6 +1546,23 @@ projected). `[TEST: fake terminal]` `[UNVERIFIED — HARDWARE-GATED]`: that the 
 the chunk's end, the events of scans made during the chunk (`ReadRTLog`/`GetRTLog` after a write
 loop), and that the terminal's own card and fingerprint decisions — which the PC does not make — are
 unaffected by a concurrent push.
+
+**The bound is within ONE pass** (review R1-23). Each pass also has a setup — roster build, state
+reads, the capacity read, the removal step — with no yield, and the cap multiplies passes (19 for 928
+members). Measured on the fake: a desk open queued at the end of a capped pass waited 0.35 s (the next
+pass's setup), and setup alone is 17 ms median with the local fingerprint index stubbed. On the gym
+PC it is `[UNVERIFIED]` — FIELD-TEST: compare each `FULL_SYNC_START` with that pass's first
+`ZKEM_PUSH_CHUNK`. A pass that served an update mid-push withholds the roster hash (review R1-24: that
+update may itself have failed or been deferred), so the scheduler runs the next pass that re-checks it.
+
+**A dead link is rebuilt** (review R1-21). A COM call past its deadline — a door open, a sweep
+command, the daily read-back's enumeration — makes the driver abandon its STA thread and clear
+`is_connected`; the worker never looked (its only reconnect trigger is a poll returning None, and this
+driver's poll never fails), so nothing pumped events or opened the door until an unrelated push or the
+30-min refresh. `UltraDeviceWorker._push_link_lost` now checks once per loop iteration and reconnects:
+`[T] WORKER_LINK_LOST`. `[TEST: test_worker_link_recovery.py]` It does not shorten the command itself:
+while the read-back's single enumeration runs (duration on 1,860 users `[UNVERIFIED]`), no scan is
+decided and no door opens.
 
 **The desk's Open button can still time out during a push** (§3.1a): 4.1 s > the handler's 2.0 s.
 Rescue opens have no such deadline and do go through. A `_PUSH_CHUNK_MEMBERS` of about 4 would bring
@@ -2097,6 +2132,16 @@ the actual terminal.
 Declared in `zk_standalone.py`'s own module docstring: in-process COM viability, event
 field semantics, template portability, and the card-number space.
 
+Residuals the first review round accepted rather than changed (pre-existing mechanisms or paths no
+deployed gym uses): a pin whose first push failed BEFORE this branch has no intent and no ownership, so
+its revocation is `SKIPPED_NOT_OWNED` (base never removed it either, but kept the revocation pending)
+(R1-03); a vacated finger slot that is already empty answers `False`, which the removal step reads as a
+refusal, so such a pin fails on every retry — reachable after a lost state commit or a finger removed on
+the terminal by other means (R1-20/R1-28; telling "refused" from "empty" needs a template read,
+`[UNVERIFIED]` on this firmware); a PullSDK intent with no card is never proven or dropped (R1-16; the
+gym 58 C3-400s are card-only); a door open that times out inside the push yield abandons the STA thread,
+so the next outer chunk is recorded as wedged and its members as failed, then retried (R1-25).
+
 A MonClub membership id that collides with another system's user id on a shared MB2000 (gym 45):
 MonClub's write overwrites that user's name and card, and since review round 1 the pin is MonClub's
 as soon as that user row lands (§3.4), so a departure deletes the whole user; the finger-slot sweep
@@ -2300,6 +2345,7 @@ A grep on the wrong key finds nothing. `[CODE]`
 | `CAPACITY_FULL` | `ultra_engine.py::_capacity_admit` | `worker users_free fingerprints_free need_users need_fingers skipped withheld_fingers withheld_pins` (warn; `skipped` = new members not pushed, no user slot; `withheld_*` = fingers not written, no fingerprint slot — the member itself was pushed; §3.4d) |
 | `TEMPLATE_VERSION_MISMATCH` | `zk_standalone.py::push_roster` | `worker skipped device_fp_version` (warn; templates of another algorithm version not uploaded, once per push, §3.4d) |
 | `PUSH_YIELD` | `ultra_engine.py::_standalone_push_yield` | `worker member_updates pins dur_ms` — a member update or revoke served between two push chunks; `pins` = pins it handled, dropped from the rest of the push. Emitted only when one was served (§3.4e) |
+| `WORKER_LINK_LOST` | `ultra_engine.py::_push_link_lost` | `worker` (warn; a push driver reported its link down — an abandoned STA thread or a dead event pump — and the worker reconnects; review R1-21, §3.4e) |
 | `FULL_SYNC_CAPPED` | `ultra_engine.py::_run_standalone_full_sync` | `worker cap pushing left` — this pass pushes `pushing` pins and leaves `left` for its continuation (§3.4e) |
 | `ZKEM_PUSH_DONE` | `zk_standalone.py::push_roster` | `pushed failed skipped_pin ok chunks tpl_attempted tpl_ok tpl_failed op del_attempted del_ok not_attempted superseded` — `superseded` (2026-09-19) = pins the between-chunks caller handled itself and dropped (§3.4e) |
 | `ZKEM_DELETE_DONE` | `zk_standalone.py::_do_delete_users` | `deleted failed ok dur_ms` — `dur_ms` (2026-09-19) is the one STA command's duration: no door, no event pump during it (§3.4e) |

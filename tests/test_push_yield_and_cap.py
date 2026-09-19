@@ -141,6 +141,9 @@ class TestTheDoorDoesNotWait:
         assert not w._pending_member_syncs
         kw = w._on_full_sync_finished.call_args.kwargs
         assert kw["ok"] is True, "a superseded pin is not a failed pin"
+        # Review R1-24: the update served mid-push may itself have failed or been
+        # deferred; the pass must not stamp the roster hash as if it covered that pin.
+        assert kw["fingerprint_hash"] is None
 
     def test_a_revoke_queued_mid_push_is_served_and_the_pass_never_re_enrols(
             self, db, monkeypatch):

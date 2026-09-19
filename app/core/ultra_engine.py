@@ -743,6 +743,10 @@ class UltraDeviceWorker(threading.Thread):
                     if not self._connected:
                         continue
 
+                # A push driver that lost its link (review R1-21) is rebuilt here.
+                if self._push_link_lost():
+                    continue
+
                 # Drain queued door-open commands (uses the already-connected SDK)
                 _tel.set_state(self._tel_wid, "draining_cmds")
                 self._drain_commands()
@@ -1025,6 +1029,31 @@ class UltraDeviceWorker(threading.Thread):
             self._sdk = None
 
     @_tel.timed("CONN_DISCONNECT", slow_ms=200)
+    def _push_link_lost(self) -> bool:
+        """True -- and the worker disconnects, so the loop reconnects -- when a push driver
+        (MB2000) reports its link down.
+
+        The driver clears ``is_connected`` when it abandons a wedged STA thread (a COM
+        call past its deadline: the daily read-back, a sweep command, a door open) or
+        when its event pump dies. The worker's only other reconnect trigger is a poll
+        returning None, and this driver's poll is a queue drain that never fails -- so the
+        link stayed dead, with no event pumped and no door opened, until an unrelated push
+        or the 30-min connection refresh (review R1-21). One attribute read per loop.
+        """
+        sdk = self._sdk
+        if sdk is None or not self._connected or not getattr(sdk, "owns_event_source", False):
+            return False
+        try:
+            up = bool(getattr(sdk, "is_connected", True))
+        except Exception:
+            up = True
+        if up:
+            return False
+        logger.warning("%s push driver reports its link down -- reconnecting", self._prefix)
+        _tel.warn("WORKER_LINK_LOST", worker=self._tel_wid)
+        self._disconnect()
+        return True
+
     def _disconnect(self):
         if self._connected or self._sdk:
             logger.debug(f"{self._prefix} disconnect: was_connected={self._connected}")
@@ -3283,6 +3312,11 @@ class UltraDeviceWorker(threading.Thread):
                     # A superseded pin was not sent: it is neither confirmed nor failed.
                     pushed_users = [u for u in to_push
                                     if str(u.get("pin") or "").strip() not in _superseded]
+                    if _superseded or pass_touched:
+                        # The update served mid-push may itself have failed or been
+                        # deferred: do not stamp the roster hash as if this pass covered
+                        # those pins; the next pass re-checks them (review R1-24).
+                        pass_incomplete = True
                     batch_attempted = len(pushed_users)
                     sync_ok = bool(result.get("ok")) and not self._standalone_failed_pins_from_result(
                         users=pushed_users, result=result,

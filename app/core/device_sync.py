@@ -1434,7 +1434,19 @@ class DeviceSyncEngine:
             if not owned:
                 # A push MonClub never got to confirm (crash, refused authorize) leaves a
                 # write-ahead intent; the card on the panel proves it (P3a-2 item 3).
-                owned = self._prove_pullsdk_intent(sdk=sdk, did=did, pin=pin)
+                proof = self._prove_pullsdk_intent(sdk=sdk, did=did, pin=pin)
+                if proof is None:
+                    # The proof could not be read (intent row or panel read failed): the
+                    # same "cannot tell" as unreadable ownership -- a retry, never the
+                    # FINAL skip (review R1-12).
+                    self._last_member_sync_outcome = MEMBER_SYNC_OWNERSHIP_UNREADABLE
+                    self.logger.warning(
+                        "[DeviceSync] targeted member delete: device_id=%s pin=%s intent "
+                        "proof unreadable -- nothing deleted, retried later. source=%s",
+                        did, pin, source,
+                    )
+                    return False
+                owned = proof
             if not owned:
                 self._last_member_sync_outcome = MEMBER_SYNC_SKIPPED_NOT_OWNED
                 self.logger.critical(
@@ -1590,7 +1602,9 @@ class DeviceSyncEngine:
         }
         if not cands:
             return set()
-        absent = sorted(p for p in cands if p not in device_pins)
+        # An EMPTY whole-table read cannot tell an empty panel from a read that returned
+        # nothing: drop no intent on it (review R1-30).
+        absent = sorted(p for p in cands if p not in device_pins) if device_pins else []
         present = {p: it for p, it in cands.items() if p in device_pins}
         promoted: List[str] = []
         mismatched: List[str] = []
@@ -1623,23 +1637,28 @@ class DeviceSyncEngine:
             pass
         return set(promoted)
 
-    def _prove_pullsdk_intent(self, *, sdk: PullSDK, did: int, pin: str) -> bool:
+    def _prove_pullsdk_intent(self, *, sdk: PullSDK, did: int, pin: str) -> "bool | None":
         """A targeted revoke found no ownership: is this pin a push MonClub never got to
-        confirm (an intent) whose card is on the panel? One filtered read."""
+        confirm (an intent) whose card is on the panel? One filtered read.
+
+        True = proven (promoted); False = not proven; None = CANNOT TELL (the intent or
+        the panel could not be read) -- the caller retries instead of skipping for good
+        (review R1-12). An empty answer is "not proven" but does NOT drop the intent: a
+        one-pin read that answers nothing is not proof of absence; the full sync's
+        whole-table read settles it (review R1-30)."""
         try:
             intent = get_push_intent(device_id=did, pin=pin)
         except Exception:
-            return False
+            return None
         if not intent or str(intent.get("protocol") or "") not in ("", "ZK_PULLSDK"):
             return False
         if not str(intent.get("card") or "").strip():
             return False
         cards = self._read_panel_cards(sdk, pin=pin)
         if cards is None:
-            return False
+            return None
         try:
             if pin not in cards:
-                drop_push_intents(device_id=did, pins=[pin])
                 return False
             if self._same_card(intent.get("card") or "", cards.get(pin) or ""):
                 promote_push_intents(device_id=did, pins=[pin])

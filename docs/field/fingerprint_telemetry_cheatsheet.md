@@ -389,7 +389,7 @@ grep -E "\[T\] (CAPACITY_FULL|TEMPLATE_VERSION_MISMATCH)" app-*.log
 ## 4c. Did the door wait behind a push? (P3a-2)
 
 ```bash
-grep -E "\[T\] (FULL_SYNC_CAPPED|PUSH_YIELD|SYNC_DOOR_YIELD|WORKER_STALL|ZKEM_DELETE_DONE)" app-*.log
+grep -E "\[T\] (FULL_SYNC_CAPPED|PUSH_YIELD|SYNC_DOOR_YIELD|WORKER_STALL|WORKER_LINK_LOST|ZKEM_DELETE_DONE)" app-*.log
 ```
 
 During a push to the MB2000 the PC now stops every 10 members to decide the scans that came in
@@ -399,7 +399,7 @@ push. `FULL_SYNC_CAPPED pushing=50 left=N` means the terminal needed more than 5
 50 now, the rest in the next passes, one after another (the push-history page says
 `PUSH_CAPPED=N`). `WORKER_STALL state=full_sync` should now appear only if ONE group of 10 members
 takes more than 25 s — a real problem, not a long push. `ZKEM_DELETE_DONE dur_ms=` is how long a
-removal kept the door waiting (removals still go in one command). The desk's Open button can still
+removal kept the door waiting (removals still go in one command). `WORKER_LINK_LOST` means the PC lost its link to the terminal (a command never answered) and rebuilt it at once; before, QR codes and the desk button could stay dead for up to 30 minutes after that. The desk's Open button can still
 answer "timed out" when pressed during a push; the door is then NOT opened later.
 
 ---

@@ -343,3 +343,44 @@ class TestPullSdkWriteAhead:
             sdk=sdk, device=_pullsdk_device(), member_id=5, revocation=True) is False
         assert eng._last_member_sync_outcome == "SKIPPED_NOT_OWNED"
         assert _deleted_pins(sdk) == []
+
+
+class TestPullSdkProofReviewRoundOne:
+    """R1-12/R1-30: a read that FAILED, or answered nothing, is not proof of absence."""
+
+    def _revoked_sonia(self, sqlite_db):
+        from tests.test_account_pin_device_sites import _cache, _sonia, _ali_gym
+        _cache(sqlite_db, [_ali_gym(), _sonia()])
+        _cache(sqlite_db, [], valid_ids=[31000])                    # Sonia (pin 5) revoked
+        sqlite_db.record_push_intents(device_id=1, protocol="ZK_PULLSDK",
+                                      rows=[("5", "Sonia", "1901", "h")])
+
+    def test_a_failed_panel_read_during_the_proof_is_retried_not_final(self, sqlite_db):
+        self._revoked_sonia(sqlite_db)
+        sdk = _panel_sdk({"5": "1901"})
+        sdk.get_device_data_rows.side_effect = RuntimeError("GetDeviceData rc=-2")
+        eng = _engine()
+        assert eng.sync_member_on_connected_sdk(
+            sdk=sdk, device=_pullsdk_device(), member_id=5, revocation=True) is False
+        assert eng._last_member_sync_outcome == "OWNERSHIP_UNREADABLE", (
+            "a SKIPPED_NOT_OWNED here is final: the member kept the card for good")
+        assert "5" in sqlite_db.list_push_intents(device_id=1)
+
+    def test_an_empty_answer_to_the_one_pin_read_keeps_the_intent(self, sqlite_db):
+        self._revoked_sonia(sqlite_db)
+        sdk = _panel_sdk({})
+        eng = _engine()
+        assert eng.sync_member_on_connected_sdk(
+            sdk=sdk, device=_pullsdk_device(), member_id=5, revocation=True) is False
+        assert _deleted_pins(sdk) == []
+        assert "5" in sqlite_db.list_push_intents(device_id=1), (
+            "the full sync's whole-table read settles it, not an empty one-pin answer")
+
+    def test_an_empty_full_read_drops_no_intent(self, sqlite_db):
+        sqlite_db.record_push_intents(device_id=1, protocol="ZK_PULLSDK",
+                                      rows=[("150", "M150", "100150", "h")])
+        sdk = _panel_sdk({})
+        with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
+            _engine()._sync_one_device(device=_c3(), users=_c3_users(101), local_fp_index={},
+                                       default_door_id=1, changed_ids=None)
+        assert "150" in sqlite_db.list_push_intents(device_id=1)
