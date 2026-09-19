@@ -136,6 +136,14 @@ _OFFLINE_RECONCILE_INTERVAL_SEC = 600
 # so back-to-back re-runs cannot keep re-deferring a disconnected worker.
 _RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC = 5.0
 
+# P3b-1 date flips (MainApp._apply_date_flips). The 60 s tick re-checks the gym date (sleep, a
+# clock change, a missed one-shot); the one-shot runs at 00:00:05 gym time; a membership starting
+# on the applied day gets one automatic sync at 00:17:00 gym time, after the server's 00:16 job
+# that enables its QR credential (backend DailyScheduleService, cron "0 16 0 * * *").
+_DATE_FLIP_TICK_MS = 60 * 1000
+_DATE_FLIP_MIDNIGHT_GYM_TIME = (0, 0, 5)
+_FIRST_DAY_SYNC_GYM_TIME = (0, 17, 0)
+
 
 def _read_runtime_version_string() -> str:
     """Best-effort: read MonClub Access version from update.json / version.json.

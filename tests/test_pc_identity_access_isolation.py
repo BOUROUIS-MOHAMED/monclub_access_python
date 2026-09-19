@@ -58,6 +58,8 @@ def test_member_sync_and_card_verification_ignore_pc_identity_state(
     )
 
     assert identity_state in {"first_run", "offline", "revoked", "invalid_token"}
+    # P3b-1: the client stamps the PC time the answer arrived (a clock reading, identity-free).
+    assert isinstance(sync_result.pop("_clientReceivedAtEpoch"), float)
     assert sync_result == {"refreshMembers": False, "members": []}
     assert api._session.calls[0][1]["headers"]["Authorization"] == "Bearer gym-jwt"
     assert card_result["allowed"] is True

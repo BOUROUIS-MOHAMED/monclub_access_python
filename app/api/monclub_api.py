@@ -336,6 +336,11 @@ class MonClubApi:
         params = {"lastCheckTimeStamp": _now_epoch_ms()}
         if version_tokens:
             params.update(version_tokens)
+        # P3b-1: every request asks for sync protocol 2 (validity windows, the upcoming list,
+        # syncMeta). A stored windowsVersion rides in version_tokens like the other tokens. Set
+        # after them, so no stored token can replace it. A server without protocol 2 ignores
+        # the parameter and answers v1 (plan docs/plans/2026-09-19_p3b1_power_on_dates.md §2).
+        params["protocol"] = "2"
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -347,9 +352,13 @@ class MonClubApi:
             r = self._session.get(url, params=params, headers=headers, timeout=timeout)
         except Exception as e:
             raise MonClubApiError(f"getSyncData request failed: {e}") from e
+        # The PC clock right after the answer arrived: the save measures the PC/server clock
+        # skew against syncMeta.serverTime from it (db._client_received_epoch). Read here, not
+        # after the JSON decode or in the save, so neither counts as skew.
+        received_at_epoch = time.time()
 
         if r.status_code < 200 or r.status_code >= 300:
-            
+
             txt = (r.text or "").strip()
             extra = _extract_trace_info(txt)
             self.logger.info(extra)
@@ -376,6 +385,7 @@ class MonClubApi:
         if not isinstance(data, dict):
             raise MonClubApiError("getSyncData JSON is not an object/dict.")
 
+        data["_clientReceivedAtEpoch"] = received_at_epoch
         return data
 
     def ack_pending_sync(self, *, token: str, timeout: int = 10) -> bool:
