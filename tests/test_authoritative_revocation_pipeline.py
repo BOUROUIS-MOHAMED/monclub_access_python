@@ -655,6 +655,9 @@ def _run_main_sync_dispatch(
         ),
         maybe_run_offline_retry=MagicMock(),
         _maybe_emit_sync_success_feedback=MagicMock(),
+        # P3b-1: the date precheck before the fetch and the flip after each save
+        _maybe_apply_date_flips=MagicMock(),
+        _apply_date_flips=MagicMock(),
     )
 
     monkeypatch.setattr(app_module.threading, "Thread", _InlineThread)
