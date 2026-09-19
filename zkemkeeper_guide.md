@@ -861,7 +861,10 @@ _record_standalone_pin_state, _standalone_pin_hash]`
   since P3a-2 — `guide_for_agents_and_dev.md` §3.2g); the MIRROR enrolment grace window and protected-pin
   allowlist are honoured; since P3a-2 the pass runs BEFORE the push (a failed push no longer
   blocks it) and a pin whose removal the terminal refused is retried by the worker within 300 s
-  (`guide_for_agents_and_dev.md` §3.4b). Confirmed device
+  (`guide_for_agents_and_dev.md` §3.4b). Since P3b-1 one exception: on MEMBERSHIP pins, the old pin
+  of a person whose new pin this pass still has to write (a plan switch, typically produced by the
+  power-on date flip) is removed AFTER the push, and only once the new pin landed; the ceiling still
+  counts it (`guide_for_agents_and_dev.md` §3.4f, `[T] RENEWAL_HOLD`). Confirmed device
   removal clears `device_sync_state` and `device_content_mirror` in one SQLite
   transaction; a cleanup failure rolls both back and keeps the retry record.
   A percentage alone was wrong here — one departure on a 3-member rig is 33 % and
