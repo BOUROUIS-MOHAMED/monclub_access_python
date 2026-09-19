@@ -232,6 +232,11 @@ _REMOVAL_RETRY_PARKED_SEC = 1800.0
 # reconnect waits 2, 4, 8 ... up to the connect backoff cap (R2-12). The first loss after a
 # stable link reconnects at once -- that is the door path.
 _LINK_STABLE_SEC = 60.0
+# Scans carried over a link loss are decided after the reconnect only if they are at most
+# this old: a QR/TOTP or staff-RFID rescue decided later could open the door for nobody
+# (review, after round 3). A design bound, not a measurement: a member who got no answer
+# has re-scanned or left by then. [UNVERIFIED] field-tune if reconnects take longer.
+_CARRY_MAX_AGE_SEC = 10.0
 
 # P3a-2 item 5: finger-slot sweep of owned MB2000 pins never swept (guide §3.4c).
 # One sweep STA command clears at most this many slots: 3 x 71-171 ms (field-measured
@@ -1070,10 +1075,10 @@ class UltraDeviceWorker(threading.Thread):
             events = sdk.poll_rtlog_once() or []
         except Exception:
             events = []
-        if events:
-            carried = list(getattr(self, "_carried_events", None) or []) + list(events)
-            self._carried_events = carried[-256:]
         now = time.monotonic()
+        if events:
+            carried = list(getattr(self, "_carried_events", None) or []) + [(now, e) for e in events]
+            self._carried_events = carried[-256:]
         # Flapping = the link did not stay up _LINK_STABLE_SEC after the reconnect that
         # followed the PREVIOUS loss -- measured from that loss, not from the last connect,
         # so a routine CONN_REFRESH reconnect never inherits an old streak (review R3-01).
@@ -1104,10 +1109,21 @@ class UltraDeviceWorker(threading.Thread):
         return True
 
     def _take_carried_events(self) -> list:
-        """Events carried over a link loss (see _push_link_lost); emptied by the call."""
+        """Events carried over a link loss (see _push_link_lost), at most _CARRY_MAX_AGE_SEC
+        old; older ones are dropped (logged). Emptied by the call."""
         carried = list(getattr(self, "_carried_events", None) or [])
         self._carried_events = []
-        return carried
+        if not carried:
+            return []
+        now = time.monotonic()
+        fresh = [e for t, e in carried if (now - float(t)) <= _CARRY_MAX_AGE_SEC]
+        dropped = len(carried) - len(fresh)
+        if dropped:
+            logger.warning("%s %d scan(s) carried over a link loss were too old to decide "
+                           "(> %.0fs) -- dropped", self._prefix, dropped, _CARRY_MAX_AGE_SEC)
+            _tel.warn("CARRIED_EVENTS_DROPPED", worker=self._tel_wid, count=dropped,
+                      max_age_s=round(_CARRY_MAX_AGE_SEC))
+        return fresh
 
     @_tel.timed("CONN_DISCONNECT", slow_ms=200)
     def _disconnect(self):
@@ -3858,6 +3874,11 @@ class UltraDeviceWorker(threading.Thread):
                 templates_by_pin=self._without_withheld(templates_by_pin, cap_withheld),
                 unknown_fingers_pins={p for p, plan in sweep_plan.items() if plan["unknown"]},
             )
+            # What is resident for a pin whose fingers were withheld (review R3-12, the
+            # targeted path -- the full sync records it per chunk).
+            self._record_withheld_residents(
+                users, result, self._without_withheld(templates_by_pin, cap_withheld),
+                cap_withheld)
             if sweep_plan:
                 # The outcome as RECORDED: a pin whose fingers capacity withheld is not in
                 # sync, so it is not swept either -- the sweep would record the withheld

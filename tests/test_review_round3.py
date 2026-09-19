@@ -180,7 +180,6 @@ def test_r3_11_the_prune_keeps_the_grace_the_removal_step_used(db, monkeypatch):
         w._run_standalone_full_sync(reason="timer", fingerprint_hash="h")
     finally:
         drv.disconnect()
-    assert "30077" in term.users or True                 # never written here: no device user
     assert "30077" in set(db.list_confirmed_device_sync_pins(device_id=9)), (
         "neither removed nor kept: its ownership row was pruned")
 
@@ -255,3 +254,38 @@ def test_r3_06_the_prune_keeps_the_row_of_a_pin_still_on_the_panel(sqlite_db):
                                    default_door_id=1, changed_ids=None)
     assert sqlite_db.get_device_sync_ownership_for_pin(device_id=1, pin="40001") is True, (
         "the pin is still on the panel; without its row a later revocation is final-skipped")
+
+
+# ═══════════════ follow-ups (advisor, after round 3) ═══════════════
+
+def test_r3_12_the_targeted_push_records_a_withheld_pins_resident_fingers(db, monkeypatch):
+    term = TerminalZkem()
+    term.status = {11: 500, 10: 0}
+    term.add_user("30002", "B", "2", fingers=(0, 3))
+    db.save_device_sync_state_batch(device_id=9, rows=[("30002", "h-old", True, None, "0,3")])
+    drv = _make_driver(term)
+    w, _c = _worker(monkeypatch, driver=drv, users=[])
+    monkeypatch.setattr(w, "_member_row_in_db", lambda m: [
+        _user(30002, "B", "2", fps=[_tpl(0, "AAAA"), _tpl(5, "FFFF"), _tpl(6, "GGGG")])])
+    try:
+        w._run_standalone_member_sync(30002)
+    finally:
+        drv.disconnect()
+    assert term.fingers_of("30002") == {0, 5}
+    assert db.list_device_pushed_fingers(device_id=9)["30002"] == {0, 5}
+
+
+def test_a_scan_carried_over_a_long_outage_is_not_decided_late(db, monkeypatch):
+    """A rescue decided minutes after the member scanned would open the door for nobody."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ue.time, "monotonic", lambda: clock["t"])
+    evt = {"eventId": "e1", "cardNo": "123"}
+    w = _link_worker(monkeypatch, _DeadLink(events=[evt]))
+    w._connected = True
+    w._push_link_lost()
+    clock["t"] += ue._CARRY_MAX_AGE_SEC + 1.0
+    assert w._take_carried_events() == []
+    w._sdk, w._connected = _DeadLink(events=[evt]), True
+    w._push_link_lost()
+    clock["t"] += 1.0
+    assert w._take_carried_events() == [evt], "a quick reconnect still decides it"
