@@ -367,6 +367,21 @@ test_an_sdk_call_the_caller_gave_up_on_is_never_run_later,
 ::test_the_control_panel_does_not_call_an_unanswered_call_unreachable]` — the ordering tests
 script the caller's `Event.wait`, as the door tests do.
 
+**The door path, before vs after the integration (2026-09-25).** The decision code —
+`_process_event`, `_handle_totp_rescue`, `_handle_rfid_rescue`, `_open_door_with_retry`,
+`_poll_with_watchdog`, `run`, `access_verification.py::verify_totp` and `::verify_card`, the standalone
+driver's `open_door` and `poll_rtlog_once` — is identical to master `ca1e29a` (compared as syntax trees,
+comments aside). `[CODE]` Measured with §3.4e's harness (the real `UltraDeviceWorker.run()` loop over a
+fake terminal), master and this branch interleaved, three runs each of 150 scans and 150 desk
+presses: scan to decision median 267 / 255 / 273 ms on master and 247 / 265 / 266 ms here, p95
+472–481 and 451–490 ms (set by the STA loop's 250 ms idle wait), no scan lost; desk-open round trip
+median 0.4–0.5 ms and 0.4–0.9 ms, every press answered ok. One run here had a p95 of 4.0 ms and a
+worst press of 112 ms. On the 400-press probe the first run here had 21 presses of 41–93 ms, all within
+one 20 s stretch and each with the worker asleep in its idle wait (a thread not scheduled, not work on
+the door path); two re-runs of both trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a
+100-member push, a scan, a desk press and a member update waited the same on both: median 5, at most 9
+member writes. `[TEST: fake terminal; harness kept out of the repo, §3.4e]`
+
 Found while tracing this, **not changed** `[CODE]`:
 - AGENT has no queue — `DecisionService` and the local API call `DeviceWorker.open_door`
   synchronously — but `PullSDKDevice.open_door` waits on `_sdk_lock` with no timeout and
@@ -2598,27 +2613,32 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2109 passed** (2026-09-19,
-branch `claude/p3a2-push-engine`, P3a-2 push engine + six adversarial review rounds; the CLAUDE.md
-command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv` Python 3.11,
-`MONCLUB_ACCESS_DATA_ROOT` set to an empty scratch folder; exit code 0). This command: 2109 passed on
-the round-6 fix, then twice 2108 passed + 1 failed on the final text-only follow-up — the door-timing
-test below, whose two functions are byte-identical to the base. Its base
-`d09f88f` (1924 tests) measured 1922–1923 passed, 1–2 failed in repeated runs: the two known flaky
-tests below. `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **2148 passed** (2026-09-25,
+branch `claude/access-integration-0919` at f4fbda1: master `ca1e29a` + the QR grants diff, the
+heartbeat's `qrRosterCheck`, the operator-queue claim and two adversarial review rounds). Measured
+with this command and with the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`,
+twice each, interleaved with master `ca1e29a`, which gave **2109 passed** all four times; 32-bit
+`.venv` Python 3.11, a new empty `MONCLUB_ACCESS_DATA_ROOT` per run, 0 failed, exit code 0. `[TEST]`
 `tests/test_door_open_deadline.py::test_a_door_open_the_caller_gave_up_on_is_never_executed_later`
-is timing-flaky on the base too — runs of that file alone failed 13/52 on `d09f88f` (6/20, 5/12, and
-2/20 interleaved with this branch) and 16/60 on this branch (3/20, 8/20, 5/20 interleaved): the same
-rate; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]` The race behind it:
-`Event.wait(timeout)` can return while `time.monotonic()` has not passed the entry's deadline, so a
-drain right after the caller's `timeout` still sends the open (§3.1a); in isolation that scenario
-opened the door in 23 of 300 repetitions (2026-09-18, development PC, commit 75f2c7d on branch
-`claude/confident-williamson-07839d`, integrated as 079bb02). `[TEST]`
+was timing-flaky up to master `ca1e29a`: runs of that file alone failed 13/52 on `d09f88f` and 16/60
+on P3a-2. The race behind it: `Event.wait(timeout)` can return while `time.monotonic()` has not passed
+the entry's deadline, so a drain right after the caller's `timeout` still sent the open; in isolation
+that scenario opened the door in 23 of 300 repetitions (2026-09-18, development PC, commit 75f2c7d on
+branch `claude/confident-williamson-07839d`, integrated as 079bb02). The claim (§3.1a) closes it.
+Re-measured on 2026-09-25, master and this branch interleaved, a new empty data root per process:
+the file alone failed 19/60 on master and 0/60 here; the test's original body alone, 18/60 and 0/60;
+an in-process loop of that scenario opened the door 24, 33 and 36 times per 300 on master and 0 here.
+In the four full runs of each tree that day it passed every time, on master too. `[TEST]`
+`tests/test_review_round6.py::test_r6_01_a_scan_from_the_sta_threads_last_pump_is_decided` fails
+whenever the PC has been up for less than 5000 s, on master too: it sets `_connected_since_mono =
+time.monotonic() - 5000.0`, which is negative on a fresh boot, and `_maybe_refresh_connection`
+refuses a non-positive value. It passes once the uptime is past 5000 s. `[TEST: observed 2026-09-19
+and 2026-09-25 after reboots]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
-failed once in a full base run and passed 20/20 alone on both. `[UNVERIFIED]` cause (test-order).
+failed once in a full run of `d09f88f` and passed 20/20 alone. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`
-failed once in a reviewer's `-x` run and passed alone and in every full run; no `app/sdk` file
-changed on this branch. `[UNVERIFIED]` whether it is timing-flaky.
+failed once in a reviewer's `-x` run on P3a-2 and passed alone and in every full run.
+`[UNVERIFIED]` whether it is timing-flaky.
 
 > **Run the suite with `MONCLUB_ACCESS_DATA_ROOT` pointing at an empty scratch folder.** It
 > moves the whole data root (`app/core/utils.py::_candidate_data_roots`), so a test that forgets
