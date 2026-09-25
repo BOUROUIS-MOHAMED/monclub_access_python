@@ -477,9 +477,7 @@ Two layers, two vocabularies — grep both or you see half the story `[CODE: §5
 
 `500_sent_no_answer` means the command **was sent** and no answer came in time — the door may
 have opened; check it before pressing again. On an MB2000 it pairs with a driver line
-`result=timeout` (the driver stopped waiting on `ACUnlock`). `500_failed` is every other failure;
-its `err=` carries the first 40 characters of the reason the local API received. It does not prove the
-door stayed shut, so check the door before pressing again. `[CODE: local_access_api_v2.py::_handle_device_door_open]`
+`result=timeout` (the driver stopped waiting on `ACUnlock`). `[CODE: guide §3.1a]`
 
 Whether the command was even allowed:
 
