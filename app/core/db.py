@@ -1520,6 +1520,13 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
             if not isinstance(payload, dict):
                 continue      # written by _replace_sync_upcoming from a dict: not expected
             _upsert_sync_user_row(cur, payload)
+            # The promoted row is server data (its upcoming[] row), and member_shadow is the
+            # record the server's own removals are detected against: without it, a sync that
+            # later drops this membership (a cancelled pre-sale, a moved start) produced no
+            # revocation and the turnstile kept the pin (review R3). Held rows keep their
+            # shadow row (residual (c)); only promotions add one.
+            _upsert_member_shadow_row(cur, payload,
+                                      datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
             promoted += 1
         if plan.restore or promoted:
             _refresh_member_account_links(cur)
@@ -3571,6 +3578,59 @@ def get_mirror_reconcile_state(*, device_id: int) -> Dict[str, Any]:
 # -----------------------------
 
 @_tel.timed("SHADOW_DIFF", slow_ms=100, warn_ms=2000)
+def _upsert_member_shadow_row(conn: Any, u: Mapping[str, Any], now: str) -> None:
+    """One member_shadow upsert on the caller's connection/cursor (its transaction)."""
+    amid = u.get("activeMembershipId") or u.get("active_membership_id")
+    if amid is None:
+        return
+    try:
+        amid = int(amid)
+    except (TypeError, ValueError):
+        return
+    # Build fingerprint hash from fingerprints list (if any)
+    fps = u.get("fingerprints") or []
+    if fps:
+        import hashlib as _hashlib
+        fp_str = json.dumps(
+            sorted([f.get("fingerId") for f in fps if isinstance(f, dict)]),
+            sort_keys=True,
+        )
+        fp_hash = _hashlib.sha1(fp_str.encode()).hexdigest()
+    else:
+        fp_hash = None
+
+    conn.execute(
+        """
+        INSERT INTO member_shadow
+            (active_membership_id, pin, full_name, card_id, second_card_id,
+             membership_id, valid_from, valid_to, fp_hash, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(active_membership_id) DO UPDATE SET
+            pin            = excluded.pin,
+            full_name      = excluded.full_name,
+            card_id        = excluded.card_id,
+            second_card_id = excluded.second_card_id,
+            membership_id  = excluded.membership_id,
+            valid_from     = excluded.valid_from,
+            valid_to       = excluded.valid_to,
+            fp_hash        = excluded.fp_hash,
+            updated_at     = excluded.updated_at
+        """,
+        (
+            amid,
+            str(u.get("activeMembershipId") or u.get("active_membership_id") or amid),
+            u.get("fullName") or u.get("full_name"),
+            u.get("firstCardId") or u.get("first_card_id"),
+            u.get("secondCardId") or u.get("second_card_id"),
+            u.get("membershipId") or u.get("membership_id"),
+            u.get("validFrom") or u.get("valid_from"),
+            u.get("validTo") or u.get("valid_to"),
+            fp_hash,
+            now,
+        ),
+    )
+
+
 def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
     """
     Upsert the local shadow copy of backend member state.
@@ -3583,55 +3643,7 @@ def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         for u in users:
-            amid = u.get("activeMembershipId") or u.get("active_membership_id")
-            if amid is None:
-                continue
-            try:
-                amid = int(amid)
-            except (TypeError, ValueError):
-                continue
-            # Build fingerprint hash from fingerprints list (if any)
-            fps = u.get("fingerprints") or []
-            if fps:
-                import hashlib as _hashlib
-                fp_str = json.dumps(
-                    sorted([f.get("fingerId") for f in fps if isinstance(f, dict)]),
-                    sort_keys=True,
-                )
-                fp_hash = _hashlib.sha1(fp_str.encode()).hexdigest()
-            else:
-                fp_hash = None
-
-            conn.execute(
-                """
-                INSERT INTO member_shadow
-                    (active_membership_id, pin, full_name, card_id, second_card_id,
-                     membership_id, valid_from, valid_to, fp_hash, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(active_membership_id) DO UPDATE SET
-                    pin            = excluded.pin,
-                    full_name      = excluded.full_name,
-                    card_id        = excluded.card_id,
-                    second_card_id = excluded.second_card_id,
-                    membership_id  = excluded.membership_id,
-                    valid_from     = excluded.valid_from,
-                    valid_to       = excluded.valid_to,
-                    fp_hash        = excluded.fp_hash,
-                    updated_at     = excluded.updated_at
-                """,
-                (
-                    amid,
-                    str(u.get("activeMembershipId") or u.get("active_membership_id") or amid),
-                    u.get("fullName") or u.get("full_name"),
-                    u.get("firstCardId") or u.get("first_card_id"),
-                    u.get("secondCardId") or u.get("second_card_id"),
-                    u.get("membershipId") or u.get("membership_id"),
-                    u.get("validFrom") or u.get("valid_from"),
-                    u.get("validTo") or u.get("valid_to"),
-                    fp_hash,
-                    now,
-                ),
-            )
+            _upsert_member_shadow_row(conn, u, now)
 
     _run_db_write_sync("upsert_member_shadow", _write)
 
