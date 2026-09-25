@@ -439,9 +439,11 @@ waits for the next sync (the wiring arms one at 00:17, §3.8). `[CODE: backend]`
 `[TEST: local e2e S6]`
 
 *Which snapshot.* `access_verification.current_access_days(max_generation=)` keeps the snapshots of
-the last few local-state generations. The ULTRA rescue passes the generation of the data it matches
-against — the shared TOTP index's when it uses the index (the grants come from it), else its own
-list's — and the AGENT decision the older of its two cached halves, so a list loaded before a flip
+the last few local-state generations. The ULTRA rescue passes the generation of the data the scan is
+matched against — its own list's as `access_days`, and the shared TOTP index's as
+`access_days_index`, which `verify_totp` uses only when the match came through the index (it uses
+the index only while that index covers the scan's counter window; a late RTLog event falls back to
+the loop over the worker's own credentials, review round 2) — and the AGENT decision the older of its two cached halves, so a list loaded before a flip
 is checked against the day it was loaded on: checking it against the newer day refused a renewing
 member whose old plan ended yesterday until the worker's refresh landed (found in review of part D),
 and checking a newer list against the older day refused a starter and, in trial, admitted an
