@@ -47,10 +47,15 @@ def db(tmp_path, monkeypatch):
         db_module._shutdown_db_writer_for_tests()
 
 
-def _fail_once(db, monkeypatch, fragment: str) -> None:
+def _fail_once(db, monkeypatch, fragment: str) -> dict:
     """Every connection ``init_db`` opens raises sqlite3.OperationalError on the FIRST statement
-    containing ``fragment`` (whitespace-normalised) and passes everything else through."""
-    state = {"fired": False}
+    containing ``fragment`` (whitespace-normalised) and passes everything else through.
+
+    Returns a dict whose ``in_transaction`` is the connection's state at the cut. On the
+    databases seeded below the only DML that can run before each cut is the migration's own
+    first write, so True there shows that write ran -- and the post-failure checks show it was
+    rolled back, not skipped."""
+    state = {"fired": False, "in_transaction": None}
 
     class _Conn:
         def __init__(self, real):
@@ -59,6 +64,7 @@ def _fail_once(db, monkeypatch, fragment: str) -> None:
         def execute(self, sql, *args):
             if not state["fired"] and fragment in " ".join(str(sql).split()):
                 state["fired"] = True
+                state["in_transaction"] = self._real.in_transaction
                 raise sqlite3.OperationalError(f"injected at: {fragment}")
             return self._real.execute(sql, *args)
 
@@ -71,6 +77,7 @@ def _fail_once(db, monkeypatch, fragment: str) -> None:
         real = getattr(db, opener)
         monkeypatch.setattr(db, opener, lambda *a, _real=real, **k: _Conn(_real(*a, **k)))
     db._close_thread_local_conn()
+    return state
 
 
 def _raw(path, sql, params=()):
@@ -149,14 +156,15 @@ def test_a_legacy_rebuild_that_fails_midway_leaves_no_copy_behind(db, monkeypatc
         " qr_code_payload TEXT)", ()), (
         "INSERT INTO sync_users (user_id, active_membership_id, full_name) VALUES (900, 31000, 'Ali')", ()),
     )
-    _fail_once(db_module, monkeypatch, "DROP TABLE sync_users;")
+    cut = _fail_once(db_module, monkeypatch, "DROP TABLE sync_users;")
 
     with pytest.raises(sqlite3.OperationalError, match="injected"):
         _start(db_module)
+    assert cut["in_transaction"] is True, "the copy into sync_users_new ran before the cut"
 
     assert "fingerprint" in _columns(path, "sync_users")
-    if "sync_users_new" in _tables(path):
-        assert _raw(path, "SELECT count(*) FROM sync_users_new") == [(0,)], "the copy rolled back"
+    # Its CREATE ran before any DML, so it autocommitted; the copy into it rolled back.
+    assert _raw(path, "SELECT count(*) FROM sync_users_new") == [(0,)]
 
     _start(db_module)
     _start(db_module)
@@ -178,10 +186,11 @@ def test_a_firmware_profile_rebuild_that_fails_midway_keeps_the_cached_profile(d
         " authorize_body_index INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT '')", ()), (
         "INSERT INTO sync_firmware_profiles VALUES (7, 'templatev10', 4, 3, 'x')", ()),
     )
-    _fail_once(db_module, monkeypatch, "ALTER TABLE sync_firmware_profiles__new RENAME")
+    cut = _fail_once(db_module, monkeypatch, "ALTER TABLE sync_firmware_profiles__new RENAME")
 
     with pytest.raises(sqlite3.OperationalError, match="injected"):
         _start(db_module)
+    assert cut["in_transaction"] is True, "the copy into sync_firmware_profiles__new ran before the cut"
 
     assert _raw(path, "SELECT device_id, template_table FROM sync_firmware_profiles") == [(7, "templatev10")]
     # Its CREATE ran before any DML, so it autocommitted; the copy into it rolled back.
@@ -209,10 +218,11 @@ def test_a_main_account_column_that_fails_after_the_token_drop_rolls_the_drop_ba
         "INSERT INTO sync_version_tokens (key, value) VALUES ('membersVersion', 'm'),"
         " ('membersUpdatedAfter', 'u'), ('devicesVersion', 'd')", ()),
     )
-    _fail_once(db_module, monkeypatch, "ALTER TABLE sync_users ADD COLUMN main_account_id")
+    cut = _fail_once(db_module, monkeypatch, "ALTER TABLE sync_users ADD COLUMN main_account_id")
 
     with pytest.raises(sqlite3.OperationalError, match="injected"):
         _start(db_module)
+    assert cut["in_transaction"] is True, "the token DELETE ran before the cut"
 
     assert "main_account_id" not in _columns(path, "sync_users")
     assert _token_keys(path) == {"membersVersion", "membersUpdatedAfter", "devicesVersion"}
@@ -240,10 +250,11 @@ def test_a_pin_scheme_column_that_fails_after_the_token_drop_rolls_the_drop_back
           ("DELETE FROM sync_version_tokens", ()),
           ("INSERT INTO sync_version_tokens (key, value) VALUES ('devicesVersion', 'd'),"
            " ('settingsVersion', 's')", ()))
-    _fail_once(db_module, monkeypatch, "INSERT OR IGNORE INTO device_pin_scheme_seen")
+    cut = _fail_once(db_module, monkeypatch, "INSERT OR IGNORE INTO device_pin_scheme_seen")
 
     with pytest.raises(sqlite3.OperationalError, match="injected"):
         _start(db_module)
+    assert cut["in_transaction"] is True, "the devicesVersion DELETE ran before the cut"
 
     assert "pin_scheme" not in _columns(path, "sync_devices")
     assert _token_keys(path) == {"devicesVersion", "settingsVersion"}

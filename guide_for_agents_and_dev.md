@@ -1267,9 +1267,10 @@ stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone
 fails, its own exception leaves `init_db` and `get_conn` closes the connection uncommitted. Neither
 `access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
 or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
-`%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`).
-The next start runs the migration again. `[CODE: db.py::init_db; access/store.py::init_db;
-app.py::MainApp.__init__, ::run_app; access/main.py::main]`
+`%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`;
+`app/main.py` redirects to the same file; no `sys.excepthook` is installed anywhere in the repo,
+grep 2026-09-26). The next start runs the migration again. `[CODE: db.py::init_db;
+access/store.py::init_db; app.py::MainApp.__init__, ::run_app; access/main.py::main]`
 
 What rolls back is the transaction, and Python's `sqlite3` opens it at the first INSERT, UPDATE or
 DELETE, not at DDL. A `CREATE`, `DROP` or `ALTER` that ran before that is already committed. So a
@@ -1289,9 +1290,19 @@ written to do exactly that, and `_ensure_pin_scheme_column`'s also added the col
 stopped startup, by accident. `[TEST: ::test_init_db_binds_no_local_logging — the local imports are
 gone]`
 
-Making the wrappers work was measured and is worse (2026-09-25, a scratch run with the four imports
-removed and the wrappers kept, a failure injected between two statements, then clean starts; not a
-repo test):
+Making the wrappers work was measured and is worse. The run was on 2026-09-25, from scratch scripts
+that are not in the repo: the four imports removed, the wrappers kept, a failure injected between
+two statements, then clean starts.
+`[CODE: git show 832af74:app/core/db.py, init_db's four wrappers; Python's sqlite3 opens a
+transaction only at DML]`
+No test pins this. To check: on 832af74, delete the four `import logging` lines in `init_db`, then
+run `tests/test_init_db_migration_failures.py::test_a_legacy_rebuild_that_fails_midway_leaves_no_copy_behind`.
+It fails with `DID NOT RAISE`, after `[DB] schema migration _rebuild_sync_users failed` is logged:
+the first start completed with the copy committed. Calling `init_db()` twice more after the same
+`_fail_once` cut fails both times with `UNIQUE constraint failed: sync_users.user_id,
+sync_users.active_membership_id`. Checked this way on 2026-09-26.
+
+What the run showed:
 - **Legacy `sync_users` rebuild failing at `DROP TABLE sync_users`:** a full `sync_users_new` was
   committed. The next start copied the rows into it again, and it and every later start failed on
   `uq_sync_users_uid_amid`.
