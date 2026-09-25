@@ -284,6 +284,9 @@ def _revoke_skipped_not_owned(engine: Any) -> bool:
 # An operator door-open queued by request_door_open (guide §3.1a). The worker passes
 # the SDK timeout to the driver; the in-flight wait is how long a caller whose open the
 # worker already took keeps waiting for the answer after its own timeout ran out.
+# Only the standalone driver honours timeout_ms (its STA wait is max(2 s, timeout_ms));
+# PullSDKDevice.open_door ignores it, so on a panel the wait bounds the caller, not the
+# call -- "sent, no answer" then, and the pulse may still come.
 _DOOR_OPEN_SDK_TIMEOUT_MS = 4000
 _DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
 

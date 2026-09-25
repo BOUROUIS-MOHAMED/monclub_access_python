@@ -291,12 +291,17 @@ def test_the_mid_push_yield_event_counts_expired_opens_apart() -> None:
         (1, 3000, threading.Event(), {}, time.monotonic() - 0.001, ultra_engine._CommandClaim()))
     worker._cmd_queue.put_nowait(
         (2, 3000, threading.Event(), {}, time.monotonic() + 60.0, ultra_engine._CommandClaim()))
+    # P3a-2's between-chunk yield reaches the same drain: an entry whose caller already
+    # took the claim is skipped there too, however far off its deadline is.
+    gave_up = ultra_engine._CommandClaim()
+    assert gave_up.give_up() is True
+    worker._cmd_queue.put_nowait((3, 3000, threading.Event(), {}, time.monotonic() + 60.0, gave_up))
 
     with patch("app.core.ultra_engine._tel.event") as tel:
         worker._sync_yield_to_doors()
 
     yields = [c.kwargs for c in tel.call_args_list if c.args[0] == "SYNC_DOOR_YIELD"]
-    assert yields == [{"worker": worker._tel_wid, "opened": 1, "expired": 1}]
+    assert yields == [{"worker": worker._tel_wid, "opened": 1, "expired": 2}]
     worker._sdk.open_door.assert_called_once_with(door_id=2, pulse_time_ms=3000, timeout_ms=4000)
 
 

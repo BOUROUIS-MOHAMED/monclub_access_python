@@ -219,7 +219,16 @@ and a drain in that gap still opened the door. `[TEST]` The scenario of
 `::test_a_door_open_the_caller_gave_up_on_is_never_executed_later` (`timeout=0.05`, then an
 immediate `_drain_commands`), looped 300 times with the 32-bit `.venv` Python 3.11 on the dev
 PC, opened the door 23/300 times, then 15, 8 and 15 /300 in three reruns on `d09f88f`; 0/300 in
-three runs with this change. It also failed once in a full-suite run.
+three runs with this change. It also failed once in a full-suite run. Re-measured on master
+`ca1e29a` (P3a-2, 2026-09-19): 26, 51 and 50 /300, and 0/300 in three runs with the claim ported
+onto it. A stress probe with a real concurrent drainer — `_drain_commands`, `_sync_yield_to_doors`
+(the mid-push path) and the SDK queue below — sent 189 of 11,404 commands on master after their
+caller had answered "timeout", and 0 of 11,404 with the claim (same seeds, interleaved runs).
+`[TEST: scratch probes, not committed]` A competing fix (branches `claude/p3a1-door-deadline-race`
+and `claude/p3a1-sdk-cmd-abandoned`: the caller sets an `abandoned` flag once its wait has run
+out, the worker reads the flag at dequeue) was not kept. The worker can read the flag while it is
+still clear, the caller then sets it and answers "timeout", and the command is still sent; a
+forced interleaving reproduced it. The claim makes that decision under a lock. `[CODE]`
 
 Now each entry carries a `_CommandClaim` (named `_DoorOpenClaim` until the SDK queue below
 started using it too), a lock and an owner, taken once. The worker takes it
@@ -232,8 +241,9 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   "timeout". It waits up to `_DOOR_OPEN_IN_FLIGHT_WAIT_SEC` more (the 4 s `timeout_ms` the worker
   passes to the driver, plus 1 s — a chosen bound) and returns the worker's own answer, `ok=True`
   on success. (If the worker finds itself disconnected after taking it, nothing is sent and
-  that answer is `not connected` → 500 "appareil non connecté", where the caller used to say
-  `timeout` → 503.) If the extra wait also runs out it returns `sent, no answer`, never
+  the answer is `not connected` → 500 "appareil non connecté", the answer any drain on a
+  disconnected worker already gave; only a caller whose wait ran out before that answer used to
+  say `timeout` → 503.) If the extra wait also runs out it returns `sent, no answer`, never
   `timeout`; the local API answers 500 whose `error` is "commande envoyée à l'appareil, sans
   réponse à temps — vérifier si la porte s'est ouverte", not the generic "échec…".
   What the operator sees `[CODE]`: the Tauri pages' `post` throws that `error` as the
@@ -1850,6 +1860,13 @@ while the read-back's single enumeration runs (duration on 1,860 users `[UNVERIF
 decided and no door opens.
 
 **The desk's Open button can still time out during a push** (§3.1a): 4.1 s > the handler's 2.0 s.
+A press the yield has not reached when the caller's 2.0 s run out answers 503, and the claim keeps
+the yield from sending it afterwards; a press the yield takes first gets the device's answer, the
+handler waiting up to 2 s + 5 s for it. `[CODE: ultra_engine.py::request_door_open,
+::_drain_commands]` `[TEST: test_door_open_deadline.py::test_the_mid_push_yield_event_counts_expired_opens_apart]`
+On a scratch probe that held the drain for 1.9 s (a stand-in for a chunk, not the real push
+yield), master answered 503 at 2.0 s while the relay fired at 1.9 s; with the claim the answer was
+200 at 2.4 s. `[TEST: scratch probe, not committed]`
 Rescue opens have no such deadline and do go through. A `_PUSH_CHUNK_MEMBERS` of about 4 would bring
 the worst case under 2 s, but every chunk also costs a `RefreshData(1)` whose duration on the MB2000
 is `[UNKNOWN]`, so it is not changed without that number.
