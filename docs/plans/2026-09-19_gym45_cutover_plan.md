@@ -281,8 +281,8 @@ retire or switch a terminal that did not pass E6.
 | E7 | **Interlock**: unplug the network cable of every terminal that passed E6 (they keep power), or the §5.2 block on P1, **proven** | the §5.2 proof, or no link light | -- |
 | E8 | **Retire on P1, per terminal that passed E6** (D3), with Access stopped -- or D3(a)'s action in its no-engine mode. §5.1. | counts 0 for that device | Restore the `access.db` copy; stop (R2) |
 | E9 | Dashboard /gym-devices, per retired terminal: PIN scheme **"Per person"**, tick both boxes, save. | reopen EACH device: it reads "Per person" | Leave it; no PC is running |
-| E10 | Start Access on P1. In `%ProgramData%\MonClub Access\data\logs\` (the newest file) wait for, per switched device: **`[T] PIN_SCHEME_SWITCH device_id=8 previous=MEMBERSHIP scheme=ACCOUNT cleared_rows=0 first_sighting=False`** (`device_id=10` likewise). `cleared_rows=0` is the proof the retire came first. (The `[DB] … pinScheme …` line of guide §3.2e does not reach this folder: only the `zkapp` loggers write there `[CODE: app/core/logger.py]`.) | the line(s) | **`cleared_rows` ≠ 0 → STOP, do not plug in**: something pushed after the retire; Quit, E6 export, back to E5. One device switched, the other not → fix that device in /gym-devices and wait; do not switch back the one that switched. No line after a few minutes → **"Réinitialisation complète"** (clears the version tokens, forces the device refresh `[CODE]`). Still none → stop, call the developer; do not plug in (R4) |
-| E11 | **Plug the cables in** (or remove the block). P1 reconnects within ≤ 140 s `[CODE: connect backoff ≤ 120 s + 20 s connect deadline]` and re-pushes: 50 pins per pass, passes back to back, both terminals in parallel `[CODE]`. **Done, per device**, when the last `FULL_SYNC_START` has no `[T] FULL_SYNC_CAPPED` after it and its pass ends with `ZKEM_PUSH_DONE … failed=0`, and after pressing **"Synchroniser"** the log says `full sync (reason=…): all N desired pins already on the terminal -- nothing to push` with N = the number of people. Floor: ~902 people ÷ 50 = 19 passes × ≤ 22.6 s of writes ≈ **7 min per terminal**, from the one field rate (928 users / 419 s, device 8, v1.4.26, before P3a-2 `[FIELD]`); each pass also rebuilds the whole roster and runs a fingerprint-table query whose result is not used `[CODE]` (a comparable query took 6.8 s on this PC class `[FIELD]`), so it can be well above the floor -- D4 measures it. | the completion lines | `[T] PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète" (full member refresh); persists → those members get in at the desk, call the developer. `[T] CAPACITY_FULL` → Quit, quick export, read `users_free`/`fingerprints_free`, call the developer. `[T] TEMPLATE_VERSION_MISMATCH` → stop, call the developer (G3 was wrong; those members' fingers are not written; their cards still are). `[T] REVOKE_ABORTED` → the retire missed rows: Quit, §5.1 counts |
+| E10 | Start Access on P1. In `%ProgramData%\MonClub Access\data\logs\` (the newest file) wait for, per switched device: **`[T] PIN_SCHEME_SWITCH device_id=8 previous=MEMBERSHIP scheme=ACCOUNT cleared_rows=0 first_sighting=False`** (`device_id=10` likewise). `cleared_rows=0` confirms `device_sync_state` was empty when the switch arrived (it counts that table only `[CODE: db._clear_device_sync_hashes_on]`); the proof for all three tables is the §5.1 counts taken at E8. (The `[DB] … pinScheme …` line of guide §3.2e does not reach this folder: only the `zkapp` loggers write there `[CODE: app/core/logger.py]`.) | the line(s) | **`cleared_rows` ≠ 0 → STOP, do not plug in**: something pushed after the retire; Quit, E6 export, back to E5. One device switched, the other not → fix that device in /gym-devices and wait; do not switch back the one that switched. No line after a few minutes → check the log shows `getSyncData OK` (the PC reached the server); then **"Réinitialisation complète"** (clears the version tokens, forces the device refresh `[CODE]`). Still none → the switch was NOT recorded: do not plug in, go to **R3** (which first puts the dashboard back to "Per membership") and call the developer |
+| E11 | **Plug the cables in** (or remove the block). P1 reconnects within ≤ 140 s `[CODE: connect backoff ≤ 120 s + 20 s connect deadline]` and re-pushes: 50 pins per pass, passes back to back, both terminals in parallel `[CODE]`. **Done, per device**, when (1) the last pass has no `[T] FULL_SYNC_CAPPED` and ends with `[T] ZKEM_PUSH_DONE … failed=0 … tpl_failed=0` and `[T] FULL_SYNC_DONE … ok=True` (a refused template still counts as pushed, so `failed=0` alone is not enough `[CODE: zk_standalone.push_roster, ultra_engine._run_standalone_full_sync]`); then (2) **Quit and restart Access** (behind nothing now -- the switch is recorded): its start-up full pass logs `full sync (reason=startup): all N desired pins already on the terminal -- nothing to push` with N = the number of people, and no `[T] SYNC_RETRY_BACKOFF` (N also counts pins held back by the retry backoff `[CODE: ultra_engine._standalone_pins_needing_push]`). Pressing "Synchroniser" does not produce that line: without a server change it requests no push, and the timer skips an unchanged roster `[CODE: app.py::_request_running_ultra_sync, ultra_engine.UltraSyncScheduler._sync_all]`. Floor: ~902 people ÷ 50 = 19 passes × ≤ 22.6 s of writes ≈ **7 min per terminal**, from the one field rate (928 users / 419 s, device 8, v1.4.26, before P3a-2 `[FIELD]`); each pass also rebuilds the whole roster and runs a fingerprint-table query whose result is not used `[CODE]` (a comparable query took 6.8 s on this PC class `[FIELD]`), so it can be well above the floor -- D4 measures it. | the completion lines | `[T] PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète" (full member refresh); persists → those members get in at the desk, call the developer. `[T] CAPACITY_FULL` → Quit, quick export, read `users_free`/`fingerprints_free`, call the developer. `[T] TEMPLATE_VERSION_MISMATCH` → stop, call the developer (G3 was wrong; those members' fingers are not written; their cards still are). `[T] REVOKE_ABORTED` → the retire missed rows: Quit, §5.1 counts |
 | E12 | **Verify**: Quit Access on P1, `-Fingers` export of each terminal (full commands), comparison with `--scheme ACCOUNT --access-db <fresh copy>` on the G11 machine: `member_owned` = `deliverable_people`, `leftover` = the kept admins, `sha self-check` at the Phase B rate, no `people_with_terminal_only_finger`. Restart Access. `[TEST: TestVerifyingThePushUnderAccount -- the same terminal read as MEMBERSHIP shows no member]` | numbers as stated | Members missing: "Réinitialisation complète", redo E11-E12 |
 | E13 | **Doors**: 3-5 people with MonClub fingers (finger AND card), one expired member (refused), one QR code, the reception "Open" button | all as expected | See the half-state table |
 | E14 | P1: re-tick start-with-Windows, watchdog on, resume Windows Update. P2/P3 stay blocked (D2). **Open.** | -- | -- |
@@ -292,15 +292,18 @@ time out (a chunk holds the worker ~4 s against the button's 2 s wait, and an ex
 executed later) `[CODE+TEST: guide §3.1a/§3.4e]`, and QR / staff-card rescues work between chunks.
 
 #### 5.1 The retire, if done by hand (D3 = b) -- one transaction per terminal
-With Access stopped on that PC (Task Manager), a copy of `access.db` taken, and for device `D` = 8 or
-10 **only if D passed E6**:
+With Access stopped on that PC, a copy of `access.db` taken, and for device `D` = 8 or 10 **only if
+D passed E6**. Stopped means: Task Manager shows no `MonClubAccess.exe`, AND renaming the folder
+`%ProgramData%\MonClub Access\access` to `access_x` and back succeeds (Windows refuses the rename while
+any process holds `access.db` open). `BEGIN IMMEDIATE` is NOT a check: in WAL mode an idle Access passes
+it and writes again afterwards `[CODE: db.py journal_mode=WAL]`.
 ```sql
 -- baseline, recorded
 SELECT device_id, COUNT(*), SUM(ownership_confirmed) FROM device_sync_state GROUP BY device_id;
 SELECT device_id, COUNT(*) FROM device_push_intent GROUP BY device_id;
 SELECT device_id, COUNT(*) FROM device_content_mirror GROUP BY device_id;
 SELECT * FROM device_pin_scheme_switch;  SELECT * FROM device_pin_scheme_seen;
--- retire device D (BEGIN IMMEDIATE fails with "database is locked" if Access is still writing)
+-- retire device D
 BEGIN IMMEDIATE;
 DELETE FROM device_sync_state     WHERE device_id = D;
 DELETE FROM device_push_intent    WHERE device_id = D;
@@ -311,7 +314,10 @@ COMMIT;
 Never touch `device_pin_scheme_switch`, `device_pin_scheme_seen` (the history door events are read
 by), `access_history`, `member_account_link`. Rows of a device id that no longer exists (e.g. 9 in the
 2026-09-05/06 copies) have no worker and are harmless. This needs a SQLite command-line tool on the gym
-PC; none ships with Access. On a PC that never pushed to D it deletes 0 rows.
+PC; none ships with Access. P2 and P3 drove both terminals too (§3.3), so they hold rows of their own.
+**On a PC still running 1.4.33** there is no `device_push_intent` (nor the scheme-history tables):
+`git show access_1.4.33:app/core/db.py` `[CODE]` -- there, retire `device_sync_state` and
+`device_content_mirror` only, and skip the baseline SELECTs of the missing tables.
 
 #### 5.2 The firewall block (P2/P3 from E1; P1 instead of unplugging)
 Admin PowerShell:
@@ -328,10 +334,18 @@ network (P2/P3). Remove with `Remove-NetFirewallRule -DisplayName "MonClub cutov
 #### 5.3 P2 and P3 afterwards (D2)
 Started as they are, each would record the switch, re-push every account pin once, and jam its own
 removal step like §2; on 1.4.32/1.4.33 it pushes membership pins onto the account terminals `[CODE]`.
-For each PC that D2 brings back, with the gym closed: 1.4.35 installed (block still on); Access
-stopped; §5.1 for 8 and 10 (or D3's action); start it -- the block keeps it off the terminals -- until
-its log shows the two `PIN_SCHEME_SWITCH … cleared_rows=0` lines; remove the block; its one re-push
-rewrites every member. Until then the block stays.
+For each PC that D2 brings back, with the gym closed and its §5.2 block still on:
+1. Access stopped on it (untick start-with-Windows, Quit, watchdog off, the §5.1 rename test).
+2. Retire its rows for 8 and 10 **on the version it runs** (1.4.33: `device_sync_state` and
+   `device_content_mirror` only, §5.1).
+3. Install 1.4.35 with the installer's last box **"Launch MonClub Access" unticked** (it is ticked by
+   default and would start Access before the retire otherwise `[CODE: installer/MonClubAccess.iss [Run]
+   postinstall]`).
+4. Start Access. Its first start marks both devices as seen on MEMBERSHIP and then receives ACCOUNT, so
+   its log must show `[T] PIN_SCHEME_SWITCH device_id=8 … cleared_rows=0` and the same for 10 `[CODE:
+   db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
+   rows after the retire: Quit, retire again.
+5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows.
 
 ### Phase F -- the days after
 Daily, P1's log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no
@@ -353,8 +367,8 @@ can time out during a push; QR codes work between chunks.
 |---|---|---|---|
 | R1 | Before E5 | Re-tick start-with-Windows, watchdog on, restart Access on P1 | nothing changed |
 | R2 | E5 started, **not retired** (before E8) | Cables in / block off, start Access on P1, press **"Réinitialisation complète"**: it clears every per-pin record's hash and the version tokens but keeps ownership `[CODE: local_access_api_v2._handle_sync_hard_reset, db.clear_all_device_sync_hashes]`, so every member is re-pushed under MEMBERSHIP. Done when the E11 completion lines appear; check with an E12 run using `--scheme MEMBERSHIP`. | the old system's users (the goal) |
-| R3 | Retired (E8), **switch not recorded** | Cables in, start Access on P1 without switching: every member is new to it and is pushed under MEMBERSHIP `[CODE]`. Same completion check. | as R2 |
-| R4 | Switch recorded (E10), before or during E11 | Count the account pins already pushed (P1's `device_sync_state` rows with `ownership_confirmed=1` for that device). **At or under the removal ceiling** `max(10, 25 % of the roster)` (~225 for 902 people): unplug, Quit, set "Per membership", **do not retire**, start behind the interlock, plug in -- the MEMBERSHIP pass removes those owned account pins `[CODE: push_safety.check_bulk_removal]`; proof: no `REVOKE_ABORTED`, an export shows no account pin left. **Above it**: wipe again (E5-E6), retire, switch back, interlocked push. | -- |
+| R3 | Retired (E8), **switch not recorded** | First make sure the dashboard says **"Per membership"** for that device (if E9 saved "Per person", set it back and reopen the device to check) -- otherwise a first sync that fails at boot would push ~919 membership pins that the later switch then strands above the removal ceiling (§2). Then start Access on P1 **behind the interlock**, wait for `getSyncData OK` in the log, plug in: every member is new to it and is pushed under MEMBERSHIP `[CODE]`. Same completion check as E11. | as R2 |
+| R4 | Switch recorded (E10), before or during E11 | Count the account pins already pushed (P1's `device_sync_state` rows with `ownership_confirmed=1` for that device) and the unconfirmed ones (`device_push_intent` rows for it). **At or under the removal ceiling** `max(10, 25 % of the MEMBERSHIP roster)` (~229 for 919 memberships; use 225 to be safe; refused only strictly above `[CODE: push_safety.check_bulk_removal]`): unplug, Quit, set "Per membership", **do not retire**, start behind the interlock, plug in -- the MEMBERSHIP pass removes those owned account pins `[CODE: push_safety.check_bulk_removal]`; proof: no `REVOKE_ABORTED`, an export shows no account pin left -- except intent-only pins (a chunk cut off by the Quit), which leave only after the next day's read-back promotes them `[CODE: ultra_engine._promote_intents_by_readback]`. **Above it**: wipe again (E5-E6), retire, switch back, interlocked push. | -- |
 | R5 | After opening | A full second procedure | the old system's users (the goal) |
 
 **Restoring the backup instead** (`10_backup_restore_device.ps1` → `[R]`): copy ONE file into
