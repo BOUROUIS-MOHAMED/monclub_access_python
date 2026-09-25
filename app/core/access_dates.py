@@ -431,6 +431,9 @@ class AccessDaysSnapshot:
     grace_days: int
     windows: Mapping[int, AccessWindow]                    # today's set and the upcoming list
     upcoming_qr_account: Mapping[int, int] = field(default_factory=dict)
+    # activeMembershipId -> userId (member_person_link) of the windowed memberships: the person
+    # second chance of qr_date_verdict (review R4).
+    person_of: Mapping[int, int] = field(default_factory=dict)
 
     @property
     def active(self) -> bool:
@@ -490,6 +493,16 @@ def qr_date_verdict(
         return "ok"
     if unknown:
         return "unchecked"
+    # Person second chance (review R4): the stored grants can be stale -- the server recomputes a
+    # credential's grants from the account's memberships but the PC's credential diff does not see
+    # it -- so a paying member whose OTHER plan is on today's list, while the only stored grant is
+    # an expired plan whose window is still stored, was refused in trial mode (base: allowed). The
+    # same person (member_person_link userId) listed today is deliverable today.
+    persons = {snapshot.person_of.get(am) for am in ids} - {None}
+    if persons and users_by_am:
+        for row in users_by_am.values():
+            if isinstance(row, Mapping) and _positive_int(row.get("userId")) in persons:
+                return "ok"
     return "not_today"
 
 

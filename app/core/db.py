@@ -1019,10 +1019,25 @@ def load_access_days_snapshot():
             row = conn.execute("SELECT * FROM access_v2_state WHERE id = 1").fetchone()
             state = dict(row) if row is not None else {}
             today, upcoming, qr = _read_protocol2_windows(conn)
+            try:
+                links = conn.execute(
+                    "SELECT active_membership_id, user_id FROM member_person_link "
+                    "WHERE user_id IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                links = []
     except Exception:
         return None
     windows = dict(upcoming)
     windows.update(today)          # a membership in both is today's
+    person_of: Dict[int, int] = {}
+    for am, uid in links:
+        try:
+            am_i, uid_i = int(am), int(uid)
+        except (TypeError, ValueError):
+            continue
+        if am_i in windows:
+            person_of[am_i] = uid_i
     try:
         grace = max(0, int(state.get("grace_days") or 0))
     except (TypeError, ValueError):
@@ -1035,6 +1050,7 @@ def load_access_days_snapshot():
         grace_days=grace,
         windows=windows,
         upcoming_qr_account=qr,
+        person_of=person_of,
     )
 
 

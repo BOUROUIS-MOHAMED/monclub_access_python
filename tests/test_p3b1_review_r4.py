@@ -177,3 +177,65 @@ def test_with_room_for_every_new_pin_the_renewal_is_still_held(db, monkeypatch):
     assert {str(NEW1), str(N)} <= on and str(OLD1) not in on
     [hold] = [f for name, f in events if name == "RENEWAL_HOLD"]
     assert (hold["held"], hold["removed_after_push"]) == (1, 1)
+
+
+# ================================================================== 3. a stale grant of a paying member
+import random  # noqa: E402
+import time  # noqa: E402
+
+from app.core import access_verification as av  # noqa: E402
+from tests.test_totp_index import _code_for, _settings  # noqa: E402
+
+A, B, OTHER, ACCOUNT = 606, 909, 101, 5006
+
+
+def _person_row(am, frm, until, main, uid):
+    return {"activeMembershipId": am, "userId": uid, "membershipId": 3, "fullName": f"M{am}",
+            "mainAccountId": main, "accessFrom": frm, "accessUntil": until, "offDays": []}
+
+
+def _overlap_world(db, *, b_person):
+    """A (ends 09-19) and B (09-16..10-16) in today's set, no mainAccountId; the QR credential's
+    stored grants are stale: [A] only. B belongs to person ``b_person``; A to 7606."""
+    rng = random.Random(7)
+    cred = {"id": 6, "gymId": 1, "accountId": ACCOUNT, "enabled": True,
+            "secretHex": "".join(rng.choice("0123456789abcdef") for _ in range(32)),
+            "grantedActiveMembershipIds": [A], "updatedAt": "2026-09-01T10:00:00Z"}
+    other = {"id": 1, "gymId": 1, "accountId": 5101, "enabled": True,
+             "secretHex": "".join(rng.choice("0123456789abcdef") for _ in range(32)),
+             "grantedActiveMembershipIds": [OTHER], "updatedAt": "2026-09-01T10:00:00Z"}
+    eve = _v2([_person_row(A, "2026-08-20", "2026-09-19", None, 7606),
+               _person_row(B, "2026-09-16", "2026-10-16", None, b_person),
+               _person_row(OTHER, "2026-09-01", "2026-09-30", 5101, 7101)])
+    eve["gymAccessCredentials"] = [cred, other]
+    sections = {"members": True, "devices": False, "credentials": True, "settings": False}
+    db.save_sync_cache_delta(eve, sections)
+    _flip(db, "2026-09-19T20:00:05+01:00")
+    r = _flip(db, "2026-09-20T07:30:00+01:00")                 # offline power-on: A held
+    assert r["held"] == 1 and A in _ids("sync_users_held")
+    return cred
+
+
+def _scan(cred, mode):
+    av._reset_access_days_cache_for_tests()
+    creds, uam, _ = av.load_local_state()
+    s = _settings(totp_roster_check_mode=mode)
+    now = time.time()
+    return av.verify_totp_resilient(scanned=_code_for(cred, s, now), settings=s,
+                                    creds_payload=creds, users_by_am=uam, users_by_card={},
+                                    scan_epoch=now, access_days=av.current_access_days())
+
+
+def test_offline_trial_allows_a_paying_member_whose_stored_grant_is_an_expired_plan(db):
+    # Review R4: the flip held A (its expired window stays stored); the credential's stored grants
+    # are stale ([A]; the server would grant B); B's row has no mainAccountId, so the account
+    # second chance misses. Trial refused DENY_NOT_ALLOWED_TODAY; base allowed (A still listed).
+    cred = _overlap_world(db, b_person=7606)
+    r = _scan(cred, "trial")
+    assert r["allowed"] is True and r["dateCheck"] == "ok"
+
+
+def test_an_expired_grant_of_a_person_not_listed_today_is_still_refused(db):
+    cred = _overlap_world(db, b_person=7909)                   # B is somebody else
+    r = _scan(cred, "trial")
+    assert r["allowed"] is False and r["reason"] == "DENY_NOT_ALLOWED_TODAY"
