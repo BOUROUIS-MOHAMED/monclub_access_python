@@ -50,6 +50,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
+| What happens when an `init_db` step fails — the four schema migrations that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -510,24 +511,22 @@ nothing, the marker is written, and no later start touches its tokens.
 `[TEST: ::test_a_fresh_install_gets_the_marker_and_nothing_else]`
 
 *Atomic, and never lost.* The DELETE runs before the marker INSERT, both inside the one transaction
-`init_db` already has open by then (its unconditional `UPDATE access_history` backfill starts it)
-and commits at its end. A crash between them rolls both back and the next start acts again.
+`init_db` already has open by then and commits at its end. The statement that opens it comes
+earlier than the `UPDATE access_history` backfill this paragraph used to name. On every start it is
+the unconditional F-015 `DELETE FROM sync_devices` de-duplication at the latest. A migration that
+writes rows opens it sooner, for example the members helper's token DELETE on a first start. `init_db`
+has one `conn.commit()`, at the end of its `with` block. `[CODE: db.py::init_db; checked with an
+in_transaction probe on a fresh and an existing database, 2026-09-26]` A crash between them rolls
+both back and the next start acts again.
 `[TEST: ::test_a_crash_between_the_delete_and_the_marker_rolls_both_back — it checks, at the cut,
 that the DELETE had already run inside the open transaction]` An ordinary error at the INSERT is
 logged and startup goes on: the DELETE commits without the marker, so the next start drops the
 token again — a second full re-send, never a lost one; the other order could commit the marker
-without the drop. `[TEST: ::test_a_failed_marker_write_repeats_the_drop_never_loses_it]` The catch
-sits in `_run_one_shot_credentials_resend`, not inline in `init_db`: `init_db` imports `logging` in
-its own body (the stale-lock resets after its `with` block), which makes `logging` a local name for
-the whole function, so an inline `except …: logging.getLogger(…)` raises `UnboundLocalError`
-instead of logging. That is what the four wrappers already inline in `init_db` do on a failure
-(`_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
-`_ensure_main_account_id_column`, `_ensure_pin_scheme_column`): the error escapes `init_db`, whose
-transaction is then never committed, and `MainApp.__init__` calls `init_db()` unguarded.
-`[CODE: db.py::init_db — a name bound anywhere in a function body is local to all of it;
-app.py MainApp.__init__]` No test pins it. To check: monkeypatch any one of the four to raise
-`RuntimeError` and call `init_db()` on a temp database — each raises `UnboundLocalError` (run for
-all four on 2026-09-25). Not changed here.
+without the drop. `[TEST: ::test_a_failed_marker_write_repeats_the_drop_never_loses_it]` That catch
+is deliberate and sits in `_run_one_shot_credentials_resend`. The schema migrations earlier in
+`init_db` have no catch and stop startup on a failure. Before that was made the rule it happened by
+accident: their inline catches raised `UnboundLocalError` and never logged. §3.2d "A failing
+migration stops startup" says why it is now the rule.
 
 *The one-time cost.* One sync carries the whole credentials list and writes it through the diff.
 `tools/bench_credential_resend.py` times that write end to end (`save_sync_cache_delta` with only
@@ -1241,7 +1240,9 @@ per-row diff fills the column. `[CODE: db.py::_ensure_main_account_id_column, in
 
 It is **atomic**: the token DELETE runs before the ALTER, so both sit in the single transaction
 `init_db` commits at its end; a crash in between rolls both back and the next start detects the
-missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]`
+missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]` An *error*
+in between does the same, because `init_db` does not catch it (see "A failing migration stops
+startup" below). `[TEST: test_init_db_migration_failures.py::test_a_main_account_column_that_fails_after_the_token_drop_rolls_the_drop_back]`
 **The same trap on the device side (review #13).** `sync_devices.pin_scheme` also arrives NULL,
 and `devicesVersion` survives the upgrade, so the backend answers `refreshDevices=false`: a device
 set to ACCOUNT while the PC still ran the old client would read as MEMBERSHIP (no switch, no hash
@@ -1251,12 +1252,65 @@ lacks the column (measured before the `CREATE TABLE`, so a fresh install is not 
 deletes `devicesVersion` — the device section's only progress token — and records every device
 already in the table as seen on MEMBERSHIP (the old client had no other scheme, so the ACCOUNT
 value the refresh brings is a real switch, §3.2e). Same one-shot, DELETE-before-ALTER atomicity
-as the members helper. The backend half (`refreshDevices = clientDevicesVersion == null || …`) was
-read in `GymAccessController`, not run. `[CODE: db.py::_ensure_pin_scheme_column, init_db]`
-`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh]`
+as the members helper, for a crash and for an error. The backend half (`refreshDevices =
+clientDevicesVersion == null || …`) was read in `GymAccessController`, not run.
+`[CODE: db.py::_ensure_pin_scheme_column, init_db]`
+`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh,
+test_init_db_migration_failures.py::test_a_pin_scheme_column_that_fails_after_the_token_drop_rolls_the_drop_back]`
 
 If the backend in use does not emit `mainAccountId`, the refresh still runs once and the column
 stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone (§3.2b).
+
+**A failing migration stops startup — on purpose (owner's decision, 2026-09-25).** `init_db` calls
+`_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
+`_ensure_main_account_id_column` and `_ensure_pin_scheme_column` with no `try`. When one of them
+fails, its own exception leaves `init_db` and `get_conn` closes the connection uncommitted. Neither
+`access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
+or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
+`%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`).
+The next start runs the migration again. `[CODE: db.py::init_db; access/store.py::init_db;
+app.py::MainApp.__init__, ::run_app; access/main.py::main]`
+
+What rolls back is the transaction, and Python's `sqlite3` opens it at the first INSERT, UPDATE or
+DELETE, not at DDL. A `CREATE`, `DROP` or `ALTER` that ran before that is already committed. So a
+failed first start keeps the tables it had created, and a failed `_relax…` leaves an empty
+`sync_firmware_profiles__new`, which the retry drops first. `[TEST: test_init_db_migration_failures.py
+— each of the four made to fail at its entry, and each failed between two of its statements through
+a connection proxy, followed by a clean start: ::test_a_failing_migration_raises_its_own_error_and_the_next_start_completes,
+::test_a_legacy_rebuild_that_fails_midway_leaves_no_copy_behind,
+::test_a_firmware_profile_rebuild_that_fails_midway_keeps_the_cached_profile, and the two token
+tests above]`
+
+*Why not log and go on.* The four used to sit in `except …: logging.getLogger(…).error(…)` wrappers
+written to do exactly that, and `_ensure_pin_scheme_column`'s also added the column with
+`_ensure_column`. But `init_db` imported `logging` in its own body (the stale-lock resets after its
+`with` block). A name bound anywhere in a function is local to all of it, so every one of those
+`except` branches raised `UnboundLocalError` instead of logging: a failing migration already
+stopped startup, by accident. `[TEST: ::test_init_db_binds_no_local_logging — the local imports are
+gone]`
+
+Making the wrappers work was measured and is worse (2026-09-25, a scratch run with the four imports
+removed and the wrappers kept, a failure injected between two statements, then clean starts; not a
+repo test):
+- **Legacy `sync_users` rebuild failing at `DROP TABLE sync_users`:** a full `sync_users_new` was
+  committed. The next start copied the rows into it again, and it and every later start failed on
+  `uq_sync_users_uid_amid`.
+- **Firmware-profile rebuild failing at its RENAME:** the DROP of the old table was committed, a
+  later `CREATE TABLE IF NOT EXISTS` made an empty one, and the cached profile stayed in the orphan
+  copy.
+- **`pin_scheme` failing at its `devicesVersion` DELETE:** the fallback added the column, so the
+  forced device refresh never ran.
+- **`_ensure_main_account_id_column`:** it cannot go on at all. The unguarded
+  `idx_sync_users_main_account` index fails without the column, and every `sync_users` writer names
+  it.
+
+With no catch, each of these rolls back and the next clean start completes (the tests above).
+
+The cost: a fault that persists (a corrupt file, a full disk) stops the app on every start until it
+is cleared, as it already did. Not everything in `init_db` stops startup:
+- the plain `_ensure_column` adds swallow their own `ALTER` error, silently (`db.py::_ensure_column`);
+- the one-shot credentials drop logs and goes on (§3.1b "The upgrade window");
+- the stale-lock resets after the commit log and go on. `[TEST: ::test_the_stale_lock_resets_still_log_through_the_module_logging]`
 
 **`member_account_link` — membership → person, durable.** `_refresh_member_account_links` runs at
 the end of every sync_users write transaction and records each cached `(active_membership_id,
