@@ -3438,14 +3438,15 @@ class UltraDeviceWorker(threading.Thread):
                         hold_persons.add(_who)
                 if hold_persons:
                     # A hold keeps the old pin's user and finger slots until the new pin is
-                    # confirmed. On a terminal with no free slot the new pin is then refused
-                    # CAPACITY_FULL on every pass and never lands (review R2; a card moved to
-                    # the new plan then opens nothing). So the people whose new pin the
-                    # terminal has no room for right now are NOT held: their old pin goes
-                    # first, as before P3b-1, and frees the slot the new pin needs. A dry run
-                    # of the same admission (a live capacity read; only when there are holds).
-                    # Every pending new pin: to push now, or held back by the retry backoff
-                    # (a pin that keeps failing on a full terminal ends up there, review R3).
+                    # confirmed, where base freed them first. So holds are allowed only when
+                    # EVERY pending new pin -- to push now, or parked by the retry backoff --
+                    # fits in the free slots without the held ones; otherwise nobody is held and
+                    # every old pin goes first, as before P3b-1. Holding "only the people whose
+                    # own pin fits" (rounds 2-3) still let a hold take the slot another pending
+                    # pin needed -- a first-day starter, or a renewal not held and so left with
+                    # neither pin (review R4). A dry run of the same admission (a live capacity
+                    # read; only when there are holds); a pin not confirmed on the terminal counts
+                    # as new (review R3).
                     _pending_users = [u for u in users
                                       if str(u.get("pin") or "").strip() in unconfirmed_at_start]
                     try:
@@ -3457,13 +3458,13 @@ class UltraDeviceWorker(threading.Thread):
                         logger.warning("%s renewal holds: capacity dry run failed -- holding as "
                                        "usual", self._prefix, exc_info=True)
                         _dry_skipped, _dry_withheld = [], {}
-                    for _p in list(_dry_skipped) + list(_dry_withheld):
-                        _who = renewal_person_id(_pin_persons.get(str(_p)))
-                        if _who is not None and _who in hold_persons:
-                            hold_persons.discard(_who)
-                            logger.info("%s renewal hold skipped for person %s: no room on the "
-                                        "terminal for the new pin %s -- old pin removed first",
-                                        self._prefix, _who, _p)
+                    if _dry_skipped or _dry_withheld:
+                        logger.info("%s renewal holds dropped for %d person(s): the terminal has no "
+                                    "room for every pending new pin (%s) -- old pins removed first",
+                                    self._prefix, len(hold_persons),
+                                    ",".join(sorted(str(p) for p in
+                                                    list(_dry_skipped) + list(_dry_withheld))[:20]))
+                        hold_persons.clear()
             safe_to_prune = True
             removal_attempt_failed = False
             if roster_withheld:
