@@ -408,7 +408,7 @@ Every matched QR result carries `dateCheck`:
 
 | `dateCheck` | Means | Result |
 |---|---|---|
-| `ok` | a grant is deliverable on the applied gym date by its window; or a grant is on the list with no window (a fast patch, a v1 row); or `rosterCheck` is `in_roster_by_account` (a renewal whose grants are stale) | allowed as before |
+| `ok` | a grant is deliverable on the applied gym date by its window; or a grant is on the list with no window (a fast patch, a v1 row); or `rosterCheck` is `in_roster_by_account` (a renewal whose grants are stale); or a grant's person (`member_person_link` userId) has a row on the list (another current plan, review round 4) | allowed as before |
 | `not_today` | every grant is provably not deliverable today BY ITS WINDOW | **refused `DENY_NOT_ALLOWED_TODAY`, in BOTH roster modes** |
 | `unchecked` | no trusted windows (`access_days` None, `trusted=0`, no applied date), or a grant with no stored window and no row on the list — the PC knows no date for it; whether it opens is the roster check's question (trial counts it, enforce refuses it) | allowed as before |
 
@@ -462,7 +462,14 @@ the next refresh (the next scan sees the generation moved and triggers it) that 
 against the pre-flip day — in trial an ex-member held that night is admitted, which base also did
 (no date check). Reported in review round 2; not changed. `[CODE]` A reload on the scan path (the first scan
 after a bump, before the refresh warms it) cost 35 ms median on the development PC with 1,860
-synthetic windows; a cached call 1.2 µs. `[measured, dev PC; gym PC UNKNOWN]`
+synthetic windows; a cached call 1.2 µs. Re-measured 2026-09-26 with the snapshot's person map
+(1,860 windows and 1,860 `member_person_link` rows): 16–17 ms median, max 38 ms; cached 1 µs.
+`[measured, dev PC; gym PC UNKNOWN]` *The person second chance.* The PC's credential diff does not
+see a server-side change of a credential's grants, so stored grants can name only an expired plan
+of a member whose other plan is current; with that plan's expired window still stored, the date
+check refused the member in trial mode offline (base: allowed). The snapshot carries the
+`member_person_link` userIds of its windowed memberships, and a grant not deliverable today is `ok`
+when the same person has a row on the list. `[TEST: tests/test_p3b1_review_r4.py — the QR tests]`
 
 *Counting.* `record_totp_roster_check` also counts `not_today` and logs
 `[T] QR_DATE_CHECK source verdict=not_today` (no member identity). `refused` keeps its meaning (the
@@ -1822,13 +1829,17 @@ link (a membership never cached on this database, a read failure) → no hold: r
   capacity admission (§3.4d) refused the new pin on every pass while they were taken — it never
   landed (review round 2, reproduced against base). When there are holds, the full sync dry-runs the
   same admission first (`_capacity_admit(report=False, unconfirmed_is_new=True)`, a live capacity
-  read) over every pending new pin — to push now or parked by the retry backoff; a person whose new
-  pin the terminal has no room for right now is not held — the old pin goes first, as before P3b-1.
-  A new pin not confirmed on the terminal counts as needing a slot even when an earlier attempt left
-  a state row or a push intent: the first dry run counted such a pin as an update, so one failed
-  attempt on a full terminal restored the deadlock (review round 3).
+  read) over every pending new pin — to push now or parked by the retry backoff. Holds are allowed
+  only when EVERY pending new pin fits without the held slots; otherwise nobody is held and every
+  old pin goes first, as before P3b-1. A new pin not confirmed on the terminal counts as needing a
+  slot even when an earlier attempt left a state row or a push intent (review round 3). The earlier
+  per-person rule ("hold the people whose own pin fits") still let a hold take the slot another
+  pending pin needed — a first-day starter refused, or a renewal not held and so left with neither
+  pin (review round 4). So on a terminal near capacity a renewal falls back to base behaviour
+  (old pin first; the R3-21 gap for that pass) rather than costing someone else their slot.
   `[TEST: tests/test_p3b1_review_r2.py::test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_lands,
-  tests/test_p3b1_review_r3.py::test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held]`
+  tests/test_p3b1_review_r3.py::test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held,
+  tests/test_p3b1_review_r4.py — the slot tests]`
 - One removal-retry report per pass: with holds, the removal step's own result and the post-push
   failures are reported together after the push (the exception handler reports if the pass raises
   in between). One `[T] RENEWAL_HOLD worker|device_id held removed_after_push kept` per pass that
@@ -2241,7 +2252,13 @@ own revocation still arrives with the next sync and finds the pin already gone (
 `upcoming[]`): a pre-sale promoted offline and dropped by the next sync (cancelled or re-dated
 meanwhile) is then a normal revocation. Without it that sync produced no revoked id and the
 turnstile kept the pin until an unrelated full pass (review round 3).
-`[TEST: tests/test_p3b1_review_r3.py::test_a_promoted_pre_sale_the_next_sync_drops_is_revoked]` The flip bumps the local-state generation when rows move, and also
+`[TEST: tests/test_p3b1_review_r3.py::test_a_promoted_pre_sale_the_next_sync_drops_is_revoked]`
+Both shadow diffs (`apply_member_shadow_delta`, `diff_member_shadow`) now call a shadow row missing
+from the server's valid ids a revocation only when the membership also left `sync_users`
+(`_on_roster_ids`) — always true before P3b-1 at that point, since the save runs first. An answer
+still carrying the previous server day, saved just after the midnight flip, otherwise revoked the
+starter the flip after the save had put back (review round 4). The H-006 decision is taken before
+that filter, unchanged. `[TEST: tests/test_p3b1_review_r4.py — the previous-day answer tests]` The flip bumps the local-state generation when rows move, and also
 when the applied day moves while trusted, and expires the sync cache when rows move.
 `[CODE: db.py::apply_local_date_flips]` `[TEST: tests/test_protocol2_save_and_flip.py,
 tests/test_p3b1_integration_fixes.py]`
