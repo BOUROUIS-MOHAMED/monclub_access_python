@@ -1892,7 +1892,8 @@ class UltraDeviceWorker(threading.Thread):
             pending = self._cmd_queue.qsize()
             if pending:
                 drained, expired = self._drain_commands()
-                # opened = entries sent to the device (as before, whatever it answered);
+                # opened = entries taken and not skipped: handed to the driver (whatever it
+                # answered) or answered "not connected" without a call, as before;
                 # expired = entries skipped, never sent: the caller gave up or the deadline passed (§3.1a).
                 _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid,
                            opened=drained - expired, expired=expired)

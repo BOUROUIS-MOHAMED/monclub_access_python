@@ -307,8 +307,9 @@ def test_the_mid_push_yield_event_counts_expired_opens_apart() -> None:
 
 def test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false() -> None:
     # A driver answers open_door False for a refusal AND for a call it stopped waiting
-    # on; the standalone driver records which (last_open_door_result). A timed-out call
-    # was handed to the terminal and may still pulse: "sent, no answer", not a refusal.
+    # on; the standalone driver records which (last_open_door_result). A timed-out call was
+    # queued to the driver and may or may not have reached the terminal, so the door may
+    # still pulse: "sent, no answer", not a refusal.
     for recorded, expected in (("timeout", "sent, no answer"), ("false", "open_door returned False"),
                                ("exception", "open_door returned False")):
         worker = _connected_worker()

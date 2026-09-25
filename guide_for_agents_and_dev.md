@@ -208,7 +208,8 @@ connected — so an open pressed during an outage or a sync hand-off (`pause_for
 no door yield) pulsed the relay on the next reconnect, however late. `request_door_open` also
 returns a **copy** of the result box, and the worker writes `ok`/`error` in one `dict.update`,
 so the handler can no longer read a half-written pair. Mid-push, `[T] SYNC_DOOR_YIELD` carries
-`opened` (entries sent to the device, as before) and `expired` (skipped) separately.
+`opened` (entries the worker took and did not skip: handed to the driver whatever it answered, or
+answered `not connected` without a call — as before) and `expired` (skipped) separately.
 `[CODE: ultra_engine.py::request_door_open, ::_drain_commands, ::_sync_yield_to_doors]`
 `[TEST: test_door_open_deadline.py]`
 
@@ -268,7 +269,9 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   refusal. `PullSDKDevice.open_door` keeps no `last_open_door_result` and answers `False` for
   "not connected" and for any exception from `door_pulse_open` alike, so on a panel both still read
   as the refusal, as on master. That answer is a label, not proof the door stayed shut. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
-  pullsdk.py::PullSDKDevice.open_door]` `[TEST: test_mb2000_force_open.py::TestLocalApiDoorOpenChain::
+  pullsdk.py::PullSDKDevice.open_door; the not-reached case: zk_standalone.py::_call (its deadline
+  includes the time in the queue), ::_sta_main, ::_pump_events_once]`
+  `[TEST: test_mb2000_force_open.py::TestLocalApiDoorOpenChain::
   test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal, test_door_open_deadline.py::
   test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false]`
 
@@ -2834,7 +2837,7 @@ because its algorithm version differs from the terminal's, §3.4d). `[CODE: _do_
 | Event | Where | Carries |
 |---|---|---|
 | `DOOR_CMD_EXPIRED` | `ultra_engine.py::_drain_commands` | `worker door` — an operator door-open dequeued after its caller gave up or its deadline passed, **not executed** (§3.1a). Which of the two is only in the log line's `reason=` |
-| `SYNC_DOOR_YIELD` | `ultra_engine.py::_sync_yield_to_doors` | `worker opened expired` — operator opens drained between push chunks; `opened` = sent to the device (whatever it answered), `expired` = skipped. `expired` added 2026-09-18; before, `opened` counted every queued entry (§3.1a) |
+| `SYNC_DOOR_YIELD` | `ultra_engine.py::_sync_yield_to_doors` | `worker opened expired` — operator opens drained between push chunks; `opened` = taken and not skipped: handed to the driver whatever it answered (on an MB2000 a `timeout` one may never have reached `ACUnlock`, §3.1a), or answered `not connected` without a call, `expired` = skipped. `expired` added 2026-09-18; before, `opened` counted every queued entry (§3.1a) |
 | `QR_ROSTER_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict mode allowed` — one per QR scan whose verdict is not `in_roster`; no member id, name or credential (§3.1b) |
 | `QR_ROSTER_SUMMARY` | `access_verification.py::maybe_log_totp_roster_summary` | `since in_roster in_roster_by_account not_in_roster roster_empty roster_behind refused` — running totals since the process started, at most once an hour (§3.1b) |
 

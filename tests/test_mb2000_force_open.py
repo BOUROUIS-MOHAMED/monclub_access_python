@@ -569,8 +569,9 @@ class TestLocalApiDoorOpenChain:
 
     def test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal(self, v2, monkeypatch):
         # The claim keeps the desk waiting for the answer of an open the worker took
-        # (guide §3.1a). A timed-out ACUnlock was handed to the terminal and the relay
-        # may still fire, so it must not read as "the terminal refused, check the
+        # (guide §3.1a). A timed-out open was queued to the STA thread and may or may not
+        # have reached ACUnlock -- here it did -- so the relay may still fire, and it must
+        # not read as "the terminal refused, check the
         # wiring" -- the driver's False is the same for both, its recorded outcome is not.
         import app.core.ultra_engine as ue
         monkeypatch.setattr(ue, "_DOOR_OPEN_SDK_TIMEOUT_MS", 100)  # driver waits max(2 s, 0.1 s)
