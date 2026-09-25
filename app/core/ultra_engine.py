@@ -1778,7 +1778,8 @@ class UltraDeviceWorker(threading.Thread):
             caller_gave_up = not claim.take_for_worker()
             if caller_gave_up or time.monotonic() > float(deadline):
                 result_box.update({"ok": False, "error": "expired (not executed)"})
-                late_ms = round((time.monotonic() - float(deadline)) * 1000)
+                # A caller that gave up before its deadline is not late: 0, never negative.
+                late_ms = max(0, round((time.monotonic() - float(deadline)) * 1000))
                 logger.warning(
                     f"{self._prefix} CMD door_open EXPIRED (not executed): door={door_id} "
                     f"reason={'caller_gave_up' if caller_gave_up else 'deadline'} "
@@ -1795,9 +1796,19 @@ class UltraDeviceWorker(threading.Thread):
                     ok = self._sdk.open_door(
                         door_id=door_id, pulse_time_ms=pulse_ms, timeout_ms=_DOOR_OPEN_SDK_TIMEOUT_MS,
                     )
-                    result_box.update({"ok": bool(ok), "error": "" if ok else "open_door returned False"})
+                    if ok:
+                        error = ""
+                    elif getattr(self._sdk, "last_open_door_result", None) == "timeout":
+                        # The standalone driver handed ACUnlock to its STA thread and
+                        # stopped waiting (it abandons that thread): the relay may still
+                        # fire. Not a refusal -- the desk must check the door (§3.1a).
+                        error = "sent, no answer"
+                    else:
+                        error = "open_door returned False"
+                    result_box.update({"ok": bool(ok), "error": error})
                     logger.info(
                         f"{self._prefix} CMD door_open: door={door_id} pulse={pulse_ms}ms ok={ok}"
+                        + (f" error={error}" if error else "")
                     )
             except Exception as e:
                 result_box.update({"ok": False, "error": str(e)})
@@ -1830,7 +1841,8 @@ class UltraDeviceWorker(threading.Thread):
             caller_gave_up = not claim.take_for_worker()
             if caller_gave_up or time.monotonic() > float(deadline):
                 result_box.update({"ok": False, "error": "expired (not executed)"})
-                late_ms = round((time.monotonic() - float(deadline)) * 1000)
+                # A caller that gave up before its deadline is not late: 0, never negative.
+                late_ms = max(0, round((time.monotonic() - float(deadline)) * 1000))
                 logger.warning(
                     f"{self._prefix} SDK_CMD op={label} EXPIRED (not executed): "
                     f"reason={'caller_gave_up' if caller_gave_up else 'deadline'} "
@@ -1880,7 +1892,7 @@ class UltraDeviceWorker(threading.Thread):
             if pending:
                 drained, expired = self._drain_commands()
                 # opened = entries sent to the device (as before, whatever it answered);
-                # expired = entries past their caller's deadline, never sent (§3.1a).
+                # expired = entries skipped, never sent: the caller gave up or the deadline passed (§3.1a).
                 _tel.event("SYNC_DOOR_YIELD", worker=self._tel_wid,
                            opened=drained - expired, expired=expired)
         except Exception:

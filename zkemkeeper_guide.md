@@ -430,6 +430,13 @@ Every attempt emits one telemetry line — `_tel.event` for `ok`, `_tel.warn` ot
 `false` = `ACUnlock` answered `False` **or the driver was not connected** (the STA loop
 answers `False` without calling COM in that case). `[CODE]` `[TEST]`
 
+`open_door` returns `False` for every result but `ok`. The result itself is kept in
+`last_open_door_result` (written by `_door_open_event`, on the caller's thread), so the ULTRA
+worker's operator queue can answer a `timeout` — `ACUnlock` handed to the STA thread, the relay
+may still fire — as "sent, no answer" rather than as a refusal (guide §3.1a). `[CODE]`
+`[TEST: test_mb2000_force_open.py::TestDriverDoorCommand::test_false_return_is_reported_not_swallowed,
+::test_wedged_acunlock_times_out_abandons_sta_and_reports_timeout]`
+
 `door_id` is informational only: the machine number is always `1` and the MB2000 has
 one lock relay. `[CODE]`
 

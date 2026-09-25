@@ -339,6 +339,12 @@ class ZKStandaloneDevice:
     # UNVERIFIED until tools/mb2000_scripts 12/9 pass on site -- so every call is
     # logged and emits a DOOR_OPEN telemetry result; a silent no-op is impossible.
     supports_open_door = _OPEN_DOOR_FAMILY_DEFAULT
+    # The last open_door outcome, a _DOOR_OPEN_RESULTS value (None before the first).
+    # open_door answers False for a refusal AND for a timed-out ACUnlock; this lets the
+    # worker's operator queue tell them apart -- a timed-out call was handed to the
+    # terminal and the relay may still fire (guide §3.1a). Written by _door_open_event,
+    # which every open_door path calls once, on the caller's thread.
+    last_open_door_result: Optional[str] = None
     # The PullSDK "transaction" table has no analogue here: this driver reads
     # events through the COM event sink, not a table. read_transaction_rows /
     # get_table_count / delete_all_transaction_rows are all inert, so callers
@@ -592,6 +598,7 @@ class ZKStandaloneDevice:
                          clamped: bool, err: str | None = None) -> None:
         """One DOOR_OPEN telemetry line per attempt; result is from _DOOR_OPEN_RESULTS."""
         assert result in _DOOR_OPEN_RESULTS, result
+        self.last_open_door_result = result
         fields = dict(
             worker=self._tel_wid, door=door_id, result=result, delay_ds=int(delay_ds),
             dur_ms=round(float(dur_ms)), clamped=True if clamped else None,

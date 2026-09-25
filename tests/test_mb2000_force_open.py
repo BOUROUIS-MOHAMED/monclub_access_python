@@ -222,6 +222,7 @@ class TestDriverDoorCommand:
         drv.connect()
         try:
             assert drv.open_door(door_id=1, pulse_time_ms=1000) is False
+            assert drv.last_open_door_result == "false"
             assert zk.unlocks() == [("ACUnlock", 1, 10)]
             ev = _tel_calls(tel, "DOOR_OPEN")
             assert [e["result"] for e in ev] == ["false"]
@@ -300,6 +301,8 @@ class TestDriverDoorCommand:
             t0 = time.monotonic()
             assert drv.open_door(door_id=1, pulse_time_ms=1000, timeout_ms=2000) is False
             assert 1.5 <= (time.monotonic() - t0) < 6.0
+            # what the worker's operator queue reads to tell it from a refusal (§3.1a)
+            assert drv.last_open_door_result == "timeout"
             assert zk.unlock_started.is_set(), "ACUnlock was actually entered on the STA thread"
             # fence: generation bumped, thread reference dropped, flag cleared
             assert drv._sta_gen == gen0 + 1
@@ -562,6 +565,34 @@ class TestLocalApiDoorOpenChain:
             ev = _tel_calls(v2._tel, "DOOR_OPEN")
             assert [e["result"] for e in ev] == ["500_failed"]
         finally:
+            drv.disconnect()
+
+    def test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal(self, v2, monkeypatch):
+        # The claim keeps the desk waiting for the answer of an open the worker took
+        # (guide §3.1a). A timed-out ACUnlock was handed to the terminal and the relay
+        # may still fire, so it must not read as "the terminal refused, check the
+        # wiring" -- the driver's False is the same for both, its recorded outcome is not.
+        import app.core.ultra_engine as ue
+        monkeypatch.setattr(ue, "_DOOR_OPEN_SDK_TIMEOUT_MS", 100)  # driver waits max(2 s, 0.1 s)
+        zk = FakeZkem(); zk.unlock_block = threading.Event()
+        drv, _ = _make_driver(fake=zk)
+        drv.connect()
+        old_thread = drv._sta_thread
+        w = _make_worker(drv)
+        try:
+            _drain_in_background(w)
+            status, payload = _post_door_open(v2, w)
+            assert status == 500 and payload["ok"] is False
+            assert payload["detail"] == "sent, no answer"
+            assert "envoyée" in payload["error"] and "refusé" not in payload["error"]
+            assert zk.unlocks() == [("ACUnlock", 1, 30)]
+            assert drv.last_open_door_result == "timeout"
+            assert [e["result"] for e in _tel_calls(v2._tel, "DOOR_OPEN")] == ["500_sent_no_answer"]
+        finally:
+            zk.unlock_block.set()
+            deadline = time.monotonic() + 3.0
+            while old_thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.02)
             drv.disconnect()
 
     def test_cooldown_429(self, v2):

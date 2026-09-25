@@ -305,6 +305,39 @@ def test_the_mid_push_yield_event_counts_expired_opens_apart() -> None:
     worker._sdk.open_door.assert_called_once_with(door_id=2, pulse_time_ms=3000, timeout_ms=4000)
 
 
+def test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false() -> None:
+    # A driver answers open_door False for a refusal AND for a call it stopped waiting
+    # on; the standalone driver records which (last_open_door_result). A timed-out call
+    # was handed to the terminal and may still pulse: "sent, no answer", not a refusal.
+    for recorded, expected in (("timeout", "sent, no answer"), ("false", "open_door returned False"),
+                               ("exception", "open_door returned False")):
+        worker = _connected_worker()
+        worker._sdk.open_door.return_value = False
+        worker._sdk.last_open_door_result = recorded
+        ev, box = threading.Event(), {"ok": False, "error": "timeout"}
+        worker._cmd_queue.put_nowait(
+            (1, 3000, ev, box, time.monotonic() + 60.0, ultra_engine._CommandClaim()))
+
+        worker._drain_commands()
+
+        assert ev.is_set() and box == {"ok": False, "error": expected}, recorded
+
+
+def test_a_caller_give_up_logs_its_reason_and_is_never_negatively_late() -> None:
+    # A caller can take the claim before its deadline (Event.wait is not timed by
+    # time.monotonic); its skipped entry is not late, so late_by_ms is 0, not negative.
+    worker = _connected_worker()
+    gave_up = ultra_engine._CommandClaim()
+    assert gave_up.give_up() is True
+    worker._cmd_queue.put_nowait((1, 3000, threading.Event(), {}, time.monotonic() + 60.0, gave_up))
+    with patch.object(ultra_engine, "logger") as log:
+        worker._drain_commands()
+    lines = [c.args[0] for c in log.warning.call_args_list if "EXPIRED" in str(c.args[0])]
+    assert len(lines) == 1
+    assert "reason=caller_gave_up" in lines[0] and "late_by_ms=0" in lines[0]
+    worker._sdk.open_door.assert_not_called()
+
+
 def test_rescue_opens_do_not_use_the_queue() -> None:
     worker = _connected_worker()
     assert worker._open_door_with_retry(door_id=1) is True

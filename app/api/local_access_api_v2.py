@@ -4012,6 +4012,17 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 # 503 = the worker thread was blocked (Type-1 freeze) and didn't
                 # drain the command within 2s. This is the user-facing symptom.
                 _tel.warn("DOOR_OPEN", device_id=did, door=door, result="503_timeout", wait_ms=_door_ms)
+            elif err == "sent, no answer":
+                # The worker sent the open and no answer came in time (guide §3.1a):
+                # the door may have opened. Its own result, so a log reader does not
+                # take it for a refusal. Same 500 and French text as before.
+                _logger.warning(
+                    "[LocalAPI] ULTRA door open SENT, NO ANSWER (the door may have opened): "
+                    "device_id=%s door=%s", did, door,
+                )
+                ctx.send_json(500, {"ok": False, "error": _door_open_error_fr(err), "detail": err})
+                _tel.warn("DOOR_OPEN", device_id=did, door=door, result="500_sent_no_answer",
+                          wait_ms=_door_ms)
             else:
                 _logger.warning("[LocalAPI] ULTRA door open FAILED: device_id=%s door=%s error=%s", did, door, err)
                 ctx.send_json(500, {

@@ -45,7 +45,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
-| The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a |
+| The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, and field cheatsheet §6 |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
@@ -252,6 +252,24 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   a "Door open failed" notice on `TrayPanelPage`. A favourite global shortcut reports only the
   HTTP status (`lib.rs`, "HTTP 500 …"). The native tray item prints the `error` to stderr only
   (`lib.rs::post_open_door`). Not changed here.
+  The local API logs this answer as `ULTRA door open SENT, NO ANSWER` and emits
+  `[T] DOOR_OPEN result=500_sent_no_answer` (same 500, same French text), so a log reader does
+  not take it for a refusal. `[CODE: local_access_api_v2.py::_handle_device_door_open]`
+- **A timed-out call is "sent, no answer", not a refusal (review, 2026-09-25).** A driver's
+  `open_door` answers `False` both when the terminal refuses and when the driver stops waiting.
+  On the standalone driver the extra wait always outlasts the call: `open_door` gives up after
+  `max(2 s, timeout_ms)` = 4 s, abandons its STA thread (`ZKEM_STA_WEDGED`) and answers `False`,
+  so a wedged `ACUnlock` read as the terminal's refusal ("vérifier le relais et le câblage") —
+  on master the same press answered 503 at 2 s. The driver now records each outcome in
+  `last_open_door_result` (a `_DOOR_OPEN_RESULTS` value, written by `_door_open_event` on every
+  path), and `_drain_commands` answers `sent, no answer` when it is `timeout`: the command was
+  handed to the terminal and the relay may still fire. A real `False` still reads as the
+  refusal. `PullSDKDevice.open_door` records nothing and answers `False` for "not connected" and
+  for any exception from `door_pulse_open` alike, so on a panel both still read as the refusal,
+  as on master. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
+  pullsdk.py::PullSDKDevice.open_door]` `[TEST: test_mb2000_force_open.py::TestLocalApiDoorOpenChain::
+  test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal, test_door_open_deadline.py::
+  test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false]`
 
 `[CODE: ultra_engine.py::_CommandClaim, ::request_door_open, ::_drain_commands;
 local_access_api_v2.py::_door_open_error_fr]` `[TEST: test_door_open_deadline.py::
@@ -365,6 +383,16 @@ Found while tracing this, **not changed** `[CODE]`:
   The `GET`s set no abort.
 - `[T] SDK_CMD` (`_drain_sdk_commands`) is not in the §10 table, so by §10's own rule it is
   invisible to anyone reading only the table.
+- A newer press supersedes every queued door-open of the device, whatever its door:
+  `request_door_open` drains the whole queue before adding its own. On a two-door panel a
+  press on door 2 while a door-1 press still waits (a busy worker, a push chunk) answers the
+  door-1 caller `superseded`, and door 1 is not opened. Unchanged since before the claim.
+  `[CODE: ultra_engine.py::request_door_open]`
+- A standalone clock write that outlasts the driver's 10 s STA wait and then lands is reported
+  as "device refused the clock write": `zk_standalone.py::set_device_time` answers `False` on
+  any exception, timeout included, and the 25 s handler budget receives that answer.
+  Unchanged since before the claim. `[CODE: zk_standalone.py::set_device_time;
+  local_access_api_v2.py::_sync_device_clock]`
 
 ### 3.1b The QR/TOTP roster check — trial first, then enforce (2026-09-18)
 
@@ -564,13 +592,16 @@ modes together), not per device, and restart with the app. `[CODE: pc_identity.p
 `[TEST: test_pc_identity.py::test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots,
 ::test_heartbeat_qr_roster_report_is_verdict_counts_only, ::test_heartbeat_qr_roster_since_is_sent_as_utc,
 ::test_heartbeat_reads_the_real_roster_counters, ::test_heartbeat_without_readable_roster_counts_leaves_the_key_out]`
-A backend without the field ignores the key. On backend `main` (e40f8648, 2026-09-19)
+A backend without the field ignores the key. On backend `main` (e40f8648, 2026-09-19; the same at
+a98bf154, 2026-09-25, whose `GymAccessPcService` changes touch only adopt and revoke)
 `HeartbeatRequest` declares four fields (`appVersion lastSyncAt lastSyncOk turnstiles`):
 `GymAccessPcService.heartbeat` reads the first three and counts `turnstiles`, and since R0 (d9d82d68)
 `AccessDeviceStatusService.storeTurnstiles` stores `turnstiles[]` — nothing reads another key. Nothing
-enables `FAIL_ON_UNKNOWN_PROPERTIES` (no `spring.jackson.*` property, no `ObjectMapper` bean; `JacksonConfig`
-only customises `LocalDateTime`), so Spring Boot's default applies and Jackson drops the key; the
-pre-R0 heartbeat (d10ba08b, da4a6d18) has the same DTO and the same `JacksonConfig`. `[CODE: backend main
+enables `FAIL_ON_UNKNOWN_PROPERTIES`: the only `spring.jackson` property is `time-zone`
+(`application.yml` Africa/Tunis, `application-local.yml` UTC), there is no `ObjectMapper` bean, and
+`JacksonConfig` registers a `Hibernate6Module` and a lenient `LocalDateTime` deserializer, neither of
+which sets it — so Spring Boot's default applies and Jackson drops the key; the pre-R0 heartbeat
+(d10ba08b, da4a6d18) has the same DTO and the same `JacksonConfig`. `[CODE: backend main
 GymAccessPcDtos, GymAccessPcController.heartbeat, GymAccessPcService.heartbeat,
 AccessDeviceStatusService.storeTurnstiles, JacksonConfig, application*.yml]` `[UNVERIFIED]` by a live
 request, and no backend test pins it (`GymAccessPcAdditiveContractTest` covers paths and JWT, not unknown
@@ -581,7 +612,10 @@ rejection is logged and retried at the next beat. `[CODE: pc_identity.py::heartb
 `HeartbeatRequest.qrRosterCheck` (`since` bound as text, so an unreadable one cannot 400 the
 heartbeat), keeps the latest report per PC in eight nullable `gym_access_pc.qr_roster_*` columns
 through a compare-and-set update after the liveness write (a heartbeat without the key leaves the
-last report; adoption clears it; hand-run `V112`), and returns it as `PcSummary.qrRosterCheck`.
+last report; adoption clears it; hand-run `V112__add_gym_access_pc_qr_roster_check.sql`), and
+returns it as `PcSummary.qrRosterCheck`. Backend `main` has since taken `V112`
+(`V112__add_access_pc_command.sql`) and `V114`, so that file needs a free number — `V115` or later —
+before the branch is merged. `[CODE: backend main a98bf154 src/main/resources/db/migration]`
 Dashboard branch `claude/access-pcs-qr-roster-counts` shows it on `/access-pcs` as a caption under
 the state chip, with the breakdown in a tooltip. `[TEST: backend GymAccessPcServiceHeartbeatTest,
 GymAccessPcHeartbeatJsonBindingTest, GymAccessPcHeartbeatUpdateJpaTest, GymAccessPcServiceAdoptTest;
@@ -613,9 +647,14 @@ online and syncs. It closes the online gap only. `[CODE]`
   (`allowEntryPastDueDate`) rules the main sync applies — so a fast-patch credential can grant a
   membership the member list deliberately leaves out. Enforce refuses that member, which matches
   the main sync's intent, but trial counts will include them. Since 2026-09-18 such grants are
-  written even when they are a credential's only change (the next main sync writes its own back);
-  that allows nothing the member list does not: a grant allows only when it is listed, and the
-  account second chance does not read grants. `[CODE: access_verification.py::verify_totp]`
+  written even when they are a credential's only change, and they stay: the main sync re-sends
+  credentials only when the credentials token moves (`GymAccessController.computeCredentialsVersion`
+  digests the main sync's own list, which the patch does not change), and a membership trigger
+  strips only `membersVersion` (`sync_scope.py::apply_trigger_hint_to_version_tokens`). So the
+  patch's grant list lasts until another credential change, a forced refresh or a logout moves
+  the token. That allows nothing the member list does not: a grant allows only when it is listed,
+  and the account second chance does not read grants. `[CODE: access_verification.py::verify_totp;
+  sync_scope.py; backend main GymAccessController, AccessPatchBundleService]`
 - Removed members still count as `not_in_roster` only until their credential is removed by a
   sync; the counts measure the gap, not a steady state.
 `[UNVERIFIED]` How often any of these happens on a real gym — that is the trial's job.
@@ -2392,10 +2431,12 @@ is nevertheless **issued** — the switch is ON for the family by operator decis
   with `result ∈ {ok, false, exception, timeout, unsupported}` (`clamped=True` when the
   pulse was clamped, `source=` which switch level decided);
 - a `False` from the terminal reaches the desk as HTTP 500 with a French message naming
-  the FALSE return (`detail` keeps the raw string) — never as a silent success;
+  the FALSE return (`detail` keeps the raw string) — never as a silent success; an `ACUnlock`
+  the driver stopped waiting on (`result=timeout`) reaches it as "sent, no answer" instead
+  (§3.1a), because the relay may still fire;
 - the local API additionally logs `DOOR_OPEN result ∈ {200_ok, 409_unsupported,
-  429_cooldown, 503_timeout, 500_failed}` keyed by `device_id`, so one grep shows the
-  press, the refusal or the SDK answer;
+  429_cooldown, 503_timeout, 500_sent_no_answer, 500_failed}` keyed by `device_id`, so one grep
+  shows the press, the refusal or the SDK answer;
 - the door command goes through the driver's `_call()` like every other STA command, so
   the generation fence and wedge recovery are not bypassed — a hung `ACUnlock` is
   abandoned at the deadline (`result=timeout`, `ZKEM_STA_WEDGED`) and the next connect

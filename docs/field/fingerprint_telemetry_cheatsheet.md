@@ -472,8 +472,13 @@ Two layers, two vocabularies — grep both or you see half the story `[CODE: §5
 
 | Layer | Key | `result` values |
 |---|---|---|
-| local API | `device_id=` | `200_ok`, `409_unsupported`, `429_cooldown`, `503_timeout`, `500_failed` |
+| local API | `device_id=` | `200_ok`, `409_unsupported`, `429_cooldown`, `503_timeout`, `500_sent_no_answer`, `500_failed` |
 | driver | `worker=ZKEM:<id>` | `ok`, `false`, `exception`, `timeout`, `unsupported` (+ `delay_ds`, `dur_ms`, `clamped`) |
+
+`500_sent_no_answer` means the command **was sent** and no answer came in time — the door may
+have opened; check it before pressing again. On an MB2000 it pairs with a driver line
+`result=timeout` (the driver stopped waiting on `ACUnlock`). `500_failed` is a refusal or an
+error: nothing opened. `[CODE: guide §3.1a]`
 
 Whether the command was even allowed:
 
