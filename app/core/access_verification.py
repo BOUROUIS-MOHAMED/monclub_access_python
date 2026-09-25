@@ -649,6 +649,7 @@ def verify_totp(
     totp_index: Optional[Dict[str, Any]] = None,
     roster_current: bool = True,
     access_days: Optional[AccessDaysSnapshot] = None,
+    access_days_index: Optional[AccessDaysSnapshot] = None,
 ) -> Dict[str, Any]:
     """Validate a scanned QR/TOTP string.
 
@@ -662,6 +663,10 @@ def verify_totp(
 
     ``access_days`` (P3b-1, see current_access_days): the allowed-days snapshot. None, or
     a snapshot with no trusted windows, is exactly the behaviour before it existed.
+    ``access_days_index``: the snapshot to use instead when the match came from ``totp_index``
+    -- a caller whose index and own credentials are of different generations (the ULTRA
+    rescue) gives each its own day; the index is used only when it covers the scan's counter
+    window, so only this function knows which one matched (review R2).
     """
     t0 = time.perf_counter()
 
@@ -886,7 +891,7 @@ def verify_totp(
         # that matched cannot prove a windowless grant absent (the ROSTER_BEHIND rule):
         # only an index match qualifies it. Refuses in both roster modes.
         date_check = qr_date_verdict(
-            access_days,
+            access_days_index if (used_index and access_days_index is not None) else access_days,
             grants=grants,
             users_by_am=users_by_am,
             account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
@@ -953,6 +958,7 @@ def verify_totp_resilient(
     totp_index: Optional[Dict[str, Any]] = None,
     roster_current: bool = True,
     access_days: Optional[AccessDaysSnapshot] = None,
+    access_days_index: Optional[AccessDaysSnapshot] = None,
 ) -> Dict[str, Any]:
     """Validate a QR/TOTP code resiliently against unreliable clocks.
 
@@ -977,6 +983,7 @@ def verify_totp_resilient(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=now_unix,
         totp_index=totp_index, roster_current=roster_current, access_days=access_days,
+        access_days_index=access_days_index,
     )
     primary_clock = "scan" if now_unix is not None else "wall"
     # A roster or allowed-days refusal already matched a credential: the retry exists for
@@ -997,6 +1004,7 @@ def verify_totp_resilient(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
         totp_index=totp_index, roster_current=roster_current, access_days=access_days,
+        access_days_index=access_days_index,
     )
     # Allowed on the wall clock -- or refused there by the roster or allowed-days check,
     # which means the code DID match a credential: report that verdict (and let it be

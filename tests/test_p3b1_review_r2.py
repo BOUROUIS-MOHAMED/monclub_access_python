@@ -152,3 +152,135 @@ def tests_flip_app(tmp_path, monkeypatch):
     MainApp._init_date_flip_state(app)
     app.request_sync_now = MagicMock()
     return app, None
+
+
+# ================================================================== 4. the ULTRA rescue's day: index or loop
+import random  # noqa: E402
+import time  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+
+from app.core import access_verification as av  # noqa: E402
+from tests.test_totp_index import _settings  # noqa: E402
+from tests.test_totp_roster_check import _ultra_worker  # noqa: E402
+
+SECTIONS = {"members": True, "devices": False, "credentials": True, "settings": False}
+OLD, NEW, OTHER, ACCOUNT = 606, 909, 101, 5006
+
+
+def _r2_epoch(iso):
+    return datetime.fromisoformat(iso).timestamp()
+
+
+@pytest.fixture
+def _fresh_ultra():
+    av._reset_access_days_cache_for_tests()
+    ue._set_shared_local_state(None, -1)
+    ue._set_shared_totp_index(None, -1)
+    yield
+    av._reset_access_days_cache_for_tests()
+    ue._set_shared_local_state(None, -1)
+    ue._set_shared_totp_index(None, -1)
+
+
+@pytest.fixture
+def _r2b_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "r2b.db"), raising=False)
+    dbmod._shutdown_db_writer_for_tests()
+    dbmod.init_db()
+    yield dbmod
+    dbmod.invalidate_sync_cache(clear_cached=True)
+    dbmod._shutdown_db_writer_for_tests()
+
+
+def _r2_row(am, frm, until, main):
+    return {"activeMembershipId": am, "userId": 7606 if am in (OLD, NEW) else 7000 + am,
+            "membershipId": 3, "fullName": f"M{am}", "mainAccountId": main,
+            "accessFrom": frm, "accessUntil": until, "offDays": []}
+
+
+def _code_at(cred, s, t):
+    period, drift, digits, prefix = av._totp_params(s)
+    return prefix + av._totp_hotp(av._totp_hex_to_bytes(cred["secretHex"]),
+                                  av._totp_counter(int(t), period), digits)
+
+
+def _scan(worker, code, t_scan, eid):
+    from tests.test_ultra_engine import _make_event
+    iso = datetime.fromtimestamp(t_scan, tz=timezone.utc).isoformat()
+    with (
+        patch("app.core.ultra_engine.insert_access_history", return_value=1),
+        patch("app.core.ultra_engine.get_staff_membership_ids_cached", return_value=set()),
+        patch.object(worker, "_trigger_bg_cache_refresh", lambda *a, **k: None),
+    ):
+        worker._sdk.open_door.reset_mock()
+        worker._process_event(_make_event(event_id=eid, card_no=code, event_type=1, door_id=1,
+                                          event_time=iso))
+    return worker._history_q.get_nowait()
+
+
+def _late_scan_setup(db, main):
+    rng = random.Random(7)
+    c = {"id": 6, "gymId": 1, "accountId": ACCOUNT, "enabled": True,
+         "secretHex": "".join(rng.choice("0123456789abcdef") for _ in range(32)),
+         "grantedActiveMembershipIds": [OLD], "updatedAt": "2026-09-01T10:00:00Z"}
+    o = {"id": 1, "gymId": 1, "accountId": 5101, "enabled": True,
+         "secretHex": "".join(rng.choice("0123456789abcdef") for _ in range(32)),
+         "grantedActiveMembershipIds": [OTHER], "updatedAt": "2026-09-01T10:00:00Z"}
+    new_up = dict(_r2_row(NEW, "2026-09-20", "2026-10-20", main), qrAccountId=ACCOUNT)
+    eve = {"syncMeta": {"protocol": 2, "today": "2026-09-19", "horizonDays": 7,
+                        "horizonEnd": "2026-09-26", "serverTime": "2026-09-19T20:00:00.000+01:00",
+                        "snapshotAt": "2026-09-19T20:00:00.000+01:00", "reconcileSec": 600,
+                        "capabilities": ["accessWindows", "upcoming", "upcomingCredentials"]},
+           "currentWindowsVersion": "p2.7.a.b", "refreshMembers": True, "membersDeltaMode": False,
+           "users": [_r2_row(OLD, "2026-08-20", "2026-09-19", main), _r2_row(OTHER, "2026-09-01", "2026-09-30", 5101)],
+           "memberWindows": [], "upcoming": [new_up], "upcomingIds": [NEW], "upcomingCredentials": [],
+           "gymAccessCredentials": [c, o], "_clientReceivedAtEpoch": _r2_epoch("2026-09-19T20:00:02+01:00")}
+    db.save_sync_cache_delta(eve, SECTIONS)
+    db.apply_local_date_flips(pc_now_epoch=_r2_epoch("2026-09-19T20:00:05+01:00"), grace_days=0, source="save")
+
+    s = {**_settings(), "totp_roster_check_mode": "trial"}
+    g0 = db.get_local_state_generation()
+    state0 = av.load_local_state()
+    a = _ultra_worker(s, state0[0], state0[1])        # (_make_worker clears the shared state)
+    b = _ultra_worker(s, state0[0], state0[1])
+    ue._set_shared_local_state(state0, g0)                       # the pre-flip refresh published
+    ue._set_shared_totp_index(av.build_totp_index(state0[0], s, time.time(), margin=1), g0)
+    for w in (a, b):
+        w._cached_state = state0
+        w._cached_state_gen = g0
+        w._cached_pair = (state0, g0)
+    out = db.apply_local_date_flips(pc_now_epoch=_r2_epoch("2026-09-20T07:30:00+01:00"), grace_days=0,
+                                    source="startup")
+    assert out["held"] == 1 and out["promoted"] == 1
+    a.reset_fast_patch_caches()
+    b.reset_fast_patch_caches()
+    # Door A has an event first: adopts the (pre-flip) shared list; its own refresh is slow.
+    with patch.object(a, "_trigger_bg_cache_refresh", lambda *x, **k: None):
+        a._get_cached_local_state()
+    assert a._cached_pair[0] is state0          # door A holds the pre-flip list
+    # Door B then refreshes for real: post-flip list + index published.
+    target = db.get_local_state_generation()
+    b._trigger_bg_cache_refresh()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if ue._get_shared_local_state()[1] >= target and ue._get_shared_totp_index()[1] >= target:
+            break
+        time.sleep(0.02)
+    b._stop_evt.set()
+    time.sleep(0.2)
+    return c, s, a, b
+
+
+@pytest.mark.parametrize("main", [None, ACCOUNT])
+def test_a_late_scan_at_the_lagging_door_uses_the_day_of_the_credentials_it_matched(
+        _r2b_db, _fresh_ultra, main):
+    # Review R2: the index did not cover a 70 s late event, so verify_totp looped over door A's
+    # own pre-flip credentials (grants [606]) -- but the rescue had bounded the day by the
+    # index's post-flip generation, and refused a renewing member (trial) that door B admits.
+    c, s, a, b = _late_scan_setup(_r2b_db, main)
+    now = time.time()
+    t_late = now - 70
+    assert _scan(a, _code_at(c, s, now), now, "live-a").allowed is True
+    assert _scan(a, _code_at(c, s, t_late), t_late, "late-a").allowed is True
+    assert _scan(b, _code_at(c, s, t_late), t_late, "late-b").allowed is True

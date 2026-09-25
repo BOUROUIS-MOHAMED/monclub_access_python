@@ -6309,12 +6309,15 @@ class UltraDeviceWorker(threading.Thread):
             totp_index=totp_index,
             roster_current=roster_current,
             # The date snapshot of the generation of the data this scan matches against: the
-            # shared index's when it is used (the grants come from it), else this worker's own
-            # list's. Never a newer day than those grants -- that refuses a renewing member
-            # whose old plan ended yesterday -- and never an older one -- that refuses a starter
-            # and, in trial, admits an ex-member (P3b-1, guide §3.1b; review R1).
-            access_days=current_access_days(
-                max_generation=_idx_gen if totp_index is not None else own_list_gen
+            # shared index's when the index matched (the grants come from it), else this
+            # worker's own credentials'. Never a newer day than those grants -- that refuses a
+            # renewing member whose old plan ended yesterday -- and never an older one -- that
+            # refuses a starter and, in trial, admits an ex-member (P3b-1, guide §3.1b; review
+            # R1). verify_totp picks: the index is used only when it covers the scan's counter
+            # window, and a late event falls back to the loop over our own credentials (R2).
+            access_days=current_access_days(max_generation=own_list_gen),
+            access_days_index=(
+                current_access_days(max_generation=_idx_gen) if totp_index is not None else None
             ),
         )
         decision_ms = (time.monotonic() - t0) * 1000
