@@ -3577,7 +3577,6 @@ def get_mirror_reconcile_state(*, device_id: int) -> Dict[str, Any]:
 # P6: Member shadow
 # -----------------------------
 
-@_tel.timed("SHADOW_DIFF", slow_ms=100, warn_ms=2000)
 def _upsert_member_shadow_row(conn: Any, u: Mapping[str, Any], now: str) -> None:
     """One member_shadow upsert on the caller's connection/cursor (its transaction)."""
     amid = u.get("activeMembershipId") or u.get("active_membership_id")
@@ -3631,6 +3630,7 @@ def _upsert_member_shadow_row(conn: Any, u: Mapping[str, Any], now: str) -> None
     )
 
 
+@_tel.timed("SHADOW_DIFF", slow_ms=100, warn_ms=2000)
 def upsert_member_shadow(*, users: List[Dict[str, Any]]) -> None:
     """
     Upsert the local shadow copy of backend member state.
@@ -3813,6 +3813,12 @@ def apply_member_shadow_delta(
             )
 
         if deleted_ids:
+            # P3b-1: still on today's roster (a flip put it back) = not revoked; see _on_roster_ids.
+            # In place: deleted_ids is the closure's return value.
+            _kept = _on_roster_ids(conn, list(deleted_ids))
+            if _kept:
+                deleted_ids[:] = [a for a in deleted_ids if a not in _kept]
+        if deleted_ids:
             placeholders = ",".join("?" * len(deleted_ids))
             conn.execute(
                 f"DELETE FROM member_shadow WHERE active_membership_id IN ({placeholders})",
@@ -3825,6 +3831,28 @@ def apply_member_shadow_delta(
         return deleted_ids
 
     return list(_run_db_write_sync("apply_member_shadow_delta", _write))
+
+
+def _on_roster_ids(conn: Any, ids: List[int]) -> set:
+    """The ids of ``ids`` that are on sync_users now.
+
+    A shadow row missing from the server's valid ids is a revocation only if the membership also
+    left today's roster. Before P3b-1 that always held here (the save removed it before the
+    shadow step); a date flip after the save can put it back -- a starter promoted from the
+    stored upcoming list by an answer that still carries the previous server day (review R4) --
+    and revoking it then removed a member the PC admits today.
+    """
+    if not ids:
+        return set()
+    out: set = set()
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        out.update(int(r[0]) for r in conn.execute(
+            f"SELECT active_membership_id FROM sync_users WHERE active_membership_id IN ({placeholders})",
+            chunk,
+        ).fetchall())
+    return out
 
 
 def get_member_shadow_cards() -> Dict[int, str | None]:
@@ -3863,6 +3891,10 @@ def diff_member_shadow(
     with get_conn() as conn:
         shadow_rows = conn.execute("SELECT * FROM member_shadow").fetchall()
         shadow = {int(r["active_membership_id"]): dict(r) for r in shadow_rows}
+        _valid_ids = set(valid_member_ids) if valid_member_ids is not None else None
+        on_roster = _on_roster_ids(
+            conn, [a for a in shadow if _valid_ids is not None and a not in _valid_ids],
+        )
 
     incoming_ids: set[int] = set()
     new_ids: List[int] = []
@@ -3917,7 +3949,8 @@ def diff_member_shadow(
     if valid_member_ids is not None:
         valid_set = set(valid_member_ids)
         for amid in shadow:
-            if amid not in valid_set and amid not in incoming_ids:
+            # P3b-1: still on today's roster (a flip put it back) = not revoked; see _on_roster_ids.
+            if amid not in valid_set and amid not in incoming_ids and amid not in on_roster:
                 deleted_ids.append(amid)
 
     return {
