@@ -380,9 +380,10 @@ ms on master and 247 / 265 / 266 ms here, p95 472–481 and 451–490 ms (set by
 idle wait plus the worker's own empty-poll wait, up to 300 ms, `empty_backoff_max_ms`, which no scan
 wakes; neither changes here), no scan lost; desk-open round trip median 0.4–0.5 ms and 0.4–0.9 ms,
 every press answered ok. One run here had a p95 of 4.0 ms and a worst press of 112 ms. On the
-400-press probe the first run here had 21 presses of 41–93 ms, all within one 20 s stretch, each with
-the worker waiting on a thread the OS had not yet scheduled — 13 in its idle wait (`_wait_for_work`),
-8 in `_poll_with_watchdog` starting its poll thread — sampled 20 ms into the press; two re-runs of both
+400-press probe the first run here had 21 presses of 41–93 ms, all within one 20 s stretch. Sampled
+20 ms into each press, the worker was still inside a wait: 13 in `_wait_for_work` after the press had
+set its wake event, 8 in `_poll_with_watchdog`'s `t.start()` waiting for its new poll thread. Why it had
+not moved on — OS scheduling or the GIL — the probe does not show `[UNVERIFIED]`. Two re-runs of both
 trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a 100-member push — §3.4e's push
 harness, which calls the pass and the loop's own drain steps in order on one thread, not `run()` — a
 scan, a desk press and a member update waited the same on both: median 5, at most 9 member writes.
