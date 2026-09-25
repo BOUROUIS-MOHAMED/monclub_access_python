@@ -1821,9 +1821,14 @@ link (a membership never cached on this database, a read failure) → no hold: r
 - **No hold on a full terminal** (MB2000): a hold keeps the old pin's user and finger slots, and
   capacity admission (§3.4d) refused the new pin on every pass while they were taken — it never
   landed (review round 2, reproduced against base). When there are holds, the full sync dry-runs the
-  same admission first (`_capacity_admit(report=False)`, a live capacity read); a person whose new
+  same admission first (`_capacity_admit(report=False, unconfirmed_is_new=True)`, a live capacity
+  read) over every pending new pin — to push now or parked by the retry backoff; a person whose new
   pin the terminal has no room for right now is not held — the old pin goes first, as before P3b-1.
-  `[TEST: tests/test_p3b1_review_r2.py::test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_lands]`
+  A new pin not confirmed on the terminal counts as needing a slot even when an earlier attempt left
+  a state row or a push intent: the first dry run counted such a pin as an update, so one failed
+  attempt on a full terminal restored the deadlock (review round 3).
+  `[TEST: tests/test_p3b1_review_r2.py::test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_lands,
+  tests/test_p3b1_review_r3.py::test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held]`
 - One removal-retry report per pass: with holds, the removal step's own result and the post-push
   failures are reported together after the push (the exception handler reports if the pass raises
   in between). One `[T] RENEWAL_HOLD worker|device_id held removed_after_push kept` per pass that
@@ -2222,15 +2227,21 @@ verdict and `applied_date`, and — only with `trusted=1` — runs `access_dates
 - a held row deliverable again (a freeze day passed) → **restored**; a held row with no window stays
   held (nothing proves it may come back);
 - an upcoming row deliverable on the day, not on the roster nor held → **promoted** (its row replayed
-  through `_upsert_sync_user_row`); the stored upcoming list is never changed;
+  through `_upsert_sync_user_row`, and its `member_shadow` row written in the same job); the stored
+  upcoming list is never changed;
 - a row with no window (one a fast patch wrote — the patch drops its stored window — or a v1
   period) is never moved.
 
 Because the rows really leave `sync_users`, every reader — the device roster, the targeted member
 sync, the ACCOUNT collapse, `load_local_state` (cards and QR), the Access UI members list — sees the
-day's roster with no reader-side filter. `member_shadow` is NOT touched: the server's own revocation
-still arrives with the next sync and finds the pin already gone (the known false
-`SKIPPED_NOT_OWNED` of §7 R3-15). The flip bumps the local-state generation when rows move, and also
+day's roster with no reader-side filter. `member_shadow` is NOT touched for held rows: the server's
+own revocation still arrives with the next sync and finds the pin already gone (the known false
+`SKIPPED_NOT_OWNED` of §7 R3-15). A **promotion** does write the promoted row's `member_shadow` row
+(`_upsert_member_shadow_row`, the same write the sync uses; the row is server data from
+`upcoming[]`): a pre-sale promoted offline and dropped by the next sync (cancelled or re-dated
+meanwhile) is then a normal revocation. Without it that sync produced no revoked id and the
+turnstile kept the pin until an unrelated full pass (review round 3).
+`[TEST: tests/test_p3b1_review_r3.py::test_a_promoted_pre_sale_the_next_sync_drops_is_revoked]` The flip bumps the local-state generation when rows move, and also
 when the applied day moves while trusted, and expires the sync cache when rows move.
 `[CODE: db.py::apply_local_date_flips]` `[TEST: tests/test_protocol2_save_and_flip.py,
 tests/test_p3b1_integration_fixes.py]`
@@ -2240,8 +2251,9 @@ flagged `offDaysBeyondHorizon` is **kept inside its window** there (the end date
 This is a PC policy — the server states no default — and an **owner decision**; memberships
 starting or unfreezing after `horizonEnd` are in no list and wait for a sync.
 `[CODE: access_dates.py::window_status]` **Offline grace** (`offline_revoke_grace_days`, Access
-config, default 0; compared as a day count, so any value is safe — a date sum overflowed past ~2.9
-million days, review round 2): on a day AFTER the last server day only, a membership past its `accessUntil`
+config, default 0; capped at `access_dates.GRACE_DAYS_MAX` = 36500 days by the config normaliser,
+the flip and the config page, and compared as a day count — a date sum overflowed past ~2.9 million
+days (review round 2) and the SQLite write past 2**63-1 (review round 3)): on a day AFTER the last server day only, a membership past its `accessUntil`
 stays that many days (never a freeze day or a future start). `[TEST: ::TestWindows]`
 
 **The gym date and the clock** (`access_dates.evaluate_gym_date`). P = the PC's date in Tunis time
@@ -2296,9 +2308,15 @@ unless manual sync mode is on (§3.6, the turnstiles change only when the admin 
 *running* ULTRA engine for a full pass (`request_sync_now(changed_ids=None, reason="date-flip")`,
 removals first per §3.4b). Dropping, not just expiring, the snapshot matters: `load_sync_cache`
 serves an expired snapshot while its reload runs, and the full pass pushed the pre-flip roster when
-it drained inside that window (review round 1). Every `invalidate_sync_cache` also bumps an epoch: a
-load already in flight (it may have read the database before the change) is never installed, and a
-reader that waited for it loads again — nothing blocks the flip's own thread. It never asks the
+it drained inside that window (review round 1). The cache still loads ONE at a time (as in base);
+every `invalidate_sync_cache` bumps an epoch that each load carries: a load that finishes at the
+current epoch is installed fresh; one that finishes after a plain invalidation is installed expired
+(newer than what it replaces) and one follow-up load starts; one that started before a clearing
+invalidation (the flip's) is never installed, and readers wait for the follow-up — nothing blocks
+the flip's own thread. The first version released the in-flight marker on every invalidation, which
+started one concurrent full load per invalidation during a burst (review round 3: 20 loads, 4 at
+once over 3 s, against 5 and 1 in base). `[TEST: tests/test_p3b1_review_r3.py — the sync-cache
+tests]` It never asks the
 backend for a sync, so a flip cannot start a sync loop. The precheck (`db.gym_date_status`) also
 reports the offline grace the last flip applied, and the app flips when the configured value differs
 (`_date_flip_needed`) — a config PATCH writes `self.cfg` only, so a grace change used to wait for the
