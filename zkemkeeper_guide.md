@@ -1245,5 +1245,7 @@ grep -rn "\.push_roster(" app/ --include=*.py
 ```
 
 On-site ground truth before changing driver code — `tools/mb2000_scripts/` (`0_MENU.ps1`
-plus 12 scripts: COM registration, device info, ZK9500 enrol, push, live monitor,
-unlock, backup/restore, portability test, force-open).
+plus 14 scripts: COM registration, device info, ZK9500 enrol, push, live monitor,
+unlock, backup/restore, portability test, force-open, inspect-and-clear, and the
+read-only export `14_export_terminal_readonly.ps1` -- every COM call it makes is a read,
+pinned by `tests/test_mb2000_export_readonly.py`).

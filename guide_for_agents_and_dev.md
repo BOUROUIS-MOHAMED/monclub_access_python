@@ -1289,6 +1289,11 @@ as MEMBERSHIP.
 > Until the wipe, a PRESERVE terminal holds the old scheme's users next to the new ones, and on
 > the 110 colliding ids (99 different people) the new push overwrites a stranger's device user.
 > `[UNVERIFIED — HARDWARE-GATED]`: the wipe itself has not been exercised on an MB2000.
+>
+> A full procedure for gym 45 -- survey, wipe, the manual retire of the old-scheme rows, the switch, an
+> interlocked re-push and the rollback rows -- is planned (not executed) in
+> [`docs/plans/2026-09-19_gym45_cutover_plan.md`](docs/plans/2026-09-19_gym45_cutover_plan.md), on branch
+> `claude/gym45-cutover-plan`.
 
 **Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
 `device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
@@ -2597,9 +2602,11 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   outage; registering it on the client PC was part of the remedy]`
 - **Backend base URL** is a single constant, `app/core/app_const.py::MONCLUB_BASE_URL`.
   Not runtime-configurable and not editable from the UI. `[CODE]`
-- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 12 scripts — COM
+- **On-site script pack**: `tools/mb2000_scripts/` (`0_MENU.ps1` plus 14 scripts — COM
   registration, device info, ZK9500 enrol, push, live monitor, unlock, backup/restore,
-  portability test, force-open). Use these to establish ground truth on hardware
+  portability test, force-open, inspect-and-clear, and the read-only export of script 14,
+  whose read-only property is pinned by `tests/test_mb2000_export_readonly.py`). Use these to
+  establish ground truth on hardware
   **before** changing driver code. `[CODE]`
 
 ---

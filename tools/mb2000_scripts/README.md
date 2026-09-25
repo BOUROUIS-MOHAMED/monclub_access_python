@@ -54,6 +54,8 @@ re-run **[1]** (registration records the DLL's path).
 | 10 | `10_backup_restore_device.ps1` | dump ALL users+templates to `backups\*.json` / restore (clone terminals, pre-wipe safety) |
 | 11 | `11_portability_test.ps1` | **the decisive gate**: push a ZK9500 desk template then auto-watch the log 90s for a live finger match -> prints **PASS / FAIL** |
 | 12 | `12_force_open_door.ps1` | **the door gate**: sustained force-open - ACUnlock repeated N times with a chosen duration/interval, device info before+after, every attempt written to `logs\force_open_*.log`. `-Auto` = no prompts (desk / scripted) |
+| 13 | `13_inspect_and_clear_tables.ps1` | counts every table, lists users/admins, then clears ONE table; administrators (privilege > 0) are never touched; every destructive call is logged BEFORE it is issued |
+| 14 | `14_export_terminal_readonly.ps1` | **read-only** export of one terminal to `exports\`: identity, counters, fingerprint algorithm version, every user (pin, name, card, privilege, enabled), and with `-Fingers` the finger slots (size + SHA-256, never the template); `-IncludeTemplates` also saves the templates (a backup script 10 can restore). Proven read-only by `tests/test_mb2000_export_readonly.py` |
 
 ## Local template store
 
