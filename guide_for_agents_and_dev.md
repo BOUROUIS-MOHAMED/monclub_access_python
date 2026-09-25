@@ -2627,7 +2627,9 @@ branch `claude/access-integration-0919` at f4fbda1: master `ca1e29a` + the QR gr
 heartbeat's `qrRosterCheck`, the operator-queue claim and two adversarial review rounds). Measured
 with this command and with the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`,
 twice each, interleaved with master `ca1e29a`, which gave **2109 passed** all four times; 32-bit
-`.venv` Python 3.11, a new empty `MONCLUB_ACCESS_DATA_ROOT` per run, 0 failed, exit code 0. `[TEST]`
+`.venv` Python 3.11, a new empty `MONCLUB_ACCESS_DATA_ROOT` per run, 0 failed, exit code 0. Re-run at
+f2f1a90 (2026-09-26, after changes to documentation, comments and test comments only), both
+commands: 2148 passed, 0 failed. `[TEST]`
 `tests/test_door_open_deadline.py::test_a_door_open_the_caller_gave_up_on_is_never_executed_later`
 was timing-flaky up to master `ca1e29a`: runs of that file alone failed 13/52 on `d09f88f` and 16/60
 on P3a-2. The race behind it: `Event.wait(timeout)` can return while `time.monotonic()` has not passed
