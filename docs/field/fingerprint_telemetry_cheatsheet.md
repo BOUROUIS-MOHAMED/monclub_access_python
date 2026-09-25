@@ -478,7 +478,9 @@ Two layers, two vocabularies — grep both or you see half the story `[CODE: §5
 `500_sent_no_answer` means the command **was sent** and no answer came in time — the door may
 have opened; check it before pressing again. On an MB2000 it pairs with a driver line
 `result=timeout` (the driver stopped waiting on `ACUnlock`). `500_failed` is a refusal or an
-error: nothing opened. `[CODE: guide §3.1a]`
+error: the terminal answered FALSE, the driver was not connected, or the call raised (driver
+`result=exception`, or a PullSDK `ControlDevice` error). After a call that raised, whether the relay
+fired is `[UNKNOWN]` — check the door before pressing again. `[CODE: guide §3.1a]`
 
 Whether the command was even allowed:
 

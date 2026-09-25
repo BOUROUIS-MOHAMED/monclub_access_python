@@ -266,7 +266,9 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   handed to the terminal and the relay may still fire. A real `False` still reads as the
   refusal. `PullSDKDevice.open_door` records nothing and answers `False` for "not connected" and
   for any exception from `door_pulse_open` alike, so on a panel both still read as the refusal,
-  as on master. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
+  as on master. That is a label, not proof the door stayed shut: after a call that raised — the
+  standalone driver's `result=exception`, a PullSDK `ControlDevice` error — whether the relay fired
+  is `[UNKNOWN]`. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
   pullsdk.py::PullSDKDevice.open_door]` `[TEST: test_mb2000_force_open.py::TestLocalApiDoorOpenChain::
   test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal, test_door_open_deadline.py::
   test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false]`
@@ -371,16 +373,20 @@ script the caller's `Event.wait`, as the door tests do.
 `_process_event`, `_handle_totp_rescue`, `_handle_rfid_rescue`, `_open_door_with_retry`,
 `_poll_with_watchdog`, `run`, `access_verification.py::verify_totp` and `::verify_card`, the standalone
 driver's `open_door` and `poll_rtlog_once` — is identical to master `ca1e29a` (compared as syntax trees,
-comments aside). `[CODE]` Measured with §3.4e's harness (the real `UltraDeviceWorker.run()` loop over a
-fake terminal), master and this branch interleaved, three runs each of 150 scans and 150 desk
-presses: scan to decision median 267 / 255 / 273 ms on master and 247 / 265 / 266 ms here, p95
-472–481 and 451–490 ms (set by the STA loop's 250 ms idle wait), no scan lost; desk-open round trip
-median 0.4–0.5 ms and 0.4–0.9 ms, every press answered ok. One run here had a p95 of 4.0 ms and a
-worst press of 112 ms. On the 400-press probe the first run here had 21 presses of 41–93 ms, all within
-one 20 s stretch and each with the worker asleep in its idle wait (a thread not scheduled, not work on
-the door path); two re-runs of both trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a
-100-member push, a scan, a desk press and a member update waited the same on both: median 5, at most 9
-member writes. `[TEST: fake terminal; harness kept out of the repo, §3.4e]`
+comments aside). `[CODE]` Measured with a copy of §3.4e's harness (its queue entries adapted to the
+claim), master and this branch interleaved. On the real `UltraDeviceWorker.run()` loop over a fake
+terminal, three runs each of 150 scans and 150 desk presses: scan to decision median 267 / 255 / 273
+ms on master and 247 / 265 / 266 ms here, p95 472–481 and 451–490 ms (set by the STA loop's 250 ms
+idle wait plus the worker's own empty-poll wait, up to 300 ms, `empty_backoff_max_ms`, which no scan
+wakes; neither changes here), no scan lost; desk-open round trip median 0.4–0.5 ms and 0.4–0.9 ms,
+every press answered ok. One run here had a p95 of 4.0 ms and a worst press of 112 ms. On the
+400-press probe the first run here had 21 presses of 41–93 ms, all within one 20 s stretch, each with
+the worker waiting on a thread the OS had not yet scheduled — 13 in its idle wait (`_wait_for_work`),
+8 in `_poll_with_watchdog` starting its poll thread — sampled 20 ms into the press; two re-runs of both
+trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a 100-member push — §3.4e's push
+harness, which calls the pass and the loop's own drain steps in order on one thread, not `run()` — a
+scan, a desk press and a member update waited the same on both: median 5, at most 9 member writes.
+`[TEST: fake terminal; harness kept out of the repo, §3.4e]`
 
 Found while tracing this, **not changed** `[CODE]`:
 - AGENT has no queue — `DecisionService` and the local API call `DeviceWorker.open_door`
@@ -1971,8 +1977,9 @@ run loop gained idle calls (`_maybe_request_removal_retry`, `_drain_daily_mainte
 round 1 `_push_link_lost`): +2.9 to 4.5 µs per iteration. Re-measured after round 1 (2 runs each):
 scan-to-decision median 238 / 256 ms base vs 266 / 305 ms branch, desk-open median 0.4 ms on both, max
 1.2 ms on both, no scan lost. Scan to decision, median 256 / 305 / 304 ms on the base and 288 / 270 /
-275 ms on the branch (p95 460-494 vs 462-493 ms; set by the STA loop's 250 ms idle wait, which
-neither version changes); no scan lost. Desk-open round trip, median 0.6-0.8 ms on both. Two branch
+275 ms on the branch (p95 460-494 vs 462-493 ms; set by the STA loop's 250 ms idle wait plus the
+worker's own empty-poll wait, up to 300 ms, which no scan wakes — neither version changes them); no
+scan lost. Desk-open round trip, median 0.6-0.8 ms on both. Two branch
 runs had one slow open each (148 and 230 ms of 150); the 400-open probe then gave base max 54 ms
 (worker asleep: thread scheduling) and branch max 29 ms — no systematic difference.
 `[TEST: fake terminal]` Not measured here: while the once-a-day intent read-back (one terminal
