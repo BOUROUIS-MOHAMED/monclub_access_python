@@ -156,11 +156,26 @@ the dialog and without a wipe. Before the cutover nobody had a reason to touch t
 | G4 | Every member in the Phase B comparison's `people_with_terminal_only_finger` / `people_losing_every_finger` is rescued or explicitly accepted (D4). **If the `sha self-check` is below 90 %, these counts are lower bounds** (a terminal-only finger on a finger number MonClub also holds reads as covered `[CODE]`): then every leftover tied to a current member (gms_id, card, pin_is_card) who has fingers also tests at the door after E11, or re-enrols | comparison + `--detail-csv` | E4 |
 | G5 | Today's `-IncludeTemplates` backups: `complete: true`; each file's `device.ip` and `device.serial` match its terminal and differ between the two files; copied to two places | the files + `.sha256` | E2 |
 | G6 | The retire method (D3) is ready and rehearsed on a copy of P1's `access.db` | dry run on the copy | E4 |
-| G7 | /gym-devices shows the "PIN scheme" choice for devices 8 and 10 | dashboard | E4 |
+| G7 | /gym-devices shows the "PIN scheme" choice for devices 8 and 10 | dashboard | B0, E4 |
 | G8 | `faces = 0` on both terminals, or the owner accepted losing them (nothing can back a face up) | export counter 21 | E4 |
 | G9 | Every member listed with `terminal_only_via_own_pin` is re-enrolled (or accepted) **before Phase D**: 1.4.35's finger sweep clears finger slots MonClub does not deliver, on pins MonClub owns, ≤100 pins a day `[CODE: ultra_engine._sweep_check, ::_drain_finger_sweep]` | Phase C | before D1 |
 | G10 | Both terminals' `clockSkewSec` within ±10 s, or corrected. Door events are read under the scheme in force at the TERMINAL's time vs the switch time on the PC, so a slow terminal names the wrong person for its first scans after the switch `[CODE: device_attendance.HistoryPinResolver]` | E3 export | E3 |
+| G12 | The technician and the on-call developer are named (D12); the script pack is on P1 (and P2/P3) with the comm key set (B0) | §3.6 | E4 |
 | G11 | The machine that runs the comparison during the window is named, has Python + the branch, and has run it on the Phase B files | rehearsal | E4 |
+
+### 3.6 People and tools
+The owner decides and watches; the hands-on steps need someone else. Named in D12:
+- **An on-site technician** who can run the script pack (`START HERE.cmd` → menu, or PowerShell), use
+  Task Scheduler (`taskschd.msc`) and Windows Defender Firewall (`wf.msc`), read a JSON file and search
+  a log file -- and, if D3 = (b), run the §5.1 SQL with the official SQLite command-line tool.
+- **The developer, on call for the whole window**: most failure branches of E10/E11 end with "call
+  the developer".
+- **A comparison machine** (G11) with Python 3.9+, `pymysql`, this branch and the production copy
+  (D11); the comparison is run there, by the developer or the technician.
+- The script pack is only on this branch: the technician copies the whole `tools/mb2000_scripts`
+  folder (with its `sdk\` folder) to P1 -- and to P2/P3 for the §5.2 proof -- and starts it with
+  `START HERE.cmd`. Never its menu `[1]` on a gym PC (it re-registers `zkemkeeper.dll` machine-wide at
+  the pack's copy; Access already registered its own).
 
 ## 4. The tools (read-only; on branch `claude/gym45-cutover-plan`)
 
@@ -179,7 +194,10 @@ completes. Its enumeration and template read are the calls of script 10's Backup
 inspect mode; `GetSysOption('~ZKFPVersion')` is the Access driver's own read, not yet run from
 PowerShell on an MB2000 (on failure `fpVersion` is null) `[UNVERIFIED]`. Unlike the Access driver it
 never sends `EnableDevice`, `RegEvent` or `RefreshData`. What the firmware does inside a read is
-beyond any test `[UNVERIFIED]`. Always pass `-DeviceIp` and `-Label`: without `-DeviceIp`, `-Auto`
+beyond any test `[UNVERIFIED]`. The "template version" it gives is the terminal-wide algorithm
+version (`~ZKFPVersion`); the terminal stores every template in its own algorithm, and no read on the
+allowlist returns a per-template version (per slot it records size and SHA-256). Always pass
+`-DeviceIp` and `-Label`: without `-DeviceIp`, `-Auto`
 reads the IP last saved in `config.json`.
 
 **`tools/gym45_cutover/compare_terminal_export.py`** -- the comparison (README in that folder).
@@ -212,7 +230,13 @@ fixed separately `[TEST: 2026-09-19, uptime 966 s]`).
 access_1.4.33:app/core/db.py]`, so the survey is complete on it. (1.4.32, on the third PC, is not
 tagged.)
 
-One hour with the gym closed and the power on, in the script-pack folder on P1:
+One hour with the gym closed and the power on, in the script-pack folder on P1 (technician):
+B0. Before the day: copy the script pack to P1 (§3.6). In /gym-devices, open device 8 and device 10:
+note whether a device **password** (COMM key) is set -- Access sends it on connect
+(`zk_standalone`: `comm_key` from the device's `password`) `[CODE]`, while the scripts read it from
+their own `config.json` (empty by default) `[CODE: _common.ps1::Get-Config]`. If set, enter it with
+`START HERE.cmd` → `[C]` on every PC that runs a script. Also check G7 now (the dashboard shows the
+"PIN scheme" choice), not first on the morning.
 B1. Stop Access on all three PCs as in §3.3 (untick start-with-Windows, Quit, watchdog off).
 B2. Time a sample -- **type each IP in full; .247 = device 8 "Sortie", .246 = device 10 "Entrée"**:
 ```powershell
@@ -233,7 +257,7 @@ the data folder `[CODE: installer/MonClubAccess.iss [UninstallDelete]]`.
 B5. In P1's log folder `%ProgramData%\MonClub Access\data\logs\` search `deviceFpVersion=` (second
 source for G3). Re-enable, restart Access where it normally runs.
 B6. On the comparison machine (G11): `compare_terminal_export.py --export 8=<device8 file> --export
-10=<device10 file> --access-db <copy> --mysql-* <fresh production copy> --day <today>` → G3, G4, G8,
+10=<device10 file> --access-db <copy> --mysql-* <the production copy of D11> --day <today>` → G3, G4, G8,
 G9 and the facts §1 left unknown: how many leftovers remain (answers what the 2026-09-06 clear did),
 admins, faces, `sha self-check`, `pin_is_a_gms_card_id`, `pins_not_in_canonical_form`.
 B7. If the gym PC's script-pack folder still has `logs\clear_*.log` from 2026-09-06, it gives the time
@@ -247,9 +271,13 @@ through MonClub, re-enable a template MonClub has but does not deliver
 `terminal_only_via_own_pin` must be done before D1 (G9).
 
 ### Phase D -- upgrade, ≥ 2 opening days before the cutover
+D0. Just before installing: Quit Access on P1 and copy its data folder (as B4). This copy is Phase
+D's rollback.
 D1. Install 1.4.35 on P1 (and on P2/P3 only if D2 brings them back). Check /access-pcs.
-D2. Let it run on MEMBERSHIP. In P1's log: `[T] TEMPLATE_VERSION_MISMATCH` → reinstall 1.4.33 on P1
-and stop (G3 was wrong); `[T] FINGER_SWEEP … cleared=` above 0 on a pin in the B6 detail CSV → that
+D2. Let it run on MEMBERSHIP. In P1's log: `[T] TEMPLATE_VERSION_MISMATCH` → stop and go back
+(G3 was wrong): restore the D0 copy of the data folder, then reinstall 1.4.33. Whether 1.4.33 runs on
+a database 1.4.35 has migrated (new columns and tables) is `[UNVERIFIED]` and the installer has no
+downgrade handling, hence the copy; `[T] FINGER_SWEEP … cleared=` above 0 on a pin in the B6 detail CSV → that
 member just lost a finger: re-enrol them; `REVOKE_ABORTED`, `CAPACITY_FULL` → call the developer.
 D3. The day before the cutover: Quit Access on P1 for a minute (Task Manager check), copy the data
 folder, restart. Run the comparison on that copy → **G2**.
@@ -274,10 +302,11 @@ retire or switch a terminal that did not pass E6.
 |---|---|---|---|
 | E1 | P2, P3: untick start-with-Windows, Quit, watchdog off, add the §5.2 block and **prove it**, shut down. P1: untick start-with-Windows, Quit, watchdog off, pause Windows Update. | Task Manager: no `MonClubAccess.exe` on P1; the §5.2 proof on P2/P3 | Nothing changed: undo, stop |
 | E2 | Backup, both terminals at once, **full commands** (as B3). Copy both files + `.sha256` to a USB key and the owner's PC. Copy P1's data folder (as B4). | G5 | Nothing changed: retry or stop |
-| E3 | Quick read of each terminal (`… -DeviceIp <ip> -Label <label> -Auto`); counters close to B3; **G10** clock skew | numbers | Investigate first |
+| E3 | Quick read of each terminal (`… -DeviceIp <ip> -Label <label> -Auto`); counters close to B3; **G10** clock skew | numbers | Investigate first. A skew above 10 s is corrected with `3_get_device_info.ps1`, answering `y` to "Set device clock to this PC's time?" -- a WRITE to the terminal (`SetDeviceTime2`) `[CODE]`, done here, before E4 |
 | E4 | **Go / no-go**: G1-G11 green, clock time not passed | -- | Stop: re-tick start-with-Windows, watchdog on, restart P1. Nothing changed |
-| E5 | **Erase, one terminal at a time:** `13_inspect_and_clear_tables.ps1` → at "Device IP" **type the IP in full** → step 2 `[N]` → step 3 **`[U] USERS whole rows`** → scope **`[A]`** (all non-admin users) → if faces > 0 it asks, answer per G8 → type **`CLEAR`**. Before each run: Task Manager shows no `MonClubAccess.exe` (script 13 does not check). It deletes every non-admin user with `SSR_DeleteEnrollData(1, pin, 12)`, logging each pin before the call, and keeps admins (privilege > 0) `[CODE]`. **From the first deleted user on, never just restart Access: it would push nobody** (its records still say everyone is on the terminal `[CODE: ultra_engine._standalone_pins_needing_push]`) -- recover with §6 R2. | the script's BEFORE → AFTER table; log `DONE ok=… failed=0` | Failed pins: re-run (it re-reads the users). **A pin that does not return within 60 s:** close the window, note the pin (last log line), re-run once; hangs again on the same pin → abandon this terminal's wipe (it stays MEMBERSHIP, not retired, not switched), recover it with R2 for that device, and go on with the other terminal only. Whether the terminal still verifies at the door after a hang is `[UNVERIFIED]`: test it |
-| E6 | **Verify empty, per terminal**, three ways: (1) quick export -- only the admins script 13 listed remain, `fingerprints` = their fingers, `faces` = 0, and `users + users_free = user_capacity` (FT6); (2) the terminal's own user count on its screen; (3) one member's finger and card at that door must be **refused**. Then (4) the comparison on that export with `--scheme ACCOUNT --access-db <fresh copy>`: `account_pins_already_on_terminal` must be 0 (an admin whose pin equals a member's account id would be overwritten as privilege 0 by the push `[CODE: zk_standalone._do_push_roster SSR_SetUserInfo(1, pin, name, "", 0, …)]`). | all four agree | Not empty: E5 again. FT6 false or an admin collides: stop before E7 for that terminal (D5) |
+| E5 | **Erase, one terminal at a time:** `13_inspect_and_clear_tables.ps1` → at "Device IP" **type the IP in full** → step 2 `[N]` → step 3 **`[U] USERS whole rows`** → scope **`[A]`** (all non-admin users) → if faces > 0 it asks, answer per G8 → type **`CLEAR`**. Before each run: Task Manager shows no `MonClubAccess.exe` (script 13 does not check). It deletes every non-admin user with `SSR_DeleteEnrollData(1, pin, 12)`, logging each pin before the call, and keeps admins (privilege > 0) `[CODE]`. **It will print "SSR_DeleteEnrollData(pin, 12) has never been confirmed on this firmware" and label the choice "UNVERIFIED api": expected (D9), carry on.** **From the first deleted user on, never just restart Access: it would push nobody** (its records still say everyone is on the terminal `[CODE: ultra_engine._standalone_pins_needing_push]`) -- recover with §6 R2. | the script's BEFORE → AFTER table; log `DONE ok=… failed=0` | Failed pins: re-run (it re-reads the users). **A pin that does not return within 60 s:** close the window, note the pin (last log line), re-run once; hangs again on the same pin → abandon this terminal's wipe (it stays MEMBERSHIP, not retired, not switched), recover it with R2 for that device, and go on with the other terminal only. Whether the terminal still verifies at the door after a hang is `[UNVERIFIED]`: test it |
+| E5b | **Only if D5 removes an admin:** Task Manager shows no `MonClubAccess.exe` (script 7 does not check), then `7_delete_device_fingerprint.ps1` → that admin's pin → choice **`U`** only (never `0`-`9`, the finger-index delete that hangs this firmware, zkemkeeper_guide §3). Irreversible: a restore brings users back as privilege 0. | the admin is gone from a quick export | -- |
+| E6 | **Verify empty, per terminal**, three ways: (1) quick export -- only the admins script 13 listed (minus any E5b removed) remain, `fingerprints` = their fingers, `faces` = 0, and `users + users_free = user_capacity` (FT6); (2) the terminal's own user count on its screen; (3) one member's finger and card at that door must be **refused**. Then (4) the comparison on that export with `--scheme ACCOUNT --access-db <fresh copy>`: `account_pins_already_on_terminal` must be 0 (an admin whose pin equals a member's account id would be overwritten as privilege 0 by the push `[CODE: zk_standalone._do_push_roster SSR_SetUserInfo(1, pin, name, "", 0, …)]`). | all four agree | Not empty: E5 again. FT6 false or an admin collides: stop before E7 for that terminal (D5) |
 | E7 | **Interlock**: unplug the network cable of every terminal that passed E6 (they keep power), or the §5.2 block on P1, **proven** | the §5.2 proof, or no link light | -- |
 | E8 | **Retire on P1, per terminal that passed E6** (D3), with Access stopped -- or D3(a)'s action in its no-engine mode. §5.1. | counts 0 for that device | Restore the `access.db` copy; stop (R2) |
 | E9 | Dashboard /gym-devices, per retired terminal: PIN scheme **"Per person"**, tick both boxes, save. | reopen EACH device: it reads "Per person" | Leave it; no PC is running |
@@ -322,22 +351,27 @@ PC; none ships with Access. P2 and P3 drove both terminals too (§3.3), so they 
 #### 5.2 The firewall block (P2/P3 from E1; P1 instead of unplugging)
 Admin PowerShell:
 ```powershell
-New-NetFirewallRule -DisplayName "MonClub cutover hold TCP" -Direction Outbound -RemoteAddress 192.168.1.246,192.168.1.247 -Protocol TCP -RemotePort 4370 -Action Block
-New-NetFirewallRule -DisplayName "MonClub cutover hold UDP" -Direction Outbound -RemoteAddress 192.168.1.246,192.168.1.247 -Protocol UDP -RemotePort 4370 -Action Block
+New-NetFirewallRule -DisplayName "MonClub cutover hold TCP" -Direction Outbound -RemoteAddress 192.168.1.246,192.168.1.247 -Protocol TCP -Action Block
+New-NetFirewallRule -DisplayName "MonClub cutover hold UDP" -Direction Outbound -RemoteAddress 192.168.1.246,192.168.1.247 -Protocol UDP -Action Block
 ```
-Which transport `Connect_Net` uses on these MB2000s is not recorded anywhere `[UNVERIFIED]`, hence both.
-**Prove it on that PC before relying on it**: `14_export_terminal_readonly.ps1 -DeviceIp 192.168.1.247
--Label test -Auto` must end with "Connect_Net returned FALSE" (exit 1); same for .246. If it connects,
-the block does not work: unplug instead (P1) or keep that PC switched off and unplugged from the
-network (P2/P3). Remove with `Remove-NetFirewallRule -DisplayName "MonClub cutover hold TCP"` (and UDP).
+(Or the same two rules in `wf.msc` → Outbound Rules → New Rule → Custom → Remote IP.) All ports, both
+transports: which transport and port `Connect_Net` uses on these MB2000s is not recorded anywhere
+`[UNVERIFIED]`. **Prove it on that PC, in two runs:** BEFORE adding the rules,
+`14_export_terminal_readonly.ps1 -DeviceIp 192.168.1.247 -Label test -Auto` must connect (this proves
+the IP and the comm key, B0); AFTER, the same command must end with "Connect_Net returned FALSE" --
+it then waits for ENTER even with `-Auto` (`_common.ps1::Connect-Zkem` calls `Pause-End`) `[CODE]`.
+Same for .246. If the second run connects, the block does not work: unplug instead (P1) or keep that PC
+switched off and off the network (P2/P3). Remove with `Remove-NetFirewallRule -DisplayName "MonClub
+cutover hold TCP"` (and UDP).
 
 #### 5.3 P2 and P3 afterwards (D2)
 Started as they are, each would record the switch, re-push every account pin once, and jam its own
 removal step like §2; on 1.4.32/1.4.33 it pushes membership pins onto the account terminals `[CODE]`.
 For each PC that D2 brings back, with the gym closed and its §5.2 block still on:
 1. Access stopped on it (untick start-with-Windows, Quit, watchdog off, the §5.1 rename test).
-2. Retire its rows for 8 and 10 **on the version it runs** (1.4.33: `device_sync_state` and
-   `device_content_mirror` only, §5.1).
+2. Retire its rows for 8 and 10. With D3 = (b): **on the version it runs** (1.4.33:
+   `device_sync_state` and `device_content_mirror` only, §5.1), then step 3. With D3 = (a): do step 3
+   first (its action exists only in 1.4.35), run the action in its no-engine mode, then step 4.
 3. Install 1.4.35 with the installer's last box **"Launch MonClub Access" unticked** (it is ticked by
    default and would start Access before the retire otherwise `[CODE: installer/MonClubAccess.iss [Run]
    postinstall]`).
@@ -351,8 +385,9 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
 Daily, P1's log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no
 `PIN_SCHEME_ACCOUNT_WITHHELD`; `FINGER_SWEEP` lines are expected (every new row starts unswept, ≤100
 pins a day `[CODE]`, harmless on a wiped terminal). **Any new `[T] PIN_SCHEME_SWITCH` after the cutover
-day** (someone edited the scheme, D8) → stop and call the developer. /access-pcs: P2/P3's "last seen"
-must not move while they are blocked. Door complaints → check that person in MonClub (fingers
+day** (someone edited the scheme, D8) → stop and call the developer. On P2/P3 (D2 a): the two block rules
+still exist in `wf.msc`. Their "last seen" on /access-pcs keeps moving -- the block covers only the
+terminals, so their heartbeats still reach the server. Door complaints → check that person in MonClub (fingers
 enrolled? membership deliverable?). Delete the biometric backup files per D7.
 
 ## 6. Half-states and rollback
@@ -370,21 +405,29 @@ can time out during a push; QR codes work between chunks.
 | R3 | Retired (E8), **switch not recorded** | First make sure the dashboard says **"Per membership"** for that device (if E9 saved "Per person", set it back and reopen the device to check) -- otherwise a first sync that fails at boot would push ~919 membership pins that the later switch then strands above the removal ceiling (§2). Then start Access on P1 **behind the interlock**, wait for `getSyncData OK` in the log, plug in: every member is new to it and is pushed under MEMBERSHIP `[CODE]`. Same completion check as E11. | as R2 |
 | R4 | Switch recorded (E10), before or during E11 | Count the account pins already pushed (P1's `device_sync_state` rows with `ownership_confirmed=1` for that device) and the unconfirmed ones (`device_push_intent` rows for it). **At or under the removal ceiling** `max(10, 25 % of the MEMBERSHIP roster)` (~229 for 919 memberships; use 225 to be safe; refused only strictly above `[CODE: push_safety.check_bulk_removal]`): unplug, Quit, set "Per membership", **do not retire**, start behind the interlock, plug in -- the MEMBERSHIP pass removes those owned account pins `[CODE: push_safety.check_bulk_removal]`; proof: no `REVOKE_ABORTED`, an export shows no account pin left -- except intent-only pins (a chunk cut off by the Quit), which leave only after the next day's read-back promotes them `[CODE: ultra_engine._promote_intents_by_readback]`. **Above it**: wipe again (E5-E6), retire, switch back, interlocked push. | -- |
 | R5 | After opening | A full second procedure | the old system's users (the goal) |
+| R6 | **Power lost during E5** (a terminal mid-erase) | At power-on: Access stays stopped (start-with-Windows unticked, watchdog off). Re-run script 13 on that terminal (it re-reads the users and deletes what is left `[CODE]`), then E6. If the day is over: R2 for that terminal before opening. | -- |
+| R7 | **Power lost during E11** (switch recorded, push partial) | At power-on Access starts (start-with-Windows was re-ticked only at E14, so start it by hand); its start-up full pass continues the push: every written chunk is recorded, the chunk in flight is covered by its push intent `[CODE: guide §3.4a]`. Wait for E11's completion lines. | -- |
+| R8 | A terminal **left for another day** (not wiped, or wipe abandoned + R2) | It stays on MEMBERSHIP with its old contents and works overnight and the next days as it does today; finish it with its own E5-E13 on another closed morning. | -- |
+| R9 | Phase D (1.4.35 installed) must be undone | Restore the D0 copy of the data folder, reinstall 1.4.33 (`[UNVERIFIED]` on a migrated database, D2) | -- |
 
 **Restoring the backup instead** (`10_backup_restore_device.ps1` → `[R]`): copy ONE file into
 `backups\` at a time and check that its label matches the IP you type. It writes every user back as
 privilege 0, **enabled**, without a password `[CODE]` -- a user the terminal had disabled (e.g. a member
 who left) comes back able to open the door, and MonClub never removes a pin it does not own. If the E2
 backup shows `disabled` > 0 or `privileged` > 0, the owner decides before E5 whether this route is
-acceptable. Its duration is unmeasured. Faces are not in any backup.
+acceptable. Its duration is unmeasured. Faces are not in any backup, and neither is an admin's
+privilege (E5b).
 
 ## 7. Decisions the owner must make before execution
 
-- **D1 -- the window.** A morning with the gym closed and the power on, a go/no-go clock for E5, and:
+- **D1 -- the window.** A morning with the gym closed and the power on -- write down when the power
+  comes on at Oxyfit, since that is the real start of the window --, a go/no-go clock for E5, and:
   while any duration is unmeasured (read, erase, re-push), the gym stays closed until E13 passes --
   i.e. opening late is acceptable that day, or the date moves.
-- **D2 -- which PC drives, and the other two.** Pick P1. P2/P3: (a) blocked by the §5.2 firewall rule
-  from E1 on, permanently, keeping the rest of Access (**default**); (b) brought back one by one per
+- **D2 -- which PC drives, and the other two.** Pick P1 among "Accueil" (LAPTOP-T6KORL9V),
+  "Accuil Oxyfit" (no hostname recorded) and "Accueil Oxyfit" (DESKTOP-6UCRVSG) (§1). P2/P3: (a) blocked by the §5.2 firewall rule
+  from E1 on, permanently, keeping the rest of Access (**default**; their reception "Open" button then
+  stops working, since it goes through the terminal); (b) brought back one by one per
   §5.3; (c) Access removed from them until one-driver-per-turnstile exists.
 - **D3 -- how the retire is done.** (a) Recommended: a small operator-confirmed "forget this terminal's
   MonClub state after a verified wipe" action in 1.4.35, one device at a time, runnable only with the
@@ -414,6 +457,17 @@ acceptable. Its duration is unmeasured. Faces are not in any backup.
   unrecorded). Fix one of them after the cutover; E6's checks do not rely on either.
 - **D10 -- measure the re-push before the day** (D4 of Phase D): writes every member again to both
   terminals with the gym closed, in exchange for a measured E11 duration.
+- **D11 -- the production copy for the comparison.** Who makes the export, how it is scrubbed (like
+  wigo-demo: no emails, tokens, phone numbers), what the database is named, where it is restored and
+  when it is deleted. The tool refuses only the name `wigo-db`; it cannot tell a scrubbed copy from an
+  unscrubbed one, so this is a rule for people. Its output is aggregates; `--detail-csv` holds names.
+- **D12 -- people.** The on-site technician and the developer on call for the window (§3.6), and who
+  runs the comparison.
+- **D13 -- what the owner accepts if it happens:** a terminal fingerprint version that cannot be read
+  from anywhere (G3 -- the push's version check is then inert); faces on a terminal (G8 -- lost);
+  a `sha self-check` below 90 % (G4 -- the lost-finger counts become lower bounds, so the members tied
+  to leftovers test at the door or re-enrol); a backup with `disabled` or `privileged` users (§6 -- the
+  restore route would re-enable or demote them).
 
 ## 8. Field tests (each needs the real terminals)
 

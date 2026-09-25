@@ -1003,6 +1003,11 @@ as MEMBERSHIP.
 > Until the wipe, a PRESERVE terminal holds the old scheme's users next to the new ones, and on
 > the 110 colliding ids (99 different people) the new push overwrites a stranger's device user.
 > `[UNVERIFIED — HARDWARE-GATED]`: the wipe itself has not been exercised on an MB2000.
+>
+> A full procedure for gym 45 -- survey, wipe, the manual retire of the old-scheme rows, the switch, an
+> interlocked re-push and the rollback rows -- is planned (not executed) in
+> [`docs/plans/2026-09-19_gym45_cutover_plan.md`](docs/plans/2026-09-19_gym45_cutover_plan.md), on branch
+> `claude/gym45-cutover-plan`.
 
 **Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
 `device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
