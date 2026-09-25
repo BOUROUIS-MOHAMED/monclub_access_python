@@ -157,3 +157,89 @@ def test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held(db, mo
     finally:
         drv.disconnect()
     assert str(NEW) in term.users and str(OLD) not in term.users
+
+
+# ================================================================== 3. one sync-cache load at a time
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+@pytest.fixture
+def slow_loads(db, monkeypatch):
+    """_load_sync_cache_db replaced by a 0.3 s fake that counts concurrent loads."""
+    st = {"calls": 0, "live": 0, "max_live": 0}
+    lk = threading.Lock()
+
+    def fake_load():
+        with lk:
+            st["calls"] += 1
+            n = st["calls"]
+            st["live"] += 1
+            st["max_live"] = max(st["max_live"], st["live"])
+        try:
+            time.sleep(0.3)
+            return ("snapshot", n)
+        finally:
+            with lk:
+                st["live"] -= 1
+
+    monkeypatch.setattr(dbmod, "_load_sync_cache_db", fake_load)
+    monkeypatch.setattr(dbmod, "_sync_cache_entry", (0.0, ("snapshot", "pre-change")))
+    monkeypatch.setattr(dbmod, "_sync_cache_loading", None)
+
+    def drain():
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with lk:
+                if st["live"] == 0 and dbmod._sync_cache_loading is None:
+                    return
+            time.sleep(0.02)
+
+    return st, drain
+
+
+def test_an_invalidation_during_a_load_does_not_start_a_second_one(slow_loads):
+    # Review R3: the round-1 epoch fix released the in-flight marker on every invalidation, so
+    # a burst of changes started one concurrent full load per invalidation.
+    st, drain = slow_loads
+    assert dbmod.refresh_sync_cache_async() is True
+    time.sleep(0.05)
+    dbmod.invalidate_sync_cache()
+    assert dbmod.refresh_sync_cache_async() is False
+    drain()
+    assert st["max_live"] == 1
+    assert st["calls"] == 2                     # the stale load, then ONE follow-up
+    assert dbmod.peek_sync_cache() == ("snapshot", 2)
+
+
+def test_one_moving_save_starts_one_load_at_a_time(slow_loads):
+    # The branch's own sequence: the flip's invalidate, the app's clear+refresh, work()'s pair.
+    st, drain = slow_loads
+    dbmod.invalidate_sync_cache()
+    dbmod.invalidate_sync_cache(clear_cached=True)
+    dbmod.refresh_sync_cache_async()
+    dbmod.invalidate_sync_cache()
+    dbmod.refresh_sync_cache_async()
+    drain()
+    assert st["max_live"] == 1
+
+
+def test_a_plain_invalidation_during_a_load_still_serves_the_newer_data(slow_loads):
+    st, drain = slow_loads
+    dbmod.refresh_sync_cache_async()
+    time.sleep(0.05)
+    dbmod.invalidate_sync_cache()               # plain: the load in flight is newer than the entry
+    time.sleep(0.4)                             # the first load has finished, the follow-up runs
+    assert dbmod.peek_sync_cache() == ("snapshot", 1)
+    drain()
+    assert dbmod.peek_sync_cache() == ("snapshot", 2)
+
+
+def test_a_clearing_invalidation_during_a_load_never_serves_its_data(slow_loads):
+    st, drain = slow_loads
+    dbmod.refresh_sync_cache_async()
+    time.sleep(0.05)
+    dbmod.invalidate_sync_cache(clear_cached=True)      # a date flip: pre-flip data never served
+    assert dbmod.load_sync_cache() == ("snapshot", 2)   # waits for the follow-up, not load 1
+    drain()
+    assert st["max_live"] == 1

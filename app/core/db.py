@@ -7283,10 +7283,20 @@ def list_optional_deals() -> List[Dict[str, Any]]:
 _sync_cache_lock = threading.Lock()
 _sync_cache_entry: tuple[float, "SyncCacheState | None"] = (0.0, None)
 _sync_cache_loading: "threading.Event | None" = None  # None = no load in progress
-# Bumped by every invalidate_sync_cache: a load that started under an older epoch may have read
-# the database before the change that invalidated it, so it is never installed (P3b-1 review R1:
-# a date flip's ULTRA pass must not be handed the pre-flip roster).
+# P3b-1 (review R1, R3). ONE load at a time, as before P3b-1, and a load never installed as fresh
+# once the database changed under it:
+# * every invalidate_sync_cache bumps _sync_cache_epoch; a load carries the epoch it started at;
+# * a load that finishes at the current epoch is installed fresh (TTL);
+# * one that finishes after a plain invalidation is installed EXPIRED (it is still newer than the
+#   snapshot it replaces; readers use it as the stale snapshot) and ONE follow-up load starts;
+# * one that started before an invalidate_sync_cache(clear_cached=True) -- a date flip's, whose
+#   ULTRA pass must not get the pre-flip roster -- is never installed (_sync_cache_strict_epoch),
+#   and the follow-up load replaces it.
+# The first version (R1) released the in-flight marker on every invalidation instead, so a burst
+# of changes started one concurrent full load per invalidation (R3: 20 loads, 4 at once in 3 s).
 _sync_cache_epoch = 0
+_sync_cache_strict_epoch = 0
+_sync_cache_entry_epoch = 0
 _SYNC_CACHE_TTL = 5.0  # seconds
 
 
@@ -7297,13 +7307,32 @@ def _finish_sync_cache_load(
     success: bool,
     epoch: Optional[int] = None,
 ) -> None:
-    global _sync_cache_entry, _sync_cache_loading
+    global _sync_cache_entry, _sync_cache_loading, _sync_cache_entry_epoch
+    follow_up: "threading.Event | None" = None
+    follow_epoch = 0
     with _sync_cache_lock:
-        if success and (epoch is None or epoch == _sync_cache_epoch):
-            _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
+        current = epoch is None or epoch == _sync_cache_epoch
+        if success:
+            if current:
+                _sync_cache_entry = (time.monotonic() + _SYNC_CACHE_TTL, result)
+                _sync_cache_entry_epoch = _sync_cache_epoch if epoch is None else epoch
+            elif epoch >= _sync_cache_strict_epoch and epoch >= _sync_cache_entry_epoch:
+                _sync_cache_entry = (0.0, result)
+                _sync_cache_entry_epoch = epoch
         if _sync_cache_loading is evt:
             _sync_cache_loading = None
+            if success and not current:
+                follow_up = threading.Event()
+                _sync_cache_loading = follow_up
+                follow_epoch = _sync_cache_epoch
     evt.set()
+    if follow_up is not None:
+        threading.Thread(
+            target=_load_sync_cache_background,
+            args=(follow_up, follow_epoch),
+            name="SyncCacheRefresh",
+            daemon=True,
+        ).start()
 
 
 def _load_sync_cache_background(evt: threading.Event, epoch: Optional[int] = None) -> None:
@@ -7316,7 +7345,8 @@ def _load_sync_cache_background(evt: threading.Event, epoch: Optional[int] = Non
 
 
 def refresh_sync_cache_async() -> bool:
-    """Start a background refresh of the sync cache if one is not already running."""
+    """Start a background refresh of the sync cache if one is not already running (the running
+    one, if it started before the latest invalidation, is followed by one more load)."""
     global _sync_cache_loading
     with _sync_cache_lock:
         if _sync_cache_loading is not None:
@@ -7336,24 +7366,28 @@ def refresh_sync_cache_async() -> bool:
 def invalidate_sync_cache(*, clear_cached: bool = False) -> None:
     """Expire the sync cache; optionally drop the stale snapshot entirely.
 
-    A load already in flight may have read the database before the change that calls this: it
-    is not installed (epoch), and the in-flight marker is released so a new load can start now.
+    A load already in flight may have read the database before the change that calls this: it is
+    not installed as fresh, and with ``clear_cached`` not at all (see _sync_cache_epoch).
     """
-    global _sync_cache_entry, _sync_cache_epoch, _sync_cache_loading
+    global _sync_cache_entry, _sync_cache_epoch, _sync_cache_strict_epoch
     with _sync_cache_lock:
         _, cached = _sync_cache_entry
         _sync_cache_entry = (0.0, None if clear_cached else cached)
         _sync_cache_epoch += 1
-        _sync_cache_loading = None
+        if clear_cached:
+            _sync_cache_strict_epoch = _sync_cache_epoch
 
 
 @_tel.timed("DB_READ_load_sync_cache", slow_ms=50, warn_ms=1000)
 def load_sync_cache() -> "SyncCacheState | None":
+    state = None
     for _attempt in range(3):
         state, retry = _load_sync_cache_once()
         if not retry:
             return state
-    return state
+    # Still invalidated under every load we waited for: read once directly rather than report
+    # "no cache" to a caller that would treat it as an empty roster.
+    return state if state is not None else _load_sync_cache_db()
 
 
 def _load_sync_cache_once() -> "tuple[SyncCacheState | None, bool]":
@@ -7401,8 +7435,7 @@ def _load_sync_cache_once() -> "tuple[SyncCacheState | None, bool]":
         evt.wait(timeout=10.0)
         with _sync_cache_lock:
             _, cached = _sync_cache_entry
-            invalidated_meanwhile = _sync_cache_epoch != epoch
-        return cached, cached is None and invalidated_meanwhile
+        return cached, cached is None
 
     assert evt is not None
     try:
