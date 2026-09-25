@@ -1799,9 +1799,10 @@ class UltraDeviceWorker(threading.Thread):
                     if ok:
                         error = ""
                     elif getattr(self._sdk, "last_open_door_result", None) == "timeout":
-                        # The standalone driver handed ACUnlock to its STA thread and
-                        # stopped waiting (it abandons that thread): the relay may still
-                        # fire. Not a refusal -- the desk must check the door (§3.1a).
+                        # The standalone driver queued the open to its STA thread and
+                        # stopped waiting (it abandons that thread); the command may or may
+                        # not have reached ACUnlock, so the relay may still fire. Not a
+                        # refusal -- the desk must check the door (§3.1a).
                         error = "sent, no answer"
                     else:
                         error = "open_door returned False"

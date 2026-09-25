@@ -340,9 +340,9 @@ class ZKStandaloneDevice:
     # logged and emits a DOOR_OPEN telemetry result; a silent no-op is impossible.
     supports_open_door = _OPEN_DOOR_FAMILY_DEFAULT
     # The last open_door outcome, a _DOOR_OPEN_RESULTS value (None before the first).
-    # open_door answers False for a refusal AND for a timed-out ACUnlock; this lets the
-    # worker's operator queue tell them apart -- a timed-out call was handed to the
-    # terminal and the relay may still fire (guide §3.1a). Written by _door_open_event,
+    # open_door answers False for a refusal AND for a command it stopped waiting on; this
+    # lets the worker's operator queue tell them apart -- a timed-out command may or may
+    # not have reached ACUnlock, so the relay may still fire (guide §3.1a). Written by _door_open_event,
     # which every open_door path calls once, on the caller's thread.
     last_open_door_result: Optional[str] = None
     # The PullSDK "transaction" table has no analogue here: this driver reads

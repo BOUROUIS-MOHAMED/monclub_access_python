@@ -4015,7 +4015,7 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 # drain the command within 2s. This is the user-facing symptom.
                 _tel.warn("DOOR_OPEN", device_id=did, door=door, result="503_timeout", wait_ms=_door_ms)
             elif err == "sent, no answer":
-                # The worker sent the open and no answer came in time (guide §3.1a):
+                # The worker handed the open to the driver and no answer came in time (§3.1a):
                 # the door may have opened. Its own result, so a log reader does not
                 # take it for a refusal. Same 500 and French text as before.
                 _logger.warning(

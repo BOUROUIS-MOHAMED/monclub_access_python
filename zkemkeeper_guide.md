@@ -432,8 +432,9 @@ answers `False` without calling COM in that case). `[CODE]` `[TEST]`
 
 `open_door` returns `False` for every result but `ok`. The result itself is kept in
 `last_open_door_result` (written by `_door_open_event`, on the caller's thread), so the ULTRA
-worker's operator queue can answer a `timeout` — `ACUnlock` handed to the STA thread, the relay
-may still fire — as "sent, no answer" rather than as a refusal (guide §3.1a). `[CODE]`
+worker's operator queue can answer a `timeout` — the `open_door` command queued to the STA thread,
+which may or may not have reached `ACUnlock`, so the relay may still fire — as "sent, no answer"
+rather than as a refusal (guide §3.1a). `[CODE]`
 `[TEST: test_mb2000_force_open.py::TestDriverDoorCommand::test_false_return_is_reported_not_swallowed,
 ::test_wedged_acunlock_times_out_abandons_sta_and_reports_timeout]`
 

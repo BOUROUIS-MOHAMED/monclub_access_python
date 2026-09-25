@@ -263,7 +263,8 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   on master the same press answered 503 at 2 s. The driver now records each outcome in
   `last_open_door_result` (a `_DOOR_OPEN_RESULTS` value, written by `_door_open_event` on every
   path), and `_drain_commands` answers `sent, no answer` when it is `timeout`: the command was
-  handed to the terminal and the relay may still fire. A real `False` still reads as the
+  queued to the driver's STA thread and may or may not have reached `ACUnlock` (that thread can be
+  stuck in another COM call), so the relay may still fire. A real `False` still reads as the
   refusal. `PullSDKDevice.open_door` keeps no `last_open_door_result` and answers `False` for
   "not connected" and for any exception from `door_pulse_open` alike, so on a panel both still read
   as the refusal, as on master. That answer is a label, not proof the door stayed shut. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
@@ -2464,9 +2465,9 @@ is nevertheless **issued** — the switch is ON for the family by operator decis
   with `result ∈ {ok, false, exception, timeout, unsupported}` (`clamped=True` when the
   pulse was clamped, `source=` which switch level decided);
 - a `False` from the terminal reaches the desk as HTTP 500 with a French message naming
-  the FALSE return (`detail` keeps the raw string) — never as a silent success; an `ACUnlock`
-  the driver stopped waiting on (`result=timeout`) reaches it as "sent, no answer" instead
-  (§3.1a), because the relay may still fire;
+  the FALSE return (`detail` keeps the raw string) — never as a silent success; an open the
+  driver stopped waiting on (`result=timeout`: its command may or may not have reached `ACUnlock`)
+  reaches it as "sent, no answer" instead (§3.1a), because the relay may still fire;
 - the local API additionally logs `DOOR_OPEN result ∈ {200_ok, 409_unsupported,
   429_cooldown, 503_timeout, 500_sent_no_answer, 500_failed}` keyed by `device_id`, so one grep
   shows the press, the refusal or the SDK answer;
