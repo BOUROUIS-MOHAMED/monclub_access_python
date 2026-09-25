@@ -45,7 +45,11 @@ prove (`[UNVERIFIED]`, guide §7); unlike the Access driver, this script never s
 `EnableDevice`, `RegEvent` or `RefreshData`.
 
 Unlike `10_backup_restore_device.ps1`, it records `privilege`, `enabled` and whether a password
-exists (never the password). An `-IncludeTemplates` file has the shape script 10's Restore reads;
+exists (never the password). Its "template version" is the terminal-wide algorithm version
+(`~ZKFPVersion`): no read on the allowlist returns a per-template version, so each slot carries its
+size and SHA-256 only. The scripts connect with the COMM key saved in `config.json` (`START HERE.cmd`
+→ `[C]`); if the terminal has a device password set in /gym-devices, enter it there first. A failed
+connection waits for ENTER, even with `-Auto`. An `-IncludeTemplates` file has the shape script 10's Restore reads;
 that Restore writes every user back as privilege 0, enabled, without a password.
 
 ## 2. The comparison (on a dev PC)
@@ -56,7 +60,7 @@ python tools/gym45_cutover/compare_terminal_export.py \
     --export 8=terminal_device8_....json --export 10=terminal_device10_....json \
     --access-db copy/access.db
 # add the backend: a MySQL COPY, never the live server, never wigo-db (refused by name)
-set MYSQL_PWD=...
+# (password in the environment: bash `export MYSQL_PWD=...`, cmd `set MYSQL_PWD=...`, PowerShell `$env:MYSQL_PWD='...'`)
 python tools/gym45_cutover/compare_terminal_export.py --export 8=... --export 10=... --access-db copy/access.db \
     --mysql-host 127.0.0.1 --mysql-port 3307 --mysql-db <copy> --mysql-user root --day 2026-09-19
 ```
@@ -84,7 +88,7 @@ or the per-gym fingerprint enrolment gate. On `wigo-demo` for 2026-09-12 it give
 ## 3. The rehearsal
 
 ```bash
-set MYSQL_PWD=monclub
+export MYSQL_PWD=monclub   # cmd: set MYSQL_PWD=monclub
 python tools/gym45_cutover/rehearsal_check.py --mysql-host 127.0.0.1 --mysql-port 3307 \
     --mysql-db wigo-demo --mysql-user root --day 2026-09-12
 ```
