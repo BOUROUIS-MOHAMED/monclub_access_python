@@ -2390,11 +2390,15 @@ class UltraDeviceWorker(threading.Thread):
         recorded_fingers: Dict[str, Any] | None,
         *,
         report: bool = True,
+        unconfirmed_is_new: bool = False,
     ) -> tuple[list[Dict[str, Any]], list[str], Dict[str, set[int]]]:
         """Refuse only the writes the terminal has no slot for: (admitted, skipped, withheld).
 
         ``report=False``: a dry run (the renewal-hold decision) -- same answer, no log line
-        and no CAPACITY_FULL telemetry.
+        and no CAPACITY_FULL telemetry. ``unconfirmed_is_new``: a pin not confirmed on the
+        terminal counts as needing a new user slot even when it has a state row or a push
+        intent (one earlier attempt that did not land) -- the hold decision's question is
+        "is there room for the new pin", and a failed attempt on a full terminal left none.
 
         ``skipped``: pins refused whole -- only a member certainly NOT on the terminal
         (no state row and no push intent: a row or an intent means it may already be
@@ -2454,7 +2458,7 @@ class UltraDeviceWorker(threading.Thread):
             pin = str(u.get("pin") or "").strip()
             desired = self._desired_fingers((templates_by_pin or {}).get(pin))
             rec = recorded.get(pin)
-            new_user = pin not in owned and pin not in known
+            new_user = pin not in owned and (unconfirmed_is_new or pin not in known)
             if rec is not None:
                 new_fingers = sorted(desired - set(rec))
                 vacated = len(set(rec) - desired)
@@ -3440,10 +3444,14 @@ class UltraDeviceWorker(threading.Thread):
                     # terminal has no room for right now are NOT held: their old pin goes
                     # first, as before P3b-1, and frees the slot the new pin needs. A dry run
                     # of the same admission (a live capacity read; only when there are holds).
+                    # Every pending new pin: to push now, or held back by the retry backoff
+                    # (a pin that keeps failing on a full terminal ends up there, review R3).
+                    _pending_users = [u for u in users
+                                      if str(u.get("pin") or "").strip() in unconfirmed_at_start]
                     try:
                         _dry_skipped, _dry_withheld = self._capacity_admit(
-                            to_push, templates_by_pin, self._load_pushed_fingers(),
-                            report=False,
+                            _pending_users, templates_by_pin, self._load_pushed_fingers(),
+                            report=False, unconfirmed_is_new=True,
                         )[1:]
                     except Exception:
                         logger.warning("%s renewal holds: capacity dry run failed -- holding as "

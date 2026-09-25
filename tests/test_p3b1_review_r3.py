@@ -72,3 +72,88 @@ def test_a_promoted_row_the_next_sync_lists_is_not_revoked(db):
                   received=_epoch("2026-09-20T09:00:02+01:00"), windows_version="p2.7.c.d")
     _changed, revoked = _shadow_sync(morning, db.save_sync_cache_delta(morning, MEMBERS_ONLY) or {})
     assert 3 not in revoked and 3 in _ids("sync_users")
+
+
+# ================================================================== 2. a known new pin on a full MB2000
+import queue  # noqa: E402
+
+import app.core.device_sync as ds  # noqa: E402
+import app.core.telemetry as tel  # noqa: E402
+import app.core.ultra_engine as ue  # noqa: E402
+from tests.fake_terminal import TerminalZkem  # noqa: E402
+from tests.test_standalone_incremental_sync import _make_driver, _worker  # noqa: E402
+
+PERSON, OLD, NEW = 900, 34439, 30001
+CAP = 5
+
+
+class _FullTerm(TerminalZkem):
+    """users_free follows the live table; a user not on the terminal is refused when it is full;
+    ``status_readable`` False -> GetDeviceStatus fails; ``fail_once`` pins refused once."""
+
+    def __init__(self):
+        super().__init__()
+        self.status_readable = True
+        self.fail_once = set()
+
+    def GetDeviceStatus(self, machine, idx, box):
+        self.status = ({11: max(0, CAP - len(self.users)), 10: 1000}
+                       if self.status_readable else {})
+        return super().GetDeviceStatus(machine, idx, box)
+
+    def SSR_SetUserInfo(self, machine, pin, name, pw, priv, enabled):
+        p = str(pin)
+        if p in self.fail_once:
+            self.fail_once.discard(p)
+            self._rec("SSR_SetUserInfo", machine, pin, name, pw, priv, enabled)
+            return False
+        if p not in self.users and len(self.users) >= CAP:
+            self._rec("SSR_SetUserInfo", machine, pin, name, pw, priv, enabled)
+            return False
+        return super().SSR_SetUserInfo(machine, pin, name, pw, priv, enabled)
+
+
+def _mrow(am, uid, name="Ali", card=""):
+    return {"activeMembershipId": am, "userId": uid, "membershipId": 3, "fullName": name,
+            "firstCardId": card, "fingerprints": []}
+
+
+@pytest.mark.parametrize("variant", ["status_unreadable_first", "transient_then_full"])
+def test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held(db, monkeypatch, variant):
+    # Review R3: after one attempt that did not land, NEW has a state row or a push intent, and
+    # the round-2 dry run counted it as an update needing no slot: the person stayed held, OLD
+    # kept the slot and NEW was refused every pass. Base removed OLD first and NEW landed.
+    monkeypatch.setattr(ds.DeviceSyncEngine, "_retry_due", staticmethod(lambda **k: True))
+    monkeypatch.setattr(tel, "event", lambda *a, **k: None)
+    monkeypatch.setattr(tel, "warn", lambda *a, **k: None)
+    term = _FullTerm()
+    term.add_user(str(OLD), "Ali", "555")
+    db.save_device_sync_state_batch(device_id=9, rows=[(str(OLD), "h-old", True, None, "")])
+    n_others = 4 if variant == "status_unreadable_first" else 3
+    others = [_mrow(30100 + i, 800 + i, f"M{i}", str(9000 + i)) for i in range(n_others)]
+    for r in others:
+        e = {"pin": str(r["activeMembershipId"]), "name": r["fullName"], "card": r["firstCardId"]}
+        term.add_user(e["pin"], e["name"], e["card"])
+        db.save_device_sync_state_batch(device_id=9, rows=[
+            (e["pin"], ue._standalone_pin_hash(e, []), True, None, "")])
+    new_row = _mrow(NEW, PERSON, card="555")
+    db.upsert_delta_users([_mrow(OLD, PERSON, card="555")] + [new_row] + others)
+    db.delete_users_by_am_ids({OLD})                     # the flip held OLD out
+    drv = _make_driver(term)
+    term.sink = drv._on_att_event
+    w, _cache = _worker(monkeypatch, driver=drv, users=[new_row] + others)
+    w._cmd_queue = queue.Queue()
+    try:
+        for i in range(1, 4):
+            if variant == "status_unreadable_first":
+                term.status_readable = (i != 1)
+            else:
+                if i == 1:
+                    term.fail_once = {str(NEW)}
+                if i == 2:
+                    term.add_user("77777", "Foreign", "4242")      # another system enrols
+            w.request_full_sync(reason="date-flip", fingerprint_hash="h", revoked_ids=set())
+            assert w._drain_full_sync_commands(limit=1) == 1
+    finally:
+        drv.disconnect()
+    assert str(NEW) in term.users and str(OLD) not in term.users
