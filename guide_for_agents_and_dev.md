@@ -482,7 +482,7 @@ the client's token is absent or differs from its own: `refreshCredentials = clie
 null || !clientCredsVersion.equals(currentCredsVersion)`; otherwise the section goes out as
 `gymAccessCredentials: []`. `[CODE: backend main a98bf154 GymAccessController, read not run; the
 same null check at fcfc850c, whose token is only count:maxUpdated with no grant digest]` Upgrading
-the client does not move that token, the §3.2d migration drops only the two member tokens, and
+the client does not move that token, the §3.2d migrations drop only member and device tokens, and
 backend `main`'s daily safety net forces members only. So `init_db` drops the stored
 `credentialsVersion` **once**, at the first start of a build with the grant-aware diff
 (`_force_one_credentials_resend`, run through `_run_one_shot_credentials_resend` right after
@@ -524,8 +524,10 @@ instead of logging. That is what the four wrappers already inline in `init_db` d
 (`_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
 `_ensure_main_account_id_column`, `_ensure_pin_scheme_column`): the error escapes `init_db`, whose
 transaction is then never committed, and `MainApp.__init__` calls `init_db()` unguarded.
-`[CODE: db.py::init_db; app.py MainApp.__init__; TEST: the failure test above raised
-UnboundLocalError while the catch was inline]` Not changed here.
+`[CODE: db.py::init_db — a name bound anywhere in a function body is local to all of it;
+app.py MainApp.__init__]` No test pins it. To check: monkeypatch any one of the four to raise
+`RuntimeError` and call `init_db()` on a temp database — each raises `UnboundLocalError` (run for
+all four on 2026-09-25). Not changed here.
 
 *The one-time cost.* One sync carries the whole credentials list and writes it through the diff.
 `tools/bench_credential_resend.py` times that write end to end (`save_sync_cache_delta` with only
