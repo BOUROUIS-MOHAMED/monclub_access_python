@@ -49,6 +49,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
+| The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -471,20 +472,86 @@ patch sends the member and a `CREDENTIALS` `UPSERT_ONLY` section in one bundle
 backend whose credentials token does not digest the grants never sets `refreshCredentials` for
 a grant-only change, so the main sync does not re-send it (`[UNVERIFIED]` whether the gyms run
 backend `main`). So once a PC runs this build, an `in_roster_by_account` count that keeps
-growing points to grant changes not arriving — after the upgrade window below, the only cause
-traced here; check which backend serves that gym before reading it any other way.
+growing points to grant changes not arriving — once the one forced re-send below has landed (the
+first successful sync after the upgrade), the only cause traced here; check which backend serves
+that gym before reading it any other way.
 
-**The upgrade window.** Rows the previous build left stale stay stale after the upgrade. The
-backend re-sends credentials only when its credentials token moves, and upgrading the client does
-not move it: nothing in this build drops the stored `credentialsVersion` (the §3.2d migration drops
-only the two member tokens), and backend `main`'s daily safety net forces members, not credentials.
-So those rows are rewritten by the first sync after any credential change in the gym — a renewal,
-a new or disabled credential — or a forced refresh or a logout; until then they keep counting as
-`in_roster_by_account` (allowed, as before) and door history keeps the old `activeMembershipId`.
-`[CODE: app.py sync's refresh map and new_tokens; db.py::save_sync_cache_delta,
-::_ensure_main_account_id_column; backend main GymAccessController refreshCredentials]` Dropping
-`credentialsVersion` once at the first start of this build, as §3.2d does for members, would close
-the window; it is not done here. `[UNVERIFIED]` how long the window lasts on a real gym.
+**The upgrade window — closed by one forced re-send (2026-09-25).** Rows the previous build left
+stale are rewritten only when the backend re-sends the credentials, and it re-sends them only when
+the client's token is absent or differs from its own: `refreshCredentials = clientCredsVersion ==
+null || !clientCredsVersion.equals(currentCredsVersion)`; otherwise the section goes out as
+`gymAccessCredentials: []`. `[CODE: backend main a98bf154 GymAccessController, read not run; the
+same null check at fcfc850c, whose token is only count:maxUpdated with no grant digest]` Upgrading
+the client does not move that token, the §3.2d migration drops only the two member tokens, and
+backend `main`'s daily safety net forces members only. So `init_db` drops the stored
+`credentialsVersion` **once**, at the first start of a build with the grant-aware diff
+(`_force_one_credentials_resend`, run through `_run_one_shot_credentials_resend` right after
+`sync_version_tokens` is created). The next `getSyncData` carries every other token and no
+`credentialsVersion`; the backend answers with every credential, and the diff rewrites only the
+rows that differ — a renewed member's stale grant is written, an order-only difference is not.
+The drop deletes no credential row: an offline PC keeps its QR credentials, and keeps asking for
+the full list, until a sync succeeds — tokens are saved only after a successful cache write.
+`[CODE: db.py::_force_one_credentials_resend, ::init_db; app.py sync tick, "Save new version
+tokens ONLY after successful cache write"; MonClubApi.get_sync_data]`
+`[TEST: test_credentials_token_one_shot.py::test_the_token_is_dropped_exactly_once_across_two_starts,
+::test_every_other_token_is_kept, ::test_the_marker_is_never_sent_to_the_backend,
+::test_the_full_resend_rewrites_only_the_stale_rows]`
+
+*Where "once" is recorded.* There is no column to key it on, so a row in `local_one_shot_steps
+(name, done_at)` — name `credentials_resend_for_grant_diff` — records that the step ran. Not in
+`sync_version_tokens`: `load_version_tokens` returns every row, the sync tick sends them all as
+`getSyncData` params, and a logout clears the table. Not in `sync_meta`: one row (`CHECK id=1`,
+`contract_status NOT NULL`) whose presence is what tells `load_sync_cache` and
+`load_sync_contract_meta` that a sync has run, so a marker there would invent a contract snapshot
+on a fresh install. `PRAGMA user_version` is one unnamed integer for the whole file; a named row
+says what ran. `[CODE: db.py::load_version_tokens, ::_fetch_sync_cache_snapshot,
+::load_sync_contract_meta; app.py sync tick]` A fresh install runs the step too: the DELETE finds
+nothing, the marker is written, and no later start touches its tokens.
+`[TEST: ::test_a_fresh_install_gets_the_marker_and_nothing_else]`
+
+*Atomic, and never lost.* The DELETE runs before the marker INSERT, both inside the one transaction
+`init_db` already has open by then (its unconditional `UPDATE access_history` backfill starts it)
+and commits at its end. A crash between them rolls both back and the next start acts again.
+`[TEST: ::test_a_crash_between_the_delete_and_the_marker_rolls_both_back — it checks, at the cut,
+that the DELETE had already run inside the open transaction]` An ordinary error at the INSERT is
+logged and startup goes on: the DELETE commits without the marker, so the next start drops the
+token again — a second full re-send, never a lost one; the other order could commit the marker
+without the drop. `[TEST: ::test_a_failed_marker_write_repeats_the_drop_never_loses_it]` The catch
+sits in `_run_one_shot_credentials_resend`, not inline in `init_db`: `init_db` imports `logging` in
+its own body (the stale-lock resets after its `with` block), which makes `logging` a local name for
+the whole function, so an inline `except …: logging.getLogger(…)` raises `UnboundLocalError`
+instead of logging. That is what the four wrappers already inline in `init_db` do on a failure
+(`_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
+`_ensure_main_account_id_column`, `_ensure_pin_scheme_column`): the error escapes `init_db`, whose
+transaction is then never committed, and `MainApp.__init__` calls `init_db()` unguarded.
+`[CODE: db.py::init_db; app.py MainApp.__init__; TEST: the failure test above raised
+UnboundLocalError while the catch was inline]` Not changed here.
+
+*The one-time cost.* One sync carries the whole credentials list and writes it through the diff.
+`tools/bench_credential_resend.py` times that write end to end (`save_sync_cache_delta` with only
+credentials refreshed, through the writer thread, commit included) against the write the same
+sync does without the drop (every section skipped), paired, 21 runs, on the development PC:
+
+| Credentials | Rows that differ | 32-bit `.venv` Python 3.11 | Python 3.13 |
+|---|---|---|---|
+| 1,500 | none / 5 % / all | +25 / +27 / +45 ms | +15 / +17 / +34 ms |
+| 3,000 | none / 5 % / all | +73 / +80 / +93 ms | +46 / +46 / +69 ms |
+
+The response carries about 394 KiB (1,500) or 790 KiB (3,000) of credentials JSON, uncompressed,
+in the probe's row shape: the DTO's ten fields, a 40-hex secret (`randomSecretHex(20)`), one grant.
+The write bumps the local-state generation, so ULTRA reloads its caches once — what every member
+refresh, the daily one included, already does. `[CODE: db.py::save_sync_cache_delta,
+::bump_local_state_generation]` "All rows" is a real ceiling: under the previous build a row's
+grants were rewritten only when one of its scalar columns changed, so every renewal since then
+stayed stale. `[TEST: re-run the tool — a measurement, not a pass/fail test]` `[UNVERIFIED]` the
+stale share on a real gym, the timing on a gym PC's disk, and the backend's time to build and send
+the list.
+
+*What it does not cover.* A PC that goes back to a build without the grant-aware diff and then
+upgrades again keeps its marker, so it is not re-sent: rows left stale in that stretch wait for a
+credential change, a forced refresh or a logout. A backend whose token does not digest the grants
+(fcfc850c) re-sends on the dropped token too — the null check does not depend on the digest —
+but does not move its token for later grant-only changes (above).
 
 The second chance is sound because the stale id and the listed one are the same person: the
 credential's `accountId` is the `MainAccountModel` id found by the member's email,

@@ -735,6 +735,84 @@ def _ensure_pin_scheme_column(
     return True
 
 
+# Named one-shot startup steps that have run on this database. Not sync_version_tokens:
+# load_version_tokens returns every row of that table and the sync sends them all to the
+# backend as getSyncData params (app.py sync tick -> MonClubApi.get_sync_data), and a logout
+# clears it. Not sync_meta: a single row (CHECK id=1, contract_status NOT NULL) whose presence
+# is what tells load_sync_cache / load_sync_contract_meta that a sync has run, so a marker there
+# would fake a contract snapshot on a fresh install.
+_ONE_SHOT_STEPS_DDL = """
+    CREATE TABLE IF NOT EXISTS local_one_shot_steps (
+        name    TEXT PRIMARY KEY,
+        done_at TEXT NOT NULL
+    );
+"""
+_CREDENTIALS_GRANT_RESEND_STEP = "credentials_resend_for_grant_diff"
+
+
+def _force_one_credentials_resend(conn: sqlite3.Connection) -> bool:
+    """Drop ``credentialsVersion`` ONCE, on the first start of a build with the grant-aware diff.
+
+    WHY. ``_sync_gym_access_credentials_rows`` now writes a grant-only change, but rows the
+    previous build left stale (a renewed member keeps the old ActiveMembership id) are
+    rewritten only when the backend re-sends the credentials, and it does so only when its
+    credentials token moves -- upgrading the client does not move it. Without
+    ``credentialsVersion`` the next ``getSyncData`` asks for the credentials in full
+    (backend ``refreshCredentials = clientCredsVersion == null || ...``) and the diff rewrites
+    the rows that differ. No credential row is deleted here. guide §3.1b "The upgrade window".
+
+    ONE-SHOT. There is no column to key it on, so a ``local_one_shot_steps`` row records that it
+    ran; a fresh database runs it too (an empty DELETE) and is never touched again.
+
+    ATOMIC. The DELETE runs BEFORE the marker INSERT, both inside the one transaction ``init_db``
+    commits at its end: a crash in between rolls both back and the next start acts again. If
+    the INSERT fails and the caller carries on, the DELETE still commits without the marker,
+    so the next start drops the token once more -- the re-send is repeated, never lost. The
+    other order could commit the marker without the drop and lose it for good.
+
+    Returns True when the step ran (the marker was written by this call).
+    """
+    conn.execute(_ONE_SHOT_STEPS_DDL)
+    if conn.execute(
+        "SELECT 1 FROM local_one_shot_steps WHERE name = ?", (_CREDENTIALS_GRANT_RESEND_STEP,),
+    ).fetchone():
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    dropped = int(conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key = ?", ("credentialsVersion",),
+    ).rowcount or 0)
+    written = int(conn.execute(
+        "INSERT OR IGNORE INTO local_one_shot_steps (name, done_at) VALUES (?, ?)",
+        (_CREDENTIALS_GRANT_RESEND_STEP, now_iso()),
+    ).rowcount or 0)
+    if dropped:
+        logging.getLogger(__name__).warning(
+            "[DB] dropped the stored credentialsVersion once so the next getSyncData re-sends "
+            "every credential and the grant-aware diff rewrites the grant lists the previous "
+            "build left stale (renewed members kept their old membership id; guide §3.1b)."
+        )
+    return bool(written)
+
+
+def _run_one_shot_credentials_resend(conn: sqlite3.Connection) -> None:
+    """``init_db``'s call: a failure is logged and startup goes on.
+
+    The catch lives here, not inline in ``init_db``: ``init_db`` imports ``logging`` in its own
+    body further down, which makes ``logging`` a local name for the whole function, so an inline
+    ``except ...: logging.getLogger(...)`` raises UnboundLocalError instead of logging."""
+    try:
+        _force_one_credentials_resend(conn)
+    except Exception as exc:
+        logging.getLogger(__name__).error("[DB] one-shot credentials re-send failed: %s", exc)
+
+
 def _member_main_account_id(u: Dict[str, Any]) -> Any:
     """The mainAccountId a member dict carries: camelCase from the backend payload,
     snake_case from a cached row. None when absent."""
@@ -2122,6 +2200,9 @@ def init_db() -> None:
             );
             """
         )
+        # One full credentials re-send, so the grant-aware diff rewrites the grant lists the
+        # previous build left stale. Once per database. guide §3.1b "The upgrade window".
+        _run_one_shot_credentials_resend(conn)
 
         # Phase 2: firmware profile cache
         # Keyed by device_id (stable int) — not IP (DHCP can reassign IPs).
