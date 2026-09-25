@@ -1039,7 +1039,7 @@ export default function ConfigPage() {
                 </div>
                 <div className="space-y-1.5">
                   <Label>Délai de grâce hors ligne (jours)</Label>
-                  <Input type="number" min={0} value={cfg.offline_revoke_grace_days ?? 0} onChange={(e) => update("offline_revoke_grace_days", Math.max(0, parseInt(e.target.value) || 0))} />
+                  <Input type="number" min={0} max={36500} value={cfg.offline_revoke_grace_days ?? 0} onChange={(e) => update("offline_revoke_grace_days", Math.min(36500, Math.max(0, parseInt(e.target.value) || 0)))} />
                   <p className="text-xs text-muted-foreground">0 = les abonnements expirent à l'heure même sans internet</p>
                 </div>
               </div>

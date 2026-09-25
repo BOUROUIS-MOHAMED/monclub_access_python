@@ -1414,7 +1414,7 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
     from app.core import access_dates as _ad
 
     try:
-        grace = max(0, int(grace_days or 0))
+        grace = min(max(0, int(grace_days or 0)), _ad.GRACE_DAYS_MAX)
     except (TypeError, ValueError):
         grace = 0
     now_epoch = float(pc_now_epoch)

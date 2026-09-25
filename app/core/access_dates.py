@@ -32,6 +32,9 @@ CLOCK_BEHIND_TOLERANCE_SEC = 300.0
 CLOCK_AHEAD_LIMIT_SEC = 86400.0
 
 DELIVERABLE_STATUSES = frozenset({"ok", "grace"})
+# Upper bound of the offline grace (days, ~100 years = "never expire offline"). A larger value
+# overflowed SQLite's INTEGER when the flip stored it and made every flip fail (review R3).
+GRACE_DAYS_MAX = 36500
 
 
 # ============================================================================== windows

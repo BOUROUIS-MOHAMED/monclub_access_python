@@ -112,7 +112,7 @@ def _clamp_int(v: Any, default: int, lo: int, hi: int) -> int:
 
 
 def offline_revoke_grace_days(cfg: Any) -> int:
-    """``cfg.offline_revoke_grace_days`` normalised to a non-negative int.
+    """``cfg.offline_revoke_grace_days`` normalised to an int in [0, GRACE_DAYS_MAX].
 
     0 for anything that is not a plain non-negative integer: a bool (Python's
     ``isinstance(True, int)`` is True, so it must be rejected explicitly, same as
@@ -127,7 +127,9 @@ def offline_revoke_grace_days(cfg: Any) -> int:
         n = int(value)
     except (TypeError, ValueError):
         return 0
-    return max(0, n)
+    from app.core.access_dates import GRACE_DAYS_MAX
+
+    return min(max(0, n), GRACE_DAYS_MAX)
 
 
 def _clamp_float(v: Any, default: float, lo: float, hi: float) -> float:

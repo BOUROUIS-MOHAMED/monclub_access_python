@@ -243,3 +243,29 @@ def test_a_clearing_invalidation_during_a_load_never_serves_its_data(slow_loads)
     assert dbmod.load_sync_cache() == ("snapshot", 2)   # waits for the follow-up, not load 1
     drain()
     assert st["max_live"] == 1
+
+
+# ================================================================== 4. the offline grace is capped
+from app.core import access_dates as ad  # noqa: E402
+from app.core.config import offline_revoke_grace_days  # noqa: E402
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    (0, 0), (3, 3), (-5, 0), (36500, 36500), (36501, 36500), (10 ** 20, 36500), ("7", 7),
+    (True, 0), (None, 0), ("x", 0),
+])
+def test_the_grace_setting_is_normalised_into_its_range(raw, expected):
+    assert offline_revoke_grace_days(SimpleNamespace(offline_revoke_grace_days=raw)) == expected
+    assert ad.GRACE_DAYS_MAX == 36500
+
+
+def test_a_grace_beyond_sqlite_integers_neither_fails_the_flip_nor_loops_the_precheck(db):
+    # Review R3: 10**20 overflowed SQLite INTEGER when the flip stored grace_days, so every flip
+    # failed (DATE_FLIP_FAILED every minute) and the applied day froze.
+    _seed_full_v2(db)
+    r = db.apply_local_date_flips(pc_now_epoch=_epoch("2026-09-20T07:30:00+01:00"),
+                                  grace_days=10 ** 20, source="test")
+    assert r["gym_date"] == "2026-09-20" and r["promoted"] == 1
+    st = db.gym_date_status(pc_now_epoch=_epoch("2026-09-20T09:00:00+01:00"))
+    assert st["grace_days"] == ad.GRACE_DAYS_MAX
+    assert st["grace_days"] == offline_revoke_grace_days(SimpleNamespace(offline_revoke_grace_days=10 ** 20))
