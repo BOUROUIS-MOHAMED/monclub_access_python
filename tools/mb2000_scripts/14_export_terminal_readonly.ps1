@@ -297,7 +297,11 @@ $doc = [ordered]@{
 # describes. This script writes into exports\, never into backups\, so a restore always
 # needs a deliberate copy.
 ($doc | ConvertTo-Json -Depth 8) | Set-Content -Path $outFile -Encoding UTF8
-$fileHash = (Get-FileHash -Path $outFile -Algorithm SHA256).Hash.ToLowerInvariant()
+# .NET, not Get-FileHash: Windows PowerShell 5.1 started from a PowerShell 7 window inherits its
+# module path and cannot load Get-FileHash, which failed the export at its last step.
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $fileHash = ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($outFile))) -replace '-','').ToLowerInvariant() }
+finally { $sha.Dispose() }
 "$fileHash  $(Split-Path $outFile -Leaf)" | Set-Content -Path ($outFile + '.sha256') -Encoding ASCII
 
 Write-Host ""
