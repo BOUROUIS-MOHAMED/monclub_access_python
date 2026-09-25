@@ -4001,9 +4001,11 @@ def _handle_device_door_open(ctx: _Ctx) -> None:
                 ctx.send_json(200, {"ok": True, "rc": 0, "source": "ultra"})
                 _tel.event("DOOR_OPEN", device_id=did, door=door, result="200_ok", wait_ms=_door_ms)
             elif err == "timeout":
-                # Worker took the command but didn't ack in time — likely
-                # mid-reconnect. Tell the UI it's unreachable, not a server
-                # crash, so it can render an "offline" state instead of a 500.
+                # Nothing was sent: the caller gave up before the worker took the
+                # command (the claim, guide §3.1a) -- the worker was busy or mid-
+                # reconnect -- or the worker found it past its deadline. Tell the UI
+                # it's unreachable, not a server crash, so it can render an "offline"
+                # state instead of a 500.
                 _logger.warning(
                     "[LocalAPI] ULTRA door open timed out: device_id=%s door=%s",
                     did, door,

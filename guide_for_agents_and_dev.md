@@ -45,7 +45,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
-| The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, and field cheatsheet §6 |
+| The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, field cheatsheet §6, and zkemkeeper_guide §4 (Door) |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
@@ -321,7 +321,8 @@ caller is `local_access_api_v2.py::_run_on_device_sdk`, used by the DevicesPage 
 abandoned entry only by `time.monotonic() > deadline`, the check the door queue outgrew.
 `[TEST: scratch probe, not committed]` 300 runs of `request_run_sdk(timeout=0.05)` followed at
 once by `_drain_sdk_commands`, with the 32-bit `.venv` Python 3.11 on the dev PC, ran the queued
-function after its caller had been answered "timeout" 25, 31 and 29 /300 times on `f1812e7`;
+function after its caller had been answered "timeout" 25, 31 and 29 /300 times on `f1812e7`
+(branch `claude/p3a1-door-open-claim`; integrated as `f8fe2a0`);
 0/300 in three runs with this change.
 
 Each entry now carries the same `_CommandClaim`, taken by the worker before `fn` runs and by
@@ -470,8 +471,20 @@ patch sends the member and a `CREDENTIALS` `UPSERT_ONLY` section in one bundle
 backend whose credentials token does not digest the grants never sets `refreshCredentials` for
 a grant-only change, so the main sync does not re-send it (`[UNVERIFIED]` whether the gyms run
 backend `main`). So once a PC runs this build, an `in_roster_by_account` count that keeps
-growing points to grant changes not arriving — the only cause traced here; check which backend
-serves that gym before reading it any other way.
+growing points to grant changes not arriving — after the upgrade window below, the only cause
+traced here; check which backend serves that gym before reading it any other way.
+
+**The upgrade window.** Rows the previous build left stale stay stale after the upgrade. The
+backend re-sends credentials only when its credentials token moves, and upgrading the client does
+not move it: nothing in this build drops the stored `credentialsVersion` (the §3.2d migration drops
+only the two member tokens), and backend `main`'s daily safety net forces members, not credentials.
+So those rows are rewritten by the first sync after any credential change in the gym — a renewal,
+a new or disabled credential — or a forced refresh or a logout; until then they keep counting as
+`in_roster_by_account` (allowed, as before) and door history keeps the old `activeMembershipId`.
+`[CODE: app.py sync's refresh map and new_tokens; db.py::save_sync_cache_delta,
+::_ensure_main_account_id_column; backend main GymAccessController refreshCredentials]` Dropping
+`credentialsVersion` once at the first start of this build, as §3.2d does for members, would close
+the window; it is not done here. `[UNVERIFIED]` how long the window lasts on a real gym.
 
 The second chance is sound because the stale id and the listed one are the same person: the
 credential's `accountId` is the `MainAccountModel` id found by the member's email,
@@ -2599,7 +2612,8 @@ is timing-flaky on the base too — runs of that file alone failed 13/52 on `d09
 rate; the `claude/p3a1-door-deadline-race` branch addresses it. `[TEST]` The race behind it:
 `Event.wait(timeout)` can return while `time.monotonic()` has not passed the entry's deadline, so a
 drain right after the caller's `timeout` still sends the open (§3.1a); in isolation that scenario
-opened the door in 23 of 300 repetitions (2026-09-18, development PC, commit 75f2c7d). `[TEST]`
+opened the door in 23 of 300 repetitions (2026-09-18, development PC, commit 75f2c7d on branch
+`claude/confident-williamson-07839d`, integrated as 079bb02). `[TEST]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
 failed once in a full base run and passed 20/20 alone on both. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`
