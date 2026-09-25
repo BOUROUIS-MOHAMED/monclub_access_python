@@ -264,11 +264,9 @@ runs out, takes it before answering "timeout". Whoever comes second is refused:
   `last_open_door_result` (a `_DOOR_OPEN_RESULTS` value, written by `_door_open_event` on every
   path), and `_drain_commands` answers `sent, no answer` when it is `timeout`: the command was
   handed to the terminal and the relay may still fire. A real `False` still reads as the
-  refusal. `PullSDKDevice.open_door` records nothing and answers `False` for "not connected" and
-  for any exception from `door_pulse_open` alike, so on a panel both still read as the refusal,
-  as on master. That is a label, not proof the door stayed shut: after a call that raised — the
-  standalone driver's `result=exception`, a PullSDK `ControlDevice` error — whether the relay fired
-  is `[UNKNOWN]`. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
+  refusal. `PullSDKDevice.open_door` keeps no `last_open_door_result` and answers `False` for
+  "not connected" and for any exception from `door_pulse_open` alike, so on a panel both still read
+  as the refusal, as on master. That answer is a label, not proof the door stayed shut. `[CODE: zk_standalone.py::open_door, ::_door_open_event; ultra_engine.py::_drain_commands;
   pullsdk.py::PullSDKDevice.open_door]` `[TEST: test_mb2000_force_open.py::TestLocalApiDoorOpenChain::
   test_a_wedged_acunlock_is_sent_no_answer_not_a_refusal, test_door_open_deadline.py::
   test_a_timed_out_open_reads_sent_no_answer_a_refusal_reads_false]`
@@ -381,10 +379,8 @@ idle wait plus the worker's own empty-poll wait, up to 300 ms, `empty_backoff_ma
 wakes; neither changes here), no scan lost; desk-open round trip median 0.4–0.5 ms and 0.4–0.9 ms,
 every press answered ok. One run here had a p95 of 4.0 ms and a worst press of 112 ms. On the
 400-press probe the first run here had 21 presses of 41–93 ms, all within one 20 s stretch. Sampled
-20 ms into each press, the worker was still inside a wait: 13 in `_wait_for_work` after the press had
-set its wake event, 8 in `_poll_with_watchdog`'s `t.start()` waiting for its new poll thread. Why it had
-not moved on — OS scheduling or the GIL — the probe does not show `[UNVERIFIED]`. Two re-runs of both
-trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a 100-member push — §3.4e's push
+20 ms into each press, the worker's stack was in `_wait_for_work` (13) or in `_poll_with_watchdog`'s
+`t.start()` (8); why, the probe does not show `[UNVERIFIED]`. Two re-runs of both trees had none, medians 0.6–0.8 ms, worst 3.7–27.6 ms. During a 100-member push — §3.4e's push
 harness, which calls the pass and the loop's own drain steps in order on one thread, not `run()` — a
 scan, a desk press and a member update waited the same on both: median 5, at most 9 member writes.
 `[TEST: fake terminal; harness kept out of the repo, §3.4e]`

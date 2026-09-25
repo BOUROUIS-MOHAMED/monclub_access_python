@@ -477,15 +477,9 @@ Two layers, two vocabularies — grep both or you see half the story `[CODE: §5
 
 `500_sent_no_answer` means the command **was sent** and no answer came in time — the door may
 have opened; check it before pressing again. On an MB2000 it pairs with a driver line
-`result=timeout` (the driver stopped waiting on `ACUnlock`). `500_failed` is every other outcome,
-and its `err=` names it: `superseded` (a newer press replaced this one while it was still queued —
-nothing was sent), `not connected` (nothing was sent), or `open_door returned False`, which covers a
-FALSE from the terminal, a driver that was not connected, a switch turned off after the press was
-queued, and a call that raised. On an MB2000 the driver's own line (`worker=ZKEM:<id>`) tells those
-apart; on a PullSDK panel no `[T]` line does — only the plain log line
-`[PullSDKDevice][<id>] open_door FAILED … error=…` shows a call that raised. After a call that raised,
-whether the relay fired is `[UNKNOWN]`, so unless the cause is known, check the door before pressing
-again. `[CODE: guide §3.1a]`
+`result=timeout` (the driver stopped waiting on `ACUnlock`). `500_failed` is every other failure;
+its `err=` carries the first 40 characters of the reason the local API received. It does not prove the
+door stayed shut, so check the door before pressing again. `[CODE: local_access_api_v2.py::_handle_device_door_open]`
 
 Whether the command was even allowed:
 
