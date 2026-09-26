@@ -25,7 +25,7 @@ today's production. The export on the night gives the real numbers.
 3. Gym 58 after closing: stop Access on every PC, export both panels, compare, decide go / no-go (C1-C5).
 4. Erase panel 5 and panel 6, check they are empty, pull their network cables (C6-C8).
 5. Install the new Access on every gym 58 PC, register each one, check the dashboard verdict (C9-C11).
-6. Set both panels to "Par personne", wait for the switch line in the log, plug the cables back, let it refill (C12-C14).
+6. Set both panels to "Par personne", wait for the switch line in the log, restart Access, plug the cables back, let it refill (C12-C14).
 7. Check the refill, test cards, QR codes and the "Ouvrir" button, re-enable autostart (C15-C17).
 8. Gym 45: the same shape with its MB2000 tools, plus the "retire" of each PC's old state (D).
 9. Morning: read the logs, watch the first entries, send the listed members to the desk (E).
