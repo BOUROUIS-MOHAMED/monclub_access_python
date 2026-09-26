@@ -24,6 +24,7 @@ def _runtime_app():
     return SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -50,6 +51,7 @@ def test_apply_fast_patch_bundle_invalidates_caches_and_requests_targeted_member
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -112,6 +114,7 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -154,6 +157,7 @@ def test_apply_fast_patch_bundle_routes_membership_delete_as_authoritative_revok
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -198,6 +202,7 @@ def test_apply_fast_patch_bundle_normalizes_delete_classifier(monkeypatch):
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -233,6 +238,7 @@ def test_apply_fast_patch_bundle_ignores_malformed_delete_entity_ids(monkeypatch
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -287,6 +293,7 @@ def test_apply_fast_patch_bundle_keeps_unrelated_delete_as_ordinary_change(monke
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
@@ -668,6 +675,7 @@ def test_apply_fast_patch_bundle_duplicate_short_circuits_runtime_actions(monkey
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
+        _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
         _request_running_ultra_sync=MagicMock(return_value=True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),

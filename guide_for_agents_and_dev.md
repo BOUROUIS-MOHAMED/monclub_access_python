@@ -49,6 +49,9 @@ This file is only useful while it is true. If you change any of the following, y
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
 | The QR roster check — its verdicts, where it runs, its switch, its counts (`access_verification.py::verify_totp`'s roster step, `::record_totp_roster_check`, `::maybe_log_totp_roster_summary`; `settings_reader.py::parse_totp_roster_check_mode`; `ultra_engine.py::_handle_totp_rescue`'s member-list choice; the heartbeat's `qrRosterCheck`, `pc_identity.py::_qr_roster_check_report`) | §3.1b, §10.2a |
 | What the credential diff compares, or how it compares grants (`db.py::_sync_gym_access_credentials_rows`, `::_sync_credential_grants_changed`) | §3.1b |
+| Sync protocol 2 on the PC — what the request sends, what the save stores (`db.py::_apply_protocol2_save`, `_reconcile_held_rows`, `_create_protocol2_tables`), the flip and the gym date/clock rules (`db.py::apply_local_date_flips`, `::gym_date_status`, `app/core/access_dates.py`), or when the flip runs (`app.py::_apply_date_flips` and its triggers, `pc_identity.py::_heartbeat_payload_after_date_check`) | §3.8, §10.2b |
+| The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
+| Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -669,9 +672,88 @@ backend main]` The Tauri popup shows it as « Aucun abonnement actif trouvé pou
 `[CODE: tauri-ui/src/pages/PopupWindow.tsx]`
 
 **What it cannot do.** The check compares against the member list this PC last received. Without
-server-sent validity dates (planned with P2/P3b), an **offline** PC's list does not change, so a
-member whose membership ends during an internet outage keeps opening by QR until the PC is back
-online and syncs. It closes the online gap only. `[CODE]`
+trusted protocol-2 windows (a v1 server, the switch off, §3.8) an **offline** PC's list does not
+change, so a member whose membership ends during an internet outage keeps opening by QR until the PC
+is back online and syncs. With trusted windows the date flip (§3.8) takes that member off the list
+and the allowed-days step below refuses the code. `[CODE]`
+
+**Allowed days (P3b-1, 2026-09-19).** After the roster check and the enforce-mode roster refusal,
+before the ALLOW return, `verify_totp(..., access_days=)` asks
+`access_dates.qr_date_verdict` about the matched credential's grants and the same member list —
+never in `_iter_eligible_totp_creds` / `build_totp_index`, so the index and the loop decide alike.
+Every matched QR result carries `dateCheck`:
+
+| `dateCheck` | Means | Result |
+|---|---|---|
+| `ok` | a grant is deliverable on the applied gym date by its window; or a grant is on the list with no window (a fast patch, a v1 row); or `rosterCheck` is `in_roster_by_account` (a renewal whose grants are stale); or a grant's person (`member_person_link` userId) has a row on the list (another current plan, review round 4) | allowed as before |
+| `not_today` | every grant is provably not deliverable today BY ITS WINDOW | **refused `DENY_NOT_ALLOWED_TODAY`, in BOTH roster modes** |
+| `unchecked` | no trusted windows (`access_days` None, `trusted=0`, no applied date), or a grant with no stored window and no row on the list — the PC knows no date for it; whether it opens is the roster check's question (trial counts it, enforce refuses it) | allowed as before |
+
+The first version also called a grant with no window and no row on a current list `not_today`: that
+turned trial mode into enforce for exactly the members the trial counts — e.g. a renewal whose stored
+credential grants are stale and whose row has no `mainAccountId` (review round 2, reproduced against
+base: base allowed, the branch refused). `[TEST: test_access_dates.py::TestQrDateVerdict,
+test_qr_allowed_days.py::test_a_code_in_neither_the_windows_nor_the_list_is_the_roster_checks_question]`
+
+So with trusted windows, trial mode no longer allows every `not_in_roster` code: a code whose
+memberships are all out of their windows is refused. `[TEST: test_qr_allowed_days.py]` The popup
+says « Abonnement non valable aujourd'hui ». A date refusal is final in `verify_totp_resilient`
+(no wall-clock re-run; a wall-clock pass that produces it is the reported verdict).
+`[TEST: ::test_a_date_refusal_does_not_rerun_the_verification,
+::test_a_date_refusal_found_on_the_wall_clock_retry_is_the_reported_verdict]`
+
+*The credentials of the gym date.* `load_local_state` passes the stored credentials through
+`access_dates.effective_credentials` (the loop AND the speed index use that list): an upcoming
+credential is added, enabled, on the first day one of its grants is deliverable (unless the account
+already has an enabled one); a main credential gains the upcoming memberships whose `qrAccountId` is
+its account and that start today (a renewal). Nothing stored changes; a failed read keeps the stored
+list. `[TEST: ::test_an_upcoming_only_credential_opens_on_its_first_day,
+::test_a_renewal_adds_the_starting_membership_to_the_existing_credential]` The server enables an
+upcoming-only account's credential row only at 00:16 Tunis on the first day
+(`DailyScheduleService.nightlySyncGymAccessCredentialEnabledStatus`, cron `0 16 0 * * *`); a sync
+between 00:00 and 00:16 lists it `enabled=false` and no longer as upcoming, so that member's QR
+waits for the next sync (the wiring arms one at 00:17, §3.8). `[CODE: backend]`
+`[TEST: local e2e S6]`
+
+*Which snapshot.* `access_verification.current_access_days(max_generation=)` keeps the snapshots of
+the last few local-state generations. The ULTRA rescue passes the generation of the data the scan is
+matched against — its own list's as `access_days`, and the shared TOTP index's as
+`access_days_index`, which `verify_totp` uses only when the match came through the index (it uses
+the index only while that index covers the scan's counter window; a late RTLog event falls back to
+the loop over the worker's own credentials, review round 2) — and the AGENT decision the older of its two cached halves, so a list loaded before a flip
+is checked against the day it was loaded on: checking it against the newer day refused a renewing
+member whose old plan ended yesterday until the worker's refresh landed (found in review of part D),
+and checking a newer list against the older day refused a starter and, in trial, admitted an
+ex-member at the second door after a flip (review round 1). The ULTRA worker keeps
+`(state, generation)` as ONE attribute (`_cached_pair`) written by every writer after the two
+separate fields, so the rescue reads the exact generation of the list it got — including a list
+`_get_cached_local_state` just adopted from the shared snapshot after a cache reset, which the older
+"generation read before the call" labelled pre-flip. No snapshot old enough → `unchecked` for that
+scan. `[TEST: tests/test_p3b1_review_r1.py — the ULTRA rescue tests]` A snapshot is labelled with the generation read before its load
+and reloaded when the generation moved during the load, so none is labelled newer than its data.
+`[TEST: tests/test_p3b1_integration_fixes.py]` Residual: a flip commits, then bumps; a load that
+reads the new rows and finishes inside that gap is labelled one generation too old (the transient
+false refusal, for that one generation's lists). Same class: an ULTRA background refresh whose load
+straddles a row-moving flip installs post-flip rows labelled with the pre-flip generation, so until
+the next refresh (the next scan sees the generation moved and triggers it) that list is checked
+against the pre-flip day — in trial an ex-member held that night is admitted, which base also did
+(no date check). Reported in review round 2; not changed. `[CODE]` A reload on the scan path (the first scan
+after a bump, before the refresh warms it) cost 35 ms median on the development PC with 1,860
+synthetic windows; a cached call 1.2 µs. Re-measured 2026-09-26 with the snapshot's person map
+(1,860 windows and 1,860 `member_person_link` rows): 16–17 ms median, max 38 ms; cached 1 µs.
+`[measured, dev PC; gym PC UNKNOWN]` *The person second chance.* The PC's credential diff does not
+see a server-side change of a credential's grants, so stored grants can name only an expired plan
+of a member whose other plan is current; with that plan's expired window still stored, the date
+check refused the member in trial mode offline (base: allowed). The snapshot carries the
+`member_person_link` userIds of its windowed memberships, and a grant not deliverable today is `ok`
+when the same person has a row on the list. `[TEST: tests/test_p3b1_review_r4.py — the QR tests]`
+
+*Counting.* `record_totp_roster_check` also counts `not_today` and logs
+`[T] QR_DATE_CHECK source verdict=not_today` (no member identity). `refused` keeps its meaning (the
+roster check's own refusals); the counters are not exclusive. `QR_ROSTER_SUMMARY` gains `not_today`.
+`[TEST: ::test_a_date_refusal_is_counted_and_logged_without_member_identity]` Card checks
+(`verify_card`) have no date input: a held member's card is refused because the flip took the row
+off the list the card index is built from. `[CODE]`
 
 **Before switching a device to enforce** — known ways a valid member could still read as
 `not_in_roster` `[CODE]`, which is what the trial counts are for:
@@ -1164,6 +1246,8 @@ not from memory:
 | `upsert_delta_users` | delta helper |
 | `_upsert_sync_user_row` ← `apply_fast_patch_bundle` | fast-patch `ACTIVE_MEMBERSHIP` upsert |
 | `_rebuild_sync_users_without_legacy_fingerprint` | legacy-schema migration |
+| `_reconcile_held_rows` (P3b-1) | a held row restored at a save — a column-for-column copy from `sync_users_held` |
+| `apply_local_date_flips` (P3b-1) | the date flip: restore (column copy) and promote (`_upsert_sync_user_row` of the stored upcoming row) |
 
 and read back as `"mainAccountId"`. `main_account_id` is part of `_SYNC_USER_COLUMNS`, the
 tuple the full-refresh diff compares: a row whose **only** change is a newly-arrived
@@ -1398,6 +1482,18 @@ panel it is refused on every pass (and the prune skipped) — no deployed gym is
 member through the ownership-gated targeted path with no ceiling (unchanged from base; the MB2000 routes
 the same revocations through its ceiling-gated revoke pass) — so "every bulk removal goes through one
 ceiling" does not cover explicit PullSDK revocations. `[CODE: ultra_engine.py::_drain_full_sync_commands]`
+
+**Renewal holds (P3b-1, §3.4f).** The removals-first step's ceiling judges what that step removes
+— the real leavers; the holds are set aside first. The released holds are removed after the push only
+while (pins removed first this pass + released holds) stays within the same ceiling, else they are
+all kept for a later pass (`REVOKE_ABORTED path=renewal_release`). So a pass never removes more than
+the ceiling allows, as when the old pins were removed first. The first version counted the holds in
+the step's ceiling; a renewal whose new pin kept failing then stayed in the count on later passes and
+could push a later day's leavers over it — `REVOKE_ABORTED`, the ex-members left on the turnstile —
+where base, having removed the old pin on the first day, removed them (review round 1, reproduced on
+both SDKs). `[TEST: test_renewal_ordering.py::TestStandaloneCeilingAndFailures::test_the_ceiling_judges_the_leavers_and_a_release_beyond_it_waits,
+::test_a_kept_hold_does_not_push_the_next_days_leavers_over_the_ceiling, and the same two in
+::TestPullSdkRenewal]`
 
 **What stays different.** MIRROR keeps its own stricter, purely fractional floor (§3.2c) — merging it
 into the shared ceiling would RELAX it below 40 members. Single-pin removals (a targeted revoke)
@@ -1644,6 +1740,8 @@ and the prune last. An explicit revocation whose pin that step removed is confir
 not re-queued even if the push then fails. `[CODE: ultra_engine.py::_run_standalone_full_sync]`
 `[TEST: test_removals_first_and_retry.py::TestRemovalsFirst]` — deliberate inversion:
 `test_standalone_revoked_pin_removal.py::test_a_failed_push_no_longer_blocks_revocation`.
+**Qualified by P3b-1 (§3.4f):** on MEMBERSHIP pins, the old pin of a person whose new pin is not yet
+on the device (a renewal) is removed AFTER the push, not first; everyone else still goes first.
 
 **Retry of a FAILED removal (≤ 300 s).** The claim "delete and upsert retries both back off to 24 h"
 held for upserts only. A failed removal had no timer at all: the pass still reported success, the
@@ -1993,6 +2091,91 @@ runs had one slow open each (148 and 230 ms of 150); the 400-open probe then gav
 enumeration, §3.4a) or a sweep command (at most 0.5 s, §3.4c) runs, the loop waits for it; their
 MB2000 durations are field items.
 
+### 3.4f Renewal ordering — the new pin first, then the old one (P3b-1, 2026-09-19)
+
+**What a renewal is, pin-wise.** The backend's **renew** action updates the SAME `ActiveMembership`
+(new start and end dates, same id — the same MEMBERSHIP pin); nothing leaves the turnstile.
+`[CODE: backend ActiveMembershipService.renewActiveMembership — findById(dto.getActiveMembershipId()),
+setStartDate/setEndDate, save]` A NEW id for the same person comes from selling ANOTHER plan
+(`startMembership` refuses the same plan twice with 409 and gives the new row the same `user`, i.e.
+the same `userId`). `[CODE: backend ActiveMembershipService.startMembership]` P3b-1's date flip
+produces exactly that case: at 00:00:05 or at power-on, the old plan's row is held out and the new
+plan's upcoming row promoted in ONE flip, so one full-sync pass sees the old pin leave and the new
+pin arrive. With removals first (§3.4b) the old pin went before the new one was written, and if
+that write failed the person had neither until a later pass (§7 R3-21).
+
+**The rule.** A **hold** is an owned pin that left the desired roster, is NOT an explicit revocation
+of the pass (nor an excluded or recently-removed id), and whose PERSON
+(`member_person_link.user_id`, §3.8) still has a desired pin not confirmed on the device at the start
+of the pass (it needs a push — new, changed, failed — or is held back by the retry backoff).
+MEMBERSHIP scheme only; under ACCOUNT a renewal keeps the account pin and nothing is held. No person
+link (a membership never cached on this database, a read failure) → no hold: removed first, as before.
+
+- The holds are set aside first; the removal ceiling (§3.2g) judges the leavers this step removes,
+  and a refusal removes none of them (the holds stay held).
+- Leavers are removed first, exactly as before.
+- After the push, a hold whose person's desired pins are ALL confirmed now (sent, not failed, not
+  superseded, not capped out, not capacity-refused) is removed by the same ownership-checked code
+  (MB2000: `_remove_departed_pins`, ownership re-read first; PullSDK: `_bulk_delete_pins` +
+  `clear_device_revocation_state`) — only while the leavers removed first plus these still fit the
+  ceiling; otherwise all of them are kept for a later pass (`REVOKE_ABORTED path=renewal_release`).
+  A failed post-push removal is a normal removal failure (fast retry, `REMOVAL_FAILED`).
+- The rest are KEPT: never removed that pass, state rows kept (prune keep set), MIRROR treats them as
+  roster; not a failure, not a ceiling refusal. The person keeps entering through the old pin until
+  the new one lands (a retry, the next capped pass) — or until the server's own revocation of the
+  old plan arrives with the next sync, which removes it first (below, "Not covered").
+- **No hold on a full terminal** (MB2000): a hold keeps the old pin's user and finger slots, and
+  capacity admission (§3.4d) refused the new pin on every pass while they were taken — it never
+  landed (review round 2, reproduced against base). When there are holds, the full sync dry-runs the
+  same admission first (`_capacity_admit(report=False, unconfirmed_is_new=True)`, a live capacity
+  read) over every pending new pin — to push now or parked by the retry backoff. Holds are allowed
+  only when EVERY pending new pin fits without the held slots; otherwise nobody is held and every
+  old pin goes first, as before P3b-1. A new pin not confirmed on the terminal counts as needing a
+  slot even when an earlier attempt left a state row or a push intent (review round 3). The earlier
+  per-person rule ("hold the people whose own pin fits") still let a hold take the slot another
+  pending pin needed — a first-day starter refused, or a renewal not held and so left with neither
+  pin (review round 4). So on a terminal near capacity a renewal falls back to base behaviour
+  (old pin first; the R3-21 gap for that pass) rather than costing someone else their slot.
+  `[TEST: tests/test_p3b1_review_r2.py::test_a_renewal_on_a_full_terminal_removes_the_old_pin_first_and_the_new_one_lands,
+  tests/test_p3b1_review_r3.py::test_a_known_new_pin_on_a_full_terminal_does_not_keep_the_person_held,
+  tests/test_p3b1_review_r4.py — the slot tests]`
+- One removal-retry report per pass: with holds, the removal step's own result and the post-push
+  failures are reported together after the push (the exception handler reports if the pass raises
+  in between). One `[T] RENEWAL_HOLD worker|device_id held removed_after_push kept` per pass that
+  had holds; `REVOKE_DONE pins` now counts only what the removal step removed first.
+
+`[CODE: ultra_engine.py::_run_standalone_full_sync, ::_neutralise_revoked_pins,
+::_remove_released_holds, ::_remove_departed_pins; device_sync.py::renewal_holds,
+::renewal_released_holds, ::DeviceSyncEngine._sync_one_device]` `[TEST: tests/test_renewal_ordering.py
+— 34 tests, both SDKs; red on the base]` `[TEST: local e2e S3d — on the synced rows, the fake MB2000
+saw the two leavers deleted before any write and the renewal's new pin written before its old pin
+was deleted]`
+
+On the MB2000 `_standalone_pins_needing_push` now runs once, BEFORE the removal step (it reads the
+state of desired pins only; the removal step clears only non-desired pins), so `SYNC_RETRY_BACKOFF`
+now appears before `REVOKE_DONE` in the log. On PullSDK "unconfirmed at the start" is the pins that
+needed a push in the hash loop (before backoff and delta pruning) plus `pins_to_sync` — on a delta
+pass it errs toward keeping the old pin. The ULTRA PullSDK full sync hands the engine the
+memberships its revoke pre-pass handled (`engine._full_sync_revoked_pins`, set in
+`_drain_full_sync_commands` after the unchanged pre-pass) so an explicit revocation is never held.
+
+**Not covered.** A server revocation of the old plan served by the TARGETED path
+(`_run_standalone_member_revoke`, `sync_member_on_connected_sdk`) still removes it first, whatever
+the new pin's state — outside "the same pass"; so does the full pass for a pin the server
+revoked explicitly (required, never held). The date-driven case is served by the flip's full sync
+before any server revocation arrives — when the new pin lands in that pass. When it does not (the
+hold is kept), the next successful sync brings the server's revocation of the old plan (the flip
+never touches `member_shadow`, so the diff names it) and the old pin is removed first while the new
+one is still refused: the member then has neither pin until the new one lands, as in base. The hold
+protects a kept renewal only while the PC is offline (review round 2). A new pin superseded mid-push
+counts as unconfirmed for that pass. `[CODE]` `[UNVERIFIED — HARDWARE-GATED]` whether an MB2000 or a C3-400 accepts a second
+user carrying a card number another user on the device holds: the backend keeps cards unique across
+a gym's memberships (`cardInUseInGym`, no status filter), but an old pin's device row can still carry
+a card later moved to the new membership. If the terminal refuses the duplicate, the new pin fails
+every pass and the hold is kept (the person still enters with the old pin, but the new plan's
+fingerprints never land). FIELD-TEST on a bench MB2000 and C3-400: write user A with card X, then
+user B with card X, and check whether B lands.
+
 ### 3.5 Door-history upload — verdicts, the unresolved retry bound, and expiry (2026-09-12)
 
 **Where it runs.** On every sync tick that starts — logged in, no previous tick still running;
@@ -2235,6 +2418,11 @@ every PC of every gym retried at the same instant after a backend restart, that 
 count concurrent connections, far below 25; the ±20 % jitter spreads the first retry over
 12–18 s. `[CODE: backend RateLimitProperties, application.yml; client sync_retry.py]`
 
+**Date flips (P3b-1).** `work()` runs the date precheck before the fetch and a date flip after
+each save; a separate 60 s timer (`_date_flip_tick`) and a 00:00:05 one-shot run the same check
+on their own. None of them touches `_sync_after_id` or the retry schedule, and a flip never
+requests a backend sync (only the one 00:17 first-day sync does). See §3.8 "When the flip runs".
+
 **A worker thread that cannot start** (`RuntimeError: can't start new thread` at the 32-bit
 ceiling) no longer leaves `_sync_work_running` True forever: the flag is cleared, the request
 context restored and a retry armed. `[TEST: ::test_a_worker_that_cannot_start_does_not_wedge_the_sync]`
@@ -2263,6 +2451,244 @@ rows are stored. `[TEST: test_optional_content_sync_auth.py]`
 `[CODE: grep of app/, access/, tv/, shared/, tauri-ui/src for the table and list_* names]` The
 scheduler has no token refresh of its own and is never `stop()`ped (it is a daemon thread).
 `[CODE]`
+
+### 3.8 Sync protocol 2 on the PC — validity windows, power-on date flips, the clock (P3b-1, 2026-09-19)
+
+**Why.** Most gyms cut the PC and the electricity overnight (§3.4a), and a `ZK_STANDALONE` turnstile
+decides alone. Before P3b-1 nothing on the PC ever removed a member whose plan ended while the PC
+was offline or off: the member list is the server's answer of the last sync, and the default
+device roster has **no date filter** (`_filter_users_for_device` compares `validFrom/validTo` only
+under `pushingToDevicePolicy=VALID_ONLY`). `[CODE: device_sync.py::_filter_users_for_device]`
+Sync protocol 2 sends each membership's days so the PC can apply them itself.
+
+**The contract** (backend `main` `2b75ddb3`, read-only here: `ActiveMemberResponseV2`,
+`ActiveMemberUserV2Dto`, `AccessWindowDto`, `AccessSyncMetaDto`, `UpcomingGymAccessCredentialDto`,
+`AccessDeliverability`, `GymAccessController.getGymAccessUsers`). The PC always sends `protocol=2`
+and its stored `windowsVersion`; the server answers v2 only while `monclub.access.v2.enabled` is on
+(env `MONCLUB_ACCESS_V2_ENABLED`), otherwise plain v1 — an old server ignores the parameter. A v2
+answer adds `syncMeta` (server `today`, `horizonEnd` = today + 7, `serverTime` with the Tunis
+offset), `currentWindowsVersion`, a window on every `users[]` row plus `memberWindows` for today's
+rows not sent (together exactly today's set), and — in every full section, and in a delta only when
+it changed — `upcoming[]` (memberships deliverable on some day up to `horizonEnd` but not today)
+with `upcomingIds` and `upcomingCredentials` (existing QR credentials of upcoming-only accounts,
+sent `enabled=false`). A day D is deliverable when `accessFrom <= D <= accessUntil` and D is not in
+`offDays`. `[CODE: backend]` `[TEST: local e2e on a scratch copy of wigo-demo, 2026-09-19 — the
+answers for gym 59 and gym 58 (1,602 rows, 11 upcoming, 2.5 s) had exactly these fields]`
+
+**Pure logic** — `app/core/access_dates.py` (no clock, no database): `parse_v2_payload` validates
+the v2 part WHOLE (a malformed `syncMeta`, a malformed `memberWindows` entry, `upcoming` without a
+matching `upcomingIds`… rejects it; a `users[]` row without a usable window is kept as
+*windowless*); `window_status` (`ok` / `grace` / `expired` / `not_started` / `frozen`);
+`evaluate_gym_date` and `clock_at_sync` (below); `plan_flip`; `qr_date_verdict`;
+`effective_credentials`. `[TEST: tests/test_access_dates.py]` The 32-bit Python the gyms run has
+no `tzdata`, so `zoneinfo.ZoneInfo('Africa/Tunis')` raises; the Tunis offset is taken from
+`syncMeta.serverTime`. `[measured 2026-09-19 on the .venv]`
+
+**Storage** (`db.py::_create_protocol2_tables`, one `init_db` transaction):
+
+| Table | Holds |
+|---|---|
+| `access_v2_state` (one row) | the last `syncMeta`, `trusted`, the clock (`server_epoch`, `utc_offset_sec`, `skew_sec`, `floor_date`, `max_pc_epoch`, `clock_suspect`, `clock_reason`), `applied_date`, `grace_days`. NOT cleared by `clear_version_tokens` |
+| `member_access_window` | the window of every membership of today's set; replaced whole by each members section |
+| `sync_upcoming_users`, `sync_upcoming_credentials` | `upcoming[]` / `upcomingCredentials` exactly as last sent (the row's JSON; credentials stored disabled) |
+| `sync_users_held` | rows of today's set taken off the roster for a later gym date; the same 20 columns as `sync_users` (`_SYNC_USER_COLUMNS`) + reason/date |
+| `member_person_link` | membership → `userId` (+ `mainAccountId`), never deleted; written with `member_account_link` by every `sync_users` writer (no `mainAccountId` filter), back-filled at `init_db` — used by §3.4f |
+
+`windowsVersion` lives in `sync_version_tokens` (so logout and hard reset drop it and the request
+sends it back) but is written or deleted only inside the save transaction.
+`[TEST: tests/test_protocol2_foundation.py]`
+
+**The save** (`db.py::_apply_protocol2_save`, called inside `save_sync_cache_delta`'s single
+`BEGIN IMMEDIATE` transaction after all v1 sections, and inside `save_sync_cache`'s transaction —
+the enrolment fallback's tokenless sync is answered v2 too). A failure there rolls the whole save
+back: the windows, the upcoming lists and the token never part from the rows they describe.
+`[TEST: tests/test_protocol2_save_and_flip.py::test_a_failure_inside_the_v2_step_rolls_back_the_whole_save]`
+
+| Answer | Effect |
+|---|---|
+| v1 (no `syncMeta`) or a malformed v2 part | `trusted=0`, `windowsVersion` deleted, lists kept but unused; the next flip puts every held row back (a v1 PC's roster is the server's last list); `[T] SYNC_V2_REJECTED reason` for a malformed one |
+| v2, members section applied with a valid authority (delta: `validMemberIds` present, valid, not H-006-refused; full: not refused) | state + clock stored, `floor_date` reset to the server's day, windows replaced, upcoming lists replaced when sent, token stored, `trusted=1` |
+| v2, members section present but not applied | `trusted=0`, token dropped (the refusal already clears the member tokens, §3.4) |
+| v2, members section skipped | lists and trust kept (the server skips it only when the PC's `windowsVersion` is current) |
+
+**Held rows at a save** (`_reconcile_held_rows`, any protocol, only when the members section was
+applied with a valid authority): a delta restores, column for column, every held row still in
+`validMemberIds`, not in `users[]` and not already back on `sync_users` — the server counts it as
+delivered and will never resend it — and drops the rest; a full section drops them all. The flip
+that follows the save holds again whatever its date says. `delete_users_by_am_ids` also deletes
+the held copy, or the next flip would restore a revoked member. **A fast patch of a membership**
+(`ACTIVE_MEMBERSHIP` `ENTITY_UPSERT` or `ENTITY_DELETE`) is newer than its stored protocol-2 data —
+the backend sends an upsert only for a membership deliverable today
+(`AccessPatchBundleService.shouldExposeMembership`) — so `_forget_protocol2_membership` drops that
+membership's stored window, upcoming row and held copy, and `windowsVersion` when a stored list
+changed (the next sync then serves the members section), and the local-state generation moves. The
+first version kept them: the flip held a pre-sale the desk moved to today, a same-id end-date change
+the next morning offline, and a freeze cancelled at the desk, and re-promoted a deleted pre-sale
+(review round 1). `[TEST: tests/test_p3b1_review_r1.py — the fast-patch tests]` H-006's empty-roster guards count held rows (they are still in the
+server's list), and so does the member-cache self-heal (`count_member_cache_rows`).
+`[TEST: tests/test_protocol2_save_and_flip.py — the held-row, H-006 and fast-patch tests]`
+
+**The flip** — `db.py::apply_local_date_flips(pc_now_epoch, grace_days, source)`: ONE write job,
+idempotent, recomputed from the stored state. It evaluates the gym date (below), persists the clock
+verdict and `applied_date`. With `trusted=0` it moves nothing by date and puts every held row back
+into `sync_users` (a held id already back — a fast patch — keeps that fresher row): untrusted means
+a v1 PC's behaviour, whose roster is the server's last list. The first version returned before
+that, so a trust drop (a v1 or malformed answer, a refused members section) left members held
+while trusted — e.g. a one-day freeze — locked out offline until the next online first-of-day sync,
+which base never did (review round 5). `[TEST: tests/test_p3b1_review_r5.py]` Only with `trusted=1`
+does it run `access_dates.plan_flip`:
+
+- a `sync_users` row whose window is not deliverable on the gym date → **held** (column-for-column
+  copy into `sync_users_held`, then deleted from `sync_users`);
+- a held row deliverable again (a freeze day passed) → **restored**; a held row with no window stays
+  held (nothing proves it may come back);
+- an upcoming row deliverable on the day, not on the roster nor held → **promoted** (its row replayed
+  through `_upsert_sync_user_row`, and its `member_shadow` row written in the same job); the stored
+  upcoming list is never changed;
+- a row with no window (one a fast patch wrote — the patch drops its stored window — or a v1
+  period) is never moved.
+
+Because the rows really leave `sync_users`, every reader — the device roster, the targeted member
+sync, the ACCOUNT collapse, `load_local_state` (cards and QR), the Access UI members list — sees the
+day's roster with no reader-side filter. `member_shadow` is NOT touched for held rows: the server's
+own revocation still arrives with the next sync and finds the pin already gone (the known false
+`SKIPPED_NOT_OWNED` of §7 R3-15). A **promotion** does write the promoted row's `member_shadow` row
+(`_upsert_member_shadow_row`, the same write the sync uses; the row is server data from
+`upcoming[]`): a pre-sale promoted offline and dropped by the next sync (cancelled or re-dated
+meanwhile) is then a normal revocation. Without it that sync produced no revoked id and the
+turnstile kept the pin until an unrelated full pass (review round 3).
+`[TEST: tests/test_p3b1_review_r3.py::test_a_promoted_pre_sale_the_next_sync_drops_is_revoked]`
+Both shadow diffs (`apply_member_shadow_delta`, `diff_member_shadow`) now call a shadow row missing
+from the server's valid ids a revocation only when the membership also left `sync_users`
+(`_on_roster_ids`) — always true before P3b-1 at that point, since the save runs first. An answer
+still carrying the previous server day, saved just after the midnight flip, otherwise revoked the
+starter the flip after the save had put back (review round 4). The H-006 decision is taken before
+that filter, unchanged. `[TEST: tests/test_p3b1_review_r4.py — the previous-day answer tests]` The flip bumps the local-state generation when rows move, and also
+when the applied day moves while trusted, and expires the sync cache when rows move.
+`[CODE: db.py::apply_local_date_flips]` `[TEST: tests/test_protocol2_save_and_flip.py,
+tests/test_p3b1_integration_fixes.py]`
+
+Beyond `horizonEnd` the server promises `accessFrom`/`accessUntil` but no off days; a membership
+flagged `offDaysBeyondHorizon` is **kept inside its window** there (the end date still applies).
+This is a PC policy — the server states no default — and an **owner decision**; memberships
+starting or unfreezing after `horizonEnd` are in no list and wait for a sync.
+`[CODE: access_dates.py::window_status]` **Offline grace** (`offline_revoke_grace_days`, Access
+config, default 0; capped at `access_dates.GRACE_DAYS_MAX` = 36500 days by the config normaliser,
+the flip and the config page, and compared as a day count — a date sum overflowed past ~2.9 million
+days (review round 2) and the SQLite write past 2**63-1 (review round 3)): on a day AFTER the last server day only, a membership past its `accessUntil`
+stays that many days (never a freeze day or a future start). `[TEST: ::TestWindows]`
+
+**The gym date and the clock** (`access_dates.evaluate_gym_date`). P = the PC's date in Tunis time
+(PC epoch + the offset from `serverTime`); S = the last server day; A = `floor_date`, the highest
+day applied since the last v2 sync (reset to S by every v2 save).
+
+- **Never earlier than S or A**: a clock that falls back (a flat CMOS battery, a wrong manual
+  change) re-admits no one.
+- **CLOCK_SUSPECT** when the PC clock reads more than 300 s behind the latest trustworthy time it has
+  seen (the last `serverTime`, or the highest PC time seen since — policy tolerance
+  `CLOCK_BEHIND_TOLERANCE_SEC`), or when it was more than a day ahead of the server at the last sync
+  (`clock_at_sync`, skew = PC − server). A suspect clock applies exactly max(S, A): dates advance only
+  as far as already known. Otherwise the day is max(P, S, A).
+- A clock ahead by less than a day is NOT suspect: it flips up to that many hours early (task rule).
+- **Owner decision — a clock set forward by mistake while offline.** Offline, a forward jump cannot be
+  told from a long closure (the skew is measured only at a sync), so it is applied: e.g. a flat
+  battery, then a hand-set date with day and month swapped (10/09 → 9 October), holds everyone whose
+  plan ends before that date. Setting the right date then reads as a clock falling back (behind the
+  highest time seen) → `CLOCK_SUSPECT`, and the day stays at the wrong, later floor until the next
+  successful protocol-2 sync resets it; the « Horloge du PC suspecte » pill appears only after the
+  correction. The alternative — trust a clock that falls back to a moment after the last sync —
+  would undo this, but also let a clock set back by mistake re-admit members whose plan ended in
+  between. Current behaviour is the fail-closed one. `[TEST: review round 1 reproduction, not in the
+  repo; both verifiers confirmed it]`
+
+`[TEST: tests/test_access_dates.py::TestGymDate;
+tests/test_protocol2_save_and_flip.py::test_a_flat_battery_after_a_day_was_applied_neither_rewinds_nor_restores]`
+The verdict is on `/api/v2/status` (`session.clockSuspectWarning`, `clockSuspectReason`, `gymDate`,
+`accessDatesTrusted`) and the Access UI shows an amber « Horloge du PC suspecte » pill; the log
+gets `[T] CLOCK_SUSPECT` / `[T] CLOCK_OK` when the verdict changes (§10.2b).
+`[TEST: tests/test_p3b1_setting_and_status.py]` The heartbeat payload carries nothing new: the
+backend's `HeartbeatRequest` has no field for it (§3.1b), and a parallel branch edits
+`build_heartbeat_payload`.
+
+**When the flip runs** (`app.py`, `MainApp._apply_date_flips` and its triggers). Every trigger
+goes through `_apply_date_flips(source)`, serialised by `_date_flip_lock` and never raising (a
+failure logs `[T] DATE_FLIP_FAILED` and returns None). A failure may still commit later —
+`_run_db_write_sync` stops waiting after 60 s but the job stays queued — so it sets
+`_date_flip_recover`: the next trigger runs a flip whatever the precheck says (it queues behind the
+late one) and, even when that run moves nothing, bumps the generation and wakes the caches and
+ULTRA as if it had (review round 5). `[TEST: tests/test_p3b1_review_r5.py]`
+
+| Trigger (`source`) | How |
+|---|---|
+| start-up (`startup`) | synchronously in `MainApp.__init__`, after the engines are constructed and before `after(250, _sync_tick)` is even scheduled. Every ULTRA / AGENT / DEVICE worker is started from a sync tick's `work()`, so none starts before it. `[TEST: tests/test_p3b1_app_wiring.py::test_init_applies_the_startup_flip_before_the_first_sync_tick]` |
+| every 60 s (`tick`) | `_date_flip_tick` on the loop thread runs the read-only precheck `db.gym_date_status`; only when it says `needs_flip` does a daemon thread run the flip — never two such threads. Catches sleep/hibernate, a clock change, a missed one-shot |
+| 00:00:05 gym time (`midnight`) | a one-shot (`_arm_midnight_date_flip`, armed at start-up or by the first tick once the gym offset is known), precheck + flip on a daemon thread, re-armed for the next day |
+| every sync (`sync-tick`, `save`) | `work()` runs the precheck **before** the fetch (so an offline tick still applies a new day) and a flip after **each** `save_sync_cache_delta` (the main one and the forced member follow-up) |
+| enrolment fallback (`save`) | after its tokenless `save_sync_cache` |
+| fast patch (`fast-patch`) | after a non-duplicate `db.apply_fast_patch_bundle`, before anything is dispatched — an upsert can put a held membership back on `sync_users` |
+| heartbeat (`heartbeat`) | `pc_identity.py::_heartbeat_payload_after_date_check` runs the precheck (and a flip if needed) before building each payload; a failure there never costs the heartbeat |
+
+A flip that moved rows drops the cached sync snapshot (`invalidate_sync_cache(clear_cached=True)`),
+resets the AGENT and ULTRA fast-patch caches (in every mode — the PC's own decisions move) and,
+unless manual sync mode is on (§3.6, the turnstiles change only when the admin syncs), asks a
+*running* ULTRA engine for a full pass (`request_sync_now(changed_ids=None, reason="date-flip")`,
+removals first per §3.4b). Dropping, not just expiring, the snapshot matters: `load_sync_cache`
+serves an expired snapshot while its reload runs, and the full pass pushed the pre-flip roster when
+it drained inside that window (review round 1). The cache still loads ONE at a time (as in base);
+every `invalidate_sync_cache` bumps an epoch that each load carries: a load that finishes at the
+current epoch is installed fresh; one that finishes after a plain invalidation is installed expired
+(newer than what it replaces) and one follow-up load starts; one that started before a clearing
+invalidation (the flip's) is never installed, and readers wait for the follow-up — nothing blocks
+the flip's own thread. The first version released the in-flight marker on every invalidation, which
+started one concurrent full load per invalidation during a burst (review round 3: 20 loads, 4 at
+once over 3 s, against 5 and 1 in base). `[TEST: tests/test_p3b1_review_r3.py — the sync-cache
+tests]` It never asks the
+backend for a sync, so a flip cannot start a sync loop. The precheck (`db.gym_date_status`) also
+reports the offline grace the last flip applied, and the app flips when the configured value differs
+(`_date_flip_needed`) — a config PATCH writes `self.cfg` only, so a grace change used to wait for the
+next day. `[TEST: tests/test_p3b1_app_wiring.py, tests/test_p3b1_review_r1.py]`
+
+**The first-day sync at 00:17.** A new membership's QR credential is enabled by the server's 00:16
+job (backend `DailyScheduleService`, cron `0 16 0 * * *`); until then the PC holds it disabled
+(`upcomingCredentials`). When a flip reports `starters` (upcoming memberships starting on the
+applied day) before 00:17:00 gym time, it arms ONE `request_sync_now(trigger_source="DATE_FLIP",
+trigger_hint={"reason": "first-day-credentials"})` at 00:17:00 on the server's clock — the PC time
+plus the PC-ahead skew measured at the last sync (a PC two minutes fast fired it before the 00:16
+job and brought nothing, review round 2); a later flip replaces it, so there are never two. From 00:17 on nothing is armed: the next ordinary sync brings the credential. The
+hint strips no version token (`sync_scope.apply_trigger_hint_to_version_tokens` acts only on
+`entityType` / `forceDeviceRefresh`). `[TEST: tests/test_p3b1_app_wiring.py — the 00:17 tests]`
+Why it is needed although the PC enables a stored upcoming credential itself on its first day
+(`access_dates.effective_credentials`): a sync between 00:00 and 00:16 already answers with the
+new day, so the starter is in today's set, no longer in `upcomingCredentials`, and its credential
+is still disabled on the server — its QR is refused until a sync after 00:16. Without network at
+00:17 it waits for the next successful sync; the card and the fingerprint are not affected (the
+row itself was promoted). `[CODE: access_dates.py::effective_credentials; plan §9]`
+`[TEST: local e2e 2026-09-19 — "a new member's QR came back disabled from the sync before the
+00:16 job and opened after it"]`
+
+**QR codes** — see §3.1b "Allowed days". **Renewals** on MEMBERSHIP-pin turnstiles — see §3.4f.
+
+**End to end** (2026-09-19, backend `main` `2b75ddb3` on port 5091 with
+`MONCLUB_ACCESS_V2_ENABLED=true`, a scratch copy of `wigo-demo`, gym 59, the branch's real save/flip/QR
+code and the suite's fake MB2000 fed with the synced rows; the backend clock cannot be moved, so
+"the server date moved" was emulated by moving the scenario's dates one day earlier): an evening
+sync, then a power-on at D+1 07:30 with no network held the expired member, the freeze-day member
+and a renewing member's old plan, promoted the pre-sold starter, the freeze-ended member and the
+renewal; their QR codes and cards followed; on the fake MB2000 the two leavers were removed before
+any write and the renewing member's new pin was written before the old one was removed; a
+flat-battery clock (2000-01-01) re-admitted no one; the next morning's server list matched what the
+PC had applied offline; a new member's QR came back disabled from the sync before the "00:16 job"
+and opened after it; a cancelled pre-sale left the upcoming list; a v1 answer dropped trust; a clock
+two days ahead was CLOCK_SUSPECT and held the server day. `[TEST: e2e harness kept out of the repo,
+the report lists every check]` Re-run on the branch with the app wiring (HEAD `e667396`): the
+real `MonClubApi` sent `protocol=2` and its `windowsVersion` itself and stamped
+`_clientReceivedAtEpoch`; every flip went through `MainApp._apply_date_flips` (a `MainApp` built
+without `__init__`, a recording ULTRA engine); the midnight path (`_maybe_apply_date_flips` at
+00:00:05 D+1) logged one `DATE_FLIP source=midnight` (held 3, promoted 3), asked ULTRA once and
+armed ONE 00:17 sync (16 min 55 s), re-armed to 12 min by a 00:05 flip; the 07:30 power-on armed
+none; the flat battery logged `CLOCK_SUSPECT reason=behind` and the fix `CLOCK_OK`. 58 checks, 0
+failed. `[TEST: same harness, 2026-09-19]` Re-run on the final branch head `5094150` after six
+review rounds (2026-09-26): 58 checks, 0 failed. `[TEST: same harness]`
 
 ---
 
@@ -2535,11 +2961,12 @@ with that worker, while the scheduler keeps the stamped roster hash (the thread 
 catches `Exception` — R2-08); an intent re-recorded with a new name/card before its new write lands
 replaces the identity of an earlier write that did land, so the read-back can never match it (R2-10).
 
-Round 3 added: **a renewal under pinScheme=MEMBERSHIP can lock the member out until the next pass**
-— the renewal is a new membership id, hence a new pin; removals run first (§3.4b), so the old pin is
-deleted before the new one is written, and if that write fails (a refused user row, a wedge, a crash)
-the person has neither until a later pass pushes the new pin (base pushed first and removed only after
-a successful push, R3-21; FIELD-TEST: watch renewals at gym 45 for `SKIPPED`/failed new pins). The
+Round 3 added: **a plan switch under pinScheme=MEMBERSHIP could lock the member out until the next
+pass** (R3-21). Corrected by P3b-1: the backend's *renew* keeps the same membership id (same pin); a
+new id for the same person comes from selling another plan (§3.4f). Removals ran first (§3.4b), so the
+old pin was deleted before the new one was written. **Closed for full-sync passes by §3.4f** (the old
+pin is held until the new one is confirmed); still open on the targeted revoke path (§3.4f "Not
+covered"). FIELD-TEST: at gym 45, watch `RENEWAL_HOLD` with `kept>0` next to failed new pins. The
 finger-slot sweep clears fingers enrolled DIRECTLY on the MB2000 for a MonClub member (base never touched
 unrecorded slots, R3-25) — enrol through MonClub. A PullSDK revocation of a pin MonClub has no record of
 (never pushed to that panel, or already removed) is reported `SKIPPED_NOT_OWNED` at CRITICAL like a
@@ -2629,14 +3056,14 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2148 passed** (2026-09-25,
-branch `claude/access-integration-0919` at f4fbda1: master `ca1e29a` + the QR grants diff, the
-heartbeat's `qrRosterCheck`, the operator-queue claim and two adversarial review rounds). Measured
-with this command and with the CLAUDE.md command `python -m pytest tests/ -q --ignore=tests/_pydeps`,
-twice each, interleaved with master `ca1e29a`, which gave **2109 passed** all four times; 32-bit
-`.venv` Python 3.11, a new empty `MONCLUB_ACCESS_DATA_ROOT` per run, 0 failed, exit code 0. Re-run at
-f2f1a90 (2026-09-26, after changes to documentation, comments and test comments only), both
-commands: 2148 passed, 0 failed. `[TEST]`
+background-thread exceptions are promoted to failures. Last run: **2616 passed, 0 failed**
+(2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
+already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
+and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`
+an empty scratch folder; `tools/check_sql_arity.py` PASS). The two branches alone: P3b-1 at `5094150`
+gave **2522 passed** (six adversarial review rounds; base `ca1e29a` 2109 passed); the integration at
+`f2f1a90` gave **2148 passed** with both commands, twice each. The door-timing flake below is
+discussed with its own measured rates. `[TEST]`
 `tests/test_door_open_deadline.py::test_a_door_open_the_caller_gave_up_on_is_never_executed_later`
 was timing-flaky up to master `ca1e29a`: runs of that file alone failed 13/52 on `d09f88f` and 16/60
 on P3a-2. The race behind it: `Event.wait(timeout)` can return while `time.monotonic()` has not passed
@@ -2853,6 +3280,25 @@ because its algorithm version differs from the terminal's, §3.4d). `[CODE: _do_
 `[TEST: test_door_open_deadline.py::test_an_expired_open_is_reported_expired_and_releases_its_waiter;
 test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identity,
 ::test_the_summary_line_is_logged_at_most_once_per_interval]`
+
+### 10.2b Date flips, the clock, QR days and renewals (P3b-1, added 2026-09-19)
+
+| Event | Where | Carries |
+|---|---|---|
+| `DATE_FLIP` | `app.py::_apply_date_flips` | `source gym_date applied_before held restored promoted moved starters reasons trusted skipped ultra dur_ms` — one per flip that moved rows, and always one at start-up (with `skipped=no_state|untrusted|no_gym_date` when nothing could move). `reasons` = `hold reason:count,…`; `ultra` = a running ULTRA engine was asked for a full pass (§3.8) |
+| `DATE_FLIP_FAILED` (warn) | `app.py::_apply_date_flips` | `source err` — the flip raised; nothing was applied, the next trigger retries |
+| `CLOCK_SUSPECT` (warn) | `app.py::_apply_date_flips` | `reason gym_date pc_date` — the clock verdict turned suspect (`reason=behind|ahead`, §3.8) |
+| `CLOCK_OK` | `app.py::_apply_date_flips` | `gym_date` — the verdict turned back to normal |
+| `SYNC_V2_REJECTED` (warn) | `db.py::_apply_protocol2_save` | `reason` — a malformed protocol-2 part; the windows stop being trusted until the next good v2 answer (§3.8) |
+| `QR_DATE_CHECK` | `access_verification.py::record_totp_roster_check` | `source verdict=not_today` — a QR refused for its days (§3.1b "Allowed days"); no member identity. `QR_ROSTER_SUMMARY` gains `not_today` |
+| `RENEWAL_HOLD` | `ultra_engine.py` (`worker=`), `device_sync.py` (`device_id=`) | `held removed_after_push kept` — one per pass that held a renewing member's old pin until the new one was written (§3.4f). `kept>0` = old pins left for a later pass: the new pin was not confirmed, or removing them with the leavers removed first would exceed the removal ceiling (then also `REVOKE_ABORTED path=renewal_release`, §3.2g) |
+
+`REVOKE_DONE pins` now counts only what the removal step removed first; held old pins removed after
+the push are in `RENEWAL_HOLD removed_after_push` (§3.4f). `REVOKE_ABORTED` has a new `path`,
+`renewal_release`: released holds kept because, with the pins removed first, they would exceed the
+ceiling (§3.2g).
+`[TEST: tests/test_p3b1_app_wiring.py, tests/test_qr_allowed_days.py, tests/test_renewal_ordering.py,
+tests/test_protocol2_save_and_flip.py]`
 
 ### 10.3 Three rules this instrumentation follows — keep them
 

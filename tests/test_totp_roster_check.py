@@ -318,7 +318,7 @@ def test_the_summary_line_is_logged_at_most_once_per_interval():
     assert tel.call_args.args[0] == "QR_ROSTER_SUMMARY"
     assert set(tel.call_args.kwargs) == {
         "since", "in_roster", "in_roster_by_account", "not_in_roster", "roster_empty",
-        "roster_behind", "refused"}
+        "roster_behind", "refused", "not_today"}
 
 
 def test_a_card_result_is_not_counted():

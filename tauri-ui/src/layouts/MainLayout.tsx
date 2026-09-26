@@ -139,6 +139,11 @@ export default function MainLayout() {
   const s = status?.session;
   const hasLoginWarning = s?.loginWarning && (s?.loginDaysRemaining ?? 99) > 0;
   const hasContractWarning = s?.contractWarning && (s?.contractDaysRemaining ?? 99) > 0;
+  const hasClockSuspectWarning = s?.clockSuspectWarning ?? false;
+  const clockSuspectTooltip =
+    `L'heure de ce PC est incohérente (motif: ${s?.clockSuspectReason ?? "inconnu"}). ` +
+    "Les dates d'accès n'avancent pas au-delà de la dernière date connue. " +
+    "Vérifiez la date et l'heure de Windows.";
   const agentRunning = status?.agent?.running ?? false;
 
   // The design's account row shows a person's name and role. SessionBlock
@@ -284,6 +289,17 @@ export default function MainLayout() {
               <AlertTriangle className="h-3 w-3 shrink-0 text-primary" />
               <span className="text-[11px] font-semibold text-primary">
                 Contrat : {s!.contractDaysRemaining} j
+              </span>
+            </div>
+          )}
+          {sidebarOpen && hasClockSuspectWarning && (
+            <div
+              className="flex items-center gap-1.5 rounded-xl bg-amber-500/10 px-2.5 py-1.5"
+              title={clockSuspectTooltip}
+            >
+              <AlertTriangle className="h-3 w-3 shrink-0 text-amber-600 dark:text-amber-400" />
+              <span className="text-[11px] font-semibold text-amber-700 dark:text-amber-400">
+                Horloge du PC suspecte
               </span>
             </div>
           )}

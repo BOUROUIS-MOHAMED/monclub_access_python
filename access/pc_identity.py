@@ -639,6 +639,22 @@ class PcHeartbeatWorker:
 _runtime_lock = threading.RLock()
 
 
+def _heartbeat_payload_after_date_check(app: Any) -> Any:
+    """P3b-1: every heartbeat first lets the app apply a new gym date (a read-only precheck
+    unless the date moved), so the payload never reports yesterday's roster. The date check
+    must never cost the heartbeat."""
+    check = getattr(app, "_maybe_apply_date_flips", None)
+    if callable(check):
+        try:
+            check("heartbeat")
+        except Exception as exc:
+            try:
+                getattr(app, "logger", _log).debug("[PC-IDENTITY] heartbeat date check failed: %s", exc)
+            except Exception:
+                pass
+    return build_heartbeat_payload(app)
+
+
 def get_pc_identity_service(app: Any) -> PcIdentityService:
     with _runtime_lock:
         existing = getattr(app, "_pc_identity_service", None)
@@ -653,7 +669,7 @@ def get_pc_identity_service(app: Any) -> PcIdentityService:
             api_client=PcIdentityApiClient(base_url=MONCLUB_BASE_URL),
             gym_token_provider=load_auth_token,
             app_version_provider=lambda: str(app._update_manager.get_current_version() or "0.0.0"),
-            heartbeat_payload_provider=lambda: build_heartbeat_payload(app),
+            heartbeat_payload_provider=lambda: _heartbeat_payload_after_date_check(app),
             logger=getattr(app, "logger", _log),
         )
         app._pc_identity_service = service

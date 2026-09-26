@@ -1037,6 +1037,11 @@ export default function ConfigPage() {
                   <Input type="number" value={cfg.max_login_age_minutes ?? 43200} onChange={(e) => update("max_login_age_minutes", parseInt(e.target.value) || 43200)} />
                   <p className="text-xs text-muted-foreground">43200 = 30 jours</p>
                 </div>
+                <div className="space-y-1.5">
+                  <Label>Délai de grâce hors ligne (jours)</Label>
+                  <Input type="number" min={0} max={36500} value={cfg.offline_revoke_grace_days ?? 0} onChange={(e) => update("offline_revoke_grace_days", Math.min(36500, Math.max(0, parseInt(e.target.value) || 0)))} />
+                  <p className="text-xs text-muted-foreground">0 = les abonnements expirent à l'heure même sans internet</p>
+                </div>
               </div>
               <div className="flex items-center gap-3">
                 <Switch checked={cfg.device_sync_enabled ?? true} onCheckedChange={(v: boolean) => update("device_sync_enabled", v)} />

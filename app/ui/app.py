@@ -136,6 +136,14 @@ _OFFLINE_RECONCILE_INTERVAL_SEC = 600
 # so back-to-back re-runs cannot keep re-deferring a disconnected worker.
 _RERUN_AFTER_ULTRA_DEFER_MARGIN_SEC = 5.0
 
+# P3b-1 date flips (MainApp._apply_date_flips). The 60 s tick re-checks the gym date (sleep, a
+# clock change, a missed one-shot); the one-shot runs at 00:00:05 gym time; a membership starting
+# on the applied day gets one automatic sync at 00:17:00 gym time, after the server's 00:16 job
+# that enables its QR credential (backend DailyScheduleService, cron "0 16 0 * * *").
+_DATE_FLIP_TICK_MS = 60 * 1000
+_DATE_FLIP_MIDNIGHT_GYM_TIME = (0, 0, 5)
+_FIRST_DAY_SYNC_GYM_TIME = (0, 17, 0)
+
 
 def _read_runtime_version_string() -> str:
     """Best-effort: read MonClub Access version from update.json / version.json.
@@ -635,6 +643,16 @@ class MainApp:
         self._agent_lock = threading.RLock()
         self._active_view: str = "unknown"
         self._started_from_windows_startup = WINDOWS_STARTUP_ARG in sys.argv[1:]
+        # P3b-1 (plan §4, F6): the start-up date flip runs here, synchronously, before the first
+        # sync tick is even scheduled -- every ULTRA / AGENT / DEVICE worker starts from that
+        # tick's work(), so none of them ever sees yesterday's roster after a power-on.
+        self._init_date_flip_state()
+        self._apply_date_flips("startup")
+        self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
+        try:
+            self._arm_midnight_date_flip()
+        except Exception:
+            self.logger.warning("[DATE] midnight one-shot not armed at start-up", exc_info=True)
         self._sync_startup_registration()
         self.after(250, self._sync_tick)
 
@@ -1523,6 +1541,295 @@ class MainApp:
             "zkemkeeper": getattr(self, "_zkemkeeper_status", None),
         }
 
+    # ======================= P3b-1 local date flips =======================
+    # What the app does around db.apply_local_date_flips (plan docs/plans/
+    # 2026-09-19_p3b1_power_on_dates.md §4, §5; guide §3.8). The db job moves the rows;
+    # this layer decides WHEN it runs and wakes the caches and the ULTRA engine after it.
+    def _init_date_flip_state(self) -> None:
+        # Held for a whole flip: two flips (tick, heartbeat, save...) never interleave their
+        # cache resets, ULTRA requests or telemetry. Never held while taking _ultra_lock's
+        # holders' locks in the other order: nothing that holds _ultra_lock calls a flip.
+        self._date_flip_lock = threading.Lock()
+        # Guards the handles below (after ids, the tick's flip thread).
+        self._date_flip_state_lock = threading.Lock()
+        self._date_flip_thread: Any = None
+        self._date_flip_midnight_after_id: int | None = None
+        self._first_day_sync_after_id: int | None = None
+        # A flip that raised may still commit later: _run_db_write_sync gives up waiting after
+        # 60 s but the job stays queued. The next trigger then runs a flip unconditionally (it
+        # queues behind the late one) and wakes the caches and ULTRA after it (review R5).
+        self._date_flip_recover = False
+
+    @staticmethod
+    def _date_flip_now() -> float:
+        return time.time()
+
+    @staticmethod
+    def _date_flip_offset() -> int | None:
+        """The gym's UTC offset (seconds) from the last protocol-2 answer, None before one."""
+        from app.core import db as _db
+
+        try:
+            raw = (_db.get_access_v2_state() or {}).get("utc_offset_sec")
+            return None if raw is None or isinstance(raw, bool) else int(raw)
+        except Exception:
+            return None
+
+    def _apply_date_flips(self, source: str, *, pc_now: float | None = None) -> Dict[str, Any] | None:
+        """Run the date flip now (serialised); returns db.apply_local_date_flips' result, or None
+        when it failed. Never raises: every caller (start-up, the sync worker, the fast patch,
+        the heartbeat) must go on without it."""
+        from app.core import db as _db
+        from app.core.config import offline_revoke_grace_days
+
+        with self._date_flip_lock:
+            started = time.perf_counter()
+            recovering = bool(getattr(self, "_date_flip_recover", False))
+            try:
+                now_epoch = float(pc_now) if pc_now is not None else float(self._date_flip_now())
+                out = _db.apply_local_date_flips(
+                    pc_now_epoch=now_epoch,
+                    grace_days=offline_revoke_grace_days(self.cfg),
+                    source=source,
+                )
+            except Exception as ex:
+                self._date_flip_recover = True
+                _tel.warn("DATE_FLIP_FAILED", source=source, err=f"{type(ex).__name__}: {ex}"[:300])
+                try:
+                    self.logger.warning("[DATE] flip failed (source=%s): %s", source, ex, exc_info=True)
+                except Exception:
+                    pass
+                return None
+            dur_ms = int((time.perf_counter() - started) * 1000)
+            out = dict(out or {})
+            moved = int(out.get("moved") or 0)
+            ultra_requested = False
+            if recovering:
+                self._date_flip_recover = False
+            if moved > 0:
+                ultra_requested = self._after_date_flip_moved(source)
+            elif recovering:
+                # The failed flip may have committed after its caller gave up: nothing moved in
+                # this run, but the rows it moved were never announced.
+                try:
+                    _db.bump_local_state_generation()
+                except Exception:
+                    pass
+                ultra_requested = self._after_date_flip_moved(source)
+            if moved > 0 or source == "startup":
+                reasons = out.get("hold_reasons") or {}
+                _tel.event(
+                    "DATE_FLIP",
+                    source=source,
+                    gym_date=out.get("gym_date"),
+                    applied_before=out.get("applied_before"),
+                    held=int(out.get("held") or 0),
+                    restored=int(out.get("restored") or 0),
+                    promoted=int(out.get("promoted") or 0),
+                    moved=moved,
+                    starters=len(out.get("starters") or []),
+                    reasons=",".join(f"{k}:{reasons[k]}" for k in sorted(reasons)) or None,
+                    trusted=bool(out.get("trusted")),
+                    skipped=out.get("skipped"),
+                    ultra=ultra_requested,
+                    dur_ms=dur_ms,
+                )
+            if out.get("clock_changed"):
+                if out.get("clock_suspect"):
+                    _tel.warn("CLOCK_SUSPECT", reason=out.get("clock_reason"),
+                              gym_date=out.get("gym_date"), pc_date=out.get("pc_date"))
+                else:
+                    _tel.event("CLOCK_OK", gym_date=out.get("gym_date"))
+            try:
+                self._arm_first_day_credentials_sync(out, now_epoch)
+            except Exception:
+                self.logger.warning("[DATE] first-day sync not armed", exc_info=True)
+            return out
+
+    def _after_date_flip_moved(self, source: str) -> bool:
+        """Rows moved: expire the member caches, reset the engines' caches and ask a running
+        ULTRA engine for a full pass (P3a-2: removals first). Returns whether ULTRA was asked."""
+        from app.core import db as _db
+
+        try:
+            # Drop the pre-flip snapshot, not just expire it: load_sync_cache would serve it
+            # while the reload runs, and the ULTRA pass requested below would push the pre-flip
+            # roster (review R1). A load already in flight is discarded by the invalidation.
+            _db.invalidate_sync_cache(clear_cached=True)
+            _db.refresh_sync_cache_async()
+        except Exception:
+            self.logger.warning("[DATE] sync cache refresh after the flip failed", exc_info=True)
+        # The PC's own view (AGENT decisions, QR checks, ULTRA's cached roster) moves in every
+        # mode, manual sync included.
+        self.reset_runtime_fast_patch_caches()
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+
+            manual = bool((get_backend_global_settings() or {}).get("manual_sync_mode", False))
+        except Exception:
+            manual = False
+        if manual:
+            # Manual sync: the turnstiles change only when the admin syncs (§3.6).
+            self.logger.info("[DATE] flip (source=%s) moved rows; manual sync mode, no push", source)
+            return False
+        try:
+            with self._ultra_lock:
+                eng = getattr(self, "_ultra_engine", None)
+                if eng is None or not getattr(eng, "running", False):
+                    return False
+                return bool(eng.request_sync_now(changed_ids=None, reason="date-flip"))
+        except Exception:
+            self.logger.warning("[DATE] ULTRA request after the flip failed", exc_info=True)
+            return False
+
+    def _arm_first_day_credentials_sync(self, out: Dict[str, Any], now_epoch: float) -> None:
+        """A membership starting on the applied day gets its QR credential enabled by the server's
+        00:16 job (F8): arm ONE sync at 00:17:00 gym time. A later flip replaces it."""
+        if not out.get("starters"):
+            return
+        offset = self._date_flip_offset()
+        if offset is None:
+            return
+        from app.core import access_dates
+
+        hh, mm, ss = _FIRST_DAY_SYNC_GYM_TIME
+        # 00:17 on the SERVER's clock: a PC clock that was fast at the last sync (skew_sec > 0,
+        # under a day so not suspect) reaches 00:17 before the server's 00:16 job has run, and
+        # the sync would bring nothing (review R2). A slow clock only makes it later.
+        ahead = 0.0
+        try:
+            from app.core import db as _db
+
+            ahead = max(0.0, float((_db.get_access_v2_state() or {}).get("skew_sec") or 0.0))
+        except Exception:
+            ahead = 0.0
+        remaining = ((hh * 3600 + mm * 60 + ss) + ahead
+                     - access_dates.gym_seconds_of_day(now_epoch, offset))
+        if remaining <= 0:
+            return
+        with self._date_flip_state_lock:
+            if self._first_day_sync_after_id is not None:
+                self.after_cancel(self._first_day_sync_after_id)
+            self._first_day_sync_after_id = self.after(
+                int(round(remaining * 1000)), self._run_first_day_credentials_sync
+            )
+        self.logger.info("[DATE] first-day credentials sync armed in %ds (%d starter(s))",
+                         int(remaining), len(out.get("starters") or []))
+
+    def _run_first_day_credentials_sync(self) -> None:
+        with self._date_flip_state_lock:
+            self._first_day_sync_after_id = None
+        try:
+            self.request_sync_now(
+                trigger_source="DATE_FLIP",
+                run_type="TRIGGERED",
+                trigger_hint={"reason": "first-day-credentials"},
+            )
+        except Exception:
+            self.logger.warning("[DATE] first-day credentials sync request failed", exc_info=True)
+
+    def _date_flip_needed(self, status: Dict[str, Any] | None) -> bool:
+        """The precheck's verdict, plus a change of the offline grace setting since the last
+        flip (a config PATCH writes self.cfg only; without this it would wait for the next day)."""
+        status = status or {}
+        if status.get("needs_flip") or getattr(self, "_date_flip_recover", False):
+            return True
+        applied_grace = status.get("grace_days")
+        if applied_grace is None:
+            return False
+        from app.core.config import offline_revoke_grace_days
+
+        return int(applied_grace) != offline_revoke_grace_days(self.cfg)
+
+    def _maybe_apply_date_flips(self, source: str) -> None:
+        """The cheap trigger (sync tick, heartbeat, 00:00:05): a read-only precheck, then a flip
+        only when the gym date, the clock verdict or the grace setting moved. Never raises."""
+        from app.core import db as _db
+
+        try:
+            status = _db.gym_date_status(pc_now_epoch=self._date_flip_now())
+            needed = self._date_flip_needed(status)
+        except Exception as ex:
+            try:
+                self.logger.debug("[DATE] precheck failed (source=%s): %s", source, ex)
+            except Exception:
+                pass
+            return None
+        if needed:
+            self._apply_date_flips(source)
+        return None
+
+    def _spawn_date_flip_thread(self, source: str, target: Any) -> bool:
+        """Run ``target`` on a daemon thread, unless the previous one is still running."""
+        with self._date_flip_state_lock:
+            running = self._date_flip_thread
+            if running is not None and running.is_alive():
+                return False
+            thread = threading.Thread(target=target, name=f"date-flip-{source}", daemon=True)
+            self._date_flip_thread = thread
+        thread.start()
+        return True
+
+    def _date_flip_tick(self) -> None:
+        """Every 60 s on the loop thread: catches sleep/hibernate, a clock change and a missed
+        one-shot. The flip itself runs on a daemon thread (it waits on the DB writer)."""
+        try:
+            with self._date_flip_state_lock:
+                midnight_armed = self._date_flip_midnight_after_id is not None
+            if not midnight_armed:
+                self._arm_midnight_date_flip()
+            status = None
+            try:
+                from app.core import db as _db
+
+                status = _db.gym_date_status(pc_now_epoch=self._date_flip_now())
+            except Exception as ex:
+                self.logger.debug("[DATE] tick precheck failed: %s", ex)
+            if status is not None and self._date_flip_needed(status):
+                self._spawn_date_flip_thread("tick", lambda: self._apply_date_flips("tick"))
+        except Exception:
+            self.logger.warning("[DATE] tick failed", exc_info=True)
+        finally:
+            if not self._stop_event.is_set():
+                self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
+
+    def _arm_midnight_date_flip(self, *, after_fire: bool = False) -> bool:
+        """(Re)arm the one-shot at 00:00:05 gym time; False while the gym offset is unknown."""
+        offset = self._date_flip_offset()
+        if offset is None:
+            return False
+        from app.core import access_dates
+
+        hh, mm, ss = _DATE_FLIP_MIDNIGHT_GYM_TIME
+        delay = access_dates.seconds_until_gym_time(self._date_flip_now(), offset, hh, mm, ss)
+        if after_fire and delay < 300:
+            # The timer fired a hair before 00:00:05: tonight's run is this one.
+            delay += 86400
+        with self._date_flip_state_lock:
+            if self._date_flip_midnight_after_id is not None:
+                self.after_cancel(self._date_flip_midnight_after_id)
+            self._date_flip_midnight_after_id = self.after(
+                int(round(delay * 1000)), self._midnight_date_flip
+            )
+        return True
+
+    def _midnight_date_flip(self) -> None:
+        # This run's entry is spent: forget it, so that if the re-arm below cannot run (no
+        # offset any more) the 60 s tick arms a fresh one instead of trusting a dead id.
+        with self._date_flip_state_lock:
+            spent, self._date_flip_midnight_after_id = self._date_flip_midnight_after_id, None
+        if spent is not None:
+            self.after_cancel(spent)
+        try:
+            self._spawn_date_flip_thread("midnight", lambda: self._maybe_apply_date_flips("midnight"))
+        except Exception:
+            self.logger.warning("[DATE] midnight flip failed to start", exc_info=True)
+        finally:
+            try:
+                self._arm_midnight_date_flip(after_fire=True)
+            except Exception:
+                self.logger.warning("[DATE] midnight one-shot not re-armed", exc_info=True)
+
     def reset_runtime_fast_patch_caches(self) -> None:
         try:
             agent_engine = getattr(self, "_agent_engine", None)
@@ -1565,6 +1872,10 @@ class MainApp:
         db_result = apply_fast_patch_bundle(bundle if isinstance(bundle, dict) else {})
         if db_result.get("ignored") == "duplicate_bundle":
             return {"ok": True, "duplicate": True, **db_result}
+
+        # P3b-1: an upsert can put a held membership back on sync_users (e.g. on its freeze
+        # day); the flip re-applies the gym date before anything is dispatched.
+        self._apply_date_flips("fast-patch")
 
         fallback_requested = False
 
@@ -2626,6 +2937,9 @@ class MainApp:
                 and str(trigger_context.trigger_hint.get("reason") or "").strip().lower() == "daily-auto-sync"
             )
 
+            # P3b-1: before the fetch, so an offline tick still applies a new gym date.
+            self._maybe_apply_date_flips("sync-tick")
+
             try:
                 from app.core.db import insert_sync_run
 
@@ -2667,10 +2981,12 @@ class MainApp:
                 # a no-op / tiny delta and the cache stays stuck at a few users.
                 # Detect that gap and drop BOTH member tokens so this request runs
                 # a FULL member refresh and rebuilds the cache.
+                # P3b-1: held rows (sync_users_held) are still in the server's count, so they
+                # count here too -- a long closure must not force a FULL refresh every tick.
                 try:
-                    from app.core.db import count_sync_users
+                    from app.core.db import count_member_cache_rows
 
-                    _local_members = count_sync_users()
+                    _local_members = count_member_cache_rows()
                     if member_cache_is_stale(
                         _local_members,
                         (stored_version_tokens or {}).get("membersVersion"),
@@ -2755,6 +3071,9 @@ class MainApp:
                 _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
                 _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
                 _log_sync_cache_write_profile(self.logger, _cache_write_ms)
+                # P3b-1: the save may have changed the windows, their trust or the rows; apply
+                # the gym date to what it stored before anything below reads or pushes it.
+                self._apply_date_flips("save")
                 from app.core.db import invalidate_sync_cache, refresh_sync_cache_async
                 invalidate_sync_cache()
                 refresh_sync_cache_async()
@@ -2786,6 +3105,7 @@ class MainApp:
                             duration_sec=20.0,
                         )
                         _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
+                        self._apply_date_flips("save")
                         invalidate_sync_cache()
                         refresh_sync_cache_async()
                         if not refresh.get("members"):
@@ -3812,6 +4132,7 @@ class MainApp:
                     api = self._api()
                     data = api.get_sync_data(token=auth.token)
                     save_sync_cache(data)
+                    self._apply_date_flips("save")
                     _enroll_add_log("Sync OK ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦")
                 except Exception as e:
                     fail(f"Sync failed: {e}", "sync_failed")

@@ -842,6 +842,24 @@ def _build_status_payload_uncached(app: Any) -> Dict[str, Any]:
         session["contractDaysRemaining"] = None
         session["contractWarning"] = False
 
+    # Protocol 2 clock/date state (P3b-1): a suspect PC clock pins the applied gym date
+    # and stops it advancing, so the operator needs to see it. Never fatal -- a read
+    # failure (no v2 state yet, a locked/corrupt DB) yields the untrusted defaults, same
+    # as the warnings above.
+    try:
+        from app.core.db import get_access_v2_state
+
+        v2_state = get_access_v2_state()
+        session["clockSuspectWarning"] = bool(v2_state.get("clock_suspect"))
+        session["clockSuspectReason"] = v2_state.get("clock_reason") or None
+        session["gymDate"] = v2_state.get("applied_date") or None
+        session["accessDatesTrusted"] = bool(v2_state.get("trusted"))
+    except Exception:
+        session["clockSuspectWarning"] = False
+        session["clockSuspectReason"] = None
+        session["gymDate"] = None
+        session["accessDatesTrusted"] = False
+
     try:
         mode = app.get_access_mode_summary()
     except Exception:

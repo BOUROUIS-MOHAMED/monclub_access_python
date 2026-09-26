@@ -14,9 +14,18 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.core import db as _db
+from app.core.access_dates import (
+    AccessDaysSnapshot,
+    effective_credentials,
+    qr_date_verdict,
+)
 from app.core.db import (
+    get_local_state_generation,
+    list_sync_upcoming_credentials,
     list_sync_users_page,
     list_sync_gym_access_credentials,
+    load_access_days_snapshot,
 )
 from app.core import telemetry as _tel
 
@@ -188,16 +197,28 @@ def totp_roster_check_mode(settings: Dict[str, Any]) -> str:
     return ROSTER_MODE_ENFORCE if raw == ROSTER_MODE_ENFORCE else ROSTER_MODE_TRIAL
 
 
+# Allowed days (P3b-1): access_dates.qr_date_verdict's verdict, carried in a matched QR
+# result as ``dateCheck`` (``ok`` | ``not_today`` | ``unchecked``). ``not_today`` refuses
+# the code (DENY_NOT_ALLOWED_TODAY) in both roster modes.
+DATE_NOT_TODAY = "not_today"
+
+# A matched credential refused on the member list or on the allowed days. The wall-clock
+# retry in verify_totp_resilient exists for clock skew (no match / expired); these
+# verdicts are final.
+_MATCHED_REFUSALS = frozenset({"DENY_NOT_IN_LOCAL_ROSTER", "DENY_NOT_ALLOWED_TODAY"})
+
 # Process-wide counts of roster verdicts, one per scan. verify_totp stays pure (the
 # resilient wrapper can call it twice per scan, and tests call it freely); the two
 # engines record the FINAL result once, after verify_totp_resilient returns.
-# ``refused`` = not_in_roster scans actually denied (enforce mode).
+# ``refused`` = not_in_roster scans the roster check denied (enforce mode).
+# ``not_today`` = scans the allowed-days check denied (any roster verdict, any mode).
 ROSTER_REFUSED = "refused"
 _roster_counts_lock = threading.Lock()
 _roster_counts: Dict[str, int] = {
     ROSTER_IN: 0, ROSTER_IN_BY_ACCOUNT: 0, ROSTER_NOT_IN: 0, ROSTER_UNEVALUABLE: 0,
     ROSTER_BEHIND: 0,
     ROSTER_REFUSED: 0,
+    DATE_NOT_TODAY: 0,
 }
 _roster_counts_since = datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -211,6 +232,9 @@ _roster_summary_next_mono = time.monotonic() + ROSTER_SUMMARY_INTERVAL_SEC
 def record_totp_roster_check(result: Any, *, source: str = "") -> None:
     """Count one scan's roster verdict; log a [T] line for every non-member verdict.
 
+    A scan refused on the allowed days (``dateCheck`` ``not_today``) is also counted as
+    ``not_today`` and logged as ``[T] QR_DATE_CHECK``.
+
     No member identity is logged or counted -- only the verdict, the mode and whether
     the scan was allowed. Never raises.
     """
@@ -221,15 +245,23 @@ def record_totp_roster_check(result: Any, *, source: str = "") -> None:
         ):
             return
         allowed = bool(result.get("allowed"))
+        not_today = result.get("dateCheck") == DATE_NOT_TODAY
         with _roster_counts_lock:
             _roster_counts[verdict] += 1
-            if verdict == ROSTER_NOT_IN and not allowed:
+            # Only the roster check's own refusal: a trial-mode not_in_roster code the
+            # date check refused is a not_today, not a roster refusal.
+            if (verdict == ROSTER_NOT_IN and not allowed
+                    and result.get("reason") == "DENY_NOT_IN_LOCAL_ROSTER"):
                 _roster_counts[ROSTER_REFUSED] += 1
+            if not_today:
+                _roster_counts[DATE_NOT_TODAY] += 1
         if verdict != ROSTER_IN:
             _tel.event(
                 "QR_ROSTER_CHECK", source=source or None, verdict=verdict,
                 mode=result.get("rosterCheckMode"), allowed=allowed,
             )
+        if not_today:
+            _tel.event("QR_DATE_CHECK", source=source or None, verdict=DATE_NOT_TODAY)
         maybe_log_totp_roster_summary()
     except Exception:
         pass
@@ -238,7 +270,7 @@ def record_totp_roster_check(result: Any, *, source: str = "") -> None:
 def totp_roster_check_counts() -> Dict[str, Any]:
     """Counts since this process started:
     ``{since, in_roster, in_roster_by_account, not_in_roster, roster_empty, roster_behind,
-    refused}``."""
+    refused, not_today}``."""
     with _roster_counts_lock:
         out: Dict[str, Any] = dict(_roster_counts)
     out["since"] = _roster_counts_since
@@ -262,11 +294,93 @@ def maybe_log_totp_roster_summary(*, now_mono: Optional[float] = None) -> bool:
             in_roster=counts[ROSTER_IN], in_roster_by_account=counts[ROSTER_IN_BY_ACCOUNT],
             not_in_roster=counts[ROSTER_NOT_IN],
             roster_empty=counts[ROSTER_UNEVALUABLE], roster_behind=counts[ROSTER_BEHIND],
-            refused=counts[ROSTER_REFUSED],
+            refused=counts[ROSTER_REFUSED], not_today=counts[DATE_NOT_TODAY],
         )
         return True
     except Exception:
         return False
+
+
+# The allowed-days snapshot (P3b-1) the QR check uses: the gym date the last flip applied
+# and the windows. Loaded once per local-state generation -- every change of what it holds
+# bumps it: a sync that changes members or credentials, a change of trust, a full replace
+# or logout, a flip that moves a row or advances the day -- and warmed by load_local_state,
+# so a scan normally pays one lock and one comparison.
+#
+# The last few generations are kept, keyed by db path (tests swap db._DB_PATH at one
+# generation; None in production): a worker's member list and credentials can be one
+# generation OLDER than the newest snapshot for the seconds before its refresh lands, and
+# checking that list's grants against the newer day refuses a renewing member whose old plan
+# ended yesterday (review of P3b-1 part D). The caller passes the generation of the list it
+# checks as ``max_generation`` and gets the snapshot of that generation.
+#
+# Labels: a snapshot is labelled with the generation read BEFORE its load, and a load the
+# generation moved under is redone once, so a snapshot is never labelled newer than its data
+# (that would keep yesterday's day -- an expired member's QR code opening -- until the next
+# bump). Residual: a flip commits, then bumps; a load that reads the new rows AND finishes in
+# that gap is labelled one generation too old -- the transient false refusal above, for
+# lists of that one generation, until they reload.
+_ACCESS_DAYS_KEEP = 4
+_access_days_lock = threading.Lock()
+_access_days_hist: Dict[Any, List[tuple]] = {}      # path -> [(generation, snapshot)] ascending
+
+
+def _load_access_days_labelled() -> tuple:
+    """(generation, snapshot or None): the snapshot and the generation it belongs to."""
+    gen = get_local_state_generation()
+    snap = None
+    for _attempt in range(2):
+        try:
+            snap = load_access_days_snapshot()
+        except Exception:
+            snap = None
+        after = get_local_state_generation()
+        if after == gen:
+            return gen, snap
+        gen = after                   # the generation moved during the load: redo it
+    return None, snap                 # still moving: usable once, never stored
+
+
+def current_access_days(max_generation: Optional[int] = None) -> Optional[AccessDaysSnapshot]:
+    """The access_dates.AccessDaysSnapshot for the QR date check. Never raises.
+
+    ``max_generation`` None: the snapshot of the current local-state generation (reloaded
+    when the generation moved). Else the newest snapshot of a generation at or below it --
+    the one that matches a member list of that generation -- and None (no date check) when
+    none is kept. A failed load returns the newest kept snapshot of the same database within
+    the bound, else None (None = no date check, a v1 PC's behaviour).
+    """
+    try:
+        path = _db._DB_PATH
+        gen_now = get_local_state_generation()
+        with _access_days_lock:
+            hist = list(_access_days_hist.get(path) or [])
+        if not hist or hist[-1][0] < gen_now:
+            # Read outside the lock: a scan must not wait behind another thread's load.
+            label, snap = _load_access_days_labelled()
+            if snap is not None and label is not None:
+                with _access_days_lock:
+                    cur = [e for e in (_access_days_hist.get(path) or []) if e[0] != label]
+                    cur.append((label, snap))
+                    cur.sort(key=lambda e: e[0])
+                    _access_days_hist[path] = cur[-_ACCESS_DAYS_KEEP:]
+                    hist = list(_access_days_hist[path])
+            elif snap is not None and max_generation is None:
+                return snap
+        bound = gen_now if max_generation is None else int(max_generation)
+        for g, s in reversed(hist):
+            if g <= bound:
+                return s
+        if max_generation is None and hist:
+            return hist[-1][1]
+        return None
+    except Exception:
+        return None
+
+
+def _reset_access_days_cache_for_tests() -> None:
+    with _access_days_lock:
+        _access_days_hist.clear()
 
 
 def _totp_counter(unix_time: int, period: int) -> int:
@@ -534,6 +648,8 @@ def verify_totp(
     now_unix: Optional[float] = None,
     totp_index: Optional[Dict[str, Any]] = None,
     roster_current: bool = True,
+    access_days: Optional[AccessDaysSnapshot] = None,
+    access_days_index: Optional[AccessDaysSnapshot] = None,
 ) -> Dict[str, Any]:
     """Validate a scanned QR/TOTP string.
 
@@ -544,6 +660,13 @@ def verify_totp(
     pauses, reconnect), and validating against wall-clock-at-processing pushes a
     still-valid code past ``totp_max_past_age_seconds`` and rejects it as
     DENY_EXPIRED / DENY_NO_MATCH. Falls back to ``time.time()`` when None.
+
+    ``access_days`` (P3b-1, see current_access_days): the allowed-days snapshot. None, or
+    a snapshot with no trusted windows, is exactly the behaviour before it existed.
+    ``access_days_index``: the snapshot to use instead when the match came from ``totp_index``
+    -- a caller whose index and own credentials are of different generations (the ULTRA
+    rescue) gives each its own day; the index is used only when it covers the scan's counter
+    window, so only this function knows which one matched (review R2).
     """
     t0 = time.perf_counter()
 
@@ -762,6 +885,35 @@ def verify_totp(
                 "user": None,
             }
 
+        # Allowed days (P3b-1). Same place and same inputs as the roster check -- the
+        # matched credential's grants and this member list -- so the index and the loop
+        # decide alike; never in _iter_eligible_totp_creds. A list older than the index
+        # that matched cannot prove a windowless grant absent (the ROSTER_BEHIND rule):
+        # only an index match qualifies it. Refuses in both roster modes.
+        date_check = qr_date_verdict(
+            access_days_index if (used_index and access_days_index is not None) else access_days,
+            grants=grants,
+            users_by_am=users_by_am,
+            account_on_roster=(roster_check == ROSTER_IN_BY_ACCOUNT),
+            roster_current=(roster_current or not used_index),
+        )
+        if date_check == DATE_NOT_TODAY:
+            return {
+                "allowed": False,
+                "reason": "DENY_NOT_ALLOWED_TODAY",
+                "scanMode": "QR_TOTP",
+                "accountId": account_id,
+                "credId": cred_id,
+                "matchedCounter": matched_ctr,
+                "ageSeconds": age,
+                "activeMembershipId": chosen_am_id,
+                "rosterCheck": roster_check,
+                "rosterCheckMode": roster_mode,
+                "dateCheck": date_check,
+                "tookMs": (time.perf_counter() - t0) * 1000.0,
+                "user": None,
+            }
+
         return {
             "allowed": True,
             "reason": "ALLOW",
@@ -773,6 +925,7 @@ def verify_totp(
             "activeMembershipId": chosen_am_id,
             "rosterCheck": roster_check,
             "rosterCheckMode": roster_mode,
+            "dateCheck": date_check,
             "user": user,
             "tookMs": (time.perf_counter() - t0) * 1000.0,
         }
@@ -804,6 +957,8 @@ def verify_totp_resilient(
     scan_epoch: Optional[float] = None,
     totp_index: Optional[Dict[str, Any]] = None,
     roster_current: bool = True,
+    access_days: Optional[AccessDaysSnapshot] = None,
+    access_days_index: Optional[AccessDaysSnapshot] = None,
 ) -> Dict[str, Any]:
     """Validate a QR/TOTP code resiliently against unreliable clocks.
 
@@ -827,16 +982,18 @@ def verify_totp_resilient(
     primary = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=now_unix,
-        totp_index=totp_index, roster_current=roster_current,
+        totp_index=totp_index, roster_current=roster_current, access_days=access_days,
+        access_days_index=access_days_index,
     )
     primary_clock = "scan" if now_unix is not None else "wall"
-    # A roster refusal already matched a credential: the retry exists for clock skew
-    # (no match / expired) and would repeat the full verification for nothing. It could
-    # only differ if ANOTHER credential produced the same code in the wall-clock window.
+    # A roster or allowed-days refusal already matched a credential: the retry exists for
+    # clock skew (no match / expired) and would repeat the full verification for nothing.
+    # It could only differ if ANOTHER credential produced the same code in the wall-clock
+    # window.
     if (
         primary.get("allowed")
         or now_unix is None
-        or primary.get("reason") == "DENY_NOT_IN_LOCAL_ROSTER"
+        or primary.get("reason") in _MATCHED_REFUSALS
     ):
         primary["clockUsed"] = primary_clock
         return primary
@@ -846,12 +1003,13 @@ def verify_totp_resilient(
     fallback = verify_totp(
         scanned=scanned, settings=settings, creds_payload=creds_payload,
         users_by_am=users_by_am, users_by_card=users_by_card, now_unix=None,
-        totp_index=totp_index, roster_current=roster_current,
+        totp_index=totp_index, roster_current=roster_current, access_days=access_days,
+        access_days_index=access_days_index,
     )
-    # Allowed on the wall clock -- or refused there by the roster check, which means
-    # the code DID match a credential: report that verdict (and let it be counted),
-    # not the scan-clock pass's no-match/expired.
-    if fallback.get("allowed") or fallback.get("reason") == "DENY_NOT_IN_LOCAL_ROSTER":
+    # Allowed on the wall clock -- or refused there by the roster or allowed-days check,
+    # which means the code DID match a credential: report that verdict (and let it be
+    # counted), not the scan-clock pass's no-match/expired.
+    if fallback.get("allowed") or fallback.get("reason") in _MATCHED_REFUSALS:
         fallback["clockUsed"] = "wall"
         return fallback
 
@@ -860,6 +1018,19 @@ def verify_totp_resilient(
 
 
 # ===================== local state loading =====================
+
+def _credentials_for_gym_date(creds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """access_dates.effective_credentials over the stored lists. Without trusted windows,
+    or when anything fails, the stored credentials exactly as read (never fewer)."""
+    try:
+        snapshot = current_access_days()
+        if snapshot is None or not snapshot.active:
+            return creds
+        upcoming = list_sync_upcoming_credentials()
+        return effective_credentials(creds, upcoming, snapshot)
+    except Exception:
+        return creds
+
 
 def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     """
@@ -895,6 +1066,12 @@ def load_local_state() -> tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]],
             creds = list_sync_gym_access_credentials()
         except Exception:
             creds = []
+
+    # P3b-1: the credentials in force on the gym date the last flip applied -- upcoming
+    # credentials whose grants start today, renewal grants. The QR loop AND the speed index
+    # (built from this list by the ULTRA refresh) use them. Also warms current_access_days().
+    with p.step("creds_dates"):
+        creds = _credentials_for_gym_date(creds)
 
     with p.step("users"):
         try:

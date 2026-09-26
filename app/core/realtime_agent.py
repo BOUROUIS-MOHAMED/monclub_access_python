@@ -13,6 +13,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 from app.core.db import (
     count_today_for_user_door,
+    get_local_state_generation,
     insert_access_history,
     prune_access_history,
     list_sync_users,
@@ -30,6 +31,7 @@ from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
 from app.core.access_verification import (
+    current_access_days,
     record_totp_roster_check,
     verify_totp_resilient,
     verify_card,
@@ -1045,6 +1047,11 @@ class DecisionService(threading.Thread):
         self._users_cache_at = 0.0
         self._users_by_active_membership_id: Dict[int, Dict[str, Any]] = {}
         self._users_by_card: Dict[str, List[Dict[str, Any]]] = {}
+        # P3b-1: the local-state generation each half of the cache was loaded at (read BEFORE
+        # the load, so never newer than its data). The QR date check uses the snapshot of the
+        # older one (access_verification.current_access_days(max_generation=...)).
+        self._creds_cache_gen: Optional[int] = None
+        self._users_cache_gen: Optional[int] = None
 
         self.stop_event = threading.Event()
 
@@ -1086,14 +1093,17 @@ class DecisionService(threading.Thread):
             need_users = ttl <= 0 or (now_s - float(self._users_cache_at)) > ttl
 
             if need_creds or need_users:
+                _gen = get_local_state_generation()
                 creds, idx_by_am, idx_by_card = load_local_state()
                 if need_creds:
                     self._creds_cache = creds
                     self._creds_cache_at = now_s
+                    self._creds_cache_gen = _gen
                 if need_users:
                     self._users_by_active_membership_id = idx_by_am
                     self._users_by_card = idx_by_card
                     self._users_cache_at = now_s
+                    self._users_cache_gen = _gen
 
             return list(self._creds_cache), dict(self._users_by_active_membership_id), dict(self._users_by_card)
 
@@ -1101,7 +1111,12 @@ class DecisionService(threading.Thread):
         return verify_card(scanned=scanned, settings=settings, users_by_card=users_by_card)
 
     def _verify_totp(self, *, scanned: str, settings: Dict[str, Any], creds_payload: List[Dict[str, Any]], users_by_am: Dict[int, Dict[str, Any]], users_by_card: Dict[str, List[Dict[str, Any]]], scan_epoch: Optional[float] = None) -> Dict[str, Any]:
-        return verify_totp_resilient(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card, scan_epoch=scan_epoch)
+        # The date snapshot of the cache's own generation: a newer day checked against an older
+        # cache refuses a renewing member (P3b-1). None (a patched or never-loaded cache): no bound.
+        _gens = [g for g in (getattr(self, "_creds_cache_gen", None), getattr(self, "_users_cache_gen", None))
+                 if g is not None]
+        _days = current_access_days(max_generation=min(_gens)) if _gens else current_access_days()
+        return verify_totp_resilient(scanned=scanned, settings=settings, creds_payload=creds_payload, users_by_am=users_by_am, users_by_card=users_by_card, scan_epoch=scan_epoch, access_days=_days)
 
     def run(self) -> None:
         while not self.stop_event.is_set():

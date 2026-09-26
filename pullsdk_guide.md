@@ -554,6 +554,12 @@ the **first** row of a chunk fails with a *structural* error — `rc=-100`, `-10
 marked failed without being attempted. `[CODE]` A progress callback fires after every
 chunk, successful or fallback. `[CODE]`
 
+A full sync (`DeviceSyncEngine._sync_one_device`) deletes its stale pins through
+`_bulk_delete_pins` BEFORE writing the user rows (Phase A) — except, since P3b-1, the old
+MEMBERSHIP pin of a person whose new pin that pass still has to write: it is deleted after Phase D,
+only once the new pin's row landed (`guide_for_agents_and_dev.md` §3.4f). `[CODE]`
+`[TEST: tests/test_renewal_ordering.py::TestPullSdkRenewal]`
+
 #### Structural vs transient, and why the firmware cache depends on it
 
 **Added 2026-09-11.** Those four rc codes are now a shared constant,

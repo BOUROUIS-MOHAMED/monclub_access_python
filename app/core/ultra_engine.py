@@ -14,6 +14,7 @@ from app.core.access_types import HistoryRecord, NotificationRequest
 from app.core.access_verification import (
     EVENT_TIME_SANITY_BOUND_SEC as _EVENT_TIME_SANITY_BOUND_SEC,
     build_totp_index,
+    current_access_days,
     load_local_state,
     maybe_log_totp_roster_summary,
     parse_event_time_to_epoch,
@@ -690,6 +691,10 @@ class UltraDeviceWorker(threading.Thread):
         self._cached_state: Optional[tuple] = None
         self._cached_state_ts: float = 0.0
         self._cached_state_gen: int = -1
+        # (state, generation) in ONE attribute, assigned in one statement by every writer after
+        # the two fields above: a reader that finds its state object in it has that state's
+        # exact generation (P3b-1: the QR date snapshot must match the list it checks).
+        self._cached_pair: tuple = (None, -1)
         self._CACHE_TTL_SEC: float = 300.0  # safety net only; real refresh is generation-driven
         self._connect_retry_base_sec = float(settings.get("connect_retry_base_sec", 2.0))
         self._connect_retry_max_sec = float(settings.get("connect_retry_max_sec", 120.0))
@@ -2119,6 +2124,8 @@ class UltraDeviceWorker(threading.Thread):
         )
         # Read by _run_standalone_full_sync to refuse removals on an incomplete roster.
         self._last_standalone_roster_stats = roster_stats
+        # ... and to name the PERSON (userId) of every desired pin: renewal ordering (P3b-1).
+        self._last_standalone_pin_persons = {p: u.get("userId") for p, u in by_pin.items()}
         if only_member_ids is not None:
             # only_member_ids are MEMBERSHIP ids. MEMBERSHIP: str(int(m)), as before.
             # ACCOUNT: the person pins those memberships belong to.
@@ -2474,8 +2481,17 @@ class UltraDeviceWorker(threading.Thread):
         users: list[Dict[str, Any]],
         templates_by_pin: Dict[str, list] | None,
         recorded_fingers: Dict[str, Any] | None,
+        *,
+        report: bool = True,
+        unconfirmed_is_new: bool = False,
     ) -> tuple[list[Dict[str, Any]], list[str], Dict[str, set[int]]]:
         """Refuse only the writes the terminal has no slot for: (admitted, skipped, withheld).
+
+        ``report=False``: a dry run (the renewal-hold decision) -- same answer, no log line
+        and no CAPACITY_FULL telemetry. ``unconfirmed_is_new``: a pin not confirmed on the
+        terminal counts as needing a new user slot even when it has a state row or a push
+        intent (one earlier attempt that did not land) -- the hold decision's question is
+        "is there room for the new pin", and a failed attempt on a full terminal left none.
 
         ``skipped``: pins refused whole -- only a member certainly NOT on the terminal
         (no state row and no push intent: a row or an intent means it may already be
@@ -2535,7 +2551,7 @@ class UltraDeviceWorker(threading.Thread):
             pin = str(u.get("pin") or "").strip()
             desired = self._desired_fingers((templates_by_pin or {}).get(pin))
             rec = recorded.get(pin)
-            new_user = pin not in owned and pin not in known
+            new_user = pin not in owned and (unconfirmed_is_new or pin not in known)
             if rec is not None:
                 new_fingers = sorted(desired - set(rec))
                 vacated = len(set(rec) - desired)
@@ -2576,7 +2592,7 @@ class UltraDeviceWorker(threading.Thread):
             if len(new_fingers) > room:
                 withheld[pin] = set(new_fingers[room:])
             f_left -= min(len(new_fingers), room)
-        if skipped or withheld:
+        if (skipped or withheld) and report:
             logger.warning(
                 "%s CAPACITY_FULL: terminal reports users_free=%s fingerprints_free=%s -- %d "
                 "new member(s) NOT pushed (%s), %d finger(s) of %d member(s) not written (%s); "
@@ -3435,13 +3451,26 @@ class UltraDeviceWorker(threading.Thread):
         self._last_revoke_removal_failed = []
         self._last_revoke_step = None
         self._last_revoke_grace = set()
+        self._last_revoke_holds = set()
+        self._last_revoke_hold_person = {}
         desired_pins: list[str] = []
+        # RENEWAL ORDERING (P3b-1, plan §7): departed pins held back by the removal step
+        # until the push confirms their person's new pin ({pin: person}), those still kept
+        # after the push, and the removal step's outcome while its report to the removal
+        # retry waits for the post-push removal (one report per pass).
+        renewal_holds: Dict[str, int] = {}
+        kept_holds: set[str] = set()
+        deferred_retry: tuple[list[str], bool] | None = None
         try:
             self._last_standalone_roster_stats = None
+            self._last_standalone_pin_persons = None
             users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
             _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
             roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
+            # Read NOW: a targeted update served between two push chunks rebuilds a roster
+            # and overwrites it.
+            _pin_persons = dict(getattr(self, "_last_standalone_pin_persons", None) or {})
             if unconfirmed_revoked_ids and owned_for_revokes is not None:
                 # A pin still in the desired roster is not a removal (ACCOUNT: the person
                 # keeps another plan and is re-pushed), so only a pin that LEFT it and is
@@ -3473,6 +3502,62 @@ class UltraDeviceWorker(threading.Thread):
             # push: its candidates are pins MonClub owns that are not in the desired
             # roster, and a pin this pass is about to push is by construction desired.
             # MIRROR still runs after a successful push, and the prune last.
+            #
+            # Which pins need a push is read HERE, before the removal step, and once (it
+            # records _last_push_kinds / _last_backoff_pins and emits SYNC_RETRY_BACKOFF):
+            # renewal ordering needs it to decide what the removal step holds back. The
+            # removal step cannot change its answer: this reads the state of DESIRED pins
+            # only, and the removal step clears only the state of pins NOT desired.
+            to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
+            # RENEWAL ORDERING (P3b-1, plan §7). A departed owned pin whose PERSON still has
+            # a desired pin that is not confirmed on the terminal -- to be pushed now, or
+            # held back by the retry backoff -- is not removed first: the removal step holds
+            # it, and it is removed only after the push confirmed that person's desired
+            # pins (below). Removing it first left a renewed member with NEITHER pin when
+            # the new pin's write failed (guide §7 R3-21). MEMBERSHIP only: under ACCOUNT a
+            # renewal keeps the account pin.
+            unconfirmed_at_start: set[str] = set()
+            hold_persons: set[int] = set()
+            if not roster_withheld and not self._pin_scheme_is_account():
+                from app.core.device_sync import renewal_person_id
+
+                unconfirmed_at_start = (
+                    {str(u.get("pin") or "").strip() for u in to_push}
+                    | set(getattr(self, "_last_backoff_pins", ()) or ())
+                )
+                for _p in unconfirmed_at_start:
+                    _who = renewal_person_id(_pin_persons.get(_p))
+                    if _who is not None:
+                        hold_persons.add(_who)
+                if hold_persons:
+                    # A hold keeps the old pin's user and finger slots until the new pin is
+                    # confirmed, where base freed them first. So holds are allowed only when
+                    # EVERY pending new pin -- to push now, or parked by the retry backoff --
+                    # fits in the free slots without the held ones; otherwise nobody is held and
+                    # every old pin goes first, as before P3b-1. Holding "only the people whose
+                    # own pin fits" (rounds 2-3) still let a hold take the slot another pending
+                    # pin needed -- a first-day starter, or a renewal not held and so left with
+                    # neither pin (review R4). A dry run of the same admission (a live capacity
+                    # read; only when there are holds); a pin not confirmed on the terminal counts
+                    # as new (review R3).
+                    _pending_users = [u for u in users
+                                      if str(u.get("pin") or "").strip() in unconfirmed_at_start]
+                    try:
+                        _dry_skipped, _dry_withheld = self._capacity_admit(
+                            _pending_users, templates_by_pin, self._load_pushed_fingers(),
+                            report=False, unconfirmed_is_new=True,
+                        )[1:]
+                    except Exception:
+                        logger.warning("%s renewal holds: capacity dry run failed -- holding as "
+                                       "usual", self._prefix, exc_info=True)
+                        _dry_skipped, _dry_withheld = [], {}
+                    if _dry_skipped or _dry_withheld:
+                        logger.info("%s renewal holds dropped for %d person(s): the terminal has no "
+                                    "room for every pending new pin (%s) -- old pins removed first",
+                                    self._prefix, len(hold_persons),
+                                    ",".join(sorted(str(p) for p in
+                                                    list(_dry_skipped) + list(_dry_withheld))[:20]))
+                        hold_persons.clear()
             safe_to_prune = True
             removal_attempt_failed = False
             if roster_withheld:
@@ -3502,11 +3587,17 @@ class UltraDeviceWorker(threading.Thread):
                             unconfirmed_revoked_ids - set(skipped_revokes),
                             desired_pins, revoked_pin_of,
                         ),
+                        hold_persons=hold_persons,
+                        # Members this pass revokes or keeps excluded: never held.
+                        hold_exempt={str(int(m)) for m in (normalized_excluded_ids
+                                                            | set(_guarded_gone))},
                     )
                 except Exception as exc:
                     logger.warning("%s revoke pass error (ignored): %s", self._prefix, exc)
                     safe_to_prune = False
                     removal_attempt_failed = True
+                    # Nothing held: the step's outcome is unknown, its state kept (no prune).
+                    self._last_revoke_hold_person = {}
                 # An explicit revocation whose pin that step removed is DONE, whatever the
                 # push does next: it must not be re-queued (and re-reported) as pending.
                 _removed_now = set(getattr(self, "_last_revoke_removed", ()) or ())
@@ -3514,15 +3605,22 @@ class UltraDeviceWorker(threading.Thread):
                     if revoked_pin_of.get(_m) in _removed_now:
                         removed_revokes.add(_m)
                         self._mark_member_revoke_confirmed(_m)
+                renewal_holds = dict(getattr(self, "_last_revoke_hold_person", None) or {})
             _step = getattr(self, "_last_revoke_step", None)
-            if _step == "skipped":
+            if renewal_holds:
+                # Reported ONCE, after the post-push removal of the holds (or by the
+                # exception handler when the pass stops before it).
+                deferred_retry = (
+                    list(getattr(self, "_last_revoke_removal_failed", ()) or ()),
+                    removal_attempt_failed or _step != "ran",
+                )
+            elif _step == "skipped":
                 self._update_removal_retry(failed=[], skipped=True)
             else:
                 self._update_removal_retry(
                     failed=list(getattr(self, "_last_revoke_removal_failed", ()) or ()),
                     errored=removal_attempt_failed or _step != "ran",
                 )
-            to_push, skipped_unchanged = self._standalone_pins_needing_push(users, hashes_by_pin)
             # Which finger slots this terminal currently holds per pin. Read ONCE
             # per sync; used both to name vacated slots below and to give unchanged
             # pins a baseline they would otherwise never get.
@@ -3678,6 +3776,34 @@ class UltraDeviceWorker(threading.Thread):
                     sync_error = "" if sync_ok else str(
                         (result.get("errors") or [None])[0] or result.get("error") or "push_roster failed"
                     )
+            if renewal_holds:
+                # RENEWAL ORDERING, second half: the holds whose person's desired pins are
+                # ALL confirmed now go, through the same removal as the step above; the rest
+                # stay -- state kept (prune keep set), never deleted by MIRROR (its roster),
+                # not a removal failure -- until a later pass confirms the new pin.
+                # Confirmed now = sent (superseded pins are not), not failed, and not left
+                # short of a finger by capacity admission; capped-out and capacity-refused
+                # pins were never sent.
+                _sent = {str(u.get("pin") or "").strip() for u in pushed_users}
+                _confirmed_now = (
+                    _sent
+                    - self._standalone_failed_pins_from_result(users=pushed_users, result=result)
+                    - set(capacity_withheld)
+                ) if _sent else set()
+                kept_holds, _hold_failed, _hold_errored = self._remove_released_holds(
+                    holds=renewal_holds, pin_persons=_pin_persons,
+                    unconfirmed=unconfirmed_at_start, confirmed_now=_confirmed_now,
+                    touched=pass_touched, roster_count=len(users),
+                    removed_first=len(getattr(self, "_last_revoke_removed", ()) or ()),
+                )
+                if _hold_failed or _hold_errored:
+                    safe_to_prune = False     # as for a failed removal in the step above
+                _failed_first, _errored_first = deferred_retry or ([], False)
+                deferred_retry = None
+                self._update_removal_retry(
+                    failed=list(_failed_first) + sorted(_hold_failed),
+                    errored=_errored_first or _hold_errored,
+                )
             # MIRROR pushing policy: after a SUCCESSFUL full push, optionally delete
             # device users not in the app roster. Heavily guarded + dry-run by default;
             # a no-op for PRESERVE (the default) and for PullSDK drivers. Never allowed
@@ -3689,12 +3815,13 @@ class UltraDeviceWorker(threading.Thread):
                 # member.
                 # A capped pass leaves MIRROR to its last continuation. Pins a targeted
                 # update handled mid-push (a member enrolled after this snapshot) count
-                # as roster, so MIRROR can never delete them (P3a-2 item 6).
+                # as roster, so MIRROR can never delete them (P3a-2 item 6). So do the
+                # renewal holds this pass kept (P3b-1).
                 if not roster_withheld and not capped_out:
                     _desired_set = {p for p in desired_pins if p}
                     _mirror_roster = list(users) + [
                         {"pin": p, "name": "", "card": ""}
-                        for p in sorted(pass_touched - _desired_set)
+                        for p in sorted((pass_touched | kept_holds) - _desired_set)
                     ]
                     try:
                         self._maybe_mirror_reconcile(full_reconcile=full_reconcile,
@@ -3716,11 +3843,14 @@ class UltraDeviceWorker(threading.Thread):
                         # snapshot, but their rows are MonClub's ownership proof.
                         # + pins pushed moments ago (the enrolment grace window): their
                         # member may not be in this cache yet (review R2-09).
+                        # + the renewal holds kept for a later pass: still on the terminal,
+                        # and their row is what lets that pass remove them (P3b-1).
                         prune_device_sync_state(
                             device_id=self._device_id,
                             keep_pins=(list(desired_pins) + sorted(pass_touched)
                                        + sorted(self._mirror_grace_pins())
-                                       + sorted(getattr(self, "_last_revoke_grace", ()) or ())),
+                                       + sorted(getattr(self, "_last_revoke_grace", ()) or ())
+                                       + sorted(kept_holds)),
                         )
                     except Exception:
                         logger.debug("%s per-pin sync state not pruned", self._prefix, exc_info=True)
@@ -3749,6 +3879,15 @@ class UltraDeviceWorker(threading.Thread):
         except Exception as exc:
             sync_ok = False
             sync_error = str(exc)
+            if deferred_retry is not None:
+                # The pass stopped between its removal step and the post-push removal of
+                # the renewal holds: report the step's own outcome, once. The holds were
+                # never attempted; their state is kept (no prune ran).
+                self._update_removal_retry(failed=list(deferred_retry[0]),
+                                           errored=deferred_retry[1])
+                deferred_retry = None
+                _tel.event("RENEWAL_HOLD", worker=self._tel_wid, held=len(renewal_holds),
+                           removed_after_push=0, kept=len(renewal_holds))
         duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
         if batch_id is not None:
             try:
@@ -4603,6 +4742,8 @@ class UltraDeviceWorker(threading.Thread):
         desired_pins: set[str],
         roster_count: int,
         required_pins: set[str] | None = None,
+        hold_persons: set[int] | None = None,
+        hold_exempt: set[str] | None = None,
     ) -> bool:
         """Strip credentials from pins we pushed that are no longer desired.
 
@@ -4630,12 +4771,25 @@ class UltraDeviceWorker(threading.Thread):
         never be touched, because those pins were never recorded here. That is
         precisely what makes this safe where MIRROR is not.
 
+        RENEWAL HOLDS (P3b-1, plan §7). ``hold_persons``: the userIds whose desired pins are
+        not all confirmed on the terminal at the start of the pass (MEMBERSHIP only; the
+        caller passes none under ACCOUNT). A departed pin of such a person -- named by
+        member_person_link -- is HELD: not removed here and not counted by this step's
+        ceiling, which judges what this step removes (the real leavers); the caller removes
+        it after the push once that person's desired pins are confirmed, within the same
+        ceiling together with this step's removals (``_remove_released_holds``). A required
+        pin (an explicit revocation) or a ``hold_exempt`` pin is never held. The held pins
+        are left in ``_last_revoke_holds`` (also when the step is refused); they are neither
+        failures nor a ceiling refusal.
+
         Returns True when it is safe to prune per-pin state, False when the pass
         aborted and the state must be kept so a later sync can retry.
         """
         self._last_revoke_aborted = 0
         self._last_revoke_removed: set[str] = set()
         self._last_revoke_removal_failed: list[str] = []
+        self._last_revoke_holds: set[str] = set()
+        self._last_revoke_hold_person: Dict[str, int] = {}
         # For the removal retry (R1-06/08/22): "skipped" = nothing to attempt until the
         # roster changes; "errored" = could not evaluate, a pending retry stays armed.
         self._last_revoke_step = "errored"
@@ -4690,6 +4844,30 @@ class UltraDeviceWorker(threading.Thread):
         if not revoked:
             return True
 
+        # RENEWAL HOLDS (P3b-1) first: they are not removed by this step, so they are not what
+        # its ceiling judges. Counting them let one renewal whose new pin keeps failing push a
+        # later day's leavers over the ceiling -- REVOKE_ABORTED, the ex-members left on the
+        # turnstile -- where base, which had removed the old pin on the first day, removed
+        # them (review R1). The caller removes released holds after the push, within the same
+        # ceiling together with this step's removals.
+        if hold_persons:
+            from app.core.device_sync import renewal_holds
+
+            self._last_revoke_hold_person = renewal_holds(
+                revoked, pending_persons=hold_persons,
+                exempt=required | {str(p).strip() for p in (hold_exempt or ())},
+            )
+            self._last_revoke_holds = set(self._last_revoke_hold_person)
+        if self._last_revoke_holds:
+            logger.info(
+                "%s revoke pass: %d departed pin(s) held until the push confirms their "
+                "person's new pin: %s", self._prefix, len(self._last_revoke_holds),
+                ",".join(sorted(self._last_revoke_holds)[:20]),
+            )
+        revoked = [p for p in revoked if p not in self._last_revoke_holds]
+        if not revoked:
+            return True
+
         # Refuse an implausible bulk revocation rather than strip a gym's worth of
         # members off a turnstile. See _REVOKE_ABSOLUTE_FLOOR for why a fraction on
         # its own is not enough here. The ONE ceiling every removal path shares
@@ -4721,9 +4899,36 @@ class UltraDeviceWorker(threading.Thread):
             self._prefix, len(revoked), ",".join(revoked[:20]),
         )
 
+        outcome, failed, pushed_fingers = self._remove_departed_pins(revoked)
+        self._last_revoke_removed = set(outcome.removed) - failed
+        self._last_revoke_removal_failed = sorted(failed)
+        confirmed_slots = sum(
+            len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
+        )
+        _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
+                   deleted=len(outcome.deleted), neutralised=len(outcome.neutralised),
+                   slots=confirmed_slots, ok=not failed)
+        if failed:
+            # Keep the state so the next sync retries rather than forgetting that
+            # these pins still hold credentials.
+            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
+                           self._prefix)
+            return False
+        return outcome.removed == frozenset(revoked)
+
+    def _remove_departed_pins(
+        self, pins: list[str],
+    ) -> tuple[_StandalonePinRemovalResult, set[str], Dict[str, Any]]:
+        """Remove owned departed pins and forget the state of each one confirmed removed.
+
+        Shared by the revoke pass and the post-push removal of the renewal holds (P3b-1).
+        Returns ``(outcome, failed, pushed_fingers)``: ``failed`` = pins the terminal did not
+        confirm removed, plus confirmed ones whose local state could not be cleared -- both
+        keep their state for the retry.
+        """
         pushed_fingers = self._load_pushed_fingers()
         outcome = self._remove_standalone_pins(
-            pins=revoked,
+            pins=pins,
             pushed_fingers=pushed_fingers,
         )
         cleanup_failed: set[str] = set()
@@ -4741,22 +4946,88 @@ class UltraDeviceWorker(threading.Thread):
                         pin,
                         exc_info=True,
                     )
-        failed = set(outcome.failed) | cleanup_failed
-        self._last_revoke_removed = set(outcome.removed) - cleanup_failed
-        self._last_revoke_removal_failed = sorted(failed)
-        confirmed_slots = sum(
-            len(pushed_fingers.get(pin) or ()) for pin in outcome.neutralised
-        )
-        _tel.event("REVOKE_DONE", worker=self._tel_wid, pins=len(revoked),
-                   deleted=len(outcome.deleted), neutralised=len(outcome.neutralised),
-                   slots=confirmed_slots, ok=not failed)
-        if failed:
-            # Keep the state so the next sync retries rather than forgetting that
-            # these pins still hold credentials.
-            logger.warning("%s revoke fallback failed -- keeping per-pin state for retry",
-                           self._prefix)
-            return False
-        return outcome.removed == frozenset(revoked)
+        return outcome, set(outcome.failed) | cleanup_failed, pushed_fingers
+
+    def _remove_released_holds(
+        self,
+        *,
+        holds: Dict[str, int],
+        pin_persons: Dict[str, Any],
+        unconfirmed: set[str],
+        confirmed_now: set[str],
+        touched: set[str],
+        roster_count: int = 0,
+        removed_first: int = 0,
+    ) -> tuple[set[str], set[str], bool]:
+        """Second half of renewal ordering (P3b-1, plan §7): after the push, remove the
+        holds whose person's desired pins are ALL confirmed on the terminal now.
+
+        Within the one removal ceiling: ``removed_first`` (pins the revoke step removed this
+        pass) plus the released holds must fit ``check_bulk_removal`` for ``roster_count``,
+        or every released hold is kept for a later pass (review R1) -- a pass never removes
+        more than the ceiling allows, as when the old pins were removed first.
+
+        ``holds``: {held pin: person} from the removal step. ``pin_persons``: {desired pin:
+        userId}. ``unconfirmed``: desired pins not confirmed at the start of the pass;
+        ``confirmed_now``: those this pass's push confirmed. A hold is removed through the
+        same removal as the revoke pass, and only while MonClub still owns it: a targeted
+        revoke served between two push chunks may have removed it already (``touched``
+        pins are left to that targeted path). Returns ``(kept, failed, errored)``: ``kept``
+        = holds left on the terminal on purpose (their person still waits for a pin);
+        ``failed`` = released holds the terminal did not confirm removed (a normal removal
+        failure: state kept, fast retry); ``errored`` = ownership unreadable, nothing
+        attempted. Emits one ``RENEWAL_HOLD`` line.
+        """
+        from app.core.device_sync import renewal_released_holds
+
+        free = renewal_released_holds(holds, person_by_pin=pin_persons,
+                                      unconfirmed=unconfirmed, confirmed_now=confirmed_now)
+        released = sorted(p for p in free if p not in touched)
+        kept = set(holds) - set(released)
+        failed: set[str] = set()
+        errored = False
+        removed = 0
+        if released:
+            try:
+                from app.core.db import list_confirmed_device_sync_pins
+
+                owned = {str(p).strip() for p in
+                         (list_confirmed_device_sync_pins(device_id=self._device_id) or ())}
+            except Exception:
+                logger.warning("%s renewal holds: ownership unreadable -- none removed this "
+                               "pass", self._prefix, exc_info=True)
+                owned = None
+                errored = True
+            released = [p for p in released if owned is not None and p in owned]
+            if released:
+                _verdict = _push_safety.check_bulk_removal(
+                    count=int(removed_first or 0) + len(released), roster_count=roster_count,
+                    path="renewal_release", device_id=self._device_id,
+                    protocol="ZK_STANDALONE", worker=self._tel_wid, sample=released,
+                )
+                if not _verdict.allowed:
+                    logger.warning(
+                        "%s renewal holds: %d released previous pin(s) kept -- with the %d "
+                        "removed first they exceed the removal ceiling (%.0f)", self._prefix,
+                        len(released), int(removed_first or 0), _verdict.ceiling,
+                    )
+                    kept |= set(released)
+                    released = []
+            if released:
+                logger.warning(
+                    "%s removing %d renewed member(s)' previous pin(s) now that the new pin "
+                    "is confirmed: %s", self._prefix, len(released), ",".join(released[:20]),
+                )
+                try:
+                    outcome, failed, _ = self._remove_departed_pins(released)
+                    removed = len(set(outcome.removed) - failed)
+                except Exception:
+                    logger.warning("%s renewal holds: removal error", self._prefix,
+                                   exc_info=True)
+                    failed = set(released)
+        _tel.event("RENEWAL_HOLD", worker=self._tel_wid, held=len(holds),
+                   removed_after_push=removed, kept=len(kept))
+        return kept, failed, errored
 
     def _mirror_grace_pins(self) -> set[str]:
         m = getattr(self, "_recent_member_push", None) or {}
@@ -5232,6 +5503,12 @@ class UltraDeviceWorker(threading.Thread):
                         _push_safety.SKIPPED_NOT_OWNED, len(_skipped_now),
                         "memberships " + ",".join(str(m) for m in sorted(_skipped_now)[:20]),
                     )]
+                # Renewal ordering (P3b-1) never holds back an explicit revocation: a pin the
+                # pre-pass above failed to delete is still removed first by the stale step.
+                # Named as MEMBERSHIP pins -- the only scheme that holds.
+                engine._full_sync_revoked_pins = {
+                    str(int(m)) for m in (revoked_ids | excluded_ids)
+                }
                 sync_ok = bool(engine.run_one_device_on_connected_sdk(
                     sdk=raw_sdk,
                     cache=filtered_cache,
@@ -6074,8 +6351,16 @@ class UltraDeviceWorker(threading.Thread):
         # would trust an old list); a refresh landing mid-read can only make it look
         # older -- roster_behind, i.e. no refusal -- for that one scan.
         _gen_before = self._cached_state_gen
-        creds, users_by_am, users_by_card = self._get_cached_local_state()
+        _state = self._get_cached_local_state()
+        creds, users_by_am, users_by_card = _state
         own_list_gen = min(_gen_before, self._cached_state_gen)
+        # _cached_pair names the state object with its exact generation. The min() above is
+        # only the fallback for a refresh landing mid-read: _get_cached_local_state can itself
+        # adopt the shared list (after a cache reset, e.g. every date flip), and then the
+        # generation read before the call is older than the list it returned (review R1).
+        _pair = getattr(self, "_cached_pair", None)
+        if isinstance(_pair, tuple) and len(_pair) == 2 and _pair[0] is _state:
+            own_list_gen = int(_pair[1])
 
         # Use the precomputed O(1) index ONLY when it was built from the exact
         # Use the shared index if it was built from a credential generation that
@@ -6125,6 +6410,17 @@ class UltraDeviceWorker(threading.Thread):
             scan_epoch=scan_epoch,
             totp_index=totp_index,
             roster_current=roster_current,
+            # The date snapshot of the generation of the data this scan matches against: the
+            # shared index's when the index matched (the grants come from it), else this
+            # worker's own credentials'. Never a newer day than those grants -- that refuses a
+            # renewing member whose old plan ended yesterday -- and never an older one -- that
+            # refuses a starter and, in trial, admits an ex-member (P3b-1, guide §3.1b; review
+            # R1). verify_totp picks: the index is used only when it covers the scan's counter
+            # window, and a late event falls back to the loop over our own credentials (R2).
+            access_days=current_access_days(max_generation=own_list_gen),
+            access_days_index=(
+                current_access_days(max_generation=_idx_gen) if totp_index is not None else None
+            ),
         )
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
@@ -6916,6 +7212,7 @@ class UltraDeviceWorker(threading.Thread):
                         self._cached_state = result
                         self._cached_state_ts = time.monotonic()
                         self._cached_state_gen = _gen_at_load
+                        self._cached_pair = (result, _gen_at_load)
                         _set_shared_local_state(result, _gen_at_load)
                         creds, uam, ucard = result
                         _tel.event(
@@ -7075,6 +7372,7 @@ class UltraDeviceWorker(threading.Thread):
             self._cached_state = shared_value
             self._cached_state_ts = now
             self._cached_state_gen = shared_gen
+            self._cached_pair = (shared_value, shared_gen)
             try:
                 _tel.event("CACHE_ADOPTED_SHARED", worker=self._tel_wid, creds=len(shared_value[0]))
             except Exception:
@@ -7100,6 +7398,7 @@ class UltraDeviceWorker(threading.Thread):
             _set_shared_local_state(result, _gen_at_load)
         self._cached_state_ts = now
         self._cached_state_gen = _gen_at_load
+        self._cached_pair = (self._cached_state, _gen_at_load)
         creds, users_by_am, users_by_card = self._cached_state
         _tel.event(
             "CACHE_SYNC_LOAD_DONE", worker=self._tel_wid,

@@ -291,6 +291,7 @@ def _run_enroll(monkeypatch, *, users, api=None, scanner=_FakeScanner,
         _restriction_reasons=lambda: (restrictions or []),
         _api=lambda: api,
         _request_running_ultra_sync=(sync_request or (lambda **_k: None)),
+        _apply_date_flips=lambda source, **_kw: None,  # P3b-1: the flip after the fallback save
     )
     self_obj._find_user_membership = lambda uid: MainApp._find_user_membership(self_obj, uid)
 

@@ -314,6 +314,7 @@ const A_DENY: Record<string, DenyCopy> = {
   DENY_COLLISION: { title: "Ce code correspond à plusieurs comptes", action: "Présentez-vous à l'accueil pour le régulariser.", short: "Code en double" },
   DENY_EXPIRED: { title: "Ce code QR a expiré", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR expiré" },
   DENY_NOT_IN_LOCAL_ROSTER: { title: "Aucun abonnement actif trouvé pour ce code", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non trouvé" },
+  DENY_NOT_ALLOWED_TODAY: { title: "Abonnement non valable aujourd'hui", action: "Présentez-vous à l'accueil pour vérifier votre abonnement.", short: "Abonnement non valable aujourd'hui" },
   DENY_TOTP_FAILED: { title: "Ce code QR n'est pas valide", action: "Régénérez-le dans l'application MonClub, puis représentez-le.", short: "Code QR invalide" },
   DENY_AMBIGUOUS_COUNTER: { title: "Ce code QR a déjà été utilisé", action: "Régénérez-le dans l'application MonClub.", short: "Code QR déjà utilisé" },
   DENY_FUTURE_SKEW: { title: "L'heure de votre téléphone est décalée", action: "Activez l'heure automatique, puis représentez votre code.", short: "Heure du téléphone décalée" },
