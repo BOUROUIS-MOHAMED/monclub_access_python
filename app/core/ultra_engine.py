@@ -5918,10 +5918,12 @@ class UltraDeviceWorker(threading.Thread):
         #   - anti-fraud ON   -> anti_fraude_duration (anti-passback)
         # The C3 fires several events per single scan; the debounce floor stops
         # the relay re-pulsing without blocking a deliberate re-entry.
+        # A never-seen card is "never", not 0.0: monotonic counts from boot, so a
+        # 0.0 default put every first scan inside the window while uptime < cooldown.
         if card_no:
             cooldown = self._effective_card_cooldown_sec(card_no)
             now_mono = time.monotonic()
-            last_seen = self._card_cooldown.get(card_no, 0.0)
+            last_seen = self._card_cooldown.get(card_no, float("-inf"))
             elapsed = now_mono - last_seen
             if elapsed < cooldown:
                 # A re-scan inside the cooldown window — normally skip. EXCEPTION:
