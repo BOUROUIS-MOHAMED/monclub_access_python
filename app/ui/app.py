@@ -538,12 +538,17 @@ class MainApp:
         # NOTE: _started_from_windows_startup is set later in __init__ from sys.argv;
         # read the same source directly here so the banner doesn't depend on init order.
         _boot_startup_arg = WINDOWS_STARTUP_ARG in sys.argv[1:]
+        # monotonic_s: the clock the ULTRA workers time against (GetTickCount64 on the
+        # 32-bit Python 3.11 build, i.e. counted from boot), so a field log shows how
+        # soon after power-on the app started. Raw value: whether a Fast Startup
+        # power-on resets it is not established.
         self.logger.info(
-            "App started. pid=%s version=%s frozen=%s startup_arg=%s exe=%s args=%r",
+            "App started. pid=%s version=%s frozen=%s startup_arg=%s monotonic_s=%.0f exe=%s args=%r",
             os.getpid(),
             self._boot_version,
             bool(getattr(sys, "frozen", False)),
             _boot_startup_arg,
+            time.monotonic(),
             sys.executable,
             sys.argv,
         )

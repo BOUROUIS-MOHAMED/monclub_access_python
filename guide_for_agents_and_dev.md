@@ -34,6 +34,7 @@ This file is only useful while it is true. If you change any of the following, y
 | `app/sdk/device_driver.py` — protocol enum, aliases, resolution order | §4 Protocol resolution |
 | A `supports_*` / capability class attribute on any driver | §5 Capability flags |
 | Which engine services which `accessDataMode` | §3 The three modes |
+| The ULTRA re-scan cooldown — its window, its default for a never-seen card, the staff exemption (`ultra_engine.py::_process_event`'s cooldown block, `::_effective_card_cooldown_sec`) | §3 ULTRA |
 | How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
 | How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches; local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
@@ -174,6 +175,33 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
     `_open_door_with_retry` (staff skip the device's re-entry interval)
   - every other denial stands — including the device's punch-interval block.
   `[CODE: ultra_engine.py::_process_event]`
+- **The PC's re-scan cooldown runs before all of the above.** A card/QR scanned again
+  inside its window returns early: no popup, no history, no rescue.
+  - The window is `_effective_card_cooldown_sec`: a 3 s debounce, or
+    `anti_fraude_duration` when anti-fraud is on for that scan kind. The duration is
+    clamped to 5–300 s by `settings_reader.py::normalize_device_settings`.
+  - A staff RFID card past the debounce still goes through to the rescue.
+    `[CODE: ultra_engine.py::_process_event — the cooldown block]`
+  - A card never seen by this worker is **not** in cooldown. Up to master `3b28bd2`
+    it defaulted to `last_seen = 0.0`, as in every tagged release checked (`access_1.4.24`,
+    `.25`, `.26`, `.30`, `.31`, `.33`; 1.4.27–1.4.29 and 1.4.32 have no tag).
+    `time.monotonic()` counts from boot, so while the PC's uptime was below the window,
+    every first scan was skipped. A first allowed card lost its popup and history, and
+    a first QR was never rescued (the terminal refuses a QR it cannot know). It is now
+    `float("-inf")`.
+    `[TEST: test_ultra_engine.py::TestCardCooldown::test_a_never_seen_scan_is_not_in_cooldown_right_after_boot]`
+  - The field logs from gyms 44 and 45 on hand (1.4.24–1.4.33, 2026-08-27 to 09-10,
+    24 app starts) show no such skip. All 97 cooldown skips had `elapsed` below the
+    app's own age, and only 3 s and 30 s windows appear. `[FIELD]`
+  - After a start, the MB2000s at gym 45 delivered scans made while the app was not
+    running, up to 5684 s old (`ZKEM_VERIFY_* age_s`). The PC processed them from about 11–18 s after the app started
+    (most starts). So a boot window also covers that backlog. `[FIELD]`
+  - How soon after power-on a gym PC starts the app is not measured: none of those 24
+    starts came from the Run key (`startup_arg=False`). Nor is it known whether a Fast
+    Startup power-on resets the monotonic clock. `[UNVERIFIED]` The "App started" log
+    line now carries `monotonic_s=`. Read against the known power-on time, a future
+    field log answers both questions.
+    `[CODE: app/ui/app.py]`
 - ULTRA is the **only** mode that can drive a ZK_STANDALONE terminal. See §3.2.
 
 ### 3.1 Every door-open call site in the app

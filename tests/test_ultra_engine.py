@@ -1417,6 +1417,36 @@ class TestCardCooldown:
 
     @patch("app.core.ultra_engine.insert_access_history", return_value=1)
     @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
+    def test_a_never_seen_scan_is_not_in_cooldown_right_after_boot(self, mock_lls, mock_iah, monkeypatch):
+        """time.monotonic() counts from boot. A never-seen card/QR used to default to
+        last_seen=0.0, i.e. "seen at boot", so while uptime was below the window
+        (anti-fraud up to 300 s) every first scan was skipped: no popup, no history,
+        and no QR rescue -- the terminal refuses a QR it cannot know."""
+        worker = _make_worker(settings=_make_settings(
+            anti_fraude_card=True, anti_fraude_qr_code=True, anti_fraude_duration=300,
+            totp_prefix="9", totp_digits=6))
+        worker._handle_allow = MagicMock(name="_handle_allow")
+        worker._handle_totp_rescue = MagicMock(name="_handle_totp_rescue")
+        clock = {"t": 10.0}                                   # the PC booted 10 s ago
+        monkeypatch.setattr(_ue.time, "monotonic", lambda: clock["t"])
+        worker._cached_state = _EMPTY_LOCAL_STATE
+        worker._cached_state_ts = clock["t"]
+        card, qr = "4894671", "9123456"
+        worker._process_event(_make_event(event_id="b1", event_type=0, card_no=card))
+        worker._process_event(_make_event(event_id="b2", event_type=27, card_no=qr))
+        assert worker._handle_allow.call_count == 1, "a first card scan was skipped"
+        assert worker._handle_totp_rescue.call_count == 1, "a first QR never reached the rescue"
+        # The anti-passback window still applies from the first scan on.
+        clock["t"] = 11.0
+        worker._process_event(_make_event(event_id="b3", event_type=0, card_no=card))
+        worker._process_event(_make_event(event_id="b4", event_type=27, card_no=qr))
+        assert (worker._handle_allow.call_count, worker._handle_totp_rescue.call_count) == (1, 1)
+        clock["t"] = 311.0
+        worker._process_event(_make_event(event_id="b5", event_type=0, card_no=card))
+        assert worker._handle_allow.call_count == 2
+
+    @patch("app.core.ultra_engine.insert_access_history", return_value=1)
+    @patch("app.core.ultra_engine.load_local_state", return_value=_EMPTY_LOCAL_STATE)
     def test_qr_uses_qr_antifraud_flag_not_card(self, mock_lls, mock_iah):
         worker = _make_worker(settings=_make_settings(
             anti_fraude_card=False, anti_fraude_qr_code=True, anti_fraude_duration=25,
