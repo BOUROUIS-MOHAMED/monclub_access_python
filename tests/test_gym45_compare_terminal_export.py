@@ -620,13 +620,112 @@ class TestPanelCards:
         cards = report["cards"]
         # 102 (another card on the panel), 104 (its second card), 105 (a card MonClub cannot write)
         assert cards["people_with_terminal_only_card"] == 3
-        assert cards["people_with_terminal_only_card_and_no_monclub_card"] == 1   # 105
-        assert cards["people_without_monclub_card"] == 2                           # 103, 105
+        # 105 HAS a card in MonClub, one the panel cannot hold: it is not "no card in MonClub"
+        assert "people_with_terminal_only_card_and_no_monclub_card" not in cards
+        assert cards["people_with_terminal_only_card_and_unwritable_monclub_card"] == 1   # 105
+        assert cards["people_with_terminal_only_card_and_another_monclub_card"] == 2      # 102, 104
+        assert cards["people_with_terminal_only_card_and_99999_monclub_card"] == 1        # 105
+        assert cards["people_without_monclub_card"] == 1                                  # 103 only
+        assert cards["people_with_unwritable_monclub_card"] == 1                          # 105
+        assert cards["people_with_writable_monclub_card"] == 3                            # 101, 102, 104
         assert cards["terminal_only_card_via_own_pin"] == 3
         rows = {d.name: d for d in details if d.kind == "member_terminal_only_card"}
         assert set(rows) == {"Card Changed", "Second Card Only", "Too Long"}
-        assert rows["Card Changed"].note == "cards 5:102:card 7777"
-        assert rows["Too Long"].note.endswith("no card in MonClub")
+        # the desk is told never to overwrite a card MonClub already holds
+        assert rows["Card Changed"].note == "cards 5:102:card 7777; MonClub card 4002 -- do not overwrite it"
+        assert rows["Too Long"].note == (
+            "cards 5:105:card 99999999999; MonClub card 99999999999 cannot be written to a panel"
+            " -- do not overwrite it (it starts with 99999: ask the owner first)")
+        assert not any(d.note.endswith("no card in MonClub") for d in rows.values())
+
+    def test_no_card_in_monclub_is_only_an_empty_first_card(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        # 103's own pin with a card: MonClub holds none for 103, so the desk may enter this one
+        ex = _panel_export(tmp_path / "p5.json", [("103", "No Card In MonClub", "3003")])
+        report, details = cte.analyse([cte.load_export(str(ex), 5)], cte.load_access_db(str(db)))
+        assert report["cards"]["people_with_terminal_only_card_and_no_monclub_card"] == 1
+        (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
+        assert row.note == "cards 5:103:card 3003; no card in MonClub"
+
+    def test_the_card_self_check_is_printed_next_to_the_cards_and_stops_below_90(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        report, _ = cte.analyse([cte.load_export(str(_panel_export(tmp_path / "p5.json", self.PANEL)), 5)],
+                                cte.load_access_db(str(db)))
+        # own pins with a card MonClub writes: 101 (equal), 102, 104 (not); 105 has none it can write
+        assert report["card_self_check"] == {"compared": 3, "equal": 1, "rate": 0.3333, "threshold": 0.9}
+        text = cte.render(report)
+        lines = text.splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("== cards"))
+        assert lines[i + 1].strip().startswith("card self-check (member pins): 1/3")
+        assert "STOP" in lines[i + 1]
+        assert any("do not act on it, call the developer" in n for n in report["notes"])
+
+    def test_the_card_self_check_measures_the_form_the_panel_returns(self, tmp_path):
+        """A panel that answers every card in another form (here: hex) makes every member with a
+        card look like a loss; the self-check is what shows it."""
+        db = tmp_path / "access.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sync_users (user_id INTEGER, active_membership_id INTEGER,"
+                     " full_name TEXT, first_card_id TEXT, second_card_id TEXT, fingerprints_json TEXT)")
+        for i in range(10):
+            conn.execute("INSERT INTO sync_users VALUES (?,?,?,?,'','[]')", (i, 200 + i, f"M{i}", str(5000 + i)))
+        conn.commit()
+        conn.close()
+        acc = cte.load_access_db(str(db))
+        same = [(str(200 + i), f"M{i}", str(5000 + i) if i else "9") for i in range(10)]   # 9 of 10 equal
+        report, _ = cte.analyse([cte.load_export(str(_panel_export(tmp_path / "a.json", same)), 5)], acc)
+        assert report["card_self_check"]["rate"] == 0.9
+        assert "can be used" in cte.render(report)
+        hexed = [(str(200 + i), f"M{i}", format(5000 + i, "X")) for i in range(10)]
+        report, _ = cte.analyse([cte.load_export(str(_panel_export(tmp_path / "b.json", hexed)), 5)], acc)
+        assert report["card_self_check"]["equal"] == 0
+        assert report["cards"]["people_with_terminal_only_card"] == 10   # every one looks like a loss
+        assert "STOP" in cte.render(report)
+
+    def test_the_card_self_check_counts_only_pins_monclub_owns(self, gym):
+        """Beta (pin 12, card 777 in MonClub) is on the terminal without a card, but pin 12 is not
+        owned: it is not a measurement of how the device returns MonClub's cards."""
+        db, ex = gym
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
+        assert report["card_self_check"]["compared"] == 0
+        assert "NOT MEASURED" in cte.render(report)
+
+    def test_an_mb2000_keeps_a_card_above_the_4_byte_range(self, tmp_path):
+        """The MB2000 is sent firstCardId's digits raw: 105's 11-digit card is on the terminal as
+        MonClub wrote it, so it is not a loss (it would be one on a C3 panel)."""
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        users = [_u(p, n, c) for p, n, c in self.PANEL]
+        ex = _export(tmp_path / "t8.json", users, fingers=False)
+        report, details = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
+        rows = {d.name for d in details if d.kind == "member_terminal_only_card"}
+        assert rows == {"Card Changed", "Second Card Only"}
+        assert report["cards"]["people_with_writable_monclub_card"] == 4      # 105 too, on an MB2000
+        assert report["cards"]["people_with_unwritable_monclub_card"] == 0
+        # 101 (0004001 = 4001) and 105 equal; 102 and 104 not
+        assert report["card_self_check"]["compared"] == 4 and report["card_self_check"]["equal"] == 2
+
+    def test_exports_of_two_kinds_are_refused(self, tmp_path, capsys):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        panel = _panel_export(tmp_path / "p5.json", self.PANEL)
+        mb = _export(tmp_path / "t8.json", [_u("101", "Card Kept", "4001")], fingers=False)
+        with pytest.raises(ValueError, match="two kinds"):
+            cte.analyse([cte.load_export(str(panel), 5), cte.load_export(str(mb), 8)], cte.load_access_db(str(db)))
+        rc = cte.main(["--export", f"5={panel}", "--export", f"8={mb}", "--access-db", str(db)])
+        assert rc == 2
+        assert "two kinds" in capsys.readouterr().err
+
+    def test_mb2000_card_is_what_the_mb2000_driver_writes(self):
+        from app.sdk.zk_standalone import _digits_only
+        for raw in ("0004001", " 12 34 ", "99999+123", "99999999999", "", "0", None, "abc", "١٢٣", "12²"):
+            assert cte.mb2000_card(raw) == _digits_only(raw).lstrip("0"), raw
+
+    def test_the_card_rule_follows_the_export_schema(self):
+        assert cte.card_rule(cte.PANEL_EXPORT_SCHEMA) is cte.wire_card
+        assert cte.card_rule(cte.EXPORT_SCHEMA) is cte.mb2000_card
 
     def test_a_leftover_holding_a_members_card_is_counted_for_that_member(self, tmp_path):
         db = tmp_path / "access.db"

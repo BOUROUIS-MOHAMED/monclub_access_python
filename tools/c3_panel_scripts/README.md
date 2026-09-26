@@ -25,9 +25,26 @@ Type each IP in full. Add `-Password <device password>` when /gym-devices shows 
 `..\mb2000_scripts\sdk\` and the installed MonClub Access, in that order. Copy the whole `tools` folder
 (or at least this folder and `mb2000_scripts\sdk`) to the gym PC.
 
-Exit codes: 0 complete, 1 setup or connect failure (nothing read), 2 a table read failed (partial file,
-`complete: false`). A refused connection prints `CONNECT FAILED`: that is also the proof that a
-firewall block works (gym 58 plan §3.2).
+Exit codes: 0 complete, 1 setup or connect failure, or MonClub Access running on this PC (nothing
+read, no file), 2 a table read failed or the count of `user`, `userauthorize` or `templatev10` failed
+(partial file, `complete: false`). A failed count is written as `null` (never as a number) and listed
+in `errors`, which the screen prints as `error: …` lines; a failed count of another table is in
+`errors` only. **Read `errors` even when the file says complete.**
+
+A refused connection prints `CONNECT FAILED … (PullLastError=<code>, <n> ms)`. It is the proof that a
+pulled cable or a firewall block works (gym 58 plan §3.2) only when the code is the one a **known**
+unreachable panel gives: take that reference first (runbook step A2b / C3b: the panel's cable
+unplugged at the panel, link light off, the export run once) and write the code down. A different
+code at the interlock check means something else refused the connection -- for example another PC
+still holding the panel (whether a C3-400 refuses a second client is `[UNVERIFIED]`). The check that
+MonClub Access is not running covers **this PC only**.
+
+**Personal data.** Each `exports\panel_*.json` holds every user's name and card number (a card number
+may be enough to copy a card; the card technology is `[UNVERIFIED]`). Keep the files private and
+delete them from all three places they end up once the cutover is verified: the gym PC's copy of this
+folder (`exports\`), the USB key, and the laptop that ran the comparison. Better: run the tool from
+the USB key and never copy it to the gym PC. `.gitignore` keeps `exports/` and every `*.csv` out of
+a commit.
 
 ## What it reads, and why it cannot write
 
@@ -47,8 +64,13 @@ how long it takes, is known after the first run (the file records `timings` and 
 Compare with MonClub on any PC with Python 3.9+:
 
 ```
-python tools\gym45_cutover\compare_terminal_export.py --gym-id 58 --export 5=<file> --export 6=<file> --access-db <copy>\access.db --detail-csv cards58.csv
+python tools\gym45_cutover\compare_terminal_export.py --gym-id 58 --export 5=<file> --export 6=<file> --access-db <copy>\access.db --detail-csv <USB key>\cards58.csv
 ```
 
 The `cards` section counts the members whose card is on the panel but will not be written by MonClub;
-`cards58.csv` names them (personal data).
+`cards58.csv` names them (personal data: write it to the USB key, not into the repo). The line under
+`== cards` is the **card self-check**: on the pins MonClub owns, how many panel cards equal the card
+MonClub wrote. Below 90 % (or not measured) the list may only show that the panel returns cards in
+another form than MonClub writes them: do not act on it, call the developer. In the CSV, only a row
+whose note ends `no card in MonClub` may be entered at the desk; every other row names a card MonClub
+already holds, which must not be overwritten (see the runbook, A6).

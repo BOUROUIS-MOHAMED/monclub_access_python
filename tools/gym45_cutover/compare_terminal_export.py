@@ -27,9 +27,19 @@ What the numbers mean is in tools/gym45_cutover/README.md. The questions it answ
 3. For an ACCOUNT switch without a wipe: how many account pins would land on a pin the
    terminal already holds (the reason the wipe comes first).
 4. Which current members have a card on the terminal that MonClub will not push -- they
-   are refused by card after an erase until the card is entered in MonClub. Only a
-   row's first card reaches a terminal (device_sync._normalize_device_card on
-   firstCardId, guide 3.2b), so that is the card compared.
+   are refused by card after an erase until their card is sorted out at the desk. Only a
+   row's first card (firstCardId) reaches a terminal, so that is the card compared, in
+   the form each device type is sent it:
+   - a PullSDK panel (C3): device_sync._normalize_device_card -- digits only, and nothing
+     outside 1..4294967295 (the 4-byte CardNo) -- see ``wire_card``;
+   - an MB2000: the standalone roster passes firstCardId raw
+     (ultra_engine._build_standalone_roster) and the driver keeps its digits with no range
+     check (zk_standalone._digits_only before SetStrCardNumber) -- see ``mb2000_card``.
+     What an MB2000 stores for a value above the 4-byte range is not proven anywhere.
+   Whether a panel returns CardNo in the form it was written is not proven either, so
+   the report measures it first (``card self-check``) on the pins MonClub owns, the way
+   the ``sha self-check`` measures templates. A low rate means the cards list is an
+   artefact and must not be acted on.
 
 It reads the MB2000 export (tools/mb2000_scripts/14_export_terminal_readonly.ps1) and the
 PullSDK panel export (tools/c3_panel_scripts/export_c3_panel_readonly.ps1, no finger slots).
@@ -116,6 +126,24 @@ def wire_card(card: Any) -> str:
     return str(n) if 1 <= n <= 4294967295 else ""
 
 
+def mb2000_card(card: Any) -> str:
+    """The card MonClub writes to an MB2000 for this value: zk_standalone._digits_only on the
+    raw firstCardId (no range check), in norm_card's form (leading zeros dropped); '' when
+    nothing is written."""
+    return "".join(ch for ch in str(card or "") if ch.isdigit()).lstrip("0")  # str.isdigit, as the driver
+
+
+def card_rule(schema: Optional[str]):
+    """The function that gives, for a MonClub firstCardId, the card that export's device type
+    is sent: ``mb2000_card`` for an MB2000 export, ``wire_card`` for a PullSDK panel export."""
+    return mb2000_card if schema == EXPORT_SCHEMA else wire_card
+
+
+def no_monclub_card(card: Any) -> bool:
+    """True when MonClub holds no card at all in this slot: empty, blank, or only zeros."""
+    return str(card or "").strip().strip("0") == ""
+
+
 def norm_pin(pin: Any) -> str:
     """A terminal pin or a GMS card id as a comparable key: digits without leading
     zeros when it is numeric, else the trimmed text."""
@@ -188,6 +216,7 @@ class TerminalExport:
     counters: Dict[int, int]
     users: List[TerminalUser]
     taken_at: str
+    schema: str = EXPORT_SCHEMA  # which export tool wrote it: decides the card rule (card_rule)
 
 
 def load_export(path: str, device_id: int) -> TerminalExport:
@@ -232,6 +261,7 @@ def load_export(path: str, device_id: int) -> TerminalExport:
         counters=counters,
         users=users,
         taken_at=str(doc.get("takenAt") or ""),
+        schema=str(doc.get("schema")),
     )
 
 
@@ -251,7 +281,8 @@ class MonClubRow:
     name: str
     cards: Set[str]
     templates: List[MonClubTemplate]
-    first_card: str = ""         # wire_card(firstCardId): the one card MonClub pushes for this row
+    first_card: str = ""         # wire_card(firstCardId): the one card MonClub pushes to a PullSDK panel
+    first_card_raw: str = ""     # firstCardId as MonClub holds it (card_rule turns it into what a device gets)
 
     def person_key(self) -> str:
         if self.main_account_id is not None:
@@ -345,6 +376,7 @@ def load_access_db(path: str) -> AccessDb:
                 cards={c for c in (norm_card(c1), norm_card(c2)) if c},
                 templates=templates,
                 first_card=wire_card(c1),
+                first_card_raw=str(c1 or "").strip(),
             ))
         # A client older than the ownership bit (ownership_confirmed) records none: that is
         # "unknown", never "nobody owns anything".
@@ -504,7 +536,7 @@ def snapshot_from_rows(
         rows.append(MonClubRow(
             membership_id=am_id, main_account_id=acct, user_id=_int_or_none(user_id), name="",
             cards={c for c in (norm_card(c1), norm_card(c2)) if c}, templates=tpl,
-            first_card=wire_card(c1),
+            first_card=wire_card(c1), first_card_raw=str(c1 or "").strip(),
         ))
     gms = {norm_pin(k): int(a) for k, a in gms_persons if k is not None and _int_or_none(a) is not None}
     notes = [
@@ -603,6 +635,43 @@ def sha_self_check(
     return out
 
 
+CARD_TRUST_THRESHOLD = 0.9
+
+
+def card_self_check(
+    exports: List[TerminalExport],
+    rows: List[MonClubRow],
+    ownership: Optional[Dict[int, Dict[str, OwnState]]],
+    scheme: str,
+) -> Counter:
+    """On member pins -- the ones MonClub OWNS, when ownership is known -- that MonClub sends
+    a card, how many terminal users carry exactly that card (norm_card of what the device
+    returned == the card_rule value of firstCardId). It is what licenses reading the ``cards``
+    section as losses at all: a device that returns CardNo in another form than the decimal
+    MonClub wrote (hex, a facility/card split, another width) would make every member with a
+    card look like one."""
+    out: Counter = Counter()
+    for ex in exports:
+        rule = card_rule(ex.schema)
+        want: Dict[str, Set[str]] = defaultdict(set)
+        for r in rows:
+            p = r.pin(scheme)
+            c = rule(r.first_card_raw)
+            if p is not None and c:
+                want[p].add(c)
+        own = ownership.get(ex.device_id, {}) if ownership is not None else None
+        for u in ex.users:
+            if u.key not in want:
+                continue
+            if own is not None:
+                st = own.get(u.key)
+                if not (st and st.ownership_confirmed):
+                    continue
+            out["compared"] += 1
+            out["equal"] += int(norm_card(u.card) in want[u.key])
+    return out
+
+
 def analyse(
     exports: List[TerminalExport],
     access: Optional[AccessDb],
@@ -613,6 +682,12 @@ def analyse(
 ) -> Tuple[Dict[str, Any], List[DetailRow]]:
     if scheme not in SCHEMES:
         raise ValueError(scheme)
+    kinds = sorted({ex.schema for ex in exports})
+    if len(kinds) > 1:
+        # the card rule differs by device type; the people counts are gym-wide
+        raise ValueError(f"exports of two kinds in one run ({', '.join(kinds)}): compare each kind separately")
+    rule = card_rule(kinds[0] if kinds else None)
+    device_word = "a panel" if rule is wire_card else "the terminal"
     report: Dict[str, Any] = {"scheme_assumed_on_terminal": scheme, "devices": {}, "notes": []}
     details: List[DetailRow] = []
 
@@ -831,10 +906,20 @@ def analyse(
     report["people"] = dict(sorted(ppl.items()))
 
     # --- cards: who would be refused by card after an erase (the card is only on the terminal)
+    ccheck = card_self_check(exports, rows, ownership, scheme)
+    crate = (ccheck["equal"] / ccheck["compared"]) if ccheck["compared"] else None
+    report["card_self_check"] = {"compared": ccheck["compared"], "equal": ccheck["equal"],
+                                 "rate": None if crate is None else round(crate, 4),
+                                 "threshold": CARD_TRUST_THRESHOLD}
     crd: Counter = Counter()
-    pushed_cards = {k: {r.first_card for r in v if r.first_card} for k, v in persons.items()}
-    crd["people_with_monclub_card"] = sum(1 for k in persons if pushed_cards[k])
-    crd["people_without_monclub_card"] = sum(1 for k in persons if not pushed_cards[k])
+    pushed_cards = {k: {rule(r.first_card_raw) for r in v} - {""} for k, v in persons.items()}
+    # what MonClub holds in firstCardId, whether or not a device can be sent it
+    held_cards = {k: sorted({r.first_card_raw for r in v if not no_monclub_card(r.first_card_raw)})
+                  for k, v in persons.items()}
+    crd["people_with_writable_monclub_card"] = sum(1 for k in persons if pushed_cards[k])
+    crd["people_without_monclub_card"] = sum(1 for k in persons if not held_cards[k])
+    crd["people_with_unwritable_monclub_card"] = sum(
+        1 for k in persons if held_cards[k] and not pushed_cards[k])
     # under ACCOUNT one row per person reaches the terminal, so only one of these cards does
     crd["people_with_several_monclub_cards"] = sum(1 for k in persons if len(pushed_cards[k]) > 1)
     for key, seen in linked_cards.items():
@@ -842,8 +927,20 @@ def analyse(
         if not only:
             continue
         crd["people_with_terminal_only_card"] += 1
-        if not pushed_cards.get(key):
+        held = held_cards.get(key, [])
+        marker = any(re.sub(r"\D", "", c).startswith("99999") for c in held)
+        if not held:
             crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
+            tail = "; no card in MonClub"
+        elif not pushed_cards.get(key):
+            crd["people_with_terminal_only_card_and_unwritable_monclub_card"] += 1
+            tail = f"; MonClub card {'/'.join(held)} cannot be written to {device_word} -- do not overwrite it"
+        else:
+            crd["people_with_terminal_only_card_and_another_monclub_card"] += 1
+            tail = f"; MonClub card {'/'.join(held)} -- do not overwrite it"
+        if marker:
+            crd["people_with_terminal_only_card_and_99999_monclub_card"] += 1
+            tail += " (it starts with 99999: ask the owner first)"
         for where in {w for *_, w in only}:
             crd[f"terminal_only_card_via_{where}"] += 1
         details.append(DetailRow(
@@ -851,10 +948,14 @@ def analyse(
             name=names.get(key, ""),
             fingers="",
             link=",".join(sorted({w for *_, w in only})),
-            note="cards " + ";".join(f"{d}:{p}:card {c}" for d, p, c, _ in only)
-                 + ("; no card in MonClub" if not pushed_cards.get(key) else ""),
+            note="cards " + ";".join(f"{d}:{p}:card {c}" for d, p, c, _ in only) + tail,
         ))
     report["cards"] = dict(sorted(crd.items()))
+    if crd["people_with_terminal_only_card"] and (crate is None or crate < CARD_TRUST_THRESHOLD):
+        report["notes"].append(
+            "card self-check " + ("not measured" if crate is None else f"{crate:.0%}")
+            + f" (below {CARD_TRUST_THRESHOLD:.0%}): the cards list may only show that the device returns "
+              "cards in another form than MonClub writes them -- do not act on it, call the developer")
     if access is None and backend is None:
         report["notes"].append("no --access-db and no backend: members and finger coverage are not evaluated")
     if ownership is None and (access is not None or backend is not None):
@@ -906,6 +1007,16 @@ def render(report: Dict[str, Any]) -> str:
     lines.append(f"== people {report['people']}")
     if "cards" in report:
         lines.append(f"== cards {report['cards']}")
+        cc = report.get("card_self_check", {})
+        rate, thr = cc.get("rate"), cc.get("threshold", CARD_TRUST_THRESHOLD)
+        if rate is None:
+            verdict = "NOT MEASURED -- the cards list is unchecked: do not act on it"
+        elif rate >= thr:
+            verdict = f"at or above {thr:.0%} -- the cards list can be used"
+        else:
+            verdict = f"BELOW {thr:.0%} -- STOP: do not act on the cards list, call the developer"
+        lines.append(f"   card self-check (member pins): {cc.get('equal', 0)}/{cc.get('compared', 0)} device cards "
+                     f"equal the card MonClub writes ({'-' if rate is None else f'{rate:.1%}'}) -> {verdict}")
     for n in report.get("notes", []):
         lines.append(f"note: {n}")
     if "backend" in report:
@@ -966,7 +1077,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             user=args.mysql_user, password=os.environ.get(args.mysql_password_env, ""),
             gym_id=args.gym_id, day=args.day or datetime.date.today().isoformat(),
         )
-    report, details = analyse(exports, access, backend, scheme=args.scheme, match_by=args.match_by)
+    try:
+        report, details = analyse(exports, access, backend, scheme=args.scheme, match_by=args.match_by)
+    except ValueError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
     print(render(report))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:

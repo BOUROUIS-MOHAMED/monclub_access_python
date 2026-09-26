@@ -131,7 +131,7 @@ function Write-Warn { param([string]$m) Write-Host "[!] $m" }
 function Write-Info { param([string]$m) Write-Host "[i] $m" }
 function Enter-32Bit { param([string]$ScriptPath, [object[]]$ScriptArgs) }
 function Resolve-PlcommproDll { param([string]$Explicit, [string]$Here) 'fake-plcommpro.dll' }
-function Get-Process { param($Name, $ErrorAction) @() }
+function Get-Process { param($Name, $ErrorAction) __PROCS__ }
 function New-PullSdk {
     param([string]$DllPath)
     $o = [pscustomobject]@{ log = '__LOG__'; connectOk = __CONNECT_OK__ }
@@ -140,7 +140,9 @@ function New-PullSdk {
     Add-Fake 'Disconnect' { param($h) Add-Content -LiteralPath $this.log 'Disconnect' }
     Add-Fake 'PullLastError' { Add-Content -LiteralPath $this.log 'PullLastError'; -2 }
     Add-Fake 'GetDeviceDataCount' { param($h, $t, $f, $o2) Add-Content -LiteralPath $this.log "GetDeviceDataCount:$t"
-        @{ user = 4; userauthorize = 3; transaction = 1200; templatev10 = 2; template = 0; timezone = 1; holiday = 0 }[$t] }
+        $c = @{ user = 4; userauthorize = 3; transaction = 1200; templatev10 = 2; template = 0; timezone = 1; holiday = 0 }
+        __COUNT_OVERRIDES__
+        $c[$t] }
     Add-Fake 'GetDeviceParam' { param($h, $items) Add-Content -LiteralPath $this.log "GetDeviceParam:$($items.Split(',').Count)"
         if ($items -eq 'DateTime') {
             $n = Get-Date
@@ -161,12 +163,16 @@ function New-PullSdk {
 """
 
 
-def _run(tmp_path: Path, *, connect_ok: bool = True) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
+def _run(tmp_path: Path, *, connect_ok: bool = True, access_running: bool = False,
+         counts: dict[str, int] | None = None) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
     pack = tmp_path / "pack"
     pack.mkdir()
     shutil.copy2(SCRIPT, pack / SCRIPT.name)
     log = tmp_path / "calls.log"
-    helper = _FAKE_HELPER.replace("__LOG__", str(log)).replace("__CONNECT_OK__", "$true" if connect_ok else "$false")
+    procs = "@([pscustomobject]@{ ProcessName = 'MonClubAccess' })" if access_running else "@()"
+    overrides = "; ".join(f"$c['{t}'] = {n}" for t, n in (counts or {}).items())
+    helper = (_FAKE_HELPER.replace("__LOG__", str(log)).replace("__CONNECT_OK__", "$true" if connect_ok else "$false")
+              .replace("__PROCS__", procs).replace("__COUNT_OVERRIDES__", overrides))
     (pack / HELPER.name).write_text(helper, encoding="utf-8")
     proc = subprocess.run(
         [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(pack / SCRIPT.name),
@@ -239,3 +245,45 @@ class TestAgainstAFakePanel:
         digest, name = sidecar.read_text(encoding="ascii").split()
         import hashlib
         assert hashlib.sha256((exports / name).read_bytes()).hexdigest() == digest
+
+
+    def test_it_refuses_to_run_while_monclub_access_runs_on_this_pc(self, tmp_path: Path):
+        """The guard runs before the DLL is looked for: no connection, no file."""
+        proc, doc, calls = _run(tmp_path, access_running=True)
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert doc is None
+        assert not (tmp_path / "pack" / "exports").exists()
+        assert calls == []
+        assert "MonClub Access is running on this PC" in proc.stdout
+
+    def test_a_failed_finger_count_is_an_error_not_a_count_and_the_export_is_partial(self, tmp_path: Path):
+        proc, doc, calls = _run(tmp_path, counts={"templatev10": -100})
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert doc["complete"] is False
+        assert doc["counts"]["templatev10"] is None
+        assert "GetDeviceDataCount(templatev10) rc=-100" in doc["errors"]
+        # unknown is not empty: the finger ids are still listed
+        assert "GetDeviceData:templatev10" in calls
+        assert {u["pin"]: u["fingerIds"] for u in doc["users"]}["101"] == ["0", "6"]
+        assert "templatev10=FAILED" in proc.stdout
+
+    def test_a_failed_user_count_makes_the_export_partial(self, tmp_path: Path):
+        proc, doc, _ = _run(tmp_path, counts={"user": -2})
+        assert proc.returncode == 2, proc.stdout + proc.stderr
+        assert doc["complete"] is False and doc["counts"]["user"] is None
+        assert "GetDeviceDataCount(user) rc=-2" in doc["errors"]
+        assert doc["summary"]["users"] == 4          # the table itself was read
+
+    def test_a_failed_count_of_another_table_is_recorded_but_not_partial(self, tmp_path: Path):
+        """Whether a C3-400 answers every table name is not known: a table the runbook does not
+        read as proof does not make the export partial, but it is in errors."""
+        proc, doc, _ = _run(tmp_path, counts={"holiday": -100})
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert doc["complete"] is True and doc["counts"]["holiday"] is None
+        assert doc["errors"] == ["GetDeviceDataCount(holiday) rc=-100"]
+        assert "error: GetDeviceDataCount(holiday) rc=-100" in proc.stdout
+
+    def test_an_empty_finger_table_is_not_listed(self, tmp_path: Path):
+        _, doc, calls = _run(tmp_path, counts={"templatev10": 0})
+        assert doc["complete"] is True and doc["counts"]["templatev10"] == 0
+        assert "GetDeviceData:templatev10" not in calls

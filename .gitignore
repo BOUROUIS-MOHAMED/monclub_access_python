@@ -53,3 +53,10 @@ tools/mb2000_scripts/logs/
 tools/mb2000_scripts/backups/
 tools/mb2000_scripts/templates/
 tools/mb2000_scripts/config.json
+# Cutover exports and comparisons: every member's name and card (and, for an MB2000
+# -IncludeTemplates export, the fingerprint templates) -- personal data, never part of a
+# commit. The comparison's --detail-csv lands wherever it is run; no CSV is tracked in this
+# repo (a CSV that must be committed is added with `git add -f`).
+tools/c3_panel_scripts/exports/
+tools/mb2000_scripts/exports/
+*.csv

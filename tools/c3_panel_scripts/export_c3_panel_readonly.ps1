@@ -29,8 +29,14 @@
 #   add -Password <device password> when /gym-devices shows one for this panel
 #   add -DllPath <path to plcommpro.dll> when the sdk\ folder is not found
 #
-# EXIT CODES: 0 = complete export written, 1 = setup / connect failure,
-#             2 = a table read failed (a partial file is written, marked complete=false)
+# EXIT CODES: 0 = complete export written, 1 = setup / connect failure (also: MonClub
+#             Access runs on this PC), 2 = a table read, or the count of user /
+#             userauthorize / templatev10, failed (a partial file is written, marked
+#             complete=false). A failed count is stored as null and listed in "errors";
+#             read "errors" even when the file is complete.
+#
+# PERSONAL DATA: the file holds every member's name and card number. Keep it private and
+# delete it (here, on the USB key, on the laptop) once the cutover is verified.
 param(
     [string] $DeviceIp  = '',
     [int]    $Port      = 4370,
@@ -201,13 +207,23 @@ try {
     } else { $errors.Add("GetDeviceParam(DateTime) rc=$($dt.rc)") }
     $timings.paramsMs = $clock.ElapsedMilliseconds - $t0
 
+    # A negative answer is a PullSDK error code, not a row count: it is recorded in errors
+    # and the count is stored as null ("not read"), never as a number.
     $t0 = $clock.ElapsedMilliseconds
+    $countFailed = @()
     foreach ($t in $countTables) {
         Count-Call 'GetDeviceDataCount'
-        $counts[$t] = [int]$sdk.GetDeviceDataCount($h, $t, '', '')
+        [int]$rc = $sdk.GetDeviceDataCount($h, $t, '', '')
+        if ($rc -lt 0) {
+            $errors.Add("GetDeviceDataCount($t) rc=$rc")
+            $counts[$t] = $null
+            $countFailed += $t
+        } else {
+            $counts[$t] = $rc
+        }
     }
     $timings.countsMs = $clock.ElapsedMilliseconds - $t0
-    Write-Info ("counts: " + (($counts.Keys | ForEach-Object { "$_=$($counts[$_])" }) -join ' '))
+    Write-Info ("counts: " + (($counts.Keys | ForEach-Object { if ($null -eq $counts[$_]) { "$_=FAILED" } else { "$_=$($counts[$_])" } }) -join ' '))
 
     # the user table, every column the firmware returns
     $t0 = $clock.ElapsedMilliseconds
@@ -242,8 +258,10 @@ try {
         })
     }
 
-    # finger ids per pin - only the fields named, never the Template column
-    if ($counts['templatev10'] -gt 0) {
+    # finger ids per pin - only the fields named, never the Template column. Listed when
+    # the count says there are rows, AND when the count failed (unknown is not empty).
+    $fingerCount = $counts['templatev10']
+    if (($null -eq $fingerCount) -or ($fingerCount -gt 0)) {
         $t0 = $clock.ElapsedMilliseconds
         Count-Call 'GetDeviceData'
         $res = $sdk.GetDeviceData($h, 'templatev10', "Pin`tFingerID`tValid`tSize", '', '')
@@ -255,7 +273,12 @@ try {
             $fingerIdsByPin[$p].Add([ordered]@{ fingerId = (Get-Field $r @('FingerID')); valid = (Get-Field $r @('Valid')); size = (Get-Field $r @('Size')) })
         }
     }
-    $complete = $true
+    # The runbook proves a panel empty with the counts of these three tables: a failed one
+    # leaves no number to read, so the export is not complete. A failed count of another
+    # table (transaction, template, timezone, holiday: whether a C3-400 answers each is not
+    # known) is in errors only.
+    $proofFailed = @($countFailed | Where-Object { $_ -in @('user', 'userauthorize', 'templatev10') })
+    $complete = ($proofFailed.Count -eq 0)
 } catch {
     $errors.Add("read stopped: $($_.Exception.Message)")
     Write-Err "read stopped: $($_.Exception.Message)"
@@ -311,12 +334,13 @@ Write-Host ""
 Write-Host "EXPORT" -ForegroundColor Cyan
 Write-Host ("  panel           {0} ({1})  serial {2}  firmware {3}" -f $DeviceIp, $Label, $params['~SerialNumber'], $params['FirmVer'])
 Write-Host ("  users           {0}   with card {1}   with door rights {2}   with fingers {3}" -f $summary.users, $summary.withCard, $summary.withDoorRights, $summary.withFingers)
-Write-Host ("  counts          " + (($counts.Keys | ForEach-Object { "$_=$($counts[$_])" }) -join ' '))
+Write-Host ("  counts          " + (($counts.Keys | ForEach-Object { if ($null -eq $counts[$_]) { "$_=FAILED" } else { "$_=$($counts[$_])" } }) -join ' '))
 Write-Host ("  clock skew      {0} s" -f $device.clockSkewSec)
 Write-Host ("  took            {0:N1} s" -f ($timings.totalMs / 1000))
 Write-Host ("  calls made      {0}" -f (($calls.Keys | ForEach-Object { "$_ x$($calls[$_])" }) -join ', '))
 Write-Host ("  file            {0}" -f $outFile)
 Write-Host ("  file SHA-256    {0}" -f $fileHash)
+foreach ($e in $errors) { Write-Warn "error: $e" }
 if ($complete) { Write-Ok "complete - nothing was written to the panel"; Stop-Run 0 }
 Write-Warn "PARTIAL export - nothing was written to the panel"
 Stop-Run 2
