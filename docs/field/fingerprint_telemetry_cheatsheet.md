@@ -199,6 +199,18 @@ grep -F "[T] PIN_SCHEME_SWITCH" app-*.log
 scheme's pins; the terminal keeps the old scheme's users until an operator wipes it. Door events stamped
 before the switch are read under `previous`. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
 
+**Did a push stop because the scheme changed under it?**
+
+```bash
+grep -F "[T] PIN_SCHEME_PASS_STOPPED" app-*.log
+```
+
+`worker=` (MB2000) or `device_id=` (PullSDK), `path=`, `scheme=` the scheme the stopped pass had derived
+its pins under. Nothing more was written by that pass; the next pass pushes the new scheme. One or two of
+these right after a `PIN_SCHEME_SWITCH` are expected. On the MB2000 the chunk already in flight (at most 10
+members) may still have gone out under the old scheme; the cutover runbook's cables-out interlock and its
+proven restart are what keep that from ever reaching a turnstile. `[CODE: app/core/device_sync.py::pin_scheme_superseded; guide §3.2e]`
+
 > **Per-pin success lines are deliberately not emitted.** The STA thread pumps no COM
 > messages while a command runs and the log handler writes inline, so a line per member on
 > a 928-member push would widen that window — a behaviour change, not instrumentation.

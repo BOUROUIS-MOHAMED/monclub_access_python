@@ -5029,6 +5029,24 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
     return True
 
 
+def get_device_pin_scheme(device_id: int) -> Optional[str]:
+    """The pinScheme this database records for a device now (``sync_devices.pin_scheme``,
+    normalised), None when the device has no row. One primary-key read.
+
+    The column every device write sets in the same transaction as the switch record
+    (``_insert_device_row``), and the value the device payload projects as ``pinScheme``. A
+    push pass compares the scheme it derived its pins under with this before it writes
+    (guide §3.2e); a read error propagates, so the caller can refuse the write.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT pin_scheme FROM sync_devices WHERE id = ?", (int(device_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return normalize_pin_scheme(row[0])
+
+
 def list_device_pin_scheme_switches(*, device_id: int | None = None) -> Dict[int, List[Dict[str, Any]]]:
     """{device_id: [{"previous_scheme", "scheme", "switched_at"}, ...]} oldest first.
 

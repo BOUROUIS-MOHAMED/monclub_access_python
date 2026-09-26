@@ -37,7 +37,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The ULTRA re-scan cooldown — its window, its default for a never-seen card, the staff exemption (`ultra_engine.py::_process_event`'s cooldown block, `::_effective_card_cooldown_sec`) | §3 ULTRA |
 | How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
-| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches; local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
+| How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches, the worker refresh on a device change and the push passes' scheme re-check (`app.py::_refresh_running_ultra_devices`, `device_sync.py::pin_scheme_superseded`, `ultra_engine.py::_pass_scheme_stopped`); local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
@@ -1552,13 +1552,51 @@ as MEMBERSHIP.
 > has no tool for a PullSDK panel yet (`clear_device_table`'s only caller is the ceiling-gated
 > `FULL_REPLACE` clear, §3.2g) `[CODE]`.
 
-**A switch that arrives by fast patch does not reach running workers at once (review, 2026-09-26).**
-A dashboard `GYM_DEVICE` fast patch records the switch and logs `[T] PIN_SCHEME_SWITCH`
-(`app.py::apply_fast_patch_bundle` → `db._insert_device_row`), but a running `UltraDeviceWorker`
-keeps its own device copy until the next successful sync's device refresh (`refresh_devices`), and
-its full pass pushes from that copy (`ultra_engine.py::_drain_full_sync_commands`). So the switch
-line alone does not prove the workers derive account pins: the cutover procedures restart Access
-after it, before a terminal is reconnected. `[CODE]` Not changed.
+**A switch reaches the running workers before any pass is queued (release MUST, lane B, 2026-09-26).**
+Until this change a dashboard `GYM_DEVICE` fast patch recorded the switch and logged
+`[T] PIN_SCHEME_SWITCH` (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) and then queued
+a full pass (`_request_running_ultra_sync`), but a running `UltraDeviceWorker` kept its own device copy
+until the next successful sync's device refresh, and the pass pushed from that copy
+(`ultra_engine.py::_drain_full_sync_commands`) — MEMBERSHIP pins onto a terminal just wiped for
+ACCOUNT, including a pass queued while the link was down and one already pushing. A server sync had
+the same gap: it saved the device section, then refreshed the workers only near the end of its tick,
+after the DeviceSync run, the fingerprint report and the attendance upload. `[TEST: red on aeeef69]`
+Now `[CODE]`:
+- **The copies follow the database first.** `MainApp._refresh_running_ultra_devices` (under
+  `_ultra_lock`, only while the engine runs) hands the workers
+  `ultra_devices_for_this_pc(db.list_sync_devices_payload())` through `UltraEngine.refresh_devices`.
+  `apply_fast_patch_bundle` calls it when any item of the bundle is `GYM_DEVICE` or carries
+  `requiresDeviceRescope` — applied or not, the database is the truth — before either dispatch
+  branch; the sync tick calls it right after each `save_sync_cache_delta` and its date flip whenever
+  `refresh["devices"]` (the refresh near the end of the tick stays). A failed refresh is logged,
+  schedules the full reconcile, and still dispatches: the guard below refuses the old scheme's pins,
+  and the bundle's revocations are not held back.
+- **Every push pass re-checks the recorded scheme.** `device_sync.pin_scheme_superseded` compares the
+  scheme a pass derived its pins under with `sync_devices.pin_scheme` (`db.get_device_pin_scheme`, one
+  primary-key read). MB2000: the full sync at its start (the device copy — nothing removed, nothing
+  pushed), before the push (`_push_with_chunk_recording`, the roster's own scheme) and between chunks
+  (`_standalone_push_yield`); the targeted member push; the ACCOUNT revoke re-push. PullSDK: the ULTRA
+  worker's pass at its start, `DeviceSyncEngine._sync_one_device` at its start (before any session)
+  and again before its user batch (`PinSchemeSwitchedError`, so every caller reads a failed pass,
+  never an in-sync panel), and `sync_member_on_connected_sdk` (`DEFERRED`). A stop sends nothing,
+  writes no state and stamps no roster hash; its revocations stay pending; `[T] PIN_SCHEME_PASS_STOPPED`.
+  The next pass is the one the app queues after the refresh.
+- **What is left.** On the MB2000 the chunk already in flight when the switch lands (at most
+  `_PUSH_CHUNK_MEMBERS` = 10 members, handed over before the switch existed); on PullSDK a user batch
+  already started (no abort inside it). A targeted revoke drained between the save and the refresh
+  names its pin under the previous scheme — what an unwiped terminal holds. A device row that cannot be
+  read is not re-checked (logged): a broken database already stops every write at its write-ahead
+  intent (§3.4a). `[CODE]`
+`[TEST: test_pin_scheme_worker_refresh.py — the real fast patch on a temp database driving a real
+worker over a fake MB2000 (pin 5 is Alice's membership and Bob's account), a pass queued while the link
+was down, a switch mid-push and before the push, a pass drained before the refresh, the four PullSDK
+sites, the tick order, the refresh helper; 13 of its 15 tests fail on aeeef69 (the other two are
+controls) — two of the panel ones only at the import of `PinSchemeSwitchedError`, where a scratch probe
+showed aeeef69 writing the MEMBERSHIP pins 5 and 6, and the three helper ones because the helper is new;
+test_fast_patch_runtime.py::test_apply_fast_patch_bundle_requests_device_rescope_sync pins the order
+refresh → dispatch]`
+The cutover procedures still restart Access after the switch, before a terminal is reconnected
+(runbook C13, D15, gym 45 plan E10b): a second guard, not replaced by this one.
 
 **Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
 `device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
@@ -3891,6 +3929,7 @@ test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identi
 | `REMOVAL_DEFERRED` (warn) | `push_safety.py::check_bulk_removal`, `ultra_engine.py::_run_standalone_member_revoke` | `worker device_id protocol path count reason member_id` — a removal refused because the turnstile is add-only (`reason=add_only`) or being handed over (`handover_release`); retryable, state kept, NOT a `REVOKE_ABORTED` (§3.9) |
 | `REMOVAL_CONFIRMED` (warn) | `push_safety.py::check_bulk_removal` | `worker device_id protocol path count roster ceiling` — an above-ceiling step let through once by a Confirm-removal approval for exactly that pin set (§3.2g) |
 | `MIRROR_SKIP_REMOVALS_DEFERRED` | `ultra_engine.py::_maybe_mirror_reconcile` | `worker` — MIRROR skipped on an add-only / handed-over turnstile |
+| `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=`), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). `path` ∈ `full_sync` (pass start), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000) / `sync`, `batch`, `member_sync` (PullSDK). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
 
 The v2 runtime logs on `zkapp.v2*` loggers with a `[V2]` prefix (roles changed, availability, commands,
 releases, restores, read-backs, loss checks); none is a `[T]` event.

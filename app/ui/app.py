@@ -1141,6 +1141,34 @@ class MainApp:
             )
         return started
 
+    def _refresh_running_ultra_devices(self, *, reason: str) -> bool:
+        """Hand the running ULTRA workers the device rows the database holds now.
+
+        A worker pushes from its own copy of its device row. A GYM_DEVICE fast patch or a
+        sync's device section changes the database at once -- a pinScheme switch included --
+        so the copies are refreshed BEFORE any pass is queued on them, not at the end of the
+        next sync tick (release checklist §3a, guide §3.2e). True when refreshed, or when no
+        ULTRA engine runs; False when the rows could not be read or applied (logged). The push
+        passes re-check the recorded scheme themselves, so a stale copy never writes pins of a
+        scheme the database no longer records.
+        """
+        with self._ultra_lock:
+            engine = getattr(self, "_ultra_engine", None)
+            if engine is None or not getattr(engine, "running", False):
+                return True
+            try:
+                from app.core.db import list_sync_devices_payload
+
+                devices = ultra_devices_for_this_pc(list_sync_devices_payload())
+                refreshed = int(engine.refresh_devices(devices) or 0)
+            except Exception:
+                self.logger.warning(
+                    "[ULTRA] worker device rows not refreshed (%s)", reason, exc_info=True,
+                )
+                return False
+        self.logger.info("[ULTRA] refreshed %d worker device row(s) (%s)", refreshed, reason)
+        return True
+
     def _defer_ultra_reconnects(self, *, trigger_source: str, duration_sec: float = 20.0) -> int:
         if not _should_defer_ultra_reconnects(trigger_source):
             return 0
@@ -1943,6 +1971,20 @@ class MainApp:
                 for item_index, item in enumerate(raw_items)
                 if isinstance(item, dict)
             }
+            # A device item -- a pinScheme switch among them -- reaches the running workers
+            # BEFORE anything below queues a pass on their device copies (release checklist
+            # §3a, guide §3.2e). Every item the bundle carries counts, applied or not: the
+            # database is the truth either way and re-reading it is idempotent. A failed
+            # refresh still dispatches: the passes refuse pins of a scheme the database no
+            # longer records, and the full reconcile refreshes the copies.
+            if any(
+                str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
+                or (isinstance(item.get("impact"), dict)
+                    and bool(item["impact"].get("requiresDeviceRescope")))
+                for item in indexed_items.values()
+            ):
+                if not self._refresh_running_ultra_devices(reason="FAST_PATCH_BUNDLE"):
+                    _schedule_full_reconcile("worker_device_refresh_failed")
             raw_applied_count = db_result.get("applied")
             raw_skipped_count = db_result.get("skipped")
             counts_valid = (
@@ -3110,6 +3152,11 @@ class MainApp:
                 from app.core.db import invalidate_sync_cache, refresh_sync_cache_async
                 invalidate_sync_cache()
                 refresh_sync_cache_async()
+                if refresh.get("devices"):
+                    # The running workers' device copies follow the saved rows now, not at the
+                    # end of this tick (after the attendance upload): a pass drained in between
+                    # would build from the old copy (guide §3.2e).
+                    self._refresh_running_ultra_devices(reason="sync-save")
 
                 if (
                     refresh.get("devices")
@@ -3141,6 +3188,8 @@ class MainApp:
                         self._apply_date_flips("save")
                         invalidate_sync_cache()
                         refresh_sync_cache_async()
+                        if refresh.get("devices"):
+                            self._refresh_running_ultra_devices(reason="sync-save")
                         if not refresh.get("members"):
                             clear_version_tokens()
                             new_tokens = {}
