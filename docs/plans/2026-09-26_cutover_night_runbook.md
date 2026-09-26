@@ -6,6 +6,22 @@ For the owner. Plain steps, in the order of the night. The evidence behind each 
 - the PCs starting by themselves: [`2026-09-26_autostart_checklist.md`](2026-09-26_autostart_checklist.md)
 - what the release must contain: [`2026-09-26_cutover_release_checklist.md`](2026-09-26_cutover_release_checklist.md)
 
+> **NOT READY -- DO NOT USE ON THE NIGHT YET (master-session review, 2026-09-26).** A read-only review
+> found one blocker and four major gaps in this runbook. They must be fixed before any go-ahead:
+> 1. **Blocker:** gym 45 dropped the plan's section 5.2 firewall block on the PCs that are not reinstalled. Revoking a PC
+>    in /access-pcs does NOT stop an old Access: it syncs with the gym login and would push membership PINs
+>    onto the account-keyed terminals. Gym 58's C11 needs the same block, or the PC unplugged from the network.
+> 2. The installer re-registers and re-enables the watchdog that C1/D1 disabled, so Access can relaunch by
+>    itself about 4 minutes after the install and during every "Quit, then export" step.
+> 3. "Ouvrir keeps working" is false while a panel or terminal cable is out: the button needs the device
+>    connection. A physical opening fallback is needed.
+> 4. The erase happens before the new release has ever started on that PC, and there is no rollback if it fails
+>    to start (the installer deletes the old program). Pre-install first, or bring the previous installer and add an F row.
+> 5. The card list can only drive desk edits once a card self-check shows the panel returns cards in the form
+>    Access wrote them (the C3 read-back format is unverified).
+> Minor points: check `cleared_rows` on every running gym 45 PC; prove the restart with a new `App started` line;
+> the export tool records failed counts and lists; the export JSON files are personal data and should be git-ignored.
+
 **PLAN ONLY -- nothing has been run.** Written 2026-09-26 on Access `master` `22c9cfc`.
 
 **About the times.** Almost nothing here has ever been timed on the real devices. Where a time is
