@@ -1538,8 +1538,15 @@ as MEMBERSHIP.
 >
 > A full procedure for gym 45 -- survey, wipe, the manual retire of the old-scheme rows, the switch, an
 > interlocked re-push and the rollback rows -- is planned (not executed) in
-> [`docs/plans/2026-09-19_gym45_cutover_plan.md`](docs/plans/2026-09-19_gym45_cutover_plan.md), on branch
-> `claude/gym45-cutover-plan`.
+> [`docs/plans/2026-09-19_gym45_cutover_plan.md`](docs/plans/2026-09-19_gym45_cutover_plan.md).
+> Gym 58's two C3-400 panels (PullSDK) are planned in
+> [`docs/plans/2026-09-26_gym58_cutover_plan.md`](docs/plans/2026-09-26_gym58_cutover_plan.md), and the
+> night that does both in [`docs/plans/2026-09-26_cutover_night_runbook.md`](docs/plans/2026-09-26_cutover_night_runbook.md).
+> **On a PullSDK panel the retire is not needed**: the stale set there is built from the pins READ from
+> the panel, so after a verified erase it is empty, and the first clean ACCOUNT pass prunes the old
+> rows (`device_sync.py::_sync_one_device`, `db.prune_device_sync_state`) `[CODE]`. The erase itself
+> has no tool for a PullSDK panel yet (`clear_device_table`'s only caller is the ceiling-gated
+> `FULL_REPLACE` clear, §3.2g) `[CODE]`.
 
 **Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
 `device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
@@ -3197,6 +3204,11 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   whose read-only property is pinned by `tests/test_mb2000_export_readonly.py`). Use these to
   establish ground truth on hardware
   **before** changing driver code. `[CODE]`
+- **PullSDK panels**: `tools/c3_panel_scripts/export_c3_panel_readonly.ps1` reads one panel
+  (parameters, clock, table counts, `user`, `userauthorize`, `templatev10` finger ids) into a file,
+  through a helper that declares only `Connect`, `Disconnect`, `GetDeviceData`, `GetDeviceDataCount`,
+  `GetDeviceParam`, `PullLastError` `[TEST: tests/test_c3_panel_export_readonly.py]`. Never run
+  against a real panel yet `[UNVERIFIED]`. There is no PullSDK write or erase script. `[CODE]`
 
 ---
 

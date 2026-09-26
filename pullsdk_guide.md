@@ -813,6 +813,12 @@ What is actually pinned, and what is not.
   `tests/test_device_sync_protocol_guard.py`
 - Batch push and the `fingerprintEnabled=false` gate — `tests/test_batch_device_push.py`
 - The 2-door fallback `[1, 2]` — `tests/test_device_control_settings.py`
+- The read-only panel export `tools/c3_panel_scripts/export_c3_panel_readonly.ps1` (32-bit
+  PowerShell, its own P/Invoke of six read entry points, the table-read ladder and connection string
+  of §4-§5) — `tests/test_c3_panel_export_readonly.py`, against a fake panel. A smoke run of the real
+  helper on the development PC (the pack's `plcommpro.dll`, `Connect` to 127.0.0.1:1 where no device
+  listens) returned handle 0 and `PullLastError=-307` after 2.3 s with `timeout=2000`
+  `[TEST: 2026-09-26, not committed]`. It has never read a real panel.
 
 **NOT covered — hardware-gated.** `[UNVERIFIED]`
 > **No test calls `open_door`, `poll_rtlog_once`, `get_device_time` or `set_device_time`
