@@ -36,6 +36,20 @@ def _start_pc_identity_runtime(app: Any) -> None:
         )
 
 
+def _start_v2_runtime(app: Any) -> None:
+    """P3b-2: notice socket, remote commands, driver leases (dormant until the server answers)."""
+    try:
+        from app.core.v2.runtime import start_v2_runtime
+
+        start_v2_runtime(app)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[runtime] v2 realtime runtime did not start; access remains available: %s", exc
+        )
+
+
 def schedule_access_shell_startup(app: Any) -> None:
     """Schedule Access-owned startup work for the current combined shell."""
 
@@ -49,6 +63,7 @@ def schedule_access_shell_startup(app: Any) -> None:
     app.after(5000, app.start_expiry_warning_scheduler)
     app.after(10000, lambda: _start_optional_content_sync_scheduler(app))
     app.after(11000, lambda: _start_pc_identity_runtime(app))
+    app.after(12000, lambda: _start_v2_runtime(app))
 
 __all__ = [
     "AgentRealtimeEngine",

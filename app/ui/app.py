@@ -666,6 +666,15 @@ class MainApp:
         # tick's work(), so none of them ever sees yesterday's roster after a power-on.
         self._init_date_flip_state()
         self._apply_date_flips("startup")
+        # P3b-2: the driver/reader roles cached from the last assignment, installed before the
+        # first sync tick can start any worker -- a reader stays a reader at a power-on without
+        # internet. Local read only; no cache (v2 off, never fetched) keeps today's behaviour.
+        try:
+            from app.core.v2.runtime import load_cached_roles
+
+            load_cached_roles(self)
+        except Exception:
+            self.logger.warning("[V2] cached roles not loaded at start-up", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
         try:
             self._arm_midnight_date_flip()
@@ -786,6 +795,12 @@ class MainApp:
     def destroy(self) -> None:
         self._stop_event.set()
         self._wake_scheduler()
+        v2_runtime = getattr(self, "_v2_runtime", None)
+        if v2_runtime is not None:
+            try:
+                v2_runtime.stop()
+            except Exception:
+                pass
         if self._change_detector is not None:
             try:
                 self._change_detector.stop()
@@ -4240,7 +4255,9 @@ class MainApp:
             except Exception:
                 # Distinguishes "the finger never got captured" from every later
                 # failure. A cancel is re-tagged below, after the cancel check.
-                _outcome["v"] = "capture_failed"
+                # P3b-2: a cancel that interrupts the capture itself is a cancel too
+                # (it read as capture_failed, so ENROLL_CANCEL looked like a scanner fault).
+                _outcome["v"] = "cancelled" if self._enroll_cancel_event.is_set() else "capture_failed"
                 raise
             _phase_done("capture")
 
@@ -4435,6 +4452,12 @@ class MainApp:
             except Exception:
                 pass
             with self._enroll_state_lock:
+                # P3b-2: the terminal outcome of this attempt, for a remote ENROLL_START
+                # command (the SSE ``result`` only says success/failed/cancelled).
+                self._last_enroll_outcome = {
+                    "enrollId": enroll_id or None,
+                    "outcome": _outcome.get("v") or "unknown",
+                }
                 self._enroll_running = False
 
 

@@ -399,6 +399,13 @@ class PcIdentityService:
                 self._last_error = str(exc)
                 raise
 
+    def invalidate_token(self) -> None:
+        """P3b-2: the server closed the notice socket with 4001 (token expired): mint anew
+        at the next ``ensure_token`` instead of reusing the cached one."""
+        with self._lock:
+            self._pc_token = None
+            self._token_expires_at = None
+
     def heartbeat_once(self) -> bool:
         """Attempt one heartbeat without allowing any failure to escape."""
 
@@ -584,7 +591,24 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     qr_roster_check = _qr_roster_check_report()
     if qr_roster_check is not None:
         payload["qrRosterCheck"] = qr_roster_check
+    clock_offset = _clock_offset_report()
+    if clock_offset is not None:
+        payload["clockOffset"] = clock_offset
     return payload
+
+
+def _clock_offset_report() -> dict[str, Any] | None:
+    """P3b-2 (owner decision 5a): the PC's measured offset to the server clock
+    ``{offsetSec, samples, source}`` -- ``offsetSec`` = server - PC, seconds. Absent before the
+    first measurement. Backend main c7d4b532's HeartbeatRequest has no field for it; Jackson's
+    default drops an unknown key (guide §3.1b), so an old backend ignores it."""
+    try:
+        from app.core.v2.runtime import default_clock
+
+        clock = default_clock()
+        return clock.report() if clock is not None else None
+    except Exception:
+        return None
 
 
 class PcHeartbeatWorker:
