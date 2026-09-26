@@ -3218,7 +3218,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2633 passed, 0 failed** (2026-09-26, master after also merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`
