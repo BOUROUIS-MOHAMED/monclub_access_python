@@ -69,6 +69,24 @@ def _certifi_bundle() -> Any:
         return True
 
 
+def _cap_fact_times(payload: Dict[str, Any], sent_epoch: float) -> Dict[str, Any]:
+    """P2c-2: ``observedAt``/``wipedAt`` may not be later than this attempt's ``sentAt`` (400
+    otherwise). A time computed before a clock correction (a ``CLOCK_SKEW`` retry) can be; it
+    is capped here, per attempt, and the caller records what was sent (``last_body``)."""
+    def cap(value):
+        epoch = timefmt.to_epoch(value) if isinstance(value, str) else None
+        return timefmt.format_utc(sent_epoch) if epoch is not None and epoch > sent_epoch else value
+
+    out = dict(payload)
+    for key in ("observedAt", "wipedAt"):
+        if key in out:
+            out[key] = cap(out[key])
+    if isinstance(out.get("rows"), list):
+        out["rows"] = [dict(r, observedAt=cap(r.get("observedAt"))) if isinstance(r, dict) and "observedAt" in r
+                       else r for r in out["rows"]]
+    return out
+
+
 class V2Api:
     def __init__(
         self,
@@ -91,6 +109,7 @@ class V2Api:
         self._wall = getattr(self.clock, "_wall", time.time)
         self._mono = time.monotonic
         self._verify = _certifi_bundle()
+        self.last_body: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------ core
     def _headers(self, token: str, with_body: bool) -> Dict[str, str]:
@@ -128,7 +147,10 @@ class V2Api:
         if body is not None:
             payload = dict(body)
             if stamp_sent_at:
-                payload["sentAt"] = timefmt.format_utc(self.clock.now())
+                sent_at = self.clock.now()
+                payload["sentAt"] = timefmt.format_utc(sent_at)
+                payload = _cap_fact_times(payload, sent_at)
+        self.last_body = payload
         kw: Dict[str, Any] = {"headers": self._headers(token, payload is not None),
                               "timeout": float(timeout or self._timeout), "verify": self._verify}
         if params:
@@ -161,15 +183,16 @@ class V2Api:
             wait = err.retry_after if err.retry_after is not None else DEFAULT_RATE_LIMIT_BACKOFF_SEC
             self._backoff_until = self._mono() + max(1.0, float(wait))
         if backend and code == "CLOCK_SKEW":
-            self._sample((details or {}).get("serverTime"), sent, recv, source="clock_skew")
+            self._sample((details or {}).get("serverTime"), sent, recv, source="clock_skew",
+                         authoritative=True)
         raise err
 
-    def _sample(self, server_time, sent, recv, *, source: str) -> None:
+    def _sample(self, server_time, sent, recv, *, source: str, authoritative: bool = False) -> None:
         if not isinstance(server_time, str):
             return
         epoch = timefmt.to_epoch(server_time, default_offset_sec=self.clock.utc_offset)
         if epoch is not None:
-            self.clock.add_sample(epoch, sent, recv, source=source)
+            self.clock.add_sample(epoch, sent, recv, source=source, authoritative=authoritative)
 
     # ------------------------------------------------------------------ commands (P2b)
     def pending(self) -> Dict[str, Any]:

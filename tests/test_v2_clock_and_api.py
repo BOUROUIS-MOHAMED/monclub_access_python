@@ -287,3 +287,37 @@ def test_rest_server_times_feed_the_clock_when_the_gym_offset_is_known():
     api._wall = c.wall
     api.pending()
     assert clk.offset() == pytest.approx(5.0, abs=0.01)
+
+
+def test_a_clock_skew_refusal_outvotes_earlier_wrong_samples():
+    # Found in the end-to-end run: a PC that believed the server 15 min ahead got CLOCK_SKEW,
+    # but the median of [900, 0] is 450 s -- still refused on the retry.
+    c = _Clocks(wall=1790413200.0)
+    clk = ServerClock(wall=c.wall, mono=c.mono)
+    clk.set_utc_offset(3600)
+    clk.add_sample(c.wall_v + 900.0, c.wall_v, c.wall_v, source="wrong")
+    skew = {"status": False, "code": "CLOCK_SKEW",
+            "details": {"serverTime": "2026-09-26T10:00:00", "skewSeconds": -900}}
+    api, s = _api([_Resp(409, skew), _Resp(200, {"stored": 1})], clock=clk)
+    api._wall = c.wall
+    assert api.turnstile_problems({"gymDeviceId": 8, "pinScheme": "MEMBERSHIP", "problems": []}) == {"stored": 1}
+    assert clk.offset() == pytest.approx(0.0, abs=1.0)
+    assert timefmt.to_epoch(s.calls[1][2]["json"]["sentAt"]) == pytest.approx(c.wall_v, abs=1.0)
+
+
+def test_fact_times_are_capped_at_the_sent_at_of_each_attempt():
+    # Found in the end-to-end run: after a CLOCK_SKEW correction the body's observedAt (computed
+    # with the old estimate) was later than the new sentAt -> 400 OBSERVED_AT_INVALID.
+    c = _Clocks(wall=1790413200.0)
+    clk = ServerClock(wall=c.wall, mono=c.mono)
+    clk.set_utc_offset(3600)
+    clk.add_sample(c.wall_v + 900.0, c.wall_v, c.wall_v, source="wrong")
+    early = timefmt.format_utc(clk.now())
+    skew = {"status": False, "code": "CLOCK_SKEW", "details": {"serverTime": "2026-09-26T10:00:00"}}
+    api, s = _api([_Resp(409, skew), _Resp(200, {"stored": 1})], clock=clk)
+    api._wall = c.wall
+    api.ownership_upload({"gymDeviceId": 8, "pinScheme": "MEMBERSHIP", "generation": 1, "finalPage": False,
+                          "rows": [{"pin": "1", "state": "APPLIED", "observedAt": early}]})
+    second = s.calls[1][2]["json"]
+    assert timefmt.to_epoch(second["rows"][0]["observedAt"]) <= timefmt.to_epoch(second["sentAt"])
+    assert api.last_body["rows"][0]["observedAt"] == second["rows"][0]["observedAt"]

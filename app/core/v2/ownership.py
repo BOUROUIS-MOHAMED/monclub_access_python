@@ -255,7 +255,14 @@ class OwnershipSync:
             for k in ("stored", "ignoredNotNewer", "ignoredOutdated"):
                 summary[k] += int(ans.get(k) or 0)
             summary["releaseRecorded"] = summary["releaseRecorded"] or bool(ans.get("releaseRecorded"))
-            self._record_uploaded(did, scheme, generation, page, epochs)
+            # Record the times as SENT (capped at that attempt's sentAt) -- the server's rule:
+            # a capped time is written back, or each re-send would look newer.
+            sent_rows = (getattr(self.api, "last_body", None) or {}).get("rows") or page
+            for r in sent_rows:
+                t = timefmt.to_epoch(r.get("observedAt")) if isinstance(r, dict) else None
+                if t is not None and r.get("pin") in epochs:
+                    epochs[r["pin"]] = t
+            self._record_uploaded(did, scheme, generation, sent_rows, epochs)
         return summary
 
     # ------------------------------------------------------------------ restore

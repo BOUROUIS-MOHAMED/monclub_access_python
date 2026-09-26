@@ -12,6 +12,8 @@ report it in the heartbeat.
 * ``now()`` = PC time + offset, and never lower than the last value it returned in this
   process: when the estimate moves back (a better sample, or the PC clock stepped back), the
   corrected time keeps advancing at ``SLEW_RATE`` of real time until the estimate catches up.
+  One exception: a 409 ``CLOCK_SKEW`` (the server refused a time more than 5 min off) resets
+  the estimate and the floor -- see ``add_sample(authoritative=True)``.
   Nothing is persisted as a time floor: a floor carried over from a run with a fast clock would
   keep ``sentAt`` ahead of the server after a restart.
 * The offset itself is persisted, and reused after a restart only while younger than
@@ -68,7 +70,15 @@ class ServerClock:
                 self._persisted_offset = None
 
     # ------------------------------------------------------------------ samples
-    def add_sample(self, server_epoch: float, sent_wall: float, recv_wall: float, *, source: str) -> bool:
+    def add_sample(self, server_epoch: float, sent_wall: float, recv_wall: float, *, source: str,
+                   authoritative: bool = False) -> bool:
+        """``authoritative``: the server just refused this PC's time (409 ``CLOCK_SKEW``), so the
+        earlier samples are known wrong: the window restarts from this one (without it, one good
+        sample never outvotes a wrong one -- the median of two is their mean), and the
+        never-backwards floor is dropped. That is the ONE case where the corrected time may step
+        back: the server refused every write stamped with the wrong estimate (more than 5 min
+        off), so nothing it stored can be out of order; keeping the floor would keep every
+        ``sentAt`` refused until real time caught up (found in the end-to-end run)."""
         try:
             server_epoch, sent_wall, recv_wall = float(server_epoch), float(sent_wall), float(recv_wall)
         except (TypeError, ValueError):
@@ -80,6 +90,10 @@ class ServerClock:
         if abs(offset) > _SANE_OFFSET_SEC:
             return False
         with self._lock:
+            if authoritative:
+                self._samples = []
+                self._persisted_offset = None
+                self._last_issued = None
             self._samples.append(offset)
             del self._samples[:-WINDOW]
             self._source = str(source)
