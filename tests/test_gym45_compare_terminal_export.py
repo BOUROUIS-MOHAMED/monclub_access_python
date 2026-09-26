@@ -744,7 +744,10 @@ class TestPanelCards:
         db, ex = gym
         report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
         assert report["card_self_check"]["compared"] == 0
-        assert "NOT MEASURED" in cte.render(report)
+        text = cte.render(report)
+        assert "NOT MEASURED" in text
+        # the copy records ownership: the line names the wrong-PC cause too
+        assert "that this access.db copy owns" in text and "a copy of the PC that drives this device" in text
 
     def test_an_mb2000_keeps_a_card_above_the_4_byte_range(self, tmp_path):
         """The MB2000 is sent firstCardId's digits raw: 105's 11-digit card is on the terminal as

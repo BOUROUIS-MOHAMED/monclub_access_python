@@ -1031,8 +1031,10 @@ def render(report: Dict[str, Any]) -> str:
         cc = report.get("card_self_check", {})
         rate, thr = cc.get("rate"), cc.get("threshold", CARD_TRUST_THRESHOLD)
         if rate is None:
+            owned = " that this access.db copy owns" if report.get("ownership_known") else ""
             verdict = (f"NOT MEASURED (no {report['scheme_assumed_on_terminal']} member pin on the device with a card "
-                       "MonClub sends: read the cards from the run whose --scheme is the one the device holds) "
+                       f"MonClub sends{owned}: check that --scheme is the one the device holds, and that "
+                       "--access-db is a copy of the PC that drives this device) "
                        "-- the cards list is unchecked: do not act on it")
         elif rate >= thr:
             verdict = f"at or above {thr:.0%} -- the cards list can be used"
