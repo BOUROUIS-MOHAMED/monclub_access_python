@@ -5,7 +5,9 @@ erased or reconfigured, and no database was changed while writing it. Written 20
 Access `master` `22c9cfc`, backend `main` `c7d4b532`, dashboard `main` `75025186`. Branch
 `claude/cutover-night-runbook` (merged into `master` at `dbf865f`); second round 2026-09-26 on
 `claude/cutover-runbook-round2` (the review findings: pre-install before the erase, the card
-self-check, the firewall block, the restart proof). The owner-facing steps are in
+self-check, the firewall block, the restart proof); third round 2026-09-26 on `master` `aeeef69`
+(P3b-2 merged: §3.3, G8, E3 and E7 re-read against driver PCs -- the night runs without drivers,
+runbook part H). The owner-facing steps are in
 [`2026-09-26_cutover_night_runbook.md`](2026-09-26_cutover_night_runbook.md); this file is the evidence.
 
 It follows the gym 45 plan ([`2026-09-19_gym45_cutover_plan.md`](2026-09-19_gym45_cutover_plan.md)) and
@@ -146,7 +148,9 @@ un nouveau PC"**, a name) and heartbeat once before the switch. The dashboard's 
 must not run Access afterwards (it never registered, so the gate cannot see it -- memory note of
 2026-09-19: "`gym_access_pc` is not a census of the fleet"). Switching it off is not enough -- staff
 switch reception PCs on (gym 45 plan section 3.3) -- and a revoke could not stop it even if it were
-registered: an old Access syncs with the gym login (runbook D12). So it carries the firewall block of
+registered: an old Access syncs with the gym login (runbook D12) -- and a new Access drives on after a
+revoke too, while gym 58 has no driver set (`app/core/v2/leases.py::LeaseManager._drop_leases`; runbook
+part H) `[CODE]`. So it carries the firewall block of
 the runbook's C1b (the gym 45 plan section 5.2 rules with gym 58's IPs, proven with this plan's export
 before and after) or is unplugged from the network. **The same holds for a PC pre-installed on the new
 Access that is not started on the night**: started later with a first sync that fails at boot, it works
@@ -237,7 +241,7 @@ C3-400; the export records its own timings.
 | G5. Erase panel 5, then panel 6 (E1 tool) | the tool's AFTER counts `user=0`, `userauthorize=0`, `templatev10=0` | re-run; still not empty → that panel stays on MEMBERSHIP (R8 below) |
 | G6. Verify empty: a new export -- `complete: true`, `errors` empty, `counts.user`, `counts.userauthorize`, `counts.templatev10` each exactly 0 (`null` is not 0), `summary.users` 0 -- and a member's card at that door refused | both | back to G5; a `null` count: the panel is not proven empty, call the developer |
 | G7. Interlock: panel network cables out (they keep power) | the export from the PC now ends with `CONNECT FAILED` **with the G2 reference `PullLastError`** | another code: something else refused the connection (another PC holding the panel? whether a C3-400 allows two clients is `[UNVERIFIED]`): find it first |
-| G8. No install after the erase (§3.4). Start the new Access on each PC (registered at runbook A7) | /access-pcs lists each PC with the new version | a start-up that stops: `%TEMP%\MonClubAccess.log`, call the developer; the rollback is the runbook's F row "does not start -- after the erase" |
+| G8. No install after the erase (§3.4). Start the new Access on each PC (registered at runbook A7) | /access-pcs lists each PC with the new version; a minute or more after the start, each PC's « Pilote / Lecteur » page reads « Inconnu » or « Tous les tourniquets (sans affectation) » -- no driver set at gym 58 (runbook part H4; anything else: runbook C10's STOP) | a start-up that stops: `%TEMP%\MonClubAccess.log`, call the developer; the rollback is the runbook's F row "does not start -- after the erase" |
 | G9. Dashboard: the verdict sentence "Tous les PC enregistrés…" (shown only on the add-device form, `gym-devices-view.tsx`; on an existing device a refusal shows as a red message and the confirm dialog names the minimum version); device 5 then 6: "Par personne", tick both boxes, save; reopen each | each reads "Par personne" | refused (409): read `blockingPcs`, revoke retired PCs in /access-pcs |
 | G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected. **Then Quit and restart Access on every running PC** and wait for `getSyncData OK`: a switch that reached a PC through a dashboard fast patch (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) is recorded and logged, but the running ULTRA workers keep their MEMBERSHIP device copy until a server sync refreshes them (`app.py` sync tick → `refresh_devices`), and the full pass pushes from that copy (`ultra_engine._drain_full_sync_commands`, `self._device`) `[CODE, review 2026-09-26]`. The restart is proven three ways (runbook C13's box): no `MonClubAccess.exe` after the Quit; a new `App started. pid=... version=X.Y.Z` line later than the switch lines; `getSyncData OK` after it -- the log file is cut by hour, not by process (`app/core/logger.py`), so "the new log" alone proves nothing | the lines, then the three restart checks | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer. A restart check fails → do NOT plug in |
 | G11. Plug the panel cables back only when every PC that is switched on has shown G10 and its proven restart; every other PC stays blocked or unplugged (G0, §3.3) -- the cable is the panel's, so it releases every PC that can reach it | -- | -- |
@@ -266,7 +270,8 @@ cannot open it; the opening fallback is the turnstile arm dropped by hand, with 
 - **E1 -- the erase tool** (§3.1). Without one, gym 58 cannot be done: then decide explicitly that gym 58
   waits and the night is gym 45 only.
 - **E2 -- the QR rescue flag** (§1): which value is right, and who checks it before the night.
-- **E3 -- which PCs gym 58 has**, which one drives the panels, and whether the others come back
+- **E3 -- which PCs gym 58 has**, which one drives the panels (runs Access on the night -- not a driver
+  set in the dashboard: the night runs without drivers, runbook part H), and whether the others come back
   (gym 45 plan D2). Each one that runs must be upgraded and registered, or never started again.
 - **E4 -- the card list** from G3: accept that those members are refused by card until their card is
   entered in MonClub (QR still works for all 1,690), or fix MonClub before the night.
@@ -277,7 +282,8 @@ cannot open it; the opening fallback is the turnstile arm dropped by hand, with 
   owner (runbook A6).
 - **E7 -- when the new Access is pre-installed** (§3.4, runbook A7): the survey evening (then it runs
   days on MEMBERSHIP) or the night, after the export. And, before it, the state of protocol 2 and of
-  the panels' QR roster check (runbook A7, point 5).
+  the panels' QR roster check (runbook A7, point 5), and of the server's commands switch -- unchanged
+  from A7 until the night is verified, with no driver set at gym 58 (runbook A7 point 7, part H).
 - **E8 -- the turnstile arm** (§5 half-states): how it is dropped at doors 1 and 2, who can do it, and
   whether the gym opens with the arms dropped if the refill is not proven.
 
