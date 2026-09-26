@@ -334,3 +334,23 @@ def test_after_a_midnight_promotion_and_hold_nothing_is_missing_and_nothing_move
     assert quiet.app._pending_sync_context is None
     assert _tel_calls(fake_tel, "warn", "MEMBERS_MISSING") == []
     assert (_local_ids(), set(dbmod.list_local_member_ids())) == before == ({3, 5}, {1, 3, 5})
+
+
+# ================================================================== review round 1
+def test_r1_a_probe_request_another_sync_replaced_is_asked_again(quiet) -> None:
+    """R1-F4: the probe was marked as asked when it was REQUESTED; an automatic request landing
+    before it ran (the change detector writes the pending context itself) replaced it, and the
+    digest was never re-checked for that token. Marked now only when a sync carried it."""
+    from app.core.sync_observability import SyncTriggerContext
+
+    token = "3:2026-09-26T10:00:00:0:0:0:0:" + member_id_set_digest([5, 6, 7])
+    api = _Api([_v1_full([_row(5), _row(6)], token), _v1_skipped(token), _v1_skipped(token)],
+               quiet.events)
+    _sync(quiet, api)
+    _sync(quiet, api)
+    assert quiet.app._pending_sync_context.trigger_hint.get("probeMemberSet") is True
+    quiet.app._pending_sync_context = SyncTriggerContext(run_type="TRIGGERED",
+                                                         trigger_source="CHANGE_DETECTOR")
+    _sync(quiet, api)                                 # ran without the probe; still mismatched
+    ctx = quiet.app._pending_sync_context
+    assert ctx is not None and ctx.trigger_hint.get("probeMemberSet") is True

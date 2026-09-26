@@ -8736,10 +8736,15 @@ class UltraEngine:
         def _adm(d):
             return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
 
-        ultra_devices = _lease_gate.filter_devices([d for d in (devices or []) if _adm(d) == "ULTRA"])
+        ultra_all = [d for d in (devices or []) if _adm(d) == "ULTRA"]
+        # The scheduler's list follows the lease (a turnstile this PC does not drive is never
+        # pushed); a worker's device COPY does not: it is data, and a worker left with an old
+        # copy while its lease was away would have every later pass stopped by the pinScheme
+        # guard once the lease came back (review R1-F5, guide §3.2e). Writes stay lease-gated.
+        ultra_devices = _lease_gate.filter_devices(ultra_all)
 
         refreshed = 0
-        for d in ultra_devices:
+        for d in ultra_all:
             try:
                 device_id = int(d.get("id", 0))
             except (TypeError, ValueError):

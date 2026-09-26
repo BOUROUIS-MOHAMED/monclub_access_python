@@ -1564,36 +1564,47 @@ the same gap: it saved the device section, then refreshed the workers only near 
 after the DeviceSync run, the fingerprint report and the attendance upload. `[TEST: red on aeeef69]`
 Now `[CODE]`:
 - **The copies follow the database first.** `MainApp._refresh_running_ultra_devices` (under
-  `_ultra_lock`, only while the engine runs) hands the workers
-  `ultra_devices_for_this_pc(db.list_sync_devices_payload())` through `UltraEngine.refresh_devices`.
+  `_ultra_lock`, only while the engine runs) hands `UltraEngine.refresh_devices` the ULTRA rows of
+  `db.list_sync_devices_payload()` that already have a worker. `refresh_devices` updates those workers'
+  copies whatever their lease state, and gives the ULTRA scheduler only the lease-filtered list (review
+  R1-F5: a copy left stale while a lease was away made the guard below stop every pass once it came
+  back). Devices without a worker are left out on purpose: `refresh_devices` also replaces the
+  scheduler's list, and the scheduler pushes a device with no worker over its own session (R1-F2); a
+  device added or switched to ULTRA gets its worker when the next tick restarts the engine, as before.
   `apply_fast_patch_bundle` calls it when any item of the bundle is `GYM_DEVICE` or carries
-  `requiresDeviceRescope` — applied or not, the database is the truth — before either dispatch
-  branch; the sync tick calls it right after each `save_sync_cache_delta` and its date flip whenever
-  `refresh["devices"]` (the refresh near the end of the tick stays). A failed refresh is logged,
-  schedules the full reconcile, and still dispatches: the guard below refuses the old scheme's pins,
-  and the bundle's revocations are not held back.
+  `requiresDeviceRescope` — applied or not, the database is the truth — right after the database apply
+  and before its date flip (which may queue a pass itself, R1-F6) and both dispatch branches; the sync
+  tick calls it right after each `save_sync_cache_delta` whenever `refresh["devices"]`, before that
+  save's date flip (the refresh near the end of the tick stays). A failed refresh is logged, schedules
+  the full reconcile, and still dispatches: the guard below refuses the old scheme's pins, and the
+  bundle's revocations are not held back.
 - **Every push pass re-checks the recorded scheme.** `device_sync.pin_scheme_superseded` compares the
   scheme a pass derived its pins under with `sync_devices.pin_scheme` (`db.get_device_pin_scheme`, one
   primary-key read). MB2000: the full sync at its start (the device copy — nothing removed, nothing
   pushed), before the push (`_push_with_chunk_recording`, the roster's own scheme) and between chunks
   (`_standalone_push_yield`); the targeted member push; the ACCOUNT revoke re-push. PullSDK: the ULTRA
   worker's pass at its start, `DeviceSyncEngine._sync_one_device` at its start (before any session)
-  and again before its user batch (`PinSchemeSwitchedError`, so every caller reads a failed pass,
-  never an in-sync panel), and `sync_member_on_connected_sdk` (`DEFERRED`). A stop sends nothing,
-  writes no state and stamps no roster hash; its revocations stay pending; `[T] PIN_SCHEME_PASS_STOPPED`.
-  The next pass is the one the app queues after the refresh.
+  and again after its panel read, before the removal steps (the stale delete, a `FULL_REPLACE` clear —
+  R1-F3), and before its user batch (`PinSchemeSwitchedError`, so every caller reads a failed pass,
+  never an in-sync panel), and `sync_member_on_connected_sdk` (`DEFERRED`). A stop at a pass's start
+  sends nothing; a later stop sends nothing more — what that pass already did under the scheme that was
+  current when it did it stays done. No stop stamps a roster hash; its revocations stay pending;
+  `[T] PIN_SCHEME_PASS_STOPPED`. The next pass is the one the app queues after the refresh.
 - **What is left.** On the MB2000 the chunk already in flight when the switch lands (at most
-  `_PUSH_CHUNK_MEMBERS` = 10 members, handed over before the switch existed); on PullSDK a user batch
-  already started (no abort inside it). A targeted revoke drained between the save and the refresh
+  `_PUSH_CHUNK_MEMBERS` = 10 members, handed over before the switch existed); on PullSDK a removal step
+  or a user batch already started (no abort inside either). A targeted revoke drained between the save and the refresh
   names its pin under the previous scheme — what an unwiped terminal holds. A device row that cannot be
   read is not re-checked (logged): a broken database already stops every write at its write-ahead
   intent (§3.4a). `[CODE]`
 `[TEST: test_pin_scheme_worker_refresh.py — the real fast patch on a temp database driving a real
 worker over a fake MB2000 (pin 5 is Alice's membership and Bob's account), a pass queued while the link
 was down, a switch mid-push and before the push, a pass drained before the refresh, the four PullSDK
-sites, the tick order, the refresh helper; 13 of its 15 tests fail on aeeef69 (the other two are
-controls) — two of the panel ones only at the import of `PinSchemeSwitchedError`, where a scratch probe
-showed aeeef69 writing the MEMBERSHIP pins 5 and 6, and the three helper ones because the helper is new;
+sites, the tick order, the refresh helper, and the review-round-1 cases (no device without a worker for
+the scheduler, a copy refreshed while the lease is away, the refresh before the flip, no removal after a
+switch during a panel read); 16 of its 19 tests fail on aeeef69 (two controls pass, and the no-worker
+case, which guards this change itself) — two of the panel ones only at the import of
+`PinSchemeSwitchedError`, where a scratch probe showed aeeef69 writing the MEMBERSHIP pins 5 and 6, and
+the three helper ones because the helper is new;
 test_fast_patch_runtime.py::test_apply_fast_patch_bundle_requests_device_rescope_sync pins the order
 refresh → dispatch]`
 The cutover procedures still restart Access after the switch, before a terminal is reconnected
@@ -2690,6 +2701,18 @@ Now `[CODE]`:
   does, as before). No fleet device is DEVICE-mode (§3.2g). ULTRA workers are asked for nothing by a
   tick that refreshed nothing (unchanged). `TIMER` is not in `_should_defer_ultra_reconnects`, so a
   safety tick defers no reconnect.
+- **No success sound on a safety tick** (review R1-F1): `_maybe_emit_sync_success_feedback` publishes no
+  `sync_completed_success` for a `TIMER` sync in safety mode — the desk's sound and confetti
+  (`tauri-ui` `AccessFeedbackProvider`, both on by default) would otherwise play up to every ~2 min.
+  Every other successful sync, and every `TIMER` sync outside safety mode, still plays them. Each tick
+  still writes its `sync_run_history` row (kept 30 days, `prune_sync_run_history`): up to ~560 a day
+  with the socket down all day (37.5/h over a ~15 h day), ~110 with it up, against ~30 today; the row
+  size is not measured `[UNVERIFIED]`.
+- **A lost notice now waits for the safety sync** (review R1-F8): with the probe off, a change whose
+  notice never arrives is picked up by the next safety sync — within `reconcileSec` (600 s) while the
+  socket is up, 120 s while it is down — where the 45 s probe caught one within ~45 s. The backend's
+  `AccessNoticeCoalescer` javadoc speaks of a "120 s safety poll"; its `syncMeta.reconcileSec` default
+  (600, `GymAccessController`) is what this PC follows. `[CODE: backend main 919231a8, read not run]`
 - **Power-on and offline**: the runtime starts 12 s after launch in `UNKNOWN` (§3.9a), so a PC boots on
   today's cadence and the probe runs until the server answers `ON`; offline the syncs fail and the
   failure schedule decides, as before (`UNREACHABLE` keeps `ON`, which only matters once a sync
@@ -2739,10 +2762,12 @@ whose socket drops goes from ~45 s change detection to ≤ 120 s, not to 30 min.
   `manual_sync_mode` — and does not mark the day as run, so if the safety sync stops later that evening
   the job still fires. In a manual-sync gym it stays: it is that gym's only automatic push of the day
   (a safety sync is a `TIMER` sync, which manual mode never pushes). What an auto-sync gym gives up with
-  it: one explicit `full_reconcile` pass a day (the roster-hash skip bypassed, MIRROR's reconcile — no
-  gym runs MIRROR, §3.2c) and `report_daily_sync`. The dashboard shows a banner only on a report with
-  `lastDailySyncOk === false`, so no report shows none; a failure reported before the gate stays shown
-  until a later report. `[CODE: dashboard layouts/dashboard/layout.tsx::refreshPendingSync; backend
+  it (review R1-F7): `report_daily_sync`, and — only on a day whose 22:00 answer carried a members or
+  devices section, since `_request_running_ultra_sync` returns early without one — one explicit
+  `full_reconcile` pass (the roster-hash skip bypassed, MIRROR's reconcile — no gym runs MIRROR, §3.2c).
+  The dashboard shows a banner only on a report with `lastDailySyncOk === false`, so no report shows
+  none; a failure reported before the gate stays shown until someone dismisses it. Offline in safety
+  mode (`UNREACHABLE` keeps `ON`) the job is skipped as well — its sync would have failed anyway. `[CODE: dashboard layouts/dashboard/layout.tsx::refreshPendingSync; backend
   GymAccessController.reportGymAccessDailySync]` `[TEST: test_v2_safety_sync.py — the daily-job tests]`
 - An old server, a switch off, a PC not yet `ON` (power-on) or offline from start: both run as before.
 
@@ -2773,7 +2798,9 @@ date flip and the tokens), `MainApp._check_missing_members` compares the server'
   digest cannot tell a missing member from an extra row, so a mismatch asks ONE delta answer per token value
   (`probeMemberSet`: `membersVersion` dropped, `membersUpdatedAfter` kept — the backend then serves a delta
   whose `validMemberIds` is exactly the list its digest hashes `[CODE: backend main GymAccessController,
-  read not run]`), and the first rule decides on it.
+  read not run]`), and the first rule decides on it. The probe counts as asked for that token only
+  once a sync that CARRIED it has completed (review R1-F4): a pending request can be replaced by a later
+  automatic one before it runs.
 A missing member → `request_sync_now(trigger_source="MISSING_MEMBERS", trigger_hint={forceMemberRefresh})`,
 posted to the loop; `sync_scope.apply_trigger_hint_to_version_tokens` drops both member tokens for it, so the
 next `getSyncData` serves the full list. `[T] MEMBERS_MISSING source action count sample`. `[CODE]`
@@ -2782,7 +2809,11 @@ the ordinary full member refresh (hard reset and the self-heal use the same one)
 refusal, its per-row diff and the previous-day guards of §3.8; the probe is an ordinary delta. What either
 removes, the next member change would have removed through the same authority — only sooner. It is
 automatic, so in manual sync mode the refreshed members reach the turnstiles with the admin's next "Sync data",
-as every automatic sync. `[TEST: test_missing_member_check.py — the digest vectors, the token parsing, both
+as every automatic sync. Side effects accepted (review R1-F9/F10): the local API already accepted
+`forceMemberRefresh` in a `POST /api/v2/sync/now` body (`local_access_api_v2.py::_sync_trigger_hint_from_body`
+lists it) and nothing read it; it now forces a full member refresh — nothing in the Tauri UI, the dashboard
+or the backend sends it (grep, 2026-09-27); `probeMemberSet` is not accepted there. And a fast-patch delete
+landing between the check's two reads can cost one needless full refresh. `[TEST: test_missing_member_check.py — the digest vectors, the token parsing, both
 hints, the decision and its suppression, and on the §3.6 harness with a real temp database: a delta naming a
 member the PC lacks, a held member, a matching and a disagreeing digest, the probe once per token, the
 protocol-2 windows, a promoted starter and a held member after a midnight flip (nothing asked, nothing moved),
@@ -4073,7 +4104,7 @@ test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identi
 | `REMOVAL_CONFIRMED` (warn) | `push_safety.py::check_bulk_removal` | `worker device_id protocol path count roster ceiling` — an above-ceiling step let through once by a Confirm-removal approval for exactly that pin set (§3.2g) |
 | `MIRROR_SKIP_REMOVALS_DEFERRED` | `ultra_engine.py::_maybe_mirror_reconcile` | `worker` — MIRROR skipped on an add-only / handed-over turnstile |
 | `MEMBERS_MISSING` (warn) | `app.py::_report_missing_members` | `source action count sample` — members the server lists and this PC lacks (§3.6 "The missing-member check", lane B 2026-09-26). `source` ∈ `delta`, `full`, `windows`, `digest`; `action` ∈ `full_refresh` (a full member refresh asked), `probe` (a digest mismatch: one delta answer asked; `count`/`sample` empty), `suppressed` (a full answer's rows this PC could not store — reported once, never refreshed again); `sample` = up to 20 membership ids |
-| `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=`), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). `path` ∈ `full_sync` (pass start), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000) / `sync`, `batch`, `member_sync` (PullSDK). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
+| `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=`), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). `path` ∈ `full_sync` (pass start), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000) / `sync`, `removal`, `batch`, `member_sync` (PullSDK). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
 
 The v2 runtime logs on `zkapp.v2*` loggers with a `[V2]` prefix (roles changed, availability, commands,
 releases, restores, read-backs, loss checks); none is a `[T]` event.

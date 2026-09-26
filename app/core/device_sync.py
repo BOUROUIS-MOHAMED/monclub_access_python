@@ -3432,6 +3432,11 @@ class DeviceSyncEngine:
                 door_bitmask,
             )
 
+            # guide §3.2e: re-checked before the removal steps too (review R1-F3) -- the stale
+            # set and a FULL_REPLACE clear below were computed from this pass's device copy, and
+            # a switch recorded during the panel read above makes them old-scheme decisions.
+            self._raise_if_pin_scheme_switched(device, where="removal")
+
             # ── P1: Policy-driven removal decisions (P3a-2: ONE ceiling, no automatic wipe) ──
             # FULL_REPLACE  → clear all tables, but only when the rows on the panel fit
             #                 under the shared removal ceiling: a clear deletes EVERY row,

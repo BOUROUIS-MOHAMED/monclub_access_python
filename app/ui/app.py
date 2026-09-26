@@ -1162,7 +1162,21 @@ class MainApp:
             try:
                 from app.core.db import list_sync_devices_payload
 
-                devices = ultra_devices_for_this_pc(list_sync_devices_payload())
+                # Only devices that already have a worker: refresh_devices also replaces the
+                # scheduler's device list, and the scheduler pushes a device WITHOUT a worker over
+                # its own session (review R1-F2). A device added or switched to ULTRA gets its
+                # worker when the next sync tick restarts the engine, as before. Not filtered by
+                # the lease here: refresh_devices applies it to the scheduler list only (R1-F5).
+                workers = {int(i) for i in (getattr(engine, "_workers", None) or {})}
+                devices = []
+                for d in list_sync_devices_payload():
+                    if not isinstance(d, dict) or str(d.get("accessDataMode", "")).strip().upper() != "ULTRA":
+                        continue
+                    try:
+                        if int(d.get("id")) in workers:
+                            devices.append(d)
+                    except (TypeError, ValueError):
+                        continue
                 refreshed = int(engine.refresh_devices(devices) or 0)
             except Exception:
                 self.logger.warning(
@@ -1370,6 +1384,12 @@ class MainApp:
             return
         if str(final_status or "").strip().upper() != "SUCCESS":
             return
+        if (str(getattr(trigger_context, "trigger_source", "") or "").strip().upper() == "TIMER"
+                and self._v2_safety_sync() is not None):
+            # A v2 safety tick runs every 2-10 min (guide §3.6): the desk's success sound and
+            # confetti are for the syncs that were asked for, not for every background check
+            # (review R1-F1). Outside safety mode the 30-min timer sync still plays them.
+            return
         self.publish_feedback_event(
             "sync_completed_success",
             {
@@ -1538,8 +1558,8 @@ class MainApp:
                     if getattr(self, "_daily_sync_gated_logged", None) != today:
                         self._daily_sync_gated_logged = today
                         self.logger.info(
-                            "[DailySync] Not fired today: the v2 safety sync reconciles every "
-                            "few minutes instead (guide §3.6)"
+                            "[DailySync] Not fired today: v2 safety mode is on (the safety sync "
+                            "replaces it; guide §3.6)"
                         )
                     return
                 self._daily_sync_last_run_date = today
@@ -1975,6 +1995,29 @@ class MainApp:
         if db_result.get("ignored") == "duplicate_bundle":
             return {"ok": True, "duplicate": True, **db_result}
 
+        # A device item -- a pinScheme switch among them -- reaches the running workers BEFORE
+        # anything queues a pass on their device copies: the date flip below may queue one
+        # itself (review R1-F6), the dispatch further down does (release checklist §3a, guide
+        # §3.2e). Every item the bundle carries counts, applied or not: the database is the
+        # truth either way and re-reading it is idempotent. A failed refresh still dispatches:
+        # the passes refuse pins of a scheme the database no longer records, and the full
+        # reconcile scheduled below refreshes the copies.
+        worker_refresh_failed = False
+        try:
+            if any(
+                isinstance(item, dict) and (
+                    str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
+                    or (isinstance(item.get("impact"), dict)
+                        and bool(item["impact"].get("requiresDeviceRescope")))
+                )
+                for item in list((bundle or {}).get("items") or [])
+            ):
+                worker_refresh_failed = not self._refresh_running_ultra_devices(
+                    reason="FAST_PATCH_BUNDLE")
+        except Exception:
+            self.logger.warning("[FastPatch] worker device refresh failed", exc_info=True)
+            worker_refresh_failed = True
+
         # P3b-1: an upsert can put a held membership back on sync_users (e.g. on its freeze
         # day); the flip re-applies the gym date before anything is dispatched.
         self._apply_date_flips("fast-patch")
@@ -2012,20 +2055,8 @@ class MainApp:
                 for item_index, item in enumerate(raw_items)
                 if isinstance(item, dict)
             }
-            # A device item -- a pinScheme switch among them -- reaches the running workers
-            # BEFORE anything below queues a pass on their device copies (release checklist
-            # §3a, guide §3.2e). Every item the bundle carries counts, applied or not: the
-            # database is the truth either way and re-reading it is idempotent. A failed
-            # refresh still dispatches: the passes refuse pins of a scheme the database no
-            # longer records, and the full reconcile refreshes the copies.
-            if any(
-                str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
-                or (isinstance(item.get("impact"), dict)
-                    and bool(item["impact"].get("requiresDeviceRescope")))
-                for item in indexed_items.values()
-            ):
-                if not self._refresh_running_ultra_devices(reason="FAST_PATCH_BUNDLE"):
-                    _schedule_full_reconcile("worker_device_refresh_failed")
+            if worker_refresh_failed:
+                _schedule_full_reconcile("worker_device_refresh_failed")
             raw_applied_count = db_result.get("applied")
             raw_skipped_count = db_result.get("skipped")
             counts_valid = (
@@ -3035,7 +3066,8 @@ class MainApp:
         return ("full_refresh", new) if new else (None, set())
 
     def _check_missing_members(self, *, data: Dict[str, Any], refresh: Dict[str, Any],
-                               outcome: Dict[str, Any], members_token: Any) -> None:
+                               outcome: Dict[str, Any], members_token: Any,
+                               trigger_hint: Any = None) -> None:
         """After a successful sync: is a member the server lists missing on this PC? (lane B)
 
         Compared with ``sync_users`` + ``sync_users_held`` (``db.list_local_member_ids``):
@@ -3046,13 +3078,17 @@ class MainApp:
           set of the day (replaced whole by each members section);
         * no members section, not trusted, a P1a token -- its id-set digest; a digest cannot tell a
           missing member from an extra row, so a mismatch asks ONE delta answer per token value
-          (``probeMemberSet``), whose validMemberIds then decide.
+          (``probeMemberSet``), whose validMemberIds then decide. The probe counts as asked only
+          once a sync that CARRIED it has completed: a pending request can be replaced by a
+          later automatic one before it runs (review R1-F4).
         A missing member asks an immediate FULL member refresh (``forceMemberRefresh``). This only
         reads; the refresh it asks for is the ordinary one, with its H-006 and previous-day guards.
         """
         try:
             from app.core.db import get_access_v2_state, list_local_member_ids, list_member_window_ids
 
+            if isinstance(trigger_hint, dict) and trigger_hint.get("probeMemberSet"):
+                self._member_set_probed_token = members_token
             if refresh.get("members"):
                 if outcome.get("members_delete_refused") or not outcome.get(
                         "authoritative_member_ids_valid", False):
@@ -3068,8 +3104,7 @@ class MainApp:
                 if digest is None or member_id_set_digest(list_local_member_ids()) == digest:
                     return
                 if getattr(self, "_member_set_probed_token", None) == members_token:
-                    return   # asked once for this token already
-                self._member_set_probed_token = members_token
+                    return   # a probe for this token already came back
                 self._report_missing_members(source="digest", action="probe", ids=None)
                 self._request_member_refresh({"reason": "member-set-probe", "probeMemberSet": True})
                 return
@@ -3370,17 +3405,18 @@ class MainApp:
                 _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
                 _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
                 _log_sync_cache_write_profile(self.logger, _cache_write_ms)
+                if refresh.get("devices"):
+                    # The running workers' device copies follow the saved rows now -- before the
+                    # date flip, which may queue a pass itself (review R1-F6), and not at the end
+                    # of this tick (after the attendance upload): a pass drained in between would
+                    # build from the old copy (guide §3.2e).
+                    self._refresh_running_ultra_devices(reason="sync-save")
                 # P3b-1: the save may have changed the windows, their trust or the rows; apply
                 # the gym date to what it stored before anything below reads or pushes it.
                 self._apply_date_flips("save")
                 from app.core.db import invalidate_sync_cache, refresh_sync_cache_async
                 invalidate_sync_cache()
                 refresh_sync_cache_async()
-                if refresh.get("devices"):
-                    # The running workers' device copies follow the saved rows now, not at the
-                    # end of this tick (after the attendance upload): a pass drained in between
-                    # would build from the old copy (guide §3.2e).
-                    self._refresh_running_ultra_devices(reason="sync-save")
 
                 if (
                     refresh.get("devices")
@@ -3409,11 +3445,11 @@ class MainApp:
                             duration_sec=20.0,
                         )
                         _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
+                        if refresh.get("devices"):
+                            self._refresh_running_ultra_devices(reason="sync-save")
                         self._apply_date_flips("save")
                         invalidate_sync_cache()
                         refresh_sync_cache_async()
-                        if refresh.get("devices"):
-                            self._refresh_running_ultra_devices(reason="sync-save")
                         if not refresh.get("members"):
                             clear_version_tokens()
                             new_tokens = {}
@@ -3514,6 +3550,7 @@ class MainApp:
                     data=data, refresh=refresh, outcome=_cache_write_outcome,
                     members_token=(new_tokens or {}).get("membersVersion")
                     or (stored_version_tokens or {}).get("membersVersion"),
+                    trigger_hint=trigger_context.trigger_hint,
                 )
 
                 sync_response_summary = build_sync_response_summary(

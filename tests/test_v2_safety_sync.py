@@ -428,3 +428,32 @@ def test_a_manual_sync_gym_keeps_its_daily_push_in_safety_mode(monkeypatch) -> N
     app = _daily_app(monkeypatch, safety=dict(UP), manual=True)
     app._daily_sync_check()
     app.request_sync_now.assert_called_once()
+
+
+# ================================================================== review round 1
+from app.core.sync_observability import SyncTriggerContext  # noqa: E402
+
+
+def _feedback_app(safety):
+    import app.ui.app as app_module
+
+    app = object.__new__(app_module.MainApp)
+    app.logger = MagicMock()
+    app.publish_feedback_event = MagicMock()
+    app._v2_safety_sync = lambda: safety
+    return app
+
+
+@pytest.mark.parametrize(("safety", "source", "played"), [
+    (None, "TIMER", True),                 # today: the 30-min timer sync plays it
+    (dict(DOWN), "TIMER", False),          # a safety tick every ~2 min must not
+    (dict(UP), "TIMER", False),
+    (dict(UP), "SYNC_NOW_API", True),      # a sync someone asked for still does
+    (dict(UP), "REALTIME_NOTICE", True),   # P3b-2's notice syncs: unchanged
+])
+def test_r1_the_success_sound_is_not_played_on_every_safety_tick(safety, source, played) -> None:
+    app = _feedback_app(safety)
+    app._maybe_emit_sync_success_feedback(
+        sync_run_id=7, final_status="SUCCESS",
+        trigger_context=SyncTriggerContext(run_type="PERIODIC", trigger_source=source))
+    assert app.publish_feedback_event.called is played

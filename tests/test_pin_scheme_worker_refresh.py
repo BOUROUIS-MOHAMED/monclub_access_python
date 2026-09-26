@@ -411,7 +411,8 @@ def test_a_sync_that_saved_a_device_section_refreshes_the_workers_before_anythin
 
     _run_worker(wired)
 
-    assert ev[:4] == [("fetch",), ("save",), ("flip", "save"), ("refresh", "sync-save")], ev
+    # refreshed before the flip too (R1-F6): a flip that moves rows queues a pass itself
+    assert ev[:4] == [("fetch",), ("save",), ("refresh", "sync-save"), ("flip", "save")], ev
     assert ev.index(("refresh", "sync-save")) < ev.index(("attendance",))
 
 
@@ -484,3 +485,73 @@ def test_the_refresh_reports_an_unreadable_device_table(monkeypatch):
 
     assert app._refresh_running_ultra_devices(reason="test") is False
     app._ultra_engine.refresh_devices.assert_not_called()
+
+
+# ================================================================== review round 1
+def test_r1_the_refresh_gives_the_scheduler_no_device_without_a_worker(world):
+    """R1-F2: refresh_devices also replaces the ULTRA scheduler's device list, and the scheduler
+    pushes a device WITHOUT a worker over its own session (the no-worker fallback). A fast patch
+    that adds an ULTRA device must not hand it to the scheduler before the engine restarts."""
+    app, engine = world["app"], world["engine"]
+    added = dict(_device("MEMBERSHIP"), id=10, name="Sortie", ipAddress="192.168.9.11")
+    bundle = {"bundleId": "b-add", "requiresReconcile": False, "items": [{
+        "kind": "ENTITY_UPSERT", "entityType": "GYM_DEVICE", "entityId": 10,
+        "revision": "2026-09-26T21:00:00", "payload": {"device": added},
+        "impact": {"affectedMemberIds": [], "affectedDeviceIds": [10]}}]}
+
+    app.apply_fast_patch_bundle(bundle)
+
+    assert [d.get("id") for d in engine._sync_scheduler._devices] == [_DEVICE_ID]
+
+
+def test_r1_a_worker_whose_lease_is_not_drive_still_gets_its_new_device_row(world):
+    """R1-F5: the lease filter decides who DRIVES, not whose device copy is current. A copy left
+    stale while the lease was away made the pass guard stop every pass once it came back."""
+    from app.core.v2 import lease_gate as lg
+
+    app, worker = world["app"], world["worker"]
+    lg.install(lg.snapshot_from_assignment({
+        "gymUsesAssignments": True, "role": "DRIVER", "readerOf": [], "release": [],
+        "drive": [{"gymDeviceId": _DEVICE_ID, "generation": 1, "state": "WAIT_FOR_RELEASE",
+                   "handoverForced": False}]}, source="server"))
+    try:
+        app.apply_fast_patch_bundle(_switch_bundle("ACCOUNT"))
+        assert worker._device.get("pinScheme") == "ACCOUNT"
+    finally:
+        lg.reset_for_tests()
+
+
+def test_r1_the_fast_patch_refreshes_the_workers_before_its_date_flip(world):
+    """R1-F6: the date flip after a fast patch may queue a pass itself; the copies are fresh
+    before it runs."""
+    app = world["app"]
+    order = []
+    real_refresh = app._refresh_running_ultra_devices
+    app._refresh_running_ultra_devices = lambda **kw: order.append("refresh") or real_refresh(**kw)
+    app._apply_date_flips = lambda source, **_kw: order.append(("flip", source))
+
+    app.apply_fast_patch_bundle(_switch_bundle("ACCOUNT"))
+
+    assert order[:2] == ["refresh", ("flip", "fast-patch")], order
+
+
+def test_r1_a_switch_during_a_panel_pass_removes_nothing_either(sqlite_db):
+    """R1-F3: the stale-pin delete and the FULL_REPLACE clear ran before the batch re-check."""
+    from app.core.device_sync import PinSchemeSwitchedError
+
+    _record_schemes(sqlite_db, "MEMBERSHIP")
+    sqlite_db.save_device_sync_state(device_id=1, pin="99", desired_hash="h", ok=True, error=None)
+    sdk = _sdk(["99"])
+    rows = sdk.get_device_data_rows.return_value
+
+    def _read_then_switch(*_a, **_kw):
+        _record_schemes(sqlite_db, "ACCOUNT")
+        return rows
+
+    sdk.get_device_data_rows.side_effect = _read_then_switch
+
+    with pytest.raises(PinSchemeSwitchedError):
+        _run_panel(_panel_users(), _pullsdk_device(pinScheme="MEMBERSHIP"), sdk)
+
+    assert _deleted_pins(sdk) == [], f"a removal ran after the switch: {_deleted_pins(sdk)}"
+    assert _written_pins(sdk) == []
