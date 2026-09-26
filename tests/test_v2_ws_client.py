@@ -246,3 +246,18 @@ def test_a_bypassed_host_goes_direct(monkeypatch):
     monkeypatch.setattr(wc.urllib.request, "getproxies", lambda: {"http": "http://10.255.255.1:3128"})
     monkeypatch.setattr(wc.urllib.request, "proxy_bypass", lambda host: True)
     assert wc._pick_proxy("ws", "127.0.0.1") is None
+
+
+def test_a_chunked_refusal_body_is_read_like_tomcat_sends_it():
+    # Found against the real backend with the switch off: Tomcat answers the handshake 404
+    # NOT_FOUND with Transfer-Encoding: chunked and no Content-Length.
+    srv = ScriptedWsServer(lambda conn: None, chunked=True,
+                           refuse=(404, {"status": False, "errorMsg": "Resource not found", "code": "NOT_FOUND",
+                                         "details": {"path": "/api/v1/public/access/v2/pc/ws"}}, {}))
+    try:
+        c = WebSocketClient(srv.url, {"Authorization": "Bearer tok"}, use_system_proxy=False)
+        with pytest.raises(WsHandshakeError) as ei:
+            c.connect()
+        assert (ei.value.status, ei.value.code) == (404, "NOT_FOUND")
+    finally:
+        srv.close()

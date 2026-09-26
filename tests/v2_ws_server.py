@@ -22,9 +22,11 @@ from app.core.v2.ws_client import (OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT,
 class ScriptedWsServer:
     """Accepts connections; ``on_connect(conn)`` runs per connection on its own thread."""
 
-    def __init__(self, on_connect: Callable[["ServerConn"], None], *, refuse: Optional[tuple] = None):
+    def __init__(self, on_connect: Callable[["ServerConn"], None], *, refuse: Optional[tuple] = None,
+                 chunked: bool = False):
         self._on_connect = on_connect
         self._refuse = refuse          # (status, json_body_dict, extra_headers)
+        self._chunked = chunked        # send the refusal body chunked, as Tomcat does
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(8)
@@ -65,9 +67,17 @@ class ScriptedWsServer:
         if self._refuse:
             status, body, extra = self._refuse
             raw = json.dumps(body).encode()
-            hdr = [f"HTTP/1.1 {status} Refused", "Content-Type: application/json",
-                   f"Content-Length: {len(raw)}"] + [f"{k}: {v}" for k, v in (extra or {}).items()]
-            s.sendall(("\r\n".join(hdr) + "\r\n\r\n").encode() + raw)
+            if self._chunked:
+                hdr = [f"HTTP/1.1 {status} ", "Content-Type: application/json", "Transfer-Encoding: chunked"]
+                half = len(raw) // 2
+                payload = b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in (raw[:half], raw[half:])) + b"0\r\n\r\n"
+            else:
+                hdr = [f"HTTP/1.1 {status} Refused", "Content-Type: application/json",
+                       f"Content-Length: {len(raw)}"]
+                payload = raw
+            hdr += [f"{k}: {v}" for k, v in (extra or {}).items()]
+            s.sendall(("\r\n".join(hdr) + "\r\n\r\n").encode() + payload)
+            time.sleep(0.2)            # a server may keep the connection open after the body
             s.close()
             return
         accept = base64.b64encode(hashlib.sha1((headers["sec-websocket-key"] + _GUID).encode()).digest()).decode()

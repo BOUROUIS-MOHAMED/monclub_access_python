@@ -212,6 +212,46 @@ class WebSocketClient:
         head, rest = data.split(b"\r\n\r\n", 1)
         return head, rest
 
+    def _read_error_body(self, headers: Dict[str, str], rest: bytes) -> bytes:
+        """The body of a refused handshake: Content-Length, chunked (Tomcat's own error
+        answers -- e.g. 404 NOT_FOUND while the server switch is off, found in the end-to-end
+        run), or until close. At most 16 KiB; a read error just ends it."""
+        body = rest
+        chunked = "chunked" in headers.get("transfer-encoding", "").lower()
+        try:
+            want = int(headers.get("content-length") or -1)
+        except ValueError:
+            want = -1
+        try:
+            self._sock.settimeout(min(self._connect_timeout, 5.0))
+            while len(body) < 16384:
+                if want >= 0 and len(body) >= want:
+                    break
+                if chunked and b"\r\n0\r\n\r\n" in b"\r\n" + body:
+                    break
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+        except Exception:
+            pass
+        if not chunked:
+            return body if want < 0 else body[:want]
+        out, pos = b"", 0
+        while pos < len(body):
+            line_end = body.find(b"\r\n", pos)
+            if line_end < 0:
+                break
+            try:
+                size = int(body[pos:line_end].split(b";")[0].strip() or b"0", 16)
+            except ValueError:
+                break
+            if size == 0:
+                break
+            out += body[line_end + 2:line_end + 2 + size]
+            pos = line_end + 2 + size + 2
+        return out
+
     def _handshake(self) -> None:
         assert self._sock is not None
         key = base64.b64encode(os.urandom(16)).decode("ascii")
@@ -231,16 +271,7 @@ class WebSocketClient:
             if sep:
                 headers[name.strip().lower()] = value.strip()
         if status != 101:
-            body = rest
-            try:
-                want = int(headers.get("content-length") or 0)
-                while len(body) < min(want, 16384):
-                    chunk = self._sock.recv(4096)
-                    if not chunk:
-                        break
-                    body += chunk
-            except Exception:
-                pass
+            body = self._read_error_body(headers, rest)
             code, message = f"HTTP_{status}", ""
             try:
                 obj = json.loads(body.decode("utf-8", "replace") or "null")
