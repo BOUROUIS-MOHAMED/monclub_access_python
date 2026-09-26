@@ -3074,11 +3074,20 @@ Re-measured on 2026-09-25, master and this branch interleaved, a new empty data 
 the file alone failed 19/60 on master and 0/60 here; the test's original body alone, 18/60 and 0/60;
 an in-process loop of that scenario opened the door 24, 33 and 36 times per 300 on master and 0 here.
 In the four full runs of each tree that day it passed every time, on master too. `[TEST]`
-`tests/test_review_round6.py::test_r6_01_a_scan_from_the_sta_threads_last_pump_is_decided` fails
-whenever the PC has been up for less than 5000 s, on master too: it sets `_connected_since_mono =
-time.monotonic() - 5000.0`, which is negative on a fresh boot, and `_maybe_refresh_connection`
-refuses a non-positive value. It passes once the uptime is past 5000 s. `[TEST: observed 2026-09-19
-and 2026-09-25 after reboots]`
+`tests/test_review_round6.py::test_r6_01_a_scan_from_the_sta_threads_last_pump_is_decided`
+depended on machine uptime up to master `3b28bd2` (a test defect, not a product one). It set
+`_connected_since_mono = time.monotonic() - 5000.0`. `time.monotonic()` counts from boot
+(`GetTickCount64()` on the 32-bit Python 3.11 `.venv`), so that value is negative on a PC up for
+less than 5000 s, and `_maybe_refresh_connection` reads a non-positive value as "never
+connected". It failed after reboots on 2026-09-19 and 2026-09-25, and on 2026-09-26 at uptime
+1047 s. The test now sets `ultra_connection_refresh_sec = 1.0` in the worker's settings and
+back-dates the connect by 5 s, clamped positive. It does not patch the clock, because the real
+STA thread shares the `time` module. It passed at uptime 1134 s on 2026-09-26 (branch
+`claude/heuristic-dirac-3b96e7`). The full suite on that branch gave **2616 passed, 0 failed**
+between uptime 1298 s and 1481 s: the CLAUDE.md command, `MONCLUB_ACCESS_DATA_ROOT` an empty
+scratch folder, `tools/check_sql_arity.py` PASS. No other test in `tests/` back-dates a monotonic value into a
+guard that reads `<= 0` as unset: the round-2, round-3 and round-5 link tests write positive
+values under a patched `ue.time.monotonic` (fake clocks at 1000.0 and up). `[TEST]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
 failed once in a full run of `d09f88f` and passed 20/20 alone. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`
