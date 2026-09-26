@@ -3060,6 +3060,22 @@ the rest of the UI. `[CODE]` `[TEST: test_v2_local_routes.py]`
 (`device_allowed`, `writes_frozen`) at each drain and at connect, and an in-memory note of the connect-time user
 count. Measurements: §3.9a below.
 
+#### 3.9a Measured before and after (development PC, 2026-09-26)
+
+Scratch harnesses (not in the repo), base `22c9cfc` and this branch interleaved, 32-bit `.venv` Python 3.11,
+the PC at 85–96 % memory load. `[TEST: measurement, not pass/fail]`
+
+| What | Base `22c9cfc` | Branch, no leases | Branch, DRIVER lease installed |
+|---|---|---|---|
+| Scan → decision on the real `UltraDeviceWorker.run()` loop over the fake MB2000, 150 scans × 3 runs | median 230.1–232.4 ms, p95 541.8–546.8 ms, 0 lost (6 runs) | median 231.0–233.2 ms, p95 542.5–546.4 ms, 0 lost | median 231.4–232.4 ms, p95 531.9–544.6 ms, 0 lost |
+| Desk door open (`request_door_open`) round trip, 150 × 3 | median 0.49–0.76 ms, max ≤ 4.5 ms | median 0.47–0.90 ms, max ≤ 4.1 ms | median 0.56–0.81 ms, max ≤ 4.7 ms |
+| `create_access_app()` (MainApp `__init__`), warm data root, network blocked | 480–505 ms (3 runs) | 488–701 ms (3 runs; the 701 ms run also took 215 ms to import — disk noise) | — |
+
+The v2 runtime starts 12 s after launch (after the PC identity); offline and unregistered it reads
+`availability=UNKNOWN`, `mode=ALL`, reason `NO_PC_TOKEN`, and changes nothing. `[TEST: same harness]`
+Remote door open, reader request → driver's door handler, local backend: median 81–108 ms, max 175–311 ms
+(two runs of 10). `[TEST: e2e]` On a gym PC and through the internet: `[UNVERIFIED — FIELD-TEST]`.
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver
