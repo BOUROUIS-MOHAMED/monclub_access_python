@@ -237,11 +237,28 @@ class V2Runtime(NoticeCallbacks):
     def _set_availability(self, result: str) -> None:
         if result == UNREACHABLE:
             return                      # keep what we knew: offline is not "switched off"
-        if result != self.availability:
+        changed = result != self.availability
+        if changed:
             _log.info("[V2] server v2 availability: %s -> %s", self.availability, result)
         self.availability = result
         from app.core.v2 import loss
         loss.set_enabled(result == ON)
+        if changed and result == ON:
+            # The socket is not up yet: the app's safety sync may now run every 120 s.
+            self._post_cadence_check("v2-on")
+
+    def _post_cadence_check(self, reason: str) -> None:
+        """Ask the app, on its own loop, to bring its next data sync forward when the safety
+        cadence just got shorter (v2 came on, the socket dropped). Never runs the check here:
+        this is the control or the notice thread (guide §3.6)."""
+        app = self.app
+        tighten = getattr(app, "_tighten_sync_timer", None)
+        if not callable(tighten):
+            return
+        try:
+            app.after(0, lambda: tighten(reason))
+        except Exception as exc:
+            _log.debug("[V2] cadence check not posted: %s", exc)
 
     # ------------------------------------------------------------------ syncs
     def _request_sync(self, trigger_source: str) -> None:
@@ -299,6 +316,7 @@ class V2Runtime(NoticeCallbacks):
 
     def on_disconnected(self, reason) -> None:
         self._next_poll = time.monotonic() + 5.0
+        self._post_cadence_check("socket-down")
 
     def on_switched_off(self) -> None:
         self._next_refresh = 0.0

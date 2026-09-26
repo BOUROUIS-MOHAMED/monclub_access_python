@@ -41,7 +41,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Anything currently marked `UNVERIFIED` that you actually prove or disprove | §7 Unverified |
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
-| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
+| The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — the v2 safety sync and what it switches off (`app/core/sync_cadence.py`, `app.py::_v2_safety_sync`, `::_tighten_sync_timer`, `::_safety_tick_device_reconcile_due`, `::change_detection_gated`, `::_daily_sync_gated`, `::_daily_sync_check`, `change_detector.py::_poll_once`'s gate, `v2/runtime.py::_post_cadence_check`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
@@ -2656,6 +2656,90 @@ every PC of every gym retried at the same instant after a backend restart, that 
 count concurrent connections, far below 25; the ±20 % jitter spreads the first retry over
 12–18 s. `[CODE: backend RateLimitProperties, application.yml; client sync_retry.py]`
 
+**The v2 safety sync (lane B, 2026-09-26).** Before it, `syncMeta.reconcileSec` (600 s: the server's
+"how often an idle v2 PC should compare its list with mine", `GymAccessController.accessV2ReconcileSeconds`)
+was stored in `access_v2_state.reconcile_sec` and read nowhere; a v2 PC synced data on the healthy
+interval (30 min) and polled only pending COMMANDS every 120 s while its socket was down (§3.9). The
+server leaves some changes un-notified and counts on that poll ("the PC's safety poll covers it",
+backend plan P2b). `[CODE: db.py::_apply_protocol2_save; backend GymAccessController, read not run]`
+Now `[CODE]`:
+- **One predicate**, `MainApp._v2_safety_sync`: the v2 runtime's `availability` is `ON` (the commands
+  switch), `access_v2_state.trusted` (the dates switch and a members section applied) and
+  `reconcile_sec` a positive integer → `{reconcile_sec, socket_connected}` (`notice.connected`);
+  anything else — no runtime yet, `UNKNOWN`/`OFF`, an untrusted or unreadable state — is None, today's
+  behaviour.
+- **The healthy timer** (`reschedule_sync_timer`, `sync_cadence.healthy_sync_delay_sec`): None → the
+  healthy interval exactly, as before. Socket connected → `max(60, reconcileSec)`; socket down → 120 s;
+  never longer than the healthy interval, and a shorter cadence is spread by × uniform(0.8, 1.0) so the
+  PCs of a gym whose sockets dropped together (a redeploy) do not sync in step — the spread only brings
+  a sync forward. The timer is armed at each tick's start, so a notice-driven sync restarts the count.
+- **The failure-retry schedule and the `Retry-After` clamp are unchanged**: they keep the healthy
+  interval as their cap, so an outage is still retried at 15/30/60/120/300 s and a 429 still waits its
+  `Retry-After` (up to 30 min), never the 120 s cadence.
+- **Tighten only** (`_tighten_sync_timer`, loop thread): when v2 comes on (`V2Runtime._set_availability`
+  → `ON`), when a socket session ends (`on_disconnected`; a handshake that never succeeds leaves
+  `connected` False, so the cadence is already the 120 s one), and after each successful sync (trust
+  may have just arrived with that save) — each posted through `app.after(0, …)` by
+  `runtime.py::_post_cadence_check`. It brings the armed timer forward when it is due later than the
+  new target, never pushes it back, and never touches a failure retry. A socket that comes back is
+  followed by its `welcome` sync, whose tick arms the longer cadence.
+- **DEVICE-mode panels keep their cadence**: a successful `TIMER` tick that refreshed neither members
+  nor devices reconciles them only when it started at least one healthy interval after the last
+  reconcile it dispatched (`_safety_tick_device_reconcile_due`; outside safety mode every such tick
+  does, as before). No fleet device is DEVICE-mode (§3.2g). ULTRA workers are asked for nothing by a
+  tick that refreshed nothing (unchanged). `TIMER` is not in `_should_defer_ultra_reconnects`, so a
+  safety tick defers no reconnect.
+- **Power-on and offline**: the runtime starts 12 s after launch in `UNKNOWN` (§3.9a), so a PC boots on
+  today's cadence and the probe runs until the server answers `ON`; offline the syncs fail and the
+  failure schedule decides, as before (`UNREACHABLE` keeps `ON`, which only matters once a sync
+  succeeds). An old server (`OFF`, or a v1 answer → `trusted=0`) is today's behaviour exactly.
+`[TEST: test_v2_safety_sync.py — the cadence, the predicate (every "not v2" case), the timer on the
+§3.6 harness, the failure schedule and a 429 in safety mode, tighten/never-lengthen, the runtime
+hooks, the DEVICE-mode gate]` On aeeef69 nothing reads `reconcile_sec` (grep, 2026-09-26). `[CODE]`
+
+*Load, per gym with 3 v2 PCs* (they share the gym account's `RateLimitFilter` bucket, 200 requests /
+60 s, for `getSyncData` and the probe; the command poll uses the PC token). Counted from the code, not
+measured `[CODE]`:
+
+| per hour, 3 PCs | before (v2 on) | socket up | socket down |
+|---|---|---|---|
+| members-version probe (2 `MAX(updated_at)` queries each; off in safety mode, below) | 240 | 0 | 0 |
+| `getSyncData` on the timer | 6 | 18–22.5 | 90–112.5 |
+| pending-command poll (P3b-2, unchanged) | 0 up / 90 down | 0 | 90 |
+
+Plus, unchanged: the notice-driven syncs (≤ 1 a minute per PC, §3.9), one heartbeat per PC every
+300 s, and the first sync of each Tunis day carrying the full member list. The busiest case — socket
+down — is ≤ 112.5 + 90 requests an hour for the gym, ≤ 3.4 a minute, 1.7 % of the bucket. The weight is
+per request, not per count: a no-change `getSyncData` still loads the gym's whole deliverable scope
+(`findAllValidForAccessByGymId`/`…ByGymFamilyName` + freezes), builds the credentials, computes the four
+version tokens (`computeMembersVersion` counts fingerprints and enrolments and digests the id set) and,
+on protocol 2, `buildSyncV2` — against the probe's two aggregate reads `[CODE: backend main 919231a8
+GymAccessController.getGymAccessUsers, ::getMembersVersion, read not run]`. So socket down means up to
+~19× as many scope builds as before for that gym, in exchange for 240 fewer probes; socket up, 3–3.75×.
+The server time of a no-change `getSyncData` for gym 58 (~1,690 deliverable rows) is `[UNVERIFIED]` —
+FIELD-TEST: the backend's `[PERF] scope+freeze+filter` log line. Socket down should be the exception
+since the nginx WebSocket block was added (2026-09-26, §3.9 `[UNVERIFIED — FIELD-TEST]`); a gym whose
+sockets never connect runs at the socket-down rate for as long as that lasts.
+
+**The 45 s probe and the 22:00 job are off in safety mode — and only then (lane B, 2026-09-26).** Both read
+the same `_v2_safety_sync`, so the probe can never be off while the cadence is the 30-min one: a v2 PC
+whose socket drops goes from ~45 s change detection to ≤ 120 s, not to 30 min. `[CODE]`
+- `ChangeDetectorService._poll_once` asks `app.change_detection_gated()` first and makes no request
+  while it answers exactly `True` (logged once per change of state); a gate that raises or answers
+  anything else leaves the probe on. The thread keeps running, so the probe resumes at its next turn
+  when the safety sync stops; its first poll then compares with the baseline it had, and a change made
+  meanwhile starts one sync. `[TEST: test_v2_safety_sync.py — the probe tests]`
+- `_daily_sync_check` does not fire the 22:00 job while `_daily_sync_gated()` — safety mode AND not
+  `manual_sync_mode` — and does not mark the day as run, so if the safety sync stops later that evening
+  the job still fires. In a manual-sync gym it stays: it is that gym's only automatic push of the day
+  (a safety sync is a `TIMER` sync, which manual mode never pushes). What an auto-sync gym gives up with
+  it: one explicit `full_reconcile` pass a day (the roster-hash skip bypassed, MIRROR's reconcile — no
+  gym runs MIRROR, §3.2c) and `report_daily_sync`. The dashboard shows a banner only on a report with
+  `lastDailySyncOk === false`, so no report shows none; a failure reported before the gate stays shown
+  until a later report. `[CODE: dashboard layouts/dashboard/layout.tsx::refreshPendingSync; backend
+  GymAccessController.reportGymAccessDailySync]` `[TEST: test_v2_safety_sync.py — the daily-job tests]`
+- An old server, a switch off, a PC not yet `ON` (power-on) or offline from start: both run as before.
+
 **Date flips (P3b-1).** `work()` runs the date precheck before the fetch and a date flip after
 each save; a separate 60 s timer (`_date_flip_tick`) and a 00:00:05 one-shot run the same check
 on their own. None of them touches `_sync_after_id` or the retry schedule, and a flip never
@@ -2984,7 +3068,10 @@ notice-driven sync a minute (`assignment` scope → a roles refresh only); `roll
 dropped as half-open; a wall-clock jump of more than 30 s against the monotonic clock (sleep/resume) rebuilds
 it; after a session a random 0–60 s wait, repeated handshake failures back off to 15 min, `Retry-After`
 wins; close 4001 → a new token (`PcIdentityService.invalidate_token`), 4003 → 30 min, 4009 → 5 min. While the
-socket is down pending commands are polled every `pollIntervalSec` (120 s). No notice handler touches a device,
+socket is down pending commands are polled every `pollIntervalSec` (120 s) — and, on a trusted v2 PC, the
+data sync runs every 120 s too, and at least every `reconcileSec` while it is up; the 45 s members-version
+probe and (outside manual sync mode) the 22:00 job are then off (§3.6 "The v2 safety sync", lane B
+2026-09-26). No notice handler touches a device,
 a DB write job or an engine lock; syncs go through `app.after(0, request_sync_now)`. `[CODE]`
 `[TEST: test_v2_ws_client.py, test_v2_notice_and_leases.py, test_v2_runtime.py]`
 `[TEST: e2e — the handshake with the real Tomcat backend answered 101 + welcome in 41–134 ms; a bad token was

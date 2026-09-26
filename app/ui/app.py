@@ -98,6 +98,7 @@ from shared.api.monclub_api import MonClubApi, MonClubApiConflictError, MonClubA
 from app.core.change_detector import ChangeDetectorService
 from app.core.log_sync_request_poller import LogSyncRequestPoller
 from app.core.sync_retry import sync_retry_delay_sec
+from app.core.sync_cadence import healthy_sync_delay_sec, safety_target_sec
 from app.core.sync_observability import (
     SyncTriggerContext,
     build_sync_response_summary,
@@ -1494,6 +1495,34 @@ class MainApp:
             return  # already armed
         self._daily_sync_check()
 
+    def change_detection_gated(self) -> bool:
+        """Is the 45 s members-version probe off? While the v2 safety sync runs (guide §3.6), and
+        only then: notices announce changes within seconds while the socket is up, and the data
+        sync runs every 120 s while it is down. Called by the probe's own thread before each poll;
+        the change of state is logged once."""
+        gated = self._v2_safety_sync() is not None
+        if gated != getattr(self, "_change_detection_gated_last", False):
+            self._change_detection_gated_last = gated
+            self.logger.info(
+                "[ChangeDetector] %s",
+                "paused: the v2 safety sync replaces the 45 s probe"
+                if gated else "resumed: the v2 safety sync is not active",
+            )
+        return gated
+
+    def _daily_sync_gated(self) -> bool:
+        """Is the in-memory 22:00 job off today? While the v2 safety sync runs, unless the gym is
+        in manual sync mode: there the 22:00 job is the only automatic push of the day (a safety
+        sync is a TIMER sync, which manual mode never pushes), so it stays. guide §3.6."""
+        if self._v2_safety_sync() is None:
+            return False
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+
+            return not bool((get_backend_global_settings() or {}).get("manual_sync_mode", False))
+        except Exception:
+            return False
+
     def _daily_sync_check(self) -> None:
         try:
             from datetime import datetime
@@ -1501,6 +1530,16 @@ class MainApp:
             now = datetime.now()  # local time (gym PC clock)
             today = now.date().isoformat()
             if now.hour >= self._daily_sync_hour and self._daily_sync_last_run_date != today:
+                if self._daily_sync_gated():
+                    # Not marked as run: if the safety sync stops later today (a v1 answer, the
+                    # switch turned off), the job still fires tonight.
+                    if getattr(self, "_daily_sync_gated_logged", None) != today:
+                        self._daily_sync_gated_logged = today
+                        self.logger.info(
+                            "[DailySync] Not fired today: the v2 safety sync reconciles every "
+                            "few minutes instead (guide §3.6)"
+                        )
+                    return
                 self._daily_sync_last_run_date = today
                 self.logger.info(
                     "[DailySync] Firing scheduled daily auto-sync (>= %02d:00 local)",
@@ -2830,6 +2869,8 @@ class MainApp:
 
         base_interval = self._sync_base_interval_sec()
         if after_failure:
+            # The retry steps and the Retry-After clamp keep the healthy INTERVAL as their cap,
+            # never the v2 safety cadence below: an outage or a 429 is not retried faster.
             interval = sync_retry_delay_sec(
                 self._sync_fail_count,
                 base_interval,
@@ -2841,8 +2882,79 @@ class MainApp:
                 interval, self._sync_fail_count, self._sync_retry_after_sec, base_interval,
             )
         else:
-            self._sync_after_id = self.after(base_interval * 1000, self._sync_tick)
-            self.logger.info(f"Sync scheduled every {base_interval} sec")
+            safety = self._v2_safety_sync()
+            interval = healthy_sync_delay_sec(base_interval, safety)
+            self._sync_after_id = self.after(int(interval * 1000), self._sync_tick)
+            if safety is None:
+                self.logger.info(f"Sync scheduled every {base_interval} sec")
+            else:
+                self.logger.info(
+                    "Sync scheduled in %.0fs (v2 safety sync: socket %s, reconcileSec=%s; "
+                    "healthy interval %ss)", interval,
+                    "up" if safety["socket_connected"] else "down", safety["reconcile_sec"],
+                    base_interval,
+                )
+        self._sync_timer_due_mono = time.monotonic() + float(interval)
+
+    def _v2_safety_sync(self) -> Optional[Dict[str, Any]]:
+        """``{"reconcile_sec", "socket_connected"}`` while this PC is v2-on AND trusted, else None.
+
+        v2-on: the v2 runtime's ``availability`` is ON (the server answers the v2 PC routes --
+        the commands switch). Trusted: the stored protocol-2 windows are trusted (the dates
+        switch, a members section applied) and the server sent a positive
+        ``syncMeta.reconcileSec``. ONE predicate for the timer cadence (app/core/sync_cadence.py),
+        the members-version probe and the 22:00 job, so the probe can never be off while the
+        cadence is the long one. Any doubt -- no runtime yet, UNKNOWN or OFF, an unreadable
+        state -- answers None: today's behaviour. guide §3.6.
+        """
+        try:
+            runtime = getattr(self, "_v2_runtime", None)
+            if runtime is None or getattr(runtime, "availability", None) != "ON":
+                return None
+            from app.core.db import get_access_v2_state
+
+            state = get_access_v2_state() or {}
+            if state.get("trusted") is not True:
+                return None
+            reconcile_sec = state.get("reconcile_sec")
+            if isinstance(reconcile_sec, bool) or not isinstance(reconcile_sec, int) or reconcile_sec <= 0:
+                return None
+            notice = getattr(runtime, "notice", None)
+            return {"reconcile_sec": int(reconcile_sec),
+                    "socket_connected": bool(getattr(notice, "connected", False))}
+        except Exception:
+            return None
+
+    def _tighten_sync_timer(self, reason: str) -> None:
+        """Bring the next healthy sync forward when the safety cadence got shorter.
+
+        Called on the loop thread when the notice socket drops, when v2 comes on, and after each
+        successful sync (trust may have just arrived with a save). It never pushes a sync back --
+        a longer cadence waits for the next tick -- and never touches a failure retry: the
+        failure schedule owns the timer then. guide §3.6.
+        """
+        try:
+            if self._sync_fail_count > 0:
+                return
+            safety = self._v2_safety_sync()
+            if safety is None:
+                return
+            now = time.monotonic()
+            due = getattr(self, "_sync_timer_due_mono", None)
+            if (self._sync_after_id is not None and due is not None
+                    and due - now <= safety_target_sec(safety)):
+                return
+            delay = healthy_sync_delay_sec(self._sync_base_interval_sec(), safety)
+            if self._sync_after_id is not None:
+                try:
+                    self.after_cancel(self._sync_after_id)
+                except Exception:
+                    pass
+            self._sync_after_id = self.after(int(delay * 1000), self._sync_tick)
+            self._sync_timer_due_mono = now + delay
+            self.logger.info("[SYNC] v2 safety sync: next data sync in %.0fs (%s)", delay, reason)
+        except Exception:
+            self.logger.debug("[SYNC] safety timer not tightened (%s)", reason, exc_info=True)
 
     def _ensure_sync_timer(self):
         """Arm the healthy sync timer only if none is armed (startup, access/runtime.py).
@@ -2884,6 +2996,18 @@ class MainApp:
         last = self._last_tick_device_reconcile_mono
         return last is None or time.monotonic() - last >= _OFFLINE_RECONCILE_INTERVAL_SEC
 
+    def _safety_tick_device_reconcile_due(self, tick_started_mono: float) -> bool:
+        """May a successful TIMER tick that refreshed nothing reconcile the DEVICE-mode panels?
+
+        Outside the v2 safety sync every such tick does, as before: the timer ticks one healthy
+        interval apart. Inside it the timer ticks every 2-10 min, so only a tick that started at
+        least one healthy interval after the last dispatched reconcile does -- the old cadence.
+        """
+        if self._v2_safety_sync() is None:
+            return True
+        last = self._last_tick_device_reconcile_mono
+        return last is None or tick_started_mono - last >= self._sync_base_interval_sec()
+
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).
 
@@ -2918,6 +3042,9 @@ class MainApp:
             )
             self._cancel_pending_rerun()
             self._sync_rerun_after_id = self.after(int(delay * 1000), self._sync_tick)
+        # The healthy timer was armed when this sync STARTED; the save may have just made this PC
+        # v2-trusted (or changed reconcileSec): bring the next safety sync forward if so.
+        self._tighten_sync_timer("sync")
 
     def _cancel_pending_rerun(self):
         if self._sync_rerun_after_id is not None:
@@ -3396,6 +3523,19 @@ class MainApp:
                                     "devicesDispatched": 0,
                                     "skippedReason": "NO_MEMBER_DELTA",
                                 }
+                        elif (
+                            sync_online
+                            and trigger_context.trigger_source == "TIMER"
+                            and not (refresh.get("members") or refresh.get("devices"))
+                            and not self._safety_tick_device_reconcile_due(tick_started_mono)
+                        ):
+                            # A v2 safety tick (every 2-10 min, guide §3.6) that brought nothing
+                            # new: the DEVICE-mode panels keep their healthy-interval reconcile
+                            # (a PullSDK session, a full Pin read and SetDeviceParam writes each).
+                            self.logger.info(
+                                "[DeviceSync] Skipped: v2 safety sync tick with no change; panels "
+                                "were reconciled less than one healthy interval ago."
+                            )
                         elif (
                             not sync_online
                             and not _is_user_initiated_sync
