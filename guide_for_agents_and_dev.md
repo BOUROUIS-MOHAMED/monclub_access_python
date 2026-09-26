@@ -2388,7 +2388,8 @@ without `__init__`, a recording ULTRA engine); the midnight path (`_maybe_apply_
 00:00:05 D+1) logged one `DATE_FLIP source=midnight` (held 3, promoted 3), asked ULTRA once and
 armed ONE 00:17 sync (16 min 55 s), re-armed to 12 min by a 00:05 flip; the 07:30 power-on armed
 none; the flat battery logged `CLOCK_SUSPECT reason=behind` and the fix `CLOCK_OK`. 58 checks, 0
-failed. `[TEST: same harness, 2026-09-19]`
+failed. `[TEST: same harness, 2026-09-19]` Re-run on the final branch head `5094150` after six
+review rounds (2026-09-26): 58 checks, 0 failed. `[TEST: same harness]`
 
 ---
 
@@ -2752,10 +2753,11 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2457 passed, 0 failed**
-(2026-09-19, branch `claude/p3b1-power-on-dates` at `e667396`, the CLAUDE.md command, 32-bit `.venv`
-Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` an empty scratch folder; its base, master `ca1e29a`, gave
-**2109 passed** the same way, exit 0). The door-timing flake below still fails 7/20 isolated runs on
+background-thread exceptions are promoted to failures. Last run: **2522 passed, 0 failed**
+(2026-09-26, branch `claude/p3b1-power-on-dates` at `5094150`, after six adversarial review rounds;
+the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT` an empty scratch
+folder, exit 0; `tools/check_sql_arity.py` PASS). Its base, master `ca1e29a`, gave **2109 passed**
+the same way, exit 0. The door-timing flake below still fails 7/20 isolated runs on
 both. Previous record: **2109 passed** (2026-09-19,
 branch `claude/p3a2-push-engine`, P3a-2 push engine + six adversarial review rounds; the CLAUDE.md
 command `python -m pytest tests/ -q --ignore=tests/_pydeps`, 32-bit `.venv` Python 3.11,
