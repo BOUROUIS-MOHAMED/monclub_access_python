@@ -42,6 +42,7 @@ from app.core.popup_image_cache import prefetch as _prefetch_popup_image
 from app.core import telemetry as _tel
 from app.core import push_safety as _push_safety
 from app.sdk.pullsdk import PullSDKDevice
+from app.core.v2 import lease_gate as _lease_gate
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
 logger = logging.getLogger("zkapp")
@@ -1025,6 +1026,10 @@ class UltraDeviceWorker(threading.Thread):
             self._connect_failures,
         )
         try:
+            # P3b-2: the last line of defence -- a worker for a turnstile this PC does not
+            # drive (a lease moved while it ran) never connects; the engine drops it at its
+            # next re-evaluation. Raised inside the try, so it reads as a failed connect.
+            _lease_gate.require_device(self._device_id)
             # Route through the driver factory (protocol-keyed). Defaults to ZK_PULLSDK
             # -> PullSDKDevice, so this is a pure indirection for the C3 gym today.
             self._sdk = get_driver(device_payload=self._device, logger=logger)
@@ -8365,6 +8370,8 @@ class UltraEngine:
             return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
 
         ultra_devices = [d for d in devices if _adm(d) == "ULTRA"]
+        # P3b-2: never start a worker for a turnstile another PC drives (reader / lease).
+        ultra_devices = _lease_gate.filter_devices(ultra_devices)
 
         all_device_count = len(devices)
         non_ultra = [d for d in devices if _adm(d) != "ULTRA"]
@@ -8477,7 +8484,7 @@ class UltraEngine:
         def _adm(d):
             return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
 
-        ultra_devices = [d for d in (devices or []) if _adm(d) == "ULTRA"]
+        ultra_devices = _lease_gate.filter_devices([d for d in (devices or []) if _adm(d) == "ULTRA"])
 
         refreshed = 0
         for d in ultra_devices:

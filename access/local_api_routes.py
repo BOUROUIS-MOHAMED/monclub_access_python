@@ -150,13 +150,60 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
 )
 
 
+# P3b-2: every handler that opens a session on a turnstile (a PullSDK connection, or a call
+# run on the ULTRA worker's connection). With driver/reader assignments on, a PC that does not
+# drive that turnstile answers 409 ``notDriver`` without touching it (owner decision 1: readers
+# never connect). Routes that only read or write local state are not gated.
+LEASE_GATED_HANDLERS: tuple[str, ...] = (
+    "_handle_device_connect",
+    "_handle_device_info",
+    "_handle_device_settings_get",
+    "_handle_device_reentry_set",
+    "_handle_device_clock_get",
+    "_handle_device_clock_sync",
+    "_handle_device_table",
+    "_handle_device_door_open",
+    "_handle_device_users_push",
+    "_handle_device_users_list",
+    "_handle_device_users_delete",
+)
+
+
+def gated_handler(handler):
+    """Wrap a device-session handler with the lease gate."""
+    import functools
+
+    @functools.wraps(handler)
+    def _gated(ctx) -> None:
+        from app.core.v2 import lease_gate
+
+        try:
+            device_id = ctx.param_int("deviceId")
+        except Exception:
+            device_id = 0
+        if device_id > 0 and not lease_gate.device_allowed(device_id):
+            ctx.send_json(409, {
+                "ok": False,
+                "notDriver": True,
+                "deviceId": device_id,
+                "error": "Ce PC ne pilote pas ce tourniquet (un autre PC en est le pilote).",
+            })
+            return
+        handler(ctx)
+
+    return _gated
+
+
 def register_access_local_api_routes(router) -> None:
     from access import pc_identity_routes
     from app.api import local_access_api_v2 as legacy
 
     for method, pattern, handler_name in ACCESS_LOCAL_ROUTE_SPECS:
         owner = pc_identity_routes if handler_name.startswith("_handle_pc_identity_") else legacy
-        router.add(method, pattern, getattr(owner, handler_name))
+        handler = getattr(owner, handler_name)
+        if handler_name in LEASE_GATED_HANDLERS:
+            handler = gated_handler(handler)
+        router.add(method, pattern, handler)
 
 
 def get_access_local_api_route_specs() -> tuple[RouteSpec, ...]:
@@ -165,6 +212,8 @@ def get_access_local_api_route_specs() -> tuple[RouteSpec, ...]:
 
 __all__ = [
     "ACCESS_LOCAL_ROUTE_SPECS",
+    "LEASE_GATED_HANDLERS",
+    "gated_handler",
     "get_access_local_api_route_specs",
     "register_access_local_api_routes",
 ]

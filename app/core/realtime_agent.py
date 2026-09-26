@@ -27,6 +27,7 @@ from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
+from app.core.v2 import lease_gate as _lease_gate
 from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
@@ -2185,6 +2186,12 @@ class AgentRealtimeEngine:
             if mode != "AGENT":
                 self.logger.info(
                     "[RT] device id=%s name=%r skipped: accessDataMode=%r (not AGENT)", did, dev_name, mode
+                )
+                continue
+
+            if not _lease_gate.device_allowed(did):
+                self.logger.info(
+                    "[RT] device id=%s name=%r skipped: driven by another PC (assignment)", did, dev_name
                 )
                 continue
 

@@ -26,6 +26,7 @@ from app.core.db import (
 from app.core.settings_reader import get_backend_global_settings, normalize_device_settings
 from app.core.pin_scheme import PIN_SCHEME_ACCOUNT, PIN_SCHEME_MEMBERSHIP, scheme_at
 from app.core.utils import now_iso
+from app.core.v2 import lease_gate as _lease_gate
 from app.sdk.pullsdk import PullSDKDevice
 from app.sdk.device_driver import get_driver
 from shared.api.monclub_api import MonClubApi, MonClubApiError, MonClubApiHttpError
@@ -676,6 +677,9 @@ class DeviceAttendanceMaintenanceEngine:
             if not _boolish(device.get("active", True), True):
                 continue
             if not _boolish(device.get("accessDevice", device.get("access_device", True)), True):
+                continue
+            if not _lease_gate.device_allowed(device.get("id")):
+                # P3b-2: another PC drives this turnstile (driver/reader assignment).
                 continue
             out.append((device, settings))
         return out

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
+from app.core.v2 import lease_gate as _lease_gate
 from app.core.db import (
     list_device_pin_scheme_switches,
     list_fingerprints,
@@ -1097,6 +1098,13 @@ class DeviceSyncEngine:
         sync_run_id: int | None,
         sdk: PullSDK | None,
     ) -> bool:
+        if not _lease_gate.device_allowed((device or {}).get("id")):
+            # P3b-2: a turnstile this PC does not drive (driver/reader assignment) is never
+            # connected to -- not even through the ULTRA scheduler's fallback path.
+            self.logger.warning(
+                "[DeviceSync] Skip single-device (%s) id=%s: not driven by this PC (assignment)",
+                source, (device or {}).get("id"))
+            return False
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip single-device ({source}): already running")
@@ -2975,6 +2983,11 @@ class DeviceSyncEngine:
         report_progress: bool = True,
     ) -> None:
         dev_id = device.get("id")
+        if not _lease_gate.device_allowed(dev_id):
+            # P3b-2: never open a PullSDK session on a turnstile another PC drives.
+            self.logger.warning(
+                "[DeviceSync] Device id=%s not driven by this PC (assignment) -> skip", dev_id)
+            return None
         dev_name = device.get("name") or ""
         ip = (device.get("ipAddress") or "").strip()
         port = _to_int(device.get("portNumber"), default=4370) or 4370
@@ -4410,6 +4423,13 @@ class DeviceSyncEngine:
                 self.logger.info(
                     "[DeviceSync] Skip device id=%s name=%r: accessDataMode=%r (not DEVICE)",
                     dev_id, dev_name, adm,
+                )
+                continue
+
+            if not _lease_gate.device_allowed(dev_id):
+                self.logger.info(
+                    "[DeviceSync] Skip device id=%s name=%r: driven by another PC (assignment)",
+                    dev_id, dev_name,
                 )
                 continue
 
