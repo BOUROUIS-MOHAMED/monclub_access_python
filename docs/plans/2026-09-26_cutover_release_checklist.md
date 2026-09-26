@@ -44,7 +44,7 @@ report https://claude.ai/artifact/LwWWoAdgzkF6TKH4P7gvYm):
 
 For the night, in plain words:
 
-- **With the server's commands switch off -- production today** (the backend's CI passes no
+- **With the server's commands switch off -- expected in production** (the backend's CI passes no
   `MONCLUB_ACCESS_*` variable to `docker run`, `.gitlab-ci.yml`, backend `main` `919231a8`
   `[CODE]`; the running server's state is `[UNVERIFIED]` -- the runbook's page check reads it): every v2 route answers 404 `NOT_FOUND`, the PC reads it as "switched off", allows every
   turnstile, opens no socket, uploads nothing, and asks again every 30 min
