@@ -148,7 +148,11 @@ must not run Access afterwards (it never registered, so the gate cannot see it -
 switch reception PCs on (gym 45 plan section 3.3) -- and a revoke could not stop it even if it were
 registered: an old Access syncs with the gym login (runbook D12). So it carries the firewall block of
 the runbook's C1b (the gym 45 plan section 5.2 rules with gym 58's IPs, proven with this plan's export
-before and after) or is unplugged from the network, until it runs the new Access.
+before and after) or is unplugged from the network. **The same holds for a PC pre-installed on the new
+Access that is not started on the night**: started later with a first sync that fails at boot, it works
+from its stored MEMBERSHIP row (§3.2). Any such PC is brought back in the order of gym 45 plan §5.3:
+block on, new Access, its `PIN_SCHEME_SWITCH … scheme=ACCOUNT` lines for 5 and 6, the restart proven,
+then the block removed.
 
 ### 3.4 Upgrade in place, not a clean data folder, and BEFORE the erase
 
@@ -198,10 +202,12 @@ format for that row (counted as `userRowsMalformed`), as it does in Access's own
 `--gym-id 58`. New `cards` section: per current person, the cards seen on the panel under their own
 pin or on an old user strongly tied to them (same card number, pin = card) that MonClub will not write
 -- another card, a second card, a value outside the 4-byte range. Detail rows `member_terminal_only_card`
-in `--detail-csv` (names); the note says which of three cases it is: `no card in MonClub` (MonClub holds
-nothing: the only case the desk may enter), `MonClub card ... cannot be written to a panel -- do not
-overwrite it`, or `MonClub card ... -- do not overwrite it`, plus a flag for a MonClub card starting with
-`99999`. **The card self-check** (printed under `== cards`): on the pins MonClub owns (every member pin
+in `--detail-csv` (names); the note says which case it is: `no card in MonClub` (MonClub holds
+no first and no second card: the only case the desk may enter), `MonClub card ... cannot be written to
+a panel -- do not overwrite it`, `MonClub card ... -- do not overwrite it`, `MonClub holds only a second
+card ... -- do not overwrite it`; a flag for a MonClub card starting with `99999`; and `that card is held
+by another member in MonClub -- do not enter it` when the panel card is another person's MonClub card
+(a recycled card, say). **The card self-check** (printed under `== cards`): on the pins MonClub owns (every member pin
 when the PC records no ownership, as <= 1.4.31 does) that MonClub sends a card, the share whose panel
 `CardNo` equals it. How a C3-400 returns `CardNo` is `[UNVERIFIED]` (`device_sync.py::_same_card`'s own
 note; pullsdk_guide §5); below 90 % the list may be an artefact and is not acted on. The card rule
@@ -222,7 +228,7 @@ C3-400; the export records its own timings.
 
 | Step | Proof it worked | If it fails |
 |---|---|---|
-| G0. Every PC of the gym: untick "Ouvrir MonClub Access avec Windows", watchdog off (**before** the Quit: it restarts Access after any Quit), Quit (gym 45 plan §3.3). A PC that will not run the new Access: the firewall block, proven, or unplugged (§3.3; runbook C1b) | Task Manager: no `MonClubAccess.exe`; the watchdog task `Disabled` or absent | stop; nothing changed |
+| G0. Every PC of the gym: untick "Ouvrir MonClub Access avec Windows", watchdog off (**before** the Quit: it restarts Access after any Quit), Quit (gym 45 plan §3.3). A PC that will not be started tonight, whatever its version: the firewall block, proven, or unplugged (§3.3; runbook C1b) | Task Manager: no `MonClubAccess.exe`; the watchdog task `Disabled` or absent | stop; nothing changed |
 | G1. Copy the data folder `%ProgramData%\MonClub Access\access\` of each PC (Access stopped) | the copy exists | stop |
 | G2. Export both panels, full commands, `-Label device5` / `-Label device6` (type each IP in full). Once per panel, the reference refusal: the panel's cable unplugged at the panel, the same command, its `PullLastError` written down (runbook A2b) | `complete: true`, `errors` empty; `counts.user` = `summary.users` | a connect failure: check cable, IP, device password; nothing changed. `errors` not empty: call the developer before G5 |
 | G3. Compare each export with `--access-db <copy of the PC that drives it>` `--gym-id 58`; and a second run with `--scheme ACCOUNT` to confirm `account_pins_already_on_terminal` (expected 0, §1.1) | the `cards` list and the card self-check line; `classes`; `leftovers` | a non-zero ACCOUNT hit: stop and call the developer. Card self-check below 90 % or not measured: the card list is not acted on (G4) |
@@ -235,7 +241,7 @@ C3-400; the export records its own timings.
 | G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected. **Then Quit and restart Access on every running PC** and wait for `getSyncData OK`: a switch that reached a PC through a dashboard fast patch (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) is recorded and logged, but the running ULTRA workers keep their MEMBERSHIP device copy until a server sync refreshes them (`app.py` sync tick → `refresh_devices`), and the full pass pushes from that copy (`ultra_engine._drain_full_sync_commands`, `self._device`) `[CODE, review 2026-09-26]`. The restart is proven three ways (runbook C13's box): no `MonClubAccess.exe` after the Quit; a new `App started. pid=... version=X.Y.Z` line later than the switch lines; `getSyncData OK` after it -- the log file is cut by hour, not by process (`app/core/logger.py`), so "the new log" alone proves nothing | the lines, then the three restart checks | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer. A restart check fails → do NOT plug in |
 | G11. Plug the panel cables back only when every PC that is switched on has shown G10; the other PCs stay shut down (the cable is the panel's, so it releases every PC at once) | -- | -- |
 | G12. Push: per panel, a pass ending with `[DeviceSync] Device id=5: device_pins=N desired=N to_sync=0 stale=0` on the pass after the push, N = the people count that pass computed (it can change after midnight: the 00:00:05 date flip asks for a full pass, guide §3.8) | the line for 5 and 6 | `REVOKE_ABORTED` → the panel was not empty: Quit, export, back to G5. `PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète"; persists → call the developer |
-| G13. Verify: Quit, export both panels, compare with `--scheme ACCOUNT --access-db <fresh copy>`: `member_owned` = people, `leftover` = 0, the card self-check at or above 90 %, no `cards` loss beyond the G4 list | numbers | members missing → "Réinitialisation complète", redo G12-G13 |
+| G13. Verify: Quit, export both panels, compare with `--scheme ACCOUNT --access-db <fresh copy>`: `member_owned` = people, `leftover` = 0, the card self-check at the G3 rate (at or above 90 % when G3 reached it; lower than G3: call the developer), no `cards` loss beyond the G4 list | numbers | members missing → "Réinitialisation complète", redo G12-G13 |
 | G14. Doors: 3 members' cards, 1 QR code, 1 expired member (refused), 1 staff card, the reception "Open" button (it needs the PC's connection to the panel: `local_access_api_v2._handle_device_door_open` answers 503 while the panel is unreachable `[CODE]`), on both panels | as expected | the half-state table |
 | G15. Re-tick start-with-Windows; only now the watchdog on, and its `NextRunTime` checked (autostart checklist §4). Open | -- | -- |
 

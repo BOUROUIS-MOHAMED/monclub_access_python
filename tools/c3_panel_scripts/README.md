@@ -73,4 +73,5 @@ The `cards` section counts the members whose card is on the panel but will not b
 MonClub wrote. Below 90 % (or not measured) the list may only show that the panel returns cards in
 another form than MonClub writes them: do not act on it, call the developer. In the CSV, only a row
 whose note ends `no card in MonClub` may be entered at the desk; every other row names a card MonClub
-already holds, which must not be overwritten (see the runbook, A6).
+already holds (first or second card), which must not be overwritten, or a card MonClub holds on another
+member, which must not be entered (see the runbook, A6).

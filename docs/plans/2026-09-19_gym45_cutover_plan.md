@@ -393,8 +393,8 @@ Daily, P1's log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FUL
 `PIN_SCHEME_ACCOUNT_WITHHELD`; `FINGER_SWEEP` lines are expected (every new row starts unswept, ≤100
 pins a day `[CODE]`, harmless on a wiped terminal). **Any new `[T] PIN_SCHEME_SWITCH` after the cutover
 day** (someone edited the scheme, D8) → stop and call the developer. On P2/P3 (D2 a): the two block rules
-still exist in `wf.msc`. Their "last seen" on /access-pcs keeps moving -- the block covers only the
-terminals, so their heartbeats still reach the server. Door complaints → check that person in MonClub (fingers
+still exist in `wf.msc`. Once revoked (runbook D12) they send no heartbeat (§3.3), so their "last seen"
+on /access-pcs stops moving: that says nothing about the block, which only `wf.msc` shows. Door complaints → check that person in MonClub (fingers
 enrolled? membership deliverable?). Delete the biometric backup files per D7.
 
 ## 6. Half-states and rollback

@@ -648,6 +648,42 @@ class TestPanelCards:
         (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
         assert row.note == "cards 5:103:card 3003; no card in MonClub"
 
+    def test_a_card_monclub_holds_on_another_member_is_never_offered_to_the_desk(self, tmp_path):
+        """103 has no card in MonClub, but the card on 103's panel pin is Card Kept's MonClub card
+        (a recycled card, say): entering it on 103 would put one card on two members."""
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        ex = _panel_export(tmp_path / "p5.json", [("101", "Card Kept", "0004001"),
+                                                   ("103", "No Card In MonClub", "4001")])
+        report, details = cte.analyse([cte.load_export(str(ex), 5)], cte.load_access_db(str(db)))
+        cards = report["cards"]
+        assert cards["people_with_terminal_only_card"] == 1
+        assert cards["people_with_terminal_only_card_held_by_another_member"] == 1
+        assert "people_with_terminal_only_card_and_no_monclub_card" not in cards
+        (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
+        assert row.note == ("cards 5:103:card 4001; no card in MonClub"
+                            "; that card is held by another member in MonClub -- do not enter it")
+        assert not row.note.endswith("no card in MonClub")
+
+    def test_a_member_whose_only_monclub_card_is_the_second_is_not_no_card(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute("INSERT INTO sync_users (user_id, active_membership_id, full_name, first_card_id,"
+                     " second_card_id, fingerprints_json) VALUES (6, 106, 'Second Only', '', '6006', '[]')")
+        conn.commit()
+        conn.close()
+        ex = _panel_export(tmp_path / "p5.json", [("106", "Second Only", "6006")])
+        report, details = cte.analyse([cte.load_export(str(ex), 5)], cte.load_access_db(str(db)))
+        cards = report["cards"]
+        assert cards["people_with_second_monclub_card_only"] == 1
+        assert cards["people_without_monclub_card"] == 1                       # 103 only
+        assert cards["people_with_terminal_only_card_and_second_monclub_card_only"] == 1
+        assert "people_with_terminal_only_card_and_no_monclub_card" not in cards
+        (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
+        assert row.note == ("cards 5:106:card 6006; MonClub holds only a second card 6006"
+                            " (a device is sent the first card only) -- do not overwrite it")
+
     def test_the_card_self_check_is_printed_next_to_the_cards_and_stops_below_90(self, tmp_path):
         db = tmp_path / "access.db"
         _access_1_4_30_db(db)

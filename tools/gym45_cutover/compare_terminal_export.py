@@ -283,6 +283,7 @@ class MonClubRow:
     templates: List[MonClubTemplate]
     first_card: str = ""         # wire_card(firstCardId): the one card MonClub pushes to a PullSDK panel
     first_card_raw: str = ""     # firstCardId as MonClub holds it (card_rule turns it into what a device gets)
+    second_card_raw: str = ""    # secondCardId as MonClub holds it: never sent to a device
 
     def person_key(self) -> str:
         if self.main_account_id is not None:
@@ -377,6 +378,7 @@ def load_access_db(path: str) -> AccessDb:
                 templates=templates,
                 first_card=wire_card(c1),
                 first_card_raw=str(c1 or "").strip(),
+                second_card_raw=str(c2 or "").strip(),
             ))
         # A client older than the ownership bit (ownership_confirmed) records none: that is
         # "unknown", never "nobody owns anything".
@@ -537,6 +539,7 @@ def snapshot_from_rows(
             membership_id=am_id, main_account_id=acct, user_id=_int_or_none(user_id), name="",
             cards={c for c in (norm_card(c1), norm_card(c2)) if c}, templates=tpl,
             first_card=wire_card(c1), first_card_raw=str(c1 or "").strip(),
+            second_card_raw=str(c2 or "").strip(),
         ))
     gms = {norm_pin(k): int(a) for k, a in gms_persons if k is not None and _int_or_none(a) is not None}
     notes = [
@@ -916,8 +919,13 @@ def analyse(
     # what MonClub holds in firstCardId, whether or not a device can be sent it
     held_cards = {k: sorted({r.first_card_raw for r in v if not no_monclub_card(r.first_card_raw)})
                   for k, v in persons.items()}
+    # ... and in secondCardId, which never reaches a device
+    held_second = {k: sorted({r.second_card_raw for r in v if not no_monclub_card(r.second_card_raw)})
+                   for k, v in persons.items()}
     crd["people_with_writable_monclub_card"] = sum(1 for k in persons if pushed_cards[k])
-    crd["people_without_monclub_card"] = sum(1 for k in persons if not held_cards[k])
+    crd["people_without_monclub_card"] = sum(1 for k in persons if not held_cards[k] and not held_second[k])
+    crd["people_with_second_monclub_card_only"] = sum(
+        1 for k in persons if not held_cards[k] and held_second[k])
     crd["people_with_unwritable_monclub_card"] = sum(
         1 for k in persons if held_cards[k] and not pushed_cards[k])
     # under ACCOUNT one row per person reaches the terminal, so only one of these cards does
@@ -927,20 +935,31 @@ def analyse(
         if not only:
             continue
         crd["people_with_terminal_only_card"] += 1
-        held = held_cards.get(key, [])
-        marker = any(re.sub(r"\D", "", c).startswith("99999") for c in held)
-        if not held:
-            crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
-            tail = "; no card in MonClub"
-        elif not pushed_cards.get(key):
+        held, second = held_cards.get(key, []), held_second.get(key, [])
+        # a device card that MonClub has on ANOTHER person (a recycled card, say): entering it on
+        # this one would put the same card on two members
+        others = {o for _, _, c, _ in only for o in card_to_persons.get(c, set())} - {key}
+        marker = any(re.sub(r"\D", "", c).startswith("99999") for c in held + second)
+        if held and not pushed_cards.get(key):
             crd["people_with_terminal_only_card_and_unwritable_monclub_card"] += 1
             tail = f"; MonClub card {'/'.join(held)} cannot be written to {device_word} -- do not overwrite it"
-        else:
+        elif held:
             crd["people_with_terminal_only_card_and_another_monclub_card"] += 1
             tail = f"; MonClub card {'/'.join(held)} -- do not overwrite it"
+        elif second:
+            crd["people_with_terminal_only_card_and_second_monclub_card_only"] += 1
+            tail = (f"; MonClub holds only a second card {'/'.join(second)} (a device is sent the first card only)"
+                    " -- do not overwrite it")
+        else:
+            if not others:
+                crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
+            tail = "; no card in MonClub"
         if marker:
             crd["people_with_terminal_only_card_and_99999_monclub_card"] += 1
             tail += " (it starts with 99999: ask the owner first)"
+        if others:
+            crd["people_with_terminal_only_card_held_by_another_member"] += 1
+            tail += "; that card is held by another member in MonClub -- do not enter it"
         for where in {w for *_, w in only}:
             crd[f"terminal_only_card_via_{where}"] += 1
         details.append(DetailRow(
