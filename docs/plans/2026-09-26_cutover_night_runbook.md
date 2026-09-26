@@ -27,8 +27,9 @@ D11, D12, E3 and G. Step IDs are unchanged.
 **P3b-2 in five lines** (part H has the evidence):
 1. The new Access can make one PC the "driver" of a turnstile and every other PC a "reader" that
    never connects to it. That happens only when the server's commands switch is on **and** someone
-   set a driver in the dashboard. Neither can be the case in production today: the switch is off
-   unless set, and the deployment does not set it (part H1).
+   set a driver in the dashboard. Neither should be the case in production today: the switch is off
+   unless the server was started with it, and the deployment does not set it (part H1); the page
+   check below reads the real state on each PC.
 2. **Tonight runs without drivers**, at both gyms, from the gym 58 pre-install (A7) until the night
    is verified (E). Then every running PC connects to every turnstile of its gym -- what this
    runbook was written for. Each PC's « Pilote / Lecteur » page shows it (A7, C10, D11).
@@ -38,7 +39,8 @@ D11, D12, E3 and G. Step IDs are unchanged.
    switch is on, nobody sends remote commands to these gyms and nobody presses « Confirmer la
    suppression » tonight (E3).
 5. Drivers come later, on a quiet day, and each turnstile's driver should be a PC that ran
-   tonight's refill (G, question 17).
+   tonight's refill (G, question 17). A driver, once set at a gym, cannot be removed from the
+   dashboard (H3).
 
 **Grades**, as in the two plans: `[CODE]` (an executable statement, named), `[TEST]`, `[FIELD]` (a dated
 measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated; nobody has checked it here), `[UNVERIFIED]`,
@@ -94,7 +96,7 @@ after. A7 (gym 58 only) is required before the erase, whether or not A1-A6 happe
 | A4 | Gym 45: restart Access on every PC (re-tick the box, `Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` where it existed). Gym 58: go to A7 -- and every gym 58 PC that does **not** get A7 this evening (A7 put off, or the evening stops) gets this same restart of its old Access before you leave | Access is back on every PC that did not get A7 | -- | -- |
 | A5 | At home, on the laptop with the tools: `python tools\gym45_cutover\compare_terminal_export.py --gym-id 58 --export 5=<file> --export 6=<file> --access-db <copy>\access.db --detail-csv <USB key>\cards58.csv` (gym 45: `--gym-id 45`, with `-Fingers` exports, `--detail-csv <USB key>\fingers45.csv`). Write the CSV to the USB key, not into the repo | `== cards …` and, on the line under it, `card self-check (member pins): …` (gym 58); `== people …` and the `sha self-check` line (gym 45) | seconds | gym 58: the card self-check says **BELOW 90 %** or **NOT MEASURED** -- the card list may only show that the panel returns cards in another form than MonClub writes them: do **not** use it at the desk; call the developer (the night can still happen: the list is then unknown, C5) |
 | A6 | The desk fixes MonClub, **only** from a list the self-check passed (A5): **gym 58** -- only the `member_terminal_only_card` rows whose note ends **`no card in MonClub`**: enter that card as the member's card. Every other row names a card MonClub already holds (as first or as second card), or a panel card MonClub holds on **another** member ("that card is held by another member in MonClub -- do not enter it"): **never overwrite, never enter** (the note says so). The tool checks the other members only among the current members it loaded (the PC's delivered roster): **before entering a card, the desk searches that card number in MonClub**, and does not enter it if anyone holds it (whether MonClub refuses a duplicate card is `[UNVERIFIED]`). Never touch a MonClub card starting with `99999` -- what that marker means is `[UNVERIFIED]` (`device_sync._normalize_device_card` calls it an "anti-abuse prefix" in a comment only); those members are refused by that panel card after the erase and are sorted out when they come to the desk, with you. **Gym 45** -- re-enrol the fingers listed in `member_terminal_only_finger` rows (gym 45 plan G4 on the `sha self-check`) | -- | depends on the list | -- |
-| A7 | **Gym 58 only, required before any erase** (after A1-A3 the same evening, or at the latest on the night at C3c). **Only with the release that passed B1** (its checklist ticked) and its installer downloaded as in B4 -- on a survey evening days before the night, do B1 and B4's release-installer part first (B2, the server minimum, can wait until the night). Before A7 on each PC, check that the **previous** installer for the version A1 just recorded is on the key: without it that PC has no rollback -- do A7 on that PC another evening, once it is found, or you accept it (G). On every PC that will run Access, the new installer **over** the existing Access -- **never uninstall first** (the uninstaller deletes the whole `%ProgramData%\MonClub Access` folder) -- with **"Launch MonClub Access" unticked** on the last page. "Keep MonClub Access running": as the autostart checklist says on a survey evening (the PC then runs normally for days); **unticked** on the night (C3c). Start Access (the panels connected, still "Par abonnement"): it keeps its login; on "Identité du poste" choose **"C'est un nouveau PC"** and the name staff use. On a survey evening, when the checks pass: re-tick "Ouvrir MonClub Access avec Windows" (the PC runs normally until the night) | "Postes de réception" lists each PC with version X.Y.Z; newest log in `%ProgramData%\MonClub Access\data\logs\`: `App started. pid=… version=X.Y.Z`, then `getSyncData OK`, then `[DeviceSync] Device id=5: device_pins=…` and the same for 6, with no `REVOKE_ABORTED`. A minute or more after the start, the PC's « Pilote / Lecteur » page (press « Actualiser »): « Rôle de ce PC » reads **« Inconnu »** or **« Tous les tourniquets (sans affectation) »** (part H4). Test one member's card and one QR code at each door | not measured | The « Pilote / Lecteur » page reads anything else (« PC pilote », « PC lecteur », « REVOKED »): a driver is set at gym 58 -- this runbook does not cover it; Quit Access on that PC and call the developer (part H). The installer fails, Access does not open (`%TEMP%\MonClubAccess.log`), or the log shows `REVOKE_ABORTED`: part F, row "the new Access does not start -- before the erase", and call the developer. A refused card or QR code first gets C16's checks (that card is on that member in MonClub; the member is current; the QR rescue setting, gym 58 plan E2): roll back only when those are right and the call with the developer says so. Gym 58 is not done until the developer has fixed it |
+| A7 | **Gym 58 only, required before any erase** (after A1-A3 the same evening, or at the latest on the night at C3c). **Only with the release that passed B1** (its checklist ticked) and its installer downloaded as in B4 -- on a survey evening days before the night, do B1 and B4's release-installer part first (B2, the server minimum, can wait until the night). Before A7 on each PC, check that the **previous** installer for the version A1 just recorded is on the key: without it that PC has no rollback -- do A7 on that PC another evening, once it is found, or you accept it (G). On every PC that will run Access, the new installer **over** the existing Access -- **never uninstall first** (the uninstaller deletes the whole `%ProgramData%\MonClub Access` folder) -- with **"Launch MonClub Access" unticked** on the last page. "Keep MonClub Access running": as the autostart checklist says on a survey evening (the PC then runs normally for days); **unticked** on the night (C3c). Start Access (the panels connected, still "Par abonnement"): it keeps its login; on "Identité du poste" choose **"C'est un nouveau PC"** and the name staff use. On a survey evening, when the checks pass: re-tick "Ouvrir MonClub Access avec Windows" (the PC runs normally until the night) | "Postes de réception" lists each PC with version X.Y.Z; newest log in `%ProgramData%\MonClub Access\data\logs\`: `App started. pid=… version=X.Y.Z`, then `getSyncData OK`, then `[DeviceSync] Device id=5: device_pins=…` and the same for 6, with no `REVOKE_ABORTED`. After « Identité du poste », the PC's « Pilote / Lecteur » page shows one of part H4's two **expected** readings (press « Actualiser »; a PC registered after its start first asks the server up to a few minutes later -- or Quit and start Access again, H4). Test one member's card and one QR code at each door | not measured | The « Pilote / Lecteur » page reads « PC pilote », « PC lecteur » or « REVOKED »: a driver is set at gym 58 -- this runbook does not cover it (the way back is the server's commands switch off, H3); Quit Access on that PC and call the developer. No expected reading after a restart of Access: call the developer (H4). The installer fails, Access does not open (`%TEMP%\MonClubAccess.log`), or the log shows `REVOKE_ABORTED`: part F, row "the new Access does not start -- before the erase", and call the developer. A refused card or QR code first gets C16's checks (that card is on that member in MonClub; the member is current; the QR rescue setting, gym 58 plan E2): roll back only when those are right and the call with the developer says so. Gym 58 is not done until the developer has fixed it |
 
 **Why A7 is required.** The installer deletes the old program before copying the new one
 (`installer/MonClubAccess.iss::PrepareToInstall` → `DeleteTreeIfExists({app}\current)`) `[CODE]`, and a
@@ -194,7 +196,7 @@ measured on a C3-400. If C6 has not started by that time: stop, nothing has chan
 | C7 | Check each is empty: a new export (A2 command) says `complete`, no `error:` line, and in the file `counts.user`, `counts.userauthorize` and `counts.templatev10` are each exactly `0` (a `FAILED` or `null` count is **not** 0) and `summary.users` is `0`; one member's card at that door is refused | both | minutes | not empty: back to C6. A count `FAILED`: call the developer -- the panel is not proven empty |
 | C8 | **Pull the network cable of both panels** (leave them powered) and run each A2 command | each ends with `CONNECT FAILED` **with the same `PullLastError` code as that panel's A2b reference** | minutes | it still connects: find the right cable before going on. `CONNECT FAILED` with **another** code: STOP -- something other than the pulled cable refused the connection (for example another PC still holding the panel; whether a C3-400 refuses a second client is `[UNVERIFIED]`): find it before C9 |
 | C9 | **No installer runs after the erase.** Every PC that will run Access already has the new version (C5) | -- | -- | a PC without it: it stays blocked or unplugged (C1b), off tonight |
-| C10 | Start Access on each PC. It keeps its login and its registration (A7) | "Postes de réception" lists each PC with the new version, seen a moment ago; a minute or more after the start, each PC's « Pilote / Lecteur » page reads « Inconnu » or « Tous les tourniquets (sans affectation) » (A7, part H4) | seconds after start (the PC reports at start) | Access does not open (`%TEMP%\MonClubAccess.log`): part F, "the new Access does not start -- after the erase". The page reads anything else: a driver is set at gym 58 -- Quit Access on every PC, call the developer (part H); nothing is plugged in; if it is not solved within the go/no-go clock, part F |
+| C10 | Start Access on each PC. It keeps its login and its registration (A7) | "Postes de réception" lists each PC with the new version, seen a moment ago; each PC's « Pilote / Lecteur » page shows one of part H4's two **expected** readings (A7) | seconds after start (the PC reports at start) | Access does not open (`%TEMP%\MonClubAccess.log`): part F, "the new Access does not start -- after the erase". The page reads « PC pilote », « PC lecteur » or « REVOKED »: a driver is set at gym 58 -- Quit Access on every PC, call the developer (the way back is the server's commands switch off, H3); nothing is plugged in; if it is not solved within the go/no-go clock, part F |
 | C11 | Any gym 58 PC not started at C10 stays blocked (C1b) or unplugged and switched off, whatever its version, until it is brought back as C1b says. **Revoking does not replace the block**: an old one was never registered, and a revoke does not stop an old Access anyway (D12). Nor a new one tonight: the new Access stops driving on a revoke only in a gym that uses drivers (`app/core/v2/leases.py::LeaseManager._drop_leases` returns at once otherwise) `[CODE]`, and gym 58 has none (part H) | -- | -- | -- |
 | C12 | Dashboard, reload. On the "add a device" form (then cancel) the verdict now says **"Tous les PC enregistrés de ce club font tourner au moins la version X.Y.Z…"**. Open device 5: choose **"Par personne"**, tick **both** boxes ("Je confirme que MonClub Access a été mis à jour…", "Je confirme que les utilisateurs de ce terminal ont été effacés"), **"Les deux sont faits — enregistrer"**. Same for device 6. Reopen each | the dialog names version X.Y.Z; after saving, each reads "Par personne" | a minute | refused (red message): it names the PCs in the way; revoke a retired one in "Postes de réception" |
 | C13 | On each running PC, newest file in `%ProgramData%\MonClub Access\data\logs\`: search `PIN_SCHEME_SWITCH`. Want `device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` and the same for `device_id=6`. At gym 58 `cleared_rows` is a big number: **normal here**. **Then, on every running PC, the restart, proven three ways** (box "Proving a restart" below) | both lines on every running PC, then the three restart checks | a few minutes | no line: search `getSyncData OK`; then dashboard page of Access → **"Réinitialisation complète"**; still none: **do not plug in**, call the developer. A restart check fails: **do not plug in** |
@@ -214,6 +216,10 @@ once, saying so only in `%TEMP%\MonClubAccess.log` (`access/main.py`) `[CODE]`. 
    every start) whose time is **later than the `PIN_SCHEME_SWITCH` lines**, and whose `pid` differs from
    the previous `App started` line's.
 3. **After** that `App started` line, a `getSyncData OK` line.
+
+Then, before any plug-in, the « Pilote / Lecteur » page of that PC shows one of part H4's two **expected** readings: after
+this restart the PC has its identity, and it asks the server 12 s after the start (part H4). No
+expected reading: **do not plug in**, call the developer.
 
 Why: if the dashboard was open on a gym PC when you saved "Par personne", the switch reached that
 PC's Access directly (a fast patch) and was logged, but its running turnstile workers keep their old
@@ -273,7 +279,7 @@ The PCs that are **not** reinstalled tonight get the plan's §5.2 firewall block
 | D8 | **Interlock**: network cables out of both terminals (they keep power), or the firewall block proven on P1 (plan §5.2) | the export now fails to connect | minutes | it still connects: find the right cable |
 | D9 | On every PC that will run Access: the new installer **over the existing Access -- never uninstall first** (the uninstaller deletes the whole `%ProgramData%\MonClub Access` folder: login, history, the rollback). On its pages: **untick "Keep MonClub Access running"** (the installer re-ticks your previous choice and would re-register the watchdog as a new, enabled task, which restarts Access by itself before the retire) and **untick "Launch MonClub Access"**. Right after: `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` | the installer ends; the watchdog `Disabled` or nothing printed; Task Manager: no `MonClubAccess.exe` | not measured | the installer fails: part F, "the new Access does not start -- after the erase". The watchdog reads `Ready` or `Running`: `Disable-ScheduledTask …`, Quit Access if it started, check again -- and if Access ran on that PC before the retire, D14 decides |
 | D10 | **The retire**, per PC (blocker 3), before Access starts -- see the box below | (a) the action's counts 0; (b) the plan §5.1 counts 0; (c) the renamed folder exists and `data\app.db` is moved | minutes | a failure: put the D3 copy back, stop (plan R2) |
-| D11 | Start Access on P1 (and on each other PC that will run). With a fresh folder (c): log in, and on "Identité du poste" choose **"Ce PC remplace un ancien poste"** and pick that PC's own record | "Postes de réception" shows the new version for it; a minute or more after the start (and after "Identité du poste" with (c)), its « Pilote / Lecteur » page reads « Inconnu » or « Tous les tourniquets (sans affectation) » (part H4) | seconds | Access does not open (`%TEMP%\MonClubAccess.log`): part F, "the new Access does not start -- after the erase". The page reads anything else: a driver is set at gym 45 -- Quit Access on every PC, call the developer (part H); nothing is plugged in; if it is not solved within the N3 clock, part F |
+| D11 | Start Access on P1 (and on each other PC that will run). With a fresh folder (c): log in, and on "Identité du poste" choose **"Ce PC remplace un ancien poste"** and pick that PC's own record | "Postes de réception" shows the new version for it; its « Pilote / Lecteur » page shows one of part H4's two **expected** readings (after "Identité du poste" with (c): H4, a PC registered after its start) | seconds | Access does not open (`%TEMP%\MonClubAccess.log`): part F, "the new Access does not start -- after the erase". The page reads « PC pilote », « PC lecteur » or « REVOKED »: a driver is set at gym 45 -- Quit Access on every PC, call the developer (the way back is the server's commands switch off, H3); nothing is plugged in; if it is not solved within the N3 clock, part F |
 | D12 | "Postes de réception": **revoke** every gym 45 record whose PC is not reinstalled tonight -- that is what lets the server accept "Par personne". **A revoke does NOT stop an old Access from syncing or pushing**: 1.4.32/1.4.33 fetch the members with the gym login, and the revoke only stops that PC's heartbeat (`git show access_1.4.33:access/pc_identity.py`, state `revoked`; `…:app/ui/app.py::_sync_tick` calls `get_sync_data` with the gym login token) `[CODE]`; the server's member sync checks no PC status (backend `GymAccessController`, review 2026-09-26). What keeps those PCs off the terminals is the D1 block (or the PC unplugged) -- never the revoke. The new Access too drives on after a revoke tonight: it stops only in a gym that uses drivers (`app/core/v2/leases.py::LeaseManager._drop_leases`) `[CODE]`, and gym 45 has none (part H) | the verdict on the add-device form: "Tous les PC enregistrés…" | a minute | a PC not reinstalled has no proven block: do not go on until it is blocked or unplugged |
 | D13 | Devices 8 and 10: "Par personne", tick both boxes, "Les deux sont faits — enregistrer"; reopen each (plan E9) | each reads "Par personne" | a minute | refused: the red message names the PCs in the way |
 | D14 | **Each running PC's** log (every PC started at D11): `[T] PIN_SCHEME_SWITCH device_id=8 previous=MEMBERSHIP scheme=ACCOUNT cleared_rows=0` and the same for 10 (plan E10). After a fresh data folder (D10 (c)) whose first successful sync came only after D13, the line reads `previous=UNKNOWN scheme=ACCOUNT cleared_rows=0 first_sighting=True` instead: also right (`db.py::_record_device_pin_scheme_switch`, first sighting on ACCOUNT) `[CODE]`. **Here it must be `cleared_rows=0` on every one of them** | both lines on every running PC | a few minutes | `cleared_rows` not 0 on a PC: STOP, do not plug in. Quit that PC and keep it Quit; plan E10's fail column (an E6 export: the terminal still empty?). Then retire that PC again (D10, Access stopped). With (a) or (b): the counts for 8 and 10 are 0, and the switch line does not come again -- the switch is already recorded on that PC (`db.py::_record_device_pin_scheme_switch` records nothing when the scheme is unchanged) `[CODE]`. With (c) -- where a non-zero `cleared_rows` most likely means `data\app.db` was not moved: check that first -- a fresh folder again, renamed to `access_before_cutover_2` (never touch the first kept folder: it is a rollback); its first start logs `previous=UNKNOWN scheme=ACCOUNT cleared_rows=0 first_sighting=True` for 8 and 10 -- that is the check. No line: plan E10's fail column |
@@ -303,7 +309,7 @@ The PCs that are **not** reinstalled tonight get the plan's §5.2 firewall block
 |---|---|---|---|
 | E1 | Be there at opening. Watch the first ten entries | members pass | a refused member: are their card / fingers in MonClub? Is the membership valid? Staff open with "Ouvrir" (it works while that turnstile is connected; during a push chunk it can time out) and send them to the desk |
 | E2 | The desk has the two lists (gym 58: only the rows whose note **ends with** `no card in MonClub` are entered, after the desk searched that card number in MonClub, A6; gym 45: fingers to re-enrol) | -- | -- |
-| E3 | Each driving PC, newest log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no `PIN_SCHEME_ACCOUNT_WITHHELD`; **no new `PIN_SCHEME_SWITCH`** after the night (someone changed the setting: call the developer). If the server's commands switch is on (part H5): the dashboard may also list these as turnstile problems -- **nobody presses « Confirmer la suppression »** on a list for devices 5, 6, 8 or 10 until the developer has read it; and « Pilote / Lecteur » still reads « Inconnu » or « Tous les tourniquets (sans affectation) » on each PC | clean | call the developer |
+| E3 | Each driving PC, newest log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no `PIN_SCHEME_ACCOUNT_WITHHELD`; **no new `PIN_SCHEME_SWITCH`** after the night (someone changed the setting: call the developer). If the server's commands switch is on (part H5): the dashboard may also list these as turnstile problems -- **nobody presses « Confirmer la suppression »** on a list for devices 5, 6, 8 or 10 until the developer has read it; and « Pilote / Lecteur » still shows one of part H4's two **expected** readings on each PC | clean | call the developer |
 | E4 | "Postes de réception": each PC that ran tonight seen in the last minutes, with the new version. (The PCs blocked at C1b / D1 were shut down; a revoked one sends no heartbeat, D12) | yes | a PC off: autostart checklist |
 | E5 | The next days: the same log check once a day. Once the night is verified: delete the export JSON files and the CSV files from every place they are in -- the `exports\` folder of the tools on **every PC where a tool ran** (the driving PCs, and each PC that got the block proof at C1b / D1: the `blocktest` / `test` runs are full user lists too), the USB key, the laptop -- and the biometric backups per gym 45 plan D7 | -- | -- |
 
@@ -348,7 +354,7 @@ read 2026-09-26) and deletes the program folder before copying `[CODE]`.
 The ten questions of the first round, then the ones the second and third rounds add. The owner page of
 2026-09-26 ("Cutover Night, Round 2") numbers them differently: its 1-10 are 1-10 here; its 11-15 are
 12-16 here; its 16-22 split question 11 (gym 45 plan D2, D5, D7, D8, D10, D11, D13). The third round
-widens 16 (page 15) and adds 17 (page 23).
+widens 16 (page 15) and adds 17 (not on the page yet).
 
 1. Which Access version is the release, and who ticks its checklist (release checklist)?
 2. Gym 58's panel erase: a tool in the release, or the ZKTeco software (gym 58 plan E1)? Or does gym 58 wait, and the night is gym 45 only?
@@ -379,22 +385,23 @@ driver set in the dashboard.
 
 | The PC runs | It connects to | Evidence |
 |---|---|---|
-| An old Access (1.4.33 or older, the untagged 1.4.32 included) | every turnstile of its gym, always: it has no driver code | `git ls-tree access_1.4.33 app/core/v2` lists nothing `[CODE]`; 1.4.32 was never tagged `[UNVERIFIED]` |
+| An old Access (1.4.33 or older, the untagged 1.4.32 included) | every turnstile of its gym, always: it has no driver code | `git ls-tree access_1.4.33 app/core/v2` lists nothing `[CODE]`; 1.4.32 has no tag to read (`git tag -l access_1.4.32` is empty), so for it this is `[UNVERIFIED]` |
 | The new Access, the server's commands switch **off** | every turnstile of its gym | every v2 route answers 404 `NOT_FOUND`; the PC reads it as "switched off" and allows every turnstile (`app/core/v2/leases.py::LeaseManager.refresh`, `lease_gate.py` mode `ALL`) `[CODE]` `[TEST: test_v2_runtime.py::test_an_old_server_keeps_everything_dormant]` |
 | The new Access, the switch **on**, no driver set at the gym | every turnstile of its gym (« Tous les tourniquets (sans affectation) ») | `lease_gate.snapshot_from_assignment`: `gymUsesAssignments` false → mode `ALL` `[CODE]`; the server makes it true as soon as the gym has one driver row (`AccessAssignmentQueryService.GymSnapshot.usesAssignments`) `[CODE, backend]` |
 | The new Access, the switch on, **a driver set for any turnstile of the gym** | only the turnstiles it drives; a PC without a driver lease connects to **none** | `lease_gate.LeaseSnapshot.allows`, checked at every place the PC connects (guide §3.9) `[CODE]` `[TEST: test_v2_lease_gate.py]` |
 | The new Access, the server not reachable | what its cached roles say; with no cache, every turnstile | `app/ui/app.py` installs the cache before the first sync tick (`runtime.py::load_cached_roles`); an error keeps what is installed (`LeaseManager.refresh`) `[CODE]` |
 | Any PC whose panel / terminal cable is out, or behind the firewall block | nothing | unchanged |
 
-**Production today.** The commands switch is `false` unless set (`application.yml`:
-`${MONCLUB_ACCESS_V2_COMMANDS_ENABLED:false}`) and the backend's deployment passes no `MONCLUB_ACCESS_*`
-variable (`.gitlab-ci.yml`, `docker run`) `[CODE, backend main 919231a8]`; which build runs in
-production cannot be read from anywhere (gym 45 plan §3.2). A driver cannot be created while the
+**Production today.** The commands switch is `false` unless the server is started with it
+(`application.yml`: `${MONCLUB_ACCESS_V2_COMMANDS_ENABLED:false}`), and the backend's CI passes no
+`MONCLUB_ACCESS_*` variable to its `docker run` `[CODE, backend main 919231a8, .gitlab-ci.yml]`. That is
+the pipeline, not the running server: which build runs in production, and with what, cannot be
+read from anywhere (gym 45 plan §3.2) `[UNVERIFIED]` -- the page check (H4) reads the answer on each PC. A driver cannot be created while the
 switch is off (`AccessLeaseService` exists only with it on), and with it on every gym's driver screen
 stays locked until `MONCLUB_ACCESS_V2_ASSIGNMENT_MIN_ACCESS_VERSION` is set, every ACTIVE PC of the gym
 reports that version, **and** someone pressed « Confirmer qu'aucun poste non enregistré ne tourne ici »
 for that gym (`AccessAssignmentLock.evaluate`; dashboard `src/locales/fr/access-assignment.ts`)
-`[CODE, backend and dashboard main]`.
+`[CODE, backend and dashboard main]`. Once set, a driver is not removed again from the dashboard (H3).
 
 **Tonight**, with no driver set, every running new-Access PC connects to both devices of its gym --
 like the old Access, and as every step of parts A-F assumes.
@@ -408,8 +415,8 @@ Why, from the code:
 1. **A driver is not an interlock.** Only the new Access obeys it, and only from what the server last
    said: a PC with no cached roles connects to every turnstile until the server answers, and the v2
    part starts 12 s after launch (`access/runtime.py::schedule_access_shell_startup`). A fresh data
-   folder (D10 (c)) deletes the cached roles and the PC's identity file together (`v2_kv` in
-   `access\access.db`, `access\pc_identity.dat`: `app/core/v2/store.py`,
+   folder (D10 (c)) leaves the cached roles and the PC's identity file behind, in the renamed
+   folder, so the new one starts with neither (`v2_kv` in `access\access.db`, `access\pc_identity.dat`: `app/core/v2/store.py`,
    `access/pc_identity.py::PcCredentialStore`, `app/core/utils.py::ACCESS_DATA_DIR`) `[CODE]`. The
    cables and the firewall blocks stay the interlock.
 2. **A new driver writes "add-only".** Until it has restored the server's ownership record for its
@@ -423,8 +430,11 @@ Why, from the code:
    member, a power-on without internet -- P3b-2 report); what a C3 panel does with two PC sessions at
    once is `[UNKNOWN]` (guide §3.9).
 4. **A reader's « Ouvrir » goes through the server to the driver:** it needs the internet and the
-   driver PC on, opens for 3 s whatever the favourite says, and shows « demandé au PC pilote », never
-   « ouverte » (`local_api_routes.py::_door_request_via_driver`, `handlers.py::door_open`) `[CODE]`.
+   driver PC on, opens for 3 s whatever the favourite says, and the screen says only that the request
+   went to the driver (« Demande envoyée au PC pilote. Son résultat n'est pas visible ici. », or that
+   it will expire without opening when the driver is not connected), never that the door opened
+   (`local_api_routes.py::_door_request_via_driver`, `v2/handlers.py::CommandHandlers.door_open`,
+   `tauri-ui/src/api/realtime.ts::doorRequestedMessage`) `[CODE]`.
    Not something to learn on the night.
 
 ### H3. Drivers after the night (G, question 17)
@@ -442,27 +452,39 @@ Why, from the code:
   PC's own proof wins") `[CODE]`. A member its driver did not push, and that no upload holds, is never
   removed by that driver when the member leaves (guide §3.9, residual; P3b-2 report, "Members pushed
   before the gym used drivers") `[CODE]`.
+- **A driver cannot be taken back.** Once a gym has one driver row -- even a released one -- the
+  server treats it as a gym with drivers for good (`AccessAssignmentQueryService`: every lease row
+  of a turnstile the gym still has, whatever its state; `GymSnapshot.usesAssignments` is
+  `!leaseByDevice.isEmpty()`), and the dashboard can only move a turnstile to another PC, never back
+  to "no driver" (`AccessLeaseService.validateChanges` refuses a change with no PC,
+  `CHANGES_INVALID`) `[CODE, backend]`. Revoking the driver PC leaves that turnstile with no PC at
+  all (`AccessLeaseService.releaseByRevoke`) `[CODE, backend]`. On the PCs the only way back to
+  "every PC connects" is the server's commands switch off -- for every gym, with a backend restart
+  (`LeaseManager.refresh` on the 404) `[CODE]`; how long that takes is `[UNVERIFIED]`. The first
+  driver at a gym is a one-way step: a quiet day, never the night.
 - So: drivers only after the night is verified, after the switch has been on while the PCs that ran
   tonight were running; and each turnstile's driver is a PC that ran tonight's refill (gym 45: P1;
   gym 58: one of the PCs started at C10) -- that covers it even if an upload is missing.
 
-### H4. The page check (A7, C10, D11, E3)
+### H4. The page check (A7, C10, D11, E3, and the restart box of part C)
 
-On each running PC, the new Access's **« Pilote / Lecteur »** page (main menu), a minute or more after
-the start, press « Actualiser ». « Rôle de ce PC »:
+On each running PC, the new Access's **« Pilote / Lecteur »** page (main menu); press « Actualiser ».
+« Rôle de ce PC », and the line under it:
 
 | It reads | Under it | Meaning |
 |---|---|---|
-| « Inconnu » | « Serveur sans v2 (fonctionnement habituel) » | commands switch off: every turnstile. **Expected** |
-| « Inconnu » | « Pas encore démarré » (the first 12 s) or « Serveur injoignable pour l'instant (rôles du cache local) » | no role known: every turnstile. Fine; check again a minute later |
-| « Tous les tourniquets (sans affectation) » | « Serveur v2 actif » | switch on, no driver: every turnstile. Fine -- then H5's rules apply |
+| « Inconnu » | « Serveur sans v2 (fonctionnement habituel) » | commands switch off: every turnstile. **Expected reading 1** |
+| « Tous les tourniquets (sans affectation) » | « Serveur v2 actif » | switch on, no driver: every turnstile. **Expected reading 2** -- then H5's rules apply |
+| « Inconnu » | « Pas encore démarré » (the first 12 s) or « Serveur injoignable pour l'instant (rôles du cache local) » | **not yet a proof**: the PC connects to every turnstile for now, but it has not heard the server, and a driver set there would reach it later and stop it in the middle of a refill. It asks 12 s after each start, then 2, 4, 8, 16 and 30 min after each failure; a PC registered after its start (A7, D10 (c)) has no identity at its 12 s question (`runtime.py::V2Runtime.refresh_assignment`, `api.py` `NO_PC_TOKEN`) `[CODE]`. Wait and press « Actualiser », or Quit and start Access again; still this after a restart: call the developer before any plug-in |
 | « PC pilote », « PC lecteur », « REVOKED » | anything | **a driver is set at this gym: STOP** (the step's STOP column) |
 
 `[CODE: tauri-ui/src/pages/RealtimePage.tsx AVAILABILITY_FR; tauri-ui/src/api/realtime.ts ROLE_LABEL_FR;
 access/v2_routes.py::_handle_v2_status]`. The page exists only in a release whose shell was rebuilt
-(release checklist §2). The log says the same: a line starting `[V2] roles` that names `LEASED`,
-`DRIVER`, `READER` or `REVOKED` is the same STOP (`runtime.py::V2Runtime._on_lease_change`,
-`leases.py::LeaseManager.load_cache`, both at INFO) `[CODE]`.
+(release checklist §2). The log says the same, at INFO: `[V2] server v2 availability: UNKNOWN -> OFF`
+(or `-> ON`) is the answer that makes a reading expected (`runtime.py::V2Runtime._set_availability`);
+a line containing `[V2] roles` whose part after `->` or after `role=` names `LEASED`, `DRIVER`,
+`READER` or `REVOKED` is the STOP (`runtime.py::V2Runtime._on_lease_change`,
+`leases.py::LeaseManager.load_cache`) `[CODE]`.
 
 ### H5. What the commands switch changes tonight
 
@@ -491,8 +513,9 @@ question to the server every 30 min (guide §3.9) `[CODE]`.
   `[CODE]`. A successful sync refreshes the running workers, but the restart after the switch stays
   the proof (C13's box), switch on or off.
 - **The missing-member re-add** does nothing to an erased device: a listing that shows none of
-  MonClub's pins changes nothing and reports nothing (`app/core/v2/loss.py::evaluate_listing`)
-  `[CODE]`.
+  MonClub's pins changes nothing and reports nothing -- on the MB2000
+  (`app/core/v2/loss.py::evaluate_listing`) and on a C3 panel (`device_sync.py::_sync_one_device`,
+  the report only when `_owned & device_pins`) `[CODE]`.
 
 ### H6. Does any step need a switch on or off?
 

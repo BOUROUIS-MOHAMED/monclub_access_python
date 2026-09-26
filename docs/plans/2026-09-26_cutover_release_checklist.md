@@ -46,7 +46,7 @@ For the night, in plain words:
 
 - **With the server's commands switch off -- production today** (the backend's CI passes no
   `MONCLUB_ACCESS_*` variable to `docker run`, `.gitlab-ci.yml`, backend `main` `919231a8`
-  `[CODE]`): every v2 route answers 404 `NOT_FOUND`, the PC reads it as "switched off", allows every
+  `[CODE]`; the running server's state is `[UNVERIFIED]` -- the runbook's page check reads it): every v2 route answers 404 `NOT_FOUND`, the PC reads it as "switched off", allows every
   turnstile, opens no socket, uploads nothing, and asks again every 30 min
   `[CODE: leases.py::LeaseManager.refresh, runtime.py::V2Runtime.refresh_assignment]`
   `[TEST: test_v2_runtime.py::test_an_old_server_keeps_everything_dormant; e2e 5/5 with the switch off, guide §3.9]`.
@@ -63,7 +63,8 @@ For the night, in plain words:
   tick (none cached → every turnstile) and the v2 runtime starts 12 s after launch
   (`app.py` `load_cached_roles`, `access/runtime.py::schedule_access_shell_startup`) `[CODE]`.
 - P3b-2 does **not** refresh the running workers on a `pinScheme` fast patch: the restart after the
-  switch stays (§3a, runbook C13's box) `[CODE: guide §3.2e, "Not changed"]`.
+  switch stays (§3a, runbook C13's box) `[CODE: app/ui/app.py::apply_fast_patch_bundle -- its
+  GYM_DEVICE branch calls _request_running_ultra_sync, never refresh_devices; guide §3.2e]`.
 
 ## 2. MUST pass on the release commit
 
@@ -73,7 +74,7 @@ For the night, in plain words:
 | ☐ | `python tools/check_sql_arity.py` on the release commit | PASS |
 | ☐ | **The version gate.** `X.Y.Z` is higher than any version a production PC has ever reported. `update.json`, `tauri.conf.json`, `Cargo.toml` and `package.json` have said `1.4.34` since `eeae1ed` (2026-09-13, "release: MonClub Access and TV 1.4.34 shells"), and no tag `access_1.4.34` exists `[CODE: git tag]`: every build made from `master` since then reports `1.4.34`. Whether any was installed on a gym PC is `[UNKNOWN]` (untagged builds do reach gyms: "Accueil Oxyfit" runs 1.4.32, never tagged, gym 45 plan §1). Check the version column of "Postes de réception" (/access-pcs) for every gym | no PC anywhere reports `X.Y.Z` or higher. Why: both server minimums (§5a) compare the version the PC reports; an older build reporting the same number would pass the pin-scheme gate and the assignment lock |
 | ☐ | The version in the installer, `update.json` and the Tauri files is `X.Y.Z` (`packaging/sync_tauri_version_files.py`, `tests/test_tauri_version_sync.py`) | the three agree |
-| ☐ | **The Tauri shell is rebuilt**, not only the Python part. P3b-2 changed `tauri-ui/src-tauri/src/lib.rs` (tray menu, global favourite shortcuts) and the pages bundled into the shell (`RealtimePage.tsx` « Pilote / Lecteur », `DevicesPage.tsx`, `TrayPanelPage.tsx`, `FavoritesOverlayPage.tsx`, `EnrollPage.tsx`) `[CODE: git diff --stat 2f6b96e 318fb3d -- tauri-ui]`. A Python-only release keeps the old shell's messages and has no « Pilote / Lecteur » page (P3b-2 report) -- which the runbook's C10 / D11 check reads | the installed shell shows the « Pilote / Lecteur » menu entry |
+| ☐ | **The Tauri shell is rebuilt**, not only the Python part. P3b-2 changed `tauri-ui/src-tauri/src/lib.rs` (tray menu, global favourite shortcuts) and the pages bundled into the shell (`RealtimePage.tsx` « Pilote / Lecteur », `DevicesPage.tsx`, `TrayPanelPage.tsx`, `FavoritesOverlayPage.tsx`, `EnrollPage.tsx`) `[CODE: git diff --stat 2f6b96e 318fb3d -- tauri-ui]`. The pages are compiled into the shell (`tauri-ui/src-tauri/tauri.conf.json`: `"frontendDist": "../dist"`), and `build_release.ps1 -SkipTauriBuild` reuses an already staged shell `[CODE]`: a release built that way keeps the old tray and shortcut messages (P3b-2 report) and has no « Pilote / Lecteur » page -- which the runbook's A7 / C10 / D11 check reads | the installed shell shows the « Pilote / Lecteur » menu entry |
 | ☐ | The installer is built after the owner's own installer / watchdog edits are committed -- never over them | the owner says so |
 | ☐ | The tag `access_X.Y.Z` exists and is published, so the PCs and the owner's USB key get the same file | the download URL works |
 | ☐ | **Only after all of the above:** the server minimum is set to exactly `X.Y.Z` (backend doc: one-line commit + deploy, or `MONCLUB_ACCOUNT_PIN_MIN_ACCESS_VERSION` added to the CI's `docker run`, then a restart); its start-up log shows it at INFO | runbook B2 |
@@ -97,7 +98,7 @@ from it is merged; do not tick a row below on its word -- tick it on the merged 
 
 | ✓ | Item | Needed for | If not built |
 |---|---|---|---|
-| ☐ | **Gym 45 "retire" method** (gym 45 plan D3) -- **owner decision pending** (runbook G question 3): (a) an action in the release -- per device, only after a verified wipe, only with the ULTRA engine not started (a command-line mode that exits), refuses a device with push intents or rows written after the last recorded switch; deletes that device's `device_sync_state`, `device_push_intent`, `device_content_mirror` rows; never `device_pin_scheme_switch`, `device_pin_scheme_seen`, `access_history`, `member_account_link`; guide §3.2e updated -- or (b) SQL by a technician, or (c) a fresh data folder. With P3b-2 a fresh folder (c) also drops the cached driver/reader roles and the PC's identity file (both under `%ProgramData%\MonClub Access\access\`: `v2_kv` in `access.db`, `pc_identity.dat`) `[CODE: app/core/v2/store.py, access/pc_identity.py::PcCredentialStore, app/core/utils.py::ACCESS_DATA_DIR]` -- harmless while gym 45 has no driver (runbook part H) | gym 45 | the runbook's D10 (b) or (c) |
+| ☐ | **Gym 45 "retire" method** (gym 45 plan D3) -- **owner decision pending** (runbook G question 3): (a) an action in the release -- per device, only after a verified wipe, only with the ULTRA engine not started (a command-line mode that exits), refuses a device with push intents or rows written after the last recorded switch; deletes that device's `device_sync_state`, `device_push_intent`, `device_content_mirror` rows; never `device_pin_scheme_switch`, `device_pin_scheme_seen`, `access_history`, `member_account_link`; guide §3.2e updated -- or (b) SQL by a technician, or (c) a fresh data folder. With P3b-2 a fresh folder (c) also leaves the cached driver/reader roles and the PC's identity file behind in the renamed folder (both under `%ProgramData%\MonClub Access\access\`: `v2_kv` in `access.db`, `pc_identity.dat`) `[CODE: app/core/v2/store.py, access/pc_identity.py::PcCredentialStore, app/core/utils.py::ACCESS_DATA_DIR]` -- harmless while gym 45 has no driver (runbook part H) | gym 45 | the runbook's D10 (b) or (c) |
 | ☐ | The installer's "Launch MonClub Access" stays ticked by default; the runbook unticks it by hand. The watchdog default changes later (owner decision, after his installer edits) | -- | -- |
 
 ## 4. Other sessions
@@ -141,7 +142,10 @@ How they combine:
 - A driver lease can only be created while the commands switch is on (`AccessLeaseService` is
   conditional on it), and `gymUsesAssignments` is true as soon as the gym has one lease row
   (`AccessAssignmentQueryService.GymSnapshot.usesAssignments`) `[CODE]`. On the PC, that is the moment
-  every PC without a lease becomes a reader (runbook part H).
+  every PC without a lease becomes a reader (runbook part H). **It is one-way:** the gym stays
+  "with drivers" whatever state its lease rows are in, a change must name a PC
+  (`AccessLeaseService.validateChanges`, `CHANGES_INVALID`), and on the PC only the commands switch
+  off brings back "every turnstile" `[CODE]` (runbook H3).
 - The two minimum-version settings are separate and both read the version the PC reports -- hence the
   version gate of §2.
 - The night needs only `MONCLUB_ACCOUNT_PIN_MIN_ACCESS_VERSION` (runbook B2). The other three are the
