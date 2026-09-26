@@ -3136,6 +3136,13 @@ The v2 runtime starts 12 s after launch (after the PC identity); offline and unr
 `availability=UNKNOWN`, `mode=ALL`, reason `NO_PC_TOKEN`, and changes nothing. `[TEST: same harness]`
 Remote door open, reader request → driver's door handler, local backend: median 81–108 ms, max 175–311 ms
 (two runs of 10). `[TEST: e2e]` On a gym PC and through the internet: `[UNVERIFIED — FIELD-TEST]`.
+Final end-to-end run on `0cbf26d` against backend `c7d4b532` (scratch copy of `wigo-demo`, dropped after):
+**46/46** with both switches on — the 37 earlier checks plus: the clock corrected by a refusal with no gym
+offset known; a turnstile lost by a forced move whose new fact goes up by POST without the holder-only GET;
+a reader's own local door route answering 202 `requested`, 429 on a second press within 1 s, the driver
+running it once (SUCCEEDED/OPENED); a PC revoked on the server driving nothing, also after a cold start —
+and **5/5** with the commands switch off. Reader request → driver handler in that run: median 145 ms, max
+562 ms (one run of 10, the backend freshly started). `[TEST: e2e]`
 
 ---
 
