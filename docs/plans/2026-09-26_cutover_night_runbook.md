@@ -6,9 +6,16 @@ For the owner. Plain steps, in the order of the night. The evidence behind each 
 - the PCs starting by themselves: [`2026-09-26_autostart_checklist.md`](2026-09-26_autostart_checklist.md)
 - what the release must contain: [`2026-09-26_cutover_release_checklist.md`](2026-09-26_cutover_release_checklist.md)
 
-> **NOT READY -- DO NOT USE ON THE NIGHT YET.** The review findings of 2026-09-26 (the gym 45 firewall
-> block, the watchdog, "Ouvrir" with the cables out, the erase before the first start, the card list)
-> are addressed in this second round, which is itself under review.
+> **NOT READY -- DO NOT USE ON THE NIGHT YET.** Three things still block the night:
+> 1. **The release.** No released Access honours "Par personne". It must be built and pass the release
+>    checklist, including its MUST items (§3a: the running workers refreshed by a fast patch; the installer
+>    and the watchdog).
+> 2. **The C3 erase tool** for gym 58 -- or your explicit decision that gym 58 waits and the night is gym 45 only.
+> 3. **Your answers** in part G (among them the gym 45 retire method, power left on, the people on site and on
+>    call, the turnstile arm, the previous installers).
+>
+> The review findings of 2026-09-26 are closed in this second round (independent review, clean on its
+> fourth pass, 2026-09-26).
 
 **PLAN ONLY -- nothing has been run.** Written 2026-09-26 on Access `master` `22c9cfc`; second round
 (the review findings of 2026-09-26) on `master` `dbf865f`, branch `claude/cutover-runbook-round2`.
