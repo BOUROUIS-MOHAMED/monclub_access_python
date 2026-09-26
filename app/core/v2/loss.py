@@ -116,6 +116,55 @@ def clear_readd(device_id: int, pins: Iterable[str]) -> None:
         "DELETE FROM v2_readd WHERE device_id = ? AND pin = ?", [(int(device_id), p) for p in pins]))
 
 
+_counts_lock = __import__("threading").Lock()
+_pending_counts: Dict[int, Any] = {}
+
+
+def note_user_count(device_id: Any, users_now: Any) -> None:
+    """Called on the worker thread at connect: memory only."""
+    try:
+        did = int(device_id)
+    except (TypeError, ValueError):
+        return
+    with _counts_lock:
+        _pending_counts[did] = users_now
+
+
+def pop_user_counts() -> Dict[int, Any]:
+    with _counts_lock:
+        out = dict(_pending_counts)
+        _pending_counts.clear()
+    return out
+
+
+class LossWatch:
+    """v2 control-thread step: compares the connect-time user counts (off the door thread) and
+    asks the turnstile's worker for a loss check in its maintenance slot. Runs whether or not
+    the server has v2 (loss detection is local)."""
+
+    def __init__(self, runtime: Any = None) -> None:
+        self.rt = runtime
+        self.flagged: Dict[int, float] = {}
+
+    def tick(self, runtime: Any) -> None:
+        for did, count in pop_user_counts().items():
+            try:
+                if not user_count_dropped(did, count):
+                    continue
+            except Exception:
+                continue
+            eng = getattr(getattr(runtime, "app", None), "_ultra_engine", None)
+            worker = (getattr(eng, "_workers", None) or {}).get(did) if eng is not None else None
+            if worker is not None:
+                worker._loss_check_due = True
+                self.flagged[did] = time.time()
+                _log.warning("[V2] turnstile %s: user count dropped more than MonClub removed -- a loss "
+                             "check (terminal listing) runs in today's maintenance slot", did)
+
+    def status(self) -> Dict[str, Any]:
+        return {"lossChecksRequested": {str(k): v for k, v in self.flagged.items()}}
+
+
 def user_count_dropped(device_id: int, users_now: Any) -> bool:
     """Connect-time check: did the terminal lose users MonClub did not remove?
 

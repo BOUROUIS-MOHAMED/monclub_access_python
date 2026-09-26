@@ -212,6 +212,12 @@ class OwnershipSync:
             if h is not None and not (str(h).isalnum() and len(str(h)) <= 64):
                 h = None
             before = prev.get(pin)
+            if (f["state"] == "REMOVED" and before is not None and before[0] != "REMOVED"
+                    and (f["at"] if f["corrected"] else f["at"] + offset) <= before[3]):
+                # A removal logged BEFORE the state this PC already uploaded (the pin was written
+                # again, then its state row went without a device removal -- a prune): not a
+                # newer fact. Bumping it past the upload would claim a removal that never happened.
+                continue
             same = before is not None and before[:3] == (f["state"], h, fingers)
             if same and not full:
                 continue

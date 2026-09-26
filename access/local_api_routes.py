@@ -194,6 +194,38 @@ def gated_handler(handler):
     return _gated
 
 
+# P3b-2: the desk card scanner connects to an IP address, not a device id. A scanner set on
+# the address of a turnstile this PC does not drive would be a connection to that turnstile.
+SCANNER_GATED_HANDLERS: tuple[str, ...] = ("_handle_scan_start", "_handle_scan_quick", "_handle_scanner_start")
+
+
+def scanner_gated_handler(handler):
+    import functools
+
+    @functools.wraps(handler)
+    def _gated(ctx) -> None:
+        from app.api import local_access_api_v2 as legacy
+        from app.core.v2.device_ips import ip_is_undriven_turnstile
+
+        try:
+            body = ctx.body() or {}
+            cfg = legacy._get_runtime_access_config(ctx)
+            mode = str(body.get("mode") or getattr(cfg, "scanner_mode", "") or "").strip().lower()
+            ip = str(body.get("ip") or getattr(cfg, "scanner_network_ip", "") or "").strip()
+        except Exception:
+            mode, ip = "", ""
+        if mode != "usb" and ip and ip_is_undriven_turnstile(ip):
+            ctx.send_json(409, {
+                "ok": False,
+                "notDriver": True,
+                "error": "Ce lecteur de cartes est configuré sur l'adresse d'un tourniquet qu'un autre PC pilote.",
+            })
+            return
+        handler(ctx)
+
+    return _gated
+
+
 def register_access_local_api_routes(router) -> None:
     from access import pc_identity_routes
     from app.api import local_access_api_v2 as legacy
@@ -207,6 +239,8 @@ def register_access_local_api_routes(router) -> None:
         handler = getattr(owner, handler_name)
         if handler_name in LEASE_GATED_HANDLERS:
             handler = gated_handler(handler)
+        if handler_name in SCANNER_GATED_HANDLERS:
+            handler = scanner_gated_handler(handler)
         router.add(method, pattern, handler)
 
 

@@ -119,7 +119,8 @@ class CommandHandlers:
             scanner_mode = str(getattr(cfg, "scanner_mode", "") or "").strip().lower()
         except Exception:
             scanner_ip, scanner_mode = "", ""
-        if scanner_ip and scanner_mode != "usb" and _ip_of_undriven_turnstile(scanner_ip):
+        from app.core.v2.device_ips import ip_is_undriven_turnstile
+        if scanner_ip and scanner_mode != "usb" and ip_is_undriven_turnstile(scanner_ip):
             # A reader never connects to a turnstile: a scanner configured on a turnstile's
             # address is that turnstile.
             return ("FAILED", "SCANNER_IS_A_TURNSTILE", {"ip": scanner_ip})
@@ -360,12 +361,3 @@ class CommandHandlers:
         return ("SUCCEEDED", "FLUSHED", {k: res.get(k) for k in ("rotated", "activeBefore", "pendingNow")})
 
 
-def _ip_of_undriven_turnstile(ip: str) -> bool:
-    try:
-        from app.core.db import list_sync_devices_payload
-        for d in list_sync_devices_payload():
-            if str(d.get("ipAddress") or "").strip() == ip and not lease_gate.device_allowed(d.get("id")):
-                return True
-    except Exception:
-        return False
-    return False

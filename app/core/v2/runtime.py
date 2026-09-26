@@ -109,7 +109,9 @@ class V2Runtime(NoticeCallbacks):
         self._sync_due: Optional[float] = None
         self._last_notice_sync = 0.0
         self._lock = threading.Lock()
-        self.extensions: list = []           # ownership, problems, loss re-add (each: tick(runtime))
+        self.extensions: list = []           # ownership, problems (each: tick(runtime)) -- server ON only
+        self.local_extensions: list = []     # local steps that run whatever the server (loss watch)
+        self._unknown_streak = 0
         self.last_error: Optional[str] = None
 
     # ------------------------------------------------------------------ identity
@@ -174,6 +176,11 @@ class V2Runtime(NoticeCallbacks):
 
     def tick(self) -> None:
         now = time.monotonic()
+        for ext in list(self.local_extensions):
+            try:
+                ext.tick(self)
+            except Exception as exc:
+                _log.warning("[V2] %s tick failed: %s", type(ext).__name__, exc)
         if now >= self._next_refresh:
             self.refresh_assignment()
         if self.availability != ON:
@@ -205,7 +212,9 @@ class V2Runtime(NoticeCallbacks):
         elif result == OFF:
             self._next_refresh = now + OFF_REPROBE_SEC
         else:
-            self._next_refresh = now + UNKNOWN_REPROBE_SEC
+            # Offline, a proxy page, no token: 2 min, doubling to 30 min while it lasts.
+            self._next_refresh = now + min(OFF_REPROBE_SEC, UNKNOWN_REPROBE_SEC * (2 ** min(self._unknown_streak, 4)))
+        self._unknown_streak = self._unknown_streak + 1 if result == UNREACHABLE else 0
         return result
 
     def _set_availability(self, result: str) -> None:
@@ -327,6 +336,8 @@ def start_v2_runtime(app: Any) -> Optional[V2Runtime]:
                 rt.extensions.append(factory(rt))
             except Exception as exc:
                 _log.warning("[V2] extension not started: %s", exc)
+        from app.core.v2.loss import LossWatch
+        rt.local_extensions.append(LossWatch(rt))
         app._v2_runtime = rt
         rt.start()
         return rt

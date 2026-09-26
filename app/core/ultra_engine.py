@@ -295,6 +295,12 @@ _DOOR_OPEN_SDK_TIMEOUT_MS = 4000
 _DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
 
 
+def _v2_writes_blocked(device_id) -> bool:
+    """P3b-2: no push, removal or maintenance on a turnstile this PC is handing over or no
+    longer drives (driver leases). Always False without assignments."""
+    return _lease_gate.writes_frozen(device_id) or not _lease_gate.device_allowed(device_id)
+
+
 class _CommandClaim:
     """Decides, once, who owns a queued operator command: its worker or its caller.
 
@@ -1978,11 +1984,13 @@ class UltraDeviceWorker(threading.Thread):
     def _drain_member_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
-        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
-            # P3b-2: this turnstile is being handed over; its ownership record is uploaded as
-            # final, so nothing is written until the release is acknowledged (the worker then
-            # stops) or the handover is cancelled (the queued updates run then). The door,
-            # the events and the rescues keep running.
+        if _v2_writes_blocked(getattr(self, "_device_id", None)):
+            # P3b-2: this turnstile is being handed over (its ownership record is uploaded as
+            # final, so nothing is written until the release is acknowledged -- the worker then
+            # stops -- or the handover is cancelled and the queued updates run), or this PC no
+            # longer drives it at all (a forced move: nothing may be written from the moment
+            # the lease is gone, not only once the engine restarts). The door, the events and
+            # the rescues keep running until then.
             return 0
 
         drained = 0
@@ -2237,6 +2245,7 @@ class UltraDeviceWorker(threading.Thread):
         # (loss.py). Only pins the state says are in sync are affected: one pending or in
         # backoff is already handled by its own retry.
         readd = _v2_loss.readd_pins(getattr(self, "_device_id", None) or 0)
+        self._readd_pending = set(readd)
         readd_now: list[str] = []
         for u in users:
             pin = str(u.get("pin") or "").strip()
@@ -3128,10 +3137,11 @@ class UltraDeviceWorker(threading.Thread):
             if not getattr(self._sdk, "owns_event_source", False):
                 return
             users_now = (getattr(self._sdk, "_device_status", None) or {}).get("users")
-            if users_now is not None and _v2_loss.user_count_dropped(self._device_id, users_now):
-                self._loss_check_due = True
-                logger.warning("%s terminal user count dropped more than MonClub removed -- a loss "
-                               "check (terminal listing) runs in today's maintenance slot", self._prefix)
+            if users_now is not None:
+                # Only noted here (in memory): the comparison reads and writes the database, so
+                # the v2 control thread does it and flags this worker (loss.LossWatch), never the
+                # worker thread that serves the door.
+                _v2_loss.note_user_count(self._device_id, users_now)
         except Exception:
             pass
 
@@ -3149,8 +3159,10 @@ class UltraDeviceWorker(threading.Thread):
             _v2_problems.registry.update_code_pins(
                 getattr(self, "_device_id", None), _v2_problems.TEMPLATE_VERSION_MISMATCH,
                 add=bad, remove=fine)
-            if fine:
-                _v2_loss.clear_readd(getattr(self, "_device_id", None) or 0, fine)
+            pending = fine & set(getattr(self, "_readd_pending", None) or ())
+            if pending:          # a DB write only when a re-add marker was actually served
+                _v2_loss.clear_readd(getattr(self, "_device_id", None) or 0, pending)
+                self._readd_pending = set(self._readd_pending) - pending
         except Exception:
             pass
 
@@ -5381,8 +5393,8 @@ class UltraDeviceWorker(threading.Thread):
             return
         if not bool(getattr(self._sdk, "is_connected", True)):
             return          # a dead link: never use up the day's read-back on it (R2-16)
-        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
-            return          # P3b-2: handover in progress -- no promotion, no sweep
+        if _v2_writes_blocked(getattr(self, "_device_id", None)):
+            return          # P3b-2: handover or lease lost -- no promotion, no sweep
         today = _local_day()
         if getattr(self, "_maintenance_ready_day", None) != today:
             return
@@ -5418,8 +5430,8 @@ class UltraDeviceWorker(threading.Thread):
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
-        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
-            return 0            # P3b-2: handover in progress -- see _drain_member_sync_commands
+        if _v2_writes_blocked(getattr(self, "_device_id", None)):
+            return 0            # P3b-2: handover or lease lost -- see _drain_member_sync_commands
 
         drained = 0
         while drained < limit:
