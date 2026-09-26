@@ -6,7 +6,7 @@ C3 panel (guide §2).
 
 | File | What |
 |---|---|
-| `START EXPORT.cmd` | starts the export in 32-bit PowerShell; pass the arguments after it |
+| `START_EXPORT.cmd` | starts the export in 32-bit PowerShell; pass the arguments after it |
 | `export_c3_panel_readonly.ps1` | reads ONE panel into `exports\panel_<label>_<time>.json` + `.sha256` |
 | `_pullsdk_read.ps1` | the only file that touches `plcommpro.dll`: six entry points, all reads |
 
@@ -16,8 +16,8 @@ C3 panel (guide §2).
 `MonClubAccess.exe` runs on its own PC; other PCs cannot be checked from here.
 
 ```
-START EXPORT.cmd -DeviceIp 192.168.0.202 -Label device5 -Auto
-START EXPORT.cmd -DeviceIp 192.168.0.203 -Label device6 -Auto
+.\START_EXPORT.cmd -DeviceIp 192.168.0.202 -Label device5 -Auto
+.\START_EXPORT.cmd -DeviceIp 192.168.0.203 -Label device6 -Auto
 ```
 
 Type each IP in full. Add `-Password <device password>` when /gym-devices shows one for the panel, and

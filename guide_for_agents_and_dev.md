@@ -1548,6 +1548,14 @@ as MEMBERSHIP.
 > has no tool for a PullSDK panel yet (`clear_device_table`'s only caller is the ceiling-gated
 > `FULL_REPLACE` clear, §3.2g) `[CODE]`.
 
+**A switch that arrives by fast patch does not reach running workers at once (review, 2026-09-26).**
+A dashboard `GYM_DEVICE` fast patch records the switch and logs `[T] PIN_SCHEME_SWITCH`
+(`app.py::apply_fast_patch_bundle` → `db._insert_device_row`), but a running `UltraDeviceWorker`
+keeps its own device copy until the next successful sync's device refresh (`refresh_devices`), and
+its full pass pushes from that copy (`ultra_engine.py::_drain_full_sync_commands`). So the switch
+line alone does not prove the workers derive account pins: the cutover procedures restart Access
+after it, before a terminal is reconnected. `[CODE]` Not changed.
+
 **Known consequence after a switch: the revoke pass stays aborted.** The old scheme's
 `device_sync_state` rows remain `ownership_confirmed=1` (deliberately, §3.2c). The revoke pass's
 candidates are `owned − keep`, i.e. essentially every old-scheme pin, which exceeds the floor, so it

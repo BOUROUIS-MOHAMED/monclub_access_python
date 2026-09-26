@@ -106,8 +106,14 @@ def norm_card(card: Any) -> str:
 def wire_card(card: Any) -> str:
     """The card MonClub writes to a terminal for this value: device_sync._normalize_device_card
     (digits only, 1..4294967295), in norm_card's form; '' when nothing is written."""
-    digits = norm_card(card)
-    return digits if digits and int(digits) <= 4294967295 else ""
+    digits = "".join(ch for ch in str(card or "") if ch.isdigit())  # str.isdigit, as the push
+    if not digits:
+        return ""
+    try:
+        n = int(digits)
+    except ValueError:                  # e.g. superscript digits: isdigit() but not int()
+        return ""
+    return str(n) if 1 <= n <= 4294967295 else ""
 
 
 def norm_pin(pin: Any) -> str:

@@ -24,7 +24,7 @@
 # BEFORE YOU RUN IT: stop MonClub Access on EVERY PC of the gym (see the plan). Whether
 # the panel accepts a second connection while Access holds one is not known here.
 #
-# USAGE (from START EXPORT.cmd, or in 32-bit PowerShell; it relaunches itself if needed)
+# USAGE (from START_EXPORT.cmd, or in 32-bit PowerShell; it relaunches itself if needed)
 #   .\export_c3_panel_readonly.ps1 -DeviceIp 192.168.0.202 -Label device5 -Auto
 #   add -Password <device password> when /gym-devices shows one for this panel
 #   add -DllPath <path to plcommpro.dll> when the sdk\ folder is not found

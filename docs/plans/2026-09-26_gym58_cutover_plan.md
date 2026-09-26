@@ -25,15 +25,15 @@ queried.
 | Two panels, both **`ZK_PULLSDK`, model `C3_400`, `accessDataMode=ULTRA`, `rosterPushingPolicy=PRESERVE`, `pushing_to_device_policy=1`, active**: device **5 "Door 1" 192.168.0.202:4370** and device **6 "Door 2" 192.168.0.203:4370**, zone "hall" (agent 23). `door_ids` "1-----2-----4-----8" (4 doors, mask 15). `fingerprint_enabled=0`, `rfid_enabled=1`, `totp_enabled=1`. No device password. `pin_scheme` stored as `''` = MEMBERSHIP | `[FIELD]` copy, `gym_device` |
 | `ultra_totp_rescue_enabled=0` on both panels, **yet QR entries were allowed every day** up to 09-12 (device 5: 37-124 a day). With the flag off, `ultra_engine._is_totp_format` returns False and no QR rescue runs `[CODE]`. Which is true on the production server is `[UNKNOWN]` (the copy may have been mutated). **Read the setting in /gym-devices and test a real QR at the door** (runbook) | `[FIELD]` copy + `[CODE]` |
 | **No registered Access PC** for gym 58. Pin-scheme history reads `NO_REGISTERED_PC` → ACCOUNT refused (§3.3) | `[FIELD]` copy, `gym_access_pc`; matches memory of 2026-09-19 |
-| How many PCs gym 58 has, and which Access they run, is **`[UNKNOWN]`**: registration exists from `access_1.4.33` (`access/pc_identity.py` first appears in that tag `[CODE: git tag --contains]`), and a 1.4.33 PC runs unregistered until someone registers it. So each PC runs ≤ 1.4.31, or 1.4.33 never registered | `[CODE]` + owner to answer |
-| `manual_sync_mode=0` → Access pushes by itself at start-up; `ultra_sync_yield_to_rtlog=1` | `[FIELD]` copy, `gym_access_software_settings` |
+| How many PCs gym 58 has, and which Access they run, is **`[UNKNOWN]`**: `access/pc_identity.py` first appears in the tag `access_1.4.33` `[CODE: git tag --contains]`, but gym 45 has a registered PC on 1.4.32, an untagged build, so registration may exist from 1.4.32; a PC runs unregistered until someone registers it. So each gym 58 PC runs ≤ 1.4.31, or 1.4.32/1.4.33 never registered | `[CODE]` + owner to answer |
+| `manual_sync_mode=0` → Access pushes by itself at start-up (the drift re-push of §2 depends on it; with manual mode on, "Réinitialisation complète" or "Synchroniser" is needed); `ultra_sync_yield_to_rtlog=1` | `[FIELD]` copy, `gym_access_software_settings` |
 | Opening hours: entries from about 05:00-06:00 to 22:00 (30 days: 39 at 05:xx, 282 at 06:xx, 198 at 22:xx, 3 at 23:xx, 5 between 01:00 and 02:59) | `[FIELD]` copy |
 
 ### 1.1 Roster on 2026-09-12 (copy, the comparison tool's SQL filters, gym 58)
 
 | Measure | Value |
 |---|---|
-| Deliverable memberships / people | **1,690 / 1,690** (nobody holds two plans at once; 0 without an account) |
+| Deliverable memberships / people | **1,690 / 1,690** (nobody holds two plans at once; 0 without an account). The guide's "1,602 rows" for gym 58 (§3.8) is another measure: a protocol-2 answer of a local backend on another mutated copy, 2026-09-19, with the backend's own filters |
 | People with an enabled QR credential at gym 58 | **1,690** (1,691 enabled credentials) |
 | Memberships with a first card in MonClub | **1,660**; 30 without any card; 1 with a second card |
 | … of which MonClub can write to a panel | **1,558**. 102 carry a value outside the panel's 4-byte range, and 103 start with the `99999+` marker. `_normalize_device_card` keeps the digits and drops a value above 4,294,967,295, so those 102 get no card on a panel today and none after (the cutover changes nothing for them) `[CODE: device_sync._normalize_device_card]` |
@@ -155,7 +155,7 @@ has run, or the prune is skipped and every removal on the panel waits (guide §3
 
 ## 4. The tools (read-only)
 
-**`tools/c3_panel_scripts/export_c3_panel_readonly.ps1`** (launcher `START EXPORT.cmd`) -- one panel to
+**`tools/c3_panel_scripts/export_c3_panel_readonly.ps1`** (launcher `START_EXPORT.cmd`) -- one panel to
 a JSON file: the parameter list Access itself reads for its device page, the clock skew, row counts
 of `user`, `userauthorize`, `transaction`, `templatev10`, `template`, `timezone`, `holiday`, every `user`
 row (pin, name, card, whether a password is set -- never the value -- and the other columns the
@@ -180,6 +180,10 @@ pin or on an old user strongly tied to them (same card number, pin = card) that 
 in `--detail-csv` (names). `[TEST: tests/test_gym45_compare_terminal_export.py::TestPanelCards, including
 a database in the `access_1.4.30` schema]`. With `--access-db` alone (a copy of the PC's database) the
 card list needs no production MySQL copy; add the MySQL copy to tie old users by their GMS id.
+Limits: the C3 `user` table has no privilege or enabled column, so the export writes `privilege 0`,
+`enabled true` for every row and the report's "privileged 0 / disabled 0" means "not read"; the `cards`
+section counts every first card a person holds in MonClub as written, without the door filter
+(`allowedMemberships`) or the ACCOUNT collapse -- exact at gym 58, where nobody holds two plans.
 
 ## 5. The procedure at gym 58 (evidence for the runbook's section C)
 
@@ -198,8 +202,8 @@ C3-400; the export records its own timings.
 | G6. Verify empty: a new export (counts 0), a member's card at that door refused | both | back to G5 |
 | G7. Interlock: panel network cables out (they keep power) | the export from the PC now ends with `CONNECT FAILED` | -- |
 | G8. Install the new Access on each PC, **"Launch MonClub Access" unticked**; start it; login kept; "Identité du poste" → "C'est un nouveau PC" | /access-pcs lists each PC with the new version | a start-up that stops: `%TEMP%\MonClubAccess.log`, call the developer |
-| G9. Dashboard: turnstile page shows the "Tous les PC enregistrés…" verdict; device 5 then 6: "Par personne", tick both boxes, save; reopen each | each reads "Par personne" | refused (409): read `blockingPcs`, revoke retired PCs in /access-pcs |
-| G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected | the lines | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer |
+| G9. Dashboard: the verdict sentence "Tous les PC enregistrés…" (shown only on the add-device form, `gym-devices-view.tsx`; on an existing device a refusal shows as a red message and the confirm dialog names the minimum version); device 5 then 6: "Par personne", tick both boxes, save; reopen each | each reads "Par personne" | refused (409): read `blockingPcs`, revoke retired PCs in /access-pcs |
+| G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected. **Then Quit and restart Access on every running PC** and wait for `getSyncData OK`: a switch that reached a PC through a dashboard fast patch (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) is recorded and logged, but the running ULTRA workers keep their MEMBERSHIP device copy until a server sync refreshes them (`app.py` sync tick → `refresh_devices`), and the full pass pushes from that copy (`ultra_engine._drain_full_sync_commands`, `self._device`) `[CODE, review 2026-09-26]` | the lines, then the restart | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer |
 | G11. Plug the panel cables back only when every PC that is switched on has shown G10; the other PCs stay shut down (the cable is the panel's, so it releases every PC at once) | -- | -- |
 | G12. Push: per panel, a pass ending with `[DeviceSync] Device id=5: device_pins=N desired=N to_sync=0 stale=0` on the pass after the push, N = the people count that pass computed (it can change after midnight: the 00:00:05 date flip asks for a full pass, guide §3.8) | the line for 5 and 6 | `REVOKE_ABORTED` → the panel was not empty: Quit, export, back to G5. `PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète"; persists → call the developer |
 | G13. Verify: Quit, export both panels, compare with `--scheme ACCOUNT --access-db <fresh copy>`: `member_owned` = people, `leftover` = 0, no `cards` loss beyond the G4 list | numbers | members missing → "Réinitialisation complète", redo G12-G13 |
@@ -209,9 +213,11 @@ C3-400; the export records its own timings.
 **Half-states** (per panel): before G5, nothing changed (R1). After G5 and before G10 on some PC:
 set "Par abonnement" back if it was saved, reconnect, start Access → the drift re-push refills the panel
 under MEMBERSHIP `[CODE]`; done when the G12 line shows `to_sync=0 stale=0` (R2). After G10 (switch
-recorded) with a partial push: the push continues at the next pass `[CODE]` (R7); to go back instead,
-erase again, then "Par abonnement" (the dashboard asks "J'ai effacé le terminal — basculer"), then
-reconnect (R4). A panel left for another day stays on MEMBERSHIP, works as today (R8).
+recorded) with a partial push: the push continues at the next pass `[CODE]` (R7); to go back instead:
+erase again, cables out, "Par abonnement" (the dashboard asks "J'ai effacé le terminal — basculer"),
+start each PC behind the interlock until it logs `previous=ACCOUNT scheme=MEMBERSHIP`, restart it (G10),
+then reconnect (R4). Started with the cables in and a failed first sync, a PC works from its stored
+"Par personne" row and writes account pins back `[CODE: app.py start-up from the cached devices]`. A panel left for another day stays on MEMBERSHIP, works as today (R8).
 
 ## 6. Decisions only the owner can take
 

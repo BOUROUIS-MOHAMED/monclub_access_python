@@ -648,5 +648,10 @@ class TestPanelCards:
 
     def test_wire_card_is_what_the_push_writes(self):
         from app.core.device_sync import _normalize_device_card
-        for raw in ("0004001", " 12 34 ", "99999+123", "4294967295", "4294967296", "", "0", None, "abc"):
-            assert cte.wire_card(raw) == cte.norm_card(_normalize_device_card(raw)), raw
+        for raw in ("0004001", " 12 34 ", "99999+123", "4294967295", "4294967296", "", "0", None, "abc",
+                    "١٢٣", "12²", "１２"):
+            try:
+                expected = cte.norm_card(_normalize_device_card(raw))
+            except ValueError:          # the push itself raises on these; MonClub writes no card
+                expected = ""
+            assert cte.wire_card(raw) == expected, raw
