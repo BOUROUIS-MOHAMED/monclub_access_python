@@ -52,6 +52,8 @@ This file is only useful while it is true. If you change any of the following, y
 | Sync protocol 2 on the PC — what the request sends, what the save stores (`db.py::_apply_protocol2_save`, `_reconcile_held_rows`, `_create_protocol2_tables`), the flip and the gym date/clock rules (`db.py::apply_local_date_flips`, `::gym_date_status`, `app/core/access_dates.py`), or when the flip runs (`app.py::_apply_date_flips` and its triggers, `pc_identity.py::_heartbeat_payload_after_date_check`) | §3.8, §10.2b |
 | The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
 | Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
+| The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
+| What happens when an `init_db` step fails — the four schema migrations that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -497,20 +499,86 @@ patch sends the member and a `CREDENTIALS` `UPSERT_ONLY` section in one bundle
 backend whose credentials token does not digest the grants never sets `refreshCredentials` for
 a grant-only change, so the main sync does not re-send it (`[UNVERIFIED]` whether the gyms run
 backend `main`). So once a PC runs this build, an `in_roster_by_account` count that keeps
-growing points to grant changes not arriving — after the upgrade window below, the only cause
-traced here; check which backend serves that gym before reading it any other way.
+growing points to grant changes not arriving — once the one forced re-send below has landed (the
+first successful sync after the upgrade), the only cause traced here; check which backend serves
+that gym before reading it any other way.
 
-**The upgrade window.** Rows the previous build left stale stay stale after the upgrade. The
-backend re-sends credentials only when its credentials token moves, and upgrading the client does
-not move it: nothing in this build drops the stored `credentialsVersion` (the §3.2d migration drops
-only the two member tokens), and backend `main`'s daily safety net forces members, not credentials.
-So those rows are rewritten by the first sync after any credential change in the gym — a renewal,
-a new or disabled credential — or a forced refresh or a logout; until then they keep counting as
-`in_roster_by_account` (allowed, as before) and door history keeps the old `activeMembershipId`.
-`[CODE: app.py sync's refresh map and new_tokens; db.py::save_sync_cache_delta,
-::_ensure_main_account_id_column; backend main GymAccessController refreshCredentials]` Dropping
-`credentialsVersion` once at the first start of this build, as §3.2d does for members, would close
-the window; it is not done here. `[UNVERIFIED]` how long the window lasts on a real gym.
+**The upgrade window — closed by one forced re-send (2026-09-25).** Rows the previous build left
+stale are rewritten only when the backend re-sends the credentials, and it re-sends them only when
+the client's token is absent or differs from its own: `refreshCredentials = clientCredsVersion ==
+null || !clientCredsVersion.equals(currentCredsVersion)`; otherwise the section goes out as
+`gymAccessCredentials: []`. `[CODE: backend main a98bf154 GymAccessController, read not run; the
+same null check at fcfc850c, whose token is only count:maxUpdated with no grant digest]` Upgrading
+the client does not move that token, the §3.2d migrations drop only member and device tokens, and
+backend `main`'s daily safety net forces members only. So `init_db` drops the stored
+`credentialsVersion` **once**, at the first start of a build with the grant-aware diff
+(`_force_one_credentials_resend`, run through `_run_one_shot_credentials_resend` right after
+`sync_version_tokens` is created). The next `getSyncData` carries every other token and no
+`credentialsVersion`; the backend answers with every credential, and the diff rewrites only the
+rows that differ — a renewed member's stale grant is written, an order-only difference is not.
+The drop deletes no credential row: an offline PC keeps its QR credentials, and keeps asking for
+the full list, until a sync succeeds — tokens are saved only after a successful cache write.
+`[CODE: db.py::_force_one_credentials_resend, ::init_db; app.py sync tick, "Save new version
+tokens ONLY after successful cache write"; MonClubApi.get_sync_data]`
+`[TEST: test_credentials_token_one_shot.py::test_the_token_is_dropped_exactly_once_across_two_starts,
+::test_every_other_token_is_kept, ::test_the_marker_is_never_sent_to_the_backend,
+::test_the_full_resend_rewrites_only_the_stale_rows]`
+
+*Where "once" is recorded.* There is no column to key it on, so a row in `local_one_shot_steps
+(name, done_at)` — name `credentials_resend_for_grant_diff` — records that the step ran. Not in
+`sync_version_tokens`: `load_version_tokens` returns every row, the sync tick sends them all as
+`getSyncData` params, and a logout clears the table. Not in `sync_meta`: one row (`CHECK id=1`,
+`contract_status NOT NULL`) whose presence is what tells `load_sync_cache` and
+`load_sync_contract_meta` that a sync has run, so a marker there would invent a contract snapshot
+on a fresh install. `PRAGMA user_version` is one unnamed integer for the whole file; a named row
+says what ran. `[CODE: db.py::load_version_tokens, ::_fetch_sync_cache_snapshot,
+::load_sync_contract_meta; app.py sync tick]` A fresh install runs the step too: the DELETE finds
+nothing, the marker is written, and no later start touches its tokens.
+`[TEST: ::test_a_fresh_install_gets_the_marker_and_nothing_else]`
+
+*Atomic, and never lost.* The DELETE runs before the marker INSERT, both inside the one transaction
+`init_db` already has open by then and commits at its end. The statement that opens it comes
+earlier than the `UPDATE access_history` backfill this paragraph used to name. On every start it is
+the unconditional F-015 `DELETE FROM sync_devices` de-duplication at the latest. A migration that
+writes rows opens it sooner, for example the members helper's token DELETE on a first start. `init_db`
+has one `conn.commit()`, at the end of its `with` block. `[CODE: db.py::init_db; checked with an
+in_transaction probe on a fresh and an existing database, 2026-09-26]` A crash between them rolls
+both back and the next start acts again.
+`[TEST: ::test_a_crash_between_the_delete_and_the_marker_rolls_both_back — it checks, at the cut,
+that the DELETE had already run inside the open transaction]` An ordinary error at the INSERT is
+logged and startup goes on: the DELETE commits without the marker, so the next start drops the
+token again — a second full re-send, never a lost one; the other order could commit the marker
+without the drop. `[TEST: ::test_a_failed_marker_write_repeats_the_drop_never_loses_it]` That catch
+is deliberate and sits in `_run_one_shot_credentials_resend`. The schema migrations earlier in
+`init_db` have no catch and stop startup on a failure. Before that was made the rule it happened by
+accident: their inline catches raised `UnboundLocalError` and never logged. §3.2d "A failing
+migration stops startup" says why it is now the rule.
+
+*The one-time cost.* One sync carries the whole credentials list and writes it through the diff.
+`tools/bench_credential_resend.py` times that write end to end (`save_sync_cache_delta` with only
+credentials refreshed, through the writer thread, commit included) against the write the same
+sync does without the drop (every section skipped), paired, 21 runs, on the development PC:
+
+| Credentials | Rows that differ | 32-bit `.venv` Python 3.11 | Python 3.13 |
+|---|---|---|---|
+| 1,500 | none / 5 % / all | +25 / +27 / +45 ms | +15 / +17 / +34 ms |
+| 3,000 | none / 5 % / all | +73 / +80 / +93 ms | +46 / +46 / +69 ms |
+
+The response carries about 394 KiB (1,500) or 790 KiB (3,000) of credentials JSON, uncompressed,
+in the probe's row shape: the DTO's ten fields, a 40-hex secret (`randomSecretHex(20)`), one grant.
+The write bumps the local-state generation, so ULTRA reloads its caches once — what every member
+refresh, the daily one included, already does. `[CODE: db.py::save_sync_cache_delta,
+::bump_local_state_generation]` "All rows" is a real ceiling: under the previous build a row's
+grants were rewritten only when one of its scalar columns changed, so every renewal since then
+stayed stale. `[TEST: re-run the tool — a measurement, not a pass/fail test]` `[UNVERIFIED]` the
+stale share on a real gym, the timing on a gym PC's disk, and the backend's time to build and send
+the list.
+
+*What it does not cover.* A PC that goes back to a build without the grant-aware diff and then
+upgrades again keeps its marker, so it is not re-sent: rows left stale in that stretch wait for a
+credential change, a forced refresh or a logout. A backend whose token does not digest the grants
+(fcfc850c) re-sends on the dropped token too — the null check does not depend on the digest —
+but does not move its token for later grant-only changes (above).
 
 The second chance is sound because the stale id and the listed one are the same person: the
 credential's `accountId` is the `MainAccountModel` id found by the member's email,
@@ -1279,7 +1347,9 @@ per-row diff fills the column. `[CODE: db.py::_ensure_main_account_id_column, in
 
 It is **atomic**: the token DELETE runs before the ALTER, so both sit in the single transaction
 `init_db` commits at its end; a crash in between rolls both back and the next start detects the
-missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]`
+missing column again. `[TEST: ::test_the_column_and_the_token_drop_commit_together]` An *error*
+in between does the same, because `init_db` does not catch it (see "A failing migration stops
+startup" below). `[TEST: test_init_db_migration_failures.py::test_a_main_account_column_that_fails_after_the_token_drop_rolls_the_drop_back]`
 **The same trap on the device side (review #13).** `sync_devices.pin_scheme` also arrives NULL,
 and `devicesVersion` survives the upgrade, so the backend answers `refreshDevices=false`: a device
 set to ACCOUNT while the PC still ran the old client would read as MEMBERSHIP (no switch, no hash
@@ -1289,12 +1359,76 @@ lacks the column (measured before the `CREATE TABLE`, so a fresh install is not 
 deletes `devicesVersion` — the device section's only progress token — and records every device
 already in the table as seen on MEMBERSHIP (the old client had no other scheme, so the ACCOUNT
 value the refresh brings is a real switch, §3.2e). Same one-shot, DELETE-before-ALTER atomicity
-as the members helper. The backend half (`refreshDevices = clientDevicesVersion == null || …`) was
-read in `GymAccessController`, not run. `[CODE: db.py::_ensure_pin_scheme_column, init_db]`
-`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh]`
+as the members helper, for a crash and for an error. The backend half (`refreshDevices =
+clientDevicesVersion == null || …`) was read in `GymAccessController`, not run.
+`[CODE: db.py::_ensure_pin_scheme_column, init_db]`
+`[TEST: test_pin_scheme_switch.py::test_an_old_database_gains_pin_scheme_and_forces_one_device_refresh,
+test_init_db_migration_failures.py::test_a_pin_scheme_column_that_fails_after_the_token_drop_rolls_the_drop_back]`
 
 If the backend in use does not emit `mainAccountId`, the refresh still runs once and the column
 stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone (§3.2b).
+
+**A failing migration stops startup — on purpose (owner's decision, 2026-09-25).** `init_db` calls
+`_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
+`_ensure_main_account_id_column` and `_ensure_pin_scheme_column` with no `try`. When one of them
+fails, its own exception leaves `init_db` and `get_conn` closes the connection uncommitted. Neither
+`access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
+or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
+`%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`;
+`app/main.py` redirects to the same file; no `sys.excepthook` is installed anywhere in the repo,
+grep 2026-09-26). The next start runs the migration again. `[CODE: db.py::init_db;
+access/store.py::init_db; app.py::MainApp.__init__, ::run_app; access/main.py::main]`
+
+What rolls back is the transaction, and Python's `sqlite3` opens it at the first INSERT, UPDATE or
+DELETE, not at DDL. A `CREATE`, `DROP` or `ALTER` that ran before that is already committed. So a
+failed first start keeps the tables it had created, and a failed `_relax…` leaves an empty
+`sync_firmware_profiles__new`, which the retry drops first. `[TEST: test_init_db_migration_failures.py
+— each of the four made to fail at its entry, and each failed between two of its statements through
+a connection proxy, followed by a clean start: ::test_a_failing_migration_raises_its_own_error_and_the_next_start_completes,
+::test_a_legacy_rebuild_that_fails_midway_leaves_no_copy_behind,
+::test_a_firmware_profile_rebuild_that_fails_midway_keeps_the_cached_profile, and the two token
+tests above]`
+
+*Why not log and go on.* The four used to sit in `except …: logging.getLogger(…).error(…)` wrappers
+written to do exactly that, and `_ensure_pin_scheme_column`'s also added the column with
+`_ensure_column`. But `init_db` imported `logging` in its own body (the stale-lock resets after its
+`with` block). A name bound anywhere in a function is local to all of it, so every one of those
+`except` branches raised `UnboundLocalError` instead of logging: a failing migration already
+stopped startup, by accident. `[TEST: ::test_init_db_binds_no_local_logging — the local imports are
+gone]`
+
+Making the wrappers work was measured and is worse. The run was on 2026-09-25, from scratch scripts
+that are not in the repo: the four imports removed, the wrappers kept, a failure injected between
+two statements, then clean starts.
+`[CODE: git show 832af74:app/core/db.py, init_db's four wrappers; Python's sqlite3 opens a
+transaction only at DML]`
+No test pins this. To check: on 832af74, delete the four `import logging` lines in `init_db`, then
+run `tests/test_init_db_migration_failures.py::test_a_legacy_rebuild_that_fails_midway_leaves_no_copy_behind`.
+It fails with `DID NOT RAISE`, after `[DB] schema migration _rebuild_sync_users failed` is logged:
+the first start completed with the copy committed. Calling `init_db()` twice more after the same
+`_fail_once` cut fails both times with `UNIQUE constraint failed: sync_users.user_id,
+sync_users.active_membership_id`. Checked this way on 2026-09-26.
+
+What the run showed:
+- **Legacy `sync_users` rebuild failing at `DROP TABLE sync_users`:** a full `sync_users_new` was
+  committed. The next start copied the rows into it again, and it and every later start failed on
+  `uq_sync_users_uid_amid`.
+- **Firmware-profile rebuild failing at its RENAME:** the DROP of the old table was committed, a
+  later `CREATE TABLE IF NOT EXISTS` made an empty one, and the cached profile stayed in the orphan
+  copy.
+- **`pin_scheme` failing at its `devicesVersion` DELETE:** the fallback added the column, so the
+  forced device refresh never ran.
+- **`_ensure_main_account_id_column`:** it cannot go on at all. The unguarded
+  `idx_sync_users_main_account` index fails without the column, and every `sync_users` writer names
+  it.
+
+With no catch, each of these rolls back and the next clean start completes (the tests above).
+
+The cost: a fault that persists (a corrupt file, a full disk) stops the app on every start until it
+is cleared, as it already did. Not everything in `init_db` stops startup:
+- the plain `_ensure_column` adds swallow their own `ALTER` error, silently (`db.py::_ensure_column`);
+- the one-shot credentials drop logs and goes on (§3.1b "The upgrade window");
+- the stale-lock resets after the commit log and go on. `[TEST: ::test_the_stale_lock_resets_still_log_through_the_module_logging]`
 
 **`member_account_link` — membership → person, durable.** `_refresh_member_account_links` runs at
 the end of every sync_users write transaction and records each cached `(active_membership_id,

@@ -636,7 +636,9 @@ def _ensure_main_account_id_column(
     commits at its end (Python's sqlite3 opens it at the DELETE and does not commit before
     DDL): a crash in between rolls both back and the next start detects the missing column
     again. The other order would autocommit a lone ALTER (DDL outside a transaction) and
-    lose the refresh for good. [TEST: tests/test_account_pin_sqlite_roundtrip.py]
+    lose the refresh for good. [TEST: tests/test_account_pin_sqlite_roundtrip.py] An error in
+    between rolls back the same way: ``init_db`` does not catch it.
+    [TEST: tests/test_init_db_migration_failures.py]
 
     Returns True when the column was added.
     """
@@ -691,8 +693,9 @@ def _ensure_pin_scheme_column(
     switch (hashes cleared, CRITICAL), not a first sighting of unknown history (guide §3.2e).
 
     ONE-SHOT and ATOMIC like the members helper: the token DELETE runs before the ALTER, so both
-    sit in the single transaction ``init_db`` commits. A fresh database (no table before
-    ``init_db``) is not an upgrade and keeps its tokens.
+    sit in the single transaction ``init_db`` commits, and an error in between escapes
+    ``init_db`` and rolls both back. A fresh database (no table before ``init_db``) is not an
+    upgrade and keeps its tokens.
     """
     if column_was_present:
         return False
@@ -733,6 +736,84 @@ def _ensure_pin_scheme_column(
         dropped, seeded,
     )
     return True
+
+
+# Named one-shot startup steps that have run on this database. Not sync_version_tokens:
+# load_version_tokens returns every row of that table and the sync sends them all to the
+# backend as getSyncData params (app.py sync tick -> MonClubApi.get_sync_data), and a logout
+# clears it. Not sync_meta: a single row (CHECK id=1, contract_status NOT NULL) whose presence
+# is what tells load_sync_cache / load_sync_contract_meta that a sync has run, so a marker there
+# would fake a contract snapshot on a fresh install.
+_ONE_SHOT_STEPS_DDL = """
+    CREATE TABLE IF NOT EXISTS local_one_shot_steps (
+        name    TEXT PRIMARY KEY,
+        done_at TEXT NOT NULL
+    );
+"""
+_CREDENTIALS_GRANT_RESEND_STEP = "credentials_resend_for_grant_diff"
+
+
+def _force_one_credentials_resend(conn: sqlite3.Connection) -> bool:
+    """Drop ``credentialsVersion`` ONCE, on the first start of a build with the grant-aware diff.
+
+    WHY. ``_sync_gym_access_credentials_rows`` now writes a grant-only change, but rows the
+    previous build left stale (a renewed member keeps the old ActiveMembership id) are
+    rewritten only when the backend re-sends the credentials, and it does so only when its
+    credentials token moves -- upgrading the client does not move it. Without
+    ``credentialsVersion`` the next ``getSyncData`` asks for the credentials in full
+    (backend ``refreshCredentials = clientCredsVersion == null || ...``) and the diff rewrites
+    the rows that differ. No credential row is deleted here. guide §3.1b "The upgrade window".
+
+    ONE-SHOT. There is no column to key it on, so a ``local_one_shot_steps`` row records that it
+    ran; a fresh database runs it too (an empty DELETE) and is never touched again.
+
+    ATOMIC. The DELETE runs BEFORE the marker INSERT, both inside the one transaction ``init_db``
+    commits at its end: a crash in between rolls both back and the next start acts again. If
+    the INSERT fails and the caller carries on, the DELETE still commits without the marker,
+    so the next start drops the token once more -- the re-send is repeated, never lost. The
+    other order could commit the marker without the drop and lose it for good.
+
+    Returns True when the step ran (the marker was written by this call).
+    """
+    conn.execute(_ONE_SHOT_STEPS_DDL)
+    if conn.execute(
+        "SELECT 1 FROM local_one_shot_steps WHERE name = ?", (_CREDENTIALS_GRANT_RESEND_STEP,),
+    ).fetchone():
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    dropped = int(conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key = ?", ("credentialsVersion",),
+    ).rowcount or 0)
+    written = int(conn.execute(
+        "INSERT OR IGNORE INTO local_one_shot_steps (name, done_at) VALUES (?, ?)",
+        (_CREDENTIALS_GRANT_RESEND_STEP, now_iso()),
+    ).rowcount or 0)
+    if dropped:
+        logging.getLogger(__name__).warning(
+            "[DB] dropped the stored credentialsVersion once so the next getSyncData re-sends "
+            "every credential and the grant-aware diff rewrites the grant lists the previous "
+            "build left stale (renewed members kept their old membership id; guide §3.1b)."
+        )
+    return bool(written)
+
+
+def _run_one_shot_credentials_resend(conn: sqlite3.Connection) -> None:
+    """``init_db``'s call: a failure is logged and startup goes on.
+
+    Unlike the schema migrations earlier in ``init_db``, which stop startup on a failure (guide
+    §3.2d), this step may carry on: the DELETE runs before the marker INSERT, so the part of it
+    that commits can only repeat the drop on the next start, never lose it (guide §3.1b)."""
+    try:
+        _force_one_credentials_resend(conn)
+    except Exception as exc:
+        logging.getLogger(__name__).error("[DB] one-shot credentials re-send failed: %s", exc)
 
 
 def _member_main_account_id(u: Dict[str, Any]) -> Any:
@@ -1905,13 +1986,14 @@ def init_db() -> None:
         # P0-bulk: strategy cache on firmware profile (bulk upsert / delete cascade)
         _ensure_column(conn, "sync_firmware_profiles", "insert_strategy", "insert_strategy TEXT")
         _ensure_column(conn, "sync_firmware_profiles", "delete_strategy", "delete_strategy TEXT")
-        try:
-            _relax_firmware_profiles_not_null(conn)
-        except Exception as _mig_exc:
-            logging.getLogger(__name__).error(
-                "[DB] schema migration _relax_firmware_profiles_not_null failed: %s",
-                _mig_exc,
-            )
+        # A FAILING MIGRATION STOPS STARTUP, ON PURPOSE (this one and the three below): its
+        # error leaves init_db uncommitted, so whatever ran inside the open transaction rolls
+        # back (DDL run before the first INSERT/UPDATE/DELETE is already committed) and the next
+        # start retries it. Logging and carrying on committed half a migration (a full
+        # sync_users_new copy that fails every later start, a lost forced device refresh).
+        # guide §3.2d "A failing migration stops startup".
+        # [TEST: tests/test_init_db_migration_failures.py]
+        _relax_firmware_profiles_not_null(conn)
 
         # The bias under which the cached (template_table, body_index) combo was
         # learned. 0 = no override.
@@ -1937,13 +2019,7 @@ def init_db() -> None:
         # [TEST: tests/test_account_pin_sqlite_roundtrip.py::test_a_legacy_database_is_rebuilt_without_losing_a_column]
         # Measured BEFORE the rebuild, which re-creates the table with an empty column.
         _main_account_col_before = "main_account_id" in set(_table_columns(conn, "sync_users"))
-        try:
-            _rebuild_sync_users_without_legacy_fingerprint(conn)
-        except Exception as _mig_exc:
-            logging.getLogger(__name__).error(
-                "[DB] schema migration _rebuild_sync_users failed: %s",
-                _mig_exc,
-            )
+        _rebuild_sync_users_without_legacy_fingerprint(conn)
         _ensure_column(conn, "sync_users", "fingerprints_json", "fingerprints_json TEXT")
         _ensure_column(conn, "sync_users", "active_membership_id", "active_membership_id INTEGER")
         _ensure_column(conn, "sync_users", "account_username_id", "account_username_id TEXT")
@@ -1953,13 +2029,7 @@ def init_db() -> None:
         _ensure_column(conn, "sync_users", "user_profile_image", "user_profile_image TEXT")
         # The PERSON behind a member row (backend mainAccountId). NULL until the members
         # section is re-fetched, which the helper forces exactly once. guide §3.2d.
-        try:
-            _ensure_main_account_id_column(conn, column_was_present=_main_account_col_before)
-        except Exception as _mig_exc:
-            logging.getLogger(__name__).error(
-                "[DB] schema migration sync_users.main_account_id failed: %s",
-                _mig_exc,
-            )
+        _ensure_main_account_id_column(conn, column_was_present=_main_account_col_before)
 
         # F-005: UNIQUE index on (user_id, active_membership_id) to prevent duplicate rows
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_sync_users_uid_amid ON sync_users(user_id, active_membership_id) WHERE user_id IS NOT NULL AND active_membership_id IS NOT NULL;")
@@ -2232,18 +2302,13 @@ def init_db() -> None:
         # (activeMembershipId pins, exactly the pre-existing behaviour); 'ACCOUNT' ->
         # main_account.id pins. Read by device_sync.device_pin_scheme. Delivered on the same
         # path as roster_pushing_policy. See guide §3.2b. When NEWLY added the helper forces one
-        # device-section refresh (review #13, guide §3.2d).
-        try:
-            _ensure_pin_scheme_column(
-                conn,
-                table_existed=_sync_devices_existed_before,
-                column_was_present=_pin_scheme_col_before,
-            )
-        except Exception as _mig_exc:
-            logging.getLogger(__name__).error(
-                "[DB] schema migration sync_devices.pin_scheme failed: %s", _mig_exc,
-            )
-            _ensure_column(conn, "sync_devices", "pin_scheme", "pin_scheme TEXT")
+        # device-section refresh (review #13, guide §3.2d). No fallback _ensure_column on a
+        # failure: a column added without the devicesVersion drop is never refreshed again.
+        _ensure_pin_scheme_column(
+            conn,
+            table_existed=_sync_devices_existed_before,
+            column_was_present=_pin_scheme_col_before,
+        )
 
         # Opaque per-device capability descriptor (backend deviceCapabilities JSON,
         # e.g. {"fingerprintTemplateVersion": 9}). Stored as the raw JSON string and
@@ -2974,6 +3039,9 @@ def init_db() -> None:
             );
             """
         )
+        # One full credentials re-send, so the grant-aware diff rewrites the grant lists the
+        # previous build left stale. Once per database. guide §3.1b "The upgrade window".
+        _run_one_shot_credentials_resend(conn)
 
         # Phase 2: firmware profile cache
         # Keyed by device_id (stable int) — not IP (DHCP can reassign IPs).
@@ -3185,20 +3253,16 @@ def init_db() -> None:
     try:
         n = reset_stale_processing_locks()
         if n > 0:
-            import logging
             logging.getLogger("db").warning(f"[DB] Reset {n} stale processing lock(s) in offline_creation_queue on startup.")
     except Exception as _e:
-        import logging
         logging.getLogger("db").error(f"[DB] Failed to reset stale processing locks on startup: {_e}")
 
     # Same recovery for the lifecycle-mutation queue.
     try:
         nm = reset_stale_offline_mutation_locks()
         if nm > 0:
-            import logging
             logging.getLogger("db").warning(f"[DB] Reset {nm} stale processing lock(s) in offline_mutation_queue on startup.")
     except Exception as _e:
-        import logging
         logging.getLogger("db").error(f"[DB] Failed to reset stale mutation locks on startup: {_e}")
 
     # Reset a WAL inherited large from a prior session BEFORE the device workers
