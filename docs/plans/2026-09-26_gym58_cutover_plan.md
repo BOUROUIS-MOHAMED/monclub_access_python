@@ -3,12 +3,15 @@
 **Status: PLAN ONLY.** Nothing here has been executed. No panel was connected to, written to,
 erased or reconfigured, and no database was changed while writing it. Written 2026-09-26 against
 Access `master` `22c9cfc`, backend `main` `c7d4b532`, dashboard `main` `75025186`. Branch
-`claude/cutover-night-runbook` (not merged, not pushed). The owner-facing steps are in
+`claude/cutover-night-runbook` (merged into `master` at `dbf865f`); second round 2026-09-26 on
+`claude/cutover-runbook-round2` (the review findings: pre-install before the erase, the card
+self-check, the firewall block, the restart proof). The owner-facing steps are in
 [`2026-09-26_cutover_night_runbook.md`](2026-09-26_cutover_night_runbook.md); this file is the evidence.
 
 It follows the gym 45 plan ([`2026-09-19_gym45_cutover_plan.md`](2026-09-19_gym45_cutover_plan.md)) and
 only spells out what differs. Grades as there: `[CODE]` (an executable statement, named), `[TEST]`,
-`[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[UNVERIFIED]`, `[UNKNOWN]`.
+`[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated;
+nobody has checked it), `[UNVERIFIED]`, `[UNKNOWN]`.
 **Every number below marked "copy" comes from `cutover_scratch_demo`, a scratch copy of `wigo-demo`
 taken 2026-09-26: a scrubbed clone of the 2026-09-12 production dump that later test sessions
 mutated. They are rehearsal numbers, not production numbers.** Aggregates only; `wigo-db` was not
@@ -141,9 +144,22 @@ un nouveau PC"**, a name) and heartbeat once before the switch. The dashboard's 
 "Tous les PC enregistrés de ce club font tourner au moins la version …"
 `[CODE: dashboard main fr locale pinScheme.default.reason.allMeet]`. A PC that is not reinstalled
 must not run Access afterwards (it never registered, so the gate cannot see it -- memory note of
-2026-09-19: "`gym_access_pc` is not a census of the fleet").
+2026-09-19: "`gym_access_pc` is not a census of the fleet"). Switching it off is not enough -- staff
+switch reception PCs on (gym 45 plan section 3.3) -- and a revoke could not stop it even if it were
+registered: an old Access syncs with the gym login (runbook D12). So it carries the firewall block of
+the runbook's C1b (the gym 45 plan section 5.2 rules with gym 58's IPs, proven with this plan's export
+before and after) or is unplugged from the network, until it runs the new Access.
 
-### 3.4 Upgrade in place, not a clean data folder
+### 3.4 Upgrade in place, not a clean data folder, and BEFORE the erase
+
+The upgrade is done and the new Access started once, still on MEMBERSHIP, **before** the erase
+(runbook A7, required): the installer deletes the old program before copying
+(`installer/MonClubAccess.iss::PrepareToInstall`) and a failing migration stops start-up, so a first
+start after the erase could leave both panels empty with nothing able to refill them. On MEMBERSHIP
+the new release writes the same pins, fields and rows as 1.4.22-1.4.33, clears no hash, records no
+switch and never touches fingerprint rows; the exceptions (a PC on 1.4.19/1.4.21, the first full
+refresh, protocol 2 and the QR roster check if on) are listed with their grades in the runbook, part A,
+"What A7 changes at the door" (code read 2026-09-26).
 
 The new Access upgrades the old database: it adds `sync_users.main_account_id` and forces one full
 member refresh, adds `sync_devices.pin_scheme`, drops `devicesVersion` and records every known device
@@ -162,10 +178,15 @@ row (pin, name, card, whether a password is set -- never the value -- and the ot
 firmware returns), the `userauthorize` rows, and per pin the finger ids of `templatev10` (never the
 template column). It reaches `plcommpro.dll` only through `_pullsdk_read.ps1`, which declares
 `Connect, Disconnect, GetDeviceData, GetDeviceDataCount, GetDeviceParam, PullLastError` and nothing
-else; the real-time log is never read. It refuses to run while `MonClubAccess.exe` runs on the PC.
+else; the real-time log is never read. It refuses to run while `MonClubAccess.exe` runs on the PC
+(that PC only). A negative `GetDeviceDataCount` answer is a PullSDK error, not a count: it is listed in
+`errors` and the count is written as `null`; a failed count of `user`, `userauthorize` or `templatev10`
+(the counts that prove a panel empty) makes the export partial (`complete: false`, exit 2), and
+`templatev10` is still listed when its count is unknown.
 `[TEST: tests/test_c3_panel_export_readonly.py -- static allowlist, no write entry point named, no
-dynamic invocation, the connection string Access sends, and the shipped script run against a fake
-panel with only those six calls]`. Smoke run on the development PC, 32-bit PowerShell, the pack's
+dynamic invocation, the connection string Access sends, the shipped script run against a fake
+panel with only those six calls, the refusal while MonClub Access runs (exit 1, no Connect), and the
+failed counts]`. Smoke run on the development PC, 32-bit PowerShell, the pack's
 `plcommpro.dll`, `Connect` to 127.0.0.1:1 (no device): handle 0, `PullLastError=-307`, 2.3 s with
 `timeout=2000` `[TEST: 2026-09-26, not committed]`. **Never run against a real panel.** Whether a
 C3-400 answers every parameter name, returns the `user` table with `*`, and how long the reads take are
@@ -177,8 +198,16 @@ format for that row (counted as `userRowsMalformed`), as it does in Access's own
 `--gym-id 58`. New `cards` section: per current person, the cards seen on the panel under their own
 pin or on an old user strongly tied to them (same card number, pin = card) that MonClub will not write
 -- another card, a second card, a value outside the 4-byte range. Detail rows `member_terminal_only_card`
-in `--detail-csv` (names). `[TEST: tests/test_gym45_compare_terminal_export.py::TestPanelCards, including
-a database in the `access_1.4.30` schema]`. With `--access-db` alone (a copy of the PC's database) the
+in `--detail-csv` (names); the note says which of three cases it is: `no card in MonClub` (MonClub holds
+nothing: the only case the desk may enter), `MonClub card ... cannot be written to a panel -- do not
+overwrite it`, or `MonClub card ... -- do not overwrite it`, plus a flag for a MonClub card starting with
+`99999`. **The card self-check** (printed under `== cards`): on the pins MonClub owns (every member pin
+when the PC records no ownership, as <= 1.4.31 does) that MonClub sends a card, the share whose panel
+`CardNo` equals it. How a C3-400 returns `CardNo` is `[UNVERIFIED]` (`device_sync.py::_same_card`'s own
+note; pullsdk_guide §5); below 90 % the list may be an artefact and is not acted on. The card rule
+follows the export: a panel gets `_normalize_device_card`, an MB2000 the raw digits; exports of the two
+kinds are refused in one run. `[TEST: tests/test_gym45_compare_terminal_export.py::TestPanelCards, including
+a database in the `access_1.4.30` schema, the self-check at 90 % and on hex-returned cards]`. With `--access-db` alone (a copy of the PC's database) the
 card list needs no production MySQL copy; add the MySQL copy to tie old users by their GMS id.
 Limits: the C3 `user` table has no privilege or enabled column, so the export writes `privilege 0`,
 `enabled true` for every row and the report's "privileged 0 / disabled 0" means "not read"; the `cards`
@@ -193,22 +222,22 @@ C3-400; the export records its own timings.
 
 | Step | Proof it worked | If it fails |
 |---|---|---|
-| G0. Every PC of the gym: untick "Ouvrir MonClub Access avec Windows", Quit, watchdog off (gym 45 plan §3.3) | Task Manager: no `MonClubAccess.exe` | stop; nothing changed |
+| G0. Every PC of the gym: untick "Ouvrir MonClub Access avec Windows", watchdog off (**before** the Quit: it restarts Access after any Quit), Quit (gym 45 plan §3.3). A PC that will not run the new Access: the firewall block, proven, or unplugged (§3.3; runbook C1b) | Task Manager: no `MonClubAccess.exe`; the watchdog task `Disabled` or absent | stop; nothing changed |
 | G1. Copy the data folder `%ProgramData%\MonClub Access\access\` of each PC (Access stopped) | the copy exists | stop |
-| G2. Export both panels, full commands, `-Label device5` / `-Label device6` (type each IP in full) | `complete: true`; `counts.user` = `summary.users` | a connect failure: check cable, IP, device password; nothing changed |
-| G3. Compare each export with `--access-db <copy of the PC that drives it>` `--gym-id 58`; and a second run with `--scheme ACCOUNT` to confirm `account_pins_already_on_terminal` (expected 0, §1.1) | the `cards` list; `classes`; `leftovers` | a non-zero ACCOUNT hit: stop and call the developer |
-| G4. Go / no-go: owner accepts the card list (members who will be refused by card until their card is entered in MonClub); erase tool present (E1); clock skew within ±10 s or accepted | -- | stop; nothing changed |
+| G2. Export both panels, full commands, `-Label device5` / `-Label device6` (type each IP in full). Once per panel, the reference refusal: the panel's cable unplugged at the panel, the same command, its `PullLastError` written down (runbook A2b) | `complete: true`, `errors` empty; `counts.user` = `summary.users` | a connect failure: check cable, IP, device password; nothing changed. `errors` not empty: call the developer before G5 |
+| G3. Compare each export with `--access-db <copy of the PC that drives it>` `--gym-id 58`; and a second run with `--scheme ACCOUNT` to confirm `account_pins_already_on_terminal` (expected 0, §1.1) | the `cards` list and the card self-check line; `classes`; `leftovers` | a non-zero ACCOUNT hit: stop and call the developer. Card self-check below 90 % or not measured: the card list is not acted on (G4) |
+| G4. Go / no-go: the new Access has started once on every PC that will run (§3.4, runbook A7); owner accepts the card list (members who will be refused by card until their card is sorted out) -- the survey list is the one the desk used; with a failed card self-check the owner accepts that the losses are unknown, or stops; erase tool present (E1); clock skew within ±10 s or accepted; the go/no-go clock (runbook C) | -- | stop; nothing changed |
 | G5. Erase panel 5, then panel 6 (E1 tool) | the tool's AFTER counts `user=0`, `userauthorize=0`, `templatev10=0` | re-run; still not empty → that panel stays on MEMBERSHIP (R8 below) |
-| G6. Verify empty: a new export (counts 0), a member's card at that door refused | both | back to G5 |
-| G7. Interlock: panel network cables out (they keep power) | the export from the PC now ends with `CONNECT FAILED` | -- |
-| G8. Install the new Access on each PC, **"Launch MonClub Access" unticked**; start it; login kept; "Identité du poste" → "C'est un nouveau PC" | /access-pcs lists each PC with the new version | a start-up that stops: `%TEMP%\MonClubAccess.log`, call the developer |
+| G6. Verify empty: a new export -- `complete: true`, `errors` empty, `counts.user`, `counts.userauthorize`, `counts.templatev10` each exactly 0 (`null` is not 0), `summary.users` 0 -- and a member's card at that door refused | both | back to G5; a `null` count: the panel is not proven empty, call the developer |
+| G7. Interlock: panel network cables out (they keep power) | the export from the PC now ends with `CONNECT FAILED` **with the G2 reference `PullLastError`** | another code: something else refused the connection (another PC holding the panel? whether a C3-400 allows two clients is `[UNVERIFIED]`): find it first |
+| G8. No install after the erase (§3.4). Start the new Access on each PC (registered at runbook A7) | /access-pcs lists each PC with the new version | a start-up that stops: `%TEMP%\MonClubAccess.log`, call the developer; the rollback is the runbook's F row "does not start -- after the erase" |
 | G9. Dashboard: the verdict sentence "Tous les PC enregistrés…" (shown only on the add-device form, `gym-devices-view.tsx`; on an existing device a refusal shows as a red message and the confirm dialog names the minimum version); device 5 then 6: "Par personne", tick both boxes, save; reopen each | each reads "Par personne" | refused (409): read `blockingPcs`, revoke retired PCs in /access-pcs |
-| G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected. **Then Quit and restart Access on every running PC** and wait for `getSyncData OK`: a switch that reached a PC through a dashboard fast patch (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) is recorded and logged, but the running ULTRA workers keep their MEMBERSHIP device copy until a server sync refreshes them (`app.py` sync tick → `refresh_devices`), and the full pass pushes from that copy (`ultra_engine._drain_full_sync_commands`, `self._device`) `[CODE, review 2026-09-26]` | the lines, then the restart | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer |
+| G10. On each PC, newest log in `%ProgramData%\MonClub Access\data\logs\`: `[T] PIN_SCHEME_SWITCH device_id=5 previous=MEMBERSHIP scheme=ACCOUNT` (and 6). `cleared_rows` is the old row count here: expected. **Then Quit and restart Access on every running PC** and wait for `getSyncData OK`: a switch that reached a PC through a dashboard fast patch (`app.py::apply_fast_patch_bundle` → `db._insert_device_row`) is recorded and logged, but the running ULTRA workers keep their MEMBERSHIP device copy until a server sync refreshes them (`app.py` sync tick → `refresh_devices`), and the full pass pushes from that copy (`ultra_engine._drain_full_sync_commands`, `self._device`) `[CODE, review 2026-09-26]`. The restart is proven three ways (runbook C13's box): no `MonClubAccess.exe` after the Quit; a new `App started. pid=... version=X.Y.Z` line later than the switch lines; `getSyncData OK` after it -- the log file is cut by hour, not by process (`app/core/logger.py`), so "the new log" alone proves nothing | the lines, then the three restart checks | none after a few minutes: `getSyncData OK` in the log? then "Réinitialisation complète"; still none → do NOT plug in, call the developer. A restart check fails → do NOT plug in |
 | G11. Plug the panel cables back only when every PC that is switched on has shown G10; the other PCs stay shut down (the cable is the panel's, so it releases every PC at once) | -- | -- |
 | G12. Push: per panel, a pass ending with `[DeviceSync] Device id=5: device_pins=N desired=N to_sync=0 stale=0` on the pass after the push, N = the people count that pass computed (it can change after midnight: the 00:00:05 date flip asks for a full pass, guide §3.8) | the line for 5 and 6 | `REVOKE_ABORTED` → the panel was not empty: Quit, export, back to G5. `PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète"; persists → call the developer |
-| G13. Verify: Quit, export both panels, compare with `--scheme ACCOUNT --access-db <fresh copy>`: `member_owned` = people, `leftover` = 0, no `cards` loss beyond the G4 list | numbers | members missing → "Réinitialisation complète", redo G12-G13 |
-| G14. Doors: 3 members' cards, 1 QR code, 1 expired member (refused), 1 staff card, the reception "Open" button, on both panels | as expected | the half-state table |
-| G15. Re-tick start-with-Windows, watchdog on (autostart checklist). Open | -- | -- |
+| G13. Verify: Quit, export both panels, compare with `--scheme ACCOUNT --access-db <fresh copy>`: `member_owned` = people, `leftover` = 0, the card self-check at or above 90 %, no `cards` loss beyond the G4 list | numbers | members missing → "Réinitialisation complète", redo G12-G13 |
+| G14. Doors: 3 members' cards, 1 QR code, 1 expired member (refused), 1 staff card, the reception "Open" button (it needs the PC's connection to the panel: `local_access_api_v2._handle_device_door_open` answers 503 while the panel is unreachable `[CODE]`), on both panels | as expected | the half-state table |
+| G15. Re-tick start-with-Windows; only now the watchdog on, and its `NextRunTime` checked (autostart checklist §4). Open | -- | -- |
 
 **Half-states** (per panel): before G5, nothing changed (R1). After G5 and before G10 on some PC:
 set "Par abonnement" back if it was saved, reconnect, start Access → the drift re-push refills the panel
@@ -218,10 +247,17 @@ erase again, cables out, "Par abonnement" (the dashboard asks "J'ai effacé le t
 start each PC behind the interlock until it logs `previous=ACCOUNT scheme=MEMBERSHIP`, restart it (G10),
 then reconnect (R4). Started with the cables in and a failed first sync, a PC works from its stored
 "Par personne" row and writes account pins back `[CODE: app.py start-up from the cached devices]`. A panel left for another day stays on MEMBERSHIP, works as today (R8).
+The new Access failing to start: before the erase, the previous installer and the pre-A7 data copy
+bring the old Access back with nothing changed at the door; after the erase, the same, then the drift
+re-push refills under MEMBERSHIP (runbook part F, two rows; the old version on its own copy after a
+newer install is `[UNVERIFIED]`, never tried). While a panel is unplugged the reception "Open" button
+cannot open it; the opening fallback is the turnstile arm dropped by hand, with a staff member there
+`[OWNER, 2026-09-26]` -- how, and by whom, is still to be written down (runbook G).
 
 ## 6. Decisions only the owner can take
 
-- **E1 -- the erase tool** (§3.1). Without one, gym 58 cannot be done.
+- **E1 -- the erase tool** (§3.1). Without one, gym 58 cannot be done: then decide explicitly that gym 58
+  waits and the night is gym 45 only.
 - **E2 -- the QR rescue flag** (§1): which value is right, and who checks it before the night.
 - **E3 -- which PCs gym 58 has**, which one drives the panels, and whether the others come back
   (gym 45 plan D2). Each one that runs must be upgraded and registered, or never started again.
@@ -229,7 +265,14 @@ then reconnect (R4). Started with the cables in and a failed first sync, a PC wo
   entered in MonClub (QR still works for all 1,690), or fix MonClub before the night.
 - **E5 -- the survey evening** (runbook A): run G2-G3 on an earlier closed evening, so the card list is
   known and fixed in MonClub before the night. Read-only.
-- **E6 -- the 102 cards MonClub cannot write** (§1.1): unchanged by the cutover; a separate question.
+- **E6 -- the 102 cards MonClub cannot write** (§1.1): unchanged by the cutover; a separate question. At
+  the desk they are never overwritten, and the 103 starting with `99999` are never touched without the
+  owner (runbook A6).
+- **E7 -- when the new Access is pre-installed** (§3.4, runbook A7): the survey evening (then it runs
+  days on MEMBERSHIP) or the night, after the export. And, before it, the state of protocol 2 and of
+  the panels' QR roster check (runbook A7, point 5).
+- **E8 -- the turnstile arm** (§5 half-states): how it is dropped at doors 1 and 2, who can do it, and
+  whether the gym opens with the arms dropped if the refill is not proven.
 
 ## 7. Field tests (each needs the real panels)
 
@@ -237,11 +280,11 @@ then reconnect (R4). Started with the cables in and a failed first sync, a PC wo
 |---|---|---|---|
 | F58-1 | The export reads a C3-400 (parameter names, `user` with `*`, `userauthorize`, `templatev10` fields) | `complete: true`, `errors` empty | G2 |
 | F58-2 | Read duration | `timings` in the file | G2 |
-| F58-3 | The firewall block stops a PullSDK connection | the export before/after | G7 |
+| F58-3 | The firewall block stops a PullSDK connection (a PC not upgraded); a pulled cable gives the same `PullLastError` every time | the export before/after; the G2 reference code equals the G7 code | G0, G2, G7 |
 | F58-4 | The erase empties the panel (E1 tool) | counts 0 | G5-G6 |
 | F58-5 | Full ACCOUNT push time for ~1,690 people on a C3-400 | first to last pass in the log | G12 |
 | F58-6 | QR codes open during the push (`ultra_sync_yield_to_rtlog=1`) | someone scans a QR during G12 | G12 |
-| F58-7 | `CardNo` read back as written (leading zeros ignored by the comparison) | the `cards` section of G13 shows no loss beyond the G4 list | G13 |
+| F58-7 | `CardNo` read back as written (leading zeros ignored by the comparison) | the card self-check rate at G3 (cards the old Access wrote) and at G13 (the new push) | G3, G13 |
 | F58-8 | A member deleted then restored opens the door (guide §7, R6-08) | one member | days after |
 
 ## 8. Still unknown after this plan

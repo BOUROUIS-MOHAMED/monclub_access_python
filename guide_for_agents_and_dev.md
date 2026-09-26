@@ -3215,8 +3215,14 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
 - **PullSDK panels**: `tools/c3_panel_scripts/export_c3_panel_readonly.ps1` reads one panel
   (parameters, clock, table counts, `user`, `userauthorize`, `templatev10` finger ids) into a file,
   through a helper that declares only `Connect`, `Disconnect`, `GetDeviceData`, `GetDeviceDataCount`,
-  `GetDeviceParam`, `PullLastError` `[TEST: tests/test_c3_panel_export_readonly.py]`. Never run
-  against a real panel yet `[UNVERIFIED]`. There is no PullSDK write or erase script. `[CODE]`
+  `GetDeviceParam`, `PullLastError` `[TEST: tests/test_c3_panel_export_readonly.py]`; a negative
+  `GetDeviceDataCount` is recorded in `errors` and written as `null`, and a failed `user` /
+  `userauthorize` / `templatev10` count makes the export partial `[TEST: same file]`. Its output is
+  compared by `tools/gym45_cutover/compare_terminal_export.py`, whose `cards` section is licensed by a
+  card self-check (own pins whose device card equals the card MonClub writes, ≥ 90 %), the card rule
+  chosen per export (`_normalize_device_card` for a panel, the raw digits for an MB2000)
+  `[TEST: tests/test_gym45_compare_terminal_export.py::TestPanelCards]`. Never run against a real panel
+  yet `[UNVERIFIED]`. There is no PullSDK write or erase script. `[CODE]`
 
 ---
 

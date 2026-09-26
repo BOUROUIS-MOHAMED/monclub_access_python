@@ -7,7 +7,8 @@ the time; execution is a separate, later step. Written 2026-09-19 against Access
 `claude/gym45-cutover-plan` (not merged, not pushed).
 
 Every claim is graded as in the guides: `[CODE]` (an executable statement, named), `[TEST]`,
-`[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[UNVERIFIED]`, `[UNKNOWN]`.
+`[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated;
+nobody has checked it), `[UNVERIFIED]`, `[UNKNOWN]`.
 `wigo-demo` numbers come from a scrubbed clone of the 2026-09-12 production dump that later test
 sessions **mutated**: they are rehearsal numbers, **not production numbers**. The real run needs a
 fresh production export (SELECT-only; never `wigo-db`).
@@ -115,7 +116,12 @@ starting again, or block the terminals' IPs on that PC with Windows Firewall (§
 P2, P3 = the other two. They run 1.4.32 / 1.4.33, which ignore `pinScheme`: started after the switch
 they would write membership pins onto the account terminals, pins only they own, which nothing then
 removes `[CODE]`. Switching them off is not enough -- staff switch reception PCs on. So from step E1
-on they carry the §5.2 firewall block until §5.3 is done for them (D2).
+on they carry the §5.2 firewall block until §5.3 is done for them (D2). **Revoking their record in
+/access-pcs does not stop them**: 1.4.32/1.4.33 fetch the members with the gym login, and a revoke only
+stops the PC's heartbeat (`git show access_1.4.33:access/pc_identity.py`, state `revoked`;
+`…:app/ui/app.py::_sync_tick` → `get_sync_data` with the gym login token) `[CODE]`; the backend's
+member sync checks no PC status (`GymAccessController`, review 2026-09-26). Only the block (or the PC
+off the network) keeps them off the terminals.
 
 How to fully stop Access on a PC and keep it stopped `[CODE]`:
 - **Untick "Ouvrir MonClub Access avec Windows"** on Access's Config page FIRST. The app rewrites the
@@ -311,7 +317,7 @@ retire or switch a terminal that did not pass E6.
 | E8 | **Retire on P1, per terminal that passed E6** (D3), with Access stopped -- or D3(a)'s action in its no-engine mode. §5.1. | counts 0 for that device | Restore the `access.db` copy; stop (R2) |
 | E9 | Dashboard /gym-devices, per retired terminal: PIN scheme **"Per person"**, tick both boxes, save. | reopen EACH device: it reads "Per person" | Leave it; no PC is running |
 | E10 | Start Access on P1. In `%ProgramData%\MonClub Access\data\logs\` (the newest file) wait for, per switched device: **`[T] PIN_SCHEME_SWITCH device_id=8 previous=MEMBERSHIP scheme=ACCOUNT cleared_rows=0 first_sighting=False`** (`device_id=10` likewise). `cleared_rows=0` confirms `device_sync_state` was empty when the switch arrived (it counts that table only `[CODE: db._clear_device_sync_hashes_on]`); the proof for all three tables is the §5.1 counts taken at E8. (The `[DB] … pinScheme …` line of guide §3.2e does not reach this folder: only the `zkapp` loggers write there `[CODE: app/core/logger.py]`.) | the line(s) | **`cleared_rows` ≠ 0 → STOP, do not plug in**: something pushed after the retire; Quit, E6 export, back to E5. One device switched, the other not → fix that device in /gym-devices and wait; do not switch back the one that switched. No line after a few minutes → check the log shows `getSyncData OK` (the PC reached the server); then **"Réinitialisation complète"** (clears the version tokens, forces the device refresh `[CODE]`). Still none → the switch was NOT recorded: do not plug in, go to **R3** (which first puts the dashboard back to "Per membership") and call the developer |
-| E10b | *(added 2026-09-26, review of the cutover-night runbook)* **Quit and restart Access on P1**, wait for `getSyncData OK`. If the dashboard was open on P1, the switch reached P1 through a fast patch: it is recorded and logged, but the running workers keep their MEMBERSHIP copy of the device until a server sync refreshes them `[CODE: app.py::apply_fast_patch_bundle; the sync tick's refresh_devices; ultra_engine._drain_full_sync_commands uses self._device]` | the new log | -- |
+| E10b | *(added 2026-09-26, review of the cutover-night runbook; proof tightened in its second round)* **Quit and restart Access on P1, proven three ways**: (1) after the Quit, Task Manager shows no `MonClubAccess.exe`; (2) after the start, the newest log has an `App started. pid=… version=…` line (`app.py`, written at every start) later than the `PIN_SCHEME_SWITCH` lines, with another `pid` than the previous one; (3) a `getSyncData OK` line after it. "The new log" alone proves nothing: log files are cut by hour, not by process (`app/core/logger.py::active_log_name_for`), and a second launch while the first still runs exits at once, saying so only in `%TEMP%\MonClubAccess.log` (`access/main.py`) `[CODE]`. Why the restart: if the dashboard was open on P1, the switch reached P1 through a fast patch: it is recorded and logged, but the running workers keep their MEMBERSHIP copy of the device until a server sync refreshes them `[CODE: app.py::apply_fast_patch_bundle; the sync tick's refresh_devices; ultra_engine._drain_full_sync_commands uses self._device]` | the three checks | a check fails: do not plug in; call the developer |
 | E11 | **Plug the cables in** (or remove the block). P1 reconnects within ≤ 140 s `[CODE: connect backoff ≤ 120 s + 20 s connect deadline]` and re-pushes: 50 pins per pass, passes back to back, both terminals in parallel `[CODE]`. **Done, per device**, when (1) the last pass has no `[T] FULL_SYNC_CAPPED` and ends with `[T] ZKEM_PUSH_DONE … failed=0 … tpl_failed=0` and `[T] FULL_SYNC_DONE … ok=True` (a refused template still counts as pushed, so `failed=0` alone is not enough `[CODE: zk_standalone.push_roster, ultra_engine._run_standalone_full_sync]`); then (2) **Quit and restart Access** (behind nothing now -- the switch is recorded): its start-up full pass logs `full sync (reason=startup): all N desired pins already on the terminal -- nothing to push` with N = the number of people, and no `[T] SYNC_RETRY_BACKOFF` (N also counts pins held back by the retry backoff `[CODE: ultra_engine._standalone_pins_needing_push]`). Pressing "Synchroniser" does not produce that line: without a server change it requests no push, and the timer skips an unchanged roster `[CODE: app.py::_request_running_ultra_sync, ultra_engine.UltraSyncScheduler._sync_all]`. Floor: ~902 people ÷ 50 = 19 passes × ≤ 22.6 s of writes ≈ **7 min per terminal**, from the one field rate (928 users / 419 s, device 8, v1.4.26, before P3a-2 `[FIELD]`); each pass also rebuilds the whole roster and runs a fingerprint-table query whose result is not used `[CODE]` (a comparable query took 6.8 s on this PC class `[FIELD]`), so it can be well above the floor -- D4 measures it. | the completion lines | `[T] PIN_SCHEME_ACCOUNT_WITHHELD` → "Réinitialisation complète" (full member refresh); persists → those members get in at the desk, call the developer. `[T] CAPACITY_FULL` → Quit, quick export, read `users_free`/`fingerprints_free`, call the developer. `[T] TEMPLATE_VERSION_MISMATCH` → stop, call the developer (G3 was wrong; those members' fingers are not written; their cards still are). `[T] REVOKE_ABORTED` → the retire missed rows: Quit, §5.1 counts |
 | E12 | **Verify**: Quit Access on P1, `-Fingers` export of each terminal (full commands), comparison with `--scheme ACCOUNT --access-db <fresh copy>` on the G11 machine: `member_owned` = `deliverable_people`, `leftover` = the kept admins, `sha self-check` at the Phase B rate, no `people_with_terminal_only_finger`. Restart Access. `[TEST: TestVerifyingThePushUnderAccount -- the same terminal read as MEMBERSHIP shows no member]` | numbers as stated | Members missing: "Réinitialisation complète", redo E11-E12 |
 | E13 | **Doors**: 3-5 people with MonClub fingers (finger AND card), one expired member (refused), one QR code, the reception "Open" button | all as expected | See the half-state table |
@@ -396,8 +402,12 @@ enrolled? membership deliverable?). Delete the biometric backup files per D7.
 **Which states the gym can open in:** only (a) before E5 -- nothing changed -- and (b) after E13 passed.
 Anything between refuses members at that terminal (device 8 "Sortie" is the exit). If the gym must open
 anyway, apply the row below for that state first; members already written back get in, the others are
-let through by staff (a manual release of these turnstiles is `[UNVERIFIED]`); the reception Open button
-can time out during a push; QR codes work between chunks.
+let through by staff: the owner says the turnstile arm can be dropped by hand so everyone enters freely
+`[OWNER, 2026-09-26, relayed by the master session]` -- nobody is then checked and nothing is logged,
+so a staff member stays there until the push is proven and the arm is raised; how it is dropped and by
+whom is not written down yet. The reception Open button can time out during a push, and cannot open a
+terminal whose cable is out or that is blocked (`local_access_api_v2._handle_device_door_open`, 503)
+`[CODE]`; QR codes work between chunks.
 
 | Row | Point reached (per terminal) | Back to a working door | What cannot be undone |
 |---|---|---|---|
@@ -497,4 +507,5 @@ the driver plan; Access is always stopped before a script connects).
 - The production numbers (roster, fingers, PCs' versions today) -- wigo-demo is a mutated rehearsal copy.
 - Durations: full read, erase, per-pass setup (FT1, FT5, FT7).
 - Whether the MB2000 sends events for scans made during a push chunk (guide §3.4e) -- the gym is closed.
-- Whether the turnstiles can be released by hand when a door is refusing members.
+- How the turnstile arm is dropped by hand, and who on staff can do it (the owner says it can be
+  dropped, `[OWNER, 2026-09-26]`; the method is not recorded).

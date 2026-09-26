@@ -14,7 +14,7 @@ For the owner. Plain steps, in the order of the night. The evidence behind each 
 (the review findings of 2026-09-26) on `master` `dbf865f`, branch `claude/cutover-runbook-round2`.
 
 **Grades**, as in the two plans: `[CODE]` (an executable statement, named), `[TEST]`, `[FIELD]` (a dated
-measurement), `[OWNER]` (the owner said so, dated; nobody has checked it here), `[UNVERIFIED]`,
+measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated; nobody has checked it here), `[UNVERIFIED]`,
 `[UNKNOWN]`.
 
 **About the times.** Almost nothing here has ever been timed on the real devices. Where a time is

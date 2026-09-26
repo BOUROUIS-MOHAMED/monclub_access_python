@@ -816,7 +816,8 @@ What is actually pinned, and what is not.
 - The read-only panel export `tools/c3_panel_scripts/export_c3_panel_readonly.ps1` (32-bit
   PowerShell, its own P/Invoke of six read entry points, the table-read ladder and connection string
   of §4-§5) — `tests/test_c3_panel_export_readonly.py`: static checks of both files, and the export script run
-  with the helper REPLACED by a fake panel, so the helper's DLL calls, buffer ladder and 32-bit
+  with the helper REPLACED by a fake panel (including its refusal while `MonClubAccess` runs on the PC,
+  and a negative `GetDeviceDataCount` recorded as an error and a `null` count), so the helper's DLL calls, buffer ladder and 32-bit
   relaunch are checked only statically and by reading them against §4-§5. A smoke run of the real
   helper on the development PC (the pack's `plcommpro.dll`, `Connect` to 127.0.0.1:1 where no device
   listens) returned handle 0 and `PullLastError=-307` after 2.3 s with `timeout=2000`
