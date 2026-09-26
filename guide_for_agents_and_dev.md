@@ -2972,10 +2972,10 @@ leases (role `REVOKED`, cached too, so a cold start keeps it); in a gym without 
 merely offline keeps its cached roles. `[CODE: leases.py::LeaseManager._revoked, ::_drop_leases]`
 `[TEST: test_v2_review1.py::test_r2_*]` Residual `[CODE]`: a PC that is revoked or loses its lease while it is
 **off** acts on its cached roles at the next power-on until the server answers (usually the first minute
-online); offline it has no way to learn it. `[UNVERIFIED]` An AGENT-mode worker (`realtime_agent.py`) has no
-connect-time lease check (only `refresh_devices` filters) and the release does not wait for it, so after a
-handover the outgoing PC may stay connected to a C3 panel until its next sync tick while the new driver
-connects; what two concurrent PullSDK sessions do on a C3 is unknown (review round 5, not shown to harm).
+online); offline it has no way to learn it. An AGENT-mode worker (`realtime_agent.py::DeviceWorker.run`) re-reads the
+gate at every loop turn (one lock-free snapshot read): when the lease or the release it was finishing ends it
+disconnects at once and does not reconnect, instead of holding its PullSDK session until the next sync tick
+(review round 5). `[CODE]` `[TEST: test_v2_review1.py::test_round5_an_agent_worker_drops_its_session_once_the_lease_ends]`
 
 **Add-only and the handover (P2c-1/P2c-2).** A `DRIVE` turnstile is add-only while its lease says
 `handoverForced` or while this PC has not restored the ownership backup for the lease generation it holds; a
@@ -3490,7 +3490,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2873 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 5; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2874 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 5 and the AGENT lease check; before that 2873; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`

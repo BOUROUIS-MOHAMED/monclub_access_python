@@ -544,3 +544,46 @@ def test_round4_a_retry_after_a_seen_write_timeout_reuses_the_token(db):
     except Exception:
         pass
     assert len(seen) == 2 and seen[0] == seen[1]
+
+
+# ---------------------------------------------------------------------------------- round 5
+def test_round5_an_agent_worker_drops_its_session_once_the_lease_ends(monkeypatch):
+    import logging
+    import queue as _queue
+    import app.core.realtime_agent as ra
+
+    class Dev:
+        def __init__(self):
+            self.is_connected, self.connects, self.disconnects = True, 0, 0
+
+        def ensure_connected(self):
+            self.connects += 1
+            self.is_connected = True
+            return True
+
+        def disconnect(self):
+            self.disconnects += 1
+            self.is_connected = False
+
+        def __getattr__(self, name):       # any poll call: nothing to read
+            return lambda *a, **k: []
+    dev = Dev()
+    monkeypatch.setattr(ra, "get_driver", lambda payload, logger=None: dev)
+    lg.install(lg.snapshot_from_assignment({"gymUsesAssignments": True, "role": "READER",
+                                            "drive": [], "release": []}, source="server"))
+    statuses = []
+    w = ra.DeviceWorker(device_payload={"id": 8, "name": "T8"}, logger=logging.getLogger("t"),
+                        event_queue=_queue.Queue(), status_cb=statuses.append,
+                        settings_provider=lambda did: {"enabled": True})
+    w.start()
+    try:
+        deadline = time.time() + 3
+        while dev.disconnects == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert dev.disconnects == 1 and dev.connects == 0 and not dev.is_connected
+        time.sleep(0.3)
+        assert dev.connects == 0                        # a reader never reconnects
+    finally:
+        w.stop_event.set()
+        w.wake_event.set()
+        w.join(3)

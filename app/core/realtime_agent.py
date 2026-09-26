@@ -754,6 +754,22 @@ class DeviceWorker(threading.Thread):
                 self.wake_event.clear()
                 continue
 
+            if not _lease_gate.device_allowed(self.device_id):
+                # P3b-2 (review round 5): the lease (or the release this PC was finishing)
+                # ended -- stop polling and drop the session now, not at the next sync tick,
+                # so two PCs never hold a session on the panel (one lock-free snapshot read).
+                if self._device.is_connected:
+                    try:
+                        self._device.disconnect()
+                    except Exception:
+                        pass
+                    self.logger.info("[RT][device=%s] disconnected: this PC no longer drives it",
+                                     self.device_id)
+                self._emit_status(enabled=True, connected=False, last_error="not_leased")
+                self.wake_event.wait(timeout=1.0)
+                self.wake_event.clear()
+                continue
+
             # keep EMA alpha adjustable (future fields)
             try:
                 self._poll_ema.alpha = float(settings.get("poll_ema_alpha", 0.2))
