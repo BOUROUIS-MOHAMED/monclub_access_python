@@ -79,6 +79,7 @@ class CommandHandlers:
             "DEVICE_RECONCILE": self.device_reconcile,
             "DEVICE_AUDIT": self.device_audit,
             "LOGS_FLUSH": self.logs_flush,
+            "REMOVAL_CONFIRM": self.removal_confirm,
         }
 
     # ------------------------------------------------------------------ door
@@ -281,6 +282,74 @@ class CommandHandlers:
         if ctx.status == 200 and ctx.payload.get("ok"):
             return [str(u.get("pin")) for u in ctx.payload.get("users") or [] if u.get("pin")]
         return None
+
+    # ------------------------------------------------------------------ confirm removal
+    def removal_confirm(self, run: CommandRun) -> Outcome:
+        """Owner decision 7: run the refused removal only while its bound list is unchanged.
+
+        The payload binds the list the owner saw (``expectedCount``, ``pinSetHash``). This PC
+        recomputes its CURRENT refused list; a different count or hash is
+        ``REMOVAL_LIST_CHANGED`` (and the fresh list goes out with the next problem report).
+        Otherwise a one-shot approval for exactly that pin set is armed (push_safety consumes it
+        on the standalone revoke pass or the PullSDK stale step, never on a table clear or an
+        empty roster) and a pass of that turnstile is requested; SUCCEEDED once the approved
+        step removed them.
+        """
+        from app.core.v2 import problems as pr
+
+        did = run.gym_device_id
+        payload = run.payload or {}
+        try:
+            expected_count = int(payload.get("expectedCount"))
+        except (TypeError, ValueError):
+            return ("FAILED", "PAYLOAD_INVALID", None)
+        expected_hash = str(payload.get("pinSetHash") or "").strip().lower()
+        if not did:
+            return ("FAILED", "DEVICE_REQUIRED", None)
+        if not lease_gate.device_allowed(did):
+            return ("FAILED", "NOT_DRIVER", {"gymDeviceId": did})
+        blocked = lease_gate.removals_blocked(did)
+        if blocked:
+            return ("FAILED", "REMOVALS_DEFERRED", {"gymDeviceId": did, "reason": blocked})
+        current = pr.registry.current_removal_list(did)
+        if current is None:
+            return ("FAILED", "NO_REMOVAL_PENDING", {"gymDeviceId": did})
+        pins, reason = current
+        if reason != "above_ceiling":
+            return ("FAILED", "REMOVAL_NOT_CONFIRMABLE", {"gymDeviceId": did, "reason": reason})
+        current_hash = pr.canonical_hash(pins)
+        if len(pins) != expected_count or current_hash != expected_hash:
+            return ("FAILED", "REMOVAL_LIST_CHANGED",
+                    {"gymDeviceId": did, "currentCount": len(pins), "currentPinSetHash": current_hash})
+        pr.registry.approve_removal(did, current_hash, len(pins), expires_wall=time.time() + max(1.0, run.remaining()))
+        used_before = len(pr.registry.approvals_used)
+        if not self._request_device_pass(did):
+            pr.registry.withdraw_approval(did)
+            return ("FAILED", "NO_PASS_POSSIBLE", {"gymDeviceId": did})
+        while run.remaining() > 1.0:
+            if any(h == current_hash and d == did for d, h in pr.registry.approvals_used[used_before:]):
+                return ("SUCCEEDED", "REMOVAL_RAN", {"gymDeviceId": did, "count": len(pins)})
+            if not pr.registry.approval_pending(did):
+                break
+            now_list = pr.registry.current_removal_list(did)
+            if now_list is not None and pr.canonical_hash(now_list[0]) != current_hash:
+                pr.registry.withdraw_approval(did)
+                return ("FAILED", "REMOVAL_LIST_CHANGED",
+                        {"gymDeviceId": did, "currentCount": len(now_list[0]),
+                         "currentPinSetHash": pr.canonical_hash(now_list[0])})
+            self._sleep(1.0)
+        pr.registry.withdraw_approval(did)
+        return ("FAILED", "NOT_RUN_IN_TIME", {"gymDeviceId": did})
+
+    def _request_device_pass(self, did: int) -> bool:
+        eng = getattr(self.app, "_ultra_engine", None)
+        worker = eng._workers.get(int(did)) if eng is not None and getattr(eng, "running", False) else None
+        if worker is not None:
+            # A worker pass, whatever the roster hash says (like the removal retry).
+            return bool(worker.request_full_sync(reason="removal-confirm"))
+        # A DEVICE-mode panel: an explicit sync runs its reconcile.
+        self._request_sync(explicit=True, trigger_source="REMOTE_COMMAND")
+        return True
 
     # ------------------------------------------------------------------ logs
     def logs_flush(self, run: CommandRun) -> Outcome:

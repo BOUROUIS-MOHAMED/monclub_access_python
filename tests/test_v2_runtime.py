@@ -20,7 +20,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(rtmod, "_pc_uuid", lambda app: "uuid-1")
     yield
     lg.reset_for_tests()
-    rtmod._default_clock = None          # the runtime sets this module global itself
+    __import__('app.core.v2.server_clock', fromlist=['x']).set_default(None)   # set by the runtime
     dbmod._shutdown_db_writer_for_tests()
 
 
@@ -140,7 +140,7 @@ def test_the_heartbeat_carries_the_measured_offset_only_once_measured(monkeypatc
     monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
     app = SimpleNamespace(_update_manager=SimpleNamespace(get_current_version=lambda: "1.4.35"),
                           _agent_engine=None, _ultra_engine=None)
-    rtmod._default_clock = None
+    __import__('app.core.v2.server_clock', fromlist=['x']).set_default(None)
     assert "clockOffset" not in pc_identity.build_heartbeat_payload(app)
     rt, _app, _calls = _runtime()
     now = time.time()

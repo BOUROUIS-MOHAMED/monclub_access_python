@@ -43,6 +43,8 @@ from app.core import telemetry as _tel
 from app.core import push_safety as _push_safety
 from app.sdk.pullsdk import PullSDKDevice
 from app.core.v2 import lease_gate as _lease_gate
+from app.core.v2 import problems as _v2_problems
+from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
 logger = logging.getLogger("zkapp")
@@ -1029,7 +1031,7 @@ class UltraDeviceWorker(threading.Thread):
             # P3b-2: the last line of defence -- a worker for a turnstile this PC does not
             # drive (a lease moved while it ran) never connects; the engine drops it at its
             # next re-evaluation. Raised inside the try, so it reads as a failed connect.
-            _lease_gate.require_device(self._device_id)
+            _lease_gate.require_device(getattr(self, "_device_id", None))
             # Route through the driver factory (protocol-keyed). Defaults to ZK_PULLSDK
             # -> PullSDKDevice, so this is a pure indirection for the C3 gym today.
             self._sdk = get_driver(device_payload=self._device, logger=logger)
@@ -1039,6 +1041,7 @@ class UltraDeviceWorker(threading.Thread):
                 self._connected = True
                 self._connected_since_mono = time.monotonic()
                 self._record_connect_success()
+                self._note_user_count_at_connect()
                 # Check device vs PC clock (read-only log always; correct only
                 # when opted in). Throttled internally; safe between polls.
                 self._maybe_discipline_device_clock()
@@ -1975,6 +1978,12 @@ class UltraDeviceWorker(threading.Thread):
     def _drain_member_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
+        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
+            # P3b-2: this turnstile is being handed over; its ownership record is uploaded as
+            # final, so nothing is written until the release is acknowledged (the worker then
+            # stops) or the handover is cancelled (the queued updates run then). The door,
+            # the events and the rescues keep running.
+            return 0
 
         drained = 0
         while drained < limit:
@@ -2224,10 +2233,19 @@ class UltraDeviceWorker(threading.Thread):
         to_push: list[Dict[str, Any]] = []
         backoff_skipped = 0
         self._last_backoff_pins: set[str] = set()
+        # P3b-2 loss re-add: owned members a trusted listing did not find on the terminal
+        # (loss.py). Only pins the state says are in sync are affected: one pending or in
+        # backoff is already handled by its own retry.
+        readd = _v2_loss.readd_pins(getattr(self, "_device_id", None) or 0)
+        readd_now: list[str] = []
         for u in users:
             pin = str(u.get("pin") or "").strip()
             prev_hash, prev_ok = state.get(pin, ("", False))
             if prev_ok and prev_hash and prev_hash == hashes_by_pin.get(pin):
+                if pin in readd:
+                    kinds[pin] = "readd"
+                    readd_now.append(pin)
+                    to_push.append(u)
                 continue
             rs = retry_state.get(pin)
             if rs is not None:
@@ -2260,6 +2278,10 @@ class UltraDeviceWorker(threading.Thread):
                            pins=backoff_skipped)
             except Exception:
                 pass
+        if readd_now:
+            _v2_loss.note_attempts(getattr(self, "_device_id", None) or 0, readd_now)
+            logger.warning("%s re-adding %d MonClub member(s) missing from the terminal: %s",
+                           self._prefix, len(readd_now), ",".join(readd_now[:20]))
         return to_push, len(users) - len(to_push)
 
     # ---------------------------------------------------------------- #
@@ -2317,6 +2339,8 @@ class UltraDeviceWorker(threading.Thread):
         deadline while EnableDevice(False) is held -- turnstile dead).
         """
         out: Dict[str, list[int]] = {}
+        if _lease_gate.removals_blocked(getattr(self, "_device_id", None)):
+            return out          # P3b-2: add-only / handover -- no finger slot is cleared
         for u in to_push:
             pin = str(u.get("pin") or "").strip()
             if not pin:
@@ -2597,6 +2621,14 @@ class UltraDeviceWorker(threading.Thread):
             if len(new_fingers) > room:
                 withheld[pin] = set(new_fingers[room:])
             f_left -= min(len(new_fingers), room)
+        if report:
+            # P3b-2 turnstile problem report: the members this check left out right now.
+            if skipped or withheld:
+                _v2_problems.registry.set_code(
+                    getattr(self, "_device_id", None), _v2_problems.CAPACITY_FULL,
+                    list(skipped) + sorted(withheld), count=len(skipped) + len(withheld))
+            else:
+                _v2_problems.registry.clear_code(getattr(self, "_device_id", None), _v2_problems.CAPACITY_FULL)
         if (skipped or withheld) and report:
             logger.warning(
                 "%s CAPACITY_FULL: terminal reports users_free=%s fingerprints_free=%s -- %d "
@@ -2699,6 +2731,8 @@ class UltraDeviceWorker(threading.Thread):
         fingerprints are not MonClub's to clear."""
         if not bool(self._settings.get("fingerprint_enabled", False)):
             return {}
+        if _lease_gate.removals_blocked(getattr(self, "_device_id", None)):
+            return {}   # P3b-2: a restored record may be wrong -- no sweep while add-only
         if not callable(getattr(self._sdk, "sweep_finger_slots", None)):
             return {}
         plan: Dict[str, Dict[str, Any]] = {}
@@ -2883,6 +2917,8 @@ class UltraDeviceWorker(threading.Thread):
         """The daily bounded batch: ONE short sweep command per run-loop iteration."""
         if not bool(self._settings.get("fingerprint_enabled", False)):
             return
+        if _lease_gate.removals_blocked(getattr(self, "_device_id", None)):
+            return  # P3b-2: clearing slots is a removal; not on an add-only turnstile
         if not callable(getattr(self._sdk, "sweep_finger_slots", None)):
             return
         st = getattr(self, "_sweep_state", None)
@@ -3085,6 +3121,39 @@ class UltraDeviceWorker(threading.Thread):
                       err=type(exc).__name__)
             return False
 
+    def _note_user_count_at_connect(self) -> None:
+        """P3b-2 loss detection: a terminal user count that dropped by more than MonClub
+        removed since the last connect asks the maintenance slot for a loss check today."""
+        try:
+            if not getattr(self._sdk, "owns_event_source", False):
+                return
+            users_now = (getattr(self._sdk, "_device_status", None) or {}).get("users")
+            if users_now is not None and _v2_loss.user_count_dropped(self._device_id, users_now):
+                self._loss_check_due = True
+                logger.warning("%s terminal user count dropped more than MonClub removed -- a loss "
+                               "check (terminal listing) runs in today's maintenance slot", self._prefix)
+        except Exception:
+            pass
+
+    def _note_template_version_problems(self, users, result) -> None:
+        """P3b-2 problem report: pins whose template this push did not upload because its
+        algorithm version differs from the terminal's (driver reason
+        ``template_version_mismatch_f<N>``); pins it wrote without one leave the list."""
+        try:
+            reasons = (result or {}).get("failed_reasons") or {}
+            bad = {str(p) for p, r in reasons.items() if str(r).startswith("template_version_mismatch")}
+            sent = {str(u.get("pin") or "").strip() for u in users or []}
+            superseded = {str(p) for p in ((result or {}).get("superseded_pins") or [])}
+            failed = {str(p) for p in ((result or {}).get("failed_pins") or [])}
+            fine = sent - superseded - failed
+            _v2_problems.registry.update_code_pins(
+                getattr(self, "_device_id", None), _v2_problems.TEMPLATE_VERSION_MISMATCH,
+                add=bad, remove=fine)
+            if fine:
+                _v2_loss.clear_readd(getattr(self, "_device_id", None) or 0, fine)
+        except Exception:
+            pass
+
     def _push_with_chunk_recording(
         self,
         users: list[Dict[str, Any]],
@@ -3130,6 +3199,7 @@ class UltraDeviceWorker(threading.Thread):
         if between_chunks is not None and _accepts_kwarg(self._sdk.push_roster, "between_chunks"):
             kwargs["between_chunks"] = between_chunks
         result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
+        self._note_template_version_problems(users, result)
         # A pin the between-chunks yield handled itself (P3a-2 item 6) was never sent by
         # this push; recording it from this result would overwrite the newer state the
         # targeted update just wrote -- the 2026-09-06 stale-snapshot bug again.
@@ -3150,7 +3220,8 @@ class UltraDeviceWorker(threading.Thread):
             self._record_withheld_residents(remaining, result, templates_by_pin, withheld)
         return result
 
-    def _promote_intents_by_readback(self, *, desired_pins: set[str]) -> Dict[str, list] | None:
+    def _promote_intents_by_readback(self, *, desired_pins: set[str],
+                                     loss_check: bool = False) -> Dict[str, list] | None:
         """Turn intent-only pins into ownership when the terminal holds what we wrote.
 
         Candidates are intent pins that LEFT the desired roster (a still-desired one is
@@ -3178,7 +3249,7 @@ class UltraDeviceWorker(threading.Thread):
             p: it for p, it in intents.items()
             if p not in desired and str(it.get("protocol") or "") in ("", "ZK_STANDALONE")
         }
-        if not cands:
+        if not cands and not loss_check:
             return None
         lister = getattr(self._sdk, "list_device_users", None)
         if not callable(lister):
@@ -3240,6 +3311,14 @@ class UltraDeviceWorker(threading.Thread):
             logger.warning("%s intent read-back: %d owned pin(s) absent from the terminal "
                            "listing -- reported only, nothing changed (%s)", self._prefix,
                            len(missing_owned), ",".join(missing_owned[:20]))
+        if on_device and owned_now:
+            # P3b-2 loss detection (owner decision 6): owned pins absent from this TRUSTED
+            # listing are reported, and the still-desired ones re-added (loss.py).
+            try:
+                _v2_loss.evaluate_listing(getattr(self, "_device_id", None), on_device=set(on_device),
+                                          owned=owned_now, desired=desired)
+            except Exception:
+                logger.warning("%s loss check failed", self._prefix, exc_info=True)
         promoted: list[str] = []
         dropped: list[str] = []
         mismatched: list[str] = []
@@ -3476,7 +3555,12 @@ class UltraDeviceWorker(threading.Thread):
             # Read NOW: a targeted update served between two push chunks rebuilds a roster
             # and overwrites it.
             _pin_persons = dict(getattr(self, "_last_standalone_pin_persons", None) or {})
-            if unconfirmed_revoked_ids and owned_for_revokes is not None:
+            if (unconfirmed_revoked_ids and owned_for_revokes is not None
+                    and not _lease_gate.removals_blocked(getattr(self, "_device_id", None))):
+                # P3b-2: on an add-only turnstile (a new lease whose ownership backup is not
+                # restored yet, a forced handover) "not owned" proves nothing -- the previous
+                # driver may have written that pin -- so it is never finalised here; the
+                # revocation waits for the trusted record (the revoke pass defers too).
                 # A pin still in the desired roster is not a removal (ACCOUNT: the person
                 # keeps another plan and is re-pushed), so only a pin that LEFT it and is
                 # not owned is skipped. Decided before the push, so a failed push cannot
@@ -4055,6 +4139,11 @@ class UltraDeviceWorker(threading.Thread):
                 )
             except Exception:
                 pass
+        try:
+            from app.core.v2 import problems as _v2_problems
+            _v2_problems.registry.skipped_not_owned(getattr(self, "_device_id", None), skipped.values())
+        except Exception:
+            pass
         self._finalize_full_sync_revokes(set(skipped), ok=True, excluded_ids=set())
 
     def _member_row_in_db(self, member_id: int) -> list[Dict[str, Any]] | None:
@@ -4621,6 +4710,17 @@ class UltraDeviceWorker(threading.Thread):
         only when nothing of that person remains deliverable to this device; otherwise the
         collapsed row is re-pushed (``_account_member_revoke``). guide §3.2b.
         """
+        _blocked = _lease_gate.removals_blocked(getattr(self, "_device_id", None))
+        if _blocked:
+            # P3b-2: removals wait on this turnstile (add-only lease or a handover in
+            # progress). Retryable like "ownership unreadable" -- never SKIPPED_NOT_OWNED,
+            # which is final and would drop the revocation for good.
+            logger.warning("%s member revoke of %s deferred: %s (driver lease)",
+                           self._prefix, member_id, _blocked)
+            _tel.warn("REMOVAL_DEFERRED", worker=self._tel_wid, path="member_revoke",
+                      member_id=member_id, reason=_blocked)
+            self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+            return False
         if self._pin_scheme_is_account():
             handled, pin = self._account_member_revoke(int(member_id))
             # Served inside a full-sync push (P3a-2 item 6): that push must not re-send
@@ -4676,6 +4776,11 @@ class UltraDeviceWorker(threading.Thread):
                 protocol="ZK_STANDALONE",
             )
             self._note_revoke_skipped(member_id)
+            try:
+                from app.core.v2 import problems as _v2_problems
+                _v2_problems.registry.skipped_not_owned(getattr(self, "_device_id", None), [pin])
+            except Exception:
+                pass
             return True
 
         outcome = self._remove_standalone_pins(
@@ -4847,6 +4952,7 @@ class UltraDeviceWorker(threading.Thread):
         self._last_revoke_step = "ran"
         revoked = sorted(p for p in owned if p not in keep and p not in grace)
         if not revoked:
+            _v2_problems.registry.removal_allowed(getattr(self, "_device_id", None), "standalone_revoke")
             return True
 
         # RENEWAL HOLDS (P3b-1) first: they are not removed by this step, so they are not what
@@ -4871,6 +4977,7 @@ class UltraDeviceWorker(threading.Thread):
             )
         revoked = [p for p in revoked if p not in self._last_revoke_holds]
         if not revoked:
+            _v2_problems.registry.removal_allowed(getattr(self, "_device_id", None), "standalone_revoke")
             return True
 
         # Refuse an implausible bulk revocation rather than strip a gym's worth of
@@ -4883,6 +4990,11 @@ class UltraDeviceWorker(threading.Thread):
             sample=revoked,
         )
         ceiling = _verdict.ceiling
+        if not _verdict.allowed and _verdict.reason in ("add_only", "handover_release"):
+            # P3b-2: waiting for a trusted record (REMOVAL_DEFERRED already logged); the
+            # state is kept and the prune skipped, exactly as for a ceiling refusal.
+            self._last_revoke_deferred = len(revoked)
+            return False
         if not _verdict.allowed:
             self._last_revoke_aborted = len(revoked)
             # Kept alongside REVOKE_ABORTED: existing operator greps key on it.
@@ -5067,6 +5179,9 @@ class UltraDeviceWorker(threading.Thread):
         policy = str((self._device or {}).get("rosterPushingPolicy") or "").strip().upper()
         if policy != "MIRROR":
             return  # PRESERVE / null / pre-migration -> additive, nothing to reconcile
+        if _lease_gate.removals_blocked(getattr(self, "_device_id", None)):
+            _tel.event("MIRROR_SKIP_REMOVALS_DEFERRED", worker=self._tel_wid)
+            return  # P3b-2: add-only lease or handover in progress
 
         # 2) trigger gate — only an explicit full reconcile (never daytime/spurious)
         if not full_reconcile:
@@ -5266,6 +5381,8 @@ class UltraDeviceWorker(threading.Thread):
             return
         if not bool(getattr(self._sdk, "is_connected", True)):
             return          # a dead link: never use up the day's read-back on it (R2-16)
+        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
+            return          # P3b-2: handover in progress -- no promotion, no sweep
         today = _local_day()
         if getattr(self, "_maintenance_ready_day", None) != today:
             return
@@ -5282,12 +5399,14 @@ class UltraDeviceWorker(threading.Thread):
             return
         if not self._maintenance_idle():
             return
-        if getattr(self, "_readback_done_day", None) != today:
+        loss_due = bool(getattr(self, "_loss_check_due", False))
+        if getattr(self, "_readback_done_day", None) != today or loss_due:
             self._readback_done_day = today
+            self._loss_check_due = False
             desired = getattr(self, "_last_desired_pins", None)
             if desired is not None:
                 try:
-                    self._promote_intents_by_readback(desired_pins=set(desired))
+                    self._promote_intents_by_readback(desired_pins=set(desired), loss_check=loss_due)
                 except Exception:
                     logger.warning("%s intent read-back failed", self._prefix, exc_info=True)
             return
@@ -5299,6 +5418,8 @@ class UltraDeviceWorker(threading.Thread):
     def _drain_full_sync_commands(self, limit: int = 1) -> int:
         if limit <= 0:
             return 0
+        if _lease_gate.writes_frozen(getattr(self, "_device_id", None)):
+            return 0            # P3b-2: handover in progress -- see _drain_member_sync_commands
 
         drained = 0
         while drained < limit:

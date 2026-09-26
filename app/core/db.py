@@ -8945,8 +8945,22 @@ def delete_device_sync_state(*, device_id: int, pin: str) -> None:
         conn.execute("DELETE FROM device_sync_state WHERE device_id=? AND pin=?", (did, p))
         # Every caller removed the pin from the device first; its intent is moot.
         conn.execute("DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p))
+        _log_v2_removal(conn, did, p)
 
     _run_db_write_sync("delete_device_sync_state", _write)
+
+
+def _log_v2_removal(conn: sqlite3.Connection, device_id: int, pin: str) -> None:
+    """P3b-2: remember that MonClub removed ``pin`` from the turnstile (the ownership backup's
+    ``REMOVED`` fact), in the removal's own transaction. Time = the server-corrected clock when
+    measured (owner decision 5a), else the PC's with ``corrected=0``."""
+    from app.core.v2.server_clock import corrected_now
+
+    at, corrected = corrected_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO v2_removal_log (device_id, pin, removed_at, corrected) VALUES (?, ?, ?, ?)",
+        (int(device_id), str(pin), float(at), 1 if corrected else 0),
+    )
 
 
 def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
@@ -8972,6 +8986,7 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
         profile["sync_rows"] = max(0, int(sync_cur.rowcount or 0))
         profile["mirror_rows"] = max(0, int(mirror_cur.rowcount or 0))
         profile["intent_rows"] = max(0, int(intent_cur.rowcount or 0))
+        _log_v2_removal(conn, did, p)
 
     _run_db_write_sync("clear_device_revocation_state", _write)
 

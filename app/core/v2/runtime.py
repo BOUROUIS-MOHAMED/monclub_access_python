@@ -37,20 +37,10 @@ OFF_REPROBE_SEC = 1800.0
 UNKNOWN_REPROBE_SEC = 120.0
 NOTICE_SYNC_MIN_GAP_SEC = 60.0
 
-_default_clock: Optional[ServerClock] = None
-
-
 def default_clock() -> Optional[ServerClock]:
     """The process's server clock, once the runtime exists (None before)."""
-    return _default_clock
-
-
-def corrected_now() -> tuple:
-    """(epoch, corrected?) — the server-corrected time when a measurement exists."""
-    clk = _default_clock
-    if clk is not None and clk.has_sample():
-        return clk.now(), True
-    return time.time(), False
+    from app.core.v2 import server_clock
+    return server_clock.get_default()
 
 
 def _pc_uuid(app: Any) -> Optional[str]:
@@ -83,7 +73,7 @@ def _ws_url(base_url: str) -> str:
 class V2Runtime(NoticeCallbacks):
     def __init__(self, app: Any, *, base_url: Optional[str] = None, token_provider=None,
                  app_version: Optional[str] = None, rand=random.random) -> None:
-        global _default_clock
+        from app.core.v2 import server_clock as _sc
         from app.core.v2 import store
         if base_url is None:
             from app.core.app_const import MONCLUB_BASE_URL
@@ -92,7 +82,7 @@ class V2Runtime(NoticeCallbacks):
         self._rand = rand
         self.clock = ServerClock(persist=lambda row: store.kv_put("server_clock", row),
                                  load=lambda: store.kv_get("server_clock"))
-        _default_clock = self.clock
+        _sc.set_default(self.clock)
         try:
             v2 = store.kv_get("server_clock") or {}
             if v2.get("utc_offset_sec") is None:
@@ -346,4 +336,6 @@ def start_v2_runtime(app: Any) -> Optional[V2Runtime]:
 
 
 def _extension_factories() -> list:
-    return []
+    from app.core.v2.ownership import OwnershipSync
+    from app.core.v2.reports import ProblemReporter
+    return [OwnershipSync, ProblemReporter]

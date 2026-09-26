@@ -155,3 +155,26 @@ class ServerClock:
             self._persist(row)
         except Exception:
             pass
+
+
+# The process's clock, set by the v2 runtime; read by code that records fact times (the
+# removal log in db.py) without importing the runtime.
+_default: Optional[ServerClock] = None
+
+
+def set_default(clock: Optional[ServerClock]) -> None:
+    global _default
+    _default = clock
+
+
+def get_default() -> Optional[ServerClock]:
+    return _default
+
+
+def corrected_now() -> tuple:
+    """(epoch, corrected) -- the server-corrected time when a measurement exists, else the
+    PC's own time with ``corrected=False`` (corrected later, at upload, with the offset then)."""
+    clk = _default
+    if clk is not None and clk.has_sample():
+        return clk.now(), True
+    return time.time(), False
