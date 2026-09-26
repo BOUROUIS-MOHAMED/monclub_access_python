@@ -3085,9 +3085,13 @@ back-dates the connect by 5 s, clamped positive. It does not patch the clock, be
 STA thread shares the `time` module. It passed at uptime 1134 s on 2026-09-26 (branch
 `claude/heuristic-dirac-3b96e7`). The full suite on that branch gave **2616 passed, 0 failed**
 between uptime 1298 s and 1481 s: the CLAUDE.md command, `MONCLUB_ACCESS_DATA_ROOT` an empty
-scratch folder, `tools/check_sql_arity.py` PASS. No other test in `tests/` back-dates a monotonic value into a
-guard that reads `<= 0` as unset: the round-2, round-3 and round-5 link tests write positive
-values under a patched `ue.time.monotonic` (fake clocks at 1000.0 and up). `[TEST]`
+scratch folder, `tools/check_sql_arity.py` PASS. `[TEST]`
+In `ultra_engine.py`, three fields have guards that read `0.0` as unset: `_connected_since_mono`
+(`> 0.0`), `_connect_down_since_mono` and `_last_down_error_log_mono` (`== 0.0`). No other test
+back-dates any of them from the real clock. The other writes (round-2, round-3 and round-5 link
+tests, `test_ultra_engine.py`) are `0.0`, or positive values under a patched `ue.time.monotonic`
+(fake clocks at 1000.0 and up).
+`[CODE: grep -rnE "_connected_since_mono|_connect_down_since_mono|_last_down_error_log_mono" tests/]`
 `tests/test_authoritative_revocation_pipeline.py::test_shadow_sync_never_truncates_or_accepts_noncanonical_valid_ids[0]`
 failed once in a full run of `d09f88f` and passed 20/20 alone. `[UNVERIFIED]` cause (test-order).
 `tests/test_zk_standalone_com_teardown.py::test_unexpected_exception_exit_still_unadvises_first`
