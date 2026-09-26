@@ -2207,7 +2207,7 @@ back: the windows, the upcoming lists and the token never part from the rows the
 
 | Answer | Effect |
 |---|---|
-| v1 (no `syncMeta`) or a malformed v2 part | `trusted=0`, `windowsVersion` deleted, lists kept but unused; `[T] SYNC_V2_REJECTED reason` for a malformed one |
+| v1 (no `syncMeta`) or a malformed v2 part | `trusted=0`, `windowsVersion` deleted, lists kept but unused; the next flip puts every held row back (a v1 PC's roster is the server's last list); `[T] SYNC_V2_REJECTED reason` for a malformed one |
 | v2, members section applied with a valid authority (delta: `validMemberIds` present, valid, not H-006-refused; full: not refused) | state + clock stored, `floor_date` reset to the server's day, windows replaced, upcoming lists replaced when sent, token stored, `trusted=1` |
 | v2, members section present but not applied | `trusted=0`, token dropped (the refusal already clears the member tokens, §3.4) |
 | v2, members section skipped | lists and trust kept (the server skips it only when the PC's `windowsVersion` is current) |
@@ -2231,7 +2231,13 @@ server's list), and so does the member-cache self-heal (`count_member_cache_rows
 
 **The flip** — `db.py::apply_local_date_flips(pc_now_epoch, grace_days, source)`: ONE write job,
 idempotent, recomputed from the stored state. It evaluates the gym date (below), persists the clock
-verdict and `applied_date`, and — only with `trusted=1` — runs `access_dates.plan_flip`:
+verdict and `applied_date`. With `trusted=0` it moves nothing by date and puts every held row back
+into `sync_users` (a held id already back — a fast patch — keeps that fresher row): untrusted means
+a v1 PC's behaviour, whose roster is the server's last list. The first version returned before
+that, so a trust drop (a v1 or malformed answer, a refused members section) left members held
+while trusted — e.g. a one-day freeze — locked out offline until the next online first-of-day sync,
+which base never did (review round 5). `[TEST: tests/test_p3b1_review_r5.py]` Only with `trusted=1`
+does it run `access_dates.plan_flip`:
 
 - a `sync_users` row whose window is not deliverable on the gym date → **held** (column-for-column
   copy into `sync_users_held`, then deleted from `sync_users`);
@@ -2307,7 +2313,11 @@ backend's `HeartbeatRequest` has no field for it (§3.1b), and a parallel branch
 
 **When the flip runs** (`app.py`, `MainApp._apply_date_flips` and its triggers). Every trigger
 goes through `_apply_date_flips(source)`, serialised by `_date_flip_lock` and never raising (a
-failure logs `[T] DATE_FLIP_FAILED` and returns None):
+failure logs `[T] DATE_FLIP_FAILED` and returns None). A failure may still commit later —
+`_run_db_write_sync` stops waiting after 60 s but the job stays queued — so it sets
+`_date_flip_recover`: the next trigger runs a flip whatever the precheck says (it queues behind the
+late one) and, even when that run moves nothing, bumps the generation and wakes the caches and
+ULTRA as if it had (review round 5). `[TEST: tests/test_p3b1_review_r5.py]`
 
 | Trigger (`source`) | How |
 |---|---|
