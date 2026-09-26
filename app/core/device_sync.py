@@ -2061,9 +2061,12 @@ class DeviceSyncEngine:
 
         Filters:
         - allowedMemberships (if provided) uses user.membershipId
-        - validFrom/validTo ONLY when pushingToDevicePolicy == "VALID_ONLY"
-          (default: push ALL members with an activeMembershipId regardless of
-          expiry — the PC/ULTRA engine handles real-time validity at scan time)
+        - no date filter: every member of the list is pushed whatever its
+          validFrom/validTo. The list is the server's deliverable set of the day
+          (P3b-1's flips hold and restore rows by date, guide §3.8). A
+          ``pushingToDevicePolicy == "VALID_ONLY"`` filter lived here; no backend
+          enum value is VALID_ONLY (``AccessSoftwareInDeviceDataModePushingPolicy``,
+          every version), so it never ran and was removed (lane B, 2026-09-26).
         - pin must be digits (controllers expect numeric Pin)
 
         PIN: ``derive_member_pin`` under the DEVICE's ``pinScheme`` (``device_pin_scheme``).
@@ -2093,15 +2096,7 @@ class DeviceSyncEngine:
             door_ids = [int(default_door_id)]
         device["doorIds"] = door_ids  # keep for downstream use
 
-        # Validity-date filter: ONLY apply when explicitly opted in via
-        # pushingToDevicePolicy="VALID_ONLY".  The default (null / any other
-        # value) pushes every member so the full roster is on the device and
-        # the PC-side logic decides access at scan time.
-        policy = str(device.get("pushingToDevicePolicy") or "").strip().upper()
-        filter_by_validity = (policy == "VALID_ONLY")
-
         scheme = device_pin_scheme(device)
-        now = datetime.now(tz=timezone.utc)
         out: Dict[str, Dict[str, Any]] = {}
         sources: Dict[str, str] = {}
         withheld = 0
@@ -2115,13 +2110,6 @@ class DeviceSyncEngine:
             mid = _to_int(u.get("membershipId"), default=None)
             if allowed_set and (mid is None or int(mid) not in allowed_set):
                 return False
-            if filter_by_validity:
-                vf = _parse_dt_any(u.get("validFrom") or "")
-                vt = _parse_dt_any(u.get("validTo") or "")
-                if vf and now < vf:
-                    return False
-                if vt and now > vt:
-                    return False
             return True
 
         if scheme != PIN_SCHEME_ACCOUNT:

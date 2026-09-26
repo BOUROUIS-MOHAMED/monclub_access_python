@@ -3318,9 +3318,9 @@ class MainApp:
                 if _manual_sync_mode and _is_user_initiated_sync:
                     version_tokens = strip_all_member_version_tokens(version_tokens) or None
 
-                # First sync (no tokens) transfers full payload - allow more time.
-                # Delta syncs (tokens present) are small and fast - keep tight timeout.
-                sync_timeout = 60 if version_tokens else 60
+                # One read timeout for every getSyncData, full or delta (the two branches of the
+                # old expression were both 60).
+                sync_timeout = 60
 
                 self.logger.info(
                     "[SYNC-DEBUG] >>> Sending sync request. version_tokens=%s",

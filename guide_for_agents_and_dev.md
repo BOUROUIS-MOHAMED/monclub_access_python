@@ -969,7 +969,7 @@ device row, and a row carries one validity window, one name and — on the termi
 `_merge_same_pin_entries` resolves it:
 
 - **validity** — the furthest-reaching membership wins, *among those this device accepts*, since
-  `allowedMemberships` and the validity filter both run BEFORE the collision is possible. An
+  `allowedMemberships` runs BEFORE the collision is possible (the roster has no date filter, §3.8). An
   absent `validTo` counts as furthest: that is how "no end date" is expressed, and treating an
   unknown as expired would revoke members we cannot date. **Ties go to the larger
   `activeMembershipId`**: both the push and `furthest_reach` rank by the one total order
@@ -2722,6 +2722,11 @@ FIELD-TEST: the backend's `[PERF] scope+freeze+filter` log line. Socket down sho
 since the nginx WebSocket block was added (2026-09-26, §3.9 `[UNVERIFIED — FIELD-TEST]`); a gym whose
 sockets never connect runs at the socket-down rate for as long as that lasts.
 
+*The ULTRA scheduler's own timer is separate and unchanged*: `UltraSyncScheduler._run` passes every
+`min(15 min, the shortest ultra_sync_interval_minutes)` — the 15-min seed caps the per-device default of
+30 min, which `/api/v2/ultra/status` reports as `sync_interval_minutes` all the same. Local work only (a
+device whose roster hash is unchanged is skipped); left as it is and now commented so (lane B). `[CODE]`
+
 **The 45 s probe and the 22:00 job are off in safety mode — and only then (lane B, 2026-09-26).** Both read
 the same `_v2_safety_sync`, so the probe can never be off while the cadence is the 30-min one: a v2 PC
 whose socket drops goes from ~45 s change detection to ≤ 120 s, not to 30 min. `[CODE]`
@@ -2824,8 +2829,14 @@ scheduler has no token refresh of its own and is never `stop()`ped (it is a daem
 **Why.** Most gyms cut the PC and the electricity overnight (§3.4a), and a `ZK_STANDALONE` turnstile
 decides alone. Before P3b-1 nothing on the PC ever removed a member whose plan ended while the PC
 was offline or off: the member list is the server's answer of the last sync, and the default
-device roster has **no date filter** (`_filter_users_for_device` compares `validFrom/validTo` only
-under `pushingToDevicePolicy=VALID_ONLY`). `[CODE: device_sync.py::_filter_users_for_device]`
+device roster has **no date filter**. `[CODE: device_sync.py::_filter_users_for_device]` It used to
+compare `validFrom/validTo` under `pushingToDevicePolicy == "VALID_ONLY"`, a value no backend version
+has ever sent: the backend enum `AccessSoftwareInDeviceDataModePushingPolicy` never had it (`git log -S
+VALID_ONLY` over the backend and dashboard histories finds only comments), so the filter never ran; lane B
+removed it (2026-09-26). `[TEST: test_pin_scheme_gate.py::test_no_pushing_policy_filters_by_date — its
+two VALID_ONLY cases fail on aeeef69, every real enum value passes on both;
+::test_membership_scheme_is_byte_identical_to_the_pre_account_derivation no longer draws VALID_ONLY, the
+one input whose oracle branch is now unreachable — a deliberate change]`
 Sync protocol 2 sends each membership's days so the PC can apply them itself.
 
 **The contract** (backend `main` `2b75ddb3`, read-only here: `ActiveMemberResponseV2`,

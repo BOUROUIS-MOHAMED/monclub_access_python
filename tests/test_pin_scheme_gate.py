@@ -140,7 +140,14 @@ def test_membership_scheme_is_byte_identical_to_the_pre_account_derivation(seed,
     device: Dict[str, Any] = {
         "doorIds": rng.choice([[], [1], [1, 2]]),
         "allowedMemberships": rng.choice([[], [1], [2, 3], ["2"]]),
-        "pushingToDevicePolicy": rng.choice([None, "VALID_ONLY", "ALL"]),
+        # The backend's enum values (AccessSoftwareInDeviceDataModePushingPolicy), None, and an
+        # unknown token. "VALID_ONLY" was drawn here until lane B (2026-09-26) removed the client
+        # filter it drove: no backend version has that value, so the oracle's VALID_ONLY branch
+        # can no longer be reached by a real device -- test_no_pushing_policy_filters_by_date.
+        "pushingToDevicePolicy": rng.choice([
+            None, "ALL", "DELETE_ALL_KNOWING_PINS_BUT_NO_LONGER_DESIRED_BEFORE_PUSHING",
+            "PUSH_WITHOUT_DELETING", "DELETE_ALL_BEFORE_PUSHING",
+        ]),
     }
     if scheme_value != "__absent__":
         device["pinScheme"] = scheme_value
@@ -378,3 +385,28 @@ def test_pin_scheme_survives_the_delta_device_refresh(db):
         {"members": False, "devices": True, "credentials": False, "settings": False},
     )
     assert db.get_sync_device_payload(44)["pinScheme"] == "ACCOUNT"
+
+
+@pytest.mark.parametrize("policy", [
+    None, "DELETE_ALL_BEFORE_PUSHING", "DELETE_ALL_KNOWING_PINS_BUT_NO_LONGER_DESIRED_BEFORE_PUSHING",
+    "PUSH_WITHOUT_DELETING", "DELETE_ALL_NOT_KNOWING_PINS_AND_DONT_PUSH",
+    "DELETE_ALL_NOT_DESIRED_PINS_BEFORE_PUSHING",
+    "VALID_ONLY",          # not a backend value; the filter it drove was removed (lane B)
+])
+@pytest.mark.parametrize("scheme", ["MEMBERSHIP", "ACCOUNT"])
+def test_no_pushing_policy_filters_by_date(policy, scheme):
+    """The roster is the server's list of the day (P3b-1 flips hold rows by date); no push policy
+    drops a member by validFrom/validTo."""
+    now = datetime.now(tz=timezone.utc)
+    past = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    future = (now + timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    users = [
+        {"activeMembershipId": 11, "userId": 1, "mainAccountId": 101, "membershipId": 1,
+         "validFrom": "2026-01-01T00:00:00", "validTo": past, "fullName": "Ended", "fingerprints": []},
+        {"activeMembershipId": 12, "userId": 2, "mainAccountId": 102, "membershipId": 1,
+         "validFrom": future, "validTo": None, "fullName": "Starts", "fingerprints": []},
+    ]
+    device = {"doorIds": [1], "allowedMemberships": [], "pushingToDevicePolicy": policy,
+              "pinScheme": scheme}
+    got = _engine()._filter_users_for_device(users=users, device=device, default_door_id=1)
+    assert sorted(got) == (["11", "12"] if scheme == "MEMBERSHIP" else ["101", "102"])

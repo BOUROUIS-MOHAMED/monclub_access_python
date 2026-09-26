@@ -2128,7 +2128,7 @@ class UltraDeviceWorker(threading.Thread):
         full sync and recorded in device_sync_state after each push.
 
         Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
-        VALID_ONLY policy / pin derivation under the device's pinScheme, guide §3.2b) and
+        pin derivation under the device's pinScheme, guide §3.2b) and
         _collect_templates_for_pin (cache fingerprints -> local SQLite fallback)
         so a standalone device sees exactly the roster a PullSDK panel would.
         Cards are passed RAW (digits handled by the driver): the 4-byte CardNo
@@ -8105,8 +8105,12 @@ class UltraSyncScheduler:
             self._sync_all(reason="startup")
 
         while not self._stop.is_set():
-            # Find the shortest interval among all ULTRA devices
-            min_interval = 15 * 60  # default 15 min
+            # The shortest interval among all ULTRA devices, CAPPED at 15 min: the seed is
+            # not only the no-device default -- with the per-device default of 30 min
+            # (ultra_sync_interval_minutes) the timer pass still runs every 15 min, which
+            # /api/v2/ultra/status does not show (it reports the setting). A local pass: a
+            # device whose roster hash is unchanged is skipped. Kept as it is (lane B, 2026-09-26).
+            min_interval = 15 * 60
             for d in self._devices:
                 settings = d.get("_settings", {})
                 interval = int(settings.get("ultra_sync_interval_minutes", 30)) * 60
@@ -8146,11 +8150,6 @@ class UltraSyncScheduler:
             elif not self._manual_sync_mode():
                 self._sync_all(reason="timer")
 
-    def _check_worker_health(self):
-        """Deprecated: worker restarts are handled exclusively by the watchdog thread.
-        Kept as no-op for backward compat in case external code calls it."""
-        pass
-
     def _sync_all(
         self,
         *,
@@ -8188,11 +8187,6 @@ class UltraSyncScheduler:
             "all" if device_ids is None else len(device_ids),
         )
         t0 = time.time()
-        # Check worker health before each sync cycle
-        try:
-            self._check_worker_health()
-        except Exception as e:
-            self._logger.warning("[ULTRA] _check_worker_health error: %s", e)
         synced = 0
         skipped = 0
         failed = 0
@@ -8783,8 +8777,8 @@ class UltraEngine:
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
 
-        This is the SOLE restart mechanism.  UltraSyncScheduler._check_worker_health
-        is now a no-op — all restarts go through this watchdog to avoid race conditions.
+        This is the SOLE restart mechanism: every restart goes through this watchdog, to
+        avoid races between restarters.
         """
         self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
         while not self._stop_event.wait(self._watchdog_interval_sec):
