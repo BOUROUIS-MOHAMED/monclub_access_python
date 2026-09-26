@@ -198,6 +198,10 @@ def register_access_local_api_routes(router) -> None:
     from access import pc_identity_routes
     from app.api import local_access_api_v2 as legacy
 
+    from access import v2_routes
+
+    for method, pattern, handler_name in v2_routes.ROUTES:
+        router.add(method, pattern, getattr(v2_routes, handler_name))
     for method, pattern, handler_name in ACCESS_LOCAL_ROUTE_SPECS:
         owner = pc_identity_routes if handler_name.startswith("_handle_pc_identity_") else legacy
         handler = getattr(owner, handler_name)

@@ -15,6 +15,7 @@ import DevicesPage from "./pages/DevicesPage";
 import UsersPage from "./pages/UsersPage";
 import EnrollPage from "./pages/EnrollPage";
 import AgentPage from "./pages/AgentPage";
+import RealtimePage from "./pages/RealtimePage";
 import LogsPage from "./pages/LogsPage";
 import SyncHistoryPage from "./pages/SyncHistoryPage";
 import PushHistoryPage from "./pages/PushHistoryPage";
@@ -79,6 +80,7 @@ function AppRoutes() {
         <Route path="users" element={<UsersPage />} />
         <Route path="enroll" element={<EnrollPage />} />
         <Route path="agent" element={<AgentPage />} />
+        <Route path="realtime" element={<RealtimePage />} />
         <Route path="sync-history" element={<SyncHistoryPage />} />
         <Route path="push-history" element={<PushHistoryPage />} />
         <Route path="logs" element={<LogsPage />} />
