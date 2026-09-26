@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
@@ -109,7 +110,12 @@ class V2Api:
         self._wall = getattr(self.clock, "_wall", time.time)
         self._mono = time.monotonic
         self._verify = _certifi_bundle()
-        self.last_body: Optional[Dict[str, Any]] = None
+        self._local = threading.local()      # last_body is per thread (review: shared across threads)
+
+    @property
+    def last_body(self) -> Optional[Dict[str, Any]]:
+        """The body this thread's last request actually sent (times capped)."""
+        return getattr(self._local, "last_body", None)
 
     # ------------------------------------------------------------------ core
     def _headers(self, token: str, with_body: bool) -> Dict[str, str]:
@@ -144,13 +150,14 @@ class V2Api:
         if not token:
             raise V2ApiError(0, "NO_PC_TOKEN", "no PC token (PC not registered or revoked)")
         payload = None
+        sent_at = None
         if body is not None:
             payload = dict(body)
             if stamp_sent_at:
                 sent_at = self.clock.now()
                 payload["sentAt"] = timefmt.format_utc(sent_at)
                 payload = _cap_fact_times(payload, sent_at)
-        self.last_body = payload
+        self._local.last_body = payload
         kw: Dict[str, Any] = {"headers": self._headers(token, payload is not None),
                               "timeout": float(timeout or self._timeout), "verify": self._verify}
         if params:
@@ -182,9 +189,17 @@ class V2Api:
         if status == 429:
             wait = err.retry_after if err.retry_after is not None else DEFAULT_RATE_LIMIT_BACKOFF_SEC
             self._backoff_until = self._mono() + max(1.0, float(wait))
+        if backend and self.clock.utc_offset is None:
+            self.clock.set_utc_offset(timefmt.utc_offset_of((details or {}).get("timestamp")))
         if backend and code == "CLOCK_SKEW":
+            before = self.clock.offset()
             self._sample((details or {}).get("serverTime"), sent, recv, source="clock_skew",
                          authoritative=True)
+            skew = (details or {}).get("skewSeconds")
+            if self.clock.offset() == before and isinstance(skew, (int, float)) and sent_at is not None:
+                # No gym offset to place serverTime (review R4): skewSeconds = serverNow - sentAt.
+                self.clock.add_sample(sent_at + float(skew), sent, recv, source="clock_skew",
+                                      authoritative=True)
         raise err
 
     def _sample(self, server_time, sent, recv, *, source: str, authoritative: bool = False) -> None:

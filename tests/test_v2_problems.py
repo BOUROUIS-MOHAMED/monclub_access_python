@@ -83,6 +83,7 @@ def _reporter(api):
 def test_a_report_is_sent_on_change_and_not_repeated():
     api = FakeApi()
     rep = _reporter(api)
+    pr.registry.removal_allowed(8, "standalone_revoke")   # the removal step ran (review R9)
     pr.registry.skipped_not_owned(8, ["7"])
     rep.tick(None)
     [body] = api.bodies

@@ -3418,6 +3418,11 @@ class DeviceSyncEngine:
                             "clearing all tables (%d row(s), within the ceiling), pushing all %d members",
                             dev_id, len(device_pins), len(pins_to_sync),
                         )
+                    elif _clear_verdict.reason in ("add_only", "handover_release", "not_leased"):
+                        # P3b-2: deferred by the driver lease, not a ceiling refusal.
+                        removal_notes.append(_push_safety.outcome_note(
+                            "REMOVAL_DEFERRED", _clear_verdict.count,
+                            f"table_clear; {_clear_verdict.reason}"))
                     else:
                         removal_aborted += _clear_verdict.count
                         removal_notes.append(_push_safety.outcome_note(
@@ -3529,7 +3534,7 @@ class DeviceSyncEngine:
                     )
                     if not _stale_verdict.allowed:
                         removal_aborted += _stale_verdict.count
-                        if _stale_verdict.reason in ("add_only", "handover_release"):
+                        if _stale_verdict.reason in ("add_only", "handover_release", "not_leased"):
                             # P3b-2: waiting for a trusted record, not a ceiling refusal.
                             removal_notes.append(_push_safety.outcome_note(
                                 "REMOVAL_DEFERRED", _stale_verdict.count,
@@ -3595,6 +3600,15 @@ class DeviceSyncEngine:
             # In normal mode we pre-delete pins individually before batch push.
             use_batch = nuke_mode or len(pins_to_sync) > 5
             pins_sorted = sorted(pins_to_sync)
+            if pins_sorted and (_lease_gate.writes_frozen(did) or not _lease_gate.device_allowed(did)):
+                # P3b-2 (review R11): the lease moved or a handover began during this pass --
+                # nothing more is written to this panel.
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s: lease lost or handover begun mid-pass -- %d push(es) "
+                    "not sent", dev_id, len(pins_sorted))
+                batch_error = "driver lease lost mid-pass"
+                pins_sorted = []
+                pins_to_sync = set()
 
             # WRITE-AHEAD (P3a-2 item 3, guide §3.4a): durable BEFORE the first write of
             # this pass. Phase D records state (and clears these) only after phases A-C,

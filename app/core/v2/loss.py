@@ -40,6 +40,20 @@ def trusted_ceiling(owned_count: int) -> float:
     return max(float(ABSOLUTE_FLOOR), max(0, int(owned_count)) * FRACTION)
 
 
+_enabled = False
+
+
+def set_enabled(value: bool) -> None:
+    """Loss re-add runs only while the server has v2 (seen ON in this process, or roles cached
+    from it): on an old server the PC behaves exactly as before (review R5)."""
+    global _enabled
+    _enabled = bool(value)
+
+
+def is_enabled() -> bool:
+    return _enabled
+
+
 def evaluate_listing(device_id: int, *, on_device: Iterable[str], owned: Iterable[str],
                      desired: Optional[Iterable[str]]) -> Dict[str, Any]:
     """Decide what a listing says was lost; record MISSING_OWNED; mark re-adds."""
@@ -54,7 +68,7 @@ def evaluate_listing(device_id: int, *, on_device: Iterable[str], owned: Iterabl
         _problems.registry.set_code(device_id, _problems.MISSING_OWNED, missing, count=len(missing))
     else:
         _problems.registry.clear_code(device_id, _problems.MISSING_OWNED)
-    if not trusted or desired is None:
+    if not trusted or desired is None or not _enabled:
         if missing and not trusted:
             _log.warning("[V2] loss check turnstile %s: %d owned pin(s) absent -- more than the "
                          "ceiling (%.0f), so the listing is not believed: reported, nothing re-added",
@@ -147,7 +161,10 @@ class LossWatch:
         self.flagged: Dict[int, float] = {}
 
     def tick(self, runtime: Any) -> None:
-        for did, count in pop_user_counts().items():
+        counts = pop_user_counts()
+        if not _enabled:
+            return
+        for did, count in counts.items():
             try:
                 if not user_count_dropped(did, count):
                     continue

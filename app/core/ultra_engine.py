@@ -2288,7 +2288,10 @@ class UltraDeviceWorker(threading.Thread):
             except Exception:
                 pass
         if readd_now:
-            _v2_loss.note_attempts(getattr(self, "_device_id", None) or 0, readd_now)
+            try:
+                _v2_loss.note_attempts(getattr(self, "_device_id", None) or 0, readd_now)
+            except Exception:
+                logger.warning("%s re-add attempt count not recorded", self._prefix, exc_info=True)
             logger.warning("%s re-adding %d MonClub member(s) missing from the terminal: %s",
                            self._prefix, len(readd_now), ",".join(readd_now[:20]))
         return to_push, len(users) - len(to_push)
@@ -2856,6 +2859,11 @@ class UltraDeviceWorker(threading.Thread):
         """
         if getattr(self, "_in_push_yield", False):
             return set()
+        if _v2_writes_blocked(getattr(self, "_device_id", None)):
+            # P3b-2 (review R11): the lease went away mid-push -- drop every chunk not sent yet.
+            logger.warning("%s push stopped between chunks: this PC no longer writes to this "
+                           "turnstile (lease)", self._prefix)
+            return set(getattr(self, "_pass_all_pins", None) or ())
         self._in_push_yield = True
         touched: set[str] = set()
         served = 0
@@ -3210,7 +3218,21 @@ class UltraDeviceWorker(threading.Thread):
             kwargs["on_chunk"] = _on_chunk
         if between_chunks is not None and _accepts_kwarg(self._sdk.push_roster, "between_chunks"):
             kwargs["between_chunks"] = between_chunks
-        result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
+        all_pins = {str(u.get("pin") or "").strip() for u in users or []}
+        if _v2_writes_blocked(getattr(self, "_device_id", None)):
+            # P3b-2 (review R11): the lease went away between the drain and the push -- no
+            # device write, no state write (every pin "superseded"); not ok, so no roster hash
+            # is stamped if the turnstile ever comes back.
+            logger.warning("%s push skipped: this PC no longer writes to this turnstile (lease)",
+                           self._prefix)
+            return {"ok": False, "pushed": 0, "failed": 0, "templates_failed": 0, "skipped_pin": 0,
+                    "chunks_wedged": 0, "errors": ["driver lease lost"], "failed_pins": [],
+                    "superseded_pins": sorted(all_pins), "user_written": []}
+        self._pass_all_pins = all_pins
+        try:
+            result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
+        finally:
+            self._pass_all_pins = None
         self._note_template_version_problems(users, result)
         # A pin the between-chunks yield handled itself (P3a-2 item 6) was never sent by
         # this push; recording it from this result would overwrite the newer state the
@@ -4342,6 +4364,10 @@ class UltraDeviceWorker(threading.Thread):
             if not users:
                 self._defer_member_sync(member_id, reason="CAPACITY_FULL")
                 return
+            if _v2_writes_blocked(getattr(self, "_device_id", None)):
+                # P3b-2 (review R11): the lease went away after the drain -- no write.
+                self._defer_member_sync(member_id, reason="driver lease lost")
+                return
             if not self._record_push_intents(users, hashes_by_pin):
                 # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
                 self._defer_member_sync(member_id, reason="push intent not recorded")
@@ -5002,10 +5028,10 @@ class UltraDeviceWorker(threading.Thread):
             sample=revoked,
         )
         ceiling = _verdict.ceiling
-        if not _verdict.allowed and _verdict.reason in ("add_only", "handover_release"):
-            # P3b-2: waiting for a trusted record (REMOVAL_DEFERRED already logged); the
-            # state is kept and the prune skipped, exactly as for a ceiling refusal.
-            self._last_revoke_deferred = len(revoked)
+        if not _verdict.allowed and _verdict.reason in ("add_only", "handover_release", "not_leased"):
+            # P3b-2: waiting for a trusted record, or no longer this PC's turnstile
+            # (REMOVAL_DEFERRED already logged); the state is kept and the prune skipped,
+            # exactly as for a ceiling refusal -- never recorded as a ceiling abort.
             return False
         if not _verdict.allowed:
             self._last_revoke_aborted = len(revoked)

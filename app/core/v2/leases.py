@@ -31,12 +31,14 @@ ON, OFF, UNREACHABLE = "ON", "OFF", "UNREACHABLE"
 
 class LeaseManager:
     def __init__(self, *, api: V2Api, pc_uuid_provider: Callable[[], Optional[str]],
+                 identity_state_provider: Optional[Callable[[], Optional[str]]] = None,
                  on_change: Optional[Callable[[lease_gate.LeaseSnapshot, lease_gate.LeaseSnapshot], None]] = None,
                  kv_get: Optional[Callable[[str], Any]] = None, kv_put: Optional[Callable[..., None]] = None,
                  kv_delete: Optional[Callable[[str], None]] = None, wall: Callable[[], float] = time.time) -> None:
         from app.core.v2 import store
         self._api = api
         self._pc_uuid = pc_uuid_provider
+        self._identity_state = identity_state_provider or (lambda: None)
         self._on_change = on_change
         self._get = kv_get or store.kv_get
         self._put = kv_put or store.kv_put
@@ -97,6 +99,37 @@ class LeaseManager:
             cur = lease_gate.current()
             self._install(self._build(body, cur.source, cur.fetched_at))
 
+    def _revoked(self, exc: V2ApiError) -> bool:
+        """The server says this installation is no longer an ACTIVE PC (review R2)."""
+        if exc.backend and exc.code in ("ACCESS_PC_REVOKED", "ACCESS_PC_ADOPTED"):
+            return True
+        if exc.code == "NO_PC_TOKEN":
+            try:
+                return self._identity_state() in ("revoked", "invalid_credentials", "invalid_token")
+            except Exception:
+                return False
+        return False
+
+    def _drop_leases(self, why: str) -> None:
+        """A revoked or adopted PC drives nothing while the gym uses leases: the server already
+        gave its turnstiles to another PC (forced, add-only there), so this PC writing on would
+        be a second writer -- and the only one that removes. In a gym without leases it keeps
+        today's behaviour (every PC drives every turnstile). The dropped roles are cached too,
+        so a cold start does not bring them back."""
+        with self._lock:
+            cur = lease_gate.current()
+            if cur.mode != lease_gate.MODE_LEASED:
+                return
+            body = {"gymUsesAssignments": True, "role": "REVOKED", "drive": [], "release": [],
+                    "readerOf": []}
+            self.last_body = body
+            self._install(self._build(body, "revoked", self._wall()))
+        _log.warning("[V2] this PC is %s: it drives no turnstile any more", why)
+        try:
+            self._put(CACHE_KEY, {"body": body, "pcUuid": self._pc_uuid(), "fetchedAt": self._wall()})
+        except Exception:
+            pass
+
     def load_cache(self) -> bool:
         """At start-up: install the cached roles (before any worker starts)."""
         cached = self._get(CACHE_KEY)
@@ -131,6 +164,8 @@ class LeaseManager:
                 except Exception:
                     pass
                 return OFF
+            if self._revoked(exc):
+                self._drop_leases("revoked or adopted")
             self.last_result = UNREACHABLE
             return UNREACHABLE
         now = self._wall()

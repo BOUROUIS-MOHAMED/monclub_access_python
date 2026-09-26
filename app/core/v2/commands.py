@@ -37,7 +37,11 @@ SEEN, STARTED, DONE = "SEEN", "STARTED", "DONE"
 REPORT_GIVE_UP_SEC = 3600.0
 # Minimum time left (s) for a command to start: a door must open within the window, an
 # enrolment needs time for three finger presses.
-START_MARGIN_SEC = {"DOOR_OPEN": 3.0, "CARD_SCAN": 5.0, "ENROLL_START": 30.0}
+START_MARGIN_SEC = {"DOOR_OPEN": 10.0, "CARD_SCAN": 5.0, "ENROLL_START": 30.0}
+# DOOR_OPEN, 10 s (review R6): the desk handler it reuses can take the ULTRA queue's 2 s + 5 s,
+# or the AGENT bus's 4 s followed by a direct PullSDK connect and pulse; with 10 s left the open
+# lands inside the command's 20 s window in every path measured here (the PullSDK connect is
+# bounded by the device's own timeout, not by this code -- guide §3.9).
 DEFAULT_START_MARGIN_SEC = 2.0
 
 Outcome = Tuple[str, Optional[str], Optional[Dict[str, Any]]]     # (SUCCEEDED|FAILED, code, detail)
@@ -140,6 +144,7 @@ class CommandExecutor(threading.Thread):
         self._q: "queue.Queue[str]" = queue.Queue()
         self._queued: set = set()
         self._running: Dict[str, CommandRun] = {}
+        self._started_here: set = set()      # ids this process started: never "interrupted"
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._last_report_sweep = 0.0
@@ -216,7 +221,7 @@ class CommandExecutor(threading.Thread):
             if row["state"] == DONE:
                 return
             if row["state"] == STARTED:
-                if cid in self.running():
+                if cid in self.running() or cid in self._started_here:
                     return
                 if row.get("outcome") is None:
                     self._journal.set_outcome(cid, "FAILED", "INTERRUPTED",
@@ -254,6 +259,7 @@ class CommandExecutor(threading.Thread):
         margin = START_MARGIN_SEC.get(run.type, DEFAULT_START_MARGIN_SEC)
         # The at-most-once point: durable BEFORE anything acts.
         self._journal.mark_started(cid, run.type, run.gym_device_id, run.payload, view.get("finishBy"))
+        self._started_here.add(cid)
         if handler is None:
             self._finish(run, ("FAILED", "UNSUPPORTED_TYPE", {"type": run.type}))
             return
@@ -274,13 +280,17 @@ class CommandExecutor(threading.Thread):
 
     def _run_handler(self, run: CommandRun, handler) -> None:
         try:
-            outcome = handler(run)
-        except Exception as exc:
-            outcome = ("FAILED", "ERROR", {"message": f"{type(exc).__name__}: {exc}"[:300]})
+            try:
+                outcome = handler(run)
+            except Exception as exc:
+                outcome = ("FAILED", "ERROR", {"message": f"{type(exc).__name__}: {exc}"[:300]})
+            # The outcome is journaled while the command is still "running" in this process:
+            # a duplicate offer in between must not read STARTED-without-outcome as a crash
+            # (review R1 -- it reported a door that opened as FAILED INTERRUPTED).
+            self._finish(run, outcome)
         finally:
             with self._lock:
                 self._running.pop(run.id, None)
-        self._finish(run, outcome)
 
     def _finish(self, run: CommandRun, outcome: Outcome) -> None:
         status, code, detail = outcome

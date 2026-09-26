@@ -18,6 +18,14 @@ from tests.test_standalone_finger_removal_state import FingerState, fstate  # no
 from tests.test_standalone_incremental_sync import _user, _worker
 
 
+@pytest.fixture(autouse=True)
+def _v2_seen_on():
+    """Loss re-add runs only where the server has v2 (review R5); these tests are about that."""
+    loss.set_enabled(True)
+    yield
+    loss.set_enabled(False)
+
+
 @pytest.fixture
 def db(tmp_path, monkeypatch):
     import app.core.db as dbmod

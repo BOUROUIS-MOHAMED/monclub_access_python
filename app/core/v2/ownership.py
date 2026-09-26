@@ -278,8 +278,13 @@ class OwnershipSync:
         from app.core.utils import now_iso
 
         after, adopted = 0, 0
+        local_scheme = self._device_scheme(did)
         while True:
             page = self.api.ownership_page(did, after, 1000)
+            if local_scheme and page.get("pinScheme") and page.get("pinScheme") != local_scheme:
+                # The server's record is of another pin scheme than this PC pushes: adopting
+                # it would claim pins of the other numbering. Retried once the schemes agree.
+                raise V2ApiError(409, "PIN_SCHEME_MISMATCH", "restore: pin scheme differs", backend=False)
             rows = [r for r in page.get("rows") or [] if isinstance(r, dict) and r.get("state") == "APPLIED"]
             if rows:
                 def op(conn, _p, rows=rows):
@@ -327,9 +332,18 @@ class OwnershipSync:
 
     # ------------------------------------------------------------------ release
     def _worker_idle(self, did: int) -> bool:
-        eng = getattr(self.rt.app, "_ultra_engine", None)
-        worker = getattr(eng, "_workers", {}).get(did) if eng is not None else None
-        return worker is None or not bool(getattr(worker, "_full_sync_running", False))
+        """No pass is writing to the turnstile: the ULTRA worker's full sync (either SDK: its
+        private DeviceSync engine included) and the DEVICE-mode DeviceSync engine (review R3)."""
+        app = self.rt.app
+        eng = getattr(app, "_ultra_engine", None)
+        worker = (getattr(eng, "_workers", None) or {}).get(did) if eng is not None else None
+        if worker is not None and (bool(getattr(worker, "_full_sync_running", False))
+                                   or getattr(worker, "_active_sync_engine", None) is not None):
+            return False
+        dev_engine = getattr(app, "_device_sync_engine", None)
+        if dev_engine is not None and bool(getattr(dev_engine, "_running", False)):
+            return False
+        return True
 
     def release(self, did: int, generation: int) -> Optional[str]:
         now = self._mono()
@@ -388,6 +402,26 @@ class OwnershipSync:
             pass
         return sorted(d for d in ids if d > 0)
 
+    def _lost_with_facts(self, snap: "lease_gate.LeaseSnapshot") -> List[int]:
+        """Turnstiles this PC holds ownership facts for but does not drive (a forced move, or
+        a move while it was offline or revoked: no release, so no final upload; or pins it
+        pushed before the gym used leases). Their facts are still uploaded, changes only,
+        under the server's current generation: the server keeps the newer fact per pin, so
+        nothing the new driver wrote is overwritten, and the members this PC pushed stay
+        provably MonClub's (review R7). No wipe is reported for them and nothing connects to
+        the turnstile: this is the local record only."""
+        if snap.mode != lease_gate.MODE_LEASED:
+            return []
+        try:
+            from app.core.db import get_conn
+            with get_conn() as conn:
+                ids = {int(r[0]) for r in conn.execute(
+                    "SELECT DISTINCT device_id FROM device_sync_state").fetchall()}
+        except Exception:
+            return []
+        return sorted(d for d in ids
+                      if d > 0 and d not in snap.drive and d not in snap.release)
+
     def tick(self, runtime: Any) -> None:
         snap = lease_gate.current()
         now = self._mono()
@@ -429,7 +463,7 @@ class OwnershipSync:
             self.report_wipes(drivable)
         except V2ApiError as exc:
             self.last["wipe"] = exc.code
-        for did in drivable:
+        for did in drivable + self._lost_with_facts(snap):
             if now < self._next_upload.get(did, 0.0):
                 continue
             self._next_upload[did] = now + UPLOAD_EVERY_SEC

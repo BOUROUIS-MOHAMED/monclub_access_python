@@ -2901,7 +2901,9 @@ Production (`origin/main` `fcfc850c`) maps an unmapped route to the same envelop
 **The server clock (owner decision 5a).** `server_clock.py::ServerClock`: a sample is `serverTime −
 midpoint(send, receive)`, a round trip over 5 s is no sample, the offset is the median of the last 7; sources:
 the socket `welcome`, every REST `serverTime` (Tunis local — placed with the gym offset learnt from `welcome`
-or `access_v2_state.utc_offset_sec`), and a 409 `CLOCK_SKEW`'s `details.serverTime`. `now()` = PC time +
+or `access_v2_state.utc_offset_sec`), and a 409 `CLOCK_SKEW`'s `details.serverTime` — or, while no gym offset is known (no `welcome` yet: e.g. a
+proxy that does not pass WebSockets), its `details.skewSeconds` (server now − our `sentAt`, offset-free); any
+backend error's `details.timestamp` that carries an offset also teaches the gym offset (review R4). `now()` = PC time +
 offset and never lower than the last value it returned in this process (it slews at 10 % of real time until
 the estimate catches up). **One deliberate exception:** a `CLOCK_SKEW` refusal restarts the sample window and
 drops that floor — the server refused every write stamped with the wrong estimate (> 5 min off), so nothing it
@@ -2956,10 +2958,19 @@ synchronously **before the first sync tick** (`runtime.py::load_cached_roles`), 
 power-on without internet (owner decision 8). A roles change asks for a sync (`LEASE_CHANGE`), whose `work()`
 starts/stops the workers; until then a worker for a turnstile this PC no longer drives writes nothing
 (`ultra_engine.py::_v2_writes_blocked` gates the member drain, the full-sync drain and the maintenance slot;
-DeviceSync skips the device) and does not reconnect. `[CODE]` `[TEST: test_v2_review0.py::test_a_lost_lease_stops_every_write_at_once,
-test_v2_runtime.py::test_a_reader_is_a_reader_at_a_cold_start_before_any_worker]` Residual `[CODE]`: a PC that
-is revoked or loses its lease while it is **off** acts on its cached roles at the next power-on until the
-server answers (usually the first minute online); offline it has no way to learn it.
+DeviceSync skips the device) and does not reconnect. A pass already running re-reads the gate before it
+writes: the MB2000 push (`_push_with_chunk_recording`: nothing sent, every pin "superseded", no roster hash
+stamped), between two push chunks (`_standalone_push_yield` drops the rest), the member push, and
+`_sync_one_device` before its batch push; a removal refused as `not_leased` is a deferral like `add_only`,
+never a ceiling abort. `[CODE]` `[TEST: test_v2_review0.py::test_a_lost_lease_stops_every_write_at_once,
+test_v2_review1.py::test_r11_*, test_v2_runtime.py::test_a_reader_is_a_reader_at_a_cold_start_before_any_worker]`
+A PC the server calls `ACCESS_PC_REVOKED`/`ACCESS_PC_ADOPTED`, or whose identity is `revoked` /
+`invalid_credentials` / `invalid_token` (no token can be minted), drives nothing any more when its gym uses
+leases (role `REVOKED`, cached too, so a cold start keeps it); in a gym without leases nothing changes; a PC
+merely offline keeps its cached roles. `[CODE: leases.py::LeaseManager._revoked, ::_drop_leases]`
+`[TEST: test_v2_review1.py::test_r2_*]` Residual `[CODE]`: a PC that is revoked or loses its lease while it is
+**off** acts on its cached roles at the next power-on until the server answers (usually the first minute
+online); offline it has no way to learn it.
 
 **Add-only and the handover (P2c-1/P2c-2).** A `DRIVE` turnstile is add-only while its lease says
 `handoverForced` or while this PC has not restored the ownership backup for the lease generation it holds; a
@@ -2977,8 +2988,9 @@ pushed_finger_ids=pushedFingerIds, finger_slots_swept=1)` — the engine's own h
 already in sync (no whole-roster re-push after a handover) and pushes one that is not; local proof is never
 lowered; `REMOVED`/absent rows prove nothing (the server's ~10-minute clock-ordering window, P2c-2 report).
 Read-back (a forced lease, once restored): one listing through the worker, then `POST …/assignment/read-back` —
-the only way the flag clears. Release: writes frozen at once, the door kept; once no full pass is running
-(+2 s grace) the WHOLE record is uploaded with `finalPage=true`, then `POST …/assignment/release`. `[CODE]`
+the only way the flag clears. Release: writes frozen at once, the door kept; once no pass is writing the
+turnstile — the ULTRA worker's full sync and its private DeviceSync engine, and the DEVICE-mode DeviceSync
+engine (`OwnershipSync._worker_idle`) — (+2 s grace) the WHOLE record is uploaded with `finalPage=true`, then `POST …/assignment/release`. `[CODE]`
 `[TEST: test_v2_ownership.py]` `[TEST: e2e — a release without the final upload was refused
 OWNERSHIP_NOT_UPLOADED; with it the server handed turnstile 8 to the other PC, which restored 24 owned pins
 with their hashes and without the removed one]`
@@ -2990,7 +3002,9 @@ for its duration (§3.4a); on ~1,860 users its length is unmeasured.
 and `delete_device_sync_state`'s own transaction, at the corrected time). A row that merely vanished (a prune) is
 never `REMOVED`; a logged removal older than a state already uploaded for that pin is not sent again. Rows
 older than the device's latest pin-scheme switch are not uploaded. Only what changed, every 5 min, for the
-turnstiles this PC drives (restored), pages of 1,000; `observedAt` = the row's `updated_at` (PC local) +
+turnstiles this PC drives (restored) — and, in a gym with leases, for every other turnstile it holds facts for
+(a lease lost without a release, or pins pushed before leases), local record only, no wipe report, no device
+connection: the server keeps the newer fact per pin (`_lost_with_facts`, review R7) — pages of 1,000; `observedAt` = the row's `updated_at` (PC local) +
 offset, strictly newer than this PC's last upload of that pin when the state changed. A PullSDK table clear
 posts `/ownership/wiped`. `[CODE]` `[TEST: test_v2_ownership.py, test_v2_review0.py::test_an_older_removal_never_resurfaces_after_a_later_upload]`
 `[TEST: e2e — 25 pins stored, an unchanged record sent nothing, a removal stored REMOVED]`
@@ -2999,8 +3013,11 @@ posts `/ownership/wiped`. `[CODE]` `[TEST: test_v2_ownership.py, test_v2_review0
 journal row (`v2_command_journal`) with a fresh claim token BEFORE the claim (a lost answer is re-claimed with
 the same token); 404/409 on the claim = nothing runs; the row turns `STARTED` in a durable write
 (`synchronous=FULL`) BEFORE the command acts; a row found `STARTED` without an outcome after a restart is never
-run again (`FAILED INTERRUPTED`); the deadline is the claim answer's `finishBy − serverTime` (both the server's
-local clock) from the answer's arrival; below a per-type margin (door 3 s, card 5 s, enrolment 30 s) the
+run again (`FAILED INTERRUPTED`) — a command started by this process is never read so, and its outcome is
+journaled before it leaves the running set (a duplicate offer in between once reported an opened door as
+INTERRUPTED, review R1); the deadline is the claim answer's `finishBy − serverTime` (both the server's
+local clock) from the answer's arrival; below a per-type margin (door 10 s — the desk handler it reuses may
+wait 2 s + 5 s on the ULTRA queue, or 4 s on the AGENT bus and then connect; card 5 s, enrolment 30 s) the
 command is not started (`FAILED EXPIRED`); the result is re-posted until acknowledged (≤ 1 h). Handlers run on
 their own thread. `handlers.py` reuses the desk's code: DOOR_OPEN → the lease-gated `_handle_device_door_open`
 (so §3.1a's claim and deadline apply; `SENT_NO_ANSWER` when the driver answered "sent, no answer"); CARD_SCAN →
@@ -3012,7 +3029,8 @@ REMOVAL_CONFIRM below. `[CODE]` `[TEST: test_v2_commands.py, test_v2_handlers.py
 `[TEST: e2e — ten reader-filed DOOR_OPENs routed by the server to the driver, each run once (request → driver
 handler median 81–108 ms, max 175–311 ms, local backend); an expired one never ran; a restart reported
 FAILED INTERRUPTED]` Residual `[CODE]`: on an AGENT turnstile the door open has no claim/deadline (§3.1a "not
-changed"), so a remote DOOR_OPEN there can pulse late within the command's own window.
+changed"); the 10 s start margin keeps the pulse inside the command's window unless the fallback's direct
+PullSDK connect itself takes longer (bounded by the SDK's own connect timeout, not by this code).
 **The task said "DEVICE_RECONCILE (confirm removal)"; the server's contract has a separate `REMOVAL_CONFIRM`
 type (payload `{expectedCount, pinSetHash}`) — that is the one implemented as "confirm removal";
 DEVICE_RECONCILE is a plain explicit reconcile (the ceiling still applies).**
@@ -3024,7 +3042,9 @@ it); `_capacity_admit` sets/clears `CAPACITY_FULL`; every push adds/removes `TEM
 (from the driver's new aggregate `failed_reasons`); the targeted and full-sync skips add `SKIPPED_NOT_OWNED`
 (7-day expiry); a trusted listing sets `MISSING_OWNED`. `reports.py::ProblemReporter` posts one snapshot per
 driven turnstile when it changes and hourly while it has problems, only after that turnstile's removal step
-ran in this process (a restart never sends an empty snapshot that hides an undetected problem). The pin-set
+(the standalone revoke pass or the PullSDK stale step) ran in this process — a `CAPACITY_FULL` clear, a table
+clear or a targeted skip alone does not count (review R9) — so a restart never sends a snapshot that hides a
+stored `REVOKE_ABORTED` list. The pin-set
 hash is the server's (`AccessPinSets.canonicalHash`). REMOVAL_CONFIRM recomputes the CURRENT refused list; a
 different count or hash is `FAILED REMOVAL_LIST_CHANGED`; otherwise a one-shot approval bound to (turnstile,
 hash, count), expiring with the command, lets `check_bulk_removal` pass that exact pin set once, on the
@@ -3032,7 +3052,9 @@ standalone revoke pass or the PullSDK stale step only (never an empty roster, ne
 `[CODE]` `[TEST: test_v2_problems.py, test_v2_add_only.py]` `[TEST: e2e — the server stored the report and
 computed the same pin-set hash; REMOVAL_CONFIRM for the bound list ran, for another list was refused]`
 
-**Loss re-add (owner decision 6).** `loss.py`: owned pins absent from a TRUSTED listing — successful, showing
+**Loss re-add (owner decision 6).** Only where the server has v2 — seen ON in this process, or roles
+cached from it (`loss.set_enabled`); against an old server the PC behaves exactly as before (review R5).
+`loss.py`: owned pins absent from a TRUSTED listing — successful, showing
 at least one owned pin, missing no more than `max(10, 25 % of owned)` — are reported (`MISSING_OWNED`) and the
 still-desired ones marked in `v2_readd`; the next pass pushes a marked pin that its state calls in sync, at most
 50 a pass, 3 attempts; a confirmed push clears the mark. It never clears `desired_hash`/`last_ok` (R6-03), never
@@ -3449,7 +3471,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2858 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 1; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`

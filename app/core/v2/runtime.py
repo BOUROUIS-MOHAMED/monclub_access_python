@@ -51,11 +51,23 @@ def _pc_uuid(app: Any) -> Optional[str]:
         return None
 
 
+def _identity_state(app: Any) -> Optional[str]:
+    try:
+        from access.pc_identity import get_pc_identity_service
+        return (get_pc_identity_service(app).status() or {}).get("state")
+    except Exception:
+        return None
+
+
 def load_cached_roles(app: Any) -> bool:
     """Synchronous, local only: install the cached assignment before any worker starts."""
     try:
         mgr = LeaseManager(api=None, pc_uuid_provider=lambda: _pc_uuid(app))  # type: ignore[arg-type]
-        return mgr.load_cache()
+        loaded = mgr.load_cache()
+        if loaded:
+            from app.core.v2 import loss
+            loss.set_enabled(True)      # roles cached from a v2 server: the server has v2
+        return loaded
     except Exception as exc:
         _log.warning("[V2] cached roles not loaded: %s", exc)
         return False
@@ -94,6 +106,7 @@ class V2Runtime(NoticeCallbacks):
         self.api = V2Api(base_url=base_url, token_provider=self._token_provider, clock=self.clock,
                          app_version=app_version or self._app_version())
         self.leases = LeaseManager(api=self.api, pc_uuid_provider=lambda: _pc_uuid(app),
+                                   identity_state_provider=lambda: _identity_state(app),
                                    on_change=self._on_lease_change)
         self.executor: Optional[CommandExecutor] = None
         self.handlers = CommandHandlers(app, running_commands=lambda: self.executor.running() if self.executor else {})
@@ -185,7 +198,8 @@ class V2Runtime(NoticeCallbacks):
             self.refresh_assignment()
         if self.availability != ON:
             return
-        if not self.notice.connected and now >= self._next_poll:
+        if getattr(self, "_force_poll", False) or (not self.notice.connected and now >= self._next_poll):
+            self._force_poll = False
             self._next_poll = now + float(self.notice.poll_interval_sec or 120)
             try:
                 self.executor.poll_pending()
@@ -208,7 +222,10 @@ class V2Runtime(NoticeCallbacks):
         self._set_availability(result)
         now = time.monotonic()
         if result == ON:
-            self._next_refresh = now + ASSIGNMENT_REFRESH_SEC
+            waiting = any(e.state != "DRIVE" for e in lease_gate.current().drive.values())
+            # A PC waiting for a turnstile (WAIT_FOR_RELEASE) re-reads every minute, so an AGENT
+            # door is not left without a driver for 10 min when the socket is down.
+            self._next_refresh = now + (60.0 if waiting else ASSIGNMENT_REFRESH_SEC)
         elif result == OFF:
             self._next_refresh = now + OFF_REPROBE_SEC
         else:
@@ -223,6 +240,8 @@ class V2Runtime(NoticeCallbacks):
         if result != self.availability:
             _log.info("[V2] server v2 availability: %s -> %s", self.availability, result)
         self.availability = result
+        from app.core.v2 import loss
+        loss.set_enabled(result == ON)
 
     # ------------------------------------------------------------------ syncs
     def _request_sync(self, trigger_source: str) -> None:
@@ -257,11 +276,7 @@ class V2Runtime(NoticeCallbacks):
         if epoch is not None:
             self.clock.add_sample(epoch, sent_wall, recv_wall, source="welcome")
         self._next_refresh = 0.0                 # re-read the roles
-        self._next_poll = 0.0
-        try:
-            self.executor.poll_pending()         # jobs filed while we were away
-        except V2ApiError:
-            pass
+        self._force_poll = True                  # jobs filed while we were away (control thread)
         self.schedule_sync(0.0, 5.0)
         self.wake()
 

@@ -164,6 +164,7 @@ def test_the_connect_time_count_is_compared_off_the_worker_thread(monkeypatch, f
     # The control thread's LossWatch does the comparison and flags the worker.
     rt = SimpleNamespace(app=SimpleNamespace(_ultra_engine=SimpleNamespace(_workers={w._device_id: w})))
     watch = loss.LossWatch(rt)
+    monkeypatch.setattr(loss, "_enabled", True)   # the server has v2 (review R5)
     loss.note_user_count(w._device_id, 900)
     watch.tick(rt)
     loss.note_user_count(w._device_id, 890)

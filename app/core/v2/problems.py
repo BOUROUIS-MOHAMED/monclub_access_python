@@ -59,6 +59,7 @@ class _Registry:
         self._skipped: Dict[int, Dict[str, float]] = {}
         self._changed_at: Dict[int, float] = {}
         self._approvals: Dict[int, Tuple[str, int, float]] = {}   # device -> (hash, count, expires_wall)
+        self._step_ran: set = set()      # turnstiles whose removal step ran in this process
         self.approvals_used: List[Tuple[int, str]] = []
 
     # ------------------------------------------------------------------ recording
@@ -68,6 +69,7 @@ class _Registry:
             return
         with self._lock:
             key = tuple(sorted({str(p).strip() for p in pins}))
+            self._step_ran.add(did)
             prev = self._aborted.setdefault(did, {}).get(path)
             if prev is None or prev[0] != key or prev[1] != reason:
                 self._aborted[did][path] = (key, reason, time.time())
@@ -78,9 +80,13 @@ class _Registry:
         if did is None:
             return
         with self._lock:
-            if self._aborted.get(did, {}).pop(path, None) is not None or did not in self._changed_at:
-                # (also the first time a step runs in this process: the report then tells the
-                # server what this PC sees now, replacing a snapshot from before a restart)
+            first = did not in self._step_ran and path in CONFIRMABLE_PATHS
+            if path in CONFIRMABLE_PATHS:
+                self._step_ran.add(did)
+            if self._aborted.get(did, {}).pop(path, None) is not None or first:
+                # (also the first time the removal step runs in this process: the report then
+                # tells the server what this PC sees now, replacing a snapshot from before a
+                # restart)
                 self._changed_at[did] = time.time()
 
     def set_code(self, device_id: Any, code: str, pins: Iterable[Any], count: Optional[int] = None) -> None:
@@ -100,7 +106,7 @@ class _Registry:
         if did is None:
             return
         with self._lock:
-            if self._other.get(did, {}).pop(code, None) is not None or did not in self._changed_at:
+            if self._other.get(did, {}).pop(code, None) is not None:
                 self._changed_at[did] = time.time()
 
     def skipped_not_owned(self, device_id: Any, pins: Iterable[Any]) -> None:
@@ -138,8 +144,12 @@ class _Registry:
 
     # ------------------------------------------------------------------ reading
     def devices(self) -> List[int]:
+        """Turnstiles that may be reported: only those whose removal step (the standalone
+        revoke pass or the PullSDK stale step) ran in this process (review R9) -- before
+        that, this PC does not know the REVOKE_ABORTED list, and a snapshot without it would
+        replace the stored one on the server (and reset a confirmation in progress)."""
         with self._lock:
-            return sorted(set(self._aborted) | set(self._other) | set(self._skipped) | set(self._changed_at))
+            return sorted(self._step_ran)
 
     def changed_at(self, device_id: int) -> float:
         with self._lock:
