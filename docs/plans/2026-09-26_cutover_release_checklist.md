@@ -118,7 +118,7 @@ from it is merged; do not tick a row below on its word -- tick it on the merged 
 | ☐ | `pinScheme` and `mainAccountId` reach the PC | gym 45 plan gate G2 on a copy of the PC's `access.db` after the upgrade |
 | ☐ | Protocol 2 (`monclub.access.v2.enabled`) | NOT required: with it off the server answers v1 and the PC behaves as before (guide §3.8). A separate decision -- but **know its state before gym 58's pre-install** (runbook A7, point 5): with it on, the new Access removes members outside their dates and refuses QR codes on days not allowed from its first start, and a return to the old Access becomes risky |
 | ☐ | The QR roster check of gym 58's panels (`deviceCapabilities.totpRosterCheckMode`) | "trial" (the default: it never refuses). "enforce" refuses the QR codes of members not on the PC's list from the pre-install on (runbook A7, point 5) |
-| ☐ | The commands switch and the drivers (§5a) | NOT required by the night. Its state is the same from A7 to the night's verification, and **no turnstile of gym 45 or 58 has a driver** (runbook part H; checked at the server by runbook B2b and on each PC at A7, C10, D11) |
+| ☐ | The commands switch and the drivers (§5a) | NOT required by the night. Its state is the same from A7 to the night's verification, and **no turnstile of gym 45 or 58 has a driver** (runbook part H; checked at the server by runbook B2b's 404 `NOT_FOUND` and on each PC at A7, C10, D11) |
 
 ### 5a. The server switches (backend `main` `919231a8`, read-only)
 
