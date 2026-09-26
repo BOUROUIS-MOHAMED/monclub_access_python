@@ -100,7 +100,15 @@ def test_cache_dir_is_memoized_stable(tmp_path):
     assert a == b == str(tmp_path)
 
 
-def test_cache_dir_resolves_under_images_when_unmemoized(monkeypatch):
-    # With no memoized value, it resolves to the real <data>/cache/images dir.
+def test_cache_dir_resolves_under_images_when_unmemoized(tmp_path, monkeypatch):
+    # With no memoized value, it resolves to <dir of the Access db>/cache/images and
+    # creates it. The db path is pointed at tmp_path: unpatched, this creates folders in
+    # the real data root -- the installed app's folder when no override is set.
+    import access.storage
+
+    db_path = tmp_path / "access" / "access.db"
+    monkeypatch.setattr(access.storage, "current_access_runtime_db_path", lambda: db_path)
     monkeypatch.setattr(pic, "_cache_dir_cached", None)
-    assert pic.cache_dir().replace("\\", "/").endswith("cache/images")
+    resolved = pic.cache_dir()
+    assert resolved == str(tmp_path / "access" / "cache" / "images")
+    assert (tmp_path / "access" / "cache" / "images").is_dir()

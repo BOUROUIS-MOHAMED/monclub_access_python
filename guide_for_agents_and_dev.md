@@ -3269,15 +3269,13 @@ failed once in a reviewer's `-x` run on P3a-2 and passed alone and in every full
 > `test_sync_handlers_schedule_expected_trigger_metadata` ran `DELETE FROM sync_version_tokens`
 > on whatever database was active. Both are patched now (commit a87830b).
 >
-> **Many other test files still reach the default database.** Run one file at a time, each from
-> a fresh empty `MONCLUB_ACCESS_DATA_ROOT` (2026-09-18, branch `claude/access-loop-retry-fixes`),
-> 33 of the 121 `tests/test_*.py` files created `access/access.db` under that root — i.e. without
-> the variable they open the installed database. Among them: `test_authoritative_revocation_pipeline`,
-> `test_sync_observability` (`::test_main_app_initializes_scheduler_before_first_after`),
-> `test_fast_patch_runtime`, `test_pin_scheme_gate`, `test_ultra_engine`,
-> `test_ultra_sync_scheduler`, `test_zk_standalone_driver`, `test_device_sync_protocol_guard`,
-> `test_standalone_*`, `test_account_pin_*`. All 121 pass alone. Whether each one only reads, or
-> also writes, has not been established per test. `[TEST: the sweep; UNVERIFIED per-test writes]`
+> **`tests/conftest.py` now keeps the whole suite off the installed database** (merged 2026-09-26 from
+> `claude/test-dataroot-files`): session-scoped guards point `app.core.db._DB_PATH` at one temp file
+> (re-applied around every test, because some fixtures reload `app.core.db`), repoint the split-config
+> paths, and repoint the popup image cache with a `requests` stub that refuses, so no test writes the
+> installed app's config or fetches from the production backend. Before it, a per-file sweep
+> (2026-09-18) found 33-34 test files reaching the installed database. Setting
+> `MONCLUB_ACCESS_DATA_ROOT` to an empty folder is still recommended as a second guard. `[CODE: tests/conftest.py]`
 
 > **Any test that drives a full sync must use the documented `_DB_PATH` temp-database
 > override.** Without it the run writes per-pin state into the developer's *installed*
@@ -3287,6 +3285,96 @@ failed once in a reviewer's `-x` run on P3a-2 and passed alone and in every full
 > `test_zk_standalone_driver.py` now also stubs `list_confirmed_device_sync_pins`, so a
 > polluted database can no longer reach it; `get_conn()` does **not** commit ad-hoc
 > writes, so clean up through `_run_db_write_sync` if you ever need to.
+
+> **No test reaches the default database any more — `tests/conftest.py` enforces it.**
+> The default data root is `C:\ProgramData\MonClub Access` (`_candidate_data_roots` in
+> `app/core/utils.py`), so with `_DB_PATH` left at `None` a test run on a gym or dev PC opens
+> the *installed* `access.db`. A per-file sweep on master (2026-09-18: each `tests/test_*.py`
+> run alone with `MONCLUB_ACCESS_DATA_ROOT` set to a fresh empty folder) found **34 of 118**
+> files creating `access/access.db` under that root. `[TEST]` The main path was a read:
+> engine and sync code reaching `get_backend_global_settings` →
+> `load_sync_access_software_settings` unpatched. A second sweep with an `sqlite3` authorizer
+> (root pre-seeded with a migrated DB, one sweep, 2026-09-18) showed which ones **write**:
+> `test_access_history_user_id`, `test_daily_counter` and `test_anti_fraud_daily_limit_integration`
+> INSERT/UPDATE/DELETE `access_history` (the committed inserts advance its `AUTOINCREMENT`
+> counter even after cleanup; cleanup runs only if the test passes), and `test_db_anti_fraud_columns`
+> INSERTs/DELETEs `sync_devices`. `test_device_sync_protocol_guard::test_pullsdk_device_is_not_refused`
+> and `test_zk_standalone_driver::…::test_full_sync_pushes_roster_and_terminates` leave rows in
+> `push_batch_history`. `test_sync_observability::test_main_app_initializes_scheduler_before_first_after`
+> runs `cleanup_stale_in_progress_sync_runs`, which commits `UPDATE sync_run_history SET
+> status='INTERRUPTED' WHERE status='IN_PROGRESS'` and would mark a running app's live sync as
+> interrupted. Those first four files also run `init_db()` from a module-scoped fixture, so they
+> applied schema migrations (DDL) to the installed database. `[TEST]` That sweep ran against an
+> *empty* migrated schema. A populated installed database could send the same tests down
+> further write paths. `[UNVERIFIED]`
+>
+> `tests/conftest.py` now points `_DB_PATH` at one empty temp file for the whole session.
+> It never calls `init_db()` itself. So a file run alone still fails on an unpatched read of a
+> missing table, the failure that the 7 tests in `test_access_history_unresolved_bound.py`
+> hid until commit 86be8ea (cherry-picked from a87830b). **A full-suite run does not catch
+> this.** Four files (above) call `init_db()` from a module-scoped fixture without their own
+> override, which migrates the shared session file early in the run. After a full run it held
+> 41 tables. `[TEST]` Only the per-file sweep below keeps such reads detectable. Two details
+> are load-bearing. `[CODE]` **Session scope:**
+> module-scoped `init_db()` fixtures run before any function-scoped override, and the db
+> writer, sync-cache loader and popup prefetch threads outlive single tests, so the path is
+> never reverted to `None`. **Re-applied around every test:** seven fixtures call
+> `importlib.reload(app.core.db)`, which re-executes `_DB_PATH = None`. Their `monkeypatch`
+> then restores that `None` at teardown, which made every later test open the default
+> database again. Tests that need a schema still patch `_DB_PATH` to their own `tmp_path` and
+> call `init_db()`. The conftest is a safety net, not a substitute for that. After the change
+> the same sweep finds **0 of 118** files creating a database, and all 118 pass alone. `[TEST]`
+>
+> **Nor config files, the popup image cache, or the backend.** With the database guarded, the
+> sweep still found three files writing *outside* `data/` under the root (2026-09-18, traced
+> with a Python audit hook on file opens, renames and mkdirs, plus `socket.connect`). `[TEST]`
+> - `test_feedback_api` and `test_scan_session_api` wrote `access/config.json`, `tv/config.json`
+>   and `shared/install.json`. The first config read in a process (`serialize_access_config`,
+>   `load_access_app_config`) runs `shared.config.migrate_split_config_if_needed`. That calls
+>   `ensure_dirs()` and writes default component configs and `install.json` wherever they are
+>   missing. On a gym PC that is the installed app's folder.
+> - `test_ultra_engine` made a **real HTTPS request to the production backend**
+>   (`monclubwigo.tn:443`). An allow event carrying a member image (`"alice.jpg"`) reaches
+>   `popup_image_cache.prefetch`, whose pool thread runs `requests.get` on the URL joined to
+>   `MONCLUB_BASE_URL`. The server answered with a 950-byte HTML page, which was cached as
+>   `access/cache/images/<sha1>.jpg`. `fetch_and_cache` attaches `Authorization: Bearer` with
+>   whatever `load_auth_token()` returns `[CODE]`. Before the database guard, that token came
+>   from the installed database. Whether any past run actually sent a real gym token is
+>   `[UNVERIFIED]`.
+> - `test_popup_image_negcache::test_cache_dir_resolves_under_images_when_unmemoized` created
+>   the empty folders `access/cache/images` through the real
+>   `current_access_runtime_db_path()`.
+>
+> The fixes are two more session-scoped, never-reverted guards in `tests/conftest.py`. `[CODE]`
+> - **Config paths:** it repoints the `shared.desktop_paths` config-path globals, which
+>   `get_desktop_path_layout()` reads at call time, to a temp root. It stubs `ensure_dirs` inside
+>   `shared.config` (`save_json` creates the parents it needs). The migration still runs, from
+>   the first test that reads config, and writes its defaults into the temp root. `[TEST]` The
+>   conftest also resets `_MIGRATION_DONE` to `False`. That is defensive only: it is already
+>   `False` after the whole suite is collected. `[TEST]`
+> - **Popup images:** it points `popup_image_cache._cache_dir_cached` at a temp folder and
+>   replaces its `requests` with a stub that raises. `fetch_and_cache` handles that like any
+>   fetch error, so a blocked prefetch also lands in the module's negative cache. Tests of the
+>   fetch still `patch.object(pic, "requests")` and clear that cache.
+>   **This stub covers `popup_image_cache` only.** Any other code that fetches over the network
+>   is not blocked, and a network call leaves no file under the root for the sweep to find.
+> - **The negcache test:** now points `access.storage.current_access_runtime_db_path` at
+>   `tmp_path` and asserts the exact resolved folder.
+>
+> After the change, no file among the 118 creates anything outside `data/` under the root:
+> no file, no folder. The same audit hook over the per-file runs *and* over one full-suite run
+> (1771 passed) records no writes there and only one `socket.connect`:
+> `test_network_discovery` to `127.0.0.1`. `data/` itself is
+> created at import by `_pick_data_root` and stayed empty in every per-file run. The full suite
+> left nothing outside `data/` either. `[TEST]` To re-run the sweep (expected output: nothing):
+>
+> ```bash
+> for f in tests/test_*.py; do r=$(mktemp -d); MONCLUB_ACCESS_DATA_ROOT="$r" python -m pytest "$f" -q -p no:cacheprovider >/dev/null 2>&1; find "$r" -mindepth 1 -not -path "$r/data" -not -path "$r/data/*" | sed "s|^|$f: |"; rm -rf "$r"; done
+> ```
+>
+> The conftest guards only what is collected under `tests/`. A bare `pytest` from the repo
+> root also collects `totp_file_test.py`, which imports `app.core.db` and gets no guard. Always
+> run the suite with `MONCLUB_ACCESS_DATA_ROOT` set to a scratch folder. `[TEST]` / `[CODE]`
 
 ```bash
 python tools/check_sql_arity.py
