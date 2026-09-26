@@ -26,6 +26,13 @@ What the numbers mean is in tools/gym45_cutover/README.md. The questions it answ
    would lose it in a wipe -- and whether each such finger can be tied to the person.
 3. For an ACCOUNT switch without a wipe: how many account pins would land on a pin the
    terminal already holds (the reason the wipe comes first).
+4. Which current members have a card on the terminal that MonClub will not push -- they
+   are refused by card after an erase until the card is entered in MonClub. Only a
+   row's first card reaches a terminal (device_sync._normalize_device_card on
+   firstCardId, guide 3.2b), so that is the card compared.
+
+It reads the MB2000 export (tools/mb2000_scripts/14_export_terminal_readonly.ps1) and the
+PullSDK panel export (tools/c3_panel_scripts/export_c3_panel_readonly.ps1, no finger slots).
 
 Template identity is SHA-256 of the decoded template bytes on both sides. Whether an
 MB2000 returns, byte for byte, the template MonClub wrote is not proven anywhere; the
@@ -54,6 +61,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 EXPORT_SCHEMA = "monclub.mb2000.terminal_export/1"
+PANEL_EXPORT_SCHEMA = "monclub.pullsdk.panel_export/1"
+EXPORT_SCHEMAS = (EXPORT_SCHEMA, PANEL_EXPORT_SCHEMA)
 REFUSED_DATABASES = {"wigo-db"}
 SCHEMES = ("MEMBERSHIP", "ACCOUNT")
 
@@ -92,6 +101,13 @@ def norm_card(card: Any) -> str:
     digits = re.sub(r"\D", "", str(card or ""))
     digits = digits.lstrip("0")
     return digits
+
+
+def wire_card(card: Any) -> str:
+    """The card MonClub writes to a terminal for this value: device_sync._normalize_device_card
+    (digits only, 1..4294967295), in norm_card's form; '' when nothing is written."""
+    digits = norm_card(card)
+    return digits if digits and int(digits) <= 4294967295 else ""
 
 
 def norm_pin(pin: Any) -> str:
@@ -171,7 +187,7 @@ class TerminalExport:
 def load_export(path: str, device_id: int) -> TerminalExport:
     with open(path, encoding="utf-8-sig") as fh:
         doc = json.load(fh)
-    if doc.get("schema") != EXPORT_SCHEMA:
+    if doc.get("schema") not in EXPORT_SCHEMAS:
         raise ValueError(f"{path}: not a terminal export (schema={doc.get('schema')!r})")
     fingers_read = bool((doc.get("options") or {}).get("fingers"))
     users: List[TerminalUser] = []
@@ -229,6 +245,7 @@ class MonClubRow:
     name: str
     cards: Set[str]
     templates: List[MonClubTemplate]
+    first_card: str = ""         # wire_card(firstCardId): the one card MonClub pushes for this row
 
     def person_key(self) -> str:
         if self.main_account_id is not None:
@@ -321,6 +338,7 @@ def load_access_db(path: str) -> AccessDb:
                 name=str(full_name or ""),
                 cards={c for c in (norm_card(c1), norm_card(c2)) if c},
                 templates=templates,
+                first_card=wire_card(c1),
             ))
         # A client older than the ownership bit (ownership_confirmed) records none: that is
         # "unknown", never "nobody owns anything".
@@ -480,6 +498,7 @@ def snapshot_from_rows(
         rows.append(MonClubRow(
             membership_id=am_id, main_account_id=acct, user_id=_int_or_none(user_id), name="",
             cards={c for c in (norm_card(c1), norm_card(c2)) if c}, templates=tpl,
+            first_card=wire_card(c1),
         ))
     gms = {norm_pin(k): int(a) for k, a in gms_persons if k is not None and _int_or_none(a) is not None}
     notes = [
@@ -637,6 +656,8 @@ def analyse(
 
     # per person, across all terminals: fingers seen on a terminal and where
     linked_slots: Dict[str, List[Tuple[int, str, int, Optional[str], str]]] = defaultdict(list)
+    # ... and cards seen on a terminal, and where
+    linked_cards: Dict[str, List[Tuple[int, str, str, str]]] = defaultdict(list)
 
     for ex in exports:
         dev: Dict[str, Any] = {
@@ -693,6 +714,8 @@ def analyse(
             if person is not None:
                 for s in slots:
                     linked_slots[person].append((ex.device_id, u.pin, s.finger_id, s.sha256, "own_pin"))
+                if norm_card(u.card):
+                    linked_cards[person].append((ex.device_id, u.pin, norm_card(u.card), "own_pin"))
                 continue
             if cls in ("departed_owned", "intent_only"):
                 continue
@@ -730,6 +753,8 @@ def analyse(
                 (target,) = tuple(targets)
                 for s in slots:
                     linked_slots[target].append((ex.device_id, u.pin, s.finger_id, s.sha256, f"leftover_by_{primary}"))
+                if norm_card(u.card):
+                    linked_cards[target].append((ex.device_id, u.pin, norm_card(u.card), f"leftover_by_{primary}"))
             details.append(DetailRow(
                 kind=cls, device_id=ex.device_id, pin=u.pin,
                 person=",".join(sorted(targets)) or None, name=u.name,
@@ -798,6 +823,32 @@ def analyse(
             1 for k in persons if person_fingers[k] and k not in on_terminal
         )
     report["people"] = dict(sorted(ppl.items()))
+
+    # --- cards: who would be refused by card after an erase (the card is only on the terminal)
+    crd: Counter = Counter()
+    pushed_cards = {k: {r.first_card for r in v if r.first_card} for k, v in persons.items()}
+    crd["people_with_monclub_card"] = sum(1 for k in persons if pushed_cards[k])
+    crd["people_without_monclub_card"] = sum(1 for k in persons if not pushed_cards[k])
+    # under ACCOUNT one row per person reaches the terminal, so only one of these cards does
+    crd["people_with_several_monclub_cards"] = sum(1 for k in persons if len(pushed_cards[k]) > 1)
+    for key, seen in linked_cards.items():
+        only = [(d, p, c, w) for d, p, c, w in seen if c not in pushed_cards.get(key, set())]
+        if not only:
+            continue
+        crd["people_with_terminal_only_card"] += 1
+        if not pushed_cards.get(key):
+            crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
+        for where in {w for *_, w in only}:
+            crd[f"terminal_only_card_via_{where}"] += 1
+        details.append(DetailRow(
+            kind="member_terminal_only_card", device_id=None, pin=None, person=key,
+            name=names.get(key, ""),
+            fingers="",
+            link=",".join(sorted({w for *_, w in only})),
+            note="cards " + ";".join(f"{d}:{p}:card {c}" for d, p, c, _ in only)
+                 + ("; no card in MonClub" if not pushed_cards.get(key) else ""),
+        ))
+    report["cards"] = dict(sorted(crd.items()))
     if access is None and backend is None:
         report["notes"].append("no --access-db and no backend: members and finger coverage are not evaluated")
     if ownership is None and (access is not None or backend is not None):
@@ -847,6 +898,8 @@ def render(report: Dict[str, Any]) -> str:
                      f"{d['account_pins_on_someone_elses_user']} of them another person's user")
     lines.append("")
     lines.append(f"== people {report['people']}")
+    if "cards" in report:
+        lines.append(f"== cards {report['cards']}")
     for n in report.get("notes", []):
         lines.append(f"note: {n}")
     if "backend" in report:

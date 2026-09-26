@@ -545,3 +545,108 @@ class TestPinFormats:
         assert report["people"]["terminal_only_via_own_pin"] == 1
         row = next(d for d in details if d.kind == "member_terminal_only_finger")
         assert row.fingers == "8:0011:f5", "the detail keeps the pin as the terminal wrote it"
+
+
+# ------------------------------------------------------------------ gym 58: C3-400 panels, cards
+
+def _panel_export(path: Path, users) -> Path:
+    """The shape tools/c3_panel_scripts/export_c3_panel_readonly.ps1 writes: no finger slots."""
+    doc = {
+        "schema": cte.PANEL_EXPORT_SCHEMA, "complete": True, "takenAt": "2026-09-26T23:00:00",
+        "options": {"fingers": False, "includeTemplates": False}, "device": {"label": "device5"},
+        "counts": {"user": len(users)},
+        "users": [{"pin": p, "name": n, "card": c, "privilege": 0, "enabled": True, "hasPassword": False,
+                   "doors": "15", "fingerIds": []} for p, n, c in users],
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8-sig")
+    return path
+
+
+def _access_1_4_30_db(path: Path) -> None:
+    """A gym-58 PC runs Access <= 1.4.31, or 1.4.33 unregistered: no main_account_id, no
+    ownership bit, no device_push_intent table, no pin_scheme (git show access_1.4.30:app/core/db.py)."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sync_users (user_id INTEGER, active_membership_id INTEGER, membership_id INTEGER,"
+        " full_name TEXT, first_card_id TEXT, second_card_id TEXT, fingerprints_json TEXT);"
+        "CREATE TABLE device_sync_state (device_id INTEGER, pin TEXT, desired_hash TEXT, last_ok INTEGER,"
+        " last_error TEXT, updated_at TEXT);"
+        "CREATE TABLE sync_devices (id INTEGER, name TEXT);"
+    )
+    rows = [
+        (1, 101, "Card Kept", "4001", ""),        # panel has the same card: nothing to do
+        (2, 102, "Card Changed", "4002", ""),     # panel has another card under her own pin
+        (3, 103, "No Card In MonClub", "", ""),   # a card only on the panel, via an old-system pin
+        (4, 104, "Second Card Only", "4004", "5004"),  # the panel holds the second card: never pushed
+        (5, 105, "Too Long", "99999999999", ""),  # out of the 4-byte range: MonClub pushes no card
+    ]
+    for uid, am, name, c1, c2 in rows:
+        conn.execute("INSERT INTO sync_users (user_id, active_membership_id, full_name, first_card_id,"
+                     " second_card_id, fingerprints_json) VALUES (?,?,?,?,?,'[]')", (uid, am, name, c1, c2))
+    conn.execute("INSERT INTO device_sync_state VALUES (5, '101', 'h', 1, NULL, 'x')")
+    conn.commit()
+    conn.close()
+
+
+class TestPanelCards:
+    PANEL = [
+        ("101", "Card Kept", "0004001"),
+        ("102", "Card Changed", "7777"),
+        ("9003", "NO CARD IN MONCLUB", "3003"),   # old-system user, tied by name only: not counted
+        ("104", "Second Card Only", "5004"),
+        ("105", "Too Long", "99999999999"),
+        ("8000", "stranger", "8000"),             # leftover, no link
+    ]
+
+    def test_the_panel_export_loads_without_finger_slots(self, tmp_path):
+        ex = cte.load_export(str(_panel_export(tmp_path / "p5.json", self.PANEL)), 5)
+        assert ex.fingers_read is False and len(ex.users) == 6
+
+    def test_an_access_1_4_30_database_loads(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        acc = cte.load_access_db(str(db))
+        assert acc.ownership is None and acc.intents == {} and acc.pin_scheme == {}
+        assert acc.rows_without_account == 5
+        assert {r.membership_id: r.first_card for r in acc.rows} == {
+            101: "4001", 102: "4002", 103: "", 104: "4004", 105: ""}
+
+    def test_members_whose_panel_card_monclub_will_not_push(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        ex = _panel_export(tmp_path / "p5.json", self.PANEL)
+        report, details = cte.analyse([cte.load_export(str(ex), 5)], cte.load_access_db(str(db)))
+        assert report["devices"]["5"]["classes"] == {"leftover": 2, "member": 4}
+        cards = report["cards"]
+        # 102 (another card on the panel), 104 (its second card), 105 (a card MonClub cannot write)
+        assert cards["people_with_terminal_only_card"] == 3
+        assert cards["people_with_terminal_only_card_and_no_monclub_card"] == 1   # 105
+        assert cards["people_without_monclub_card"] == 2                           # 103, 105
+        assert cards["terminal_only_card_via_own_pin"] == 3
+        rows = {d.name: d for d in details if d.kind == "member_terminal_only_card"}
+        assert set(rows) == {"Card Changed", "Second Card Only", "Too Long"}
+        assert rows["Card Changed"].note == "cards 5:102:card 7777"
+        assert rows["Too Long"].note.endswith("no card in MonClub")
+
+    def test_a_leftover_holding_a_members_card_is_counted_for_that_member(self, tmp_path):
+        db = tmp_path / "access.db"
+        _access_1_4_30_db(db)
+        # an old-system user at pin 7002 holds Card Changed's MonClub card: not a loss;
+        # one at 7004 holds Second Card Only's SECOND card: a loss (never pushed)
+        ex = _panel_export(tmp_path / "p5.json", [("7002", "x", "4002"), ("7004", "y", "5004")])
+        report, details = cte.analyse([cte.load_export(str(ex), 5)], cte.load_access_db(str(db)))
+        assert report["cards"]["people_with_terminal_only_card"] == 1
+        assert report["cards"]["terminal_only_card_via_leftover_by_card"] == 1
+        (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
+        assert row.name == "Second Card Only"
+
+    def test_the_gym45_synthetic_gym_loses_no_card(self, gym):
+        """Beta's card is on a leftover (5000, '00777') and is Beta's MonClub first card."""
+        db, ex = gym
+        report, _ = cte.analyse([cte.load_export(str(ex), 8)], cte.load_access_db(str(db)))
+        assert "people_with_terminal_only_card" not in report["cards"]
+
+    def test_wire_card_is_what_the_push_writes(self):
+        from app.core.device_sync import _normalize_device_card
+        for raw in ("0004001", " 12 34 ", "99999+123", "4294967295", "4294967296", "", "0", None, "abc"):
+            assert cte.wire_card(raw) == cte.norm_card(_normalize_device_card(raw)), raw
