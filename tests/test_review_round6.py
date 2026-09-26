@@ -54,7 +54,12 @@ def test_r6_01_a_scan_from_the_sta_threads_last_pump_is_decided(db, monkeypatch)
     try:
         w = _link_worker(monkeypatch, drv)
         w._connected = True
-        w._connected_since_mono = time.monotonic() - 5000.0     # past the 30-min refresh
+        # A connection past its refresh age. Shorten the age rather than back-dating the
+        # connect by more than the 1800 s default: time.monotonic() counts from boot, so
+        # "now - 5000" is negative on a PC up < 5000 s, and the guard reads <= 0 as never
+        # connected. The clock is not patched: the real STA thread shares the time module.
+        w._settings["ultra_connection_refresh_sec"] = 1.0
+        w._connected_since_mono = max(time.monotonic() - 5.0, 1e-3)
         seen = []
         w._process_event = lambda e: seen.append(e)
         assert w._maybe_refresh_connection() is True
