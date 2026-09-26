@@ -205,7 +205,9 @@ def gated_handler(handler):
         except Exception:
             device_id = 0
         if device_id > 0 and not lease_gate.device_allowed(device_id):
-            if handler.__name__ == "_handle_device_door_open" and _door_request_via_driver(ctx, device_id):
+            if (handler.__name__ == "_handle_device_door_open"
+                    and not getattr(ctx, "in_process", False)
+                    and _door_request_via_driver(ctx, device_id)):
                 return
             ctx.send_json(409, {
                 "ok": False,

@@ -206,6 +206,15 @@ fn post_open_door(port: u16, device_id: i64, door_number: i64, pulse_seconds: i6
             // HTTP success alone is NOT proof the door opened.
             let ok = status.is_success()
                 && payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(status.is_success());
+            if payload.get("requested").and_then(|v| v.as_bool()).unwrap_or(false) {
+                // P3b-2: filed on the server for the driver PC; not proof the door opened.
+                eprintln!(
+                    "[tray-door] REQUESTED via the driver PC device={} door={} targetConnected={}",
+                    device_id, door_number,
+                    payload.get("targetConnected").and_then(|v| v.as_bool()).unwrap_or(false)
+                );
+                return false;
+            }
             if !ok {
                 let reason = payload
                     .get("error")
@@ -1228,7 +1237,22 @@ fn do_register_shortcuts(app: &AppHandle, shortcuts: Vec<FavoriteShortcutEntry>)
                         .json(&body)
                         .send()
                     {
-                        Ok(r) if r.status().is_success() => (true, None),
+                        Ok(r) if r.status().is_success() => {
+                            // P3b-2: another PC drives this turnstile -- the local API filed the
+                            // open on the server (202 "requested"). Not an opened door: never a
+                            // green flash (the driver's result is not visible here).
+                            let v = r.json::<serde_json::Value>().unwrap_or(serde_json::Value::Null);
+                            if v.get("requested").and_then(|x| x.as_bool()).unwrap_or(false) {
+                                let connected = v.get("targetConnected").and_then(|x| x.as_bool()).unwrap_or(false);
+                                (false, Some(if connected {
+                                    "demandé au PC pilote (résultat non visible ici)".to_string()
+                                } else {
+                                    "PC pilote non connecté : la demande expirera sans ouvrir".to_string()
+                                }))
+                            } else {
+                                (true, None)
+                            }
+                        }
                         Ok(r) => (false, Some(format!("HTTP {}", r.status()))),
                         Err(e) => (false, Some(e.to_string())),
                     };

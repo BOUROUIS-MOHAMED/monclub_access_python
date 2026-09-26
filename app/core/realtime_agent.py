@@ -756,8 +756,9 @@ class DeviceWorker(threading.Thread):
 
             if not _lease_gate.device_allowed(self.device_id):
                 # P3b-2 (review round 5): the lease (or the release this PC was finishing)
-                # ended -- stop polling and drop the session now, not at the next sync tick,
-                # so two PCs never hold a session on the panel (one lock-free snapshot read).
+                # ended -- stop polling and drop the session at this turn, not at the next sync
+                # tick (one lock-free snapshot read). Not a hard guarantee: a door open already
+                # decided may reconnect through the command bus until the worker is removed.
                 if self._device.is_connected:
                     try:
                         self._device.disconnect()

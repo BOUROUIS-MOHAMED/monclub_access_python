@@ -172,3 +172,17 @@ def test_round5_other_device_routes_still_answer_not_driver(monkeypatch):
     ctx = _DoorCtx(SimpleNamespace(_v2_runtime=_rt()), {"deviceId": 8})
     gated_handler(_handle_device_info)(ctx)
     assert ran == [] and ctx.sent[0] == 409
+
+
+def test_round6_a_remote_command_run_in_process_is_never_re_filed(monkeypatch):
+    """The lease is lost between the executor's own check and the gate: notDriver, no new request."""
+    from access.local_api_routes import gated_handler
+    from app.core.v2.handlers import LocalCtx
+    import app.api.local_access_api_v2 as la2
+    monkeypatch.setattr(la2, "_door_open_last", {})
+    _reader()
+    rt = _rt()
+    ran, h = _door_handler_ran()
+    ctx = LocalCtx(SimpleNamespace(_v2_runtime=rt), {"deviceId": 8}, {"doorNumber": 1, "pulseSeconds": 3})
+    gated_handler(h)(ctx)
+    assert ran == [] and rt.api.requests == [] and ctx.status == 409 and ctx.payload["notDriver"]

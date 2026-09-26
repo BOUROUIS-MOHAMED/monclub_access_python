@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { doorRequestedMessage } from "@/api/realtime";
 import {
   Activity,
   Bot,
@@ -320,15 +321,15 @@ export default function TrayPanelPage() {
     const actionKey = `preset:${device.id}:${preset.doorNumber}:${preset.pulseSeconds}`;
     setBusyKey(actionKey);
     try {
-      await post(`/devices/${device.id}/door/open`, {
+      const res: any = await post(`/devices/${device.id}/door/open`, {
         doorNumber: preset.doorNumber,
         pulseSeconds: preset.pulseSeconds,
       });
-      setNotice({
-        variant: "success",
-        title: "Door command sent",
-        message: `${device.name} - ${preset.doorName}`,
-      });
+      // P3b-2: another PC drives this turnstile -- filed for it, not opened here.
+      setNotice(res?.requested
+        ? { variant: res.targetConnected ? "info" : "destructive", title: "Demande au PC pilote",
+            message: `${device.name} - ${preset.doorName}: ${doorRequestedMessage(res)}` }
+        : { variant: "success", title: "Door command sent", message: `${device.name} - ${preset.doorName}` });
     } catch (openError) {
       setNotice({
         variant: "destructive",

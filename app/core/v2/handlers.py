@@ -22,6 +22,11 @@ _log = logging.getLogger("zkapp.v2.handlers")
 class LocalCtx:
     """The local API handler context, in process (no HTTP)."""
 
+    # A remote command runs here: the lease gate must answer notDriver, never file a new
+    # request on the server for it (review round 6 -- a lease lost between the handler's own
+    # check and the gate re-filed the DOOR_OPEN).
+    in_process = True
+
     def __init__(self, app: Any, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None):
         self.app = app
         self._params = dict(params or {})
