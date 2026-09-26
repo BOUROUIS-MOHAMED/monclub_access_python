@@ -381,6 +381,21 @@ cause is found (a truncated roster, a pin-scheme cutover that needs the manual w
 departure an operator must confirm). The push-history page shows it as `REVOKE_ABORTED=N (…)`.
 `[CODE: app/core/push_safety.py::check_bulk_removal]`
 
+**Is a removal waiting for a driver lease?** (P3b-2)
+
+```bash
+grep -F "[T] REMOVAL_DEFERRED" app-*.log
+grep -F "[T] REMOVAL_CONFIRMED" app-*.log
+```
+
+`REMOVAL_DEFERRED … reason=add_only` means this PC drives the turnstile under a new or forced lease and has
+not yet restored (or read back) the record of who MonClub put on it: removals wait, additions go on. It clears
+by itself once the PC is online. `reason=handover_release` means the turnstile is being handed to another PC.
+Neither is a `REVOKE_ABORTED` and neither offers "Confirm removal". `REMOVAL_CONFIRMED` is a removal above the
+ceiling the owner confirmed for exactly that list. The roles and the socket are on the « Pilote / Lecteur »
+page; `[V2]` log lines tell what the realtime layer did.
+`[CODE: app/core/push_safety.py, app/core/v2/]`
+
 ---
 
 ## 4b. Is the terminal full? Unusable templates? (P3a-2)

@@ -753,7 +753,10 @@ test_standalone_revoked_pin_removal.py]`
 Each *chunk* result additionally carries `failed_reasons`, `tpl_attempted`, `tpl_ok`
 and `chunk_ms` (added 2026-09-04). These are **telemetry only** — `push_roster` folds
 them into `ZKEM_PUSH_CHUNK` / `ZKEM_PUSH_FAILED_PINS` and **nothing decides on them**.
-They are not present on the aggregate `push_roster` return. `[CODE]`
+Since P3b-2 the aggregate return also carries `failed_reasons` (`{pin: reason}` for every pin of
+`failed_pins`, `chunk_wedged_or_unconfirmed` when no chunk named a reason); the engine reads only the
+`template_version_mismatch_f<N>` ones, for the turnstile problem report (guide §3.9). `tpl_attempted`,
+`tpl_ok` and `chunk_ms` stay chunk-only. `[CODE]`
 `[TEST: tests/test_fingerprint_telemetry.py::TestPushFailedPinsTelemetry]`
 
 - **`failed_pins`** (added 2026-08-31) — every pin **not confirmed** on the terminal:
