@@ -146,6 +146,7 @@ class CommandExecutor(threading.Thread):
         self._queued: set = set()
         self._running: Dict[str, CommandRun] = {}
         self._started_here: set = set()
+        self._tokens: Dict[str, str] = {}       # cid -> the claim token first chosen in this process
         self._retry_at: Dict[str, tuple] = {}   # cid -> (due monotonic, attempts): transient claim failures      # ids this process started: never "interrupted"
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -254,7 +255,12 @@ class CommandExecutor(threading.Thread):
                 return
             token = row["claim_token"]
         else:
-            token = self._token_factory()
+            # One token per command for this process's life: an insert_seen that timed out
+            # (DbWriter stall > 60 s) still commits later, so a retry must claim with the SAME
+            # token or the result would be refused (review round 4).
+            if cid not in self._tokens:
+                self._tokens[cid] = self._token_factory()
+            token = self._tokens[cid]
             self._journal.insert_seen(cid, "", token)
         sent = self._mono()
         try:

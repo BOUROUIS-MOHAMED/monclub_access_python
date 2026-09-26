@@ -520,3 +520,27 @@ def test_round3_a_transient_claim_failure_is_retried(db, monkeypatch):
     while api.stored is None and time.time() < deadline:
         time.sleep(0.05)
     assert api.claims == 2 and opened == [1] and api.stored == ("SUCCEEDED", "OPENED")
+
+
+def test_round4_a_retry_after_a_seen_write_timeout_reuses_the_token(db):
+    tokens = iter(["tok-" + c * 20 for c in "cdef"])
+    seen = []
+
+    class TimeoutJournal(Journal):
+        fail = True
+
+        def insert_seen(self, cid, ctype, token):
+            seen.append(token)
+            if TimeoutJournal.fail:
+                TimeoutJournal.fail = False
+                raise TimeoutError("db writer stalled")   # the job would still commit later
+            return super().insert_seen(cid, ctype, token)
+    ex = CommandExecutor(api=_CmdApi(), handlers={}, journal=TimeoutJournal(),
+                         token_factory=lambda: next(tokens))
+    with pytest.raises(TimeoutError):
+        ex.process(CID)
+    try:
+        ex.process(CID)
+    except Exception:
+        pass
+    assert len(seen) == 2 and seen[0] == seen[1]
