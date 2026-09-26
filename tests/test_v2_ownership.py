@@ -265,3 +265,25 @@ def test_the_tick_restores_a_new_lease_before_anything_else(db, monkeypatch):
     assert rt.leases.restored == {8: 3} and api.readbacks == [], "restore first, read-back on a later tick"
     sync.tick(rt)
     assert api.readbacks == [(8, 3)]
+
+
+def test_restored_rows_keep_the_servers_time_and_are_not_re_uploaded(db, monkeypatch):
+    """Peer review 2026-09-26: a restore used to re-date every adopted row to the handover and
+    the next tick re-uploaded them all under the new PC -- the server's observedAt and writer lost."""
+    api = FakeApi()
+    api.pages = {0: [{"id": 1, "pin": "201", "state": "APPLIED", "pushedHash": "h201", "pushedFingerIds": "2,0",
+                      "observedAt": "2026-09-20T09:30:00"},
+                     {"id": 2, "pin": "202", "state": "APPLIED", "pushedHash": "h202", "pushedFingerIds": "",
+                      "observedAt": "2026-09-21T11:00:00.250"}]}
+    rt = _rt(api)
+    rt.clock.set_utc_offset(3600)                 # Tunis
+    sync = own.OwnershipSync(rt)
+    monkeypatch.setattr(sync, "_device_scheme", lambda did: "MEMBERSHIP")
+    assert sync.restore(8, 3) == 2
+    assert sync.upload(8) == {"rows": 0}, "unchanged adopted rows are never re-sent"
+    sync.upload(8, final=True)
+    final = {r["pin"]: r["observedAt"] for r in api.uploads[-1]["rows"]}
+    assert final["201"].startswith("2026-09-20T08:30:00") and final["202"].startswith("2026-09-21T10:00:00.25")
+    _state(db, 8, "201", owned=True, h="h201-new", updated=time.strftime("%Y-%m-%d %H:%M:%S"))
+    sync.upload(8)
+    assert [r["pin"] for r in api.uploads[-1]["rows"]] == ["201"], "a real change still goes up"

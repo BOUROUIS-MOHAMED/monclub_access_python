@@ -303,8 +303,9 @@ class OwnershipSync:
                 # it would claim pins of the other numbering. Retried once the schemes agree.
                 raise V2ApiError(409, "PIN_SCHEME_MISMATCH", "restore: pin scheme differs", backend=False)
             rows = [r for r in page.get("rows") or [] if isinstance(r, dict) and r.get("state") == "APPLIED"]
+            scheme, generation = str(page.get("pinScheme") or ""), int(page.get("generation") or 0)
             if rows:
-                def op(conn, _p, rows=rows):
+                def op(conn, _p, rows=rows, scheme=scheme, generation=generation):
                     n = 0
                     stamp = now_iso()
                     for r in rows:
@@ -324,6 +325,17 @@ class OwnershipSync:
                             "pushed_finger_ids = excluded.pushed_finger_ids, finger_slots_swept = 1, "
                             "updated_at = excluded.updated_at",
                             (did, pin, r.get("pushedHash"), stamp, r.get("pushedFingerIds")))
+                        # The server's fact as already uploaded, at ITS time: an unchanged adopted
+                        # row is then never re-sent (the server keeps its writer and observedAt,
+                        # instead of every member reading "since the handover"), and a final
+                        # upload re-sends it with that time (peer review, 2026-09-26).
+                        at = timefmt.to_epoch(r.get("observedAt"), default_offset_sec=self.rt.clock.utc_offset)                             if getattr(self.rt, "clock", None) is not None else None
+                        if at is not None and scheme and generation:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO v2_ownership_uploaded (device_id, pin_scheme, generation, pin, "
+                                "state, pushed_hash, pushed_finger_ids, observed_at) VALUES (?, ?, ?, ?, 'APPLIED', ?, ?, ?)",
+                                (did, scheme, generation, pin, r.get("pushedHash"),
+                                 _canon_fingers(r.get("pushedFingerIds")), at))
                         n += 1
                     return n
                 adopted += int(_run_db_write_sync("v2_ownership_restore", op) or 0)

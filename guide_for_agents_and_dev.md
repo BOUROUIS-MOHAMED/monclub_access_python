@@ -2995,8 +2995,11 @@ run. `[CODE]` `[TEST: test_v2_add_only.py]`
 Restore (`ownership.py::OwnershipSync.restore`): every page of the current generation; an `APPLIED` row this PC
 has no confirmed state for becomes `device_sync_state(ownership_confirmed=1, desired_hash=pushedHash, last_ok=1,
 pushed_finger_ids=pushedFingerIds, finger_slots_swept=1)` — the engine's own hash comparison then skips a member
-already in sync (no whole-roster re-push after a handover) and pushes one that is not; local proof is never
-lowered; `REMOVED`/absent rows prove nothing (the server's ~10-minute clock-ordering window, P2c-2 report).
+already in sync (no whole-roster re-push after a handover) and pushes one that is not; the adopted row is also
+recorded as already uploaded (`v2_ownership_uploaded`, the server's state, hash, fingers and `observedAt`), so
+it is never re-sent unchanged and a final upload re-sends it at the server's own time — the server keeps each
+member's original writer and "since" time instead of the handover's (peer review 2026-09-26); local proof is
+never lowered; `REMOVED`/absent rows prove nothing (the server's ~10-minute clock-ordering window, P2c-2 report).
 Read-back (a forced lease, once restored): one listing through the worker, then `POST …/assignment/read-back` —
 the only way the flag clears. Release: writes frozen at once, the door kept; once no pass is writing the
 turnstile — the ULTRA worker's full sync and its private DeviceSync engine, the ULTRA scheduler's PullSDK
@@ -3121,6 +3124,13 @@ the PC at 85–96 % memory load. `[TEST: measurement, not pass/fail]`
 | Scan → decision on the real `UltraDeviceWorker.run()` loop over the fake MB2000, 150 scans × 3 runs | median 230.1–232.4 ms, p95 541.8–546.8 ms, 0 lost (6 runs) | median 231.0–233.2 ms, p95 542.5–546.4 ms, 0 lost | median 231.4–232.4 ms, p95 531.9–544.6 ms, 0 lost |
 | Desk door open (`request_door_open`) round trip, 150 × 3 | median 0.49–0.76 ms, max ≤ 4.5 ms | median 0.47–0.90 ms, max ≤ 4.1 ms | median 0.56–0.81 ms, max ≤ 4.7 ms |
 | `create_access_app()` (MainApp `__init__`), warm data root, network blocked | 480–505 ms (3 runs) | 488–701 ms (3 runs; the 701 ms run also took 215 ms to import — disk noise) | — |
+
+Re-measured on the final branch (after the seven review rounds), same harnesses and interpreter, base and
+branch interleaved, 3 runs each: scan → decision base median 230.7–232.2 ms (p95 543.5–544.1), branch no
+leases 230.2–230.9 ms (p95 542.0–545.2), branch DRIVER 230.4–231.3 ms (p95 541.5–543.6), 0 lost in every run;
+desk door open median 0.47–0.72 ms on all three; `create_access_app()` base 545–636 ms, branch 558–709 ms
+(overlapping ranges; branch middle run 590 vs base 565 ms). The AGENT worker's per-turn lease read (review
+round 5) is not on these harnesses: unmeasured. `[TEST: measurement, not pass/fail]`
 
 The v2 runtime starts 12 s after launch (after the PC identity); offline and unregistered it reads
 `availability=UNKNOWN`, `mode=ALL`, reason `NO_PC_TOKEN`, and changes nothing. `[TEST: same harness]`
@@ -3500,7 +3510,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2875 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 6; `cargo check` of `tauri-ui/src-tauri` clean; before that 2874, 2873; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2876 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 final, after review round 7 and the restore-dating fix; after round 6, 2875; `cargo check` of `tauri-ui/src-tauri` clean; before that 2874, 2873; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`
