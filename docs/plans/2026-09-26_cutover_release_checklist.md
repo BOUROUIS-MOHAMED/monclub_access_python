@@ -29,7 +29,7 @@ covers the eight commits (not the round-2 tools, which are on `claude/cutover-ru
 
 | ✓ | Check | Expected |
 |---|---|---|
-| ☐ | `python -m pytest tests/ -q --ignore=tests/_pydeps` (with `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder) | 0 failed (2656 passed on `master` `dbf865f`, 2026-09-26; guide §9) |
+| ☐ | `python -m pytest tests/ -q --ignore=tests/_pydeps` (with `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder) | 0 failed (2656 passed on `master` `dbf865f`, 2672 on `claude/cutover-runbook-round2`, 2026-09-26; guide §9) |
 | ☐ | `python tools/check_sql_arity.py` | PASS |
 | ☐ | The installer is built after the owner's own installer / watchdog edits are committed -- never over them | the owner says so |
 | ☐ | The version in the installer, `update.json` and the Tauri files is `X.Y.Z` (`packaging/sync_tauri_version_files.py`, `tests/test_tauri_version_sync.py`) | the three agree |
