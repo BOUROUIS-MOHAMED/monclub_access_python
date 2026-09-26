@@ -894,6 +894,89 @@ def _refresh_member_person_links_sql(cur: Any) -> None:
 _HELD_EXTRA_COLUMNS: tuple[str, ...] = ("held_reason", "held_for_date", "held_at")
 
 
+def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
+    """The P3b-2 tables (driver leases, remote commands, ownership backup, loss re-add). Called
+    inside init_db's single transaction; every statement is CREATE ... IF NOT EXISTS, so an
+    upgrade adds empty tables and changes no existing row.
+
+    * v2_kv -- small JSON state: the cached assignment (offline cold starts), the server clock
+      offset, the per-turnstile restore/read-back record.
+    * v2_command_journal -- one row per remote command this PC saw; ``state`` is written
+      durably BEFORE the command acts, so a restart never runs a command twice.
+    * v2_ownership_uploaded -- what this PC last told the server per (turnstile, scheme,
+      ownership generation, pin), so only changes are uploaded.
+    * v2_removal_log -- pins MonClub REMOVED from a turnstile (written in the removal's own
+      transaction): the only source of an uploaded ``REMOVED`` fact.
+    * v2_readd -- owned pins found missing from a trusted read-back, waiting to be pushed again.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_kv (
+            key         TEXT PRIMARY KEY,
+            value_json  TEXT NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_command_journal (
+            id              TEXT PRIMARY KEY,
+            type            TEXT NOT NULL DEFAULT '',
+            claim_token     TEXT NOT NULL,
+            state           TEXT NOT NULL,
+            gym_device_id   INTEGER,
+            payload_json    TEXT,
+            finish_by       TEXT,
+            started_at      REAL,
+            outcome         TEXT,
+            result_code     TEXT,
+            result_json     TEXT,
+            reported        INTEGER NOT NULL DEFAULT 0,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_ownership_uploaded (
+            device_id          INTEGER NOT NULL,
+            pin_scheme         TEXT NOT NULL,
+            generation         INTEGER NOT NULL,
+            pin                TEXT NOT NULL,
+            state              TEXT NOT NULL,
+            pushed_hash        TEXT,
+            pushed_finger_ids  TEXT,
+            observed_at        REAL NOT NULL,
+            PRIMARY KEY (device_id, pin_scheme, generation, pin)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_removal_log (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            removed_at     REAL NOT NULL,
+            corrected      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_readd (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            found_at       REAL NOT NULL,
+            attempts       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+
+
 def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     """The P3b-1 tables. Called inside init_db's single transaction, after sync_users exists.
 
@@ -3246,6 +3329,7 @@ def init_db() -> None:
         )
 
         _create_protocol2_tables(conn)
+        _create_v2_realtime_tables(conn)
 
         conn.commit()
 
