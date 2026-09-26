@@ -107,16 +107,21 @@ def test_db_writer_serializes_concurrent_write_jobs(db):
         order.append("second")
         return "second"
 
-    results: list[str] = []
+    # `order` is appended only on the DbWriter thread, so it is the serialisation proof.
+    # The two caller threads return from _run_db_write_sync back to back once `release`
+    # is set, and nothing orders what they do after that -- so results are keyed by job,
+    # which also checks that each caller got its own job's return value.
+    results: dict[str, str] = {}
 
-    first_thread = threading.Thread(
-        target=lambda: results.append(db._run_db_write_sync("first-job", first_job)),
-        daemon=True,
-    )
-    second_thread = threading.Thread(
-        target=lambda: (started.wait(timeout=1.0), results.append(db._run_db_write_sync("second-job", second_job))),
-        daemon=True,
-    )
+    def run_first():
+        results["first"] = db._run_db_write_sync("first-job", first_job)
+
+    def run_second():
+        started.wait(timeout=1.0)
+        results["second"] = db._run_db_write_sync("second-job", second_job)
+
+    first_thread = threading.Thread(target=run_first, daemon=True)
+    second_thread = threading.Thread(target=run_second, daemon=True)
 
     first_thread.start()
     second_thread.start()
@@ -129,7 +134,7 @@ def test_db_writer_serializes_concurrent_write_jobs(db):
     second_thread.join(timeout=1.0)
 
     assert order == ["first-start", "first-end", "second"]
-    assert results == ["first", "second"]
+    assert results == {"first": "first", "second": "second"}
 
 
 def test_load_sync_cache_db_builds_after_snapshot_fetch_connection_closes(monkeypatch):
