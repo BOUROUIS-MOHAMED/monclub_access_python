@@ -37,6 +37,7 @@ SEEN, STARTED, DONE = "SEEN", "STARTED", "DONE"
 REPORT_GIVE_UP_SEC = 3600.0
 # Minimum time left (s) for a command to start: a door must open within the window, an
 # enrolment needs time for three finger presses.
+CLAIM_RETRY_MAX = 6
 START_MARGIN_SEC = {"DOOR_OPEN": 10.0, "CARD_SCAN": 5.0, "ENROLL_START": 30.0}
 # DOOR_OPEN, 10 s (review R6): the desk handler it reuses can take the ULTRA queue's 2 s + 5 s,
 # or the AGENT bus's 4 s followed by a direct PullSDK connect and pulse; with 10 s left the open
@@ -144,7 +145,8 @@ class CommandExecutor(threading.Thread):
         self._q: "queue.Queue[str]" = queue.Queue()
         self._queued: set = set()
         self._running: Dict[str, CommandRun] = {}
-        self._started_here: set = set()      # ids this process started: never "interrupted"
+        self._started_here: set = set()
+        self._retry_at: Dict[str, tuple] = {}   # cid -> (due monotonic, attempts): transient claim failures      # ids this process started: never "interrupted"
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._last_report_sweep = 0.0
@@ -187,7 +189,7 @@ class CommandExecutor(threading.Thread):
         self._recover_interrupted()
         while not self._stop_event.is_set():
             try:
-                cid = self._q.get(timeout=5.0)
+                cid = self._q.get(timeout=1.0 if self._retry_at else 5.0)
             except queue.Empty:
                 cid = None
             if cid:
@@ -195,12 +197,34 @@ class CommandExecutor(threading.Thread):
                     self._queued.discard(cid)
                 try:
                     self.process(cid)
+                    self._retry_at.pop(cid, None)
                 except Exception as exc:
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     _log.warning("[V2] command %s failed to process: %s", cid, self.last_error)
+                    self._schedule_retry(cid)
+            self._offer_due_retries()
             if self._mono() - self._last_report_sweep > 30.0:
                 self._last_report_sweep = self._mono()
                 self._report_sweep()
+
+    def _schedule_retry(self, cid: str) -> None:
+        """A claim that failed for a transient reason (timeout, proxy 5xx, local 429 backoff) is
+        tried again: the server notifies a command once, so while the socket stays up nothing
+        else would re-offer it (review round 3). 2, 4, 8, 16, 30, 30 s -- then the pending poll
+        (after a reconnect, or every pollIntervalSec while the socket is down) is the backstop.
+        A re-claim reuses the journal's claim token, so it is idempotent on the server."""
+        due, attempts = self._retry_at.get(cid, (0.0, 0))
+        if attempts >= CLAIM_RETRY_MAX:
+            self._retry_at.pop(cid, None)
+            return
+        self._retry_at[cid] = (self._mono() + min(30.0, 2.0 * (2 ** attempts)), attempts + 1)
+
+    def _offer_due_retries(self) -> None:
+        now = self._mono()
+        for cid, (due, _n) in list(self._retry_at.items()):
+            if due <= now:
+                self._retry_at[cid] = (float("inf"), _n)      # until process() settles it
+                self.offer(cid)
 
     def _recover_interrupted(self) -> None:
         """A row STARTED without an outcome belongs to a process that died mid-command."""

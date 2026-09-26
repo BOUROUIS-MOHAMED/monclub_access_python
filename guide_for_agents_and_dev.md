@@ -3006,8 +3006,10 @@ turnstiles this PC drives (restored) — and, in a gym with leases, for every ot
 AND uploaded before (a lease lost without a release): under the scheme and generation of its own last upload,
 since the server's `GET /ownership` answers only the lease holder (409 `NOT_DEVICE_DRIVER`) while the upload
 POST is open to any ACTIVE PC; local record only, no wipe report, no device connection, the server keeps the
-newer fact per pin; a refusal (e.g. `STALE_OWNERSHIP_GENERATION`) is not retried until a restart or until this
-PC drives it again (`_lost_with_facts`, reviews R7 and round 2). Residual `[CODE]`: pins a PC pushed only
+newer fact per pin; a `STALE_OWNERSHIP_GENERATION` whose `details.pinScheme` is still ours is re-posted once
+under `details.currentGeneration` (this PC's own wipe report bumped it, and the server refuses facts older
+than the wipe); `CLOCK_SKEW`, 429 and network errors are retried; any other refusal is not retried until a
+restart or until this PC drives it again (`_lost_with_facts`, reviews R7 and round 2). Residual `[CODE]`: pins a PC pushed only
 before its gym used leases, on a turnstile it never uploaded for, are never uploaded (no generation to post
 under) — the new driver's restore does not see them — pages of 1,000; `observedAt` = the row's `updated_at` (PC local) +
 offset, strictly newer than this PC's last upload of that pin when the state changed. A PullSDK table clear
@@ -3023,7 +3025,10 @@ journaled before it leaves the running set (a duplicate offer in between once re
 INTERRUPTED, review R1); the deadline is the claim answer's `finishBy − serverTime` (both the server's
 local clock) from the answer's arrival; below a per-type margin (door 10 s — the desk handler it reuses may
 wait 2 s + 5 s on the ULTRA queue, or 4 s on the AGENT bus and then connect; card 5 s, enrolment 30 s) the
-command is not started (`FAILED EXPIRED`); the result is re-posted until acknowledged (≤ 1 h). Handlers run on
+command is not started (`FAILED EXPIRED`); the result is re-posted until acknowledged (≤ 1 h). A claim that fails for a transient reason (timeout, 5xx,
+the local 429 backoff) is tried again after 2, 4, 8, 16, 30, 30 s with the same token — the server notifies a
+command once, so with the socket up nothing else would re-offer it (review round 3); after that the pending
+poll is the backstop. Handlers run on
 their own thread. `handlers.py` reuses the desk's code: DOOR_OPEN → the lease-gated `_handle_device_door_open`
 (so §3.1a's claim and deadline apply; `SENT_NO_ANSWER` when the driver answered "sent, no answer"); CARD_SCAN →
 `_handle_scan_quick`; ENROLL_START → `_handle_enroll_start` with the payload as its body (outcome from
@@ -3476,7 +3481,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2861 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 2; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2864 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 3; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`

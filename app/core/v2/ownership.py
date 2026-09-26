@@ -508,10 +508,25 @@ class OwnershipSync:
                     # to send (guide §3.9 residual).
                     self._lost_done.add(did)
                     continue
-                self.last[f"upload:{did}"] = self.upload(did, known_meta=known)
+                try:
+                    self.last[f"upload:{did}"] = self.upload(did, known_meta=known)
+                except V2ApiError as exc:
+                    cur = (exc.details or {}).get("currentGeneration") if isinstance(exc.details, dict) else None
+                    if not (exc.backend and exc.code == "STALE_OWNERSHIP_GENERATION"
+                            and isinstance(cur, int) and cur > known["generation"]
+                            and exc.details.get("pinScheme") == known["pinScheme"]):
+                        raise
+                    # A generation bumped after this PC's last upload -- its own wipe report
+                    # (DEVICE_WIPED; the refusal's pinScheme must still be ours): the server refuses any
+                    # fact older than the wipe, so posting under the current one cannot plant a
+                    # stale fact (review round 3).
+                    self.last[f"upload:{did}"] = self.upload(
+                        did, known_meta={"pinScheme": known["pinScheme"], "generation": cur})
             except V2ApiError as exc:
                 self.last[f"upload:{did}"] = {"error": exc.code}
-                if exc.backend and exc.status in (403, 404, 409, 400):
+                if exc.code == "CLOCK_SKEW" or not exc.backend or exc.status >= 429:
+                    self._next_upload[did] = now + RETRY_SEC          # transient
+                elif exc.status in (403, 404, 409, 400):
                     # STALE_OWNERSHIP_GENERATION, PIN_SCHEME_MISMATCH, a refusal: never retried
                     # every minute; tried again after a restart or once this PC drives it.
                     self._lost_done.add(did)

@@ -450,3 +450,73 @@ def test_r9_nothing_is_reported_before_the_removal_step_ran(signal):
     assert _report() == []
     pr.registry.removal_allowed(8, "standalone_revoke")     # the step ran: now it is reported
     assert len(_report()) == 1
+
+
+# ---------------------------------------------------------------------------------- round 3
+def test_round3_lost_turnstile_follows_its_own_wipe_generation(db):
+    _state_row(8, "1001")
+    _uploaded_row(8, "0999", generation=1)          # last upload under 1; the wipe bumped it to 2
+    lg.install(lg.snapshot_from_assignment({"gymUsesAssignments": True, "role": "READER",
+                                            "drive": [], "release": []}, source="server"))
+    api = _UpApi(driven=())
+    real = api.ownership_upload
+
+    def upload(body):
+        if body["generation"] != 2:
+            raise V2ApiError(409, "STALE_OWNERSHIP_GENERATION", "", backend=True,
+                             details={"gymDeviceId": 8, "currentGeneration": 2, "pinScheme": "MEMBERSHIP"})
+        return real(body)
+    api.ownership_upload = upload
+    sync = ownership.OwnershipSync(_own_rt(api))
+    sync.tick(None)
+    assert any(u[:2] == (8, 2) and "1001" in u[2] for u in api.uploads)
+    assert 8 not in sync._lost_done
+    assert api.gets == []
+
+
+def test_round3_clock_skew_is_retried_not_parked(db):
+    _state_row(8, "1001")
+    _uploaded_row(8, "0999", generation=1)
+    lg.install(lg.snapshot_from_assignment({"gymUsesAssignments": True, "role": "READER",
+                                            "drive": [], "release": []}, source="server"))
+    api = _UpApi(driven=(), upload_error=V2ApiError(409, "CLOCK_SKEW", "", backend=True))
+    sync = ownership.OwnershipSync(_own_rt(api))
+    sync.tick(None)
+    assert 8 not in sync._lost_done and sync._next_upload[8] > 0
+
+
+def test_round3_a_transient_claim_failure_is_retried(db, monkeypatch):
+    import app.core.v2.commands as cmds
+
+    class FlakyApi(_CmdApi):
+        def __init__(self):
+            super().__init__()
+            self.claims = 0
+
+        def claim(self, cid, token):
+            self.claims += 1
+            if self.claims == 1:
+                raise V2ApiError(0, "UNREACHABLE", "timeout")
+            return super().claim(cid, token)
+    api = FlakyApi()
+    opened = []
+    ex = CommandExecutor(api=api, handlers={"DOOR_OPEN": lambda run: (opened.append(1) or ("SUCCEEDED", "OPENED", None))},
+                         journal=Journal(), token_factory=lambda: "tok-" + "b" * 20)
+    clock = [1000.0]
+    monkeypatch.setattr(ex, "_mono", lambda: clock[0])
+    monkeypatch.setattr(cmds.timefmt, "local_seconds_between", lambda a, b: 20.0)
+    ex.offer(CID)
+    cid = ex._q.get_nowait(); ex._queued.discard(cid)
+    with pytest.raises(V2ApiError):
+        ex.process(cid)
+    ex._schedule_retry(cid)
+    ex._offer_due_retries()
+    assert ex._q.empty()                            # not due yet
+    clock[0] += 2.5
+    ex._offer_due_retries()
+    cid = ex._q.get_nowait(); ex._queued.discard(cid)
+    ex.process(cid)
+    deadline = time.time() + 3
+    while api.stored is None and time.time() < deadline:
+        time.sleep(0.05)
+    assert api.claims == 2 and opened == [1] and api.stored == ("SUCCEEDED", "OPENED")
