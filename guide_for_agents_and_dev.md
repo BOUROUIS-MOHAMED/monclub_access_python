@@ -42,6 +42,7 @@ This file is only useful while it is true. If you change any of the following, y
 | A `[T]` telemetry event name, or the fields it carries | §10 Telemetry events |
 | How door-history upload verdicts are persisted, the unresolved retry bound, or its expiry (`device_attendance.py::_sync_pending_history`, `db.py::mark_access_history_unresolved`, `db.py::expire_unresolved_access_history`, `db.py::prune_access_history`) | §3.5 Door-history upload |
 | The sync timer — healthy interval, failure-retry schedule, `Retry-After`, the mid-sync re-run, the offline DEVICE-reconcile gate (`app.py::reschedule_sync_timer`, `::_ensure_sync_timer`, `::_sync_base_interval_sec`, `::_on_sync_work_finished`, `::_offline_device_reconcile_due`, `::_defer_ultra_reconnects`, `::request_sync_now`, `::_sync_tick`; `app/core/sync_retry.py`; the startup arming in `access/runtime.py`; the pending-context write in `change_detector.py::_poll_once`) — the v2 safety sync and what it switches off (`app/core/sync_cadence.py`, `app.py::_v2_safety_sync`, `::_tighten_sync_timer`, `::_safety_tick_device_reconcile_due`, `::change_detection_gated`, `::_daily_sync_gated`, `::_daily_sync_check`, `change_detector.py::_poll_once`'s gate, `v2/runtime.py::_post_cadence_check`) — or the headless loop's pacing (`app.py::mainloop`, `::after`) | §3.6 The sync timer and the headless loop |
+| The missing-member check — what it compares, when it asks a refresh or a probe, its suppression (`app.py::_check_missing_members`, `::_missing_member_action`, `::_request_member_refresh`; `sync_scope.py::member_id_set_digest`, `::token_id_set_digest`, the `forceMemberRefresh` / `probeMemberSet` hints in `::apply_trigger_hint_to_version_tokens`; `db.py::list_local_member_ids`, `::list_member_window_ids`) | §3.6 "The missing-member check" |
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
@@ -2740,6 +2741,50 @@ whose socket drops goes from ~45 s change detection to ≤ 120 s, not to 30 min.
   GymAccessController.reportGymAccessDailySync]` `[TEST: test_v2_safety_sync.py — the daily-job tests]`
 - An old server, a switch off, a PC not yet `ON` (power-on) or offline from start: both run as before.
 
+**The missing-member check (lane B, 2026-09-26).** A member the server lists and this PC lacks now asks an
+immediate full member refresh. Before, the only detector was the member-cache self-heal
+(`sync_scope.member_cache_is_stale`, kept): it fires below 50 % of the token's member count, so a PC missing a
+handful — a row lost to a stale fast-patch delete (the 2026-09-06 shape), an entrant the server counts as
+delivered but never sent (the collision `GymAccessController`'s javadoc describes) — stayed so until an
+unrelated change moved the token: a delta's `validMemberIds` never re-sends a member, and nothing compared
+them with the PC's rows. `[TEST: scratch probe on aeeef69 — after a delta naming member 7 the next request
+still carried both member tokens and 7 stayed missing]` Now, after each successful sync (after the save, its
+date flip and the tokens), `MainApp._check_missing_members` compares the server's set with the PC's —
+`sync_users` + `sync_users_held` (`db.list_local_member_ids`: a held member is still in the server's list):
+- **a members section applied with a valid authority** → its validated ids
+  (`save_sync_cache_delta`'s `authoritative_member_ids`: a delta's `validMemberIds`, a full answer's
+  `users[]`). A gap after a FULL section is a row this PC could not store: another full refresh cannot fix
+  it, so it is reported once and remembered (`_missing_member_action`, in memory) — never refreshed for again
+  while it stays missing; a member that arrives or leaves the server's list is forgotten. A refused section
+  (H-006, a malformed authority) is skipped: its refusal already drops the member tokens (§3.4).
+- **no members section, protocol-2 windows trusted** → `member_access_window` (`db.list_member_window_ids`):
+  the server's set of the day, replaced whole by every members section; a fast patch drops its membership's
+  window (`_forget_protocol2_membership`) and a hold keeps the row in `sync_users_held`, so neither reads as
+  missing; a promoted starter is an extra row, never missing.
+- **no members section, not trusted, a P1a token** → the token's last component, the id-set digest
+  (`sync_scope.token_id_set_digest`: 16 lowercase hex characters after the LAST colon — the timestamps hold
+  colons), against the digest of the local set (`member_id_set_digest`: ids sorted numerically, distinct,
+  joined by `,`, SHA-256, first 8 bytes hex — pinned against vectors the backend's own Java produced). A
+  digest cannot tell a missing member from an extra row, so a mismatch asks ONE delta answer per token value
+  (`probeMemberSet`: `membersVersion` dropped, `membersUpdatedAfter` kept — the backend then serves a delta
+  whose `validMemberIds` is exactly the list its digest hashes `[CODE: backend main GymAccessController,
+  read not run]`), and the first rule decides on it.
+A missing member → `request_sync_now(trigger_source="MISSING_MEMBERS", trigger_hint={forceMemberRefresh})`,
+posted to the loop; `sync_scope.apply_trigger_hint_to_version_tokens` drops both member tokens for it, so the
+next `getSyncData` serves the full list. `[T] MEMBERS_MISSING source action count sample`. `[CODE]`
+**Removal safety.** The check only reads: it deletes no row and names no revocation. The refresh it asks for is
+the ordinary full member refresh (hard reset and the self-heal use the same one), with its H-006 empty-roster
+refusal, its per-row diff and the previous-day guards of §3.8; the probe is an ordinary delta. What either
+removes, the next member change would have removed through the same authority — only sooner. It is
+automatic, so in manual sync mode the refreshed members reach the turnstiles with the admin's next "Sync data",
+as every automatic sync. `[TEST: test_missing_member_check.py — the digest vectors, the token parsing, both
+hints, the decision and its suppression, and on the §3.6 harness with a real temp database: a delta naming a
+member the PC lacks, a held member, a matching and a disagreeing digest, the probe once per token, the
+protocol-2 windows, a promoted starter and a held member after a midnight flip (nothing asked, nothing moved),
+and that the check deletes nothing]` Cost: one indexed union read of two local tables per sync, plus the
+window read or a SHA-256 over the id list (~1,860 ids) when no members section came; on the server, only the
+refresh or probe a mismatch asks.
+
 **Date flips (P3b-1).** `work()` runs the date precheck before the fetch and a date flip after
 each save; a separate 60 s timer (`_date_flip_tick`) and a 00:00:05 one-shot run the same check
 on their own. None of them touches `_sync_after_id` or the retry schedule, and a flip never
@@ -4016,6 +4061,7 @@ test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identi
 | `REMOVAL_DEFERRED` (warn) | `push_safety.py::check_bulk_removal`, `ultra_engine.py::_run_standalone_member_revoke` | `worker device_id protocol path count reason member_id` — a removal refused because the turnstile is add-only (`reason=add_only`) or being handed over (`handover_release`); retryable, state kept, NOT a `REVOKE_ABORTED` (§3.9) |
 | `REMOVAL_CONFIRMED` (warn) | `push_safety.py::check_bulk_removal` | `worker device_id protocol path count roster ceiling` — an above-ceiling step let through once by a Confirm-removal approval for exactly that pin set (§3.2g) |
 | `MIRROR_SKIP_REMOVALS_DEFERRED` | `ultra_engine.py::_maybe_mirror_reconcile` | `worker` — MIRROR skipped on an add-only / handed-over turnstile |
+| `MEMBERS_MISSING` (warn) | `app.py::_report_missing_members` | `source action count sample` — members the server lists and this PC lacks (§3.6 "The missing-member check", lane B 2026-09-26). `source` ∈ `delta`, `full`, `windows`, `digest`; `action` ∈ `full_refresh` (a full member refresh asked), `probe` (a digest mismatch: one delta answer asked; `count`/`sample` empty), `suppressed` (a full answer's rows this PC could not store — reported once, never refreshed again); `sample` = up to 20 membership ids |
 | `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=`), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). `path` ∈ `full_sync` (pass start), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000) / `sync`, `batch`, `member_sync` (PullSDK). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
 
 The v2 runtime logs on `zkapp.v2*` loggers with a `[V2]` prefix (roles changed, availability, commands,

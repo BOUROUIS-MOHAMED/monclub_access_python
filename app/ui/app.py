@@ -110,8 +110,10 @@ from app.core.sync_scope import (
     apply_trigger_hint_to_version_tokens,
     device_membership_scope_changed,
     member_cache_is_stale,
+    member_id_set_digest,
     strip_all_member_version_tokens,
     strip_member_version_tokens,
+    token_id_set_digest,
 )
 from app.core.utils import LOG_DIR
 
@@ -3008,6 +3010,101 @@ class MainApp:
         last = self._last_tick_device_reconcile_mono
         return last is None or tick_started_mono - last >= self._sync_base_interval_sec()
 
+    def _missing_member_action(
+        self, *, server_ids, local_ids, source: str,
+    ) -> Tuple[Optional[str], set]:
+        """Decide what the members the server lists and this PC lacks call for.
+
+        ``("full_refresh", ids)``: members missing that no full refresh has failed to bring.
+        ``("suppressed", ids)``: members a FULL members section just carried and the PC still does
+        not hold -- rows it could not store, which another full refresh cannot fix; remembered, and
+        never refreshed for again while they stay missing (a member that arrives, or leaves the
+        server's list, is forgotten). ``(None, set())``: nothing new. guide §3.6.
+        """
+        missing = {int(m) for m in server_ids} - {int(m) for m in local_ids}
+        unfixed = getattr(self, "_missing_members_unfixed", None)
+        if unfixed is None:
+            unfixed = self._missing_members_unfixed = set()
+        unfixed &= missing
+        if not missing:
+            return None, set()
+        new = missing - unfixed
+        if source == "full":
+            unfixed |= missing
+            return ("suppressed", new) if new else (None, set())
+        return ("full_refresh", new) if new else (None, set())
+
+    def _check_missing_members(self, *, data: Dict[str, Any], refresh: Dict[str, Any],
+                               outcome: Dict[str, Any], members_token: Any) -> None:
+        """After a successful sync: is a member the server lists missing on this PC? (lane B)
+
+        Compared with ``sync_users`` + ``sync_users_held`` (``db.list_local_member_ids``):
+        * a members section applied with a valid authority -- its validated ids
+          (``outcome["authoritative_member_ids"]``: a delta's validMemberIds, a full answer's
+          users[]); a full answer's gap is reported, never refreshed again;
+        * no members section, protocol-2 windows trusted -- ``member_access_window``, the server's
+          set of the day (replaced whole by each members section);
+        * no members section, not trusted, a P1a token -- its id-set digest; a digest cannot tell a
+          missing member from an extra row, so a mismatch asks ONE delta answer per token value
+          (``probeMemberSet``), whose validMemberIds then decide.
+        A missing member asks an immediate FULL member refresh (``forceMemberRefresh``). This only
+        reads; the refresh it asks for is the ordinary one, with its H-006 and previous-day guards.
+        """
+        try:
+            from app.core.db import get_access_v2_state, list_local_member_ids, list_member_window_ids
+
+            if refresh.get("members"):
+                if outcome.get("members_delete_refused") or not outcome.get(
+                        "authoritative_member_ids_valid", False):
+                    return   # the refusal already dropped the member tokens (§3.4)
+                server_ids = outcome.get("authoritative_member_ids")
+                if not isinstance(server_ids, (list, tuple, set)):
+                    return
+                source = "delta" if data.get("membersDeltaMode") else "full"
+            elif (get_access_v2_state() or {}).get("trusted") is True:
+                server_ids, source = list_member_window_ids(), "windows"
+            else:
+                digest = token_id_set_digest(members_token)
+                if digest is None or member_id_set_digest(list_local_member_ids()) == digest:
+                    return
+                if getattr(self, "_member_set_probed_token", None) == members_token:
+                    return   # asked once for this token already
+                self._member_set_probed_token = members_token
+                self._report_missing_members(source="digest", action="probe", ids=None)
+                self._request_member_refresh({"reason": "member-set-probe", "probeMemberSet": True})
+                return
+            action, ids = self._missing_member_action(
+                server_ids=server_ids, local_ids=list_local_member_ids(), source=source)
+            if action is None:
+                return
+            self._report_missing_members(source=source, action=action, ids=ids)
+            if action == "full_refresh":
+                self._request_member_refresh({"reason": "missing-members", "forceMemberRefresh": True})
+        except Exception:
+            self.logger.warning("[SYNC] missing-member check failed (nothing asked)", exc_info=True)
+
+    def _report_missing_members(self, *, source: str, action: str, ids) -> None:
+        sample = ",".join(str(m) for m in sorted(ids)[:20]) if ids else None
+        if action == "suppressed":
+            self.logger.warning(
+                "[SYNC] %d member(s) the server's full list names are still not stored on this PC "
+                "after a full refresh -- reported, not refreshed again: %s", len(ids), sample)
+        elif action == "probe":
+            self.logger.warning(
+                "[SYNC] the local member set does not match the server token's id-set digest -- "
+                "asking one delta answer to name the difference")
+        else:
+            self.logger.warning(
+                "[SYNC] %d member(s) the server lists are missing on this PC (%s) -- asking a full "
+                "member refresh: %s", len(ids), source, sample)
+        _tel.warn("MEMBERS_MISSING", source=source, action=action,
+                  count=len(ids) if ids is not None else None, sample=sample)
+
+    def _request_member_refresh(self, hint: Dict[str, Any]) -> None:
+        """Posted to the loop: the next sync carries ``hint`` (sync_scope strips the tokens)."""
+        self.after(0, lambda: self.request_sync_now(
+            trigger_source="MISSING_MEMBERS", run_type="TRIGGERED", trigger_hint=dict(hint)))
+
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).
 
@@ -3410,6 +3507,14 @@ class MainApp:
                 # are recognised on the next request (membersVersion, not currentMembersVersion).
                 if new_tokens:
                     save_version_tokens(new_tokens)
+
+                # A member the server lists and this PC lacks -> an immediate full member refresh
+                # (lane B, guide §3.6). Read-only; after the save, its date flip and the tokens.
+                self._check_missing_members(
+                    data=data, refresh=refresh, outcome=_cache_write_outcome,
+                    members_token=(new_tokens or {}).get("membersVersion")
+                    or (stored_version_tokens or {}).get("membersVersion"),
+                )
 
                 sync_response_summary = build_sync_response_summary(
                     data=data,

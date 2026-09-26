@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any, Iterable, Mapping
 
 
@@ -96,6 +98,8 @@ def apply_trigger_hint_to_version_tokens(
 
     entity_type = ""
     force_device_refresh = False
+    force_member_refresh = False
+    probe_member_set = False
     if isinstance(trigger_hint, Mapping):
         entity_type = str(
             trigger_hint.get("entityType") or trigger_hint.get("entity_type") or ""
@@ -104,7 +108,16 @@ def apply_trigger_hint_to_version_tokens(
             trigger_hint.get("forceDeviceRefresh")
             or trigger_hint.get("force_device_refresh")
         )
+        # The missing-member check (MainApp._check_missing_members): a member the server lists
+        # and this PC lacks -> a FULL member refresh; an id-set digest that disagrees -> one
+        # delta answer (membersVersion dropped, the watermark kept) whose validMemberIds decide.
+        force_member_refresh = bool(trigger_hint.get("forceMemberRefresh"))
+        probe_member_set = bool(trigger_hint.get("probeMemberSet"))
 
+    if force_member_refresh:
+        return strip_all_member_version_tokens(normalized)
+    if probe_member_set:
+        return strip_member_version_tokens(normalized)
     if entity_type == "ACTIVE_MEMBERSHIP":
         stripped = strip_member_version_tokens(normalized)
         import logging as _log
@@ -167,6 +180,33 @@ def member_count_from_token(members_version: Any) -> int | None:
         return int(str(members_version).split(":", 1)[0])
     except (TypeError, ValueError):
         return None
+
+
+def member_id_set_digest(member_ids: Iterable[Any]) -> str:
+    """The backend's ``memberIdSetDigest`` of a set of membership ids (P1a rule 3).
+
+    ``GymAccessController.memberIdSetDigest``: the ids sorted NUMERICALLY and de-duplicated,
+    joined by ``,`` (an empty set is ``""``), SHA-256 over the UTF-8 bytes, the first 8 bytes as
+    lowercase hex (``shortDigest``). Pinned against vectors the Java code itself produced
+    (tests/test_missing_member_check.py)."""
+    canonical = ",".join(str(i) for i in sorted({int(m) for m in member_ids if m is not None}))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+_ID_SET_DIGEST = re.compile(r"[0-9a-f]{16}")
+
+
+def token_id_set_digest(members_version: Any) -> str | None:
+    """The id-set digest a P1a ``membersVersion`` token ends with, else None.
+
+    ``count:maxMemberUpdated:fpCount:maxFpUpdated:enrCount:maxEnrUpdated:idSetDigest``
+    (``GymAccessController.computeMembersVersion``). The timestamps hold colons of their own, so
+    the digest is the part after the LAST colon, and only when it is exactly 16 lowercase hex
+    characters -- the last part of an older token is a timestamp's seconds or a ``0``."""
+    if not isinstance(members_version, str) or ":" not in members_version:
+        return None
+    last = members_version.rsplit(":", 1)[1]
+    return last if _ID_SET_DIGEST.fullmatch(last) else None
 
 
 def member_cache_is_stale(

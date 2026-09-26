@@ -602,6 +602,26 @@ time. `[CODE: app/core/db.py::apply_local_date_flips; access_dates.py::evaluate_
 
 ---
 
+## 6c. A member the server lists and the PC lacks (lane B)
+
+After every successful sync the PC compares the server's member list with its own (guide §3.6 "The
+missing-member check").
+
+```bash
+grep -F "[T] MEMBERS_MISSING" app-*.log
+```
+
+| `action` | Means |
+|---|---|
+| `full_refresh` | `count` members (`sample` = their membership ids) are on the server's list and not on this PC: the next sync re-downloads the whole member list. A second line right after it for the same ids should not appear -- if it does as `suppressed`, see below |
+| `probe` | (PCs without trusted protocol-2 dates) the token's id-set digest disagrees with the PC's list: one extra delta sync names the difference. Once per token |
+| `suppressed` | members the server's FULL list carried that the PC still did not store: another refresh cannot fix them, so they are reported once per start and left. Send the log to a developer |
+
+`source` says what was compared: `delta` / `full` (a members section), `windows` (protocol-2 days, no
+members section), `digest` (the token). `[CODE: app/ui/app.py::_check_missing_members]`
+
+---
+
 ## 7. One-liners
 
 ```bash
