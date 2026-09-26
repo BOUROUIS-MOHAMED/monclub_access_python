@@ -8,7 +8,9 @@ touching the PC. Most gyms cut the PC and the electricity from closing to openin
 Three things are needed, all three: the PC switches itself on when power returns (BIOS), Windows
 opens the session by itself (auto-logon), and MonClub Access starts in that session (watchdog, or the
 "Ouvrir MonClub Access avec Windows" box). The installer's own default for the watchdog changes later,
-after the owner's installer edits are committed: **until then it is ticked by hand.**
+after the owner's installer edits are committed: **until then it is ticked by hand** -- except during
+the cutover night, when every install leaves it **unticked** and the watchdog is switched on only at
+each gym's last step (section 4).
 
 **Grades.** The BIOS menu names and the Windows auto-logon screens below are general knowledge of
 those products, not checked on the gym PCs: `[UNVERIFIED]`. What MonClub Access and its watchdog do is
@@ -88,7 +90,20 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
   `monclub_access_watchdog.ps1`, as committed on `master`; the owner's uncommitted edits to those files
   may change this). Already installed without it: run
   `%LOCALAPPDATA%\MonClubAccess\watchdog\register_watchdog.ps1` as that user (no admin needed).
-  Check: `Get-ScheduledTask -TaskName 'MonClub Access Watchdog'`.
+  Check: `Get-ScheduledTask -TaskName 'MonClub Access Watchdog'`, and
+  `Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime` -- empty means no check will
+  run before the next Windows logon: the committed `register_watchdog.ps1` has only a logon trigger;
+  the owner's pending edit adds one that starts at once (`packaging/watchdog/README.md` in his working
+  copy).
+- **What the watchdog does not know:** a tray Quit. It restarts Access after two missed checks, so
+  about 2-4 minutes after any Quit (`monclub_access_watchdog.ps1`, `$RequiredConsecutiveMisses = 2`,
+  every 2 minutes) `[CODE]`. To keep Access stopped, disable the task first:
+  `Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`.
+- **What an install does to it:** when the box was ticked at the previous install, the installer ticks
+  it again (`UsePreviousTasks=yes`) and re-registers the task as a new, **enabled** one -- a disabled
+  task does not stay disabled (`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`;
+  `register_watchdog.ps1` removes the task, then registers it) `[CODE]`. Unticked, the installer leaves
+  the existing task as it is.
 - **"Ouvrir MonClub Access avec Windows"** (Access → Config): a start-up entry for the user; it starts
   Access at logon but does not restart it after a crash. Access rewrites that entry from the box at
   every start (`app.py::_sync_startup_registration`).
@@ -100,8 +115,16 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
 
 ## 4. After the cutover night
 
-The runbook unticks "Ouvrir MonClub Access avec Windows" and disables the watchdog for the night. The
-last step of each gym re-enables both. Check with the sheet before leaving.
+The runbook unticks "Ouvrir MonClub Access avec Windows" and disables the watchdog for the night
+(C1, D1), and every install that night is run with **"Keep MonClub Access running" unticked**, followed
+by a check that the task reads `Disabled` or does not exist (runbook C3c, D9) -- otherwise the install
+would switch the watchdog back on and Access would restart by itself in the middle of the night's
+steps. The last step of each gym (C17, D19) re-enables both: re-tick the box in Access, and
+`Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` where the task existed (or, where it never
+existed and the PC should have it, run `register_watchdog.ps1` as in section 3). Then check
+`NextRunTime` (section 3): empty means the watchdog first runs at the next Windows logon -- that is
+expected with the committed script, and is the case every morning after a power cut, which starts
+with a logon. Check with the sheet before leaving.
 
 ## 5. The test (do it on a closed evening, never during an erase or a refill)
 
