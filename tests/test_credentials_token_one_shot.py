@@ -14,6 +14,8 @@ its tokens -- only this step can drop one.
 """
 from __future__ import annotations
 
+import sys
+
 import sqlite3
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -263,6 +265,10 @@ def test_a_failed_marker_write_repeats_the_drop_never_loses_it(db, monkeypatch):
     calls = {"n": 0}
 
     def _failing_now():
+        # Fail only the marker write. init_db calls now_iso() in other steps too (P3b-1's
+        # member_person_link backfill runs after this one); failing those would test them, not this.
+        if sys._getframe(1).f_code.co_name != "_force_one_credentials_resend":
+            return real_now()
         calls["n"] += 1
         raise RuntimeError("disk full")
 
