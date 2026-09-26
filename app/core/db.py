@@ -1478,6 +1478,23 @@ def apply_local_date_flips(*, pc_now_epoch: float, grace_days: int, source: str)
         )
         if not out["trusted"]:
             out["skipped"] = "untrusted"
+            # Untrusted windows = a v1 PC's behaviour: the roster is the server's last list, held
+            # rows included. Rows held while trusted go back now; otherwise a trust drop (a v1 or
+            # malformed answer, a refused members section) stranded them offline until the next
+            # online first-of-day sync -- a paying member whose freeze ended stayed locked out,
+            # which base never did (review R5). A held id back on sync_users already (a fast patch)
+            # keeps that fresher row.
+            cols = ", ".join(_SYNC_USER_COLUMNS)
+            back = cur.execute(
+                f"INSERT INTO sync_users ({cols}) SELECT {cols} FROM sync_users_held "
+                "WHERE active_membership_id NOT IN "
+                "(SELECT active_membership_id FROM sync_users WHERE active_membership_id IS NOT NULL)"
+            ).rowcount or 0
+            cur.execute("DELETE FROM sync_users_held")
+            if back:
+                _refresh_member_account_links(cur)
+                out.update(restored=back, moved=back)
+            profile["flip_moved"] = out["moved"]
             return out
         if g.gym_date is None:
             out["skipped"] = "no_gym_date"

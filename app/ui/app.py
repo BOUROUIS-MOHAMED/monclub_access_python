@@ -1555,6 +1555,10 @@ class MainApp:
         self._date_flip_thread: Any = None
         self._date_flip_midnight_after_id: int | None = None
         self._first_day_sync_after_id: int | None = None
+        # A flip that raised may still commit later: _run_db_write_sync gives up waiting after
+        # 60 s but the job stays queued. The next trigger then runs a flip unconditionally (it
+        # queues behind the late one) and wakes the caches and ULTRA after it (review R5).
+        self._date_flip_recover = False
 
     @staticmethod
     def _date_flip_now() -> float:
@@ -1580,6 +1584,7 @@ class MainApp:
 
         with self._date_flip_lock:
             started = time.perf_counter()
+            recovering = bool(getattr(self, "_date_flip_recover", False))
             try:
                 now_epoch = float(pc_now) if pc_now is not None else float(self._date_flip_now())
                 out = _db.apply_local_date_flips(
@@ -1588,6 +1593,7 @@ class MainApp:
                     source=source,
                 )
             except Exception as ex:
+                self._date_flip_recover = True
                 _tel.warn("DATE_FLIP_FAILED", source=source, err=f"{type(ex).__name__}: {ex}"[:300])
                 try:
                     self.logger.warning("[DATE] flip failed (source=%s): %s", source, ex, exc_info=True)
@@ -1598,7 +1604,17 @@ class MainApp:
             out = dict(out or {})
             moved = int(out.get("moved") or 0)
             ultra_requested = False
+            if recovering:
+                self._date_flip_recover = False
             if moved > 0:
+                ultra_requested = self._after_date_flip_moved(source)
+            elif recovering:
+                # The failed flip may have committed after its caller gave up: nothing moved in
+                # this run, but the rows it moved were never announced.
+                try:
+                    _db.bump_local_state_generation()
+                except Exception:
+                    pass
                 ultra_requested = self._after_date_flip_moved(source)
             if moved > 0 or source == "startup":
                 reasons = out.get("hold_reasons") or {}
@@ -1716,7 +1732,7 @@ class MainApp:
         """The precheck's verdict, plus a change of the offline grace setting since the last
         flip (a config PATCH writes self.cfg only; without this it would wait for the next day)."""
         status = status or {}
-        if status.get("needs_flip"):
+        if status.get("needs_flip") or getattr(self, "_date_flip_recover", False):
             return True
         applied_grace = status.get("grace_days")
         if applied_grace is None:
