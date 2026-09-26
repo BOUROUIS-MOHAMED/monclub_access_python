@@ -8,7 +8,7 @@ route returns a command's state -- a P3c-2/backend gap, said in the UI).
 from __future__ import annotations
 
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.v2 import lease_gate
 
@@ -54,7 +54,7 @@ def _handle_v2_reader_history(ctx) -> None:
     ctx.send_json(200, page)
 
 
-def _file_request(ctx, body: Dict[str, Any]) -> None:
+def _file_request(ctx, body: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> None:
     rt = _runtime(ctx)
     if rt is None or rt.availability != "ON":
         ctx.send_json(409, {"ok": False, "code": "REALTIME_OFF",
@@ -66,11 +66,13 @@ def _file_request(ctx, body: Dict[str, Any]) -> None:
         _err(ctx, exc)
         return
     cmd = ans.get("command") or {}
-    ctx.send_json(202, {"ok": True, "commandId": cmd.get("id"), "targetPcId": cmd.get("targetPcId"),
-                        "targetConnected": bool(ans.get("targetConnected")), "created": bool(ans.get("created"))})
+    out = {"ok": True, "commandId": cmd.get("id"), "targetPcId": cmd.get("targetPcId"),
+           "targetConnected": bool(ans.get("targetConnected")), "created": bool(ans.get("created"))}
+    out.update(extra or {})
+    ctx.send_json(202, out)
 
 
-def _handle_v2_request_door(ctx) -> None:
+def _handle_v2_request_door(ctx, extra: Optional[Dict[str, Any]] = None) -> None:
     did = ctx.param_int("deviceId")
     if did <= 0:
         ctx.send_json(400, {"ok": False, "error": "invalid deviceId"})
@@ -81,7 +83,7 @@ def _handle_v2_request_door(ctx) -> None:
     except (TypeError, ValueError):
         pass
     _file_request(ctx, {"id": str(uuid.uuid4()), "type": "DOOR_OPEN", "gymDeviceId": did,
-                        "payload": {"doorNumber": door}})
+                        "payload": {"doorNumber": door}}, extra)
 
 
 def _handle_v2_request_resync(ctx) -> None:

@@ -2948,7 +2948,9 @@ line of defence), `AgentRealtimeEngine.refresh_devices`, `DeviceSyncEngine._sync
 `_run_single_device_sync` (the ULTRA scheduler's PullSDK fallback) and `_sync_one_device`,
 `DeviceAttendanceMaintenanceEngine._list_device_candidates`, the local API's device-session handlers
 (`access/local_api_routes.py::LEASE_GATED_HANDLERS` → 409 `notDriver`), the desk card scanner
-(`SCANNER_GATED_HANDLERS`: a scanner set on the address of a turnstile this PC does not drive → 409) and the
+(`SCANNER_GATED_HANDLERS`: a scanner set on the address of a turnstile this PC does not drive → 409; `mode`
+and `ip` read with the handlers' own expression, so `"USB"` or an empty `mode` — a network scan in
+`card_scanner` — cannot pass, review round 5) and the
 network discovery (those addresses are skipped). `[CODE]`
 `[TEST: test_v2_lease_gate.py — every driver constructor made to raise under a READER snapshot while each site
 runs; test_v2_review0.py — the scanner and discovery]`
@@ -2970,7 +2972,10 @@ leases (role `REVOKED`, cached too, so a cold start keeps it); in a gym without 
 merely offline keeps its cached roles. `[CODE: leases.py::LeaseManager._revoked, ::_drop_leases]`
 `[TEST: test_v2_review1.py::test_r2_*]` Residual `[CODE]`: a PC that is revoked or loses its lease while it is
 **off** acts on its cached roles at the next power-on until the server answers (usually the first minute
-online); offline it has no way to learn it.
+online); offline it has no way to learn it. `[UNVERIFIED]` An AGENT-mode worker (`realtime_agent.py`) has no
+connect-time lease check (only `refresh_devices` filters) and the release does not wait for it, so after a
+handover the outgoing PC may stay connected to a C3 panel until its next sync tick while the new driver
+connects; what two concurrent PullSDK sessions do on a C3 is unknown (review round 5, not shown to harm).
 
 **Add-only and the handover (P2c-1/P2c-2).** A `DRIVE` turnstile is add-only while its lease says
 `handoverForced` or while this PC has not restored the ownership backup for the lease generation it holds; a
@@ -3082,7 +3087,11 @@ after that day's first pass.
 **Reader screens (owner decisions 2, 3).** Local routes `access/v2_routes.py` (`/api/v2/realtime/…`): the
 role and turnstiles; the reader door history from the server (`/pc/reader/door-history`, the server picks the
 turnstiles); a reader's door or resync request FILED on the server (`POST /pc/commands`, no target: the server
-routes it to the turnstile's driver) — the local door button does this when the local API answers `notDriver`;
+routes it to the turnstile's driver). The local door route itself does it for a turnstile this PC does not
+drive while v2 is ON (`local_api_routes.py::_door_request_via_driver`: the desk's 1 s cooldown, then 202
+`{ok, requested, notDriver, targetConnected}`), so every caller — the Devices page, the favourites overlay, the
+tray panel, the tray menu and the global favourite shortcuts (`src-tauri/src/lib.rs`) — reaches the driver
+(review round 5: before, only the Devices page did); with v2 not ON it answers 409 `notDriver` as before;
 after an enrolment, each turnstile with the PC that pushes the finger. No PC route returns a command's outcome
 or a driver's per-turnstile push state, so the reader shows "demande envoyée" / "en attente du PC pilote",
 never "fait" — a contract gap (report). Tauri page « Pilote / Lecteur » (`RealtimePage.tsx`), French only like
@@ -3481,7 +3490,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **2865 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 4; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **2873 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 after review round 5; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Before it: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`

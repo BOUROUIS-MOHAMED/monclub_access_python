@@ -85,6 +85,13 @@ export const ROLE_LABEL_FR: Record<string, string> = {
 };
 
 /** Ask the driver PC (through the server) to open a door this PC does not drive. */
+/** The local door route answers 202 `requested` when another PC drives the turnstile. */
+export function doorRequestedMessage(res: { targetConnected?: boolean }): string {
+  return res.targetConnected
+    ? "Demande envoyée au PC pilote. Son résultat n'est pas visible ici."
+    : "Demande enregistrée, mais le PC pilote n'est pas connecté : elle expirera sans ouvrir.";
+}
+
 export async function requestDoorViaDriver(deviceId: number, doorNumber: number): Promise<string> {
   const res = await realtime.requestDoor(deviceId, doorNumber);
   return res.targetConnected

@@ -187,3 +187,14 @@ def test_unreachable_probes_back_off_to_half_an_hour(monkeypatch, db):
         waits.append(round(rt._next_refresh - t0))
     assert waits[0] == 120 and waits[-1] == 1800 and waits == sorted(waits)
     __import__("app.core.v2.server_clock", fromlist=["x"]).set_default(None)
+
+
+@pytest.mark.parametrize("body", [{"mode": "USB", "ip": "192.168.1.8"}, {"mode": ""}, {"mode": None}])
+def test_round5_the_scanner_gate_reads_mode_as_the_handlers_do(turnstiles, body):
+    """card_scanner compares with "usb" case-sensitively and "" means network: neither may pass."""
+    from access.local_api_routes import scanner_gated_handler
+    _driver_of(10)
+    ran = []
+    ctx = Ctx(body)
+    scanner_gated_handler(lambda c: ran.append(1))(ctx)
+    assert ctx.sent[0] == 409 and ran == []

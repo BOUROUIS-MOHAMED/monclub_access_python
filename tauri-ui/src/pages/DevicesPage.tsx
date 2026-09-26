@@ -3,7 +3,7 @@ import { useDevices, usePullSdk, usePopupStream } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import { usePageChrome } from "@/context/PageChromeContext";
 import { get, post } from "@/api/client";
-import { isNotDriverError, requestDoorViaDriver } from "@/api/realtime";
+import { doorRequestedMessage, isNotDriverError, requestDoorViaDriver } from "@/api/realtime";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -337,7 +337,10 @@ export default function DevicesPage() {
 
   const handleDoorOpen = useCallback(async () => {
     if (!doorDialog) return;
-    try { await pullsdk.doorOpen(doorDialog.deviceId, parseInt(doorNum) || 1, parseInt(pulseSec) || 3); setToast("Porte ouverte !"); setDoorDialog(null); }
+    try {
+      const res: any = await pullsdk.doorOpen(doorDialog.deviceId, parseInt(doorNum) || 1, parseInt(pulseSec) || 3);
+      setToast(res?.requested ? doorRequestedMessage(res) : "Porte ouverte !"); setDoorDialog(null);
+    }
     catch (e) {
       // P3b-2: another PC drives this turnstile -- ask it through the server instead.
       if (isNotDriverError(e)) {
@@ -350,7 +353,10 @@ export default function DevicesPage() {
   }, [doorDialog, doorNum, pulseSec, pullsdk]);
 
   const handlePresetDoorOpen = useCallback(async (deviceId: number, doorNumber: number, pulseSeconds: number) => {
-    try { await post(`/devices/${deviceId}/door/open`, { doorNumber, pulseSeconds }); setToast(`Porte ${doorNumber} ouverte (${pulseSeconds}s)`); }
+    try {
+      const res: any = await post(`/devices/${deviceId}/door/open`, { doorNumber, pulseSeconds });
+      setToast(res?.requested ? doorRequestedMessage(res) : `Porte ${doorNumber} ouverte (${pulseSeconds}s)`);
+    }
     catch (e) {
       if (isNotDriverError(e)) {
         try { setToast(await requestDoorViaDriver(deviceId, doorNumber)); }

@@ -169,6 +169,29 @@ LEASE_GATED_HANDLERS: tuple[str, ...] = (
 )
 
 
+def _door_request_via_driver(ctx, device_id: int) -> bool:
+        """A door open for a turnstile another PC drives is FILED on the server, which routes it
+        to that driver (owner decision 2) -- here, not in each caller, so the tray menu, the
+        global favourite shortcuts, the favourites overlay and the tray panel all get it
+        (review round 5; before, only the Devices page did). Answers 202 ``requested``; False
+        (the caller answers 409 ``notDriver`` as before) when v2 is not ON on this PC."""
+        from access import v2_routes
+        from app.api import local_access_api_v2 as legacy
+
+        rt = getattr(ctx.app, "_v2_runtime", None)
+        if rt is None or getattr(rt, "availability", None) != "ON":
+            return False
+        import time as _time
+        now = _time.monotonic()
+        # The desk's own 1 s per-turnstile cooldown (M-003), so a held shortcut files one request.
+        if now - legacy._door_open_last.get(device_id, 0.0) < legacy._DOOR_OPEN_COOLDOWN_SEC:
+            ctx.send_json(429, {"ok": False, "error": "Door open rate limited (1s cooldown)"})
+            return True
+        legacy._door_open_last[device_id] = now
+        v2_routes._handle_v2_request_door(ctx, extra={"requested": True, "notDriver": True})
+        return True
+
+
 def gated_handler(handler):
     """Wrap a device-session handler with the lease gate."""
     import functools
@@ -182,6 +205,8 @@ def gated_handler(handler):
         except Exception:
             device_id = 0
         if device_id > 0 and not lease_gate.device_allowed(device_id):
+            if handler.__name__ == "_handle_device_door_open" and _door_request_via_driver(ctx, device_id):
+                return
             ctx.send_json(409, {
                 "ok": False,
                 "notDriver": True,
@@ -210,8 +235,11 @@ def scanner_gated_handler(handler):
         try:
             body = ctx.body() or {}
             cfg = legacy._get_runtime_access_config(ctx)
-            mode = str(body.get("mode") or getattr(cfg, "scanner_mode", "") or "").strip().lower()
-            ip = str(body.get("ip") or getattr(cfg, "scanner_network_ip", "") or "").strip()
+            # Exactly as the handlers read it (no lower-casing, "" -> network): card_scanner
+            # compares with "usb" case-sensitively, so "USB" or an empty body mode is a network
+            # scan there and must be one here (review round 5).
+            mode = legacy._safe_str(body.get("mode"), getattr(cfg, "scanner_mode", "")) or "zkemkeeper"
+            ip = (legacy._safe_str(body.get("ip"), getattr(cfg, "scanner_network_ip", "")) or "").strip()
         except Exception:
             mode, ip = "", ""
         if mode != "usb" and ip and ip_is_undriven_turnstile(ip):

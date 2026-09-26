@@ -110,3 +110,65 @@ def test_without_assignments_every_local_turnstile_is_this_pcs(monkeypatch):
     ctx = Ctx(SimpleNamespace())
     v2_routes._handle_v2_enroll_turnstiles(ctx)
     assert ctx.sent[1]["turnstiles"][0]["status"] == "THIS_PC"
+
+
+class _DoorCtx(Ctx):
+    def param_int(self, name, default=0):
+        return int(self._p.get(name, default))
+
+
+def _door_handler_ran():
+    ran = []
+
+    def _handle_device_door_open(ctx):
+        ran.append(ctx)
+    return ran, _handle_device_door_open
+
+
+def _reader():
+    lg.install(lg.snapshot_from_assignment({"gymUsesAssignments": True, "role": "READER",
+                                            "drive": [], "release": [], "readerOf": []}, source="server"))
+
+
+def test_round5_every_door_caller_on_a_reader_files_the_request_on_the_server(monkeypatch):
+    """The tray menu, the favourite shortcuts, the overlay and the tray panel all POST the local
+    door route: the gate files the request for them (202 requested), never opens the door."""
+    from access.local_api_routes import gated_handler
+    import app.api.local_access_api_v2 as la2
+    monkeypatch.setattr(la2, "_door_open_last", {})
+    _reader()
+    rt = _rt()
+    ran, h = _door_handler_ran()
+    ctx = _DoorCtx(SimpleNamespace(_v2_runtime=rt), {"deviceId": 8}, {"doorNumber": 2, "pulseSeconds": 3})
+    gated_handler(h)(ctx)
+    status, body = ctx.sent
+    assert ran == [] and status == 202 and body["ok"] and body["requested"] and body["notDriver"]
+    assert rt.api.requests[0]["type"] == "DOOR_OPEN" and rt.api.requests[0]["payload"] == {"doorNumber": 2}
+    ctx2 = _DoorCtx(SimpleNamespace(_v2_runtime=rt), {"deviceId": 8}, {"doorNumber": 2})
+    gated_handler(h)(ctx2)                               # a held shortcut: the 1 s cooldown
+    assert ctx2.sent[0] == 429 and len(rt.api.requests) == 1
+
+
+@pytest.mark.parametrize("availability", ["OFF", "UNKNOWN", None])
+def test_round5_without_v2_on_the_reader_answers_not_driver_as_before(monkeypatch, availability):
+    from access.local_api_routes import gated_handler
+    import app.api.local_access_api_v2 as la2
+    monkeypatch.setattr(la2, "_door_open_last", {})
+    _reader()
+    app = SimpleNamespace(_v2_runtime=_rt(availability) if availability else None)
+    ran, h = _door_handler_ran()
+    ctx = _DoorCtx(app, {"deviceId": 8}, {"doorNumber": 1})
+    gated_handler(h)(ctx)
+    assert ran == [] and ctx.sent[0] == 409 and ctx.sent[1]["notDriver"]
+
+
+def test_round5_other_device_routes_still_answer_not_driver(monkeypatch):
+    from access.local_api_routes import gated_handler
+    _reader()
+    ran = []
+
+    def _handle_device_info(ctx):
+        ran.append(1)
+    ctx = _DoorCtx(SimpleNamespace(_v2_runtime=_rt()), {"deviceId": 8})
+    gated_handler(_handle_device_info)(ctx)
+    assert ran == [] and ctx.sent[0] == 409
