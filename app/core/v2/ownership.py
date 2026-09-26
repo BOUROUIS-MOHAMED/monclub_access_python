@@ -137,6 +137,7 @@ class OwnershipSync:
         self.rt = runtime
         self._meta: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._next_upload: Dict[int, float] = {}
+        self._lost_done: set = set()      # not-driven turnstiles with nothing (more) to upload
         self._next_restore: Dict[int, float] = {}
         self._next_readback: Dict[int, float] = {}
         self._release_since: Dict[int, float] = {}
@@ -233,11 +234,27 @@ class OwnershipSync:
                          "observedAt": timefmt.format_utc(at)})
         return rows, epochs
 
-    def upload(self, did: int, *, final: bool = False) -> Dict[str, Any]:
-        """Upload what changed (or everything, ``final``). Returns a summary; raises V2ApiError."""
-        if not self.rt.clock.has_sample():
-            self.meta(did, fresh=True)             # a GET gives the first clock sample
-        meta = self.meta(did)
+    def _last_uploaded_meta(self, did: int) -> Optional[Dict[str, Any]]:
+        """The (scheme, generation) of this PC's own latest upload for a turnstile, if any."""
+        from app.core.db import get_conn
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT pin_scheme, generation FROM v2_ownership_uploaded WHERE device_id = ? "
+                "ORDER BY generation DESC LIMIT 1", (did,)).fetchone()
+        return {"pinScheme": row[0], "generation": int(row[1])} if row else None
+
+    def upload(self, did: int, *, final: bool = False,
+               known_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Upload what changed (or everything, ``final``). Returns a summary; raises V2ApiError.
+        ``known_meta``: a turnstile this PC does not drive -- the server's GET (the restore
+        route) refuses it NOT_DEVICE_DRIVER, so the scheme and generation of this PC's own last
+        upload are used; the POST itself is open to any ACTIVE PC of the gym."""
+        if known_meta is None:
+            if not self.rt.clock.has_sample():
+                self.meta(did, fresh=True)             # a GET gives the first clock sample
+            meta = self.meta(did)
+        else:
+            meta = known_meta
         scheme, generation = str(meta.get("pinScheme") or ""), int(meta.get("generation") or 0)
         local_scheme = self._device_scheme(did)
         if not generation or not scheme or (local_scheme and local_scheme != scheme):
@@ -343,6 +360,9 @@ class OwnershipSync:
         dev_engine = getattr(app, "_device_sync_engine", None)
         if dev_engine is not None and bool(getattr(dev_engine, "_running", False)):
             return False
+        sched = getattr(eng, "_sync_scheduler", None) if eng is not None else None
+        if sched is not None and getattr(sched, "_active_sync_engine", None) is not None:
+            return False                # the scheduler's PullSDK fallback pass (worker not usable)
         return True
 
     def release(self, did: int, generation: int) -> Optional[str]:
@@ -463,7 +483,8 @@ class OwnershipSync:
             self.report_wipes(drivable)
         except V2ApiError as exc:
             self.last["wipe"] = exc.code
-        for did in drivable + self._lost_with_facts(snap):
+        for did in drivable:
+            self._lost_done.discard(did)
             if now < self._next_upload.get(did, 0.0):
                 continue
             self._next_upload[did] = now + UPLOAD_EVERY_SEC
@@ -472,6 +493,30 @@ class OwnershipSync:
             except V2ApiError as exc:
                 self._next_upload[did] = now + RETRY_SEC
                 self.last[f"upload:{did}"] = {"error": exc.code}
+        if not self.rt.clock.has_sample():
+            return                                   # no sentAt the server would accept yet
+        for did in self._lost_with_facts(snap):
+            if did in self._lost_done or now < self._next_upload.get(did, 0.0):
+                continue
+            self._next_upload[did] = now + UPLOAD_EVERY_SEC
+            try:
+                known = self._last_uploaded_meta(did)
+                local_scheme = self._device_scheme(did)
+                if known is None or (local_scheme and local_scheme != known["pinScheme"]):
+                    # Never uploaded by this PC (e.g. pins pushed only before the gym used
+                    # leases): no generation to post under, and the GET is refused -- nothing
+                    # to send (guide §3.9 residual).
+                    self._lost_done.add(did)
+                    continue
+                self.last[f"upload:{did}"] = self.upload(did, known_meta=known)
+            except V2ApiError as exc:
+                self.last[f"upload:{did}"] = {"error": exc.code}
+                if exc.backend and exc.status in (403, 404, 409, 400):
+                    # STALE_OWNERSHIP_GENERATION, PIN_SCHEME_MISMATCH, a refusal: never retried
+                    # every minute; tried again after a restart or once this PC drives it.
+                    self._lost_done.add(did)
+                else:
+                    self._next_upload[did] = now + RETRY_SEC
 
     def status(self) -> Dict[str, Any]:
         return {"ownership": dict(self.last)}

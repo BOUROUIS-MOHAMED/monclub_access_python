@@ -233,6 +233,10 @@ class _RelApi:
     types.SimpleNamespace(_ultra_engine=None, _device_sync_engine=types.SimpleNamespace(_running=True)),
     types.SimpleNamespace(_ultra_engine=types.SimpleNamespace(_workers={8: types.SimpleNamespace(
         _full_sync_running=False, _active_sync_engine=object())}), _device_sync_engine=None),
+    # round 2: the ULTRA scheduler's PullSDK fallback pass (the worker is not usable)
+    types.SimpleNamespace(_ultra_engine=types.SimpleNamespace(
+        _workers={}, _sync_scheduler=types.SimpleNamespace(_active_sync_engine=object())),
+        _device_sync_engine=None),
 ])
 def test_r3_release_waits_for_every_pass_writing_the_turnstile(db, monkeypatch, app):
     monkeypatch.setattr(ownership, "RELEASE_IDLE_GRACE_SEC", 0.0)
@@ -334,29 +338,87 @@ def _state_row(did, pin):
 
 
 class _UpApi:
-    def __init__(self):
-        self.uploads = []
+    """The backend's rule: GET /ownership (the restore route) answers only the lease holder;
+    POST /ownership/upload is open to any ACTIVE PC of the gym (round 2 found the first R7 fix
+    used the GET)."""
+
+    def __init__(self, driven=(9,), upload_error=None):
+        self.uploads, self.gets, self.driven, self.upload_error = [], [], set(driven), upload_error
 
     def ownership_page(self, did, after, limit):
+        self.gets.append(did)
+        if did not in self.driven:
+            raise V2ApiError(409, "NOT_DEVICE_DRIVER", "", backend=True)
         return {"generation": 1, "pinScheme": "MEMBERSHIP", "rows": [], "nextAfterId": None}
 
     def ownership_upload(self, body):
-        self.uploads.append((body["gymDeviceId"], [r["pin"] for r in body["rows"]]))
+        if self.upload_error is not None:
+            raise self.upload_error
+        self.uploads.append((body["gymDeviceId"], body["generation"], [r["pin"] for r in body["rows"]]))
         return {"stored": len(body["rows"])}
 
     last_body = None
 
 
-def test_r7_facts_of_a_turnstile_no_longer_driven_are_uploaded(db):
+def _uploaded_row(did, pin, generation=1):
+    from app.core.db import _run_db_write_sync
+    _run_db_write_sync("t", lambda c, _p: c.execute(
+        "INSERT INTO v2_ownership_uploaded (device_id, pin_scheme, generation, pin, state, pushed_hash, "
+        "pushed_finger_ids, observed_at) VALUES (?, 'MEMBERSHIP', ?, ?, 'APPLIED', 'old', '', 1.0)",
+        (did, generation, pin)))
+
+
+def _own_rt(api):
+    clock = ServerClock()
+    now = time.time()
+    clock.add_sample(now, now, now, source="t")
+    return types.SimpleNamespace(app=types.SimpleNamespace(_ultra_engine=None), api=api, clock=clock,
+                                 refresh_assignment=lambda: "ON",
+                                 leases=types.SimpleNamespace(restored_generation=lambda d: 2 if d == 9 else None))
+
+
+def test_r7_facts_of_a_turnstile_no_longer_driven_are_uploaded_without_the_restore_route(db):
     _state_row(8, "1001")                     # pushed while this PC drove turnstile 8
+    _uploaded_row(8, "0999", generation=4)    # this PC uploaded for 8 before (generation 4)
     _state_row(9, "2001")
     _drive(9, generation=2)
     api = _UpApi()
-    rt = types.SimpleNamespace(app=types.SimpleNamespace(_ultra_engine=None), api=api, clock=ServerClock(),
-                               refresh_assignment=lambda: "ON",
-                               leases=types.SimpleNamespace(restored_generation=lambda d: 2 if d == 9 else None))
-    ownership.OwnershipSync(rt).tick(rt)
-    assert sorted(api.uploads) == [(8, ["1001"]), (9, ["2001"])]
+    sync = ownership.OwnershipSync(_own_rt(api))
+    sync.tick(None)
+    assert 8 not in api.gets                  # the holder-only GET is never asked for 8
+    assert (8, 4, ["1001"]) in api.uploads and (9, 1, ["2001"]) in api.uploads
+    n = len(api.uploads)
+    sync._next_upload.clear()
+    sync.tick(None)
+    assert len(api.uploads) == n              # nothing changed: nothing re-sent
+
+
+def test_r7_a_turnstile_never_uploaded_by_this_pc_sends_nothing(db):
+    _state_row(8, "1001")                     # pushed only before the gym used leases
+    _drive(9, generation=2)
+    api = _UpApi()
+    sync = ownership.OwnershipSync(_own_rt(api))
+    for _ in range(3):
+        sync._next_upload.clear()
+        sync.tick(None)
+    assert 8 not in api.gets and all(u[0] != 8 for u in api.uploads)
+
+
+def test_r7_a_refused_upload_is_not_retried_every_minute(db):
+    _state_row(8, "1001")
+    _uploaded_row(8, "0999", generation=1)
+    lg.install(lg.snapshot_from_assignment({"gymUsesAssignments": True, "role": "READER",
+                                            "drive": [], "release": []}, source="server"))
+    calls = []
+    api = _UpApi(driven=())
+    api.upload_error = V2ApiError(409, "STALE_OWNERSHIP_GENERATION", "", backend=True)
+    real = api.ownership_upload
+    api.ownership_upload = lambda body: (calls.append(1), real(body))[1]
+    sync = ownership.OwnershipSync(_own_rt(api))
+    for _ in range(3):
+        sync._next_upload.clear()
+        sync.tick(None)
+    assert len(calls) == 1 and api.gets == []
 
 
 # ---------------------------------------------------------------------------------- R9
