@@ -6171,10 +6171,12 @@ def _handle_scanner_discover(ctx: _Ctx) -> None:
         global _discovery_running, _discovery_devices
         try:
             from app.core.network_discovery import scan_subnet
+            from app.core.v2.device_ips import undriven_ips
             results = scan_subnet(
                 subnet=subnet,
                 do_handshake=(not scanner_active),
                 cancel_event=_discovery_cancel,
+                skip_ips=undriven_ips(),
             )
             with _discovery_lock:
                 _discovery_devices = results

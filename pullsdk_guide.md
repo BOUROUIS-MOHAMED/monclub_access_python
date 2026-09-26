@@ -530,6 +530,13 @@ unmatchable.
 
 `[TEST: tests/test_template_wire_encoding.py]`
 
+#### Driver leases (P3b-2)
+
+`DeviceSyncEngine` never opens a session on a panel another PC drives (`_sync_one_device`,
+`_run_single_device_sync`, the DEVICE-mode device list), writes nothing to one being handed over, and the
+stale step / targeted delete defer on an add-only panel — `guide_for_agents_and_dev.md` §3.9. The local
+API's low-level `PullSDK` handlers are wrapped by the same lease gate (409 `notDriver`). `[CODE]`
+
 #### The user-table read-back (P3a-2)
 
 Besides the per-sync `Pin` read, the write-ahead intent (`guide_for_agents_and_dev.md` §3.4a) reads

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
+from app.core.v2 import lease_gate as _lease_gate
+from app.core.v2 import problems as _v2_problems
 from app.core.db import (
     list_device_pin_scheme_switches,
     list_fingerprints,
@@ -1097,6 +1099,13 @@ class DeviceSyncEngine:
         sync_run_id: int | None,
         sdk: PullSDK | None,
     ) -> bool:
+        if not _lease_gate.device_allowed((device or {}).get("id")):
+            # P3b-2: a turnstile this PC does not drive (driver/reader assignment) is never
+            # connected to -- not even through the ULTRA scheduler's fallback path.
+            self.logger.warning(
+                "[DeviceSync] Skip single-device (%s) id=%s: not driven by this PC (assignment)",
+                source, (device or {}).get("id"))
+            return False
         with self._run_lock:
             if self._running:
                 self.logger.info(f"[DeviceSync] Skip single-device ({source}): already running")
@@ -1437,6 +1446,17 @@ class DeviceSyncEngine:
             return False
         if not _boolish(normalized_device.get("accessDevice"), default=True):
             return False
+        if not _lease_gate.device_allowed(did) or _lease_gate.writes_frozen(did):
+            # P3b-2: another PC drives it, or this PC is handing it over (its ownership record
+            # must stay exactly as uploaded). Deferred, never finalised.
+            self.logger.warning(
+                "[DeviceSync] targeted member sync deferred: device_id=%s %s (driver lease). "
+                "source=%s", did,
+                "handover in progress" if _lease_gate.device_allowed(did) else "not driven by this PC",
+                source,
+            )
+            self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
+            return False
 
         # The request names a MEMBERSHIP; the device row is keyed by the device's pinScheme.
         # Under MEMBERSHIP they are the same number (unchanged). Under ACCOUNT the pin is the
@@ -1502,6 +1522,16 @@ class DeviceSyncEngine:
             self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
             return False
 
+        if not isinstance(desired_user, dict) and _lease_gate.removals_blocked(did):
+            # P3b-2: an add-only turnstile (new lease, backup not restored; forced handover):
+            # "not owned" proves nothing yet, so neither delete nor finalise -- defer.
+            self.logger.warning(
+                "[DeviceSync] targeted member delete deferred: device_id=%s pin=%s -- %s "
+                "(driver lease). source=%s", did, pin, _lease_gate.removals_blocked(did), source,
+            )
+            self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
+            return False
+
         if not isinstance(desired_user, dict):
             # OWNERSHIP GATE (P3a-2, guide §3.4). This deleted the pin from four tables
             # with no check at all -- under ACCOUNT, for the 110 account ids that equal
@@ -1537,6 +1567,11 @@ class DeviceSyncEngine:
                 owned = proof
             if not owned:
                 self._last_member_sync_outcome = MEMBER_SYNC_SKIPPED_NOT_OWNED
+                try:
+                    from app.core.v2 import problems as _v2_problems
+                    _v2_problems.registry.skipped_not_owned(did, [pin])
+                except Exception:
+                    pass
                 self.logger.critical(
                     "[DeviceSync] targeted member delete SKIPPED_NOT_OWNED: device_id=%s "
                     "device_name=%r pin=%s membership=%s pinScheme=%s -- MonClub has no "
@@ -2975,6 +3010,17 @@ class DeviceSyncEngine:
         report_progress: bool = True,
     ) -> None:
         dev_id = device.get("id")
+        if not _lease_gate.device_allowed(dev_id):
+            # P3b-2: never open a PullSDK session on a turnstile another PC drives.
+            self.logger.warning(
+                "[DeviceSync] Device id=%s not driven by this PC (assignment) -> skip", dev_id)
+            return None
+        if _lease_gate.writes_frozen(dev_id):
+            # P3b-2: being handed over -- no write until the release is acknowledged (the
+            # ownership record uploaded for the handover must stay exact).
+            self.logger.info(
+                "[DeviceSync] Device id=%s handover in progress -> no push this pass", dev_id)
+            return None
         dev_name = device.get("name") or ""
         ip = (device.get("ipAddress") or "").strip()
         port = _to_int(device.get("portNumber"), default=4370) or 4370
@@ -3291,6 +3337,20 @@ class DeviceSyncEngine:
                                 fingerprint_enabled=fingerprint_enabled,
                             )
 
+            # P3b-2 turnstile problem report: MonClub-owned pins the panel does not hold (the
+            # F-011 drift check above already re-pushes the desired ones).
+            try:
+                if device_pins:
+                    from app.core.db import list_confirmed_device_sync_pins as _owned_pins
+                    _owned = {str(p) for p in (_owned_pins(device_id=did) or ())}
+                    if _owned & device_pins:
+                        _missing = sorted(_owned - device_pins)
+                        if _missing:
+                            _v2_problems.registry.set_code(did, _v2_problems.MISSING_OWNED, _missing)
+                        else:
+                            _v2_problems.registry.clear_code(did, _v2_problems.MISSING_OWNED)
+            except Exception:
+                pass
             # P3a-2 write-ahead: an intent pin that LEFT the roster is settled here -- absent
             # from the panel: dropped; present with the card MonClub wrote: proven MonClub's,
             # so it joins the tracked set and leaves through the stale step (ceiling applies).
@@ -3358,6 +3418,11 @@ class DeviceSyncEngine:
                             "clearing all tables (%d row(s), within the ceiling), pushing all %d members",
                             dev_id, len(device_pins), len(pins_to_sync),
                         )
+                    elif _clear_verdict.reason in ("add_only", "handover_release", "not_leased"):
+                        # P3b-2: deferred by the driver lease, not a ceiling refusal.
+                        removal_notes.append(_push_safety.outcome_note(
+                            "REMOVAL_DEFERRED", _clear_verdict.count,
+                            f"table_clear; {_clear_verdict.reason}"))
                     else:
                         removal_aborted += _clear_verdict.count
                         removal_notes.append(_push_safety.outcome_note(
@@ -3403,6 +3468,13 @@ class DeviceSyncEngine:
                         stale_pins = list(stale_before_clear)
                         break
                 if nuke_mode:
+                    # P3b-2: the panel was wiped (every user row, foreign ones included): the
+                    # server's ownership record for it starts a new generation.
+                    try:
+                        from app.core.v2 import ownership as _v2_ownership
+                        _v2_ownership.note_wipe(did)
+                    except Exception:
+                        pass
                     # Device is now empty — push ALL desired users
                     pins_to_sync = set(desired_pins)
                     stale_pins = []
@@ -3448,6 +3520,9 @@ class DeviceSyncEngine:
                             "confirms their person's new pin: %s",
                             dev_id, len(renewal_held), sorted(renewal_held)[:10],
                         )
+                if not stale_pins:
+                    # P3b-2 problem report: the step ran and refused nothing.
+                    _v2_problems.registry.removal_allowed(did, "stale")
                 if stale_pins:
                     # ONE ceiling for every bulk removal (P3a-2, guide §3.2g). Refused:
                     # nothing is removed, the per-pin state is kept (the prune below is
@@ -3459,10 +3534,17 @@ class DeviceSyncEngine:
                     )
                     if not _stale_verdict.allowed:
                         removal_aborted += _stale_verdict.count
-                        removal_notes.append(_push_safety.outcome_note(
-                            _push_safety.REVOKE_ABORTED, _stale_verdict.count,
-                            f"stale; ceiling {_stale_verdict.ceiling:.0f}",
-                        ))
+                        if _stale_verdict.reason in ("add_only", "handover_release", "not_leased"):
+                            # P3b-2: waiting for a trusted record, not a ceiling refusal.
+                            removal_notes.append(_push_safety.outcome_note(
+                                "REMOVAL_DEFERRED", _stale_verdict.count,
+                                f"stale; {_stale_verdict.reason}",
+                            ))
+                        else:
+                            removal_notes.append(_push_safety.outcome_note(
+                                _push_safety.REVOKE_ABORTED, _stale_verdict.count,
+                                f"stale; ceiling {_stale_verdict.ceiling:.0f}",
+                            ))
                         stale_pins = []
                 if stale_pins:
                     failed_del: List[str] = list(stale_pins)
@@ -3518,6 +3600,15 @@ class DeviceSyncEngine:
             # In normal mode we pre-delete pins individually before batch push.
             use_batch = nuke_mode or len(pins_to_sync) > 5
             pins_sorted = sorted(pins_to_sync)
+            if pins_sorted and (_lease_gate.writes_frozen(did) or not _lease_gate.device_allowed(did)):
+                # P3b-2 (review R11): the lease moved or a handover began during this pass --
+                # nothing more is written to this panel.
+                self.logger.warning(
+                    "[DeviceSync] Device id=%s: lease lost or handover begun mid-pass -- %d push(es) "
+                    "not sent", dev_id, len(pins_sorted))
+                batch_error = "driver lease lost mid-pass"
+                pins_sorted = []
+                pins_to_sync = set()
 
             # WRITE-AHEAD (P3a-2 item 3, guide §3.4a): durable BEFORE the first write of
             # this pass. Phase D records state (and clears these) only after phases A-C,
@@ -4410,6 +4501,13 @@ class DeviceSyncEngine:
                 self.logger.info(
                     "[DeviceSync] Skip device id=%s name=%r: accessDataMode=%r (not DEVICE)",
                     dev_id, dev_name, adm,
+                )
+                continue
+
+            if not _lease_gate.device_allowed(dev_id):
+                self.logger.info(
+                    "[DeviceSync] Skip device id=%s name=%r: driven by another PC (assignment)",
+                    dev_id, dev_name,
                 )
                 continue
 

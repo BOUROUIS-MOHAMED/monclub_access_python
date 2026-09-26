@@ -37,6 +37,7 @@ import {
 import { get, post } from "@/api/client";
 import { useFavoritePresets } from "@/api/hooks";
 import type { FavoriteDoorPresetDto } from "@/api/types";
+import { doorRequestedMessage } from "@/api/realtime";
 
 // ── Anchor ────────────────────────────────────────────────────────────────────
 type Anchor =
@@ -449,11 +450,13 @@ export default function FavoritesOverlayPage() {
     const key = String(fav.id);
     setBusyKey(key);
     try {
-      await post(`/devices/${fav.deviceId}/door/open`, {
+      const res: any = await post(`/devices/${fav.deviceId}/door/open`, {
         doorNumber:   fav.doorNumber,
         pulseSeconds: fav.pulseSeconds,
       });
-      setFlash({ key, ok: true, msg: favoriteTitle(fav, index) });
+      // P3b-2: another PC drives this turnstile -- filed for it, not opened here.
+      if (res?.requested) setFlash({ key, ok: false, msg: `${favoriteTitle(fav, index)}: ${doorRequestedMessage(res)}` });
+      else setFlash({ key, ok: true, msg: favoriteTitle(fav, index) });
     } catch (err) {
       setFlash({ key, ok: false, msg: String(err) });
     } finally {

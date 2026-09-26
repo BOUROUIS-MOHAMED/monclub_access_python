@@ -150,13 +150,128 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
 )
 
 
+# P3b-2: every handler that opens a session on a turnstile (a PullSDK connection, or a call
+# run on the ULTRA worker's connection). With driver/reader assignments on, a PC that does not
+# drive that turnstile answers 409 ``notDriver`` without touching it (owner decision 1: readers
+# never connect). Routes that only read or write local state are not gated.
+LEASE_GATED_HANDLERS: tuple[str, ...] = (
+    "_handle_device_connect",
+    "_handle_device_info",
+    "_handle_device_settings_get",
+    "_handle_device_reentry_set",
+    "_handle_device_clock_get",
+    "_handle_device_clock_sync",
+    "_handle_device_table",
+    "_handle_device_door_open",
+    "_handle_device_users_push",
+    "_handle_device_users_list",
+    "_handle_device_users_delete",
+)
+
+
+def _door_request_via_driver(ctx, device_id: int) -> bool:
+        """A door open for a turnstile another PC drives is FILED on the server, which routes it
+        to that driver (owner decision 2) -- here, not in each caller, so the tray menu, the
+        global favourite shortcuts, the favourites overlay and the tray panel all get it
+        (review round 5; before, only the Devices page did). Answers 202 ``requested``; False
+        (the caller answers 409 ``notDriver`` as before) when v2 is not ON on this PC."""
+        from access import v2_routes
+        from app.api import local_access_api_v2 as legacy
+
+        rt = getattr(ctx.app, "_v2_runtime", None)
+        if rt is None or getattr(rt, "availability", None) != "ON":
+            return False
+        import time as _time
+        now = _time.monotonic()
+        # The desk's own 1 s per-turnstile cooldown (M-003), so a held shortcut files one request.
+        if now - legacy._door_open_last.get(device_id, 0.0) < legacy._DOOR_OPEN_COOLDOWN_SEC:
+            ctx.send_json(429, {"ok": False, "error": "Door open rate limited (1s cooldown)"})
+            return True
+        legacy._door_open_last[device_id] = now
+        v2_routes._handle_v2_request_door(ctx, extra={"requested": True, "notDriver": True})
+        return True
+
+
+def gated_handler(handler):
+    """Wrap a device-session handler with the lease gate."""
+    import functools
+
+    @functools.wraps(handler)
+    def _gated(ctx) -> None:
+        from app.core.v2 import lease_gate
+
+        try:
+            device_id = ctx.param_int("deviceId")
+        except Exception:
+            device_id = 0
+        if device_id > 0 and not lease_gate.device_allowed(device_id):
+            if (handler.__name__ == "_handle_device_door_open"
+                    and not getattr(ctx, "in_process", False)
+                    and _door_request_via_driver(ctx, device_id)):
+                return
+            ctx.send_json(409, {
+                "ok": False,
+                "notDriver": True,
+                "deviceId": device_id,
+                "error": "Ce PC ne pilote pas ce tourniquet (un autre PC en est le pilote).",
+            })
+            return
+        handler(ctx)
+
+    return _gated
+
+
+# P3b-2: the desk card scanner connects to an IP address, not a device id. A scanner set on
+# the address of a turnstile this PC does not drive would be a connection to that turnstile.
+SCANNER_GATED_HANDLERS: tuple[str, ...] = ("_handle_scan_start", "_handle_scan_quick", "_handle_scanner_start")
+
+
+def scanner_gated_handler(handler):
+    import functools
+
+    @functools.wraps(handler)
+    def _gated(ctx) -> None:
+        from app.api import local_access_api_v2 as legacy
+        from app.core.v2.device_ips import ip_is_undriven_turnstile
+
+        try:
+            body = ctx.body() or {}
+            cfg = legacy._get_runtime_access_config(ctx)
+            # Exactly as the handlers read it (no lower-casing, "" -> network): card_scanner
+            # compares with "usb" case-sensitively, so "USB" or an empty body mode is a network
+            # scan there and must be one here (review round 5).
+            mode = legacy._safe_str(body.get("mode"), getattr(cfg, "scanner_mode", "")) or "zkemkeeper"
+            ip = (legacy._safe_str(body.get("ip"), getattr(cfg, "scanner_network_ip", "")) or "").strip()
+        except Exception:
+            mode, ip = "", ""
+        if mode != "usb" and ip and ip_is_undriven_turnstile(ip):
+            ctx.send_json(409, {
+                "ok": False,
+                "notDriver": True,
+                "error": "Ce lecteur de cartes est configuré sur l'adresse d'un tourniquet qu'un autre PC pilote.",
+            })
+            return
+        handler(ctx)
+
+    return _gated
+
+
 def register_access_local_api_routes(router) -> None:
     from access import pc_identity_routes
     from app.api import local_access_api_v2 as legacy
 
+    from access import v2_routes
+
+    for method, pattern, handler_name in v2_routes.ROUTES:
+        router.add(method, pattern, getattr(v2_routes, handler_name))
     for method, pattern, handler_name in ACCESS_LOCAL_ROUTE_SPECS:
         owner = pc_identity_routes if handler_name.startswith("_handle_pc_identity_") else legacy
-        router.add(method, pattern, getattr(owner, handler_name))
+        handler = getattr(owner, handler_name)
+        if handler_name in LEASE_GATED_HANDLERS:
+            handler = gated_handler(handler)
+        if handler_name in SCANNER_GATED_HANDLERS:
+            handler = scanner_gated_handler(handler)
+        router.add(method, pattern, handler)
 
 
 def get_access_local_api_route_specs() -> tuple[RouteSpec, ...]:
@@ -165,6 +280,8 @@ def get_access_local_api_route_specs() -> tuple[RouteSpec, ...]:
 
 __all__ = [
     "ACCESS_LOCAL_ROUTE_SPECS",
+    "LEASE_GATED_HANDLERS",
+    "gated_handler",
     "get_access_local_api_route_specs",
     "register_access_local_api_routes",
 ]

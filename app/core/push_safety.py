@@ -26,6 +26,23 @@ the step stays unconfirmed. ``SKIPPED_NOT_OWNED`` is FINAL: MonClub cannot prove
 wrote that pin, so it will never delete it; the revocation is finished and the pass
 continues. The two must never be confused -- an abort that finalised a revocation
 would silently drop it.
+
+P3b-2 (driver leases, Confirm removal)
+--------------------------------------
+Three more answers, in this order, before the ceiling:
+
+* a turnstile this PC is handing over (``release[]``) or runs ADD-ONLY (a forced handover,
+  or its ownership backup not restored yet for the lease it holds) refuses every removal with
+  reason ``handover_release`` / ``add_only``: retryable exactly like a ceiling refusal, but
+  reported as ``[T] REMOVAL_DEFERRED``, never as ``REVOKE_ABORTED`` (nothing is wrong, the PC
+  is waiting for a record it can trust);
+* above the ceiling, a "Confirm removal" (``REMOVAL_CONFIRM``) the owner approved for EXACTLY
+  this pin set — same count, same canonical hash, not expired, on the standalone revoke pass
+  or the PullSDK stale step only — lets that one step through, once;
+* every refusal of those two steps is recorded (all its pins) for the turnstile problem
+  report; the table clear (which deletes foreign users too) and the renewal release are not.
+
+It still imports no engine module: the lease gate and the problem registry are leaves.
 """
 from __future__ import annotations
 
@@ -33,6 +50,8 @@ import logging
 from typing import Iterable, NamedTuple
 
 from app.core import telemetry as _tel
+from app.core.v2 import lease_gate as _lease_gate
+from app.core.v2 import problems as _problems
 
 logger = logging.getLogger(__name__)
 
@@ -87,14 +106,44 @@ def check_bulk_removal(
     n = max(0, int(count or 0))
     roster = max(0, int(roster_count or 0))
     ceiling = removal_ceiling(roster)
+    pins = [str(p) for p in (sample or ())]
     if n <= 0:
+        _problems.registry.removal_allowed(device_id, path)
         return RemovalVerdict(True, 0, roster, ceiling, "")
+    blocked = _lease_gate.removals_blocked(device_id) if device_id is not None else None
+    if blocked:
+        try:
+            _tel.warn("REMOVAL_DEFERRED", worker=worker or None, device_id=device_id,
+                      protocol=protocol or None, path=path, count=n, reason=blocked)
+        except Exception:
+            pass
+        logger.warning(
+            "REMOVAL_DEFERRED device=%s path=%s: %d pin(s) kept -- %s (driver lease); "
+            "retried once the turnstile's record is trusted.", device_id, path, n, blocked,
+        )
+        return RemovalVerdict(False, n, roster, ceiling, blocked)
     if roster <= 0:
         reason = "empty_roster"
     elif n > ceiling:
         reason = "above_ceiling"
     else:
+        _problems.registry.removal_allowed(device_id, path)
         return RemovalVerdict(True, n, roster, ceiling, "")
+    if (reason == "above_ceiling" and path in _problems.CONFIRMABLE_PATHS and len(set(pins)) == n
+            and _problems.registry.consume_approval(device_id, pins)):
+        try:
+            _tel.warn("REMOVAL_CONFIRMED", worker=worker or None, device_id=device_id,
+                      protocol=protocol or None, path=path, count=n, roster=roster,
+                      ceiling=round(ceiling, 1))
+        except Exception:
+            pass
+        logger.warning(
+            "REMOVAL_CONFIRMED device=%s path=%s: %d pin(s) above the ceiling (%.0f) removed "
+            "on the owner's Confirm removal for exactly this list.", device_id, path, n, ceiling,
+        )
+        _problems.registry.removal_allowed(device_id, path)
+        return RemovalVerdict(True, n, roster, ceiling, "")
+    _problems.registry.revoke_aborted(device_id, path, pins, reason)
     try:
         _tel.warn(
             REVOKE_ABORTED,

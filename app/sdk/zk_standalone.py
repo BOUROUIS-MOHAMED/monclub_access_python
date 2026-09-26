@@ -1068,6 +1068,12 @@ class ZKStandaloneDevice:
             pass
         # keep the event-side identity map in step with what the device now holds
         self._refresh_pin_card_map()
+        # P3b-2: why each failed pin failed (the engine's turnstile problem report reads the
+        # template-version refusals). Additive key; nothing else decides on it.
+        agg["failed_reasons"] = {
+            str(p): agg_failed_reasons.get(str(p), "chunk_wedged_or_unconfirmed")
+            for p in agg.get("failed_pins") or []
+        }
         return agg
 
     def list_device_users(self, *, timeout_sec: float = 60.0) -> Dict[str, Any]:

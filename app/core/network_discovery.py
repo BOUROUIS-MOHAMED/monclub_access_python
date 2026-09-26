@@ -74,6 +74,7 @@ def scan_subnet(
     max_workers: int = 50,
     do_handshake: bool = True,
     cancel_event: Optional[threading.Event] = None,
+    skip_ips: Optional[set] = None,
 ) -> List[DiscoveredDevice]:
     """
     Scan a /24 subnet for ZKTeco devices.
@@ -105,7 +106,8 @@ def scan_subnet(
         logger.warning(f"Subnet {subnet} too wide, limiting to /24")
         network = ipaddress.IPv4Network(f"{network.network_address}/24", strict=False)
 
-    hosts = [str(h) for h in network.hosts()]
+    # P3b-2: never probe a turnstile another PC drives (a reader never connects to one).
+    hosts = [str(h) for h in network.hosts() if str(h) not in (skip_ips or ())]
     found: List[DiscoveredDevice] = []
 
     def probe(ip: str) -> Optional[DiscoveredDevice]:

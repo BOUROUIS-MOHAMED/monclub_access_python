@@ -38,6 +38,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
+  RadioTower,
   Router,
   Users,
   Fingerprint,
@@ -76,6 +77,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: "/", label: "Dashboard", icon: LayoutDashboard },
       { to: "/devices", label: "Appareils", icon: Router },
       { to: "/agent", label: "Agent", icon: Bot, live: true },
+      { to: "/realtime", label: "Pilote / Lecteur", icon: RadioTower },
     ],
   },
   {

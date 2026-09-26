@@ -27,6 +27,7 @@ from access.storage import current_access_runtime_db_path
 from app.core.utils import ensure_dirs
 from app.core import telemetry as _tel
 from app.sdk.pullsdk import PullSDKDevice
+from app.core.v2 import lease_gate as _lease_gate
 from app.sdk.device_driver import get_driver
 from app.core.access_types import AccessEvent, NotificationRequest, HistoryRecord
 from app.core.anti_fraud import AntiFraudGuard
@@ -750,6 +751,23 @@ class DeviceWorker(threading.Thread):
                     pass
                 self._emit_status(enabled=False, connected=False, last_error="disabled")
                 self.wake_event.wait(timeout=0.5)
+                self.wake_event.clear()
+                continue
+
+            if not _lease_gate.device_allowed(self.device_id):
+                # P3b-2 (review round 5): the lease (or the release this PC was finishing)
+                # ended -- stop polling and drop the session at this turn, not at the next sync
+                # tick (one lock-free snapshot read). Not a hard guarantee: a door open already
+                # decided may reconnect through the command bus until the worker is removed.
+                if self._device.is_connected:
+                    try:
+                        self._device.disconnect()
+                    except Exception:
+                        pass
+                    self.logger.info("[RT][device=%s] disconnected: this PC no longer drives it",
+                                     self.device_id)
+                self._emit_status(enabled=True, connected=False, last_error="not_leased")
+                self.wake_event.wait(timeout=1.0)
                 self.wake_event.clear()
                 continue
 
@@ -2185,6 +2203,12 @@ class AgentRealtimeEngine:
             if mode != "AGENT":
                 self.logger.info(
                     "[RT] device id=%s name=%r skipped: accessDataMode=%r (not AGENT)", did, dev_name, mode
+                )
+                continue
+
+            if not _lease_gate.device_allowed(did):
+                self.logger.info(
+                    "[RT] device id=%s name=%r skipped: driven by another PC (assignment)", did, dev_name
                 )
                 continue
 

@@ -894,6 +894,89 @@ def _refresh_member_person_links_sql(cur: Any) -> None:
 _HELD_EXTRA_COLUMNS: tuple[str, ...] = ("held_reason", "held_for_date", "held_at")
 
 
+def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
+    """The P3b-2 tables (driver leases, remote commands, ownership backup, loss re-add). Called
+    inside init_db's single transaction; every statement is CREATE ... IF NOT EXISTS, so an
+    upgrade adds empty tables and changes no existing row.
+
+    * v2_kv -- small JSON state: the cached assignment (offline cold starts), the server clock
+      offset, the per-turnstile restore/read-back record.
+    * v2_command_journal -- one row per remote command this PC saw; ``state`` is written
+      durably BEFORE the command acts, so a restart never runs a command twice.
+    * v2_ownership_uploaded -- what this PC last told the server per (turnstile, scheme,
+      ownership generation, pin), so only changes are uploaded.
+    * v2_removal_log -- pins MonClub REMOVED from a turnstile (written in the removal's own
+      transaction): the only source of an uploaded ``REMOVED`` fact.
+    * v2_readd -- owned pins found missing from a trusted read-back, waiting to be pushed again.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_kv (
+            key         TEXT PRIMARY KEY,
+            value_json  TEXT NOT NULL,
+            updated_at  REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_command_journal (
+            id              TEXT PRIMARY KEY,
+            type            TEXT NOT NULL DEFAULT '',
+            claim_token     TEXT NOT NULL,
+            state           TEXT NOT NULL,
+            gym_device_id   INTEGER,
+            payload_json    TEXT,
+            finish_by       TEXT,
+            started_at      REAL,
+            outcome         TEXT,
+            result_code     TEXT,
+            result_json     TEXT,
+            reported        INTEGER NOT NULL DEFAULT 0,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_ownership_uploaded (
+            device_id          INTEGER NOT NULL,
+            pin_scheme         TEXT NOT NULL,
+            generation         INTEGER NOT NULL,
+            pin                TEXT NOT NULL,
+            state              TEXT NOT NULL,
+            pushed_hash        TEXT,
+            pushed_finger_ids  TEXT,
+            observed_at        REAL NOT NULL,
+            PRIMARY KEY (device_id, pin_scheme, generation, pin)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_removal_log (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            removed_at     REAL NOT NULL,
+            corrected      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS v2_readd (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            found_at       REAL NOT NULL,
+            attempts       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+
+
 def _create_protocol2_tables(conn: sqlite3.Connection) -> None:
     """The P3b-1 tables. Called inside init_db's single transaction, after sync_users exists.
 
@@ -3246,6 +3329,7 @@ def init_db() -> None:
         )
 
         _create_protocol2_tables(conn)
+        _create_v2_realtime_tables(conn)
 
         conn.commit()
 
@@ -8861,8 +8945,22 @@ def delete_device_sync_state(*, device_id: int, pin: str) -> None:
         conn.execute("DELETE FROM device_sync_state WHERE device_id=? AND pin=?", (did, p))
         # Every caller removed the pin from the device first; its intent is moot.
         conn.execute("DELETE FROM device_push_intent WHERE device_id=? AND pin=?", (did, p))
+        _log_v2_removal(conn, did, p)
 
     _run_db_write_sync("delete_device_sync_state", _write)
+
+
+def _log_v2_removal(conn: sqlite3.Connection, device_id: int, pin: str) -> None:
+    """P3b-2: remember that MonClub removed ``pin`` from the turnstile (the ownership backup's
+    ``REMOVED`` fact), in the removal's own transaction. Time = the server-corrected clock when
+    measured (owner decision 5a), else the PC's with ``corrected=0``."""
+    from app.core.v2.server_clock import corrected_now
+
+    at, corrected = corrected_now()
+    conn.execute(
+        "INSERT OR REPLACE INTO v2_removal_log (device_id, pin, removed_at, corrected) VALUES (?, ?, ?, ?)",
+        (int(device_id), str(pin), float(at), 1 if corrected else 0),
+    )
 
 
 def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
@@ -8888,6 +8986,7 @@ def clear_device_revocation_state(*, device_id: int, pin: str) -> None:
         profile["sync_rows"] = max(0, int(sync_cur.rowcount or 0))
         profile["mirror_rows"] = max(0, int(mirror_cur.rowcount or 0))
         profile["intent_rows"] = max(0, int(intent_cur.rowcount or 0))
+        _log_v2_removal(conn, did, p)
 
     _run_db_write_sync("clear_device_revocation_state", _write)
 

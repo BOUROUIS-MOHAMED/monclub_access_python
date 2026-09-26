@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import EnrollTurnstileStatus from "@/components/EnrollTurnstileStatus";
 import { useEnroll, useUsers, useDevices } from "@/api/hooks";
 import { ApiError, openSSE } from "@/api/client";
 import { useEnrollment } from "@/context/EnrollmentContext";
@@ -614,6 +615,7 @@ export default function EnrollPage() {
             </AlertDescription>
           </Alert>
         )}
+        {result === "success" && <EnrollTurnstileStatus />}
       </div>
 
       {/* ── Le rail ─────────────────────────────────────────────────────── */}
