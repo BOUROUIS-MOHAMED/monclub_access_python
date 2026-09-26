@@ -661,9 +661,9 @@ class TestPanelCards:
         assert cards["people_with_terminal_only_card_held_by_another_member"] == 1
         assert "people_with_terminal_only_card_and_no_monclub_card" not in cards
         (row,) = [d for d in details if d.kind == "member_terminal_only_card"]
-        assert row.note == ("cards 5:103:card 4001; no card in MonClub"
+        assert row.note == ("cards 5:103:card 4001; this member has none in MonClub"
                             "; that card is held by another member in MonClub -- do not enter it")
-        assert not row.note.endswith("no card in MonClub")
+        assert "no card in MonClub" not in row.note     # the desk phrase never appears on this row
 
     def test_a_member_whose_only_monclub_card_is_the_second_is_not_no_card(self, tmp_path):
         db = tmp_path / "access.db"
@@ -719,6 +719,24 @@ class TestPanelCards:
         assert report["card_self_check"]["equal"] == 0
         assert report["cards"]["people_with_terminal_only_card"] == 10   # every one looks like a loss
         assert "STOP" in cte.render(report)
+
+    def test_the_account_run_on_a_panel_still_on_membership_pins_measures_nothing(self, tmp_path):
+        """Runbook C4: the --scheme ACCOUNT run before the switch looks up account pins, which the
+        panel does not hold yet -- its self-check says so, and the cards come from the other run."""
+        db = tmp_path / "access.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sync_users (user_id INTEGER, active_membership_id INTEGER, full_name TEXT,"
+                     " first_card_id TEXT, second_card_id TEXT, fingerprints_json TEXT, main_account_id INTEGER)")
+        conn.execute("INSERT INTO sync_users VALUES (1, 101, 'A', '4001', '', '[]', 9001)")
+        conn.commit()
+        conn.close()
+        ex = cte.load_export(str(_panel_export(tmp_path / "p5.json", [("101", "A", "4001")])), 5)
+        acc = cte.load_access_db(str(db))
+        member, _ = cte.analyse([ex], acc, scheme="MEMBERSHIP")
+        assert member["card_self_check"]["compared"] == 1 and member["card_self_check"]["equal"] == 1
+        account, _ = cte.analyse([ex], acc, scheme="ACCOUNT")
+        assert account["card_self_check"]["compared"] == 0
+        assert "NOT MEASURED (no ACCOUNT member pin on the device" in cte.render(account)
 
     def test_the_card_self_check_counts_only_pins_monclub_owns(self, gym):
         """Beta (pin 12, card 777 in MonClub) is on the terminal without a card, but pin 12 is not

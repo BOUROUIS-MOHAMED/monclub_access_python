@@ -950,9 +950,11 @@ def analyse(
             crd["people_with_terminal_only_card_and_second_monclub_card_only"] += 1
             tail = (f"; MonClub holds only a second card {'/'.join(second)} (a device is sent the first card only)"
                     " -- do not overwrite it")
+        elif others:
+            # never the desk phrase "no card in MonClub": this card must not be entered
+            tail = "; this member has none in MonClub"
         else:
-            if not others:
-                crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
+            crd["people_with_terminal_only_card_and_no_monclub_card"] += 1
             tail = "; no card in MonClub"
         if marker:
             crd["people_with_terminal_only_card_and_99999_monclub_card"] += 1
@@ -1029,7 +1031,9 @@ def render(report: Dict[str, Any]) -> str:
         cc = report.get("card_self_check", {})
         rate, thr = cc.get("rate"), cc.get("threshold", CARD_TRUST_THRESHOLD)
         if rate is None:
-            verdict = "NOT MEASURED -- the cards list is unchecked: do not act on it"
+            verdict = (f"NOT MEASURED (no {report['scheme_assumed_on_terminal']} member pin on the device with a card "
+                       "MonClub sends: read the cards from the run whose --scheme is the one the device holds) "
+                       "-- the cards list is unchecked: do not act on it")
         elif rate >= thr:
             verdict = f"at or above {thr:.0%} -- the cards list can be used"
         else:
