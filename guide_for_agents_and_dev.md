@@ -3426,7 +3426,8 @@ samples taken in the last 30 minutes on the PC's own clock** (`RECENT_SEC`, incl
 2026-09-27, before contract revision 4): `offsetSec` = their median, `samples` = their count, `ageSec` = the age
 of the OLDEST of them. Why: with the socket up the guaranteed samples are the 600 s assignment refreshes, so the
 window of 7 spanned about an hour and its oldest sample never met the dashboard's freshness rule (measured ≥ last
-seen − 30 min). No sample in the last 30 minutes: the window's own median and count, **without** `ageSec`. The
+seen − 30 min). No sample in the last 30 minutes: the window's own median as `offsetSec`, `samples` **0** (it
+always counts the view, contract revision 4.1 §5.1) and **no** `ageSec`. The
 window of 7 that drives `offset()` (every `sentAt` / `observedAt`) is untouched. Each recent sample is kept, and
 persisted (`recent` in the `server_clock` kv row), with its own time, so after a restart a remembered offset counts
 its age from the original measurement; a row persisted before this change has no `recent`, so `ageSec` is left

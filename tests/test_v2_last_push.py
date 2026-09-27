@@ -452,7 +452,8 @@ def test_no_sample_in_the_last_30_minutes_sends_no_age():
     t["wall"] += 35 * 60
     rep = clk.report()
     assert "ageSec" not in rep
-    assert rep["samples"] == 2 and rep["offsetSec"] == pytest.approx(6.0), "the window's own figures"
+    assert rep["samples"] == 0, "samples counts the view: none recent (contract revision 4.1 §5.1)"
+    assert rep["offsetSec"] == pytest.approx(6.0), "the offset is the window's"
 
 
 # ─────────────────────────── master corrections (2026-09-27, before contract revision 4) ───────────────────────────
@@ -581,9 +582,10 @@ def test_a_sample_taken_before_a_clock_step_back_never_returns_to_the_view():
     real["t"] += 3600 - 60 + 10
     pc["wall"] = real["t"]
     rep = clk.report()
-    # The good sample is 58 min old, the pre-step one was dropped: nothing recent, so the
-    # window's own figures (it keeps both: offset() is not this view) and no age.
-    assert "ageSec" not in rep and rep["samples"] == 2
+    # The good sample is 58 min old, the pre-step one was dropped: nothing in the view, so
+    # samples 0, no age, and the window's offset (it keeps both: offset() is not this view).
+    assert "ageSec" not in rep and rep["samples"] == 0
+    assert rep["offsetSec"] == pytest.approx(-1800.0)
 
 
 def test_a_persisted_sample_from_the_future_is_dropped_at_load():

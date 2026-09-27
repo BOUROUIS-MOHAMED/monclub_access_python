@@ -24,7 +24,8 @@ report it in the heartbeat.
   so the window of 7 spans an hour and its oldest sample never met the dashboard's 30-minute
   freshness rule). The window that drives ``offset()`` is not touched. Each recent sample is
   persisted with its own time, so a remembered offset counts its age from the original
-  measurement. No sample in the last 30 minutes: the window's own figures, without ``ageSec``.
+  measurement. No sample in the last 30 minutes: the window's offset, ``samples`` 0 (it always
+  counts the view, contract revision 4.1 §5.1), without ``ageSec``.
   Each sample also keeps the MONOTONIC time it was taken (a loaded one is pinned to this
   process's monotonic clock at load): its age is measured on that clock, and once the PC's wall
   clock has been stepped since (wall - mono moved by more than ``STEP_TOLERANCE_SEC``, either
@@ -214,7 +215,9 @@ class ServerClock:
             off = self._offset_locked()
             if off is None:
                 return None
-            return {"offsetSec": round(off, 3), "samples": len(self._samples), "source": source}
+            # No sample in the view: the window's offset, but ``samples`` always counts the VIEW
+            # -- 0 here -- and there is no age (contract revision 4.1 §5.1).
+            return {"offsetSec": round(off, 3), "samples": 0, "source": source}
 
     # ------------------------------------------------------------------ persistence
     def _maybe_persist(self) -> None:
