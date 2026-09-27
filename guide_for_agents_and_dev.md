@@ -3054,8 +3054,10 @@ and `device_push_intent` rows by `updated_at`, and `v2_removal_log` rows by `rem
 ::test_a_corrected_removal_is_compared_with_the_switch_on_the_pcs_clock,
 ::test_a_corrected_removal_after_the_switch_is_still_uploaded]`
 Until this change the removal rows had no such check. After a MEMBERSHIP → ACCOUNT switch, the first upload under
-the new generation sent every membership-era removal as an ACCOUNT fact. `[TEST: red on aeeef69 — the upload body
-under (ACCOUNT, 5) carried membership id 300 as REMOVED, logged an hour before the recorded switch]`
+the new generation sent, as an ACCOUNT fact, every membership-era removal that no later state row of the same pin
+number had superseded. `[TEST: ::test_a_removal_logged_before_the_switch_is_not_uploaded_under_the_new_scheme fails
+on aeeef69: build_rows under (ACCOUNT, 5) returns membership id 300 as REMOVED, logged an hour before the recorded
+switch]` A scratch probe of `upload()` on aeeef69 (not in the repo) showed that row in the POST body.
 The server does not drop such a fact. Its "outdated" fence (`ignoredOutdated`) applies only to a `DEVICE_WIPED`
 generation: a `PIN_SCHEME_CHANGED` bump is lazy (the first request after the switch) and clears `wipedAt`. Its
 tombstones are looked up per scheme, too. So the fact is stored as `REMOVED` in the ACCOUNT generation, and after
