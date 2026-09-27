@@ -174,17 +174,19 @@ def held_waiting_count(device_id: Any) -> Optional[int]:
     its refill would write -- all of them wait while it is held. In memory only (the heartbeat's
     rule): the sync cache already loaded, never a load. None when it cannot be told."""
     try:
-        from app.core.db import peek_sync_cache
+        from app.core.db import _coerce_device_row_to_payload, peek_sync_cache
 
         cache = peek_sync_cache()
         if cache is None:
             return None
         did = int(device_id)
-        device = next((d for d in (getattr(cache, "devices", None) or [])
-                       if isinstance(d, dict) and str(d.get("id")) == str(did)), None)
-        if device is None:
+        row = next((d for d in (getattr(cache, "devices", None) or [])
+                    if isinstance(d, dict) and str(d.get("id")) == str(did)), None)
+        if row is None:
             return None
-        return int(refill_roster(device, cache)["members"])
+        # The cache holds the DB row (snake_case: ``allowed_memberships``, ``pin_scheme``); the
+        # passes filter the payload shape (``allowedMemberships``) -- the same coercion they get.
+        return int(refill_roster(_coerce_device_row_to_payload(row), cache)["members"])
     except Exception:
         return None
 

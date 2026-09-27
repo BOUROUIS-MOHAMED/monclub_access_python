@@ -332,6 +332,26 @@ class TestTheHeartbeatOfAHeldTurnstile:
         assert line == [{"gymDeviceId": 5, "reachable": True, "failedPins": 0, "mode": "ULTRA",
                          "held": True}], "the size cannot be told: the worker's figure stays"
 
+    def test_the_cache_row_is_filtered_as_the_passes_filter_it(self, sqlite_db, monkeypatch,
+                                                               refill_cache):
+        """The sync cache keeps the DB row (snake_case). The passes filter the payload shape:
+        ``allowedMemberships`` read from a snake_case row would be missed and every member
+        counted (found in review of this lane)."""
+        from access.pc_identity import build_heartbeat_payload
+        refill_cache.users = [
+            {"userId": 1, "activeMembershipId": 101, "mainAccountId": 9101, "membershipId": 7},
+            {"userId": 2, "activeMembershipId": 102, "mainAccountId": 9102, "membershipId": 8},
+            {"userId": 3, "activeMembershipId": 103, "membershipId": 7},          # no account id
+        ]
+        row = {"id": 5, "name": "Entrée 1", "ip_address": "192.168.0.202", "port_number": 4370,
+               "access_data_mode": "ULTRA", "allowed_memberships": [7], "pin_scheme": "ACCOUNT"}
+        app = _heartbeat_app(monkeypatch, refill_cache, _device(did=5))
+        refill_cache.devices = [row]
+        device_hold.hold(5, reason="erase", run_id="r")
+        line = build_heartbeat_payload(app)["turnstiles"][0]
+        assert line["held"] is True and line["failedPins"] == 1, (
+            "membership 7 only, under ACCOUNT: 101's person; 103 is withheld")
+
     def test_the_run_leaves_the_roster_waiting_not_none(self, sqlite_db, monkeypatch, tmp_path):
         """F0: _records used to set None, which the heartbeat sends as 0."""
         wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
