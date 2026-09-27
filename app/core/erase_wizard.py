@@ -171,13 +171,21 @@ def refill_roster(device: Dict[str, Any], cache: Any, *,
             "pins": frozenset(str(p) for p in by_pin)}
 
 
+# The verifier's text when this PC has no gym token (local_access_api_v2._erase_password_verifier).
+NOT_SIGNED_IN = "this PC is not signed in to MonClub"
+
+
 def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
-    """The refusal of a password check, with a code the page translates. ONLY a 401 is a wrong
-    password (``validate_statistics_password`` answers False on 401 alone); a 503 is "could not be
-    asked" (offline, no gym token); a 400 is no password; any other status is the server failing
-    the check (a proxy's 502/504, a 5xx) -- never "wrong password" (lane 1b review round 1)."""
+    """The refusal of a password check, with a code the page translates. A 401 is a wrong password
+    (``validate_statistics_password`` answers False on a 401 alone; whether the backend also answers
+    401 for a rejected gym token is [UNVERIFIED]); a 503 is "could not be asked" (offline) or, with
+    the verifier's ``NOT_SIGNED_IN`` text, a PC with no gym token; a 400 is no password; any other
+    status is the server failing the check (a proxy's 502/504, a 5xx) -- never "wrong password"
+    (lane 1b review rounds 1-2)."""
     code = {401: "ADMIN_PASSWORD", 400: "ADMIN_PASSWORD_REQUIRED",
             503: "ADMIN_PASSWORD_UNCHECKABLE"}.get(int(status or 0), "ADMIN_PASSWORD_CHECK_FAILED")
+    if code == "ADMIN_PASSWORD_UNCHECKABLE" and str(error or "").startswith(NOT_SIGNED_IN):
+        code = "PC_NOT_SIGNED_IN"                  # not "no internet": the PC has no gym token
     return int(status or 503), {"ok": False, "code": code, "error": error}
 
 
@@ -1370,6 +1378,7 @@ class EraseWizard:
             return 500, {"ok": False, "code": "RECORDS_NOT_RESET",
                          "error": f"MonClub's records of this turnstile could not be reset: {exc}"}
         device_hold.release(did)
+        _mark_refilled(self.backup_root(), did)        # the 30 days count from now (NEW 1)
         self._force_scheduler(did)
         worker = self._worker(did)
         requested = False
@@ -1393,18 +1402,47 @@ class EraseWizard:
 
 BACKUP_KEEP_DAYS = 30
 _RUN_DIR_NAME = re.compile(r"^(\d{8}-\d{6})-[0-9a-f]{6}_device(\d+)$")
+# No run can predate the wizard (September 2026): a run id before this is a PC clock that was
+# wrong at the time (a dead CMOS battery), and its age cannot be told -- never pruned
+# automatically (lane 1b review round 2).
+_NO_RUN_BEFORE = "20260901"
+REFILLED_MARK = "refilled_at.txt"
+
+
+def _mark_refilled(root: Path, device_id: int) -> None:
+    """Refill released this turnstile: its run folders' 30 days count from NOW, not from the
+    erase (a turnstile can stay held longer, and a refill can take several passes). One small
+    file per folder; best effort."""
+    try:
+        if not root.is_dir():
+            return
+        stamp = _now_text().encode("ascii")
+        for folder in root.iterdir():
+            m = _RUN_DIR_NAME.match(folder.name)
+            if m and int(m.group(2)) == int(device_id) and folder.is_dir():
+                try:
+                    (folder / REFILLED_MARK).write_bytes(stamp)
+                except Exception:
+                    _log.warning("[ERASE] refill mark not written in %s", folder.name,
+                                 exc_info=True)
+    except Exception:
+        _log.warning("[ERASE] refill marks not written for turnstile %s", device_id,
+                     exc_info=True)
 
 
 def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = None,
                         keep_run_id: Optional[str] = None) -> List[str]:
     """Delete erase run folders (backup + run.json) older than ``BACKUP_KEEP_DAYS`` (owner decision
-    2026-09-27, guide §3.2h). The age is the run's START, from its run id (local time). NEVER:
-    a folder whose name is not a run's; the run in progress (``keep_run_id``); any run of a
-    turnstile still HELD -- while the holds cannot be read every turnstile reads held, so nothing
-    goes; a run whose ``run.json`` does not read or is not finished (``RUNNING``, or none). An
-    ``INCOMPLETE`` run keeps its hold until Refill (the only release after a delete), so once its
-    turnstile is no longer held it was refilled. Logged by run id, turnstile and state only --
-    never a name, card or template. Returns the run ids deleted. Never raises."""
+    2026-09-27, guide §3.2h). The age counts from the LATEST of: the run's start (its run id, local
+    time) and the last write of any file in its folder -- the run's end, and the refill mark Refill
+    writes -- so a backup stays 30 days after its turnstile was refilled. NEVER: a folder whose
+    name is not a run's; a run id before ``_NO_RUN_BEFORE`` (a wrong clock); the run in progress
+    (``keep_run_id``); any run of a turnstile still HELD -- while the holds cannot be read every
+    turnstile reads held, so nothing goes. A run whose ``run.json`` is unreadable or still says
+    ``RUNNING`` goes too once old enough and not held: no run of this process is that old, so it
+    is a run a power cut or a crash ended -- its biometric copy is not kept forever (review round
+    2). Logged by run id, turnstile and state only -- never a name, card or template. Returns the
+    run ids deleted. Never raises."""
     deleted: List[str] = []
     try:
         base = Path(root) if root is not None else _default_backup_root()
@@ -1420,20 +1458,26 @@ def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = N
                 did = int(m.group(2))
                 if keep_run_id and run_id == keep_run_id:
                     continue
-                if time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S")) >= cutoff:
+                if m.group(1)[:8] < _NO_RUN_BEFORE:
+                    continue
+                newest = max([time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))]
+                             + [f.stat().st_mtime for f in folder.iterdir() if f.is_file()])
+                if newest >= cutoff:
                     continue
                 if device_hold.is_held(did):
                     continue
-                state = json.loads((folder / "run.json").read_text(encoding="utf-8")).get("state")
-                if state not in ("DONE", "FAILED", "INCOMPLETE"):
-                    continue
+                try:
+                    state = str(json.loads((folder / "run.json").read_text(encoding="utf-8"))
+                                .get("state") or "UNKNOWN")
+                except Exception:
+                    state = "UNREADABLE"
                 shutil.rmtree(folder)
                 deleted.append(run_id)
                 _log.warning("[ERASE] backup of run %s (turnstile %s, %s) deleted: older than %d "
                              "days", run_id, did, state, BACKUP_KEEP_DAYS)
                 try:
                     _tel.event("ERASE_STEP", run=run_id, device_id=did, step="backup_deleted",
-                               ok=True, state=str(state))
+                               ok=True, state=state)
                 except Exception:
                     pass
             except Exception:

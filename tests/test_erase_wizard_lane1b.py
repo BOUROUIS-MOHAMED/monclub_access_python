@@ -765,18 +765,23 @@ class TestTheGymsServerSwitch:
 # ─────────────────────────── owner decision NEW 1: backups kept 30 days ───────────────────────────
 
 def _run_folder(root, run_id, did, state="DONE", with_run=True, names=("Ali Ben Salah",)):
+    """A run folder whose files were last written at the run's own start (its run id)."""
+    import os
     folder = root / f"{run_id}_device{did}"
     folder.mkdir(parents=True)
     users = ",".join(json.dumps({"name": n}) for n in names)
     (folder / "backup.json").write_text('{"users": [' + users + ']}', encoding="utf-8")
     if with_run:
         (folder / "run.json").write_text(json.dumps({"state": state}), encoding="utf-8")
+    at = time.mktime(time.strptime(run_id[:15], "%Y%m%d-%H%M%S"))
+    for f in folder.iterdir():
+        os.utime(f, (at, at))
     return folder
 
 
-OLD = "20260801-101500-aaaaaa"          # 57 days before NOW
-RECENT = "20260920-101500-bbbbbb"
-NOW = time.mktime(time.strptime("20260927-120000", "%Y%m%d-%H%M%S"))
+OLD = "20261001-101500-aaaaaa"          # 45 days before NOW
+RECENT = "20261101-101500-bbbbbb"
+NOW = time.mktime(time.strptime("20261115-120000", "%Y%m%d-%H%M%S"))
 
 
 class TestBackupsAreKeptThirtyDays:
@@ -796,9 +801,51 @@ class TestBackupsAreKeptThirtyDays:
         folder = _run_folder(root, OLD, 5, state=state)
         device_hold.hold(5, reason="erase", run_id="r")
         assert ew.prune_erase_backups(root, now=NOW) == [] and folder.exists()
-        device_hold.release(5)
-        assert ew.prune_erase_backups(root, now=NOW) == [OLD], (
-            "an INCOMPLETE run keeps its hold until Refill: no hold, it was refilled")
+
+    def test_the_30_days_count_from_the_refill(self, sqlite_db, tmp_path, monkeypatch):
+        """Review round 2, finding 1: a turnstile held longer than 30 days keeps its backup for
+        30 days after Refill, not until the next prune."""
+        # Runs 45 days before the real clock (the refill mark is written with it).
+        monkeypatch.setattr(ew, "_NO_RUN_BEFORE", "20000101")
+        run = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - 45 * 86400))
+        mine, theirs = f"{run}-aaaaaa", f"{run}-cccccc"
+        root = tmp_path / "erase_backups"
+        folder = _run_folder(root, mine, 5, state="INCOMPLETE")
+        other = _run_folder(root, theirs, 6)
+        device_hold.hold(5, reason="erase", run_id=mine)
+        wiz = ew.EraseWizard(_app({}), backup_root=root, spawn=lambda fn: fn(),
+                             sleep=lambda s: None)
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda did: None)
+        assert wiz.refill(5, _refill_body(), verify_password=_pw_ok)[0] == 200
+        assert (folder / ew.REFILLED_MARK).exists() and not (other / ew.REFILLED_MARK).exists()
+        refilled_at = (folder / ew.REFILLED_MARK).stat().st_mtime
+        assert ew.prune_erase_backups(root, now=refilled_at + 29 * 86400) == [theirs]
+        assert folder.exists(), "29 days after the refill: kept"
+        assert ew.prune_erase_backups(root, now=refilled_at + 31 * 86400) == [mine]
+
+    def test_a_run_dated_before_the_wizard_is_a_wrong_clock_and_is_kept(self, sqlite_db,
+                                                                        tmp_path):
+        """Review round 2, finding 2: a dead CMOS battery stamps a run in 2000; once the clock
+        is corrected its age cannot be told."""
+        root = tmp_path / "erase_backups"
+        folder = _run_folder(root, "20000101-000000-dddddd", 5)
+        assert ew.prune_erase_backups(root, now=NOW) == [] and folder.exists()
+
+    @pytest.mark.parametrize("case", ["running", "no_run_json", "bad_run_json"])
+    def test_a_run_a_power_cut_ended_goes_after_30_days(self, sqlite_db, tmp_path, case):
+        """Review round 2, finding 3: no run of this process is 30 days old, so a RUNNING or
+        unreadable record is a dead run -- its biometric copy is not kept forever."""
+        import os
+        root = tmp_path / "erase_backups"
+        if case == "running":
+            folder = _run_folder(root, OLD, 5, state="RUNNING")
+        else:
+            folder = _run_folder(root, OLD, 5, with_run=False)
+            if case == "bad_run_json":
+                (folder / "run.json").write_text("{not json", encoding="utf-8")
+                at = time.mktime(time.strptime(OLD[:15], "%Y%m%d-%H%M%S"))
+                os.utime(folder / "run.json", (at, at))
+        assert ew.prune_erase_backups(root, now=NOW) == [OLD] and not folder.exists()
 
     def test_nothing_goes_while_the_holds_cannot_be_read(self, sqlite_db, tmp_path, monkeypatch):
         root = tmp_path / "erase_backups"
@@ -806,27 +853,23 @@ class TestBackupsAreKeptThirtyDays:
         monkeypatch.setattr(device_hold, "_load_failed", True)
         assert ew.prune_erase_backups(root, now=NOW) == [] and folder.exists()
 
-    @pytest.mark.parametrize("case", ["running", "no_run_json", "bad_run_json", "not_a_run",
-                                      "the_run_in_progress"])
+    @pytest.mark.parametrize("case", ["not_a_run", "the_run_in_progress", "a_file_written_lately"])
     def test_what_is_never_deleted(self, sqlite_db, tmp_path, case):
         root = tmp_path / "erase_backups"
-        if case == "running":
-            folder = _run_folder(root, OLD, 5, state="RUNNING")
-        elif case == "no_run_json":
-            folder = _run_folder(root, OLD, 5, with_run=False)
-        elif case == "bad_run_json":
-            folder = _run_folder(root, OLD, 5, with_run=False)
-            (folder / "run.json").write_text("{not json", encoding="utf-8")
-        elif case == "not_a_run":
+        if case == "not_a_run":
             folder = root / "my_copy_of_a_backup"
             folder.mkdir(parents=True)
         else:
             folder = _run_folder(root, OLD, 5)
+        if case == "a_file_written_lately":
+            import os
+            os.utime(folder / "run.json", (NOW - 86400, NOW - 86400))       # the day before
         keep = OLD if case == "the_run_in_progress" else None
         assert ew.prune_erase_backups(root, now=NOW, keep_run_id=keep) == []
         assert folder.exists()
 
     def test_a_run_prunes_the_old_backups_when_it_ends(self, sqlite_db, monkeypatch, tmp_path):
+        monkeypatch.setattr(ew, "_NO_RUN_BEFORE", "20000101")
         wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         old = _run_folder(wiz.backup_root(), "20200101-000000-cccccc", 6)
         pv = _preview(wiz, 5)
@@ -963,3 +1006,12 @@ class TestReviewRound1:
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and moved in run["error"]
         assert not device_hold.is_held(5) and worker.full_sync_requests == []
+
+    def test_a_pc_with_no_gym_token_is_not_told_there_is_no_internet(self, sqlite_db,
+                                                                     monkeypatch, tmp_path):
+        """Review round 2 nit: the verifier's no-token answer has its own code."""
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        status, out = wiz.start(5, _body(pv["previewId"]), verify_password=lambda _p: (
+            False, 503, f"{ew.NOT_SIGNED_IN}: the password cannot be checked"))
+        assert status == 503 and out["code"] == "PC_NOT_SIGNED_IN"

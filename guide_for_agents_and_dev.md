@@ -1822,11 +1822,11 @@ is in progress (`REFILL_IN_PROGRESS`); the pin scheme reads (the run records it;
 otherwise); no other run; and **the admin password, checked by the server** (`validate_statistics_password`, the Local DB
 page's call) — the page's own lock is a screen, and offline the password cannot be checked, so nothing is
 erased (503 `ADMIN_PASSWORD_UNCHECKABLE`, lane 1b: never read as a wrong password). The refusal's code
-(`erase_wizard._password_refusal`, start and Refill): ONLY a 401 is `ADMIN_PASSWORD` (a wrong password —
-`validate_statistics_password` answers False on 401 alone); 503 `ADMIN_PASSWORD_UNCHECKABLE` (offline, or no gym token
-on this PC — the verifier answered 401 "Not authenticated" for that before review round 1); 400
-`ADMIN_PASSWORD_REQUIRED`; any other status (a proxy's 502/504, a 5xx) `ADMIN_PASSWORD_CHECK_FAILED`, shown with the
-server's words. `[TEST: test_erase_wizard_gaps.py::TestTheRefillRoute]` The page ticks and locks the C3
+(`erase_wizard._password_refusal`, start and Refill): a 401 is `ADMIN_PASSWORD` (a wrong password —
+`validate_statistics_password` answers False on a 401 alone; whether the backend also answers 401 for a rejected gym
+token is `[UNVERIFIED]`); 503 `ADMIN_PASSWORD_UNCHECKABLE` (offline), or `PC_NOT_SIGNED_IN` when this PC has no gym
+token (the verifier answered 401 "Not authenticated" for that before review round 1); 400 `ADMIN_PASSWORD_REQUIRED`;
+any other status (a proxy's 502/504, a 5xx) `ADMIN_PASSWORD_CHECK_FAILED`, shown with the server's words. `[TEST: test_erase_wizard_gaps.py::TestTheRefillRoute]` The page ticks and locks the C3
 rights and fingerprint tables when `user` is ticked, fixes "forget" to yes for an MB2000 users erase, and asks the face
 confirmation for an unknown count too. `[TEST: ::TestNothingIsErasedWithout, ::TestTheRightDeviceOnly, ::TestLocalApi,
 ::TestC3UsersNeedsRightsAndFingers, ::TestMb2000UsersEraseForgets, ::TestUnknownFaces,
@@ -1874,16 +1874,20 @@ a 404 from an older backend, 401/403, 5xx, a timeout, a body that is not JSON, `
 `ERASE_SWITCH_UNCHECKED` ("…n'a pas pu être vérifiée"). The switch is OFF by default on the server: until the backend
 and dashboard side ships (a separate chip; not in this repo) EVERY start is refused `ERASE_SWITCH_UNCHECKED` (the old
 backend's 404). `[CODE]` `[TEST: test_erase_wizard_lane1b.py::TestTheGymsServerSwitch]` The route shape was given by the
-master session; the backend is `[UNVERIFIED]` here (not built yet). The page's start timeout is 60 s (the password and
-the switch take up to 15 s each).
+master session; the backend is `[UNVERIFIED]` here (not built yet). The page's start timeout is 60 s, and after a start
+that got no answer it watches `/erase/status` for another minute: `requests`' `timeout=15` applies to the connect and to
+each read, so the password check and the switch check can each take about 30 s or more.
 
 **Erase backups are kept 30 days** (owner decision 2026-09-27, NEW 1; `erase_wizard.prune_erase_backups`, at start-up on
-its own thread after the holds are loaded, and after every run). A run folder goes when its run STARTED more than 30
-days ago (the run id's local time), its `run.json` says `DONE`, `FAILED` or `INCOMPLETE`, and its turnstile is not held.
-Never: the run in progress; any run of a held turnstile (while the holds cannot be read every turnstile reads held, so
-nothing goes); a folder whose name is not a run's; a run whose `run.json` does not read or is `RUNNING`. An `INCOMPLETE`
-run keeps its hold until Refill — the only release after a delete — so once its turnstile is no longer held, it was
-refilled. Logged as `[ERASE] backup of run … (turnstile N, STATE) deleted` and `[T] ERASE_STEP step=backup_deleted` —
+its own thread after the holds are loaded, and after every run). A run folder goes 30 days after the LATEST of its run's
+start (the run id's local time) and the last write of any file in it — the run's end, and `refilled_at.txt`, which
+Refill writes into every run folder of the turnstile it releases (`_mark_refilled`): a turnstile held longer than 30
+days keeps its backups 30 days after Refill (review round 2). Never: a held turnstile's runs (while the holds cannot be
+read every turnstile reads held, so nothing goes); the run in progress; a folder whose name is not a run's; a run id
+before `20260901` (`_NO_RUN_BEFORE`: no run predates the wizard, so that is a PC clock that was wrong — its age cannot
+be told). A run whose `run.json` is unreadable or still `RUNNING` goes once old enough and not held: no run of this
+process is that old, so a power cut or a crash ended it, and its biometric copy is not kept forever (review round 2).
+Residual: a clock that was wrong by days or weeks, then corrected, shortens or lengthens the 30 days by that much. Logged as `[ERASE] backup of run … (turnstile N, STATE) deleted` and `[T] ERASE_STEP step=backup_deleted` —
 run id, turnstile and state only, never a name, card or template. `[CODE]` `[TEST: test_erase_wizard_lane1b.py::
 TestBackupsAreKeptThirtyDays]`
 
@@ -4031,6 +4035,18 @@ branch 230.6–230.9 ms; start-up base 552–805 ms, branch 577–676 ms, 3 runs
 231.0–231.9 ms (p95 542.1–542.5, max ≤ 806.3, one outlier), 0 lost in every run; desk door open median base
 0.75–1.17 ms (max ≤ 46.8), branch 0.83–1.17 ms (max ≤ 67.8), 150/150 in every run; `create_access_app()` after a
 warm-up each, 5 runs: base 665–1528 ms, branch 602–1297 ms — overlapping, dominated by the load, no difference shown.
+
+**Lane 1b (`claude/erase-wizard-and-v2-gaps`, measured at `ac8be91`, 2026-09-27)** — the same two scratch harnesses
+(lane 1's, reused unchanged), base `337f1bb` (a detached worktree) and the branch interleaved, same interpreter, the PC
+shared with other sessions `[TEST: measurement, not pass/fail]`: scan → decision base median 232.5–233.1 ms (p95
+541.4–544.7, max ≤ 588.0), branch 232.1–232.7 ms (p95 530.4–545.8, max ≤ 578.1), 0 lost of 150 in every run (3 runs
+each); desk door open median base 0.88–1.26 ms (max ≤ 13.9), branch 0.95–1.14 ms (max ≤ 16.4), 150/150 in every run;
+`create_access_app()` after one warm-up each (base 1884 ms, branch 1686 ms, not counted), 5 runs: base 693–1090 ms,
+branch 694–1285 ms — overlapping ranges, no difference this noise can show. The worker loop runs none of lane 1b's
+code (its hold gate is unchanged); the start-up adds one read of `device_write_hold` for `erase-prep` rows (a durable
+write only when there is one to release) and starts the backup-prune thread. The later commits (`699080e`, review round
+1) touch neither path. Not measured: the heartbeat of a held turnstile (it filters the roster once per held line every
+5 min) and the PullSDK authorize fallback's new yields (they only add door service between pins).
 
 ### 3.10 The heartbeat's turnstile line — "N waiting" (lane 1, 2026-09-27)
 

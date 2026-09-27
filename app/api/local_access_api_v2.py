@@ -4672,7 +4672,8 @@ def _erase_password_verifier(ctx: _Ctx):
         auth = load_auth_token()
         if not auth or not auth.token:
             # Not a wrong password: this PC cannot ask the server (lane 1b review round 1).
-            return False, 503, "this PC is not signed in to MonClub: the password cannot be checked"
+            from app.core.erase_wizard import NOT_SIGNED_IN
+            return False, 503, f"{NOT_SIGNED_IN}: the password cannot be checked"
         try:
             valid = ctx.app._api().validate_statistics_password(token=auth.token, password=password)
         except MonClubApiHttpError as e:

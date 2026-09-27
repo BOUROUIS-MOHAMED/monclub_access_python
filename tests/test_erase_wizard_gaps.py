@@ -330,7 +330,7 @@ class TestTheRefillRoute:
         device_hold.hold(5, reason="erase", run_id="r")
         ctx = _Ctx(app, 5, _refill_body())
         la2._handle_device_erase_refill(ctx)
-        assert ctx.sent[0] == 503 and ctx.sent[1]["code"] == "ADMIN_PASSWORD_UNCHECKABLE"
+        assert ctx.sent[0] == 503 and ctx.sent[1]["code"] == "PC_NOT_SIGNED_IN"
 
     def test_a_wrong_password_is_refused_by_the_server(self, sqlite_db, monkeypatch, tmp_path):
         (status, out), _w = self._ctx(monkeypatch, tmp_path, lambda token, password: False,
