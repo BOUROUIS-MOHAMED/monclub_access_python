@@ -148,6 +148,9 @@ class EraseWizard:
         self._previews: Dict[str, Dict[str, Any]] = {}
         self._run: Optional[Dict[str, Any]] = None       # the current or last run record
         self._running = False
+        # Turnstiles whose Refill is between its checks and its release: no erase may start on
+        # them (review round 2, R2-1 -- the password round trip is a network call).
+        self._refilling: set = set()
 
     # ------------------------------------------------------------------ plumbing
     def backup_root(self) -> Path:
@@ -189,6 +192,33 @@ class EraseWizard:
         return None
 
     @staticmethod
+    def _norm_addr(ip: Any, port: Any) -> Tuple[str, str]:
+        text = str(port if port is not None else "").strip()
+        try:
+            text = str(int(text)) if text else "4370"         # both drivers default to 4370
+        except ValueError:
+            pass
+        return str(ip or "").strip(), text
+
+    def _address_refusal(self, worker: Any, ident: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        """The worker must be connected to the address MonClub records for this turnstile. After
+        an IP edit the worker keeps its socket to the OLD address until it reconnects (up to the
+        30-min refresh): erasing through it would erase the turnstile at that address -- maybe
+        another one (review round 2)."""
+        addr = getattr(worker, "_connected_addr", None)
+        if not addr:
+            return ("ADDRESS_UNKNOWN",
+                    "the turnstile's worker does not report the address it is connected to")
+        have = self._norm_addr(addr[0], addr[1] if len(addr) > 1 else None)
+        want = self._norm_addr(ident.get("ip"), ident.get("port"))
+        if have != want:
+            return ("ADDRESS_CHANGED",
+                    f"the worker is connected to {have[0]}:{have[1]} but MonClub records "
+                    f"{want[0]}:{want[1]} -- the old connection is still open: wait for the "
+                    "worker to reconnect, or restart Access")
+        return None
+
+    @staticmethod
     def _write_refusal(device_id: int) -> Optional[Tuple[str, str]]:
         """The lease conditions a WRITE needs, read again at the moment of the write."""
         if not lease_gate.device_allowed(device_id):
@@ -202,15 +232,18 @@ class EraseWizard:
 
     def _write_call(self, worker: Any, did: int, fn: Callable[[Any], Any], *, label: str,
                     timeout: float) -> Any:
-        """A device WRITE: the lease is checked here and again on the worker thread, just before
-        ``fn`` runs -- the command waits in the worker's queue, and the lease can move meanwhile."""
-        refused = self._write_refusal(did)
+        """A device WRITE: the lease -- and the worker's connected address -- are checked here and
+        again on the worker thread, just before ``fn`` runs: the command waits in the worker's
+        queue, and the lease can move or the worker reconnect meanwhile."""
+        with self._lock:
+            ident = dict(((self._run or {}).get("device")) or {})
+        refused = self._write_refusal(did) or self._address_refusal(worker, ident)
         if refused:
             raise StepError(*refused)
         seen: Dict[str, Tuple[str, str]] = {}
 
         def _guarded(drv):
-            why = self._write_refusal(did)
+            why = self._write_refusal(did) or self._address_refusal(worker, ident)
             if why:
                 seen["refused"] = why
                 return None
@@ -295,12 +328,15 @@ class EraseWizard:
         refused = self._refusal(did, need_writes=False)
         if refused:
             return refused
+        ident = _device_identity(device, proto)
+        moved = self._address_refusal(self._worker(did), ident)
+        if moved:
+            return 409, {"ok": False, "code": moved[0], "error": moved[1]}
         try:
             counts = self._counts(self._worker(did), proto)
         except StepError as exc:
             return 503, {"ok": False, "code": exc.code, "error": exc.message}
         preview_id = uuid.uuid4().hex
-        ident = _device_identity(device, proto)
         with self._lock:
             now = self._mono()
             for k in [k for k, v in self._previews.items() if now - v["at"] > PREVIEW_TTL_SEC]:
@@ -380,10 +416,18 @@ class EraseWizard:
         did = int(device_id)
         body = dict(body or {})
         backup_only = bool(body.get("backupOnly"))
+        if device_hold.load_failed():
+            # Every turnstile reads as held: a run would treat its own hold as an earlier one
+            # and never release it (review round 2, R2-4).
+            return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
+                         "error": "the erase holds could not be read: no erase until they are"}
         with self._lock:
             if self._running:
                 return 409, {"ok": False, "code": "RUN_IN_PROGRESS",
                              "error": "an erase is already running"}
+            if did in self._refilling:
+                return 409, {"ok": False, "code": "REFILL_IN_PROGRESS",
+                             "error": "this turnstile is being refilled"}
             preview = self._previews.get(str(body.get("previewId") or ""))
         if preview is None or self._mono() - preview["at"] > PREVIEW_TTL_SEC:
             return 409, {"ok": False, "code": "PREVIEW_EXPIRED",
@@ -465,6 +509,9 @@ class EraseWizard:
         refused = self._refusal(did, need_writes=not backup_only)
         if refused:
             return refused
+        moved = self._address_refusal(self._worker(did), ident)
+        if moved:
+            return 409, {"ok": False, "code": moved[0], "error": moved[1]}
         try:
             scheme = self._pin_scheme_strict(did)
         except Exception as exc:
@@ -488,6 +535,9 @@ class EraseWizard:
             if self._running:
                 return 409, {"ok": False, "code": "RUN_IN_PROGRESS",
                              "error": "an erase is already running"}
+            if did in self._refilling:
+                return 409, {"ok": False, "code": "REFILL_IN_PROGRESS",
+                             "error": "this turnstile is being refilled"}
             self._running = True
             self._run = run
             self._previews.pop(str(body.get("previewId")), None)
@@ -541,6 +591,9 @@ class EraseWizard:
             device_hold.hold(did, reason="erase", run_id=run_id)
             self._step("hold", True, heldBefore=held_before)
             worker = self._wait_idle(did)
+            moved = self._address_refusal(worker, run["device"])
+            if moved:
+                raise StepError(*moved)
             self._step("idle", True)
             before = self._counts(worker, proto)
             self._update(countsBefore=before)
@@ -912,6 +965,25 @@ class EraseWizard:
             if self._running and self._run and int(self._run.get("deviceId") or 0) == did:
                 return 409, {"ok": False, "code": "RUN_IN_PROGRESS",
                              "error": "an erase of this turnstile is still running"}
+            if did in self._refilling:
+                return 409, {"ok": False, "code": "REFILL_IN_PROGRESS",
+                             "error": "this turnstile is already being refilled"}
+            self._refilling.add(did)
+        try:
+            return self._refill_marked(did, body, verify_password)
+        finally:
+            with self._lock:
+                self._refilling.discard(did)
+
+    @staticmethod
+    def _hold_run_id(did: int) -> Tuple[bool, Optional[str]]:
+        detail = device_hold.holds_detail().get(did)
+        return (detail is not None), (detail or {}).get("runId")
+
+    def _refill_marked(self, did: int, body: Dict[str, Any],
+                       verify_password: Callable[[str], Tuple[bool, int, str]]
+                       ) -> Tuple[int, Dict[str, Any]]:
+        """Refill with this turnstile marked: no erase can start until it returns."""
         if not device_hold.is_held(did):
             return 409, {"ok": False, "code": "NOT_ON_HOLD", "error": "this turnstile is not on hold"}
         if "expectedPinScheme" not in body:
@@ -919,12 +991,30 @@ class EraseWizard:
                          "error": "send the pin scheme the page showed (expectedPinScheme)"}
         expected = body.get("expectedPinScheme")
         expected = None if expected is None else str(expected)
+        try:
+            held_row, hold_run = self._hold_run_id(did)
+        except Exception as exc:
+            return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
+                         "error": f"the erase holds could not be read: {exc}"}
         # No lease or worker condition: releasing a hold writes nothing by itself. A turnstile
         # this PC no longer drives stays unwritten by the lease gate; one with no running worker
         # is refilled by the first pass once its worker starts.
         ok, status, error = verify_password(str(body.get("password") or ""))
         if not ok:
             return status, {"ok": False, "code": "ADMIN_PASSWORD", "error": error}
+        # The password was a network call: look again (review round 2, R2-1).
+        with self._lock:
+            if self._running and self._run and int(self._run.get("deviceId") or 0) == did:
+                return 409, {"ok": False, "code": "RUN_IN_PROGRESS",
+                             "error": "an erase of this turnstile started meanwhile"}
+        try:
+            still_row, still_run = self._hold_run_id(did)
+        except Exception as exc:
+            return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
+                         "error": f"the erase holds could not be read: {exc}"}
+        if (still_row, still_run) != (held_row, hold_run) or not device_hold.is_held(did):
+            return 409, {"ok": False, "code": "HOLD_CHANGED",
+                         "error": "the turnstile's hold changed meanwhile: read the page again"}
         try:
             scheme = self._pin_scheme_strict(did)
         except Exception as exc:

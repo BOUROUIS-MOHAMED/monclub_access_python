@@ -58,13 +58,14 @@ def load() -> FrozenSet[int]:
     global _held, _load_failed
     from app.core.db import list_device_write_holds
 
-    try:
-        ids = frozenset(int(d) for d in (list_device_write_holds() or {}))
-    except Exception:
-        with _lock:
-            _load_failed = True
-        raise
+    # Under the lock for the read AND the install: a hold() or release() landing between the
+    # two would otherwise be overwritten by a stale read (review round 2, R2-5).
     with _lock:
+        try:
+            ids = frozenset(int(d) for d in (list_device_write_holds() or {}))
+        except Exception:
+            _load_failed = True
+            raise
         _held = ids
         _load_failed = False
     if ids:
@@ -97,8 +98,8 @@ def hold(device_id: int, *, reason: str = "erase", run_id: Optional[str] = None)
         raise ValueError(f"bad device id {device_id!r}")
     from app.core.db import set_device_write_hold
 
-    set_device_write_hold(device_id=did, reason=reason, run_id=run_id)
     with _lock:
+        set_device_write_hold(device_id=did, reason=reason, run_id=run_id)
         _held = frozenset(_held | {did})
     _log.warning("[HOLD] turnstile %s on hold (%s, run %s): nothing is written to it", did,
                  reason, run_id)
@@ -113,8 +114,8 @@ def release(device_id: int) -> bool:
         return False
     from app.core.db import clear_device_write_hold
 
-    removed = clear_device_write_hold(device_id=did)
     with _lock:
+        removed = clear_device_write_hold(device_id=did)
         was = did in _held
         _held = frozenset(_held - {did})
     if was or removed:

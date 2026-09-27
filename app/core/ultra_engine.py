@@ -581,6 +581,11 @@ class UltraDeviceWorker(threading.Thread):
         self._sdk: Optional[PullSDKDevice] = None
         self._seen: Deque[str] = deque(maxlen=10_000)
         self._connected = False
+        # (ip, port) the driver actually connected to -- NOT the payload: update_device swaps
+        # the payload without reconnecting, so after an IP edit the socket stays on the old
+        # address until the next reconnect (up to the 30-min refresh). The Erase wizard refuses
+        # a worker whose address is not the one MonClub records (review round 2).
+        self._connected_addr: Optional[tuple] = None
         self._events_processed = 0
         self._totp_rescues = 0
         self._totp_failures = 0
@@ -1053,6 +1058,8 @@ class UltraDeviceWorker(threading.Thread):
             if ok:
                 was_down_for = self._down_for_seconds()
                 self._connected = True
+                self._connected_addr = (str(getattr(self._sdk, "ip", "") or "").strip(),
+                                        getattr(self._sdk, "port", None))
                 self._connected_since_mono = time.monotonic()
                 self._record_connect_success()
                 self._note_user_count_at_connect()
@@ -1071,6 +1078,7 @@ class UltraDeviceWorker(threading.Thread):
                     )
             else:
                 self._connected = False
+                self._connected_addr = None
                 self._sdk = None
                 delay = self._record_connect_failure("connect returned False")
                 if self._should_log_connect_error_now():
@@ -1102,6 +1110,7 @@ class UltraDeviceWorker(threading.Thread):
                     self._prefix, e, delay, self._down_for_seconds(), self._connect_failures,
                 )
             self._connected = False
+            self._connected_addr = None
             self._sdk = None
 
     def _push_link_lost(self) -> bool:
@@ -1238,6 +1247,7 @@ class UltraDeviceWorker(threading.Thread):
                 logger.debug(f"{self._prefix} disconnect error (non-fatal): {_disc_exc}")
         self._sdk = None
         self._connected = False
+        self._connected_addr = None
         self._connected_since_mono = 0.0
 
     def pause_for_sync(self, timeout: float = 20.0) -> bool:
@@ -2300,7 +2310,8 @@ class UltraDeviceWorker(threading.Thread):
             logger.info(
                 "%s %d pin(s) held back by retry backoff: unchanged content that has "
                 "already been refused repeatedly. A re-enrolment changes the hash and "
-                "pushes immediately; a full or forced resync ignores this entirely.",
+                "pushes immediately; the Erase wizard's resets clear the backoff; a forced "
+                "resync does not (it keeps fail_streak).",
                 self._prefix, backoff_skipped,
             )
             try:

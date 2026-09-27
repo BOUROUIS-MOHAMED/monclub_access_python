@@ -9786,12 +9786,18 @@ def invalidate_device_records(*, device_id: int, fingers_erased: bool,
     known EMPTY (``''``, not NULL = unknown) and swept: a recorded set would make the next push
     clear slots that are already empty, which answer False and fail on every retry (§7 R1-20) --
     except ``keep_pins``, whose fingers the erase left on the terminal (the MB2000 admins).
-    Also the Erase wizard's INCOMPLETE and Refill reset, with ``fingers_erased=False``."""
+    Also the Erase wizard's INCOMPLETE and Refill reset, with ``fingers_erased=False``. The
+    retry backoff (``fail_streak``, ``last_attempt_hash``) is cleared too: every pin is due."""
     did = int(device_id)
     keep = sorted({str(p) for p in (keep_pins or ())})
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         n = _clear_device_sync_hashes_on(conn, did)
+        # And the retry backoff: an erase removed pins that were in it (a refused template leaves
+        # the user row and card on the terminal), and both selectors would hold them back for up
+        # to _SYNC_RETRY_MAX_SEC (6 h) after the refill (review round 2, R2-2).
+        conn.execute("UPDATE device_sync_state SET fail_streak=0, last_attempt_hash=NULL "
+                     "WHERE device_id=?", (did,))
         if fingers_erased:
             spare = f" AND pin NOT IN ({','.join(['?'] * len(keep))})" if keep else ""
             conn.execute(

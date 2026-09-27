@@ -89,6 +89,8 @@ export default function EraseWizardDialog({
   const t = ERASE_TEXT[lang];
   const setLang = (l: Lang) => { setLangState(l); saveLang(l); };
   const schemeName = (sch: string | null | undefined) => (sch ? (t.schemes[sch] ?? sch) : t.unknown);
+  // A refusal the operator can act on is shown in the page's language; anything else as sent.
+  const errFor = (e: unknown) => { const c = errCode(e); return (c && t.codes[c]) || errText(e); };
 
   const [password, setPassword] = useState("");
   const [unlocked, setUnlocked] = useState(false);
@@ -133,7 +135,7 @@ export default function EraseWizardDialog({
   const loadPreview = useCallback(async () => {
     setLoading(true); setPreviewError(null);
     try { setPreview(await api.preview(deviceId)); }
-    catch (e) { setPreview(null); setPreviewError(errText(e)); }
+    catch (e) { setPreview(null); setPreviewError(errFor(e)); }
     finally { setLoading(false); }
   }, [api, deviceId]);
 
@@ -146,7 +148,7 @@ export default function EraseWizardDialog({
       const h = (res.holds ?? []).find((x) => Number(x.deviceId) === deviceId);
       setHoldsUnknown(!!res.loadFailed);
       setStillHeld(!!h || !!res.loadFailed); setHoldScheme(h ? (h.pinScheme ?? null) : undefined);
-    } catch (e) { setPreviewError(errText(e)); }
+    } catch (e) { setPreviewError(errFor(e)); }
     finally { setLoading(false); }
   }, [api, deviceId]);
 
@@ -177,6 +179,17 @@ export default function EraseWizardDialog({
   const requiredByUser = useMemo(() => (protocol === "ZK_PULLSDK" && chosen.has("user")
     ? (preview?.tables ?? []).filter((r) => r.erasable && RIGHTS_AND_FINGERS.includes(r.key)).map((r) => r.key)
     : []), [protocol, chosen, preview]);
+  // Step 1 read again: a table that reads now is locked on with the users too -- and one that
+  // no longer reads cannot stay chosen.
+  useEffect(() => {
+    if (!preview) return;
+    const erasable = new Set(preview.tables.filter((r) => r.erasable).map((r) => r.key));
+    setChosen((prev) => {
+      const next = new Set(Array.from(prev).filter((k) => erasable.has(k)));
+      for (const k of requiredByUser) next.add(k);
+      return next.size === prev.size && Array.from(next).every((k) => prev.has(k)) ? prev : next;
+    });
+  }, [preview, requiredByUser]);
 
   const optionsReady = backupOnly || (forget !== null && refill !== null && (!needFaces || acceptFaces));
   const nameOk = preview ? typedName.trim() === preview.device.name : false;
@@ -210,7 +223,7 @@ export default function EraseWizardDialog({
       });
       setStep(4);
       pollStatus();
-    } catch (e) { setStartError(errText(e)); }
+    } catch (e) { setStartError(errFor(e)); }
     finally { setStarting(false); }
   }, [api, deviceId, preview, chosen, typedName, password, backupOnly, forget, refill, needFaces,
       acceptFaces, starting, pollStatus]);
@@ -230,7 +243,7 @@ export default function EraseWizardDialog({
         const now = (e as { payload?: { pinScheme?: string | null } | null }).payload?.pinScheme ?? null;
         setRefillError(t.schemeChanged(schemeName(now)));
         void loadHold();
-      } else setRefillError(errText(e));
+      } else setRefillError(errFor(e));
     }
     finally { setRefilling(false); }
   }, [api, deviceId, password, refilling, holdScheme, holdsUnknown, t, onChanged, mode, run, preview, loadHold]);
@@ -312,6 +325,7 @@ export default function EraseWizardDialog({
         {protocol === "ZK_STANDALONE" && preview?.limits?.mbPinsPerPass ? (
           <span className="text-muted-foreground">{t.mbPasses(preview.limits.mbPinsPerPass)}</span>
         ) : null}
+        <span className="text-muted-foreground">{t.handoverWaits}</span>
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" onClick={() => void doRefill()}
                   disabled={refilling || holdScheme === undefined || holdsUnknown}>

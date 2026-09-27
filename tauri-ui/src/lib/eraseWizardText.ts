@@ -99,6 +99,17 @@ const fr = {
   holdsUnknown:
     "Access n'a pas pu relire les mises en attente : tous les tourniquets restent en attente jusqu'à la prochaine lecture réussie.",
   refillNeedsInternet: "Le remplissage demande Internet : le serveur vérifie le mot de passe.",
+  handoverWaits:
+    "Tant qu'il est en attente, ce tourniquet n'est pas cédé à un autre PC : un changement de PC pilote attend « Remplir ».",
+  codes: {
+    ADDRESS_CHANGED:
+      "Le terminal est encore connecté à son ancienne adresse IP : attendez qu'Access se reconnecte (jusqu'à 30 min) ou redémarrez Access, puis relisez.",
+    ADDRESS_UNKNOWN: "Access ne connaît pas l'adresse de la connexion ouverte avec ce terminal : relisez dans un instant.",
+    REFILL_IN_PROGRESS: "Un remplissage de ce tourniquet est en cours : réessayez dans un instant.",
+    RUN_IN_PROGRESS: "Un effacement est déjà en cours.",
+    HOLD_CHANGED: "La mise en attente de ce tourniquet a changé entre-temps : fermez et rouvrez la fenêtre.",
+    HOLDS_UNKNOWN: "Access n'a pas pu relire les mises en attente : rien n'est effacé ni rempli pour l'instant.",
+  } as Record<string, string>,
   schemes: { ACCOUNT: "Par personne", MEMBERSHIP: "Par abonnement" } as Record<string, string>,
   mbPasses: (n: number) =>
     `Un terminal autonome reçoit au plus ${n} membres par passage : le remplissage se fait en plusieurs passages.`,
@@ -220,6 +231,17 @@ const en: typeof fr = {
   holdsUnknown:
     "Access could not read the holds back: every turnstile stays on hold until the next successful read.",
   refillNeedsInternet: "Refill needs the internet: the server checks the password.",
+  handoverWaits:
+    "While it is on hold, this turnstile is not handed to another PC: a change of driving PC waits for Refill.",
+  codes: {
+    ADDRESS_CHANGED:
+      "The terminal is still connected at its old IP address: wait for Access to reconnect (up to 30 min) or restart Access, then read again.",
+    ADDRESS_UNKNOWN: "Access does not know the address of its open connection to this terminal: read again in a moment.",
+    REFILL_IN_PROGRESS: "A refill of this turnstile is running: try again in a moment.",
+    RUN_IN_PROGRESS: "An erase is already running.",
+    HOLD_CHANGED: "This turnstile's hold changed meanwhile: close and reopen the dialog.",
+    HOLDS_UNKNOWN: "Access could not read the holds back: nothing is erased or refilled for now.",
+  },
   schemes: { ACCOUNT: "Par personne (per person)", MEMBERSHIP: "Par abonnement (per membership)" },
   mbPasses: (n: number) =>
     `A standalone terminal receives at most ${n} members per pass: the refill takes several passes.`,

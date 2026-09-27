@@ -85,9 +85,10 @@ class FakePanel:
 
 
 class FakeWorker:
-    def __init__(self, drv):
+    def __init__(self, drv, addr=("192.168.0.202", 4370)):
         self.drv = drv
         self._connected = True
+        self._connected_addr = addr          # what the real worker records at connect
         self._full_sync_running = False
         self.full_sync_requests: List[str] = []
         self.no_answer: set = set()
@@ -267,7 +268,7 @@ class TestTheRightDeviceOnly:
 
     def test_a_preview_of_another_turnstile_is_refused(self, sqlite_db, monkeypatch, tmp_path):
         p5, p6 = _panel(), _panel()
-        app = _app({5: FakeWorker(p5), 6: FakeWorker(p6)})
+        app = _app({5: FakeWorker(p5), 6: FakeWorker(p6, addr=("192.168.0.203", 4370))})
         _devices(monkeypatch, _device(), _device(did=6, name="Sortie", ip="192.168.0.203"))
         wiz = _wizard(app, tmp_path)
         _, pv5 = wiz.preview(5)
@@ -491,7 +492,7 @@ class WizardTerminal(TerminalZkem):
 
 def _mb_setup(monkeypatch, tmp_path, term):
     drv = _make_driver(term)
-    worker = FakeWorker(drv)
+    worker = FakeWorker(drv, addr=("192.168.1.247", 4370))
     app = _app({8: worker})
     _devices(monkeypatch, _device(did=8, name="Sortie", ip="192.168.1.247", proto="ZK_STANDALONE"))
     return _wizard(app, tmp_path), worker, drv
@@ -1199,3 +1200,267 @@ class TestRefillWhileTheHoldsAreUnknown:
         status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
         assert status == 503 and out["code"] == "HOLDS_UNKNOWN" and worker.full_sync_requests == []
         assert wiz.holds_state()["loadFailed"] is True
+
+
+# ─────────────────────────── review round 2 (2026-09-27): each finding pinned ───────────────────────────
+
+class _BlockingWorker(FakeWorker):
+    """Blocks the FIRST erase command until ``go`` is set (a run is mid-erase, its hold set)."""
+
+    def __init__(self, drv, **kw):
+        super().__init__(drv, **kw)
+        self.reached = threading.Event()
+        self.go = threading.Event()
+
+    def request_run_sdk(self, fn, *, label, timeout):
+        if label.startswith("erase_erase_") and not self.go.is_set():
+            self.reached.set()
+            self.go.wait(20.0)
+        return super().request_run_sdk(fn, label=label, timeout=timeout)
+
+
+def _threaded_wizard(monkeypatch, tmp_path, worker):
+    app = _app({5: worker})
+    _devices(monkeypatch, _device())
+    threads: List[threading.Thread] = []
+
+    def _spawn(fn):
+        t = threading.Thread(target=fn, daemon=True)
+        threads.append(t)
+        t.start()
+
+    wiz = EraseWizard(app, backup_root=tmp_path / "b", spawn=_spawn, sleep=lambda s: None)
+    return wiz, app, threads
+
+
+class TestRefillAndARunNeverOverlap:
+    """R2-1: Refill checked for a running erase before its password round trip only, so a run
+    started meanwhile had its hold released and a pass requested under it."""
+
+    def test_no_erase_starts_while_a_refill_checks_its_password(self, sqlite_db, monkeypatch,
+                                                                 tmp_path):
+        panel = _panel()
+        worker = _BlockingWorker(panel)
+        worker.go.set()
+        wiz, app, threads = _threaded_wizard(monkeypatch, tmp_path, worker)
+        _, pv = wiz.preview(5)
+        assert wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)[0] == 202
+        threads[-1].join(10)
+        assert wiz.status()["run"]["state"] == "DONE" and device_hold.is_held(5)
+        _, pv2 = wiz.preview(5)
+        seen = {}
+
+        def _slow_password(_pw):
+            seen["start"] = wiz.start(5, _body(pv2["previewId"], refill="hold"),
+                                      verify_password=_pw_ok)
+            return GOOD
+
+        status, out = wiz.refill(5, _refill_body(), verify_password=_slow_password)
+        assert seen["start"][0] == 409 and seen["start"][1]["code"] == "REFILL_IN_PROGRESS"
+        assert status == 200 and not device_hold.is_held(5)
+        assert wiz.status()["running"] is False
+        # The mark is cleared: the next erase may start.
+        _, pv3 = wiz.preview(5)
+        assert wiz.start(5, _body(pv3["previewId"], refill="hold"), verify_password=_pw_ok)[0] == 202
+        threads[-1].join(10)
+        assert device_hold.is_held(5)
+
+    def test_a_run_that_began_before_the_mark_is_seen_after_the_password(self, sqlite_db,
+                                                                        monkeypatch, tmp_path):
+        """A run the mark could not stop (it began first) is caught by the re-check."""
+        panel = _panel()
+        worker = _BlockingWorker(panel)
+        wiz, app, threads = _threaded_wizard(monkeypatch, tmp_path, worker)
+        device_hold.hold(5, reason="erase", run_id="earlier")
+        _, pv = wiz.preview(5)
+
+        def _password_while_a_run_starts(_pw):
+            with wiz._lock:                    # the run slipped in: bypass the mark
+                wiz._refilling.discard(5)
+            assert wiz.start(5, _body(pv["previewId"], refill="hold"),
+                             verify_password=_pw_ok)[0] == 202
+            assert worker.reached.wait(10)
+            return GOOD
+
+        try:
+            status, out = wiz.refill(5, _refill_body(), verify_password=_password_while_a_run_starts)
+            assert status == 409 and out["code"] in ("RUN_IN_PROGRESS", "HOLD_CHANGED")
+            assert device_hold.is_held(5) and worker.full_sync_requests == []
+            assert app._ultra_engine._sync_scheduler.forced == []
+        finally:
+            worker.go.set()
+            for t in threads:
+                t.join(10)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["holdKept"] is True and device_hold.is_held(5)
+
+    def test_a_hold_replaced_during_the_password_check_is_not_released(self, sqlite_db,
+                                                                      monkeypatch, tmp_path):
+        wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        device_hold.hold(5, reason="erase", run_id="first")
+
+        def _password(_pw):
+            device_hold.hold(5, reason="erase", run_id="second")
+            return GOOD
+
+        status, out = wiz.refill(5, _refill_body(), verify_password=_password)
+        assert status == 409 and out["code"] == "HOLD_CHANGED" and device_hold.is_held(5)
+        assert worker.full_sync_requests == []
+
+
+class TestTheResetsClearTheRetryBackoff:
+    """R2-2: fail_streak and last_attempt_hash survived every reset of the wizard, so a pin the
+    erase removed but that was in retry backoff stayed off the terminal for up to 6 h."""
+
+    def _backoff(self, db, did, pin, attempt_hash):
+        from app.core.utils import now_iso
+        with db.get_conn() as conn:
+            conn.execute("UPDATE device_sync_state SET desired_hash='', last_ok=0, fail_streak=6, "
+                         "last_attempt_hash=?, updated_at=? WHERE device_id=? AND pin=?",
+                         (attempt_hash, now_iso(), did, pin))
+            conn.commit()
+
+    def test_mb2000_incomplete_then_refill_pushes_the_backoff_pin(self, sqlite_db, monkeypatch,
+                                                                  tmp_path):
+        from app.core.ultra_engine import UltraDeviceWorker
+        term = _terminal()
+        _own(sqlite_db, 8, ["30001", "30002"])
+        self._backoff(sqlite_db, 8, "30001", "H30001")
+        wiz, worker, drv = _mb_setup(monkeypatch, tmp_path, term)
+        worker.no_answer = {"erase_delete_users"}
+        try:
+            _, pv = wiz.preview(8)
+            wiz.start(8, _mb_body(pv["previewId"]), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert wiz.status()["run"]["state"] == "INCOMPLETE"
+        assert wiz.refill(8, _refill_body(), verify_password=_pw_ok)[0] == 200
+        rs = sqlite_db.list_device_sync_retry_state(device_id=8)["30001"]
+        assert rs[2] == 0 and rs[3] is None
+        fake = SimpleNamespace(_device_id=8, _prefix="[t]", _tel_wid="t")
+        to_push, _ = UltraDeviceWorker._standalone_pins_needing_push(
+            fake, [{"pin": "30001"}, {"pin": "30002"}], {"30001": "H30001", "30002": "H30002"})
+        assert {u["pin"] for u in to_push} == {"30001", "30002"}
+
+    def test_c3_keep_clears_the_backoff(self, sqlite_db, monkeypatch, tmp_path):
+        _own(sqlite_db, 5, ["101", "102"])
+        self._backoff(sqlite_db, 5, "101", "H101")
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], forget=False, refill="now"), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE"
+        _h, ok, streak, attempt, _seen = sqlite_db.list_device_sync_retry_state(device_id=5)["101"]
+        assert (ok, streak, attempt) == (False, 0, None)
+
+
+class TestAHeldTurnstileIsNotHandedOver:
+    """R2-3: the hold lives on this PC only; releasing a held turnstile to another PC let that
+    PC refill it under its own recorded scheme."""
+
+    def test_the_release_waits_for_refill(self, sqlite_db, monkeypatch, tmp_path):
+        from app.core.v2.ownership import OwnershipSync
+        wiz, _w, _p, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        app._erase_wizard = wiz
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE" and device_hold.is_held(5)
+        own = OwnershipSync(SimpleNamespace(app=app))
+        assert own._worker_idle(5) is False and own._worker_idle(6) is True
+        assert wiz.refill(5, _refill_body(), verify_password=_pw_ok)[0] == 200
+        assert own._worker_idle(5) is True
+
+
+class TestNoRunWhileTheHoldsAreUnknown:
+    """R2-4: a run while the start-up hold load had failed never released the hold it wrote."""
+
+    def test_start_is_refused(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        monkeypatch.setattr(device_hold, "_load_failed", True)
+        status, out = wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert status == 503 and out["code"] == "HOLDS_UNKNOWN"
+        assert sqlite_db.list_device_write_holds() == {}
+
+
+class TestTheWorkerMustBeOnTheRecordedAddress:
+    """Round 2: a worker keeps its socket to the OLD address after an IP edit (up to the 30-min
+    connection refresh). The wizard's identity was the database's only, so it could erase the
+    turnstile at the old address -- another turnstile."""
+
+    def test_preview_and_start_refuse_a_worker_on_another_address(self, sqlite_db, monkeypatch,
+                                                                 tmp_path):
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        worker._connected_addr = ("192.168.0.203", 4370)      # still on the old socket
+        status, out = wiz.preview(5)
+        assert status == 409 and out["code"] == "ADDRESS_CHANGED" and panel.calls == []
+        worker._connected_addr = ("192.168.0.202", 4370)
+        _, pv = wiz.preview(5)
+        worker._connected_addr = ("192.168.0.203", 4370)
+        status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert status == 409 and out["code"] == "ADDRESS_CHANGED"
+        assert [c for c in panel.calls if c[0] != "count"] == []
+
+    def test_an_unknown_address_is_refused(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        worker._connected_addr = None
+        status, out = wiz.preview(5)
+        assert status == 409 and out["code"] == "ADDRESS_UNKNOWN"
+
+    def test_a_reconnect_to_another_address_mid_run_stops_before_the_next_write(
+            self, sqlite_db, monkeypatch, tmp_path):
+        _own(sqlite_db, 5, ["101"])
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+        def _moved(table):
+            worker._connected_addr = ("192.168.0.203", 4370)
+
+        panel.on_erase = _moved
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert [c[1] for c in panel.calls if c[0] == "erase"] == ["templatev10"]
+        assert run["state"] == "INCOMPLETE" and "ADDRESS_CHANGED" in run["error"]
+        assert device_hold.is_held(5)
+
+    def test_the_address_is_checked_before_the_backup(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        real = wiz._wait_idle
+
+        def _idle_then_moved(did):
+            w = real(did)
+            w._connected_addr = ("192.168.0.203", 4370)
+            return w
+
+        monkeypatch.setattr(wiz, "_wait_idle", _idle_then_moved)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "ADDRESS_CHANGED" in run["error"]
+        assert [c for c in panel.calls if c[0] in ("read", "erase")] == []
+        assert not device_hold.is_held(5)
+
+    def test_the_worker_records_the_address_it_connected_to(self, monkeypatch):
+        import queue as _queue
+        import app.core.ultra_engine as ue
+
+        class _Drv:
+            ip, port = "10.0.0.9", 4370
+
+            def connect(self):
+                return True
+
+            def disconnect(self):
+                pass
+
+        monkeypatch.setattr(ue, "get_driver", lambda device_payload=None, logger=None: _Drv())
+        monkeypatch.setattr(ue._lease_gate, "require_device", lambda did: None)
+        w = ue.UltraDeviceWorker(device={"id": 5, "name": "E", "ipAddress": "10.0.0.9"}, settings={},
+                                 popup_q=_queue.Queue(), history_q=_queue.Queue(),
+                                 stop_event=threading.Event())
+        for name in ("_note_user_count_at_connect", "_maybe_discipline_device_clock"):
+            monkeypatch.setattr(w, name, lambda: None)
+        assert w._connected_addr is None
+        w._connect()
+        assert w._connected and w._connected_addr == ("10.0.0.9", 4370)
+        w._disconnect()
+        assert w._connected_addr is None

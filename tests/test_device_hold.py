@@ -121,6 +121,31 @@ def test_reset_for_tests_clears_the_failed_flag(sqlite_db, monkeypatch):
     assert device_hold.load_failed() is False and not device_hold.is_held(5)
 
 
+def test_a_load_racing_a_hold_keeps_the_in_memory_gate(sqlite_db, monkeypatch):
+    """Review round 2 (R2-5): load() read the database, then replaced the in-memory set -- a
+    hold() whose row landed in between lost its gate although its row was durable."""
+    real = dbmod.list_device_write_holds
+    raced = []
+
+    def _read_then_a_hold_lands():
+        out = real()
+        if not raced:
+            raced.append(1)
+            threading.Thread(target=lambda: device_hold.hold(5, reason="erase", run_id="r"),
+                             daemon=True).start()
+            time.sleep(0.2)                     # the hold waits for the load to finish
+        return out
+
+    monkeypatch.setattr(device_hold, "_load_failed", True)
+    monkeypatch.setattr(dbmod, "list_device_write_holds", _read_then_a_hold_lands)
+    assert device_hold.ensure_loaded() is True
+    deadline = time.monotonic() + 5
+    while 5 not in real() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    monkeypatch.setattr(dbmod, "list_device_write_holds", real)
+    assert 5 in real() and device_hold.is_held(5), "the row and the gate agree"
+
+
 def test_every_sync_tick_retries_a_failed_hold_load(monkeypatch):
     import app.ui.app as app_module
     calls: List[int] = []
