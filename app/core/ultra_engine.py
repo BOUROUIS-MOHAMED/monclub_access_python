@@ -8715,7 +8715,7 @@ class UltraEngine:
         )
         self._watchdog_thread.start()
 
-    def refresh_devices(self, devices: List[Dict[str, Any]]) -> int:
+    def refresh_devices(self, devices: List[Dict[str, Any]], *, update_scheduler: bool = True) -> int:
         """Refresh each running ULTRA worker's device snapshot in place.
 
         Workers cache the device dict at construction (self._device), which is
@@ -8725,6 +8725,9 @@ class UltraEngine:
         worker snapshots stay stale, so newly-allowed members get filtered out
         and pin-deleted instead of pushed. Call this after every sync that
         returned a refreshed devices section.
+
+        ``update_scheduler=False`` refreshes the workers' copies only and leaves the scheduler's
+        device list as it is (the app's refresh while not every worker is driven, review R2-4).
 
         Returns the number of workers refreshed.
         """
@@ -8769,7 +8772,7 @@ class UltraEngine:
                 "[ULTRA] refreshed %d worker device snapshot(s) in place", refreshed
             )
 
-        if self._sync_scheduler is not None:
+        if self._sync_scheduler is not None and update_scheduler:
             try:
                 self._sync_scheduler.update_devices(ultra_devices)
             except Exception as exc:

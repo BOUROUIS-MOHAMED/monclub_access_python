@@ -1571,13 +1571,18 @@ Now `[CODE]`:
   back). Devices without a worker are left out on purpose: `refresh_devices` also replaces the
   scheduler's list, and the scheduler pushes a device with no worker over its own session (R1-F2); a
   device added or switched to ULTRA gets its worker when the next tick restarts the engine, as before.
+  The scheduler's list itself is replaced only when every worker is driven — the end-of-tick refresh's
+  own condition — so a lease away during a refresh cannot empty it for good (review R2-4).
   `apply_fast_patch_bundle` calls it when any item of the bundle is `GYM_DEVICE` or carries
   `requiresDeviceRescope` — applied or not, the database is the truth — right after the database apply
   and before its date flip (which may queue a pass itself, R1-F6) and both dispatch branches; the sync
   tick calls it right after each `save_sync_cache_delta` whenever `refresh["devices"]`, before that
-  save's date flip (the refresh near the end of the tick stays). A failed refresh is logged, schedules
-  the full reconcile, and still dispatches: the guard below refuses the old scheme's pins, and the
-  bundle's revocations are not held back.
+  save's date flip (the refresh near the end of the tick stays), and so does the enrolment fallback
+  after its full `save_sync_cache` (review R2-3). In the fast patch a failed refresh is logged,
+  schedules the full reconcile, and still dispatches: the guard below refuses the old scheme's pins,
+  and the bundle's revocations are not held back. In the tick and the enrolment fallback it is only
+  logged (R2-2): the end-of-tick refresh and the next sync's device section are the second chances,
+  and until then the guard stops that device's passes.
 - **Every push pass re-checks the recorded scheme.** `device_sync.pin_scheme_superseded` compares the
   scheme a pass derived its pins under with `sync_devices.pin_scheme` (`db.get_device_pin_scheme`, one
   primary-key read). MB2000: the full sync at its start (the device copy — nothing removed, nothing
@@ -1592,7 +1597,12 @@ Now `[CODE]`:
   `[T] PIN_SCHEME_PASS_STOPPED`. The next pass is the one the app queues after the refresh.
 - **What is left.** On the MB2000 the chunk already in flight when the switch lands (at most
   `_PUSH_CHUNK_MEMBERS` = 10 members, handed over before the switch existed); on PullSDK a removal step
-  or a user batch already started (no abort inside either). A targeted revoke drained between the save and the refresh
+  or a user batch already started (no abort inside either), and the post-push release of a renewal
+  hold (§3.4f) — it deletes only MonClub's own old pin of a renewing member, a pin being written under
+  the new scheme is never among them on the MB2000 (`_remove_released_holds` skips pins touched
+  mid-push), and one worker drives each PullSDK panel (review R2-1). A worker the watchdog rebuilds
+  from a dead worker's copy at the very moment a refresh lands may keep the old copy until the next
+  refresh; its passes are stopped meanwhile `[UNVERIFIED — not reproduced]`. A targeted revoke drained between the save and the refresh
   names its pin under the previous scheme — what an unwiped terminal holds. A device row that cannot be
   read is not re-checked (logged): a broken database already stops every write at its write-ahead
   intent (§3.4a). `[CODE]`
@@ -2701,10 +2711,12 @@ Now `[CODE]`:
   does, as before). No fleet device is DEVICE-mode (§3.2g). ULTRA workers are asked for nothing by a
   tick that refreshed nothing (unchanged). `TIMER` is not in `_should_defer_ultra_reconnects`, so a
   safety tick defers no reconnect.
-- **No success sound on a safety tick** (review R1-F1): `_maybe_emit_sync_success_feedback` publishes no
-  `sync_completed_success` for a `TIMER` sync in safety mode — the desk's sound and confetti
-  (`tauri-ui` `AccessFeedbackProvider`, both on by default) would otherwise play up to every ~2 min.
-  Every other successful sync, and every `TIMER` sync outside safety mode, still plays them. Each tick
+- **No success sound on a safety tick that brought nothing** (review R1-F1, R2-5):
+  `_maybe_emit_sync_success_feedback` publishes no `sync_completed_success` for a `TIMER` sync in safety
+  mode whose answer refreshed no section — the desk's sound and confetti (`tauri-ui`
+  `AccessFeedbackProvider`, both on by default) would otherwise play up to every ~2 min. A safety tick
+  that brought a change plays them, as the probe's sync for that change did; every other successful
+  sync, and every `TIMER` sync outside safety mode, plays them as before. Each tick
   still writes its `sync_run_history` row (kept 30 days, `prune_sync_run_history`): up to ~560 a day
   with the socket down all day (37.5/h over a ~15 h day), ~110 with it up, against ~30 today; the row
   size is not measured `[UNVERIFIED]`.

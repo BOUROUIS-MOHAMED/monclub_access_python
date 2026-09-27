@@ -517,6 +517,9 @@ def test_r1_a_worker_whose_lease_is_not_drive_still_gets_its_new_device_row(worl
     try:
         app.apply_fast_patch_bundle(_switch_bundle("ACCOUNT"))
         assert worker._device.get("pinScheme") == "ACCOUNT"
+        # R2-4: the scheduler's list is left alone while not every worker is driven -- it used
+        # to lose the device here, and nothing put it back when the lease returned.
+        assert [d.get("id") for d in world["engine"]._sync_scheduler._devices] == [_DEVICE_ID]
     finally:
         lg.reset_for_tests()
 

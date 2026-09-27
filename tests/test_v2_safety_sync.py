@@ -444,16 +444,18 @@ def _feedback_app(safety):
     return app
 
 
-@pytest.mark.parametrize(("safety", "source", "played"), [
-    (None, "TIMER", True),                 # today: the 30-min timer sync plays it
-    (dict(DOWN), "TIMER", False),          # a safety tick every ~2 min must not
-    (dict(UP), "TIMER", False),
-    (dict(UP), "SYNC_NOW_API", True),      # a sync someone asked for still does
-    (dict(UP), "REALTIME_NOTICE", True),   # P3b-2's notice syncs: unchanged
+@pytest.mark.parametrize(("safety", "source", "changes", "played"), [
+    (None, "TIMER", False, True),                 # today: the 30-min timer sync plays it
+    (dict(DOWN), "TIMER", False, False),          # a safety tick that brought nothing: silent
+    (dict(UP), "TIMER", False, False),
+    (dict(DOWN), "TIMER", True, True),            # one that brought a change plays it (R2-5)
+    (dict(UP), "SYNC_NOW_API", False, True),      # a sync someone asked for still does
+    (dict(UP), "REALTIME_NOTICE", False, True),   # P3b-2's notice syncs: unchanged
 ])
-def test_r1_the_success_sound_is_not_played_on_every_safety_tick(safety, source, played) -> None:
+def test_r1_the_success_sound_is_not_played_on_every_safety_tick(safety, source, changes, played) -> None:
     app = _feedback_app(safety)
     app._maybe_emit_sync_success_feedback(
         sync_run_id=7, final_status="SUCCESS",
-        trigger_context=SyncTriggerContext(run_type="PERIODIC", trigger_source=source))
+        trigger_context=SyncTriggerContext(run_type="PERIODIC", trigger_source=source),
+        brought_changes=changes)
     assert app.publish_feedback_event.called is played
