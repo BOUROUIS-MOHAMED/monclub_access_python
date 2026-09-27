@@ -182,6 +182,26 @@ from app.core.pin_scheme import (  # noqa: E402  (re-exported)
 )
 
 
+def count_waiting_pins(desired_hashes: Dict[str, str], state: Dict[str, tuple]) -> int:
+    """How many pins of a pass's desired roster still wait to be written (the heartbeat's
+    ``failedPins``, the dashboard's "N waiting").
+
+    ``desired_hashes`` is ``{pin: the content hash the pass wanted on the device}``; ``state``
+    is ``list_device_sync_hashes_and_status`` read AFTER the pass: ``{pin: (hash, last_ok)}``.
+    A pin waits when it has no row, its last push is not confirmed, or the device holds other
+    content -- the pins the next pass will try again: refused, in retry backoff, left by the
+    per-pass cap or a full terminal. Rows of pins outside the roster are not counted: an old
+    scheme's rows after a switch, or a departed member a ceiling refusal kept, stay
+    ``last_ok=0`` for good and nothing will ever write them.
+    """
+    waiting = 0
+    for pin, want in (desired_hashes or {}).items():
+        have_hash, have_ok = (state or {}).get(pin, ("", False))
+        if not (have_ok and have_hash and have_hash == want):
+            waiting += 1
+    return waiting
+
+
 class PinSchemeSwitchedError(RuntimeError):
     """A PullSDK pass stopped before a write: the device's pinScheme changed after the pass read
     its device row (``pin_scheme_superseded``). Raised, not returned, so every caller reads the
@@ -3063,6 +3083,10 @@ class DeviceSyncEngine:
         report_progress: bool = True,
     ) -> None:
         dev_id = device.get("id")
+        # How many roster pins still wait to be written after THIS pass (count_waiting_pins);
+        # None until the pass has hashed its roster -- a pass that stops before that counts
+        # nothing, and the ULTRA worker keeps its previous figure.
+        self._last_waiting_pins = None
         if not _lease_gate.device_allowed(dev_id):
             # P3b-2: never open a PullSDK session on a turnstile another PC drives.
             self.logger.warning(
@@ -4447,6 +4471,14 @@ class DeviceSyncEngine:
                     pass
             raise
         finally:
+            # Read back AFTER the pass wrote its per-pin state, whatever it did: a pass that
+            # raised part-way leaves the unwritten pins waiting, which is what they are.
+            try:
+                self._last_waiting_pins = count_waiting_pins(
+                    desired_hashes, list_device_sync_hashes_and_status(device_id=did) or {})
+            except Exception:
+                self.logger.debug("[DeviceSync] Device id=%s waiting-pin count unreadable", did,
+                                  exc_info=True)
             if batch_id is not None:
                 if batch_error and pins_sorted:
                     for pin in pins_sorted:

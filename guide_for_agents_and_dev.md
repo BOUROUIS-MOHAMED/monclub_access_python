@@ -59,6 +59,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `app.py::ultra_devices_for_this_pc`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
+| What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`) | §3.10 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -3451,6 +3452,40 @@ run each (base 612 ms, branch 421 ms, not counted): base 381–384 ms, branch 36
 both, the 20 s loop exiting cleanly. The door path runs none of lane B's code (the scheme re-checks are in
 the push passes); offline the v2 runtime stays `UNKNOWN`, so this start-up is the power-on path with the
 safety sync off — a start-up in safety mode is not on these harnesses: unmeasured.
+
+### 3.10 The heartbeat's turnstile line — "N waiting" (lane 1, 2026-09-27)
+
+`pc_identity.py::build_heartbeat_payload` sends one `turnstiles[]` line per device, `{gymDeviceId,
+reachable, failedPins, mode}`: from the sync cache (`failedPins` from the cached device row), then the
+AGENT snapshot (`failedPins`), then the ULTRA worker snapshot (`failedPins` or `failed_pins`), the last
+one found winning. `[CODE]` Until this change no engine put the key in either snapshot and no device
+row carries it, so every line said 0 and the dashboard's "not reachable since 14:02, 3 waiting"
+(`mon_club_dashboard` `gym-access-pcs-turnstiles-presentation.ts::waitingLineForm`, "the PINs the PC
+could not write and keeps for its next try") never appeared. `[CODE]`
+
+- **ULTRA** — each full pass counts, when it ends, the pins of ITS desired roster that the per-pin
+  state does not show confirmed with the desired content: no `device_sync_state` row, `last_ok=0`, or
+  another hash (`device_sync.py::count_waiting_pins`, the predicate the next pass pushes on, backoff
+  aside). So a pin the terminal refused, one held by the retry backoff, one left by the per-pass cap
+  or by `CAPACITY_FULL` counts; a pin outside the roster never does — after a pinScheme switch the old
+  scheme's rows stay `last_ok=0` for good (§3.2c: the revoke pass aborts, no prune), and a raw
+  `last_ok=0` count would read ~1,000 waiting at gym 45 forever. MB2000: `_run_standalone_full_sync`
+  (after its try, so a pass that raised part-way counts what it left unwritten); PullSDK:
+  `DeviceSyncEngine._sync_one_device`'s `finally` sets `_last_waiting_pins`, which the worker's PullSDK
+  drain copies. The worker snapshot's `failed_pins` is None until a pass has counted (the heartbeat
+  sends 0 then, as before), and a pass that stops before building its roster (no cache, unreadable
+  ownership or guard, a scheme stop, a lease refusal) keeps the previous figure. `[CODE]`
+  `[TEST: test_waiting_pins_report.py — refused, backoff-held and capped-out pins counted, a clean
+  pass 0, 12 old-scheme rows at last_ok=0 not counted, an early return keeping the figure, both SDKs,
+  the worker's PullSDK copy, the heartbeat line]`
+- **Limits `[CODE]`.** The figure is as of the last full pass. No pass runs while the terminal is
+  unreachable, so the line "not reachable since …, N waiting" shows what that last pass left, not the
+  members changed since; a targeted member push does not move it until the next pass (which the
+  scheduler runs after every roster change). ACCOUNT rows withheld for a missing `mainAccountId` are
+  not counted: their pin cannot be named (§3.2b, `PIN_SCHEME_ACCOUNT_WITHHELD` reports them).
+- **AGENT** — `failedPins: 0` in the snapshot, stated, not defaulted: no engine writes a PIN to an
+  AGENT device (§3). **DEVICE** mode keeps the cache row's value, which no writer fills (no fleet device
+  is DEVICE-mode, §3.2g). `[CODE]`
 
 ---
 

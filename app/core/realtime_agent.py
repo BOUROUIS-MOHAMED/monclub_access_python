@@ -1947,6 +1947,10 @@ class AgentRealtimeEngine:
                     "pollEma": st.poll_ema,
                     "cmdEma": st.cmd_ema,
                     "droppedEvents": st.dropped_events,
+                    # The heartbeat's "N waiting". No engine writes a PIN to an AGENT device
+                    # (DeviceSyncEngine syncs DEVICE devices only, the ULTRA engine ULTRA ones,
+                    # guide §3), so nothing waits to be written: a true 0, not an unknown.
+                    "failedPins": 0,
                 }
             return snap
 

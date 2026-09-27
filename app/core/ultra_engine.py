@@ -691,6 +691,9 @@ class UltraDeviceWorker(threading.Thread):
         self._last_full_sync_duration_ms = 0.0
         self._last_full_sync_error = ""
         self._full_sync_running = False
+        # Pins of the last full pass's roster still waiting to be written (the heartbeat's
+        # failedPins, device_sync.count_waiting_pins). None until a pass has counted.
+        self._waiting_pins: Optional[int] = None
 
         # Local state cache (avoid per-event DB reads).
         # Reloads are gated by a generation counter (bumped only when a sync
@@ -2203,6 +2206,19 @@ class UltraDeviceWorker(threading.Thread):
     # skip a pin because a lookup broke); any failure to WRITE state is logged
     # and ignored (the worst case is an unnecessary re-push next time).
     # ------------------------------------------------------------------ #
+    def _count_waiting_pins(self, desired_hashes: Dict[str, str]) -> None:
+        """Set the "N waiting" figure from the per-pin state a pass just wrote
+        (``device_sync.count_waiting_pins``). An unreadable state keeps the previous figure."""
+        try:
+            from app.core.db import list_device_sync_hashes_and_status
+            from app.core.device_sync import count_waiting_pins
+            self._waiting_pins = count_waiting_pins(
+                desired_hashes,
+                list_device_sync_hashes_and_status(device_id=self._device_id) or {},
+            )
+        except Exception:
+            logger.debug("%s waiting-pin count unreadable", self._prefix, exc_info=True)
+
     def _standalone_pins_needing_push(
         self, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str]
     ) -> tuple[list[Dict[str, Any]], int]:
@@ -3640,11 +3656,14 @@ class UltraDeviceWorker(threading.Thread):
         renewal_holds: Dict[str, int] = {}
         kept_holds: set[str] = set()
         deferred_retry: tuple[list[str], bool] | None = None
+        # {pin: desired hash} of this pass's roster, for the "N waiting" count at its end.
+        waiting_hashes: Dict[str, str] | None = None
         try:
             self._last_standalone_roster_stats = None
             self._last_standalone_pin_persons = None
             users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
+            waiting_hashes = {p: (hashes_by_pin or {}).get(p, "") for p in desired_pins if p}
             _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
             roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
             # Read NOW: a targeted update served between two push chunks rebuilds a roster
@@ -4073,6 +4092,8 @@ class UltraDeviceWorker(threading.Thread):
                 deferred_retry = None
                 _tel.event("RENEWAL_HOLD", worker=self._tel_wid, held=len(renewal_holds),
                            removed_after_push=0, kept=len(renewal_holds))
+        if waiting_hashes is not None:
+            self._count_waiting_pins(waiting_hashes)
         duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
         if batch_id is not None:
             try:
@@ -5779,6 +5800,11 @@ class UltraDeviceWorker(threading.Thread):
                     source=reason,
                     changed_ids=None,
                 ))
+                # "N waiting": the pass counted what its roster still waits for; a pass that
+                # stopped before hashing its roster counted nothing and the figure stays.
+                _waiting = getattr(engine, "_last_waiting_pins", None)
+                if isinstance(_waiting, int):
+                    self._waiting_pins = _waiting
                 unconfirmed_revoked_ids = (
                     revoked_ids - self._confirmed_member_revokes(revoked_ids)
                 )
@@ -7727,6 +7753,11 @@ class UltraDeviceWorker(threading.Thread):
             "last_full_sync_finished_at": self._last_full_sync_finished_at,
             "last_full_sync_duration_ms": round(self._last_full_sync_duration_ms, 1),
             "last_full_sync_error": self._last_full_sync_error,
+            # "N waiting" (heartbeat failedPins): pins of the last full pass's roster not
+            # confirmed on the device when it ended -- refused, in retry backoff, capped out.
+            # As of that pass: not refreshed while the device is unreachable (no pass runs)
+            # nor by a targeted member push. None = no pass has counted yet.
+            "failed_pins": getattr(self, "_waiting_pins", None),
         }
 
     def get_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:
