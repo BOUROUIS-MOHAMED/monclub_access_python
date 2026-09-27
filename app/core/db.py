@@ -9790,7 +9790,13 @@ def release_unstarted_erase_holds() -> Dict[int, Optional[str]]:
     stopped (power cut, crash, kill) before its first delete command, a backup-only rehearsal
     included. Nothing was erased, so nothing waits for Refill, and a hold left there would block
     every member write, revocations included, until someone presses Refill online. Must never
-    run while an erase of this process could be in its preparation. Returns {device_id: run_id}."""
+    run while an erase of this process could be in its preparation. Returns {device_id: run_id}.
+    A plain read first: the durable write job runs only when there is something to release (every
+    start-up calls this)."""
+    with get_conn() as conn:
+        if conn.execute("SELECT 1 FROM device_write_hold WHERE reason=? LIMIT 1",
+                        (HOLD_REASON_ERASE_PREP,)).fetchone() is None:
+            return {}
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[int, Optional[str]]:
         rows = conn.execute(
