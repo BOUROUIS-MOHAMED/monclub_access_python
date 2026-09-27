@@ -2053,7 +2053,9 @@ run folder's `run.json`):
      the midnight date flip during a long MB2000 backup: a normal pass would remove them too; lane 1c review round 1; the
      step-1 roster's pins are kept with the run, `EraseWizard._run_step1_roster`, not in its record). Anyone else — a user
      enrolled on the terminal since step 1 — ends the run `NOT_REFILLED_CHANGED`, `FAILED`, nothing erased (the operator
-     reads step 1 again). Then the run records `notRefilled {count, pins}` — those who left the roster included — and,
+     reads step 1 again). That roster excuses its pins only under the scheme it was read with: a pin-scheme switch saved
+     since step 1 (during the backup) ends the run `PIN_SCHEME_CHANGED`, `FAILED`, nothing erased — every old pin would
+     otherwise read "not put back" (lane 1c review round 2). Then the run records `notRefilled {count, pins}` — those who left the roster included — and,
      when there are any, writes the keep mark (above) before `begin_device_erase`. `[TEST: ::TestPeopleTheRefillWillNotPutBack]`
    - *The erase is recorded* (`db.begin_device_erase`, one durable transaction, review F12 + F1): the run's hold row
      moves to `erase` (a delete may run from here), and the last push result (§3.9) of every pin MonClub recorded for
