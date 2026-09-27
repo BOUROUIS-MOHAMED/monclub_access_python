@@ -365,7 +365,13 @@ try {
                       "Stands down while an install or update is in progress.") | Out-Null
 } catch {
     $registerError = $_
-    $left = Restore-PreviousWatchdogTask
+    # Its own try: an error in the put-back must not replace the registration's
+    # error, which is the one the run fails with.
+    try {
+        $left = Restore-PreviousWatchdogTask
+    } catch {
+        $left = "putting the previous task back stopped with an error ($($_.Exception.Message))"
+    }
     Write-Warning "Registering the new task failed; $left."
     Write-RegisterLog 'WARN' "registering the new task failed; $left"
     throw $registerError
@@ -381,12 +387,21 @@ if ($keepDisabled) {
     if (-not (Test-WatchdogTaskKeptDisabled)) {
         # The new definition will not stay disabled on this PC. Do not leave it
         # enabled: remove it and put the old, disabled task back from its export.
+        $newRemoved = $false
         try {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-            $left = Restore-PreviousWatchdogTask
+            $newRemoved = $true
         } catch {
             $left = ("the new task could not be removed ($($_.Exception.Message)); " +
                      (Confirm-NoEnabledWatchdogTask))
+        }
+        if ($newRemoved) {
+            try {
+                $left = Restore-PreviousWatchdogTask
+            } catch {
+                $left = ("the new task was removed; putting the previous task back stopped with an " +
+                         "error ($($_.Exception.Message)); task now: $(Get-WatchdogTaskSummary)")
+            }
         }
         throw ("Scheduled task '$TaskName' was disabled before and could not be kept disabled; " +
                "$left (task now: $(Get-WatchdogTaskSummary)). If it reads Ready or Running, run: " +

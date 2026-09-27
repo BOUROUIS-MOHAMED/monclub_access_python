@@ -378,6 +378,7 @@ param(
                                # 'fails': that registration throws
     [string] $LeavesTask,      # 'yes': the failing registration (RegisterFails) still created
                                # the new task, enabled, before it threw
+    [string] $UnregisterNewFails, # 'yes': Unregister-ScheduledTask throws once the new task is registered
     [string] $Mode             # 'register', or 'remove' (-Remove)
 )
 $ErrorActionPreference = 'Stop'
@@ -391,6 +392,7 @@ $global:FailNext   = ($RegisterFails -eq 'yes')
 $global:XmlOk      = ($XmlHonoured -eq 'yes')
 $global:XmlFails   = ($XmlHonoured -eq 'fails')
 $global:LeavesTask = ($LeavesTask -eq 'yes')
+$global:UnregNewFails = ($UnregisterNewFails -eq 'yes')
 $global:Expected   = $TaskName
 $global:Registered = $null
 function global:New-FakeTask([string] $Path, [string] $State, [bool] $Enabled) {
@@ -431,6 +433,10 @@ function global:Export-ScheduledTask {
 }
 function global:Unregister-ScheduledTask {
     param([string] $TaskName, $Confirm)
+    if ($global:UnregNewFails -and $global:Calls.Contains('register')) {
+        [void] $global:Calls.Add('unregister-failed')
+        throw 'stub: unregister failed'
+    }
     [void] $global:Calls.Add('unregister')
     $global:Tasks.Clear()
 }
@@ -531,6 +537,7 @@ def _register(
     xml_honoured: bool = True,
     xml_fails: bool = False,
     leaves_task: bool = False,
+    unregister_new_fails: bool = False,
     mode: str = "register",
 ) -> dict:
     """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler.
@@ -559,6 +566,7 @@ def _register(
          "-RegisterFails", "yes" if register_fails else "no",
          "-XmlHonoured", "fails" if xml_fails else ("yes" if xml_honoured else "no"),
          "-LeavesTask", "yes" if leaves_task else "no",
+         "-UnregisterNewFails", "yes" if unregister_new_fails else "no",
          "-Mode", mode],
         capture_output=True, text=True, timeout=120, check=False,
     )
@@ -681,6 +689,16 @@ class TestRegisterKeepsADisabledTaskDisabled:
                       leaves_task=True, xml_fails=True, disable_works=False)
         assert "stub: registration failed" in r["error"], r
         assert r["final"] == "", r
+
+    def test_a_new_task_that_can_be_neither_disabled_nor_removed_is_reported(self, tmp_path: Path):
+        """Nothing more can be done on that PC: the run fails, says the task is
+        ENABLED and gives the command, and the log has it."""
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False,
+                      disable_works=False, unregister_new_fails=True)
+        assert "could not be kept disabled" in r["error"], r
+        assert "could not be removed" in r["error"] and "ENABLED" in r["error"], r
+        assert "Disable-ScheduledTask" in r["error"], r
+        assert "FAILED" in r["log"] and "ENABLED" in r["log"], r["log"]
 
     def test_an_enabled_task_is_put_back_enabled(self, tmp_path: Path):
         """The read-back applies only to a task that was disabled."""
