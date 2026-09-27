@@ -251,12 +251,34 @@ def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
     return int(status or 503), {"ok": False, "code": code, "error": error}
 
 
+def _no_answer(exc: BaseException) -> bool:
+    """A request that got no answer at all -- the exception or its cause is a connection that
+    failed or timed out: ``requests``' ConnectionError / Timeout, or a socket error. Any other
+    ``requests`` error (they all derive from OSError: a body that is not JSON, a redirect loop)
+    DID get an answer."""
+    try:
+        from requests.exceptions import ConnectionError as _ConnErr, RequestException, Timeout
+    except Exception:
+        _ConnErr = RequestException = Timeout = None         # type: ignore[assignment]
+    for err in (exc, getattr(exc, "__cause__", None)):
+        if err is None:
+            continue
+        if RequestException is not None and isinstance(err, RequestException):
+            return isinstance(err, (_ConnErr, Timeout))
+        if isinstance(err, OSError):
+            return True
+    return False
+
+
 def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
     """Is the Erase wizard switched on for this gym, on the server? (owner decision 2026-09-27,
     guide §3.2h). ``(enabled, code, why)``: ONLY a 200 whose JSON ``enabled`` is the boolean
-    ``true`` enables. ``false`` is ``ERASE_NOT_ENABLED``; anything else -- no token, a 404 from an
-    older backend, 401/403, 5xx, a timeout, a body that is not JSON or not that boolean (the
-    string ``"true"`` included) -- is ``ERASE_SWITCH_UNCHECKED``. Never raises."""
+    ``true`` enables. ``false`` is ``ERASE_NOT_ENABLED``. The refusals say why (lane 1c, review
+    F4): a 404 or 405 is ``ERASE_SWITCH_MISSING`` -- a backend without the route, which retrying
+    cannot change; no answer at all (a failed connection, a timeout) is
+    ``ERASE_SWITCH_UNREACHABLE``; anything else -- no token, 401/403, 5xx, a body that is not
+    JSON or not that boolean (the string ``"true"`` included) -- is ``ERASE_SWITCH_UNCHECKED``.
+    Never raises."""
     try:
         from access.store import load_auth_token
         auth = load_auth_token()
@@ -264,6 +286,11 @@ def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
             return False, "ERASE_SWITCH_UNCHECKED", "no gym token on this PC"
         body = app._api().get_erase_wizard_switch(token=auth.token, timeout=15)
     except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if status in (404, 405):
+            return False, "ERASE_SWITCH_MISSING", str(exc)[:200]
+        if status is None and _no_answer(exc):
+            return False, "ERASE_SWITCH_UNREACHABLE", str(exc)[:200]
         return False, "ERASE_SWITCH_UNCHECKED", str(exc)[:200]
     enabled = body.get("enabled") if isinstance(body, dict) else None
     if enabled is True:
@@ -891,11 +918,18 @@ class EraseWizard:
         # password still reads as one. Starts only -- never the preview, never Refill.
         enabled, code, why = check_erase_switch(self.app)
         if not enabled:
+            error = {
+                "ERASE_NOT_ENABLED": "the erase is not enabled for this gym: the owner can enable "
+                                     "it in the dashboard (access PCs page)",
+                "ERASE_SWITCH_MISSING": f"the MonClub server does not offer the erase switch yet "
+                                        f"({why}): the erase is not available until the server "
+                                        "is updated -- retrying will not help",
+                "ERASE_SWITCH_UNREACHABLE": f"the MonClub server did not answer the switch check "
+                                            f"({why}): check the internet, then try again",
+            }.get(str(code), f"whether the erase is enabled for this gym could not be checked: "
+                             f"{why}")
             return (403 if code == "ERASE_NOT_ENABLED" else 503), {
-                "ok": False, "code": code,
-                "error": ("the erase is not enabled for this gym: the owner can enable it in the "
-                          "dashboard (access PCs page)") if code == "ERASE_NOT_ENABLED" else
-                         f"whether the erase is enabled for this gym could not be checked: {why}"}
+                "ok": False, "code": code, "error": error}
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         started_at, corrected = _corrected_epoch()
         run = {

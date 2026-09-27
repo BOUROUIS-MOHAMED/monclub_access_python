@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { cn } from "@/lib/utils";
 import { AlertTriangle, CheckCircle2, Loader2, Lock, ShieldAlert, Trash2, XCircle, PauseCircle } from "lucide-react";
+import { ApiError } from "@/api/client";
 import {
   liveEraseApi, type EraseApi, type ErasePreview, type EraseRun, type RefillOption,
 } from "@/api/erase";
@@ -43,9 +44,10 @@ function errText(e: unknown): string {
 }
 
 // The request never got an answer (the client's own timeout, or no network): the server may
-// still have acted -- never read it as "refused".
+// still have acted -- never read it as "refused". An ApiError is an HTTP answer, whatever its
+// text says (lane 1c, review nit: a server text holding "network" is not a lost request).
 function noAnswer(e: unknown): boolean {
-  if (errCode(e)) return false;
+  if (errCode(e) || e instanceof ApiError) return false;
   const name = e && typeof e === "object" ? String((e as { name?: unknown }).name ?? "") : "";
   const msg = errText(e).toLowerCase();
   return name === "AbortError" || name === "TimeoutError" || name === "TypeError"

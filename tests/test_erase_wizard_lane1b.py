@@ -706,12 +706,22 @@ class TestTheGymsServerSwitch:
     @pytest.mark.parametrize("answer, enabled, code", [
         (_Resp(200, {"enabled": True, "updatedAt": "2026-09-27T21:00:00"}), True, None),
         (_Resp(200, {"enabled": False, "updatedAt": None}), False, "ERASE_NOT_ENABLED"),
-        (_Resp(404, text='{"status":false,"code":"NOT_FOUND"}'), False, "ERASE_SWITCH_UNCHECKED"),
+        # Lane 1c (review F4): a backend without the route is not "no internet".
+        (_Resp(404, text='{"status":false,"code":"NOT_FOUND"}'), False, "ERASE_SWITCH_MISSING"),
+        (_Resp(405, text="method not allowed"), False, "ERASE_SWITCH_MISSING"),
         (_Resp(401, text="unauthorized"), False, "ERASE_SWITCH_UNCHECKED"),
         (_Resp(403, text="forbidden"), False, "ERASE_SWITCH_UNCHECKED"),
         (_Resp(500, text="boom"), False, "ERASE_SWITCH_UNCHECKED"),
-        (TimeoutError("read timed out"), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(502, text="bad gateway"), False, "ERASE_SWITCH_UNCHECKED"),
+        (TimeoutError("read timed out"), False, "ERASE_SWITCH_UNREACHABLE"),
+        (__import__("requests").exceptions.ReadTimeout("read timed out"), False,
+         "ERASE_SWITCH_UNREACHABLE"),
+        (__import__("requests").exceptions.ConnectionError("no route"), False,
+         "ERASE_SWITCH_UNREACHABLE"),
         (_Resp(200, ValueError("not json"), text="<html>"), False, "ERASE_SWITCH_UNCHECKED"),
+        # requests' own JSON error derives from OSError: it got an answer all the same.
+        (_Resp(200, __import__("requests").exceptions.JSONDecodeError("Expecting value", "<", 0),
+               text="<html>"), False, "ERASE_SWITCH_UNCHECKED"),
         (_Resp(200, {"enabled": "true"}), False, "ERASE_SWITCH_UNCHECKED"),
         (_Resp(200, {"enabled": 1}), False, "ERASE_SWITCH_UNCHECKED"),
         (_Resp(200, [True]), False, "ERASE_SWITCH_UNCHECKED"),
@@ -727,18 +737,24 @@ class TestTheGymsServerSwitch:
         (ok, code, _w), calls = self._check(monkeypatch, _Resp(200, {"enabled": True}), token=None)
         assert (ok, code) == (False, "ERASE_SWITCH_UNCHECKED") and calls == []
 
-    @pytest.mark.parametrize("answer, status, code", [
-        ((False, "ERASE_NOT_ENABLED", "off"), 403, "ERASE_NOT_ENABLED"),
-        ((False, "ERASE_SWITCH_UNCHECKED", "timeout"), 503, "ERASE_SWITCH_UNCHECKED"),
+    @pytest.mark.parametrize("answer, status, code, says", [
+        ((False, "ERASE_NOT_ENABLED", "off"), 403, "ERASE_NOT_ENABLED", "not enabled"),
+        ((False, "ERASE_SWITCH_UNCHECKED", "HTTP 500"), 503, "ERASE_SWITCH_UNCHECKED",
+         "could not be checked"),
+        ((False, "ERASE_SWITCH_MISSING", "HTTP 404"), 503, "ERASE_SWITCH_MISSING",
+         "does not offer"),
+        ((False, "ERASE_SWITCH_UNREACHABLE", "timeout"), 503, "ERASE_SWITCH_UNREACHABLE",
+         "internet"),
     ])
     def test_a_start_is_refused_unless_the_switch_is_on(self, sqlite_db, monkeypatch, tmp_path,
-                                                        answer, status, code):
+                                                        answer, status, code, says):
         monkeypatch.setattr(ew, "check_erase_switch", lambda app: answer)
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         pv = _preview(wiz, 5)
         for body in (_body(pv["previewId"]), _body(pv["previewId"], backupOnly=True)):
             got, out = wiz.start(5, body, verify_password=_pw_ok)
             assert (got, out["code"]) == (status, code)
+            assert says in out["error"], out["error"]
         assert not device_hold.is_held(5) and wiz.status()["run"] is None
         assert {c for c in panel.calls if c[0] != "count"} == {("read", "user")}, "step 1 only"
 
