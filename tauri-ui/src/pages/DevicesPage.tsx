@@ -192,10 +192,13 @@ export default function DevicesPage() {
   // Erase-content wizard (lane 1, 2026-09-27) and the turnstiles an erase left on hold.
   const [eraseDialog, setEraseDialog] = useState<{ deviceId: number; deviceName: string; mode: "erase" | "refill" } | null>(null);
   const [heldIds, setHeldIds] = useState<Set<number>>(new Set());
+  // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
+  const [holdsUnknown, setHoldsUnknown] = useState(false);
   const reloadHolds = useCallback(async () => {
     try {
       const res = await liveEraseApi.holds();
       setHeldIds(new Set((res.holds ?? []).map((h) => Number(h.deviceId)).filter((n) => Number.isFinite(n))));
+      setHoldsUnknown(!!res.loadFailed);
     } catch { /* an older Access API without the wizard: no hold is shown */ }
   }, []);
   useEffect(() => { void reloadHolds(); }, [reloadHolds, data]);
@@ -524,6 +527,12 @@ export default function DevicesPage() {
 
         {error && (
           <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{error}</AlertDescription></Alert>
+        )}
+        {holdsUnknown && (
+          <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>
+            Access n'a pas pu relire les mises en attente après un effacement : aucun membre n'est écrit sur
+            aucun appareil jusqu'à la prochaine lecture réussie (réessayée à chaque synchronisation).
+          </AlertDescription></Alert>
         )}
 
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">

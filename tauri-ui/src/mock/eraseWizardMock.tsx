@@ -20,17 +20,24 @@ const DEVICES: MockDevice[] = [
   { id: 8, name: "Sortie", ip: "192.168.1.247", protocol: "ZK_STANDALONE" },
 ];
 
-function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = []): EraseApi {
+// Mock options (URL): ?faces=unknown -- the MB2000 does not report its face count;
+// ?incomplete=1 -- the C3 keeps its user rows after the erase (the run ends INCOMPLETE).
+type MockOpts = { facesUnknown: boolean; incomplete: boolean };
+
+function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = [],
+                 opts: MockOpts = { facesUnknown: false, incomplete: false }): EraseApi {
   let run: EraseRun | null = null;
   const holds = new Set<number>(initialHeld);
+  // Illustrative numbers only (a mock): no real panel was read.
   const counts = (d: MockDevice): EraseCounts => d.protocol === "ZK_PULLSDK"
-    ? { tables: { user: 1690, userauthorize: 1690, templatev10: null, template: null, transaction: 48213 }, extra: {} }
-    : { tables: { users: 1838, fingerprints: 2023, attendance: 70 }, extra: { admins: 2, faces: 0, passwords: 0 } };
+    ? { tables: { user: 1690, userauthorize: 1690, templatev10: 0, template: null, transaction: 48213 }, extra: {} }
+    : { tables: { users: 1838, fingerprints: 2023, attendance: 70 },
+        extra: { admins: 2, faces: opts.facesUnknown ? null : 0, passwords: 0 } };
   const rows = (d: MockDevice) => d.protocol === "ZK_PULLSDK"
     ? [
       { key: "user", count: 1690, erasable: true },
       { key: "userauthorize", count: 1690, erasable: true },
-      { key: "templatev10", count: null, erasable: false, reason: "UNREADABLE" },
+      { key: "templatev10", count: 0, erasable: true },
       { key: "template", count: null, erasable: false, reason: "UNREADABLE" },
       { key: "transaction", count: 48213, erasable: false, reason: "DOOR_LOG_NOT_SUPPORTED" },
     ]
@@ -61,8 +68,9 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = []):
       const d = DEVICES.find((x) => x.id === did)!;
       if (body.typedName !== d.name) throw new Error("the typed name is not this turnstile's name");
       const before = counts(d);
+      const failC3 = opts.incomplete && d.protocol === "ZK_PULLSDK";
       const after: EraseCounts = d.protocol === "ZK_PULLSDK"
-        ? { tables: { ...before.tables, user: 0, userauthorize: 0 }, extra: {} }
+        ? { tables: { ...before.tables, user: failC3 ? 1690 : 0, userauthorize: 0, templatev10: 0 }, extra: {} }
         : { tables: { ...before.tables, users: 2, fingerprints: 3 }, extra: before.extra };
       run = {
         runId: "20260927-234107-3fa9c1", deviceId: did,
@@ -85,7 +93,16 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = []):
           ? ["templatev10", "template", "userauthorize", "user"].filter((t) => body.tables.includes(t))
           : [body.tables.includes("users") ? "users" : "fingerprints"]
         ).map((t) => () => run!.steps.push({ step: `erase_${t}`, ok: true, at: at() })),
-        () => { run!.countsAfter = after; run!.steps.push({ step: "counts_after", ok: true, at: at() }); },
+        () => { run!.countsAfter = after; run!.steps.push({ step: "counts_after", ok: !failC3, at: at() }); },
+        ...(failC3 ? [
+          () => run!.steps.push({ step: "records_invalidated", ok: true, at: at() }),
+          () => {
+            holds.add(did); onHolds(new Set(holds));
+            run!.steps.push({ step: "finish", ok: false, at: at() });
+            run!.error = "NOT_VERIFIED: rows left or unreadable: {'user': 1690}";
+            run!.state = "INCOMPLETE"; run!.holdKept = true;
+          },
+        ] : [
         () => run!.steps.push({ step: body.forget ? "forget" : "keep_records", ok: true, at: at() }),
         () => run!.steps.push({ step: "wipe_reported", ok: true, at: at() }),
         () => {
@@ -95,18 +112,24 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = []):
           run!.steps.push({ step: "finish", ok: true, at: at() });
           run!.state = "DONE"; run!.holdKept = hold;
         },
+        ]),
       ];
       plan.forEach((fn, i) => setTimeout(fn, 500 * (i + 1)));
       return { ok: true, runId: run.runId };
     },
     async status() { return { ok: true, running: run?.state === "RUNNING", run: run ? JSON.parse(JSON.stringify(run)) : null }; },
-    async refill(did) {
+    async refill(did, _password, expectedPinScheme) {
+      // The server's interlock: the scheme the page showed must still be the recorded one.
+      if (expectedPinScheme !== "ACCOUNT") {
+        throw Object.assign(new Error("the pin scheme is ACCOUNT now"),
+          { code: "PIN_SCHEME_CHANGED", payload: { pinScheme: "ACCOUNT" } });
+      }
       holds.delete(did); onHolds(new Set(holds));
-      return { ok: true, pinScheme: "ACCOUNT", passRequested: true };
+      return { ok: true, pinScheme: "ACCOUNT", passRequested: true, invalidated: 1838 };
     },
     // A turnstile on hold after the cutover's switch: the refill will write "Par personne" pins.
     async holds() {
-      return { ok: true, holds: Array.from(holds).map((id): EraseHold => ({
+      return { ok: true, loadFailed: false, holds: Array.from(holds).map((id): EraseHold => ({
         deviceId: id, reason: "erase", since: "2026-09-27 23:41:07", pinScheme: "ACCOUNT" })) };
     },
   };
@@ -116,7 +139,8 @@ function MockPage() {
   const params = new URLSearchParams(window.location.search);
   const initialHeld = params.get("held") ? [Number(params.get("held"))] : [];
   const [held, setHeld] = useState<Set<number>>(new Set(initialHeld));
-  const api = useMemo(() => makeApi(setHeld, initialHeld), []);  // eslint-disable-line react-hooks/exhaustive-deps
+  const opts: MockOpts = { facesUnknown: params.get("faces") === "unknown", incomplete: params.get("incomplete") === "1" };
+  const api = useMemo(() => makeApi(setHeld, initialHeld, opts), []);  // eslint-disable-line react-hooks/exhaustive-deps
   const [dlg, setDlg] = useState<{ d: MockDevice; mode: "erase" | "refill" } | null>(() => {
     const id = Number(params.get("device") || 0);
     const d = DEVICES.find((x) => x.id === id);
@@ -184,11 +208,14 @@ async function autoplay(stop: string, lang: Lang, deviceId: number) {
   await sleep(200); clickButton(t.unlock); await sleep(1200);
   if (stop === "refill" || !at("choose")) return;
   clickButton(t.next); await sleep(300);
-  if (deviceId === 5) { tick(t.tableLabels.user); tick(t.tableLabels.userauthorize); } else { tick(t.tableLabels.users); }
+  // C3: ticking the users ticks and locks the rights and fingerprint tables.
+  if (deviceId === 5) { tick(t.tableLabels.user); } else { tick(t.tableLabels.users); }
   await sleep(200);
   if (!at("options")) return;
   clickButton(t.next); await sleep(300);
-  tick(t.forgetYes.slice(0, 30)); tick(t.refillHold); await sleep(200);
+  tick(t.forgetYes.slice(0, 30)); tick(t.refillHold);
+  if (deviceId === 8) tick(t.acceptFacesUnknown.slice(0, 30));
+  await sleep(200);
   if (!at("confirm")) return;
   clickButton(t.next); await sleep(300);
   setInput(document.querySelector<HTMLInputElement>("#erase-name"), deviceId === 5 ? "Entrée 1" : "Sortie");

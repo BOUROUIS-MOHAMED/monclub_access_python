@@ -26,6 +26,10 @@ const fr = {
     "Oui — MonClub oublie les membres qu'il avait écrits sur ce tourniquet (à choisir quand on efface les utilisateurs, par exemple pour passer en « Par personne »).",
   forgetNo: "Non — MonClub garde ses enregistrements et réécrit tout le monde au remplissage.",
   forgetNeedsUsers: "« Oui » n'est possible que si les utilisateurs sont effacés aussi.",
+  forgetForcedMb:
+    "Obligatoire quand on efface les utilisateurs d'un terminal autonome : sinon MonClub tenterait de supprimer des membres déjà partis.",
+  requiredByUser:
+    "Effacée avec les utilisateurs : sinon les droits et les empreintes restent et passent au prochain membre qui reçoit le même numéro.",
   refillTitle: "Remplissage",
   refillNow: "Remplir maintenant",
   refillAuto: "Remplir automatiquement (prochaine synchronisation)",
@@ -35,12 +39,15 @@ const fr = {
   refillAutoHelp: "En synchronisation manuelle, le remplissage attend le prochain « Synchroniser ».",
   acceptFaces: (n: number) =>
     `J'accepte la perte de ${n} visage(s) : aucune sauvegarde n'existe pour un visage.`,
+  acceptFacesUnknown:
+    "Le terminal n'a pas donné son nombre de visages : j'accepte la perte des visages éventuels (aucune sauvegarde n'existe pour un visage).",
   backupOnly: "Sauvegarde seule (répétition) : rien n'est effacé",
   rulesTitle: "Règles de sécurité",
   rules: [
     "Une sauvegarde des tables choisies est écrite dans un fichier et relue avant tout effacement. Si elle échoue, rien n'est effacé.",
-    "Pendant l'opération, MonClub n'écrit plus rien sur ce tourniquet. La porte et les lectures continuent.",
+    "Pendant l'opération, MonClub n'écrit plus aucun membre sur ce tourniquet. La porte et les lectures continuent.",
     "Seules les tables cochées sont effacées — jamais les paramètres, les fuseaux horaires ni les jours fériés.",
+    "Si l'effacement ne se termine pas vérifié, le tourniquet reste en attente, rien n'est oublié et tout sera réécrit au remplissage.",
     "Chaque étape est journalisée avec les nombres avant et après.",
   ],
   ruleAdmins: "Les administrateurs du terminal sont conservés.",
@@ -74,6 +81,7 @@ const fr = {
     counts_after: "Comptage après et vérification",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
+    records_invalidated: "Enregistrements gardés, marqués à réécrire",
     wipe_reported: "Effacement noté pour le serveur",
     refill: "Remplissage demandé",
     finish: "Fin",
@@ -86,12 +94,18 @@ const fr = {
   refillButton: "Remplir maintenant",
   schemeNote: (s: string) =>
     `Le remplissage écrira les membres selon le schéma enregistré maintenant : ${s}.`,
+  schemeChanged: (s: string) =>
+    `Le schéma a changé depuis l'affichage : c'est maintenant ${s}. Vérifiez-le, puis appuyez de nouveau sur « Remplir ».`,
+  holdsUnknown:
+    "Access n'a pas pu relire les mises en attente : tous les tourniquets restent en attente jusqu'à la prochaine lecture réussie.",
+  refillNeedsInternet: "Le remplissage demande Internet : le serveur vérifie le mot de passe.",
   schemes: { ACCOUNT: "Par personne", MEMBERSHIP: "Par abonnement" } as Record<string, string>,
   mbPasses: (n: number) =>
     `Un terminal autonome reçoit au plus ${n} membres par passage : le remplissage se fait en plusieurs passages.`,
   incompleteHelp:
-    "Vérifiez les nombres ci-dessous, puis relancez l'assistant ou appuyez sur « Remplir ». Rien n'a été oublié.",
+    "Vérifiez les nombres ci-dessous, puis relancez l'assistant ou appuyez sur « Remplir » : MonClub réécrira tous ses membres. Rien n'a été oublié.",
   refilled: "Remplissage lancé.",
+  refilledWith: (s: string) => `Remplissage lancé, schéma ${s}.`,
   notOnHold: "Ce tourniquet n'est plus en attente.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -134,6 +148,10 @@ const en: typeof fr = {
     "Yes — MonClub forgets the members it had written to this turnstile (choose it when the users are erased, for example to switch to 'Par personne').",
   forgetNo: "No — MonClub keeps its records and writes everyone again at the refill.",
   forgetNeedsUsers: "'Yes' needs the users erased too.",
+  forgetForcedMb:
+    "Required when a standalone terminal's users are erased: otherwise MonClub would try to delete members who are already gone.",
+  requiredByUser:
+    "Erased with the users: otherwise the rights and fingerprints stay and pass to the next member who gets the same number.",
   refillTitle: "Refill",
   refillNow: "Refill now",
   refillAuto: "Refill automatically (next sync)",
@@ -143,12 +161,15 @@ const en: typeof fr = {
   refillAutoHelp: "With manual sync, the refill waits for the next 'Synchronize'.",
   acceptFaces: (n: number) =>
     `I accept the loss of ${n} face template(s): no backup exists for a face.`,
+  acceptFacesUnknown:
+    "The terminal did not report its face count: I accept the loss of any faces (no backup exists for a face).",
   backupOnly: "Backup only (rehearsal): nothing is erased",
   rulesTitle: "Safety rules",
   rules: [
     "A backup of the chosen tables is written to a file and read back before anything is erased. If it fails, nothing is erased.",
-    "During the run MonClub writes nothing to this turnstile. The door and the scans keep working.",
+    "During the run MonClub writes no member to this turnstile. The door and the scans keep working.",
     "Only the ticked tables are erased — never the parameters, time zones or holidays.",
+    "If the erase does not end verified, the turnstile stays on hold, nothing is forgotten and everyone is written again at the refill.",
     "Every step is logged with the counts before and after.",
   ],
   ruleAdmins: "The terminal's administrators are kept.",
@@ -182,6 +203,7 @@ const en: typeof fr = {
     counts_after: "Counts after, and check",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
+    records_invalidated: "Records kept, marked to be written again",
     wipe_reported: "Erase noted for the server",
     refill: "Refill requested",
     finish: "End",
@@ -193,12 +215,18 @@ const en: typeof fr = {
   holdBanner: "On hold: MonClub writes nothing to this turnstile until Refill.",
   refillButton: "Refill now",
   schemeNote: (s: string) => `The refill writes the members under the scheme recorded now: ${s}.`,
+  schemeChanged: (s: string) =>
+    `The scheme changed since it was shown: it is now ${s}. Check it, then press Refill again.`,
+  holdsUnknown:
+    "Access could not read the holds back: every turnstile stays on hold until the next successful read.",
+  refillNeedsInternet: "Refill needs the internet: the server checks the password.",
   schemes: { ACCOUNT: "Par personne (per person)", MEMBERSHIP: "Par abonnement (per membership)" },
   mbPasses: (n: number) =>
     `A standalone terminal receives at most ${n} members per pass: the refill takes several passes.`,
   incompleteHelp:
-    "Check the counts below, then run the wizard again or press Refill. Nothing was forgotten.",
+    "Check the counts below, then run the wizard again or press Refill: MonClub writes all its members again. Nothing was forgotten.",
   refilled: "Refill started.",
+  refilledWith: (s: string) => `Refill started, scheme ${s}.`,
   notOnHold: "This turnstile is no longer on hold.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {

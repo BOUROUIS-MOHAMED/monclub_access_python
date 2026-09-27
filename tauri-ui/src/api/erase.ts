@@ -78,13 +78,29 @@ export interface EraseStartBody {
   backupOnly?: boolean;
 }
 
+export interface EraseHolds {
+  ok: boolean;
+  holds: EraseHold[];
+  /** The start-up read of the holds failed: every turnstile is held until it reads. */
+  loadFailed?: boolean;
+}
+
+export interface RefillResult {
+  ok: boolean;
+  pinScheme: string | null;
+  passRequested: boolean;
+  invalidated?: number;
+}
+
 export interface EraseApi {
   verifyPassword(password: string): Promise<{ ok: boolean; error?: string }>;
   preview(deviceId: number): Promise<ErasePreview>;
   start(deviceId: number, body: EraseStartBody): Promise<{ ok: boolean; runId: string }>;
   status(): Promise<{ ok: boolean; running: boolean; run: EraseRun | null }>;
-  refill(deviceId: number, password: string): Promise<{ ok: boolean; pinScheme: string | null; passRequested: boolean }>;
-  holds(): Promise<{ ok: boolean; holds: EraseHold[] }>;
+  /** ``expectedPinScheme``: the scheme the page SHOWED (read from holds()); the server refuses
+   *  with 409 PIN_SCHEME_CHANGED when it moved since. */
+  refill(deviceId: number, password: string, expectedPinScheme: string | null): Promise<RefillResult>;
+  holds(): Promise<EraseHolds>;
 }
 
 export const liveEraseApi: EraseApi = {
@@ -94,8 +110,7 @@ export const liveEraseApi: EraseApi = {
   start: (deviceId, body) =>
     post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 30_000),
   status: () => get<{ ok: boolean; running: boolean; run: EraseRun | null }>("/erase/status"),
-  refill: (deviceId, password) =>
-    post<{ ok: boolean; pinScheme: string | null; passRequested: boolean }>(
-      `/devices/${deviceId}/erase/refill`, { password }, 30_000),
-  holds: () => get<{ ok: boolean; holds: EraseHold[] }>("/erase/holds"),
+  refill: (deviceId, password, expectedPinScheme) =>
+    post<RefillResult>(`/devices/${deviceId}/erase/refill`, { password, expectedPinScheme }, 30_000),
+  holds: () => get<EraseHolds>("/erase/holds"),
 };
