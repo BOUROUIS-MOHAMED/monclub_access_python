@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 
 from app.core.v2 import lease_gate as _lease_gate
+from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
 from app.core.db import (
     list_device_pin_scheme_switches,
@@ -1508,13 +1509,16 @@ class DeviceSyncEngine:
             return False
         if not _boolish(normalized_device.get("accessDevice"), default=True):
             return False
-        if not _lease_gate.device_allowed(did) or _lease_gate.writes_frozen(did):
+        if (not _lease_gate.device_allowed(did) or _lease_gate.writes_frozen(did)
+                or _device_hold.is_held(did)):
             # P3b-2: another PC drives it, or this PC is handing it over (its ownership record
-            # must stay exactly as uploaded). Deferred, never finalised.
+            # must stay exactly as uploaded). Lane 1: or the Erase-content wizard holds it.
+            # Deferred, never finalised.
             self.logger.warning(
-                "[DeviceSync] targeted member sync deferred: device_id=%s %s (driver lease). "
-                "source=%s", did,
-                "handover in progress" if _lease_gate.device_allowed(did) else "not driven by this PC",
+                "[DeviceSync] targeted member sync deferred: device_id=%s %s. source=%s", did,
+                ("on hold (erase, until Refill)" if _device_hold.is_held(did)
+                 else "handover in progress (driver lease)" if _lease_gate.device_allowed(did)
+                 else "not driven by this PC (driver lease)"),
                 source,
             )
             self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
@@ -3098,6 +3102,12 @@ class DeviceSyncEngine:
             self.logger.info(
                 "[DeviceSync] Device id=%s handover in progress -> no push this pass", dev_id)
             return None
+        if _device_hold.is_held(dev_id):
+            # Lane 1: the Erase-content wizard holds this panel -- during the erase, and after
+            # it until Refill. No session, no write (the scheduler fallback lands here too).
+            self.logger.info(
+                "[DeviceSync] Device id=%s on hold (erase, until Refill) -> no push this pass", dev_id)
+            return None
         self._raise_if_pin_scheme_switched(device, where="sync")
         dev_name = device.get("name") or ""
         ip = (device.get("ipAddress") or "").strip()
@@ -3683,13 +3693,16 @@ class DeviceSyncEngine:
             # In normal mode we pre-delete pins individually before batch push.
             use_batch = nuke_mode or len(pins_to_sync) > 5
             pins_sorted = sorted(pins_to_sync)
-            if pins_sorted and (_lease_gate.writes_frozen(did) or not _lease_gate.device_allowed(did)):
+            if pins_sorted and (_lease_gate.writes_frozen(did) or not _lease_gate.device_allowed(did)
+                                or _device_hold.is_held(did)):
                 # P3b-2 (review R11): the lease moved or a handover began during this pass --
-                # nothing more is written to this panel.
+                # nothing more is written to this panel. Lane 1: likewise an erase hold.
+                _held_now = _device_hold.is_held(did)
                 self.logger.warning(
-                    "[DeviceSync] Device id=%s: lease lost or handover begun mid-pass -- %d push(es) "
-                    "not sent", dev_id, len(pins_sorted))
-                batch_error = "driver lease lost mid-pass"
+                    "[DeviceSync] Device id=%s: %s mid-pass -- %d push(es) not sent", dev_id,
+                    "erase hold set" if _held_now else "lease lost or handover begun",
+                    len(pins_sorted))
+                batch_error = "on hold (erase) mid-pass" if _held_now else "driver lease lost mid-pass"
                 pins_sorted = []
                 pins_to_sync = set()
             if pins_sorted:

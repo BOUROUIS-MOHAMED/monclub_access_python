@@ -4650,6 +4650,60 @@ def _handle_device_force_resync(ctx: _Ctx) -> None:
         ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
+# ==================== ERASE-CONTENT WIZARD (lane 1, 2026-09-27; guide §3.2h) ====================
+# Step 1 reads the counts (preview), step 3 starts the run (backup, erase, verify, records,
+# refill) on its own thread; the page polls /erase/status. The admin password is checked HERE,
+# on the server, for every run and every Refill -- the Local DB page's lock is only a screen.
+
+def _erase_password_verifier(ctx: _Ctx):
+    def _verify(password: str):
+        if not password:
+            return False, 400, "password is required"
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        if not auth or not auth.token:
+            return False, 401, "Not authenticated"
+        try:
+            valid = ctx.app._api().validate_statistics_password(token=auth.token, password=password)
+        except MonClubApiHttpError as e:
+            return False, int(getattr(e, "status_code", 0) or 503), str(e)
+        except Exception as e:
+            # Offline or the server failing: the password cannot be checked -- no erase.
+            return False, 503, f"the admin password could not be checked: {e}"
+        return (True, 200, "") if valid else (False, 401, "Mot de passe incorrect")
+    return _verify
+
+
+def _handle_device_erase_preview(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).preview(ctx.param_int("deviceId"))
+    ctx.send_json(status, payload)
+
+
+def _handle_device_erase_start(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).start(
+        ctx.param_int("deviceId"), ctx.body(), verify_password=_erase_password_verifier(ctx))
+    ctx.send_json(status, payload)
+
+
+def _handle_device_erase_refill(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).refill(
+        ctx.param_int("deviceId"), ctx.body(), verify_password=_erase_password_verifier(ctx))
+    ctx.send_json(status, payload)
+
+
+def _handle_erase_status(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    ctx.send_json(200, get_wizard(ctx.app).status())
+
+
+def _handle_erase_holds(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    ctx.send_json(200, {"ok": True, "holds": get_wizard(ctx.app).holds()})
+
+
 def _handle_device_users_push(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     body = ctx.body()

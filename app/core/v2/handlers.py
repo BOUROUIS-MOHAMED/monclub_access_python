@@ -259,6 +259,10 @@ class CommandHandlers:
             return ("FAILED", "NOT_DRIVER", {"gymDeviceId": did})
         if lease_gate.writes_frozen(did):
             return ("FAILED", "HANDOVER_IN_PROGRESS", {"gymDeviceId": did})
+        from app.core import device_hold
+        if device_hold.is_held(did):
+            # Lane 1: erased and on hold until an operator presses Refill at this PC.
+            return ("FAILED", "DEVICE_ON_HOLD", {"gymDeviceId": did})
         requested = False
         try:
             requested = bool(self.app._request_running_ultra_sync(

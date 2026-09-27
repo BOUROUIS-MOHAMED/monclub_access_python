@@ -43,6 +43,7 @@ from app.core import telemetry as _tel
 from app.core import push_safety as _push_safety
 from app.sdk.pullsdk import PullSDKDevice
 from app.core.v2 import lease_gate as _lease_gate
+from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
@@ -297,8 +298,12 @@ _DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
 
 def _v2_writes_blocked(device_id) -> bool:
     """P3b-2: no push, removal or maintenance on a turnstile this PC is handing over or no
-    longer drives (driver leases). Always False without assignments."""
-    return _lease_gate.writes_frozen(device_id) or not _lease_gate.device_allowed(device_id)
+    longer drives (driver leases). Always False without assignments.
+
+    Lane 1 (2026-09-27): nor on a turnstile the Erase-content wizard holds (device_hold) --
+    during the erase, and after it until Refill. An in-memory set lookup, like the lease reads."""
+    return (_lease_gate.writes_frozen(device_id) or not _lease_gate.device_allowed(device_id)
+            or _device_hold.is_held(device_id))
 
 
 class _CommandClaim:
@@ -2899,7 +2904,7 @@ class UltraDeviceWorker(threading.Thread):
         if _v2_writes_blocked(getattr(self, "_device_id", None)):
             # P3b-2 (review R11): the lease went away mid-push -- drop every chunk not sent yet.
             logger.warning("%s push stopped between chunks: this PC no longer writes to this "
-                           "turnstile (lease)", self._prefix)
+                           "turnstile (lease, or an erase hold)", self._prefix)
             return set(getattr(self, "_pass_all_pins", None) or ())
         if self._pass_scheme_stopped(getattr(self, "_pass_pin_scheme", None),
                                      where="between_chunks"):
@@ -3270,8 +3275,8 @@ class UltraDeviceWorker(threading.Thread):
             # P3b-2 (review R11): the lease went away between the drain and the push -- no
             # device write, no state write (every pin "superseded"); not ok, so no roster hash
             # is stamped if the turnstile ever comes back.
-            logger.warning("%s push skipped: this PC no longer writes to this turnstile (lease)",
-                           self._prefix)
+            logger.warning("%s push skipped: this PC no longer writes to this turnstile (lease, "
+                           "or an erase hold)", self._prefix)
             return {"ok": False, "pushed": 0, "failed": 0, "templates_failed": 0, "skipped_pin": 0,
                     "chunks_wedged": 0, "errors": ["driver lease lost"], "failed_pins": [],
                     "superseded_pins": sorted(all_pins), "user_written": []}

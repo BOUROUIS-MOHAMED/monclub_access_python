@@ -678,6 +678,16 @@ class MainApp:
             load_cached_roles(self)
         except Exception:
             self.logger.warning("[V2] cached roles not loaded at start-up", exc_info=True)
+        # Lane 1 (Erase-content wizard): a turnstile an erase left on hold stays on hold across
+        # a restart -- the cutover restarts Access between the erase and the refill. Installed,
+        # like the roles, before the first sync tick can start a worker (guide §3.2h).
+        try:
+            from app.core import device_hold
+
+            device_hold.load()
+        except Exception:
+            self.logger.error("[HOLD] erase holds NOT loaded at start-up: a held turnstile may "
+                              "be written to", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
         try:
             self._arm_midnight_date_flip()

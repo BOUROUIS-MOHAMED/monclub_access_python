@@ -1363,6 +1363,40 @@ class PullSDKDevice:
                     pass
                 return -1
 
+    # -- Erase-content wizard (lane 1, 2026-09-27). The three calls above swallow a failure
+    # (-1 / [] ): a backup must never read a failed read as an empty table, and an erase must
+    # never read a refused DeleteDeviceData as done. These raise instead.
+    def count_table_strict(self, *, table: str) -> int:
+        """GetDeviceDataCount(table). Raises when not connected, when the dll lacks the call,
+        or on a negative count (a refused table)."""
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                raise PullSDKError(f"count {table}: not connected")
+            assert self._sdk is not None
+            n = int(self._sdk.get_device_data_count(table=table))
+            if n < 0:
+                raise PullSDKError(f"GetDeviceDataCount FAILED table={table} rc={n}")
+            return n
+
+    def read_table_strict(self, *, table: str, fields: str = "*") -> List[Dict[str, str]]:
+        """Every row of ONE table (GetDeviceData, the 1-8 MB buffer ladder). Raises on any
+        failure, including a table larger than the ladder's last step."""
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                raise PullSDKError(f"read {table}: not connected")
+            assert self._sdk is not None
+            return list(self._sdk.get_device_data_rows(table=table, fields=fields) or [])
+
+    def erase_table(self, *, table: str) -> int:
+        """``DeleteDeviceData(h, table, "", "")``: EVERY row of ONE table (``clear_device_table``).
+        Raises on a negative rc. Only the Erase-content wizard calls it, on the tables the
+        operator chose -- never a parameter, timezone or holiday table (erase_wizard.C3_TABLES)."""
+        with self._sdk_lock:
+            if not self.ensure_connected():
+                raise PullSDKError(f"erase {table}: not connected")
+            assert self._sdk is not None
+            return int(self._sdk.clear_device_table(table=table))
+
     def read_transaction_rows(self, *, options: str = "new record", initial_size: int | None = None) -> List[Dict[str, str]]:
         return self.read_table_rows(
             table="transaction",

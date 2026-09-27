@@ -2583,6 +2583,22 @@ def init_db() -> None:
         )
 
         # -----------------------------
+        # Erase-content wizard (lane 1, 2026-09-27): a turnstile MonClub must write NOTHING to
+        # until an operator presses Refill (app/core/device_hold.py). Durable on purpose: the
+        # cutover restarts Access between the erase and the refill. Not a sync_* table.
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_write_hold (
+                device_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # -----------------------------
         # realtime rtlog cursor
         # -----------------------------
         conn.execute(
@@ -9556,6 +9572,102 @@ def clear_all_device_sync_hashes() -> int:
         return int(cursor.rowcount or 0)
 
     return int(_run_db_write_sync("clear_all_device_sync_hashes", _write))
+
+
+# -----------------------------------------------------------------------------
+# Erase-content wizard (lane 1, 2026-09-27): the write hold and the records of an erased
+# turnstile. guide §3.2h.
+# -----------------------------------------------------------------------------
+
+def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None) -> None:
+    """Hold a turnstile: MonClub writes nothing to it until the hold is cleared. Durable
+    (``synchronous=FULL``): a power cut or a restart between an erase and its refill must not
+    let the first pass refill the terminal under the pin scheme recorded before the switch."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO device_write_hold (device_id, reason, run_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (did, str(reason or "erase"), run_id, now_iso()),
+        )
+
+    _run_db_write_sync("set_device_write_hold", _write, durable=True)
+
+
+def clear_device_write_hold(*, device_id: int) -> int:
+    """Release a turnstile's write hold. Returns the rows removed (0 when it was not held)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        return int(conn.execute("DELETE FROM device_write_hold WHERE device_id=?",
+                                (did,)).rowcount or 0)
+
+    return int(_run_db_write_sync("clear_device_write_hold", _write, durable=True))
+
+
+def list_device_write_holds() -> Dict[int, Dict[str, Any]]:
+    """{device_id: {reason, runId, since}} for every held turnstile."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT device_id, reason, run_id, created_at FROM device_write_hold"
+        ).fetchall()
+    return {int(r[0]): {"reason": str(r[1] or ""), "runId": r[2], "since": r[3]} for r in rows}
+
+
+def retire_device_records(*, device_id: int) -> Dict[str, int]:
+    """FORGET what MonClub recorded about one turnstile, after a VERIFIED erase of its users.
+
+    Every pin with a sync-state or push-intent row was on the terminal or may have been, and the
+    erase removed it: each is logged in ``v2_removal_log`` in this same transaction (the ownership
+    backup's REMOVED fact, §3.9 -- a row that merely vanished is never uploaded as removed, and a
+    new driver's restore would otherwise adopt it as owned and in sync). Then the state, intent,
+    content-mirror and loss re-add rows of that turnstile go. The pin-scheme switch history stays.
+    Never call it for an erase that was not verified: forgetting pins still on the terminal
+    strands them there for good (§3.2c)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, int]:
+        pins = {str(r[0]) for r in conn.execute(
+            "SELECT pin FROM device_sync_state WHERE device_id=?", (did,)).fetchall()}
+        pins |= {str(r[0]) for r in conn.execute(
+            "SELECT pin FROM device_push_intent WHERE device_id=?", (did,)).fetchall()}
+        for pin in sorted(pins):
+            _log_v2_removal(conn, did, pin)
+        out = {
+            "state": int(conn.execute("DELETE FROM device_sync_state WHERE device_id=?",
+                                      (did,)).rowcount or 0),
+            "intents": int(conn.execute("DELETE FROM device_push_intent WHERE device_id=?",
+                                        (did,)).rowcount or 0),
+            "mirror": int(conn.execute("DELETE FROM device_content_mirror WHERE device_id=?",
+                                       (did,)).rowcount or 0),
+            "readd": int(conn.execute("DELETE FROM v2_readd WHERE device_id=?",
+                                      (did,)).rowcount or 0),
+            "removals_logged": len(pins),
+        }
+        profile.update(out)
+        return out
+
+    return dict(_run_db_write_sync("retire_device_records", _write, durable=True))
+
+
+def invalidate_device_records(*, device_id: int, fingers_erased: bool) -> int:
+    """KEEP MonClub's ownership records of an erased turnstile, but make the next pass write
+    every pin again: the hard-reset UPDATE (hashes cleared, ``last_ok=0``; ownership and removal
+    evidence kept, §3.2c). When the fingerprints were erased, each pin's resident finger set is
+    known EMPTY (``''``, not NULL = unknown) and swept: a recorded set would make the next push
+    clear slots that are already empty, which answer False and fail on every retry (§7 R1-20)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        n = _clear_device_sync_hashes_on(conn, did)
+        if fingers_erased:
+            conn.execute(
+                "UPDATE device_sync_state SET pushed_finger_ids='', finger_slots_swept=1 "
+                "WHERE device_id=?", (did,))
+        return int(n)
+
+    return int(_run_db_write_sync("invalidate_device_records", _write, durable=True))
 
 
 # -----------------------------

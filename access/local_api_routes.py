@@ -95,6 +95,12 @@ ACCESS_LOCAL_ROUTE_SPECS: tuple[RouteSpec, ...] = (
     ("GET", "/api/v2/devices/{deviceId}/users", "_handle_device_users_list"),
     ("POST", "/api/v2/devices/{deviceId}/users/delete", "_handle_device_users_delete"),
     ("POST", "/api/v2/devices/{deviceId}/force-resync", "_handle_device_force_resync"),
+    # Lane 1 (2026-09-27): the Erase-content wizard (guide §3.2h).
+    ("GET", "/api/v2/devices/{deviceId}/erase/preview", "_handle_device_erase_preview"),
+    ("POST", "/api/v2/devices/{deviceId}/erase", "_handle_device_erase_start"),
+    ("POST", "/api/v2/devices/{deviceId}/erase/refill", "_handle_device_erase_refill"),
+    ("GET", "/api/v2/erase/status", "_handle_erase_status"),
+    ("GET", "/api/v2/erase/holds", "_handle_erase_holds"),
     ("GET", "/api/v2/devices/{deviceId}/door-presets", "_handle_device_door_presets_list"),
     ("POST", "/api/v2/devices/{deviceId}/door-presets", "_handle_device_door_presets_create"),
     ("DELETE", "/api/v2/devices/{deviceId}/door-presets/{presetId}", "_handle_device_door_presets_delete"),
@@ -166,6 +172,9 @@ LEASE_GATED_HANDLERS: tuple[str, ...] = (
     "_handle_device_users_push",
     "_handle_device_users_list",
     "_handle_device_users_delete",
+    # Lane 1: the Erase-content wizard. Its Refill only releases a local hold: not gated.
+    "_handle_device_erase_preview",
+    "_handle_device_erase_start",
 )
 
 
