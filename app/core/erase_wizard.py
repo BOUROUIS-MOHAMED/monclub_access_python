@@ -21,16 +21,21 @@ model -- guide §2):
   there a documented MB2000 log clear (``ClearGLog`` is only in script 13, marked unverified).
 
 Order of one run (each step logged, and written to the run's ``run.json``):
-  hold (nothing is written to the turnstile from here: device_hold) -> idle (no pass running)
-  -> counts before -> BACKUP of the chosen tables to a file, re-read and hash-checked (a failure
-  stops everything: nothing erased, hold released) -> erase -> counts after -> VERIFY -> records
-  (forget / keep) -> refill. An erase that started and did not end verified (INCOMPLETE, a crash)
-  keeps the hold, forgets nothing and makes every recorded pin "not in sync", so the refill
-  writes everything again (review round 1). The lease and the handover freeze are checked again
-  on the worker thread just before every erase command, and before the records.
+  hold (phase ERASE_PREP; nothing is written to the turnstile from here: device_hold) -> idle (no
+  pass running) -> counts before -> BACKUP of the chosen tables to a file, re-read and hash-checked
+  (a failure stops everything: nothing erased, hold released) -> [MB2000: no kept admin pin in the
+  refill roster] -> the erase RECORDED (hold phase ERASE, every recorded pin's last push result
+  unknown; one durable write, or no erase) -> erase -> counts after -> VERIFY -> records (forget /
+  keep) -> refill. An erase that started and did not end verified (INCOMPLETE, a crash) keeps the
+  hold, forgets nothing and makes every recorded pin "not in sync", so the refill writes everything
+  again (review round 1). The lease and the handover freeze are checked again on the worker thread
+  just before every erase command, and before the records. Before any of it (lane 1b): every other
+  Access PC of the gym confirmed closed, and a refill that can put the members back.
 
 Every device call goes through the ULTRA worker's own connection (``request_run_sdk``) -- never a
-second session -- in short commands, so the worker serves the door and the scans between them.
+second session -- one command at a time, and the worker serves the door and the scans BETWEEN
+commands only: a whole-table C3 read or delete, or an MB2000 listing, blocks the door for its
+whole duration (guide §3.2h "What the wizard does to the door").
 """
 from __future__ import annotations
 

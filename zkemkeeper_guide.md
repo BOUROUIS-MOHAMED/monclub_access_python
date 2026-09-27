@@ -564,6 +564,12 @@ tests/test_device_hold.py::test_the_mb2000_listing_carries_the_privilege_and_tem
 30 s), below its `request_run_sdk` budget, so the driver's own timeout fires first; chosen, not measured.
 A `delete_users` that does not fully go stops the wizard's erase there. `[CODE]`
 `[TEST: tests/test_erase_wizard.py::TestMb2000Commands]`
+Since lane 1b (2026-09-27): the wizard keeps the administrators (privilege > 0), and the roster push writes
+`SSR_SetUserInfo(1, pin, name, "", 0, enabled)` — privilege 0, password emptied — so an administrator whose pin is also a
+member pin of the refill would be demoted and renamed; the wizard refuses such an erase before any delete
+(`ADMIN_PIN_IN_ROSTER`, main guide §3.2h). An MB2000 erase that answered True but left a user or a template fails the
+wizard's verify (`INCOMPLETE`, nothing forgotten). `[CODE]` `[TEST: tests/test_erase_wizard_lane1b.py::
+TestAnAdminPinTheRefillWouldOverwrite, tests/test_erase_wizard_gaps.py::TestAnUnconfirmedMb2000EraseForgetsNothing]`
 
 **Fails closed.** A failed enumeration must NEVER read as an empty device — that would
 delete every member under MIRROR. `[CODE]`
