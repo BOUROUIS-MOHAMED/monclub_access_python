@@ -3471,8 +3471,19 @@ Resolution order `[CODE: device_driver.py::_resolve_with_source]`:
    `unrecognised:<value>`.
 
 Standalone is matched against an alias set, not one literal: `ZK_STANDALONE`,
-`STANDALONE`, `ZKEMKEEPER`, `ZKEM`, `PUSH`, `ADMS`, `MB2000`.
+`STANDALONE`, `ZKEMKEEPER`, `ZKEM`, `MB2000`.
 `[CODE: _STANDALONE_ALIASES]`
+
+`PUSH` and `ADMS` are **not** aliases (removed 2026-09-27). They name ZKTeco's HTTP PUSH
+protocol, which SpeedFace face terminals speak and zkemkeeper does not; nothing in this
+app implements it. In the payload they now resolve like any unknown value:
+`ZK_PULLSDK`, source `unrecognised:PUSH` / `unrecognised:ADMS`. As a local override they
+resolve like any unknown override: `ZK_PULLSDK`, source `override`, with no warning.
+`[CODE]` `[TEST: test_device_driver_factory.py::TestPushAndAdmsAreNotStandalone]`
+Released clients up to this change still map both to ZK_STANDALONE; what keeps the
+values out of the fleet is the backend, which refuses any `deviceProtocol` other than
+`ZK_PULLSDK` / `ZK_STANDALONE` on a device save (`DEVICE_PROTOCOL_UNSUPPORTED`, 400).
+`[CODE: backend branch claude/refuse-push-adms-protocol, unmerged]`
 
 ### Why the fallback is PullSDK, and why the *source* matters
 

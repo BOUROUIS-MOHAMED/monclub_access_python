@@ -43,10 +43,14 @@ class DeviceProtocol(str, Enum):
     ZK_PULLSDK   — ZKTeco access panels via plcommpro.dll / PullSDK (C2/C3/C4/inBio).
                    Poll-based (GetRTLogExt). One persistent TCP connection per panel.
     ZK_STANDALONE — ZKTeco standalone terminals via the standalone SDK (zkemkeeper COM
-                   / TCP 4370 / Push-ADMS), e.g. MB2000. Event-push. Implemented by
+                   over TCP 4370), e.g. MB2000. Event-push. Implemented by
                    ``app/sdk/zk_standalone.py``. NOTE: zkemkeeper is a COM server and
                    must be REGISTERED on the PC (regsvr32, elevated, 32-bit) — shipping
                    the DLL is not enough.
+
+    ZKTeco's HTTP PUSH / ADMS protocol (the terminal calls a server; SpeedFace face
+    terminals speak it) is NOT a member and NOT covered by ZK_STANDALONE: nothing here
+    implements it, and zkemkeeper cannot talk to a device that only speaks it.
     """
 
     ZK_PULLSDK = "ZK_PULLSDK"
@@ -56,8 +60,14 @@ class DeviceProtocol(str, Enum):
 # Synonyms accepted from the backend/device payload for each protocol. Anything not
 # recognised as an explicit non-PullSDK protocol defaults to ZK_PULLSDK, so an absent,
 # empty, or typo'd value can NEVER route an existing ZK panel away from its working path.
+#
+# "PUSH" and "ADMS" are deliberately NOT aliases (they were until 2026-09-27). They name
+# ZKTeco's HTTP PUSH protocol, not zkemkeeper, so a device saved with either must never be
+# driven over COM/TCP 4370. They now fall through to the "unrecognised" branch like any
+# other unknown value. Released clients still carry the old set; the backend refuses both
+# values on a device save, which is what keeps them out of the fleet.
 _STANDALONE_ALIASES = frozenset(
-    {"ZK_STANDALONE", "STANDALONE", "ZKEMKEEPER", "ZKEM", "PUSH", "ADMS", "MB2000"}
+    {"ZK_STANDALONE", "STANDALONE", "ZKEMKEEPER", "ZKEM", "MB2000"}
 )
 
 

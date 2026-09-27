@@ -43,7 +43,7 @@ class TestResolveProtocol:
         # A typo / future value must NEVER strand an existing panel — default safe.
         assert resolve_device_protocol(_c3_payload(deviceProtocol="ZK_STANDALON")) == DeviceProtocol.ZK_PULLSDK
 
-    @pytest.mark.parametrize("val", ["ZK_STANDALONE", "standalone", "MB2000", "zkemkeeper", "PUSH", "adms"])
+    @pytest.mark.parametrize("val", ["ZK_STANDALONE", "standalone", "MB2000", "zkemkeeper", "zkem"])
     def test_standalone_aliases(self, val):
         assert resolve_device_protocol(_c3_payload(deviceProtocol=val)) == DeviceProtocol.ZK_STANDALONE
 
@@ -94,3 +94,68 @@ class TestGetDriver:
         drv = get_driver(_c3_payload(deviceProtocol="ZK_STANDALONE"))
         assert drv.is_connected is False
         assert drv._sta_thread is None
+
+
+class TestPushAndAdmsAreNotStandalone:
+    """PUSH / ADMS name ZKTeco's HTTP PUSH protocol (SpeedFace face terminals), which
+    zkemkeeper cannot speak and nothing in this app implements. Until 2026-09-27 both were
+    standalone aliases, so a device saved with either would have been driven over COM /
+    TCP 4370. They now take the "unrecognised" path: ZK_PULLSDK, logged, exactly like a typo.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_state(self):
+        import app.sdk.device_driver as dd
+        with dd._overrides_lock:
+            dd._protocol_overrides.clear()
+        dd._env_overrides_loaded = True  # never read the real env var here
+        with dd._driver_log_lock:
+            dd._last_driver_log.clear()
+        yield
+        with dd._overrides_lock:
+            dd._protocol_overrides.clear()
+        dd._env_overrides_loaded = False
+        with dd._driver_log_lock:
+            dd._last_driver_log.clear()
+
+    @pytest.mark.parametrize("val, shown", [
+        ("PUSH", "PUSH"), ("ADMS", "ADMS"), (" push ", "PUSH"), ("adms", "ADMS"),
+    ])
+    def test_payload_value_is_unrecognised_pullsdk(self, val, shown):
+        from app.sdk.device_driver import _resolve_with_source
+        assert _resolve_with_source(_c3_payload(deviceProtocol=val)) == (
+            DeviceProtocol.ZK_PULLSDK, "unrecognised:" + shown,
+        )
+
+    @pytest.mark.parametrize("val", ["PUSH", "ADMS"])
+    def test_snake_case_key_is_unrecognised_too(self, val):
+        assert resolve_device_protocol({"device_protocol": val}) == DeviceProtocol.ZK_PULLSDK
+
+    @pytest.mark.parametrize("device_id, val", [(31, "PUSH"), (32, "ADMS")])
+    def test_get_driver_builds_pullsdk_and_logs_the_unrecognised_value(self, caplog, device_id, val):
+        import logging
+        from app.sdk.zk_standalone import ZKStandaloneDevice
+        with caplog.at_level(logging.INFO, logger="device_driver"):
+            drv = get_driver(_c3_payload(id=device_id, deviceProtocol=val))
+        assert isinstance(drv, PullSDKDevice)
+        assert not isinstance(drv, ZKStandaloneDevice)
+        assert f"id={device_id}" in caplog.text
+        assert f"source=unrecognised:{val}" in caplog.text
+
+    def test_legacy_zkemkeeper_aliases_still_route_to_standalone(self):
+        # Only PUSH/ADMS left the set: a device already saved with a legacy alias keeps
+        # its working driver.
+        from app.sdk.zk_standalone import ZKStandaloneDevice
+        for val in ("STANDALONE", "ZKEMKEEPER", "ZKEM", "MB2000"):
+            assert isinstance(get_driver(_c3_payload(deviceProtocol=val)), ZKStandaloneDevice), val
+
+    @pytest.mark.parametrize("val", ["PUSH", "ADMS"])
+    def test_local_override_is_pullsdk_like_any_unknown_override(self, val):
+        # Unchanged override behaviour: an override the factory does not recognise as
+        # standalone routes to PullSDK with source "override" (not "unrecognised"),
+        # whatever the payload says.
+        from app.sdk.device_driver import _resolve_with_source, set_protocol_override
+        set_protocol_override(5, val)
+        assert _resolve_with_source(_c3_payload(deviceProtocol="ZK_STANDALONE")) == (
+            DeviceProtocol.ZK_PULLSDK, "override",
+        )
