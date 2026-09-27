@@ -118,7 +118,28 @@ class FakeSched:
 
 def _app(workers):
     return SimpleNamespace(_ultra_engine=SimpleNamespace(running=True, _workers=workers,
-                                                         _sync_scheduler=FakeSched()))
+                                                         _sync_scheduler=FakeSched()),
+                           _last_sync_ok=True)
+
+
+# What the refill would write (lane 1b, review C1): the sync cache's members. Membership pins
+# 101/102 (the fake C3's users) and 30001/30002 (the fake MB2000's), each with an account number,
+# none equal to the MB2000 administrator's pin 1.
+_ROSTER = [
+    {"userId": 11, "activeMembershipId": 101, "mainAccountId": 9101, "fullName": "A"},
+    {"userId": 12, "activeMembershipId": 102, "mainAccountId": 9102, "fullName": "B"},
+    {"userId": 13, "activeMembershipId": 30001, "mainAccountId": 9301, "fullName": "Ali"},
+    {"userId": 14, "activeMembershipId": 30002, "mainAccountId": 9302, "fullName": "Sonia"},
+]
+
+
+@pytest.fixture(autouse=True)
+def refill_cache(monkeypatch):
+    """Every wizard test has a member list to refill from; a test changes ``users``."""
+    cache = SimpleNamespace(users=[dict(u) for u in _ROSTER], devices=[],
+                            updated_at="2026-09-27T10:00:00")
+    monkeypatch.setattr(dbmod, "load_sync_cache", lambda: cache)
+    return cache
 
 
 def _device(did=5, name="Entrée 1", ip="192.168.0.202", proto="ZK_PULLSDK"):
@@ -150,7 +171,8 @@ def _panel():
 
 def _body(preview_id, **kw):
     body = {"previewId": preview_id, "tables": ["user", "userauthorize", "templatev10"],
-            "forget": True, "refill": "hold", "typedName": "Entrée 1", "password": "pw"}
+            "forget": True, "refill": "hold", "typedName": "Entrée 1", "password": "pw",
+            "otherPcsClosed": True}
     body.update(kw)
     return body
 
@@ -509,7 +531,7 @@ def _terminal():
 
 def _mb_body(pid, **kw):
     b = {"previewId": pid, "tables": ["users"], "forget": True, "refill": "hold",
-         "typedName": "Sortie", "password": "pw"}
+         "typedName": "Sortie", "password": "pw", "otherPcsClosed": True}
     b.update(kw)
     return b
 

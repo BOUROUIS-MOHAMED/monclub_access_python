@@ -42,7 +42,7 @@ _LEGACY_DASHBOARD_AVATAR_RE = re.compile(
     re.IGNORECASE,
 )
 
-from app.api.monclub_api import MonClubApiHttpError
+from app.api.monclub_api import MonClubApiError, MonClubApiHttpError
 from app.core.app_const import MONCLUB_BASE_URL
 from app.core import telemetry as _tel
 
@@ -1374,6 +1374,15 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
     except MonClubApiHttpError as e:
         ctx.app.logger.warning("verify_admin_password: HTTP %s", e.status_code)
         ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+    except MonClubApiError as e:
+        # The server could not be reached (MonClubApiError is the PARENT of the HTTP error, so
+        # this is the no-answer case): not a wrong password -- say that the internet is needed,
+        # with a code the Erase wizard translates (lane 1b, review F25).
+        ctx.app.logger.warning("verify_admin_password: server unreachable: %s", e)
+        ctx.send_json(503, {"ok": False, "code": "ADMIN_PASSWORD_UNCHECKABLE",
+                            "error": "Pas d'Internet : le serveur MonClub doit vérifier le mot de "
+                                     "passe administrateur. Rétablissez la connexion, puis "
+                                     "réessayez."})
     except Exception as e:
         ctx.app.logger.exception("verify_admin_password failed")
         ctx.send_json(500, {"ok": False, "error": str(e)})

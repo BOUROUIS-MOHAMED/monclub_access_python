@@ -15,6 +15,11 @@ one lookup in an immutable set: no lock, no database -- it sits on the worker lo
 A start-up load that FAILS holds every turnstile (fail closed, review round 1): not knowing which
 turnstile is held must not let the first pass refill one under the pin scheme recorded before the
 switch. ``ensure_loaded`` (every sync tick) retries until the read succeeds.
+
+The hold's phase (lane 1b, review F1): a run holds with ``REASON_ERASE_PREP`` (reads and the backup)
+and moves the row to ``REASON_ERASE`` durably before its first delete command
+(``db.begin_device_erase``). The start-up load releases a row still at ``REASON_ERASE_PREP``: that run
+stopped before any delete -- nothing to refill, and the hold would block every revocation.
 """
 from __future__ import annotations
 
@@ -27,6 +32,10 @@ _log = logging.getLogger("zkapp.device_hold")
 _lock = threading.Lock()
 _held: FrozenSet[int] = frozenset()
 _load_failed = False
+
+# The phases a hold row records (the same literals as db.HOLD_REASON_*).
+REASON_ERASE_PREP = "erase-prep"   # a run's reads and backup: no delete issued yet
+REASON_ERASE = "erase"             # a delete may have run: kept until Refill
 
 
 def _as_id(value: Any) -> Optional[int]:
@@ -52,15 +61,28 @@ def load_failed() -> bool:
     return _load_failed
 
 
-def load() -> FrozenSet[int]:
+def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
     """Install the holds recorded in the database (start-up). A read failure HOLDS EVERY
-    turnstile until a later ``load`` succeeds, and is re-raised to the caller."""
-    global _held, _load_failed
-    from app.core.db import list_device_write_holds
+    turnstile until a later ``load`` succeeds, and is re-raised to the caller.
 
+    ``release_unstarted`` (the start-up load and its retry only -- no erase of this process can
+    be preparing then: ``EraseWizard.start`` refuses while the holds are unknown) first deletes
+    every hold still at ``REASON_ERASE_PREP``: a run that stopped before its first delete command
+    (a power cut during a backup-only rehearsal, say) erased nothing (lane 1b, review F1). A
+    failure to release is logged and the rows stay held: fail closed."""
+    global _held, _load_failed
+    from app.core.db import list_device_write_holds, release_unstarted_erase_holds
+
+    released: Dict[int, Optional[str]] = {}
     # Under the lock for the read AND the install: a hold() or release() landing between the
     # two would otherwise be overwritten by a stale read (review round 2, R2-5).
     with _lock:
+        if release_unstarted:
+            try:
+                released = dict(release_unstarted_erase_holds() or {})
+            except Exception:
+                _log.error("[HOLD] holds of runs stopped before any erase NOT released: they stay "
+                           "held until Refill", exc_info=True)
         try:
             ids = frozenset(int(d) for d in (list_device_write_holds() or {}))
         except Exception:
@@ -68,6 +90,15 @@ def load() -> FrozenSet[int]:
             raise
         _held = ids
         _load_failed = False
+    for did, run_id in sorted(released.items()):
+        _log.warning("[HOLD] turnstile %s released at start-up: its erase run %s stopped before "
+                     "any delete command (reads or backup only) -- nothing was erased", did, run_id)
+        try:
+            from app.core import telemetry as _tel
+            _tel.event("ERASE_STEP", run=str(run_id or ""), device_id=did,
+                       step="released_at_start", ok=True)
+        except Exception:
+            pass
     if ids:
         _log.warning("[HOLD] turnstile(s) on hold since an erase, nothing is written to them "
                      "until Refill: %s", ",".join(str(d) for d in sorted(ids)))
@@ -80,7 +111,7 @@ def ensure_loaded() -> bool:
     if not _load_failed:
         return True
     try:
-        load()
+        load(release_unstarted=True)
     except Exception:
         _log.error("[HOLD] erase holds still unreadable: every turnstile stays on hold",
                    exc_info=True)

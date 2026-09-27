@@ -9719,20 +9719,89 @@ def clear_all_device_sync_hashes() -> int:
 # turnstile. guide §3.2h.
 # -----------------------------------------------------------------------------
 
+# The hold's phase (lane 1b, review F1). A run holds the turnstile with ERASE_PREP -- reads and the
+# backup only -- and moves it to ERASE in a durable write BEFORE its first delete command is queued
+# (``begin_device_erase``). So a row still at ERASE_PREP proves that no delete of that run was ever
+# issued, and a start-up may release it (``release_unstarted_erase_holds``). Any other reason --
+# ERASE, or a row written before this rule -- means "a delete may have run": kept until Refill.
+HOLD_REASON_ERASE_PREP = "erase-prep"
+HOLD_REASON_ERASE = "erase"
+
+
 def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None) -> None:
     """Hold a turnstile: MonClub writes nothing to it until the hold is cleared. Durable
     (``synchronous=FULL``): a power cut or a restart between an erase and its refill must not
-    let the first pass refill the terminal under the pin scheme recorded before the switch."""
+    let the first pass refill the terminal under the pin scheme recorded before the switch.
+    A row already held for a real erase keeps that reason: a second run's ERASE_PREP never
+    downgrades it (a start-up would otherwise release a turnstile a delete may have emptied)."""
     did = int(device_id)
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
-            "INSERT OR REPLACE INTO device_write_hold (device_id, reason, run_id, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (did, str(reason or "erase"), run_id, now_iso()),
+            "INSERT INTO device_write_hold (device_id, reason, run_id, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(device_id) DO UPDATE SET "
+            "reason = CASE WHEN device_write_hold.reason = ? THEN excluded.reason "
+            "ELSE device_write_hold.reason END, "
+            "run_id = excluded.run_id, created_at = excluded.created_at",
+            (did, str(reason or HOLD_REASON_ERASE), run_id, now_iso(), HOLD_REASON_ERASE_PREP),
         )
 
     _run_db_write_sync("set_device_write_hold", _write, durable=True)
+
+
+def begin_device_erase(*, device_id: int, run_id: str, keep_pins: Iterable[str] = ()) -> int:
+    """The last durable write before an erase's first delete command (lane 1b, review F12/F1).
+
+    One transaction: the run's hold row moves to ERASE (a delete may run from here -- a start-up
+    no longer releases it), and the last push result of every pin MonClub recorded for this
+    turnstile (sync state, intent or result rows) becomes UNKNOWN, stamped with this moment on the
+    corrected clock -- an erase is an attempt start for all of them (last-push contract §1.1): a
+    ``true`` left standing would read ON_TURNSTILE for a member the erase deleted, on every path
+    (INCOMPLETE, a crash, "keep"). ``keep_pins`` -- users the erase leaves on the terminal (the
+    MB2000 administrators) -- keep their result. Raises when the run's hold row is not there (no
+    row updated) or the write fails: the caller must then not erase. Returns the pins reset."""
+    from app.core.v2.server_clock import corrected_now
+
+    did = int(device_id)
+    keep = {str(p) for p in (keep_pins or ())}
+    at, corrected = corrected_now()
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        moved = int(conn.execute(
+            "UPDATE device_write_hold SET reason=? WHERE device_id=? AND run_id=?",
+            (HOLD_REASON_ERASE, did, str(run_id))).rowcount or 0)
+        if moved != 1:
+            raise RuntimeError(f"no hold row of run {run_id} on turnstile {did}")
+        pins: set = set()
+        for table in ("device_sync_state", "device_push_intent", "device_push_result"):
+            pins |= {str(r[0]) for r in conn.execute(
+                f"SELECT pin FROM {table} WHERE device_id=?", (did,)).fetchall()}
+        pins -= keep
+        _reset_push_results_on(conn, did, sorted(pins), at=at, corrected=corrected)
+        profile["pins"] = len(pins)
+        return len(pins)
+
+    return int(_run_db_write_sync("begin_device_erase", _write, durable=True))
+
+
+def release_unstarted_erase_holds() -> Dict[int, Optional[str]]:
+    """Start-up only (lane 1b, review F1): delete every hold still at ERASE_PREP -- a run that
+    stopped (power cut, crash, kill) before its first delete command, a backup-only rehearsal
+    included. Nothing was erased, so nothing waits for Refill, and a hold left there would block
+    every member write, revocations included, until someone presses Refill online. Must never
+    run while an erase of this process could be in its preparation. Returns {device_id: run_id}."""
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[int, Optional[str]]:
+        rows = conn.execute(
+            "SELECT device_id, run_id FROM device_write_hold WHERE reason=?",
+            (HOLD_REASON_ERASE_PREP,)).fetchall()
+        conn.execute("DELETE FROM device_write_hold WHERE reason=?", (HOLD_REASON_ERASE_PREP,))
+        out = {int(r[0]): (None if r[1] is None else str(r[1])) for r in rows}
+        profile["released"] = len(out)
+        return out
+
+    return dict(_run_db_write_sync("release_unstarted_erase_holds", _write, durable=True))
 
 
 def clear_device_write_hold(*, device_id: int) -> int:
