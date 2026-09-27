@@ -100,15 +100,17 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
   not merged) adds a second trigger that starts at once, and with it an empty `NextRunTime` right after
   the install is a fault for an **enabled** task (`packaging/watchdog/README.md`; a disabled task has
   none).
-- **What the watchdog does not know:** a tray Quit. It restarts Access after two missed checks, so
-  about 2-4 minutes after any Quit (`monclub_access_watchdog.ps1`, `$RequiredConsecutiveMisses = 2`,
-  every 2 minutes) `[CODE]`. To keep Access stopped, disable the task first:
-  `Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`.
+- **What the watchdog does not know:** a tray Quit. It restarts Access after two missed checks in a
+  row (`monclub_access_watchdog.ps1`, `$RequiredConsecutiveMisses = 2`) `[CODE]`: about 2-4 minutes after
+  any Quit with the logon trigger alone (every 2 minutes). The owner's second trigger (`b30ef60`) repeats
+  every 2 minutes too, from a different start, so once both run two checks can come close together and
+  the restart can come sooner -- how soon is `[UNVERIFIED]`. To keep Access stopped, disable the task
+  **first**: `Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`.
 - **What an install does to it:** when the box was ticked at the previous install, the installer ticks
   it again (`UsePreviousTasks=yes`) and runs `register_watchdog.ps1`, which removes the task and
   registers it again (`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`) `[CODE]`. With the script
   on `master` `d3725fa` the new task is **enabled** -- a disabled task does not stay disabled. From the
-  release that contains `claude/installer-watchdog-fix` (`c0391d4`), a task that was disabled is
+  release that contains `claude/installer-watchdog-fix` (`18863bc`), a task that was disabled is
   registered again **disabled** (`State: Disabled (kept)`); `Enable-ScheduledTask` turns it on
   `[CODE, TEST with the Task Scheduler stubbed]`. Unticked, the installer leaves the existing task as
   it is.

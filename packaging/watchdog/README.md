@@ -43,9 +43,10 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
   one is registered, so the script first exports it and, if the registration fails,
   registers the old one again from that export (disabled if it was) and still fails
   the run. A task that was **removed** (`-Remove`, an uninstall) is not "disabled":
-  the next install with the box ticked registers it enabled. The installer does not
-  check the script's exit code and runs it hidden, so on a silent update a failure is
-  seen only in the task's state. Installers built before this change re-registered
+  the next install with the box ticked registers it enabled. The installer runs the
+  script hidden and nothing in it reads the script's exit code (Inno's `[Run]` section
+  documents no exit-code handling), so on a silent update a failure is seen only in
+  the task's state. Installers built before this change re-registered
   it **enabled**.
 - Unticked, the installer does not touch an existing task at all.
 
