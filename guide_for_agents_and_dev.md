@@ -1594,12 +1594,15 @@ Now `[CODE]`:
   and again after its panel read, before the removal steps (the stale delete, a `FULL_REPLACE` clear —
   R1-F3), and before its user batch (`PinSchemeSwitchedError`, so every caller reads a failed pass,
   never an in-sync panel), and `sync_member_on_connected_sdk` (`DEFERRED`). A stop at a pass's start
-  sends nothing; a later stop sends nothing more — what that pass already did under the scheme that was
-  current when it did it stays done. No stop stamps a roster hash; its revocations stay pending;
+  sends nothing; a later stop sends nothing more — what that pass already did stays done (see "What is
+  left" for the steps that run without a re-check of their own). No stop stamps a roster hash; its revocations stay pending;
   `[T] PIN_SCHEME_PASS_STOPPED`. The next pass is the one the app queues after the refresh.
 - **What is left.** On the MB2000 the chunk already in flight when the switch lands (at most
   `_PUSH_CHUNK_MEMBERS` = 10 members, handed over before the switch existed); on PullSDK a removal step
-  or a user batch already started (no abort inside either), and the post-push release of a renewal
+  or a user batch already started (no abort inside either); on the MB2000 the removal step
+  (`_neutralise_revoked_pins`), which runs between the pass-start check and the push check with no
+  re-check of its own — with one pass per worker only old-scheme pins can be owned then, so what it
+  removes is a correct old-scheme removal (review R4-3); and the post-push release of a renewal
   hold (§3.4f) — it deletes only MonClub's own old pin of a renewing member, a pin being written under
   the new scheme is never among them on the MB2000 (`_remove_released_holds` skips pins touched
   mid-push), and one worker drives each PullSDK panel (review R2-1). A worker the watchdog rebuilds
@@ -2746,18 +2749,24 @@ Now `[CODE]`:
 hooks, the DEVICE-mode gate]` On aeeef69 nothing reads `reconcile_sec` (grep, 2026-09-26). `[CODE]`
 
 *Load, per gym with 3 v2 PCs* (they share the gym account's `RateLimitFilter` bucket, 200 requests /
-60 s, for `getSyncData` and the probe; the command poll uses the PC token). Counted from the code, not
+60 s, for `getSyncData`, the probe and the door-history upload; the command poll goes to the separate
+`access-pc:<ip>` bucket, 3000 / 60 s, `RateLimitFilter.ACCESS_PC_PATTERNS`). Counted from the code, not
 measured `[CODE]`:
 
 | per hour, 3 PCs | before (v2 on) | socket up | socket down |
 |---|---|---|---|
 | members-version probe (2 `MAX(updated_at)` queries each; off in safety mode, below) | 240 | 0 | 0 |
 | `getSyncData` on the timer | 6 | 18–22.5 | 90–112.5 |
-| pending-command poll (P3b-2, unchanged) | 0 up / 90 down | 0 | 90 |
+| door-history upload (only when rows are pending, review R4-2) | ≤ 6 | ≤ 18–22.5 | ≤ 90–112.5 |
+| pending-command poll (P3b-2, unchanged; PC bucket) | 0 up / 90 down | 0 | 90 |
 
 Plus, unchanged: the notice-driven syncs (≤ 1 a minute per PC, §3.9), one heartbeat per PC every
-300 s, and the first sync of each Tunis day carrying the full member list. The busiest case — socket
-down — is ≤ 112.5 + 90 requests an hour for the gym, ≤ 3.4 a minute, 1.7 % of the bucket. The weight is
+300 s, and the first sync of each Tunis day carrying the full member list. Every successful tick also
+runs the door-history upload (`DeviceAttendanceMaintenanceEngine.run_blocking` → `_sync_pending_history`):
+one `bulk_save_gym_access_history` POST whenever door events are pending — the same rows in total,
+spread over more, smaller requests. The busiest case on the gym account's bucket — socket down, doors
+busy — is ≤ 112.5 + 112.5 = 225 requests an hour for the gym, ≤ 3.75 a minute, under 2 % of the bucket;
+the command poll's 90 an hour are on the PC bucket. The weight is
 per request, not per count: a no-change `getSyncData` still loads the gym's whole deliverable scope
 (`findAllValidForAccessByGymId`/`…ByGymFamilyName` + freezes), builds the credentials, computes the four
 version tokens (`computeMembersVersion` counts fingerprints and enrolments and digests the id set) and,
@@ -4128,7 +4137,7 @@ test_totp_roster_check.py::test_record_counts_one_scan_and_logs_no_member_identi
 | `REMOVAL_CONFIRMED` (warn) | `push_safety.py::check_bulk_removal` | `worker device_id protocol path count roster ceiling` — an above-ceiling step let through once by a Confirm-removal approval for exactly that pin set (§3.2g) |
 | `MIRROR_SKIP_REMOVALS_DEFERRED` | `ultra_engine.py::_maybe_mirror_reconcile` | `worker` — MIRROR skipped on an add-only / handed-over turnstile |
 | `MEMBERS_MISSING` (warn) | `app.py::_report_missing_members` | `source action count sample` — members the server lists and this PC lacks (§3.6 "The missing-member check", lane B 2026-09-26). `source` ∈ `delta`, `full`, `windows`, `digest`; `action` ∈ `full_refresh` (a full member refresh asked), `probe` (a digest mismatch: one delta answer asked; `count`/`sample` empty), `suppressed` (a full answer's rows this PC could not store — reported once, never refreshed again); `sample` = up to 20 membership ids |
-| `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=`), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). `path` ∈ `full_sync` (pass start), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000) / `sync`, `removal`, `batch`, `member_sync` (PullSDK). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
+| `PIN_SCHEME_PASS_STOPPED` (warn) | `ultra_engine.py::_pass_scheme_stopped` (`worker=ULTRA:<id>`, any ULTRA worker), `device_sync.py::_raise_if_pin_scheme_switched` (`device_id=`, the DeviceSync engine) | `path scheme` — a push pass wrote nothing (more) because its pins were derived under `scheme` and the database records another pinScheme now (§3.2e, lane B 2026-09-26). With `worker=`: `full_sync` (pass start — MB2000 or a PullSDK panel in ULTRA), `push`, `between_chunks`, `member_sync`, `account_revoke` (MB2000); with `device_id=`: `sync`, `removal`, `batch`, `member_sync` (PullSDK, review R4-1). The app refreshes the worker copies and queues the next pass; one of these right after a `PIN_SCHEME_SWITCH` is expected |
 
 The v2 runtime logs on `zkapp.v2*` loggers with a `[V2]` prefix (roles changed, availability, commands,
 releases, restores, read-backs, loss checks); none is a `[T]` event.

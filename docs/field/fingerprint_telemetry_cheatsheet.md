@@ -205,8 +205,9 @@ before the switch are read under `previous`. `[CODE: app/core/db.py::_record_dev
 grep -F "[T] PIN_SCHEME_PASS_STOPPED" app-*.log
 ```
 
-`worker=` (MB2000) or `device_id=` (PullSDK), `path=`, `scheme=` the scheme the stopped pass had derived
-its pins under. Nothing more was written by that pass; the next pass pushes the new scheme. One or two of
+`worker=ULTRA:<id>` (the ULTRA worker of that turnstile: an MB2000, or a PullSDK panel at `path=full_sync`)
+or `device_id=` (the PullSDK sync engine), `path=`, `scheme=` the scheme the stopped pass had derived its
+pins under. Nothing more was written by that pass; the next pass pushes the new scheme. One or two of
 these right after a `PIN_SCHEME_SWITCH` are expected. On the MB2000 the chunk already in flight (at most 10
 members) may still have gone out under the old scheme; the cutover runbook's cables-out interlock and its
 proven restart are what keep that from ever reaching a turnstile. `[CODE: app/core/device_sync.py::pin_scheme_superseded; guide §3.2e]`
