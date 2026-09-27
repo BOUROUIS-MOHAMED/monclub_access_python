@@ -3430,9 +3430,12 @@ seen − 30 min). No sample in the last 30 minutes: the window's own median and 
 window of 7 that drives `offset()` (every `sentAt` / `observedAt`) is untouched. Each recent sample is kept, and
 persisted (`recent` in the `server_clock` kv row), with its own time, so after a restart a remembered offset counts
 its age from the original measurement; a row persisted before this change has no `recent`, so `ageSec` is left
-out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view; a sample stamped later than the
-PC's clock (taken before Windows stepped the clock back) is DROPPED from the view — at each new sample and at load —
-so it never comes back once the clock catches up (review round 3; the window of 7 keeps it, as before). `[CODE: server_clock.py::report, ::_recent_locked]`
+out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view. A sample of this process also keeps
+the monotonic time it was taken: its age is measured on that clock, and once the PC's wall clock has been stepped
+since — wall minus monotonic moved by more than `STEP_TOLERANCE_SEC` (2 s), either way — it leaves the view for good,
+whether or not a sample lands before the clock catches up (review rounds 3-4; the window of 7 keeps it, as before).
+A sample loaded from disk has no monotonic time: its age is on the wall clock, and one stamped later than now is
+dropped at load; a step between the save and the restart is not detected. `[CODE: server_clock.py::report, ::_recent_locked, ::_age_of]`
 `[TEST: test_v2_last_push.py — the five clock tests, incl. ::test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes,
 ::test_no_sample_in_the_last_30_minutes_sends_no_age; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
 `[TEST: test_v2_clock_and_api.py — incl. ::test_a_clock_skew_refusal_outvotes_earlier_wrong_samples,

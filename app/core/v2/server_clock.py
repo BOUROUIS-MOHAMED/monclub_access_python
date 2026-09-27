@@ -25,6 +25,11 @@ report it in the heartbeat.
   freshness rule). The window that drives ``offset()`` is not touched. Each recent sample is
   persisted with its own time, so a remembered offset counts its age from the original
   measurement. No sample in the last 30 minutes: the window's own figures, without ``ageSec``.
+  A sample of this process also keeps the MONOTONIC time it was taken: its age is measured on
+  that clock, and once the PC's wall clock has been stepped since (wall - mono moved by more
+  than ``STEP_TOLERANCE_SEC``, either way) the sample describes a clock that is gone and leaves
+  the view (review rounds 3-4). A sample loaded from disk has no monotonic time: its age is
+  measured on the wall clock, and one stamped later than now is dropped at load.
 """
 from __future__ import annotations
 
@@ -41,6 +46,7 @@ PERSISTED_MAX_AGE_SEC = 12 * 3600.0
 PERSIST_EVERY_SEC = 60.0
 RECENT_SEC = 1800.0
 RECENT_MAX = 500
+STEP_TOLERANCE_SEC = 2.0
 _SANE_OFFSET_SEC = 10 * 365 * 86400.0
 
 
@@ -58,8 +64,9 @@ class ServerClock:
         self._persist = persist
         self._lock = threading.Lock()
         self._samples: List[float] = []
-        # (offset, PC wall time) of every sample of the last RECENT_SEC: the heartbeat's view.
-        self._recent: List[Tuple[float, float]] = []
+        # (offset, PC wall time, monotonic time or None when loaded) of every sample of the last
+        # RECENT_SEC: the heartbeat's view.
+        self._recent: List[Tuple[float, float, Optional[float]]] = []
         self._source = ""
         self._measured_at = 0.0
         self._utc_offset: Optional[int] = None
@@ -88,7 +95,7 @@ class ServerClock:
                         # One stamped later than now was taken before the PC clock stepped
                         # back: dropped, never counted again once the clock catches up.
                         if math.isfinite(o) and math.isfinite(a) and a <= self._wall():
-                            recent.append((o, a))
+                            recent.append((o, a, None))
                     self._recent = recent[-RECENT_MAX:]
                 if row.get("utc_offset_sec") is not None:
                     self._utc_offset = int(row["utc_offset_sec"])
@@ -116,7 +123,7 @@ class ServerClock:
         if abs(offset) > _SANE_OFFSET_SEC:
             return False
         with self._lock:
-            wall = self._wall()
+            wall, mono = self._wall(), self._mono()
             if authoritative:
                 self._samples = []
                 self._recent = []
@@ -124,11 +131,9 @@ class ServerClock:
                 self._last_issued = None
             self._samples.append(offset)
             del self._samples[:-WINDOW]
-            self._recent.append((offset, wall))
-            # Also drops a sample stamped later than now (taken before the PC clock stepped back):
-            # hiding it would only last until the clock caught up with it (review round 3).
-            self._recent = [(o, a) for o, a in self._recent
-                            if 0.0 <= wall - a <= RECENT_SEC][-RECENT_MAX:]
+            self._recent.append((offset, wall, mono))
+            self._recent = [r for r in self._recent
+                            if self._age_of(r, wall, mono) is not None][-RECENT_MAX:]
             self._source = str(source)
             self._measured_at = wall
         self._maybe_persist()
@@ -170,11 +175,29 @@ class ServerClock:
             self._last_issued_mono = mono
             return candidate
 
-    def _recent_locked(self) -> List[Tuple[float, float]]:
-        """The samples taken in the last RECENT_SEC on the PC's own clock, inclusive. One taken
-        "in the future" (the PC clock stepped back) has no age: left out."""
-        now = self._wall()
-        return [(o, a) for o, a in self._recent if 0.0 <= now - a <= RECENT_SEC]
+    @staticmethod
+    def _age_of(sample: Tuple[float, float, Optional[float]], wall: float,
+                mono: float) -> Optional[float]:
+        """The age of a view sample, or None when it is not in the view: older than RECENT_SEC
+        (inclusive bound), "in the future", or taken before a step of the PC's wall clock."""
+        _o, a, m = sample
+        if m is not None:
+            if abs((wall - mono) - (a - m)) > STEP_TOLERANCE_SEC:
+                return None                   # the wall clock was stepped since: another clock
+            age = mono - m
+        else:
+            age = wall - a
+        return age if 0.0 <= age <= RECENT_SEC else None
+
+    def _recent_locked(self) -> List[Tuple[float, float, float]]:
+        """(offset, wall time, age) of every sample in the view now."""
+        wall, mono = self._wall(), self._mono()
+        out = []
+        for r in self._recent:
+            age = self._age_of(r, wall, mono)
+            if age is not None:
+                out.append((r[0], r[1], age))
+        return out
 
     def report(self) -> Optional[Dict[str, Any]]:
         """The heartbeat's ``clockOffset`` block (a view, see the module docstring); None
@@ -183,8 +206,8 @@ class ServerClock:
             source = self._source or "persisted"
             recent = self._recent_locked()
             if recent:
-                age = self._wall() - min(a for _o, a in recent)
-                return {"offsetSec": round(float(statistics.median(o for o, _a in recent)), 3),
+                age = max(g for _o, _a, g in recent)
+                return {"offsetSec": round(float(statistics.median(o for o, _a, _g in recent)), 3),
                         "samples": len(recent), "source": source, "ageSec": round(age, 1)}
             off = self._offset_locked()
             if off is None:
@@ -209,7 +232,7 @@ class ServerClock:
                 return
             row = {"offset_sec": off, "measured_at": self._measured_at, "source": self._source,
                    "samples": len(self._samples), "utc_offset_sec": self._utc_offset,
-                   "recent": [[o, a] for o, a in self._recent_locked()]}
+                   "recent": [[o, a] for o, a, _g in self._recent_locked()]}
             self._last_persist_mono = self._mono()
         try:
             self._persist(row)

@@ -374,9 +374,14 @@ class TestUpload:
 
 # ─────────────────────────── the heartbeat clock: ageSec ───────────────────────────
 
+def _paired(t, **kw):
+    """A clock whose wall and monotonic time move together (no step), from t["wall"]."""
+    return ServerClock(wall=lambda: t["wall"], mono=lambda: t["wall"] - 999_000.0, **kw)
+
+
 def test_the_clock_report_carries_the_age_of_the_oldest_sample():
     t = {"wall": 1_000_000.0}
-    clk = ServerClock(wall=lambda: t["wall"])
+    clk = _paired(t)
     clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="welcome")
     t["wall"] += 100
     clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="rest:x")
@@ -390,7 +395,7 @@ def test_the_view_counts_every_sample_of_the_last_30_minutes_and_restarts_after_
     """The heartbeat view is not the median window: all 9 samples of the last 30 minutes count
     (the window of 7 that drives ``offset()`` keeps only 7). A CLOCK_SKEW refusal restarts both."""
     t = {"wall": 1_000_000.0}
-    clk = ServerClock(wall=lambda: t["wall"])
+    clk = _paired(t)
     for _ in range(9):
         clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="rest:x")
         t["wall"] += 10
@@ -405,7 +410,7 @@ def test_the_view_counts_every_sample_of_the_last_30_minutes_and_restarts_after_
 def test_a_remembered_offset_counts_its_age_from_its_original_measurement():
     t = {"wall": 2_000_000.0}
     saved = {}
-    clk = ServerClock(wall=lambda: t["wall"], persist=saved.update)
+    clk = _paired(t, persist=saved.update)
     clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="welcome")
     t["wall"] += 30
     clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="rest:x")
@@ -426,7 +431,7 @@ def test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes():
     every 600 s. The window of 7 then spans an hour, so its oldest sample never passed the
     dashboard's 30-minute freshness rule. The view reports only the last 30 minutes."""
     t = {"wall": 1_000_000.0}
-    clk = ServerClock(wall=lambda: t["wall"])
+    clk = _paired(t)
     for i in range(8):                   # minutes 0, 10, ..., 70; offsets 1 .. 8 s
         clk.add_sample(t["wall"] + (i + 1), t["wall"], t["wall"], source="assignment")
         if i < 7:
@@ -440,7 +445,7 @@ def test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes():
 
 def test_no_sample_in_the_last_30_minutes_sends_no_age():
     t = {"wall": 1_000_000.0}
-    clk = ServerClock(wall=lambda: t["wall"])
+    clk = _paired(t)
     clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="welcome")
     t["wall"] += 600
     clk.add_sample(t["wall"] + 7, t["wall"], t["wall"], source="assignment")
@@ -568,7 +573,7 @@ def test_a_sample_taken_before_a_clock_step_back_never_returns_to_the_view():
     is dropped, not merely hidden until the clock catches up with it again."""
     real = {"t": 1_000_000.0}
     pc = {"wall": real["t"] + 3600.0}                  # the PC clock runs 1 h ahead
-    clk = ServerClock(wall=lambda: pc["wall"])
+    clk = ServerClock(wall=lambda: pc["wall"], mono=lambda: real["t"])
     clk.add_sample(real["t"], pc["wall"], pc["wall"], source="welcome")     # offset -3600
     real["t"] += 60
     pc["wall"] = real["t"]                             # stepped back to the real time
@@ -611,3 +616,37 @@ def test_an_mb2000_pin_the_driver_skips_as_invalid_gets_no_result(db, monkeypatc
 def test_the_engine_pin_guard_is_the_drivers():
     from app.sdk.zk_standalone import _MAX_PIN_DIGITS
     assert ue.UltraDeviceWorker._STANDALONE_MAX_PIN_DIGITS == _MAX_PIN_DIGITS
+
+
+def test_a_pre_step_sample_leaves_the_view_even_with_no_sample_before_the_catch_up():
+    """Review round 4: dropping at add_sample/load only caught a step back when a sample landed
+    while the old one was still "ahead". The monotonic time kept with each sample detects the
+    step whatever happens next: the PC clock 5 min ahead, one sample, a step back 60 s later, no
+    sample for 400 s -- the pre-step sample never returns, nor is it persisted."""
+    real = {"t": 1_000_000.0}
+    pc = {"wall": real["t"] + 300.0}
+    saved = []
+    clk = ServerClock(wall=lambda: pc["wall"], mono=lambda: real["t"], persist=saved.append)
+    clk.add_sample(real["t"], pc["wall"], pc["wall"], source="assignment")   # offset -300
+    real["t"] += 60
+    pc["wall"] = real["t"]
+    assert "ageSec" not in clk.report()
+    real["t"] += 400
+    pc["wall"] = real["t"]
+    assert "ageSec" not in clk.report(), "the catch-up does not bring it back"
+    real["t"] += 140
+    pc["wall"] = real["t"]
+    clk.add_sample(real["t"], pc["wall"], pc["wall"], source="assignment")   # offset 0
+    rep = clk.report()
+    assert rep["samples"] == 1 and rep["offsetSec"] == pytest.approx(0.0) and rep["ageSec"] == 0.0
+    clk.flush()
+    assert [r[0] for r in saved[-1]["recent"]] == [pytest.approx(0.0)]
+
+
+def test_a_forward_step_also_retires_the_samples_before_it():
+    t = {"wall": 1_000_000.0, "mono": 10.0}
+    clk = ServerClock(wall=lambda: t["wall"], mono=lambda: t["mono"])
+    clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="a")
+    t["mono"] += 30
+    t["wall"] += 30 + 3600                             # the PC clock jumps 1 h forward
+    assert "ageSec" not in clk.report()
