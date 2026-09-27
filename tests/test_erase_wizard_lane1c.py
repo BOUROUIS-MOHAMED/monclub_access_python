@@ -718,7 +718,7 @@ class TestPeopleTheRefillWillNotPutBack:
     def test_someone_new_outside_the_roster_at_the_backup_stops_the_run(self, sqlite_db,
                                                                        monkeypatch, tmp_path):
         """Bound to the backup: a person the operator was not shown -- enrolled on the panel after
-        step 1, or a member a sync took out of the roster -- is never erased unseen."""
+        step 1 -- is never erased unseen."""
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
         pv = _preview(wiz, 5)
         panel.tables["user"].append({"Pin": "556", "CardNo": "5560", "Name": "Guard Amine"})
@@ -745,6 +745,28 @@ class TestPeopleTheRefillWillNotPutBack:
         assert run["state"] == "DONE", run.get("error")
         assert run["notRefilled"] == {"count": 1, "pins": ["102"]}
         assert (_run_dir(wiz) / ew.KEEP_MARK).exists()
+
+    def test_a_scheme_switched_since_step_1_stops_the_run_before_any_delete(self, sqlite_db,
+                                                                            monkeypatch, tmp_path):
+        """Review round 2 (lane 1c): the step-1 roster excuses its own pins only under the scheme
+        it was read with. A « Par personne » switch saved during the backup makes every old pin
+        look outside the roster -- counting them all "not put back" (and keeping the backup for
+        good) would be wrong: the run stops before any delete instead."""
+        from tests.test_erase_wizard import _device
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            _account(monkeypatch, 5, _device())          # the switch lands during the backup
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "PIN_SCHEME_CHANGED" in run["error"], run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+        assert run["notRefilled"] is None
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists()
 
     def test_a_member_of_step_1_does_not_cover_a_new_stranger(self, sqlite_db, monkeypatch,
                                                               tmp_path, refill_cache):

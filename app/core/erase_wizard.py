@@ -343,6 +343,7 @@ class EraseWizard:
         # leaves the roster since is not "someone the operator was not shown" (_bind_not_refilled).
         # Kept here, not in the run record: it can hold ~1,800 pins, and the page polls the record.
         self._run_step1_roster: frozenset = frozenset()
+        self._run_step1_scheme: Optional[str] = None     # the scheme that roster was read under
         # Turnstiles whose Refill is between its checks and its release: no erase may start on
         # them (review round 2, R2-1 -- the password round trip is a network call).
         self._refilling: set = set()
@@ -564,7 +565,7 @@ class EraseWizard:
             self._previews[preview_id] = {
                 "device": ident, "counts": counts, "at": now,
                 "notRefilled": None if left_out is None else frozenset(p["pin"] for p in left_out),
-                "rosterPins": frozenset(pins_now or ())}
+                "rosterPins": frozenset(pins_now or ()), "rosterScheme": check.get("scheme")}
         return 200, {
             "ok": True, "previewId": preview_id, "device": ident,
             "pinScheme": self._pin_scheme(did),
@@ -966,6 +967,7 @@ class EraseWizard:
             self._running = True
             self._run = run
             self._run_step1_roster = frozenset(preview.get("rosterPins") or ())
+            self._run_step1_scheme = preview.get("rosterScheme")
             self._previews.pop(str(body.get("previewId")), None)
         try:
             self._spawn(lambda: self._execute(run_id))
@@ -1191,6 +1193,18 @@ class EraseWizard:
         prune never deletes a marked folder. A C3 erase without the ``user`` table has no user
         rows in its backup: the list is read once more here. Pins only -- never a name -- in the
         run record, the mark and the log (review F29)."""
+        with self._lock:
+            step1_roster = set(self._run_step1_roster)
+            step1_scheme = self._run_step1_scheme
+        if check.get("scheme") != step1_scheme:
+            # A switch saved since step 1 (during the backup): the terminal's pins are the old
+            # scheme's, the roster the new one's -- nobody can be compared, and excusing the step-1
+            # roster would count every member "not put back". Before any delete: the cheap exit
+            # (lane 1c review round 2).
+            raise StepError("PIN_SCHEME_CHANGED",
+                            f"the pin scheme moved from {step1_scheme} at step 1 to "
+                            f"{check.get('scheme')} before the first delete: who the refill would "
+                            "not put back cannot be told -- read step 1 again")
         content = backup.get("content") or {}
         if proto == PROTO_PULLSDK and "user" not in (content.get("rows") or {}):
             people = self._read_people(worker, proto)
@@ -1204,8 +1218,6 @@ class EraseWizard:
             people = terminal_people(proto, content.get("users") or [])
         left = sorted({p["pin"] for p in not_refilled(people, (check.get("_pins") or {})
                                                       .get("now"))}, key=_pin_key)
-        with self._lock:
-            step1_roster = set(self._run_step1_roster)
         unseen = sorted(set(left) - set(run.get("notRefilledAccepted") or ()) - step1_roster,
                         key=_pin_key)
         if unseen:

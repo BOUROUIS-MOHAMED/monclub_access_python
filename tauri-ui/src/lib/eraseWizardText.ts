@@ -239,6 +239,8 @@ const fr = {
       "Au moment d'effacer, le tourniquet portait des personnes hors de la liste du remplissage qui n'étaient pas affichées à l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     KEEP_MARK_NOT_WRITTEN:
       "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé.",
+    PIN_SCHEME_CHANGED:
+      "Le schéma de numérotation du tourniquet a changé depuis l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
     ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
     NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
@@ -533,6 +535,8 @@ const en: typeof fr = {
       "When the erase was about to start, the turnstile held people outside the refill's list who were not shown at step 1: nothing was erased. Read step 1 again.",
     KEEP_MARK_NOT_WRITTEN:
       "The mark that keeps the backup with no time limit could not be written: nothing was erased.",
+    PIN_SCHEME_CHANGED:
+      "The turnstile's pin scheme changed since step 1: nothing was erased. Read step 1 again.",
     NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
     ERASE_FAILED: "An erase command failed: part of it may have been erased.",
     NO_ANSWER: "A command was sent and got no answer: it may have acted.",
