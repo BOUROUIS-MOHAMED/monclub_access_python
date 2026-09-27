@@ -187,5 +187,8 @@ uses a throwaway task name and fails with `LEAKED` if one reached Windows. It al
 pins the installer's two `watchdog` task lines and compiles `MonClubAccess.iss` when
 `ISCC.exe` is installed. What Task Scheduler itself does with a task registered
 with `Settings.Enabled = $false`, or with an exported task registered again, was
-**not** run here; the script reads the state back and disables it explicitly if
-needed.
+**not** run here. After a normal registration the script reads the state back and
+disables the task explicitly if needed; after a put-back it does not -- it relies on
+the `<Enabled>false</Enabled>` inside the exported XML, and still fails the run.
+The put-back covers a task in the root folder only (where this script registers
+it); a same-name task someone moved to another folder is removed but not put back.
