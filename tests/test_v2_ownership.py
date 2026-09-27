@@ -116,6 +116,81 @@ def test_rows_older_than_the_last_pin_scheme_switch_are_not_uploaded(db):
     assert set(own.local_facts(8)) == {"200"}
 
 
+def _epoch(local_text):
+    return time.mktime(time.strptime(local_text, "%Y-%m-%d %H:%M:%S"))
+
+
+def _switch_to_account(dbmod, monkeypatch, device_id, at_text):
+    """The real recorder (``_insert_device_row``, as test_pin_scheme_switch drives it), with
+    ``switched_at`` = ``at_text``: seen on MEMBERSHIP, then a payload on ACCOUNT."""
+    device = {"id": device_id, "name": f"Lane {device_id}", "accessDataMode": "ULTRA",
+              "deviceProtocol": "ZK_STANDALONE", "rosterPushingPolicy": "PRESERVE"}
+    for scheme in ("MEMBERSHIP", "ACCOUNT"):
+        with monkeypatch.context() as m:
+            m.setattr(dbmod, "now_iso", lambda: at_text)
+            with dbmod.get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM sync_devices WHERE id = ?", (device_id,))
+                dbmod._insert_device_row(cur, dict(device, pinScheme=scheme))
+                conn.commit()
+    [switch] = dbmod.list_device_pin_scheme_switches(device_id=device_id)[device_id]
+    assert (switch["previous_scheme"], switch["scheme"], switch["switched_at"]) == ("MEMBERSHIP", "ACCOUNT", at_text)
+
+
+def _removed(dbmod, monkeypatch, device_id, pin, at, *, corrected=False):
+    """MonClub removes ``pin`` through the real writer; the log's clock reads ``at``."""
+    import app.core.v2.server_clock as sc
+    _state(dbmod, device_id, pin, updated="2026-09-01 10:00:00")
+    with monkeypatch.context() as m:
+        m.setattr(sc, "corrected_now", lambda: (at, corrected))
+        dbmod.clear_device_revocation_state(device_id=device_id, pin=pin)
+
+
+def _account_sync(api, offset=0.0):
+    api.meta = {"generation": 5, "pinScheme": "ACCOUNT"}
+    sync = own.OwnershipSync(_rt(api, offset=offset))
+    sync._device_scheme = lambda did: "ACCOUNT"
+    return sync
+
+
+def test_a_removal_logged_before_the_switch_is_not_uploaded_under_the_new_scheme(db, monkeypatch):
+    # Membership id 300 removed, THEN the device switched to ACCOUNT (the server bumps the
+    # ownership generation to ACCOUNT and does not fence facts by the switch time).
+    _removed(db, monkeypatch, 8, "300", _epoch("2026-09-10 09:00:00"))
+    _switch_to_account(db, monkeypatch, 8, "2026-09-10 10:00:00")
+    _state(db, 8, "5001", updated="2026-09-10 11:00:00")                  # account era: pushed
+    _removed(db, monkeypatch, 8, "5002", _epoch("2026-09-10 12:00:00"))   # account era: removed
+    api = FakeApi()
+    sync = _account_sync(api)
+    rows, _ = sync.build_rows(8, "ACCOUNT", 5, full=True)
+    assert {r["pin"]: r["state"] for r in rows} == {"5001": "APPLIED", "5002": "REMOVED"}
+    sync.upload(8)
+    [body] = api.uploads
+    assert (body["pinScheme"], body["generation"]) == ("ACCOUNT", 5)
+    assert {r["pin"]: r["state"] for r in body["rows"]} == {"5001": "APPLIED", "5002": "REMOVED"}, \
+        "the membership-era removal of 300 must not go up as an ACCOUNT fact"
+
+
+def test_a_corrected_removal_is_compared_with_the_switch_on_the_pcs_clock(db, monkeypatch):
+    # The PC is 10 min BEHIND the server (offset +600). A removal at PC 09:55 is logged at
+    # server time = PC 10:05; the switch is PC 10:00. On the PC's clock it is before the switch.
+    _removed(db, monkeypatch, 8, "300", _epoch("2026-09-10 09:55:00") + 600.0, corrected=True)
+    _switch_to_account(db, monkeypatch, 8, "2026-09-10 10:00:00")
+    rows, _ = _account_sync(FakeApi(), offset=600.0).build_rows(8, "ACCOUNT", 5, full=True)
+    assert rows == []
+
+
+def test_a_corrected_removal_after_the_switch_is_still_uploaded(db, monkeypatch):
+    # The PC is 10 min AHEAD of the server (offset -600). A removal at PC 10:05 -- after the
+    # switch at PC 10:00 -- is logged at server time = PC 09:55. It is an account-era fact.
+    _removed(db, monkeypatch, 8, "5002", _epoch("2026-09-10 10:05:00") - 600.0, corrected=True)
+    _switch_to_account(db, monkeypatch, 8, "2026-09-10 10:00:00")
+    rows, _ = _account_sync(FakeApi(), offset=-600.0).build_rows(8, "ACCOUNT", 5, full=True)
+    assert [(r["pin"], r["state"]) for r in rows] == [("5002", "REMOVED")]
+    assert timefmt.to_epoch(rows[0]["observedAt"]) == pytest.approx(_epoch("2026-09-10 09:55:00"), abs=1.0), \
+        "a corrected time is sent as logged"
+
+
 def test_upload_sends_changes_only_with_fact_times_on_the_server_clock(db, monkeypatch):
     _state(db, 8, "100", updated="2026-09-20 10:00:00")
     api = FakeApi()

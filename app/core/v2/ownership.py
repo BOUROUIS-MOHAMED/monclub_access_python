@@ -13,7 +13,9 @@ before a release):
 * ``REMOVED``  — ONLY from ``v2_removal_log`` (written in the removal's own transaction). A row
   that vanished from ``device_sync_state`` (a prune, a hash clear) is NEVER uploaded as removed.
 Rows older than the device's latest pin-scheme switch belong to the old scheme and are not
-uploaded under the new one.
+uploaded under the new one -- state and intent rows by ``updated_at``, removals by their
+logged time moved back to the PC's clock. It is a time rule: an old-scheme pin removed AFTER
+the switch was recorded is still uploaded (guide §3.9).
 
 ``observedAt`` is the FACT time on the server's clock (owner decision 5a): the row's
 ``updated_at`` (local PC time) plus the measured offset, or the corrected removal time; bumped
@@ -84,8 +86,12 @@ def _local_to_epoch(text: Any) -> Optional[float]:
     return time.mktime(moment.timetuple())
 
 
-def local_facts(device_id: int) -> Dict[str, Dict[str, Any]]:
-    """pin -> {state, pushedHash, pushedFingerIds, pc_epoch, corrected} for one turnstile."""
+def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, Any]]:
+    """pin -> {state, pushedHash, pushedFingerIds, pc_epoch, corrected} for one turnstile.
+
+    ``offset``: the server clock's current offset (server - PC, s). A corrected removal time
+    is on the server's clock; it is moved back by ``offset`` before it is compared with the
+    switch time, which is the PC's."""
     from app.core.db import get_conn, list_device_pin_scheme_switches
 
     did = int(device_id)
@@ -118,8 +124,11 @@ def local_facts(device_id: int) -> Dict[str, Dict[str, Any]]:
                 "SELECT pin, removed_at, corrected FROM v2_removal_log WHERE device_id = ?", (did,)).fetchall():
             if str(pin) in facts:
                 continue          # written again after the removal: the current state wins
+            at = float(removed_at)
+            if cutoff is not None and (at - offset if corrected else at) < cutoff:
+                continue          # removed under the previous pin scheme
             facts[str(pin)] = {"state": "REMOVED", "pushedHash": None, "pushedFingerIds": None,
-                               "at": float(removed_at), "corrected": bool(corrected)}
+                               "at": at, "corrected": bool(corrected)}
     return facts
 
 
@@ -205,7 +214,7 @@ class OwnershipSync:
         prev = self._uploaded(did, scheme, generation)
         rows: List[Dict[str, Any]] = []
         epochs: Dict[str, float] = {}
-        for pin, f in sorted(local_facts(did).items()):
+        for pin, f in sorted(local_facts(did, offset=offset).items()):
             if not pin.isdigit() or len(pin) > 24:
                 continue
             fingers = _canon_fingers(f.get("pushedFingerIds"))

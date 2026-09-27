@@ -3274,7 +3274,8 @@ for its duration (§3.4a); on ~1,860 users its length is unmeasured.
 `device_push_intent` (`INTENT`) and `v2_removal_log` (`REMOVED`, written in `clear_device_revocation_state`'s
 and `delete_device_sync_state`'s own transaction, at the corrected time). A row that merely vanished (a prune) is
 never `REMOVED`; a logged removal older than a state already uploaded for that pin is not sent again. Rows
-older than the device's latest pin-scheme switch are not uploaded. Only what changed, every 5 min, for the
+older than the device's latest pin-scheme switch are not uploaded — all three kinds, see "The pin-scheme cutoff"
+below. Only what changed, every 5 min, for the
 turnstiles this PC drives (restored) — and, in a gym with leases, for every other turnstile it holds facts for
 AND uploaded before (a lease lost without a release): under the scheme and generation of its own last upload,
 since the server's `GET /ownership` answers only the lease holder (409 `NOT_DEVICE_DRIVER`) while the upload
@@ -3288,6 +3289,43 @@ under) — the new driver's restore does not see them — pages of 1,000; `obser
 offset, strictly newer than this PC's last upload of that pin when the state changed. A PullSDK table clear
 posts `/ownership/wiped`. `[CODE]` `[TEST: test_v2_ownership.py, test_v2_review0.py::test_an_older_removal_never_resurfaces_after_a_later_upload]`
 `[TEST: e2e — 25 pins stored, an unchanged record sent nothing, a removal stored REMOVED]`
+
+*The pin-scheme cutoff (2026-09-27).* `ownership.py::local_facts` reads the device's latest
+`device_pin_scheme_switch.switched_at` (PC local time) and leaves out every fact from before it: `device_sync_state`
+and `device_push_intent` rows by `updated_at`, and `v2_removal_log` rows by `removed_at`. A corrected
+`removed_at` is on the server's clock, so it is first moved back by the offset `build_rows` uses for this upload.
+`[CODE]` `[TEST: test_v2_ownership.py::test_rows_older_than_the_last_pin_scheme_switch_are_not_uploaded,
+::test_a_removal_logged_before_the_switch_is_not_uploaded_under_the_new_scheme,
+::test_a_corrected_removal_is_compared_with_the_switch_on_the_pcs_clock,
+::test_a_corrected_removal_after_the_switch_is_still_uploaded]`
+Until this change the removal rows had no such check. After a MEMBERSHIP → ACCOUNT switch, the first upload under
+the new generation sent, as an ACCOUNT fact, every membership-era removal that no later state row of the same pin
+number had superseded. `[TEST: ::test_a_removal_logged_before_the_switch_is_not_uploaded_under_the_new_scheme fails
+on aeeef69: build_rows under (ACCOUNT, 5) returns membership id 300 as REMOVED, logged an hour before the recorded
+switch]` A scratch probe of `upload()` on aeeef69 (not in the repo) showed that row in the POST body.
+The server does not drop such a fact. Its "outdated" fence (`ignoredOutdated`) applies only to a `DEVICE_WIPED`
+generation: a `PIN_SCHEME_CHANGED` bump is lazy (the first request after the switch) and clears `wipedAt`. Its
+tombstones are looked up per scheme, too. So the fact is stored as `REMOVED` in the ACCOUNT generation, and after
+30 days `pruneRemoved` turns it into an ACCOUNT tombstone. `[CODE: backend 919231a8, read with git show, not run —
+AccessOwnershipService::upload, ::lockedCurrentEpoch, ::pruneRemoved; AccessDeviceOwnershipEpoch::bump;
+AccessDeviceOwnershipTombstoneRepository::findForPins; the same in c7d4b532]`
+Nothing acts on such a row beyond that:
+- The server reads stored rows only in `upload` (newest fact per pin wins; a tombstone refuses an older fact for a
+  pin with no row), `restore` and `pruneRemoved`.
+- The PC's `restore` adopts `APPLIED` rows only, and `meta` reads the page header only.
+
+This PC's own account-era facts are all later than a removal it logged before its switch, so the false fact never
+displaced them. For one PC, the gap was a false record, not a wrong decision. `[CODE]` Two PCs uploading for the
+same turnstile (a gym without drivers, `_drivable`) are a different case: there the newest fact wins across PCs,
+whatever the scheme era it came from. That case was not analysed. `[UNVERIFIED]`
+Residuals `[CODE]`:
+- **It is a time rule, not a scheme rule.** MonClub may remove an old-scheme pin *after* this PC recorded the
+  switch: a pass or a targeted revoke still working from the device copy it held before the switch (§3.2e). That
+  removal is logged after the switch and still goes up as `REMOVED` under the new scheme.
+- **The manual retire writes no removal log.** It is the plain `DELETE`s of the gym 45 plan §5.1, and
+  `db.py::_log_v2_removal` is the table's only writer, so the retire produces no `REMOVED` fact.
+- **The offset is the one at upload,** not the one in force when the removal was logged.
+- **`switched_at` has one-second resolution,** so a removal logged within the switch's own second is kept.
 
 **Remote commands (P2b; payloads P2c-2 §5).** `commands.py::CommandExecutor` (thread `v2-commands`): a
 journal row (`v2_command_journal`) with a fresh claim token BEFORE the claim (a lost answer is re-claimed with
