@@ -77,9 +77,9 @@ const fr = {
   notRefilledKept: (n: number) =>
     `${n} personne(s) effacée(s) ne sont pas dans la liste du remplissage : la sauvegarde de cet effacement est gardée sans limite de durée.`,
   otherPcsTitle:
-    "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet.",
+    "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet. Quitter ne suffit pas : le watchdog d'Access le relance en quelques minutes, et le démarrage avec Windows à la prochaine ouverture de session.",
   otherPcsTick:
-    "MonClub Access est fermé sur tous les autres PC de cette salle, et le restera jusqu'au remplissage.",
+    "MonClub Access est fermé sur tous les autres PC de cette salle — sur chacun : « Ouvrir MonClub Access avec Windows » décoché, watchdog désactivé (Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'), puis Quitter — et le restera jusqu'au remplissage.",
   deviceLine: (name: string, ip: string, port: string, sdk: string) =>
     `Tourniquet : ${name} — adresse ${ip}:${port} — ${sdk}. L'effacement est lié à cette adresse.`,
   sdkNames: { ZK_PULLSDK: "PullSDK (contrôleur C3)", ZK_STANDALONE: "zkemkeeper (terminal autonome)" } as Record<string, string>,
@@ -201,7 +201,8 @@ const fr = {
     RUN_NOT_STARTED: "L'effacement n'a pas pu démarrer : rien n'a été effacé. Réessayez.",
     NOT_ON_HOLD: "Ce tourniquet n'est plus en attente.",
     RECORDS_NOT_RESET: "Les enregistrements de MonClub n'ont pas pu être remis à zéro : le tourniquet reste en attente. Réessayez.",
-    OTHER_PCS_NOT_CONFIRMED: "Confirmez que MonClub Access est fermé sur tous les autres PC de cette salle.",
+    OTHER_PCS_NOT_CONFIRMED:
+      "Confirmez que MonClub Access est fermé sur tous les autres PC de cette salle (watchdog désactivé, « Ouvrir MonClub Access avec Windows » décoché).",
     HELD_USE_REFILL:
       "Ce tourniquet est déjà en attente depuis un effacement : choisissez « Attendre que j'appuie sur « Remplir » », puis appuyez sur « Remplir ».",
     REFILL_SOURCE_MISSING:
@@ -339,9 +340,9 @@ const en: typeof fr = {
   notRefilledKept: (n: number) =>
     `${n} erased person(s) are not in the refill's list: this erase's backup is kept with no time limit.`,
   otherPcsTitle:
-    "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile.",
+    "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile. Quitting is not enough: Access's watchdog starts it again within minutes, and the start with Windows at the next logon.",
   otherPcsTick:
-    "MonClub Access is closed on every other PC of this gym, and stays closed until the refill.",
+    "MonClub Access is closed on every other PC of this gym — on each: 'Ouvrir MonClub Access avec Windows' unticked, the watchdog switched off (Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'), then Quit — and stays closed until the refill.",
   deviceLine: (name: string, ip: string, port: string, sdk: string) =>
     `Turnstile: ${name} — address ${ip}:${port} — ${sdk}. The erase is tied to this address.`,
   sdkNames: { ZK_PULLSDK: "PullSDK (C3 controller)", ZK_STANDALONE: "zkemkeeper (standalone terminal)" },
@@ -462,7 +463,8 @@ const en: typeof fr = {
     RUN_NOT_STARTED: "The erase could not start: nothing was erased. Try again.",
     NOT_ON_HOLD: "This turnstile is no longer on hold.",
     RECORDS_NOT_RESET: "MonClub's records could not be reset: the turnstile stays on hold. Try again.",
-    OTHER_PCS_NOT_CONFIRMED: "Confirm that MonClub Access is closed on every other PC of this gym.",
+    OTHER_PCS_NOT_CONFIRMED:
+      "Confirm that MonClub Access is closed on every other PC of this gym (watchdog switched off, 'Ouvrir MonClub Access avec Windows' unticked).",
     HELD_USE_REFILL:
       "This turnstile is already on hold after an erase: choose 'Hold until I press Refill', then press Refill.",
     REFILL_SOURCE_MISSING:

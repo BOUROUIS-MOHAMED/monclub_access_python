@@ -6,6 +6,8 @@ Guide §3.2h, §3.10. Against the same fakes as tests/test_erase_wizard.py -- no
 * C0   the people an erase removes and the refill will NOT put back (not in its roster: staff,
        cleaners, another system's users) are counted and named at step 1, need their own tick,
        are bound to the backup before the first delete, and their backup is never pruned;
+* C1   the "other PCs closed" tick names what relaunches a quit Access: the watchdog task and
+       the start with Windows (runbook C1 / D1);
 """
 from __future__ import annotations
 
@@ -180,6 +182,37 @@ class TestTheMemberListMustBeRecent:
         # A failure leaves the stamp alone: the age of the last SUCCESS keeps growing.
         fails = [m.start() for m in re.finditer(r"self\._last_sync_ok = False\n", src)]
         assert fails and all("_last_sync_ok_mono" not in src[f:f + 120] for f in fails)
+
+
+# ─────────────────────────── C1: the watchdog relaunches a quit Access ───────────────────────────
+
+class TestTheOtherPcsTickNamesTheWatchdog:
+    """``packaging/watchdog/register_watchdog.ps1`` registers 'MonClub Access Watchdog' at logon
+    and every 2 min; ``monclub_access_watchdog.ps1`` starts Access again after two misses at least
+    90 s apart. A quit Access on another PC comes back within minutes unless the task is
+    disabled -- and the start with Windows brings it back at the next logon."""
+
+    TASK = "Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'"
+
+    def test_the_refusal_says_it(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        body = _body(_preview(wiz, 5)["previewId"])
+        del body["otherPcsClosed"]
+        status, out = wiz.start(5, body, verify_password=_pw_ok)
+        assert status == 400 and out["code"] == "OTHER_PCS_NOT_CONFIRMED"
+        assert self.TASK in out["error"] and "Windows" in out["error"]
+
+    def test_the_page_says_it_in_both_languages(self):
+        src = (REPO / "tauri-ui" / "src" / "lib" / "eraseWizardText.ts").read_text(encoding="utf-8")
+        ticks = re.findall(r"otherPcsTick:\s*\n?\s*\"([^\"]+)\"", src)
+        assert len(ticks) == 2, ticks                      # FR, then EN
+        for text in ticks:
+            assert self.TASK in text, text
+            assert "Ouvrir MonClub Access avec Windows" in text, text
+        assert "watchdog" in ticks[0] and "watchdog" in ticks[1]
+        # The script names the task the tick tells the operator to disable.
+        reg = (REPO / "packaging" / "watchdog" / "register_watchdog.ps1").read_text(encoding="utf-8")
+        assert "[string] $TaskName = 'MonClub Access Watchdog'" in reg
 
 
 # ─────────────────────────── C0: the people the refill will not put back ───────────────────────────

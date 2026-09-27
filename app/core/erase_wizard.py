@@ -813,9 +813,15 @@ class EraseWizard:
                 # night) every Access PC of the gym runs a worker for every ULTRA turnstile and
                 # would keep writing to it during the erase, and refill it right after, under
                 # its own records (lane 1b, review C0). No local check can see them.
+                # Quitting is not enough (lane 1c, review C1): the watchdog task relaunches a quit
+                # Access within minutes, and the start with Windows at the next logon -- the
+                # runbook's C1 / D1 order.
                 return 400, {"ok": False, "code": "OTHER_PCS_NOT_CONFIRMED",
                              "error": "confirm that MonClub Access is closed on every other PC of "
-                                      "this gym, and stays closed until Refill"}
+                                      "this gym -- on each: 'Ouvrir MonClub Access avec Windows' "
+                                      "unticked, the watchdog switched off (Disable-ScheduledTask "
+                                      "-TaskName 'MonClub Access Watchdog'), then Quit -- and "
+                                      "stays closed until Refill"}
             if refill in (REFILL_NOW, REFILL_AUTO) and device_hold.is_held(did):
                 # An earlier erase left it on hold: only the Refill button -- which shows and
                 # checks the pin scheme -- releases it, never a second run (review F2).
