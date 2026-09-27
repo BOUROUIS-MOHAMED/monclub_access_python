@@ -1113,19 +1113,43 @@ class EraseWizard:
             else:
                 # Nothing erased: nobody lost, the backup is prunable as any other.
                 self._drop_keep_mark(run)
+                moved = self._scheme_moved(did, run.get("pinScheme"))
                 # Not on a worker the run just saw connected to ANOTHER address: no pass through it.
-                self._finish("FAILED", release=not held_before,
+                self._finish("FAILED", release=not (held_before or moved),
                              error=f"{exc.code}: {exc.message} -- nothing was erased",
-                             ask_pass=exc.code not in ("ADDRESS_CHANGED", "ADDRESS_UNKNOWN"))
+                             ask_pass=exc.code not in ("ADDRESS_CHANGED", "ADDRESS_UNKNOWN"),
+                             note=self._moved_note(moved))
         except Exception as exc:  # noqa: BLE001 - a bug must never leave the run "RUNNING"
             _log.error("[ERASE] run %s crashed", run_id, exc_info=True)
+            moved = False
             if erase_started:
                 self._invalidate(did)
             else:
                 self._drop_keep_mark(run)
+                moved = self._scheme_moved(did, run.get("pinScheme"))
             self._finish("INCOMPLETE" if erase_started else "FAILED",
-                         release=(not erase_started and not held_before),
-                         error=f"UNEXPECTED: {type(exc).__name__}: {exc}")
+                         release=(not erase_started and not held_before and not moved),
+                         error=f"UNEXPECTED: {type(exc).__name__}: {exc}",
+                         note=self._moved_note(moved))
+
+    def _scheme_moved(self, did: int, run_scheme: Optional[str]) -> bool:
+        """Did the pin scheme move since the run started (or does it not read)? Then a run that
+        stops before its first delete keeps the hold and asks no pass (lane 1c review round 3): the
+        terminal still holds every pin of the old scheme, and a pass released now would write the
+        new scheme's pins beside them -- the end-of-run rule of ``_refill`` (PIN_SCHEME_CHANGED /
+        PIN_SCHEME_UNREADABLE: kept on hold, press Refill)."""
+        try:
+            return self._pin_scheme_strict(did) != run_scheme
+        except Exception:
+            return True
+
+    @staticmethod
+    def _moved_note(moved: bool) -> Optional[str]:
+        # Its own code, not PIN_SCHEME_CHANGED: that note (a run that DID erase) says "press
+        # Refill", which here would write the new scheme beside every old pin.
+        return ("HELD_SCHEME_MOVED: the pin scheme moved during the run, before any delete -- "
+                "kept on hold, the terminal still holds the old scheme's pins: erase again with "
+                "'hold', or set the scheme back, before pressing Refill" if moved else None)
 
     @staticmethod
     def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:

@@ -764,9 +764,52 @@ class TestPeopleTheRefillWillNotPutBack:
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and "PIN_SCHEME_CHANGED" in run["error"], run["error"]
-        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+        assert not [c for c in panel.calls if c[0] == "erase"]
         assert run["notRefilled"] is None
         assert not (_run_dir(wiz) / ew.KEEP_MARK).exists()
+        # Review round 3: nothing erased, but the terminal still holds every OLD pin -- releasing
+        # would push the new scheme onto it at once. Kept on hold, no pass asked: « Remplir ».
+        assert device_hold.is_held(5) and run["holdKept"] is True
+        assert "erase-released" not in _w.full_sync_requests
+        note = [s for s in run["steps"] if s["step"] == "finish"][0]["note"]
+        assert note.startswith("HELD_SCHEME_MOVED:"), "its own note: not 'press Refill'"
+
+    def test_any_failure_before_the_first_delete_after_a_switch_keeps_the_hold(
+            self, sqlite_db, monkeypatch, tmp_path, refill_cache):
+        """Review round 3: the same for every stop before the first delete once the scheme moved
+        since the run's start -- here a now/auto run whose re-check finds withheld rows under the
+        new scheme. The run's own rule at its end (_refill: PIN_SCHEME_CHANGED keeps the hold)."""
+        from tests.test_erase_wizard import _device
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            _account(monkeypatch, 5, _device())
+            if not any(u["userId"] == 15 for u in refill_cache.users):
+                refill_cache.users.append({"userId": 15, "activeMembershipId": 103})
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"], refill="now"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_WITHHELD" in run["error"], run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"]
+        assert device_hold.is_held(5) and "erase-released" not in worker.full_sync_requests
+
+    def test_a_failure_with_the_scheme_unchanged_still_releases(self, sqlite_db, monkeypatch,
+                                                                tmp_path, refill_cache):
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            refill_cache.users = []
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_SOURCE_EMPTY" in run["error"]
+        assert not device_hold.is_held(5) and worker.full_sync_requests == ["erase-released"]
 
     def test_a_member_of_step_1_does_not_cover_a_new_stranger(self, sqlite_db, monkeypatch,
                                                               tmp_path, refill_cache):
