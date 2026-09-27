@@ -218,9 +218,11 @@ def _pull_users(*ams):
 
 def _run_pull(users, sdk):
     from tests.test_account_pin_device_sites import _engine, _pullsdk_device
+    engine = _engine()
     with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
-        _engine()._sync_one_device(device=_pullsdk_device(), users=users, local_fp_index={},
-                                   default_door_id=1, changed_ids=None)
+        engine._sync_one_device(device=_pullsdk_device(), users=users, local_fp_index={},
+                                default_door_id=1, changed_ids=None)
+    return engine
 
 
 class TestPullSdk:
@@ -478,11 +480,48 @@ class TestTrueNeedsTheDoorRights:
                 raise RuntimeError("SetDeviceData FAILED table=userauthorize rc=-1")
             return 0
         sdk.set_device_data.side_effect = set_data
-        _run_pull(_pull_users(*ams), sdk)
+        engine = _run_pull(_pull_users(*ams), sdk)
         r = _results(1)
         assert r["101"] == (False, "AUTHORIZE_FAILED"), "discovery's (0, error) is read"
         assert r["104"] == (False, "AUTHORIZE_FAILED"), "the fallback's (0, error) is read"
         assert all(r[str(a)] == (True, None) for a in ams if a not in (101, 104))
+        # Lane 1b (review F16): the RETRY is what the fix is for, and the result table does not
+        # drive it -- the sync state does (last_ok=0: pushed again, counted as waiting).
+        state = db.list_device_sync_hashes_and_status(device_id=1)
+        assert state["101"][1] is False and state["104"][1] is False, "retried, never in sync"
+        assert all(state[str(a)][1] is True for a in ams if a not in (101, 104))
+        assert engine._last_waiting_pins == 2, "the heartbeat's N waiting counts both"
+
+    def test_the_fallback_serves_the_door_between_pins(self, db):
+        """Lane 1b (review F9): with no cached pattern every pin may take 4 SetDeviceData;
+        the door and the scans are served between two pins, never after the whole roster."""
+        from tests.test_account_pin_device_sites import _engine, _pullsdk_device, _sdk
+        sdk = _sdk()
+        ams = list(range(101, 109))
+        sdk.set_device_data_batch.side_effect = (
+            lambda *, table, rows, chunk_size=50, progress_cb=None: (len(rows), []))
+        events = []
+
+        def set_data(*, table, data, options=""):
+            if table == "userauthorize":
+                events.append(("auth", data.split("	", 1)[0]))
+                raise RuntimeError("SetDeviceData FAILED table=userauthorize rc=-1")
+            return 0
+        sdk.set_device_data.side_effect = set_data
+        engine = _engine()
+        engine._door_yield_cb = lambda: events.append(("door",))
+        engine._rtlog_yield_cb = lambda: events.append(("rtlog",))
+        with patch("app.core.device_sync.PullSDK", MagicMock(return_value=sdk)):
+            engine._sync_one_device(device=_pullsdk_device(), users=_pull_users(*ams),
+                                    local_fp_index={}, default_door_id=1, changed_ids=None)
+        firsts = []
+        for i, e in enumerate(events):
+            if e[0] == "auth" and e[1] != "Pin=101" and e[1] not in [events[j][1] for j in firsts]:
+                firsts.append(i)
+        assert len(firsts) == 7, "every pin after the failed discovery went through the fallback"
+        for a, b in zip(firsts, firsts[1:]):
+            between = {e[0] for e in events[a:b]}
+            assert {"door", "rtlog"} <= between, (events[a:b])
 
     @pytest.mark.parametrize("path", ["per_pin", "targeted"])
     def test_any_authorize_error_is_false_even_with_a_count(self, db, path):

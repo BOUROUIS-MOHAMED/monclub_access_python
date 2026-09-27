@@ -4053,6 +4053,11 @@ class DeviceSyncEngine:
                     elif remaining_pins:
                         # No cached pattern available — fall back to per-pin authorize
                         for pin in remaining_pins:
+                            # Up to 4 SetDeviceData per pin when the panel refuses every pattern:
+                            # serve the door and the scans between pins, as every other push loop
+                            # does -- this one ran the whole roster door-blind (lane 1b, review F9).
+                            self._maybe_yield_doors()
+                            self._maybe_yield_rtlog()
                             try:
                                 _p_ok, _p_err = self._push_userauthorize(
                                     sdk, pin=pin, door_bitmask=door_bitmask,

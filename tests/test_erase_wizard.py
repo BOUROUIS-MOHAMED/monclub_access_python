@@ -711,30 +711,127 @@ class TestLocalApi:
 
 # ─────────────────────────── static: what the wizard may call on a device ───────────────────────────
 
+_DRIVER_ALLOWLIST = {"count_table_strict", "read_table_strict", "erase_table",
+                     "read_device_status", "list_device_users", "read_user_templates",
+                     "delete_users", "sweep_finger_slots"}
+
+
+def _wizard_tree():
+    import ast
+    source = Path(__file__).resolve().parents[1] / "app" / "core" / "erase_wizard.py"
+    return ast.parse(source.read_text(encoding="utf-8"))
+
+
+def _device_commands(tree):
+    """Every function the wizard hands to the worker as a device command: the ``fn`` argument
+    of ``self._call(worker, fn, ...)`` and ``self._write_call(worker, did, fn, ...)``, resolved
+    in the scope of the method that makes the call. [(method, function node)]."""
+    import ast
+    out = []
+    for method in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        local_defs = {n.name: n for n in ast.walk(method)
+                      if isinstance(n, ast.FunctionDef) and n is not method}
+        for node in ast.walk(method):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("_call", "_write_call")):
+                continue
+            idx = 1 if node.func.attr == "_call" else 2
+            arg = node.args[idx]
+            if isinstance(arg, ast.Lambda):
+                out.append((method.name, arg))
+            elif isinstance(arg, ast.Name) and arg.id in local_defs:
+                out.append((method.name, local_defs[arg.id]))
+            elif isinstance(arg, ast.Name) and method.name == "_write_call" and arg.id == "fn":
+                continue                                # its own parameter: checked at its callers
+            else:
+                raise AssertionError(f"{method.name}: a device command that is not a lambda or a "
+                                     f"local def: {ast.dump(arg)[:80]}")
+    return out
+
+
 def test_the_wizard_calls_only_these_driver_methods():
-    """Every device call of the wizard is a lambda/closure over ``drv`` (the ULTRA worker's
-    driver, handed in by request_run_sdk). The complete list of what it may call on it: the
-    strict C3 reads and the one-table erase, the MB2000 reads, the whole-user delete and the
-    finger-slot clear. Anything else -- a parameter write, a transaction delete, a raw DLL
-    call -- fails this test."""
+    """Lane 1b (review F17): an allowlist, not a tripwire. Every function the wizard hands to the
+    worker (``_call`` / ``_write_call``) may use its device parameter -- whatever it is named --
+    ONLY as ``param.<allowed>(...)``: no alias, no ``getattr``, no nested attribute
+    (``drv._sdk._dll.X``), no passing it on (``_guarded`` hands it to the checked ``fn`` only).
+    ``request_run_sdk`` is called in ``_call`` alone. The table erase is bounded twice: by
+    ``C3_ERASE_ORDER`` here and by ``PullSDKDevice.ERASABLE_TABLES`` in the driver."""
     import ast
 
-    source = Path(__file__).resolve().parents[1] / "app" / "core" / "erase_wizard.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    called = {node.func.attr for node in ast.walk(tree)
-              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-              and isinstance(node.func.value, ast.Name) and node.func.value.id == "drv"}
-    assert called == {"count_table_strict", "read_table_strict", "erase_table",
-                      "read_device_status", "list_device_users", "read_user_templates",
-                      "delete_users", "sweep_finger_slots"}
+    tree = _wizard_tree()
+    commands = _device_commands(tree)
+    assert len(commands) >= 10, [m for m, _ in commands]
+    used = set()
+    for method, fn in commands:
+        param = fn.args.args[0].arg
+        parents = {}
+        for node in ast.walk(fn):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Name) and node.id == param):
+                continue
+            up = parents.get(node)
+            if (isinstance(up, ast.Attribute) and isinstance(parents.get(up), ast.Call)
+                    and parents[up].func is up):
+                assert up.attr in _DRIVER_ALLOWLIST, (method, up.attr)
+                used.add(up.attr)
+            elif (method == "_write_call" and isinstance(up, ast.Call)
+                  and isinstance(up.func, ast.Name) and up.func.id == "fn"):
+                continue
+            else:
+                raise AssertionError(f"{method}: the device parameter {param!r} is used as "
+                                     f"{type(up).__name__}, not as {param}.<allowed>(...)")
+    assert used == _DRIVER_ALLOWLIST, used
+    request_sites = {m.name for m in ast.walk(tree) if isinstance(m, ast.FunctionDef)
+                     for n in ast.walk(m) if isinstance(n, ast.Attribute)
+                     and n.attr == "request_run_sdk"}
+    assert request_sites == {"_call"}, request_sites
     # Every name the CODE uses (docstrings are string constants: they do not count).
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     forbidden = {"clear_device_table", "delete_device_data", "set_device_param",
                  "set_device_data", "delete_all_transaction_rows", "ClearGLog", "ClearData",
                  "SSR_DeleteEnrollData", "SSR_DeleteEnrollDataExt", "DeleteDeviceData",
-                 "remove_fingers_by_pin", "push_roster"}
+                 "SetDeviceData", "remove_fingers_by_pin", "push_roster", "partial"}
     assert not (forbidden & names), forbidden & names
+
+
+def test_the_table_erase_takes_its_table_from_the_erase_order_only():
+    """``erase_table(table=...)`` is called once, in a loop over ``C3_ERASE_ORDER``, with the
+    loop's own table: a door log or a parameter table cannot be named there (review F17)."""
+    import ast
+
+    import app.core.erase_wizard as ew
+    from app.sdk.pullsdk import PullSDKDevice
+
+    assert set(ew.C3_ERASE_ORDER) == {"templatev10", "template", "userauthorize", "user"}
+    assert set(ew.C3_ERASE_ORDER) == set(PullSDKDevice.ERASABLE_TABLES)
+    tree = _wizard_tree()
+    loops = [n for n in ast.walk(tree) if isinstance(n, ast.For)
+             and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                     and c.func.attr == "erase_table" for c in ast.walk(n))]
+    calls = [c for c in ast.walk(tree) if isinstance(c, ast.Call)
+             and isinstance(c.func, ast.Attribute) and c.func.attr == "erase_table"]
+    assert len(calls) == 1 and len(loops) == 1
+    loop, call = loops[0], calls[0]
+    assert isinstance(loop.iter, ast.Name) and loop.iter.id == "C3_ERASE_ORDER"
+    lam = [n for n in ast.walk(loop) if isinstance(n, ast.Lambda)
+           and any(c is call for c in ast.walk(n))][0]
+    (kw,) = call.keywords
+    assert kw.arg == "table" and isinstance(kw.value, ast.Name)
+    bound = dict(zip([a.arg for a in lam.args.args][-len(lam.args.defaults):], lam.args.defaults))
+    assert isinstance(bound[kw.value.id], ast.Name) and bound[kw.value.id].id == loop.target.id
+
+
+@pytest.mark.parametrize("table", ["transaction", "timezone", "holiday", "firstcard",
+                                   "user ", "USER"])
+def test_the_driver_refuses_any_other_table_before_connecting(table):
+    from app.sdk.pullsdk import PullSDKDevice, PullSDKError
+
+    dev = PullSDKDevice.__new__(PullSDKDevice)          # no connection, no DLL
+    with pytest.raises(PullSDKError):
+        dev.erase_table(table=table)
 
 
 # ─────────────────────────── review round 1 (2026-09-27): each finding pinned ───────────────────────────
