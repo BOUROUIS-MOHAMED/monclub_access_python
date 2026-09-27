@@ -7,10 +7,12 @@ touching the PC. Most gyms cut the PC and the electricity from closing to openin
 
 Three things are needed, all three: the PC switches itself on when power returns (BIOS), Windows
 opens the session by itself (auto-logon), and MonClub Access starts in that session (watchdog, or the
-"Ouvrir MonClub Access avec Windows" box). The installer's own default for the watchdog changes later,
-after the owner's installer edits are committed: **until then it is ticked by hand** -- except during
-the cutover night, when every install leaves it **unticked** and the watchdog is switched on only at
-each gym's last step (section 4).
+"Ouvrir MonClub Access avec Windows" box). The installer's own default for the watchdog: **ticked for a
+new install** from the release that contains branch `claude/installer-watchdog-fix` (built 2026-09-27,
+not merged, not released); an existing install keeps its previous choice, and one whose version
+predates the box gets it unticked (section 3). **Until that release, and on any existing install, tick
+it by hand** -- except during the cutover night, when every install leaves it **unticked** and the
+watchdog is switched on only at each gym's last step (section 4).
 
 **Grades.** The BIOS menu names and the Windows auto-logon screens below are general knowledge of
 those products, not checked on the gym PCs: `[UNVERIFIED]`. What MonClub Access and its watchdog do is
@@ -83,27 +85,33 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
 ## 3. MonClub Access starts in the session `[CODE]`
 
 - **The watchdog** (recommended): the installer's box **"Keep MonClub Access running (start at logon,
-  restart if it stops)"** -- unticked by default today (`installer/MonClubAccess.iss`, `[Tasks]
-  watchdog`, `Flags: unchecked`). It creates the task **"MonClub Access Watchdog"**, which runs at
-  logon of that user and every 2 minutes after, and starts Access when it is not running; it stands down
-  while the installer is updating and limits how often it restarts (`packaging/watchdog/register_watchdog.ps1`,
-  `monclub_access_watchdog.ps1`, as committed on `master`; the owner's uncommitted edits to those files
-  may change this). Already installed without it: run
+  restart if it stops)"** -- unticked by default on `master` `d3725fa` (`installer/MonClubAccess.iss`,
+  `[Tasks] watchdog`, `Flags: unchecked`); on branch `claude/installer-watchdog-fix` ticked for a new
+  install only, an existing install keeping its previous choice (`IsFreshInstall`, release checklist
+  §3b). It creates the task **"MonClub Access Watchdog"**, which runs at logon of that user and every 2
+  minutes after, and starts Access when it is not running; it stands down while the installer is
+  updating and limits how often it restarts (`packaging/watchdog/register_watchdog.ps1`,
+  `monclub_access_watchdog.ps1`). Already installed without it: run
   `%LOCALAPPDATA%\MonClubAccess\watchdog\register_watchdog.ps1` as that user (no admin needed).
   Check: `Get-ScheduledTask -TaskName 'MonClub Access Watchdog'`, and
   `Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime` -- empty means no check will
-  run before the next Windows logon: the committed `register_watchdog.ps1` has only a logon trigger;
-  the owner's pending edit adds one that starts at once (`packaging/watchdog/README.md` in his working
-  copy).
+  run before the next Windows logon. The script on `master` `d3725fa` has only a logon trigger, so right
+  after an install that is expected; the owner's edit (committed 2026-09-27 as `b30ef60` on that branch,
+  not merged) adds a second trigger that starts at once, and with it an empty `NextRunTime` right after
+  the install is a fault for an **enabled** task (`packaging/watchdog/README.md`; a disabled task has
+  none).
 - **What the watchdog does not know:** a tray Quit. It restarts Access after two missed checks, so
   about 2-4 minutes after any Quit (`monclub_access_watchdog.ps1`, `$RequiredConsecutiveMisses = 2`,
   every 2 minutes) `[CODE]`. To keep Access stopped, disable the task first:
   `Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`.
 - **What an install does to it:** when the box was ticked at the previous install, the installer ticks
-  it again (`UsePreviousTasks=yes`) and re-registers the task as a new, **enabled** one -- a disabled
-  task does not stay disabled (`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`;
-  `register_watchdog.ps1` removes the task, then registers it) `[CODE]`. Unticked, the installer leaves
-  the existing task as it is.
+  it again (`UsePreviousTasks=yes`) and runs `register_watchdog.ps1`, which removes the task and
+  registers it again (`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`) `[CODE]`. With the script
+  on `master` `d3725fa` the new task is **enabled** -- a disabled task does not stay disabled. From the
+  release that contains `claude/installer-watchdog-fix` (`c0391d4`), a task that was disabled is
+  registered again **disabled** (`State: Disabled (kept)`); `Enable-ScheduledTask` turns it on
+  `[CODE, TEST with the Task Scheduler stubbed]`. Unticked, the installer leaves the existing task as
+  it is.
 - **"Ouvrir MonClub Access avec Windows"** (Access → Config): a start-up entry for the user; it starts
   Access at logon but does not restart it after a crash. Access rewrites that entry from the box at
   every start (`app.py::_sync_startup_registration`).
@@ -123,8 +131,11 @@ steps. The last step of each gym (C17, D19) re-enables both: re-tick the box in 
 `Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` where the task existed (or, where it never
 existed and the PC should have it, run `register_watchdog.ps1` as in section 3). Then check
 `NextRunTime` (section 3): empty means the watchdog first runs at the next Windows logon -- that is
-expected with the committed script, and is the case every morning after a power cut, which starts
-with a logon. Check with the sheet before leaving.
+expected with the script on `master` `d3725fa` (a logon trigger only), and is the case every morning
+after a power cut, which starts with a logon. With the owner's second trigger (`b30ef60`), whether
+`Enable-ScheduledTask` on a task registered earlier gives a `NextRunTime` at once is `[UNVERIFIED]`
+(that trigger's start is the registration time, now in the past); empty still means the first check
+at the next logon. Check with the sheet before leaving.
 
 ## 5. The test (do it on a closed evening, never during an erase or a refill)
 
