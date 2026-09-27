@@ -796,6 +796,48 @@ class TestPeopleTheRefillWillNotPutBack:
         assert not [c for c in panel.calls if c[0] == "erase"]
         assert device_hold.is_held(5) and "erase-released" not in worker.full_sync_requests
 
+    def test_a_switch_between_step_1_and_start_is_refused_at_start(self, sqlite_db, monkeypatch,
+                                                                    tmp_path):
+        """Review round 4: a switch saved while the operator is on steps 2-4 makes the run's own
+        start scheme the new one, so the in-run rule could not see it. START refuses it, nothing
+        held, no pass asked -- step 1 is read again."""
+        from tests.test_erase_wizard import _device
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        panel.calls.clear()
+        _account(monkeypatch, 5, _device())
+        status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert status == 409 and out["code"] == "PIN_SCHEME_CHANGED", out
+        assert out["pinScheme"] == "ACCOUNT" and out["previewScheme"] == "MEMBERSHIP"
+        assert not device_hold.is_held(5) and wiz.status()["run"] is None
+        assert panel.calls == [] and worker.full_sync_requests == []
+        # A rehearsal erases nothing: not refused.
+        status, _ = wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert status == 202
+
+    def test_a_scheme_that_does_not_read_after_a_stop_keeps_the_hold_with_its_own_note(
+            self, sqlite_db, monkeypatch, tmp_path, refill_cache):
+        """Review round 4 nit: an unreadable scheme is not "moved" -- its own note."""
+        import app.core.db as dbmod
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _broken(did):
+            raise RuntimeError("database is locked")
+
+        def _read(*, table, fields="*"):
+            refill_cache.users = []                               # the run will stop EMPTY
+            monkeypatch.setattr(dbmod, "get_device_pin_scheme", _broken)
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_SOURCE_EMPTY" in run["error"]
+        assert device_hold.is_held(5) and "erase-released" not in worker.full_sync_requests
+        note = [s for s in run["steps"] if s["step"] == "finish"][0]["note"]
+        assert note.startswith("HELD_SCHEME_UNREADABLE:"), note
+
     def test_a_failure_with_the_scheme_unchanged_still_releases(self, sqlite_db, monkeypatch,
                                                                 tmp_path, refill_cache):
         wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)

@@ -76,6 +76,8 @@ const fr = {
     PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
     HELD_SCHEME_MOVED:
       "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+    HELD_SCHEME_UNREADABLE:
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
   } as Record<string, string>,
   // The people the refill will NOT put back (lane 1c, review C0).
   notRefilledTitle: (n: number, s: string) =>
@@ -242,7 +244,7 @@ const fr = {
     KEEP_MARK_NOT_WRITTEN:
       "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé.",
     PIN_SCHEME_CHANGED:
-      "Le schéma de numérotation du tourniquet a changé depuis l'étape 1 : rien n'a été effacé, et le tourniquet reste en attente (voir ci-dessous).",
+      "Le schéma de numérotation du tourniquet a changé depuis l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
     ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
     NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
@@ -376,6 +378,8 @@ const en: typeof fr = {
     PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
     HELD_SCHEME_MOVED:
       "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+    HELD_SCHEME_UNREADABLE:
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
   },
   notRefilledTitle: (n: number, s: string) =>
     `${n} person(s) on this turnstile will NOT be put back by the refill: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. What the erase takes from them (user, card, door rights, fingerprints) does not come back.`,
@@ -540,7 +544,7 @@ const en: typeof fr = {
     KEEP_MARK_NOT_WRITTEN:
       "The mark that keeps the backup with no time limit could not be written: nothing was erased.",
     PIN_SCHEME_CHANGED:
-      "The turnstile's pin scheme changed since step 1: nothing was erased, and the turnstile stays on hold (see below).",
+      "The turnstile's pin scheme changed since step 1: nothing was erased. Read step 1 again.",
     NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
     ERASE_FAILED: "An erase command failed: part of it may have been erased.",
     NO_ANSWER: "A command was sent and got no answer: it may have acted.",

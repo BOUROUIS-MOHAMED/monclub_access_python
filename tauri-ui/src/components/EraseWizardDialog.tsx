@@ -320,7 +320,8 @@ export default function EraseWizardDialog({
         }
       }
       const c = errCode(e);
-      if (c === "PREVIEW_EXPIRED" || c === "DEVICE_CHANGED" || c === "WRONG_DEVICE") {
+      // PIN_SCHEME_CHANGED at START: a switch saved since step 1 (lane 1c) -- nothing held.
+      if (c === "PREVIEW_EXPIRED" || c === "DEVICE_CHANGED" || c === "WRONG_DEVICE" || c === "PIN_SCHEME_CHANGED") {
         // Step 1 must be read again: go there and read it now (F27).
         setRestartNote(errFor(e)); setStartError(null); setTypedName(""); setOtherPcsClosed(false);
         setStep(0); void loadPreview();
