@@ -43,6 +43,7 @@ from app.core import telemetry as _tel
 from app.core import push_safety as _push_safety
 from app.sdk.pullsdk import PullSDKDevice
 from app.core.v2 import lease_gate as _lease_gate
+from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
@@ -297,8 +298,12 @@ _DOOR_OPEN_IN_FLIGHT_WAIT_SEC = _DOOR_OPEN_SDK_TIMEOUT_MS / 1000.0 + 1.0
 
 def _v2_writes_blocked(device_id) -> bool:
     """P3b-2: no push, removal or maintenance on a turnstile this PC is handing over or no
-    longer drives (driver leases). Always False without assignments."""
-    return _lease_gate.writes_frozen(device_id) or not _lease_gate.device_allowed(device_id)
+    longer drives (driver leases). Always False without assignments.
+
+    Lane 1 (2026-09-27): nor on a turnstile the Erase-content wizard holds (device_hold) --
+    during the erase, and after it until Refill. An in-memory set lookup, like the lease reads."""
+    return (_lease_gate.writes_frozen(device_id) or not _lease_gate.device_allowed(device_id)
+            or _device_hold.is_held(device_id))
 
 
 class _CommandClaim:
@@ -576,6 +581,11 @@ class UltraDeviceWorker(threading.Thread):
         self._sdk: Optional[PullSDKDevice] = None
         self._seen: Deque[str] = deque(maxlen=10_000)
         self._connected = False
+        # (ip, port) the driver actually connected to -- NOT the payload: update_device swaps
+        # the payload without reconnecting, so after an IP edit the socket stays on the old
+        # address until the next reconnect (up to the 30-min refresh). The Erase wizard refuses
+        # a worker whose address is not the one MonClub records (review round 2).
+        self._connected_addr: Optional[tuple] = None
         self._events_processed = 0
         self._totp_rescues = 0
         self._totp_failures = 0
@@ -691,6 +701,9 @@ class UltraDeviceWorker(threading.Thread):
         self._last_full_sync_duration_ms = 0.0
         self._last_full_sync_error = ""
         self._full_sync_running = False
+        # Pins of the last full pass's roster still waiting to be written (the heartbeat's
+        # failedPins, device_sync.count_waiting_pins). None until a pass has counted.
+        self._waiting_pins: Optional[int] = None
 
         # Local state cache (avoid per-event DB reads).
         # Reloads are gated by a generation counter (bumped only when a sync
@@ -1045,6 +1058,8 @@ class UltraDeviceWorker(threading.Thread):
             if ok:
                 was_down_for = self._down_for_seconds()
                 self._connected = True
+                self._connected_addr = (str(getattr(self._sdk, "ip", "") or "").strip(),
+                                        getattr(self._sdk, "port", None))
                 self._connected_since_mono = time.monotonic()
                 self._record_connect_success()
                 self._note_user_count_at_connect()
@@ -1063,6 +1078,7 @@ class UltraDeviceWorker(threading.Thread):
                     )
             else:
                 self._connected = False
+                self._connected_addr = None
                 self._sdk = None
                 delay = self._record_connect_failure("connect returned False")
                 if self._should_log_connect_error_now():
@@ -1094,6 +1110,7 @@ class UltraDeviceWorker(threading.Thread):
                     self._prefix, e, delay, self._down_for_seconds(), self._connect_failures,
                 )
             self._connected = False
+            self._connected_addr = None
             self._sdk = None
 
     def _push_link_lost(self) -> bool:
@@ -1230,6 +1247,7 @@ class UltraDeviceWorker(threading.Thread):
                 logger.debug(f"{self._prefix} disconnect error (non-fatal): {_disc_exc}")
         self._sdk = None
         self._connected = False
+        self._connected_addr = None
         self._connected_since_mono = 0.0
 
     def pause_for_sync(self, timeout: float = 20.0) -> bool:
@@ -2203,6 +2221,19 @@ class UltraDeviceWorker(threading.Thread):
     # skip a pin because a lookup broke); any failure to WRITE state is logged
     # and ignored (the worst case is an unnecessary re-push next time).
     # ------------------------------------------------------------------ #
+    def _count_waiting_pins(self, desired_hashes: Dict[str, str]) -> None:
+        """Set the "N waiting" figure from the per-pin state a pass just wrote
+        (``device_sync.count_waiting_pins``). An unreadable state keeps the previous figure."""
+        try:
+            from app.core.db import list_device_sync_hashes_and_status
+            from app.core.device_sync import count_waiting_pins
+            self._waiting_pins = count_waiting_pins(
+                desired_hashes,
+                list_device_sync_hashes_and_status(device_id=self._device_id) or {},
+            )
+        except Exception:
+            logger.debug("%s waiting-pin count unreadable", self._prefix, exc_info=True)
+
     def _standalone_pins_needing_push(
         self, users: list[Dict[str, Any]], hashes_by_pin: Dict[str, str]
     ) -> tuple[list[Dict[str, Any]], int]:
@@ -2279,7 +2310,8 @@ class UltraDeviceWorker(threading.Thread):
             logger.info(
                 "%s %d pin(s) held back by retry backoff: unchanged content that has "
                 "already been refused repeatedly. A re-enrolment changes the hash and "
-                "pushes immediately; a full or forced resync ignores this entirely.",
+                "pushes immediately; the Erase wizard's resets clear the backoff; a forced "
+                "resync does not (it keeps fail_streak).",
                 self._prefix, backoff_skipped,
             )
             try:
@@ -2448,6 +2480,59 @@ class UltraDeviceWorker(threading.Thread):
             save_device_sync_state_batch(device_id=self._device_id, rows=rows)
         except Exception:
             logger.debug("%s per-pin sync state not recorded", self._prefix, exc_info=True)
+        self._record_push_results(users=users, result=result, failed_set=failed_set)
+
+    # push_roster's own pin guard (zk_standalone._MAX_PIN_DIGITS): a longer or non-numeric pin is
+    # skipped, never written -- no push result for it.
+    _STANDALONE_MAX_PIN_DIGITS = 9
+
+    # The driver's per-pin failure reason (zkemkeeper guide §5) -> the last-push result code
+    # (the contract's short machine code, never free text). First prefix that matches wins.
+    _PUSH_RESULT_CODES = (
+        ("set_user_info_false", "USER_WRITE_FAILED"),
+        ("template_version_mismatch_f", "TEMPLATE_VERSION_MISMATCH"),
+        ("template_refused_f", "TEMPLATE_REFUSED"),
+        ("finger_remove_", "FINGER_CLEAR_FAILED"),
+        ("capacity_withheld", "CAPACITY_FULL"),
+        ("chunk_wedged_or_unconfirmed", "TIMEOUT"),
+        ("exception:", "OTHER"),
+    )
+
+    def _record_push_results(self, *, users: list[Dict[str, Any]], result: Dict[str, Any],
+                             failed_set: set[str]) -> None:
+        """The last push result of each pin THIS write attempted (last-push contract §1.1), from
+        the same outcome the state write just used: confirmed -> True; failed -> False with a
+        code. A pin never sent (``not_attempted``: the push stopped before its chunk) gets no
+        result -- its intent already made it unknown. Never raises."""
+        try:
+            res = result if isinstance(result, dict) else {}
+            reasons = res.get("failed_reasons") if isinstance(res.get("failed_reasons"), dict) else {}
+            text = " ".join([str(res.get("error") or "")]
+                            + [str(e) for e in (res.get("errors") or [])]).lower()
+            rows: list[tuple] = []
+            for u in users or []:
+                pin = str(u.get("pin") or "").strip()
+                if not pin:
+                    continue
+                if not pin.isdigit() or len(pin) > self._STANDALONE_MAX_PIN_DIGITS:
+                    continue      # the driver skips it unwritten, and names it nowhere (round 3)
+                if pin not in failed_set:
+                    rows.append((pin, True, None))
+                    continue
+                reason = str(reasons.get(pin) or "")
+                if reason == "not_attempted":
+                    continue
+                code = next((c for prefix, c in self._PUSH_RESULT_CODES
+                             if reason.startswith(prefix)), None)
+                if code is None:
+                    code = ("TIMEOUT" if ("wedge" in text or "timed out" in text or "timeout" in text)
+                            else "DEVICE_UNREACHABLE" if "not connected" in text else "OTHER")
+                rows.append((pin, False, code))
+            if rows:
+                from app.core.db import record_push_results
+                record_push_results(device_id=self._device_id, rows=rows)
+        except Exception:
+            logger.debug("%s last push results not recorded", self._prefix, exc_info=True)
 
     @staticmethod
     def _standalone_failed_pins_from_result(
@@ -2725,10 +2810,14 @@ class UltraDeviceWorker(threading.Thread):
             return result
         out = dict(result)
         failed = list(out.get("failed_pins") or [])
+        reasons = dict(out.get("failed_reasons") or {}) if isinstance(out.get("failed_reasons"), dict) else {}
         for p in hit:
             if p not in failed:
                 failed.append(p)
+                # Named for the last-push result only (CAPACITY_FULL); nothing decides on it.
+                reasons.setdefault(p, "capacity_withheld")
         out["failed_pins"] = failed
+        out["failed_reasons"] = reasons
         out["ok"] = False
         return out
 
@@ -2883,7 +2972,7 @@ class UltraDeviceWorker(threading.Thread):
         if _v2_writes_blocked(getattr(self, "_device_id", None)):
             # P3b-2 (review R11): the lease went away mid-push -- drop every chunk not sent yet.
             logger.warning("%s push stopped between chunks: this PC no longer writes to this "
-                           "turnstile (lease)", self._prefix)
+                           "turnstile (lease, or an erase hold)", self._prefix)
             return set(getattr(self, "_pass_all_pins", None) or ())
         if self._pass_scheme_stopped(getattr(self, "_pass_pin_scheme", None),
                                      where="between_chunks"):
@@ -3254,8 +3343,8 @@ class UltraDeviceWorker(threading.Thread):
             # P3b-2 (review R11): the lease went away between the drain and the push -- no
             # device write, no state write (every pin "superseded"); not ok, so no roster hash
             # is stamped if the turnstile ever comes back.
-            logger.warning("%s push skipped: this PC no longer writes to this turnstile (lease)",
-                           self._prefix)
+            logger.warning("%s push skipped: this PC no longer writes to this turnstile (lease, "
+                           "or an erase hold)", self._prefix)
             return {"ok": False, "pushed": 0, "failed": 0, "templates_failed": 0, "skipped_pin": 0,
                     "chunks_wedged": 0, "errors": ["driver lease lost"], "failed_pins": [],
                     "superseded_pins": sorted(all_pins), "user_written": []}
@@ -3640,11 +3729,14 @@ class UltraDeviceWorker(threading.Thread):
         renewal_holds: Dict[str, int] = {}
         kept_holds: set[str] = set()
         deferred_retry: tuple[list[str], bool] | None = None
+        # {pin: desired hash} of this pass's roster, for the "N waiting" count at its end.
+        waiting_hashes: Dict[str, str] | None = None
         try:
             self._last_standalone_roster_stats = None
             self._last_standalone_pin_persons = None
             users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(cache)
             desired_pins = [str(u.get("pin") or "").strip() for u in users]
+            waiting_hashes = {p: (hashes_by_pin or {}).get(p, "") for p in desired_pins if p}
             _roster_stats = getattr(self, "_last_standalone_roster_stats", None) or {}
             roster_withheld = int(_roster_stats.get("withheld_missing_account") or 0)
             # Read NOW: a targeted update served between two push chunks rebuilds a roster
@@ -4073,6 +4165,8 @@ class UltraDeviceWorker(threading.Thread):
                 deferred_retry = None
                 _tel.event("RENEWAL_HOLD", worker=self._tel_wid, held=len(renewal_holds),
                            removed_after_push=0, kept=len(renewal_holds))
+        if waiting_hashes is not None:
+            self._count_waiting_pins(waiting_hashes)
         duration_ms = max(0.0, (time.time() - started_at) * 1000.0)
         if batch_id is not None:
             try:
@@ -5779,6 +5873,11 @@ class UltraDeviceWorker(threading.Thread):
                     source=reason,
                     changed_ids=None,
                 ))
+                # "N waiting": the pass counted what its roster still waits for; a pass that
+                # stopped before hashing its roster counted nothing and the figure stays.
+                _waiting = getattr(engine, "_last_waiting_pins", None)
+                if isinstance(_waiting, int):
+                    self._waiting_pins = _waiting
                 unconfirmed_revoked_ids = (
                     revoked_ids - self._confirmed_member_revokes(revoked_ids)
                 )
@@ -7727,6 +7826,11 @@ class UltraDeviceWorker(threading.Thread):
             "last_full_sync_finished_at": self._last_full_sync_finished_at,
             "last_full_sync_duration_ms": round(self._last_full_sync_duration_ms, 1),
             "last_full_sync_error": self._last_full_sync_error,
+            # "N waiting" (heartbeat failedPins): pins of the last full pass's roster not
+            # confirmed on the device when it ended -- refused, in retry backoff, capped out.
+            # As of that pass: not refreshed while the device is unreachable (no pass runs)
+            # nor by a targeted member push. None = no pass has counted yet.
+            "failed_pins": getattr(self, "_waiting_pins", None),
         }
 
     def get_progress_snapshot(self) -> tuple[Optional[Dict[str, Any]], int]:

@@ -78,13 +78,24 @@ def _cap_fact_times(payload: Dict[str, Any], sent_epoch: float) -> Dict[str, Any
         epoch = timefmt.to_epoch(value) if isinstance(value, str) else None
         return timefmt.format_utc(sent_epoch) if epoch is not None and epoch > sent_epoch else value
 
+    def cap_row(r):
+        if not isinstance(r, dict):
+            return r
+        out_r = dict(r)
+        if "observedAt" in out_r:
+            out_r["observedAt"] = cap(out_r.get("observedAt"))
+        # Lane 1 (last-push contract §1.2): lastPushAt later than sentAt makes the server store
+        # the row's result as unknown -- capped the same way, and recorded as sent.
+        if out_r.get("lastPushAt") is not None:
+            out_r["lastPushAt"] = cap(out_r.get("lastPushAt"))
+        return out_r
+
     out = dict(payload)
     for key in ("observedAt", "wipedAt"):
         if key in out:
             out[key] = cap(out[key])
     if isinstance(out.get("rows"), list):
-        out["rows"] = [dict(r, observedAt=cap(r.get("observedAt"))) if isinstance(r, dict) and "observedAt" in r
-                       else r for r in out["rows"]]
+        out["rows"] = [cap_row(r) for r in out["rows"]]
     return out
 
 

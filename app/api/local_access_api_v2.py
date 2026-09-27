@@ -4650,6 +4650,76 @@ def _handle_device_force_resync(ctx: _Ctx) -> None:
         ctx.send_json(500, {"ok": False, "error": str(e)})
 
 
+# ==================== ERASE-CONTENT WIZARD (lane 1, 2026-09-27; guide §3.2h) ====================
+# Step 1 reads the counts (preview), step 3 starts the run (backup, erase, verify, records,
+# refill) on its own thread; the page polls /erase/status. The admin password is checked HERE,
+# on the server, for every run and every Refill -- the Local DB page's lock is only a screen.
+
+def _erase_password_verifier(ctx: _Ctx):
+    def _verify(password: str):
+        if not password:
+            return False, 400, "password is required"
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        if not auth or not auth.token:
+            return False, 401, "Not authenticated"
+        try:
+            valid = ctx.app._api().validate_statistics_password(token=auth.token, password=password)
+        except MonClubApiHttpError as e:
+            return False, int(getattr(e, "status_code", 0) or 503), str(e)
+        except Exception as e:
+            # Offline or the server failing: the password cannot be checked -- no erase.
+            return False, 503, f"the admin password could not be checked: {e}"
+        return (True, 200, "") if valid else (False, 401, "Mot de passe incorrect")
+    return _verify
+
+
+def _handle_device_erase_preview(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).preview(ctx.param_int("deviceId"))
+    ctx.send_json(status, payload)
+
+
+def _handle_device_erase_start(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).start(
+        ctx.param_int("deviceId"), ctx.body(), verify_password=_erase_password_verifier(ctx))
+    ctx.send_json(status, payload)
+
+
+def _handle_device_erase_refill(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    status, payload = get_wizard(ctx.app).refill(
+        ctx.param_int("deviceId"), ctx.body(), verify_password=_erase_password_verifier(ctx))
+    ctx.send_json(status, payload)
+
+
+def _handle_erase_status(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    ctx.send_json(200, get_wizard(ctx.app).status())
+
+
+def _handle_erase_holds(ctx: _Ctx) -> None:
+    from app.core.erase_wizard import get_wizard
+    ctx.send_json(200, {"ok": True, **get_wizard(ctx.app).holds_state()})
+
+
+def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
+    """A direct user write (a second PullSDK session) to a turnstile an erase holds, or one
+    being handed over, is refused before any connect (guide §3.2h). True = refused (sent)."""
+    from app.core import device_hold
+    from app.core.v2 import lease_gate
+    if device_hold.is_held(did):
+        ctx.send_json(409, {"ok": False, "code": "DEVICE_ON_HOLD",
+                            "error": "this turnstile is on hold after an erase: press Refill first"})
+        return True
+    if lease_gate.writes_frozen(did):
+        ctx.send_json(409, {"ok": False, "code": "HANDOVER_IN_PROGRESS",
+                            "error": "this turnstile is being handed over to another PC"})
+        return True
+    return False
+
+
 def _handle_device_users_push(ctx: _Ctx) -> None:
     did = ctx.param_int("deviceId")
     body = ctx.body()
@@ -4668,9 +4738,22 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
     # a SECOND COM session against a terminal the worker already holds.
     if _unsupported_for_protocol(ctx, did, "le push utilisateur direct"):
         return
+    if _refuse_held_or_frozen(ctx, did):
+        return
     sdk, err = _connect_device(ctx, did)
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
+        return
+    # Not a MonClub push attempt (the content is the operator's), but it changes what the
+    # turnstile holds for this pin: its last push result becomes unknown BEFORE the first write,
+    # durably (contract revision 4.1 §1.1). No record, no write.
+    try:
+        from app.core.db import reset_push_results_for_pins
+        reset_push_results_for_pins(device_id=did, pins=[pin])
+    except Exception as e:
+        try: sdk.disconnect()
+        except Exception: pass
+        ctx.send_json(500, {"ok": False, "error": f"the push could not be recorded first: {e}"})
         return
 
     try:
@@ -4840,6 +4923,8 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
         return
 
     if _unsupported_for_protocol(ctx, did, "la suppression utilisateur directe"):
+        return
+    if _refuse_held_or_frozen(ctx, did):
         return
     sdk, err = _connect_device(ctx, did)
     if err:

@@ -436,10 +436,15 @@ def delete_device_data(self, *, table, data, options="") -> int
 ```
 
 `clear_device_table` deletes **every row** by calling `DeleteDeviceData(handle, table,
-"", "")` — an empty data string. `[CODE]` Since P3a-2 its only caller is an explicit
-`FULL_REPLACE` policy, and only when the panel's rows fit under the shared removal ceiling
-(`guide_for_agents_and_dev.md` §3.2g); the INCREMENTAL "nuke-and-repave" heuristic that used it
-automatically is gone. Be certain before calling it.
+"", "")` — an empty data string. `[CODE]` It has two callers. An explicit `FULL_REPLACE` policy,
+only when the panel's rows fit under the shared removal ceiling (`guide_for_agents_and_dev.md`
+§3.2g); the INCREMENTAL "nuke-and-repave" heuristic that used it automatically is gone (P3a-2). And,
+since lane 1 (2026-09-27), the Erase-content wizard, through `PullSDKDevice.erase_table`, on the
+tables an operator chose among `user`, `userauthorize`, `templatev10` and `template` — `user` only
+together with every one of the others that reads, never a parameter, timezone, holiday or
+`transaction` table — after a verified backup whose `user` password values are emptied, and only
+through a worker connected to the IP MonClub records (main guide §3.2h).
+`[CODE: app/core/erase_wizard.py::C3_ERASE_ORDER]` Be certain before calling it.
 
 #### ⛔ `set_device_data` redacts `Template=` before logging
 
@@ -560,6 +565,13 @@ the **first** row of a chunk fails with a *structural* error — `rc=-100`, `-10
 `-102`, `-103` — it short-circuits: the rest of the chunk and **all later chunks** are
 marked failed without being attempted. `[CODE]` A progress callback fires after every
 chunk, successful or fallback. `[CODE]`
+
+**Door rights on the batch path (lane 1, 2026-09-27).** `_push_userauthorize` never raises: it answers
+`(ok_count, error)`, `(0, error)` when no field pattern worked. Phase B's pattern discovery (the first pin) and
+its per-pin fallback used to ignore that answer, so a pin whose `userauthorize` row the panel refused was
+recorded in sync and never retried. Both now record it FAILED. Each pin's last push result (main guide §3.9) is
+`true` on this path only when its user row and its door rights were explicitly confirmed. `[CODE]`
+`[TEST: tests/test_v2_last_push.py::TestPullSdk]`
 
 A full sync (`DeviceSyncEngine._sync_one_device`) deletes its stale pins through
 `_bulk_delete_pins` BEFORE writing the user rows (Phase A) — except, since P3b-1, the old
@@ -738,6 +750,24 @@ standalone driver deliberately mimics: `[CODE]`
 
 PullSDK rows carry **no** `scan_mode_hint` key — that is standalone-only, and its
 absence is what keeps C2-400/C3-200 output unchanged. `[CODE]`
+
+### Strict table calls (the Erase-content wizard, lane 1, 2026-09-27)
+
+```python
+def count_table_strict(self, *, table: str) -> int                              # [SIG]
+def read_table_strict(self, *, table: str, fields: str = "*") -> List[Dict[str, str]]
+def erase_table(self, *, table: str) -> int
+```
+
+`get_table_count`, `read_table_rows` and `delete_table_rows` swallow every failure (`-1`, `[]`,
+`-1`), so a failed read looks like an empty table. These three raise instead: a negative count
+(`PullSDKError`), any exception of `get_device_data_rows` (the 1-8 MB ladder included), a negative rc
+of `clear_device_table`. Each takes `_sdk_lock` and calls `ensure_connected()` like its neighbours.
+Only the wizard calls them, through the ULTRA worker's own connection (`request_run_sdk`). `[CODE]`
+`[TEST: tests/test_device_hold.py::test_the_strict_panel_calls_raise_instead_of_reading_empty]`
+Never run against a C3-400 `[UNVERIFIED]`: whether `DeleteDeviceData(h, "user", "", "")` also empties
+`userauthorize` on that firmware is not known; the wizard erases each chosen table itself and counts
+each one after.
 
 ### Transactions
 

@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import { useDevices, usePullSdk, usePopupStream } from "@/api/hooks";
 import { useApp } from "@/context/AppContext";
 import { usePageChrome } from "@/context/PageChromeContext";
@@ -15,9 +15,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
+import EraseWizardDialog from "@/components/EraseWizardDialog";
+import { liveEraseApi } from "@/api/erase";
 import {
   RefreshCw, Router, Wifi, WifiOff, DoorOpen, Info, LockOpen, Loader2, AlertCircle,
-  SlidersHorizontal, Clock, CheckCircle2, XCircle, Monitor, Bug, ListChecks,
+  SlidersHorizontal, Clock, CheckCircle2, XCircle, Monitor, Bug, ListChecks, Trash2, PauseCircle,
 } from "lucide-react";
 
 interface DoorPreset { id: number; deviceId: number; doorNumber: number; pulseSeconds: number; doorName: string; }
@@ -186,6 +188,20 @@ export default function DevicesPage() {
 
   // Control panel (re-entry block + clock). One scan-modify-apply object per device.
   const [control, setControl] = useState<ControlState | null>(null);
+
+  // Erase-content wizard (lane 1, 2026-09-27) and the turnstiles an erase left on hold.
+  const [eraseDialog, setEraseDialog] = useState<{ deviceId: number; deviceName: string; mode: "erase" | "refill" } | null>(null);
+  const [heldIds, setHeldIds] = useState<Set<number>>(new Set());
+  // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
+  const [holdsUnknown, setHoldsUnknown] = useState(false);
+  const reloadHolds = useCallback(async () => {
+    try {
+      const res = await liveEraseApi.holds();
+      setHeldIds(new Set((res.holds ?? []).map((h) => Number(h.deviceId)).filter((n) => Number.isFinite(n))));
+      setHoldsUnknown(!!res.loadFailed);
+    } catch { /* an older Access API without the wizard: no hold is shown */ }
+  }, []);
+  useEffect(() => { void reloadHolds(); }, [reloadHolds, data]);
 
   const devices = data?.devices ?? [];
 
@@ -512,6 +528,12 @@ export default function DevicesPage() {
         {error && (
           <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{error}</AlertDescription></Alert>
         )}
+        {holdsUnknown && (
+          <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>
+            Access n'a pas pu relire les mises en attente après un effacement : aucun membre n'est écrit sur
+            aucun appareil jusqu'à la prochaine lecture réussie (réessayée à chaque synchronisation).
+          </AlertDescription></Alert>
+        )}
 
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl bg-card shadow-[0_8px_20px_rgba(0,0,0,0.08)]">
           <div className={cn(GRID, "flex-none border-b border-border px-6 py-[11px]")}>
@@ -626,6 +648,35 @@ export default function DevicesPage() {
                         >
                           <SlidersHorizontal className="h-3.5 w-3.5" />Contrôle
                         </Button>
+                        {heldIds.has(Number(did)) && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="outline"
+                                className="h-7 gap-1.5 rounded-[14px] border-amber-500/50 px-3 text-[11.5px] font-semibold text-amber-700"
+                                onClick={() => setEraseDialog({ deviceId: did, deviceName: name, mode: "refill" })}
+                              >
+                                <PauseCircle className="h-3.5 w-3.5" />Remplir
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir ».
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-7 shrink-0 rounded-[14px]"
+                              onClick={() => setEraseDialog({ deviceId: did, deviceName: name, mode: "erase" })}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Effacer le contenu (administrateur)</TooltipContent>
+                        </Tooltip>
                         {/* Manual connect exists only for PullSDK panels. A ZK_STANDALONE
                             terminal is driven by its own COM event sink, which the live
                             worker already owns -- offering "Connect" here would open a
@@ -1226,6 +1277,17 @@ export default function DevicesPage() {
           <DialogFooter><Button variant="outline" onClick={() => setControl((p) => p ? { ...p, errorPopup: null } : p)}>Fermer</Button></DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {eraseDialog && (
+        <EraseWizardDialog
+          open
+          deviceId={eraseDialog.deviceId}
+          deviceName={eraseDialog.deviceName}
+          mode={eraseDialog.mode}
+          onClose={() => setEraseDialog(null)}
+          onChanged={() => { void reloadHolds(); }}
+        />
+      )}
 
       {/* Toast */}
       {toast && (

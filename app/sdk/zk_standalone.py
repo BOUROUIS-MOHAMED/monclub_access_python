@@ -1104,6 +1104,34 @@ class ZKStandaloneDevice:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def read_device_status(self, *, timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
+        """Every ``_STATUS_FIELDS`` counter NOW (admins, users, fingerprints, attendance
+        records, faces, ...), one STA command, each index tried in both win32com shapes. An
+        index that does not read is ABSENT, never a guessed value. Read-only. Returns
+        {"ok", "status": {name: int}}."""
+        try:
+            return self._call("read_status", timeout=timeout_sec) or {"ok": False}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def read_user_templates(self, pins: List[str], *,
+                            timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
+        """The fingerprint templates of a FEW pins (slots 0-9 each), for the Erase-content
+        wizard's backup. One STA command: ``SSR_GetUserTmpStr(1, pin, slot)`` per slot -- a READ,
+        the call ``tools/mb2000_scripts/14_export_terminal_readonly.ps1`` and the Backup mode of
+        script 10 make; in this driver it is new (2026-09-27) and its duration on the MB2000 is
+        unmeasured [UNVERIFIED]. Keep ``pins`` short: 10 calls per pin, no event pump, no door.
+
+        Returns {"ok", "templates": {pin: [{"fingerId", "template", "size"}]}} (+ "error").
+        ok=False on an exception or an unexpected return shape: the backup is then incomplete
+        and must not be trusted -- never "no finger"."""
+        clean = [str(p if p is not None else "").strip() for p in (pins or [])]
+        try:
+            return self._call("read_templates", args={"pins": clean},
+                              timeout=timeout_sec) or {"ok": False, "error": "no result"}
+        except Exception as exc:
+            return {"ok": False, "templates": {}, "error": str(exc)}
+
     def sweep_finger_slots(self, pin: str, slots: List[int], *, refresh: bool = False,
                            timeout_sec: float = _DEFAULT_CMD_TIMEOUT_SEC) -> Dict[str, Any]:
         """Clear finger slots of ONE pin whose resident finger set is unknown (P3a-2).
@@ -1363,6 +1391,16 @@ class ZKStandaloneDevice:
                                 cmd.result = {"ok": False, "error": "not connected"}
                             else:
                                 cmd.result = self._do_read_capacity(zk)
+                        elif cmd.op == "read_status":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "error": "not connected"}
+                            else:
+                                cmd.result = {"ok": True, "status": self._read_device_status(zk)}
+                        elif cmd.op == "read_templates":
+                            if zk is None or not connected:
+                                cmd.result = {"ok": False, "error": "not connected"}
+                            else:
+                                cmd.result = self._do_read_templates(zk, cmd.args["pins"])
                         elif cmd.op == "sweep_fingers":
                             if zk is None or not connected:
                                 cmd.result = {"ok": False, "error": "not connected",
@@ -2228,6 +2266,14 @@ class ZKStandaloneDevice:
                 pin = str(res[1] or "").strip()
                 name = str(res[2] or "")
                 enabled = bool(res[5])
+                # Privilege > 0 = a terminal ADMINISTRATOR (script 13 keeps them). None when it
+                # does not read as an integer: the Erase-content wizard then refuses to act on
+                # the listing rather than guess who is an admin. The tuple order itself is the
+                # on-hardware gate named above [UNVERIFIED].
+                try:
+                    privilege = None if isinstance(res[4], bool) else int(res[4])
+                except (TypeError, ValueError):
+                    privilege = None
                 card = ""
                 try:
                     cres = zk.GetStrCardNumber("")
@@ -2238,11 +2284,49 @@ class ZKStandaloneDevice:
                 except Exception:
                     card = ""
                 if pin:
-                    users.append({"pin": pin, "name": name, "card": card, "enabled": enabled})
+                    users.append({"pin": pin, "name": name, "card": card, "enabled": enabled,
+                                  "privilege": privilege})
         except Exception as exc:
             # a mid-enumeration failure => the list is INCOMPLETE => fail closed
             return {"ok": False, "users": [], "error": f"SSR_GetAllUserInfo: {exc}"}
         return {"ok": True, "users": users}
+
+    def _do_read_templates(self, zk: Any, pins: List[str]) -> Dict[str, Any]:
+        """STA side of read_user_templates. Read-only: SSR_GetUserTmpStr per slot 0-9.
+
+        win32com returns the ByRef out-params as a tuple, like SSR_GetAllUserInfo: here
+        ``(ok, template, length)``, placeholders passed (the auto-alloc form on TypeError). ok
+        False = an empty slot (script 14 reads it so). Any other shape, or an exception, fails
+        the WHOLE read: a backup that silently lost a finger would be trusted before an erase."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for pin in pins or []:
+            if not pin.isdigit() or len(pin) > _MAX_PIN_DIGITS:
+                return {"ok": False, "templates": {}, "error": f"invalid pin {pin!r}"}
+            slots: List[Dict[str, Any]] = []
+            for fid in range(10):
+                try:
+                    try:
+                        res = zk.SSR_GetUserTmpStr(1, pin, fid, "", 0)
+                    except TypeError:
+                        res = zk.SSR_GetUserTmpStr(1, pin, fid)
+                except Exception as exc:
+                    return {"ok": False, "templates": {},
+                            "error": f"SSR_GetUserTmpStr(pin={pin}, finger={fid}): {exc}"}
+                if isinstance(res, bool):
+                    ok, tmp, size = res, "", 0
+                elif isinstance(res, (tuple, list)) and len(res) >= 2 and isinstance(res[1], str):
+                    ok, tmp = bool(res[0]), res[1]
+                    try:
+                        size = int(res[2]) if len(res) >= 3 else len(tmp)
+                    except (TypeError, ValueError):
+                        size = len(tmp)
+                else:
+                    return {"ok": False, "templates": {},
+                            "error": f"SSR_GetUserTmpStr unexpected shape: {type(res).__name__}"}
+                if ok and tmp:
+                    slots.append({"fingerId": fid, "template": tmp, "size": size})
+            out[pin] = slots
+        return {"ok": True, "templates": out}
 
     def _do_delete_users(self, zk: Any, pins: List[str]) -> Dict[str, Any]:
         """Delete whole users from the device. Ports 7_delete_device_fingerprint.ps1.

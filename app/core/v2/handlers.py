@@ -18,6 +18,37 @@ from app.core.v2.commands import CommandRun, Outcome
 
 _log = logging.getLogger("zkapp.v2.handlers")
 
+# A ZK9500 enrolment captures three samples, then merges them (zkfinger.enroll_3_samples).
+ENROLL_SCANS_NEEDED = 3
+
+
+def enroll_progress(phase: Any, enroll_id: str) -> Dict[str, Any]:
+    """The progress of a remote enrolment, as the dashboard reads it (``{scansDone,
+    scansNeeded}``, ``command-outcome.ts::progressSummary``), from the scanner's structured phase
+    (``_enroll_set_phase``: ``wait_finger`` / ``sample_rejected`` / ``sample_captured`` with
+    ``sampleNum``, then ``processing``). Waiting for, or retrying, sample n means n-1 scans are
+    done. Anything else -- no phase yet, an unknown phase, a bad number -- reports no count.
+    Never the desk's free-text step line: it carries mojibake."""
+    out: Dict[str, Any] = {"enrollId": enroll_id}
+    if not isinstance(phase, dict):
+        return out
+    name = phase.get("phase")
+    if name == "processing":
+        done: Optional[int] = ENROLL_SCANS_NEEDED
+    else:
+        n = phase.get("sampleNum")
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= ENROLL_SCANS_NEEDED:
+            return out
+        if name == "sample_captured":
+            done = n
+        elif name in ("wait_finger", "sample_rejected"):
+            done = n - 1
+        else:
+            return out
+    out["scansDone"] = done
+    out["scansNeeded"] = ENROLL_SCANS_NEEDED
+    return out
+
 
 class LocalCtx:
     """The local API handler context, in process (no HTTP)."""
@@ -147,6 +178,10 @@ class CommandHandlers:
                 "activeMembershipId": payload.get("activeMembershipId"), "fingerId": payload.get("fingerId"),
                 "fullName": payload.get("fullName") or "", "device": "zk9500"}
         ctx = LocalCtx(self.app, body=body)
+        # The enrolment worker resets the phase as its first action, on its own thread; until
+        # then the globals still hold the PREVIOUS enrolment's last phase ("processing" = 3 of 3).
+        # That exact object is never reported (each phase is a new dict).
+        stale_phase = getattr(_la2(), "_enroll_phase", None)
         _la2()._handle_enroll_start(ctx)
         if ctx.status != 202:
             code = "ENROLL_BUSY" if ctx.status == 409 else ("NO_THREAD" if ctx.status == 503 else "BAD_REQUEST")
@@ -162,8 +197,8 @@ class CommandHandlers:
                         self.app.cancel_enroll()
                     except Exception:
                         pass
-                run.progress({"step": str(getattr(_la2(), "_enroll_step", "") or "")[:120],
-                              "enrollId": enroll_id})
+                phase = getattr(_la2(), "_enroll_phase", None)
+                run.progress(enroll_progress(None if phase is stale_phase else phase, enroll_id))
                 self._sleep(0.5)
         finally:
             self._enroll_by_command.pop(run.id, None)
@@ -224,6 +259,10 @@ class CommandHandlers:
             return ("FAILED", "NOT_DRIVER", {"gymDeviceId": did})
         if lease_gate.writes_frozen(did):
             return ("FAILED", "HANDOVER_IN_PROGRESS", {"gymDeviceId": did})
+        from app.core import device_hold
+        if device_hold.is_held(did):
+            # Lane 1: erased and on hold until an operator presses Refill at this PC.
+            return ("FAILED", "DEVICE_ON_HOLD", {"gymDeviceId": did})
         requested = False
         try:
             requested = bool(self.app._request_running_ultra_sync(

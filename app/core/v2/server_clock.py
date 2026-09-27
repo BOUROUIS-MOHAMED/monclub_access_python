@@ -18,19 +18,37 @@ report it in the heartbeat.
   keep ``sentAt`` ahead of the server after a restart.
 * The offset itself is persisted, and reused after a restart only while younger than
   ``PERSISTED_MAX_AGE_SEC`` (a PC that was off all night has no measurement of today).
+* The heartbeat's report is a VIEW over the samples of the last ``RECENT_SEC`` (30 min, PC
+  clock): their median, their count and the age of the oldest (master correction 3,
+  2026-09-27 -- with the socket up the guaranteed samples are the 600 s assignment refreshes,
+  so the window of 7 spans an hour and its oldest sample never met the dashboard's 30-minute
+  freshness rule). The window that drives ``offset()`` is not touched. Each recent sample is
+  persisted with its own time, so a remembered offset counts its age from the original
+  measurement. No sample in the last 30 minutes: the window's offset, ``samples`` 0 (it always
+  counts the view, contract revision 4.1 §5.1), without ``ageSec``.
+  Each sample also keeps the MONOTONIC time it was taken (a loaded one is pinned to this
+  process's monotonic clock at load): its age is measured on that clock, and once the PC's wall
+  clock has been stepped since (wall - mono moved by more than ``STEP_TOLERANCE_SEC``, either
+  way) the sample describes a clock that is gone and leaves the view (review rounds 3-5). A
+  loaded sample stamped later than now is dropped at load; a step between the save and the
+  restart is not detected.
 """
 from __future__ import annotations
 
+import math
 import statistics
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MAX_RTT_SEC = 5.0
 WINDOW = 7
 SLEW_RATE = 0.1
 PERSISTED_MAX_AGE_SEC = 12 * 3600.0
 PERSIST_EVERY_SEC = 60.0
+RECENT_SEC = 1800.0
+RECENT_MAX = 500
+STEP_TOLERANCE_SEC = 2.0
 _SANE_OFFSET_SEC = 10 * 365 * 86400.0
 
 
@@ -48,6 +66,9 @@ class ServerClock:
         self._persist = persist
         self._lock = threading.Lock()
         self._samples: List[float] = []
+        # (offset, PC wall time, monotonic time -- a loaded one pinned at load) of every sample of
+        # the last RECENT_SEC: the heartbeat's view.
+        self._recent: List[Tuple[float, float, float]] = []
         self._source = ""
         self._measured_at = 0.0
         self._utc_offset: Optional[int] = None
@@ -64,6 +85,24 @@ class ServerClock:
                     self._persisted_offset = float(off)
                     self._source = str(row.get("source") or "persisted")
                     self._measured_at = at
+                    # A row saved before 2026-09-27 has no "recent": its samples' ages are
+                    # unknown (``measured_at`` is the NEWEST sample's time, which would call it
+                    # fresh), so the view has nothing to report an age from.
+                    recent = []
+                    w0, m0 = self._wall(), self._mono()
+                    for item in row.get("recent") or []:
+                        try:
+                            o, a = float(item[0]), float(item[1])
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        # One stamped later than now was taken before the PC clock stepped
+                        # back: dropped. The others are pinned to THIS process's monotonic
+                        # clock at load (age w0 - a now), so a wall-clock step after the restart
+                        # retires them like any sample (review round 5); a step between the
+                        # save and the restart is not detected.
+                        if math.isfinite(o) and math.isfinite(a) and a <= w0:
+                            recent.append((o, a, m0 - (w0 - a)))
+                    self._recent = recent[-RECENT_MAX:]
                 if row.get("utc_offset_sec") is not None:
                     self._utc_offset = int(row["utc_offset_sec"])
             except Exception:
@@ -90,14 +129,19 @@ class ServerClock:
         if abs(offset) > _SANE_OFFSET_SEC:
             return False
         with self._lock:
+            wall, mono = self._wall(), self._mono()
             if authoritative:
                 self._samples = []
+                self._recent = []
                 self._persisted_offset = None
                 self._last_issued = None
             self._samples.append(offset)
             del self._samples[:-WINDOW]
+            self._recent.append((offset, wall, mono))
+            self._recent = [r for r in self._recent
+                            if self._age_of(r, wall, mono) is not None][-RECENT_MAX:]
             self._source = str(source)
-            self._measured_at = self._wall()
+            self._measured_at = wall
         self._maybe_persist()
         return True
 
@@ -137,14 +181,43 @@ class ServerClock:
             self._last_issued_mono = mono
             return candidate
 
+    @staticmethod
+    def _age_of(sample: Tuple[float, float, float], wall: float,
+                mono: float) -> Optional[float]:
+        """The age of a view sample, or None when it is not in the view: older than RECENT_SEC
+        (inclusive bound), "in the future", or taken before a step of the PC's wall clock."""
+        _o, a, m = sample
+        if abs((wall - mono) - (a - m)) > STEP_TOLERANCE_SEC:
+            return None                       # the wall clock was stepped since: another clock
+        age = mono - m
+        return age if 0.0 <= age <= RECENT_SEC else None
+
+    def _recent_locked(self) -> List[Tuple[float, float, float]]:
+        """(offset, wall time, age) of every sample in the view now."""
+        wall, mono = self._wall(), self._mono()
+        out = []
+        for r in self._recent:
+            age = self._age_of(r, wall, mono)
+            if age is not None:
+                out.append((r[0], r[1], age))
+        return out
+
     def report(self) -> Optional[Dict[str, Any]]:
-        """The heartbeat's ``clockOffsetSec`` block; None before any measurement."""
+        """The heartbeat's ``clockOffset`` block (a view, see the module docstring); None
+        before any measurement."""
         with self._lock:
+            source = self._source or "persisted"
+            recent = self._recent_locked()
+            if recent:
+                age = max(g for _o, _a, g in recent)
+                return {"offsetSec": round(float(statistics.median(o for o, _a, _g in recent)), 3),
+                        "samples": len(recent), "source": source, "ageSec": round(age, 1)}
             off = self._offset_locked()
             if off is None:
                 return None
-            return {"offsetSec": round(off, 3), "samples": len(self._samples),
-                    "source": self._source or "persisted"}
+            # No sample in the view: the window's offset, but ``samples`` always counts the VIEW
+            # -- 0 here -- and there is no age (contract revision 4.1 §5.1).
+            return {"offsetSec": round(off, 3), "samples": 0, "source": source}
 
     # ------------------------------------------------------------------ persistence
     def _maybe_persist(self) -> None:
@@ -163,7 +236,8 @@ class ServerClock:
             if off is None:
                 return
             row = {"offset_sec": off, "measured_at": self._measured_at, "source": self._source,
-                   "samples": len(self._samples), "utc_offset_sec": self._utc_offset}
+                   "samples": len(self._samples), "utc_offset_sec": self._utc_offset,
+                   "recent": [[o, a] for o, a, _g in self._recent_locked()]}
             self._last_persist_mono = self._mono()
         try:
             self._persist(row)

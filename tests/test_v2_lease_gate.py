@@ -212,7 +212,9 @@ def test_the_attendance_reader_reads_nothing_on_a_reader(no_driver, monkeypatch)
 GATED = ("_handle_device_connect", "_handle_device_info", "_handle_device_settings_get",
          "_handle_device_reentry_set", "_handle_device_clock_get", "_handle_device_clock_sync",
          "_handle_device_table", "_handle_device_door_open", "_handle_device_users_push",
-         "_handle_device_users_list", "_handle_device_users_delete")
+         "_handle_device_users_list", "_handle_device_users_delete",
+         # Lane 1: the Erase-content wizard reads and erases through the worker's session.
+         "_handle_device_erase_preview", "_handle_device_erase_start")
 
 
 class _Ctx:

@@ -145,5 +145,7 @@ def test_the_heartbeat_carries_the_measured_offset_only_once_measured(monkeypatc
     rt, _app, _calls = _runtime()
     now = time.time()
     rt.clock.add_sample(now - 2.5, now, now, source="welcome")
+    # Lane 1 (last-push contract §5.1): ``ageSec``, the age of the oldest sample in the window.
     assert pc_identity.build_heartbeat_payload(app)["clockOffset"] == {
-        "offsetSec": pytest.approx(-2.5, abs=0.01), "samples": 1, "source": "welcome"}
+        "offsetSec": pytest.approx(-2.5, abs=0.01), "samples": 1, "source": "welcome",
+        "ageSec": pytest.approx(0.0, abs=1.0)}

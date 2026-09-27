@@ -599,7 +599,8 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
 
 def _clock_offset_report() -> dict[str, Any] | None:
     """P3b-2 (owner decision 5a): the PC's measured offset to the server clock
-    ``{offsetSec, samples, source}`` -- ``offsetSec`` = server - PC, seconds. Absent before the
+    ``{offsetSec, samples, source}`` (+ ``ageSec``, lane 1: a view over the samples of the last
+    30 minutes, server_clock.report) -- ``offsetSec`` = server - PC, seconds. Absent before the
     first measurement. Backend main c7d4b532's HeartbeatRequest has no field for it; Jackson's
     default drops an unknown key (guide §3.1b), so an old backend ignores it."""
     try:

@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -953,6 +954,12 @@ def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Lane 1 (2026-09-27, the last-push contract §1): which result the upload last SENT for each
+    # row -- ``last_push_src_at`` is the local record's own time (the change key, stable whatever
+    # the clock offset does), ``last_push_sent_at`` the server-clock value sent (capped).
+    for _col, _ddl in (("last_push_ok", "INTEGER"), ("last_push_src_at", "REAL"),
+                       ("last_push_error", "TEXT"), ("last_push_sent_at", "REAL")):
+        _ensure_column(conn, "v2_ownership_uploaded", _col, f"{_col} {_ddl}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS v2_removal_log (
@@ -960,6 +967,24 @@ def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
             pin            TEXT NOT NULL,
             removed_at     REAL NOT NULL,
             corrected      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+    # Lane 1 (2026-09-27): the outcome of the LAST push attempt of each pin to each turnstile
+    # (the ownership upload's lastPushOk / lastPushAt / lastPushError). ok NULL = unknown: never
+    # attempted by this PC, an attempt started and not finished (reset with its write-ahead
+    # intent), or reset when this PC acquired the turnstile. ``at``: when the attempt ended, on
+    # the server-corrected clock when measured (``corrected=1``), else the PC's.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_push_result (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            ok             INTEGER,
+            at             REAL,
+            corrected      INTEGER NOT NULL DEFAULT 0,
+            error          TEXT,
             PRIMARY KEY (device_id, pin)
         );
         """
@@ -2578,6 +2603,22 @@ def init_db() -> None:
                 device_id INTEGER PRIMARY KEY,
                 open_door_enabled INTEGER,
                 updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # -----------------------------
+        # Erase-content wizard (lane 1, 2026-09-27): a turnstile MonClub must write NOTHING to
+        # until an operator presses Refill (app/core/device_hold.py). Durable on purpose: the
+        # cutover restarts Access between the erase and the refill. Not a sync_* table.
+        # -----------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_write_hold (
+                device_id INTEGER PRIMARY KEY,
+                reason TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -9067,8 +9108,18 @@ def record_push_intents(
         ))
     if not params:
         return 0
+    try:
+        from app.core.v2.server_clock import corrected_now
+        reset_at, reset_corrected = corrected_now()
+    except Exception:
+        reset_at, reset_corrected = time.time(), False
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        # Lane 1: an attempt STARTS here, so its last result is no longer known -- in this same
+        # durable transaction, before the device write (last-push contract §1.1). The reset keeps
+        # the start time: the upload stamps the row no earlier (master correction 4).
+        _reset_push_results_on(conn, did, [prm[1] for prm in params],
+                               at=reset_at, corrected=reset_corrected)
         conn.executemany(
             """
             INSERT INTO device_push_intent
@@ -9089,6 +9140,111 @@ def record_push_intents(
         return len(params)
 
     return int(_run_db_write_sync("record_push_intents", _write, durable=True))
+
+
+_PUSH_RESULT_CODE = re.compile(r"^[A-Z0-9_]{1,32}$")
+
+
+def _reset_push_results_on(conn: sqlite3.Connection, device_id: int, pins: "Iterable[str]", *,
+                           at: Optional[float] = None, corrected: bool = False) -> None:
+    """Make the last push result of these pins UNKNOWN (inside the caller's transaction).
+
+    ``at`` -- the attempt START, on the corrected clock when ``corrected`` -- stays on the row
+    with ``ok`` NULL: the upload stamps the reset row no earlier than it, so the server takes it
+    over another PC's later ``true`` (master correction 4, 2026-09-27)."""
+    conn.executemany(
+        "INSERT INTO device_push_result (device_id, pin, ok, at, corrected, error) "
+        "VALUES (?, ?, NULL, ?, ?, NULL) "
+        "ON CONFLICT(device_id, pin) DO UPDATE SET ok=NULL, at=excluded.at, "
+        "corrected=excluded.corrected, error=NULL",
+        [(int(device_id), str(p), None if at is None else float(at), 1 if corrected else 0)
+         for p in pins],
+    )
+
+
+def record_push_results(*, device_id: int, rows: "Iterable[tuple]") -> int:
+    """Record the outcome of push attempts: ``rows`` = ``(pin, ok: bool, code)``. Only where the
+    outcome of a real write is decided (last-push contract §1.1) -- never from a state write that is
+    not an attempt. ``code`` (only with ok False) must be a short machine code
+    ``^[A-Z0-9_]{1,32}$``; anything else is stored ``OTHER`` -- free text never leaves the PC."""
+    from app.core.v2.server_clock import corrected_now
+
+    did = int(device_id)
+    at, corrected = corrected_now()
+    params = []
+    seen: set = set()
+    for row in rows or []:
+        pin = str(row[0] if row[0] is not None else "").strip()
+        if not pin or pin in seen:
+            continue
+        seen.add(pin)
+        ok = bool(row[1])
+        code = None
+        if not ok:
+            code = str(row[2] or "").strip() if len(row) > 2 else ""
+            if not _PUSH_RESULT_CODE.match(code or ""):
+                code = "OTHER"
+        params.append((did, pin, 1 if ok else 0, float(at), 1 if corrected else 0, code))
+    if not params:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            "INSERT OR REPLACE INTO device_push_result (device_id, pin, ok, at, corrected, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)", params)
+        return len(params)
+
+    return int(_run_db_write_sync("record_push_results", _write))
+
+
+def reset_push_results_for_pins(*, device_id: int, pins: "Iterable[str]") -> int:
+    """A write OUTSIDE the sync -- the local admin route ``users/push`` -- changes what the
+    turnstile holds for these pins without being a MonClub attempt: their last push result becomes
+    UNKNOWN before its first device write, durably, stamped with this moment as an attempt start
+    is (contract revision 4.1 §1.1). Such a write never produces ``true``. Raises on failure: the
+    caller must then not write."""
+    from app.core.v2.server_clock import corrected_now
+
+    did = int(device_id)
+    clean = sorted({str(p).strip() for p in (pins or ()) if str(p or "").strip()})
+    if not clean:
+        return 0
+    at, corrected = corrected_now()
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        _reset_push_results_on(conn, did, clean, at=at, corrected=corrected)
+        return len(clean)
+
+    return int(_run_db_write_sync("reset_push_results_for_pins", _write, durable=True))
+
+
+def reset_device_push_results(*, device_id: int) -> int:
+    """Every last push result of one turnstile becomes unknown: this PC acquired it (a DRIVE
+    lease's restore) -- its own old result is not the latest any more (contract §1.1)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        return int(conn.execute(
+            "UPDATE device_push_result SET ok=NULL, at=NULL, corrected=0, error=NULL "
+            "WHERE device_id=?", (did,)).rowcount or 0)
+
+    return int(_run_db_write_sync("reset_device_push_results", _write, durable=True))
+
+
+def list_push_results(*, device_id: int) -> Dict[str, tuple]:
+    """{pin: (ok: bool | None, at: float | None, corrected: bool, error: str | None)}. ``ok``
+    None with an ``at`` = reset at an attempt start at that time; with none = reset by a restore."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, ok, at, corrected, error FROM device_push_result WHERE device_id=?",
+            (did,)).fetchall()
+    return {
+        str(r[0]): (None if r[1] is None else bool(int(r[1])),
+                    None if r[2] is None else float(r[2]), bool(int(r[3] or 0)),
+                    None if r[4] is None else str(r[4]))
+        for r in rows
+    }
 
 
 def list_push_intents(*, device_id: int) -> Dict[str, Dict[str, Any]]:
@@ -9556,6 +9712,121 @@ def clear_all_device_sync_hashes() -> int:
         return int(cursor.rowcount or 0)
 
     return int(_run_db_write_sync("clear_all_device_sync_hashes", _write))
+
+
+# -----------------------------------------------------------------------------
+# Erase-content wizard (lane 1, 2026-09-27): the write hold and the records of an erased
+# turnstile. guide §3.2h.
+# -----------------------------------------------------------------------------
+
+def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None) -> None:
+    """Hold a turnstile: MonClub writes nothing to it until the hold is cleared. Durable
+    (``synchronous=FULL``): a power cut or a restart between an erase and its refill must not
+    let the first pass refill the terminal under the pin scheme recorded before the switch."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO device_write_hold (device_id, reason, run_id, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (did, str(reason or "erase"), run_id, now_iso()),
+        )
+
+    _run_db_write_sync("set_device_write_hold", _write, durable=True)
+
+
+def clear_device_write_hold(*, device_id: int) -> int:
+    """Release a turnstile's write hold. Returns the rows removed (0 when it was not held)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        return int(conn.execute("DELETE FROM device_write_hold WHERE device_id=?",
+                                (did,)).rowcount or 0)
+
+    return int(_run_db_write_sync("clear_device_write_hold", _write, durable=True))
+
+
+def list_device_write_holds() -> Dict[int, Dict[str, Any]]:
+    """{device_id: {reason, runId, since}} for every held turnstile."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT device_id, reason, run_id, created_at FROM device_write_hold"
+        ).fetchall()
+    return {int(r[0]): {"reason": str(r[1] or ""), "runId": r[2], "since": r[3]} for r in rows}
+
+
+def retire_device_records(*, device_id: int, keep_pins: Iterable[str] = ()) -> Dict[str, int]:
+    """FORGET what MonClub recorded about one turnstile, after a VERIFIED erase of its users.
+
+    Every pin with a sync-state or push-intent row was on the terminal or may have been, and the
+    erase removed it: each is logged in ``v2_removal_log`` in this same transaction (the ownership
+    backup's REMOVED fact, §3.9 -- a row that merely vanished is never uploaded as removed, and a
+    new driver's restore would otherwise adopt it as owned and in sync). Then the state, intent,
+    content-mirror, loss re-add and push-result rows of that turnstile go. The pin-scheme switch
+    history stays. ``keep_pins`` -- users the erase deliberately LEFT on the terminal (the MB2000
+    administrators) -- keep every row and are never logged removed (review round 1).
+    Never call it for an erase that was not verified: forgetting pins still on the terminal
+    strands them there for good (§3.2c)."""
+    did = int(device_id)
+    keep = sorted({str(p) for p in (keep_pins or ())})
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, int]:
+        pins = {str(r[0]) for r in conn.execute(
+            "SELECT pin FROM device_sync_state WHERE device_id=?", (did,)).fetchall()}
+        pins |= {str(r[0]) for r in conn.execute(
+            "SELECT pin FROM device_push_intent WHERE device_id=?", (did,)).fetchall()}
+        pins -= set(keep)
+        for pin in sorted(pins):
+            _log_v2_removal(conn, did, pin)
+        spare = f" AND pin NOT IN ({','.join(['?'] * len(keep))})" if keep else ""
+
+        def _delete(table: str) -> int:
+            return int(conn.execute(f"DELETE FROM {table} WHERE device_id=?{spare}",
+                                    (did, *keep)).rowcount or 0)
+
+        out = {
+            "state": _delete("device_sync_state"),
+            "intents": _delete("device_push_intent"),
+            "mirror": _delete("device_content_mirror"),
+            "readd": _delete("v2_readd"),
+            "results": _delete("device_push_result"),
+            "removals_logged": len(pins),
+            "kept": len(keep),
+        }
+        profile.update(out)
+        return out
+
+    return dict(_run_db_write_sync("retire_device_records", _write, durable=True))
+
+
+def invalidate_device_records(*, device_id: int, fingers_erased: bool,
+                              keep_pins: Iterable[str] = ()) -> int:
+    """KEEP MonClub's ownership records of an erased turnstile, but make the next pass write
+    every pin again: the hard-reset UPDATE (hashes cleared, ``last_ok=0``; ownership and removal
+    evidence kept, §3.2c). When the fingerprints were erased, each pin's resident finger set is
+    known EMPTY (``''``, not NULL = unknown) and swept: a recorded set would make the next push
+    clear slots that are already empty, which answer False and fail on every retry (§7 R1-20) --
+    except ``keep_pins``, whose fingers the erase left on the terminal (the MB2000 admins).
+    Also the Erase wizard's INCOMPLETE and Refill reset, with ``fingers_erased=False``. The
+    retry backoff (``fail_streak``, ``last_attempt_hash``) is cleared too: every pin is due."""
+    did = int(device_id)
+    keep = sorted({str(p) for p in (keep_pins or ())})
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        n = _clear_device_sync_hashes_on(conn, did)
+        # And the retry backoff: an erase removed pins that were in it (a refused template leaves
+        # the user row and card on the terminal), and both selectors would hold them back for up
+        # to _SYNC_RETRY_MAX_SEC (6 h) after the refill (review round 2, R2-2).
+        conn.execute("UPDATE device_sync_state SET fail_streak=0, last_attempt_hash=NULL "
+                     "WHERE device_id=?", (did,))
+        if fingers_erased:
+            spare = f" AND pin NOT IN ({','.join(['?'] * len(keep))})" if keep else ""
+            conn.execute(
+                "UPDATE device_sync_state SET pushed_finger_ids='', finger_slots_swept=1 "
+                f"WHERE device_id=?{spare}", (did, *keep))
+        return int(n)
+
+    return int(_run_db_write_sync("invalidate_device_records", _write, durable=True))
 
 
 # -----------------------------

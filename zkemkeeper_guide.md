@@ -539,7 +539,31 @@ zk.GetStrCardNumber("")                          # per row
 Falls back to `zk.SSR_GetAllUserInfo(1)` on `TypeError`. `[COMMENT for the tuple
 order]` — the win32com marshalling of the `[out]` params is firmware/typelib-dependent
 and confirming the exact order on real MB2000 hardware is an on-hardware gate.
-`[UNVERIFIED]`
+`[UNVERIFIED]` Each listed user carries `privilege` = `int(res[4])` since lane 1 (2026-09-27),
+`None` when it does not read as an integer. The Erase-content wizard trusts a listing only when the
+users with privilege > 0 equal `GetDeviceStatus` 1 (admins), the count equals status 2 and every pin
+is numeric: a wrong order fails those checks instead of pointing the erase at garbage. `[CODE]`
+
+### Read templates and counters (the Erase-content wizard's backup, lane 1)
+
+```python
+zk.SSR_GetUserTmpStr(1, pin, finger_idx, "", 0)  # -> (ok, template, length); slots 0-9
+zk.GetDeviceStatus(1, idx, box)                   # every _STATUS_FIELDS index, one STA command
+```
+
+`read_user_templates(pins)` reads slots 0-9 of a FEW pins in one STA command (the wizard sends 2
+pins, 20 calls). A READ: the call `tools/mb2000_scripts/14_export_terminal_readonly.ps1` and script
+10's Backup make; new in this driver. Shapes: a tuple whose second item is a string (`ok False` = an
+empty slot, as script 14 reads it), or a bare bool; the auto-alloc form on `TypeError`. Any other shape
+or an exception fails the WHOLE read (`ok False`), never "no finger". `read_device_status()` is
+`_read_device_status` on demand (an index that does not read is absent). `[CODE]` `[TEST:
+tests/test_device_hold.py::test_the_mb2000_listing_carries_the_privilege_and_templates_read_by_slot,
+::test_an_unexpected_template_shape_fails_the_whole_read]` The shape and the duration on an MB2000 are
+`[UNVERIFIED]` — about 1,800 users × 10 reads at gym 45. The wizard passes each call its own
+`timeout_sec` (status 20 s, listing 60 s, templates 90 s, `delete_users` 90 s for 20 users, a sweep
+30 s), below its `request_run_sdk` budget, so the driver's own timeout fires first; chosen, not measured.
+A `delete_users` that does not fully go stops the wizard's erase there. `[CODE]`
+`[TEST: tests/test_erase_wizard.py::TestMb2000Commands]`
 
 **Fails closed.** A failed enumeration must NEVER read as an empty device — that would
 delete every member under MIRROR. `[CODE]`
