@@ -623,6 +623,29 @@ members section), `digest` (the token). `[CODE: app/ui/app.py::_check_missing_me
 
 ---
 
+## 6d. An erase from the Erase-content wizard (lane 1)
+
+Every step of a run is one line, and the same steps are in the run folder
+(`%ProgramData%\MonClub Access\access\erase_backups\<run>_device<id>\run.json`, next to `backup.json`).
+Guide §3.2h.
+
+```bash
+grep -F "[T] ERASE_STEP" app-*.log
+grep -F "[ERASE]" app-*.log          # the same steps, with the counts and the error text
+grep -F "[HOLD]" app-*.log           # holds set, released, and found at start-up
+```
+
+| `step` | Look at |
+|---|---|
+| `counts_before` / `counts_after` | `n_<table>` before and after (`-1`: the table did not answer). `counts_after ok=False` = the erase could not be verified: `why` says what is left |
+| `backup` | `path`, `sha256`, `rows`. A run with no `backup ok=True` line erased nothing |
+| `erase_<table>`, `erase_users`, `erase_fingerprints` | one line per erased table; `erase ok=False` carries `code` and `uncertain=True` when a command got no answer (it may have acted) |
+| `forget` / `keep_records` | what happened to MonClub's records (`removals_logged`, `invalidated`) |
+| `finish` | `state` = `DONE`, `FAILED` (nothing erased, hold released) or `INCOMPLETE` (hold kept, nothing forgotten); `holdKept=True` = MonClub writes nothing to that turnstile until « Remplir » |
+| `refill_pressed` | the Refill button: `pin_scheme` the refill will push, `requested` = a pass was queued |
+
+---
+
 ## 7. One-liners
 
 ```bash
