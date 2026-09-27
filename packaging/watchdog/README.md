@@ -17,20 +17,56 @@ These scripts are that missing piece.
 |---|---|
 | `monclub_access_watchdog.ps1` | One check: restart the app if it is down and nothing else is going on. |
 | `register_watchdog.ps1` | Register / remove the per-user scheduled task that runs it. |
+| `monclub_access_watchdog_hidden.vbs` | Starts each check with no window. The task runs it through `wscript.exe`: launching `powershell.exe` directly makes Windows draw a console before `-WindowStyle Hidden` takes effect, so a window flashed at every check. `register_watchdog.ps1` tests the launcher when it registers the task and falls back to the direct (flashing) launch if VBScript is unavailable, printing `Launch mode:`. |
 
 ## Installing
 
-Ship it by ticking **"Keep MonClub Access running"** during setup. The task is
-**unchecked by default** — it changes two behaviours at once (start at logon *and*
-restart on death), and an existing install must never silently gain a startup
-entry on a routine update. `UsePreviousTasks=yes` means a site that opts in stays
-opted in.
+Ship it by ticking **"Keep MonClub Access running"** during setup.
+
+- **A new install: ticked by default** (owner decision, 2026-09-26).
+- **An existing install keeps its previous choice** (`UsePreviousTasks=yes`): ticked
+  stays ticked, unticked stays unticked. An install whose version predates the box
+  has no recorded choice and gets it **unticked** — it changes two behaviours at
+  once (start at logon *and* restart on death), and a routine update, the silent
+  in-app one included, must never give a PC a startup entry by itself.
+- "New" means no trace of an old install: neither Inno's uninstall record nor the
+  files (`IsFreshInstall` in `MonClubAccess.iss`). It takes two `[Tasks]` entries
+  with the same name, one of them shown. **Not `checkedonce`**: in Inno Setup's own
+  code a previously *ticked* `checkedonce` task comes back **unticked**, and a task
+  missing from the previous install's record keeps its base state
+  (`Setup.WizardForm.pas`, `CreateTaskButtons`, tag `is-6_5_4`).
+- **A disabled task stays disabled.** Ticked, the installer runs
+  `register_watchdog.ps1`, which replaces the task with the current definition — and
+  keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
+  cutover runbook). It prints `State: Disabled (kept)`; `Enable-ScheduledTask -TaskName
+  'MonClub Access Watchdog'` turns it back on. The old task is removed before the new
+  one is registered, so the script first exports it and, if the registration fails,
+  registers the old one again from that export (disabled if it was) and still fails
+  the run. A task that was **removed** (`-Remove`, an uninstall) is not "disabled":
+  the next install with the box ticked registers it enabled. The installer runs the
+  script hidden and nothing in it reads the script's exit code (Inno's `[Run]` section
+  documents no exit-code handling), so on a silent update a failure is seen only in
+  the task's state. Installers built before this change re-registered
+  it **enabled**.
+- Unticked, the installer does not touch an existing task at all.
 
 To register it by hand on a PC that is already installed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File register_watchdog.ps1
 ```
+
+That, too, keeps a disabled task disabled. To turn a disabled task on:
+
+```powershell
+Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
+Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime
+```
+
+`NextRunTime` must be a date and time (see below). Whether the time trigger, whose
+start was the registration moment, gives a `NextRunTime` right after a later
+`Enable-ScheduledTask` is **not verified**; if it is empty, no check runs before the
+next Windows logon (the logon trigger).
 
 and to remove it:
 
@@ -76,19 +112,41 @@ direction and repetition is silently dropped, leaving a task that runs once at
 logon and never again — autostart with no crash recovery, while still claiming
 both.
 
-**What could NOT be verified here:** that the task actually *executes*. On the
-development machine every `powershell.exe` (5.1) scheduled task hangs before its
-first statement — including a three-line probe script that only writes a file, so
-it is the invocation environment on that box, not this script. The script itself
-runs correctly under 5.1 when launched directly.
+**The trap that `Interval = PT2M` does not show.** An `-AtLogOn` trigger only fires
+on a *future* logon, never for the session that is already open when the task is
+registered -- and every install happens inside such a session. With that trigger
+alone the task registered, read back `Interval = PT2M`, looked healthy, and had an
+**empty `NextRunTime`**: no check ran until the next reboot, so there was no crash
+recovery on install day. A manual `Start-ScheduledTask` runs the action once but does
+not open the repetition window either. `register_watchdog.ps1` therefore adds a
+second, time-based trigger that starts repeating immediately. The logon trigger
+stays, so a repeating schedule is guaranteed after every logon even if the time
+trigger does not survive a reboot. When both repeat, checks simply run more often --
+harmless, because the only action is starting an absent app and MonClub Access
+refuses to run twice (single-instance mutex, `access/main.py`).
+
+*Note added 2026-09-27 (review of the paragraph above, not the owner's text):* the
+two-misses rule counts **checks**, not minutes (`$RequiredConsecutiveMisses`,
+`monclub_access_watchdog.ps1`). With two triggers on different starts, two checks can
+land close together, so an absence of well under two minutes -- a tray Quit included --
+can already count as confirmed and be restarted. How close they land is not measured
+(`[UNVERIFIED]`). Disable the task before a Quit that must stick.
+
+**Verified here (2026-09-13):** both triggers registered; `NextRunTime` populated
+immediately; the task then ran **on its own**, two minutes apart, `LastTaskResult = 0`,
+each run writing its log line. (An earlier revision of this note said scheduled
+`powershell.exe` tasks hung on the development machine; that no longer reproduces.)
+
+**Not verified here:** a real gym PC, and the schedule after a reboot and logon.
 
 So on the first gym PC you enable this on, confirm it end to end:
 
 ```powershell
-Get-ScheduledTask 'MonClub Access Watchdog' | ForEach-Object { $_.Triggers.Repetition }
+Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime, LastRunTime
 ```
 
-`Interval` must be `PT2M`; an empty `Duration` means indefinite, which is correct.
+`NextRunTime` must be a date and time. **Empty means nothing will ever run**, even
+though `Triggers.Repetition` still reads `PT2M`.
 Then force a run and check it completes and logs:
 
 ```powershell
@@ -120,3 +178,17 @@ reintroduce date strings.
 `tests/test_watchdog_script.py` drives the script through its decision table with
 `-WhatIfOnly` (it reports what it would do and starts nothing). It skips when
 PowerShell is unavailable.
+
+The same file runs `register_watchdog.ps1` under Windows PowerShell 5.1 (what the
+installer calls) against a **stubbed** Task Scheduler — a disabled task comes back
+disabled, an enabled or absent one enabled, a failed registration puts the old task
+back — and never registers a real task: it
+uses a throwaway task name and fails with `LEAKED` if one reached Windows. It also
+pins the installer's two `watchdog` task lines and compiles `MonClubAccess.iss` when
+`ISCC.exe` is installed. What Task Scheduler itself does with a task registered
+with `Settings.Enabled = $false`, or with an exported task registered again, was
+**not** run here. After a normal registration the script reads the state back and
+disables the task explicitly if needed; after a put-back it does not -- it relies on
+the `<Enabled>false</Enabled>` inside the exported XML, and still fails the run.
+The put-back covers a task in the root folder only (where this script registers
+it); a same-name task someone moved to another folder is removed but not put back.

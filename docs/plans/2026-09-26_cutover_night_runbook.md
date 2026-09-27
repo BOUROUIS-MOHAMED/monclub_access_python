@@ -8,12 +8,15 @@ For the owner. Plain steps, in the order of the night. The evidence behind each 
 
 > **NOT READY -- DO NOT USE ON THE NIGHT YET.** Three things still block the night:
 > 1. **The release.** No released Access honours "Par personne". It must be built and pass the release
->    checklist, including its MUST items (§3a: the running workers refreshed by a fast patch -- being
->    built in another session, not merged; the installer and the watchdog) and its version and shell
->    gates (§2).
+>    checklist, including its MUST items (§3a: the running workers refreshed by a fast patch -- merged
+>    into `master` as `804f4d2`, not released; the installer and the watchdog -- built on branch
+>    `claude/installer-watchdog-fix`, not merged) and its version and shell gates (§2).
 > 2. **The C3 erase tool** for gym 58 -- or your explicit decision that gym 58 waits and the night is gym 45 only.
-> 3. **Your answers** in part G (among them the gym 45 retire method, power left on, the people on site and on
->    call, the turnstile arm, the previous installers).
+>    **Decided 2026-09-27:** an "Erase content" wizard in Access, for C3-400 and MB2000, being built in
+>    another session, not merged (release checklist §3a). Until it is, C6 and D6 below still name the old tools.
+> 3. **Your answers** in part G (among them the gym 45 retire method -- **decided 2026-09-27**: the wizard's
+>    "forget records" option, release checklist §3b; D10 is re-read once it is merged -- power left on, the
+>    people on site and on call, the turnstile arm, the previous installers).
 >
 > The review findings of 2026-09-26 are closed in this second round (independent review, clean on its
 > fourth pass, 2026-09-26).
@@ -74,8 +77,8 @@ today's production. The export on the night gives the real numbers.
 | # | Blocker | Why |
 |---|---|---|
 | 1 | **No released Access honours "Par personne".** The release must be built and must pass the release checklist | Every tag up to `access_1.4.33` ignores the setting (backend doc `access-account-pin-minimum.md`) |
-| 2 | **No tool erases a C3-400 panel** (gym 58). Decide E1 in the gym 58 plan: a small tool in the release (recommended), or the ZKTeco software -- or decide that gym 58 waits and the night is gym 45 only | Nothing in MonClub Access or its tools clears a panel's user tables on command |
-| 3 | **Gym 45: how each PC forgets its old state** ("retire", decision D3 of the gym 45 plan): a button in the release, a technician with SQL, or a fresh data folder (D10 below) | Without it, members who leave are never removed from the gym 45 turnstiles again |
+| 2 | **No tool erases a C3-400 panel** (gym 58). Decide E1 in the gym 58 plan: a small tool in the release (recommended), or the ZKTeco software -- or decide that gym 58 waits and the night is gym 45 only. **Decided 2026-09-27:** the "Erase content" wizard in Access (C3-400 and MB2000), in progress in another session, not merged (release checklist §3a) -- still a blocker until it is in the release | Nothing in MonClub Access or its tools clears a panel's user tables on command |
+| 3 | **Gym 45: how each PC forgets its old state** ("retire", decision D3 of the gym 45 plan): a button in the release, a technician with SQL, or a fresh data folder (D10 below). **Decided 2026-09-27:** the wizard's "forget records" option (release checklist §3b), not merged -- until it is in the release, D10 (b) or (c) | Without it, members who leave are never removed from the gym 45 turnstiles again |
 | 4 | **Power on all night** at both gyms (the PCs, the panels, the network) | Most gyms cut the power overnight |
 | 5 | **Who is on site and who is on call**: you, a technician who can run the scripts and read a log, the developer on the phone | Most STOP rules end with "call the developer" |
 
@@ -89,7 +92,7 @@ after. A7 (gym 58 only) is required before the erase, whether or not A1-A6 happe
 
 | Step | Do | The screen must show | Time | STOP if |
 |---|---|---|---|---|
-| A1 | On every PC of the gym, in this order: Config page, untick **"Ouvrir MonClub Access avec Windows"**; if the watchdog exists, disable it (`Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`, gym 45 plan §3.3) -- **before** Quit, because the watchdog restarts Access about 2-4 minutes after any Quit (it does not know about the tray Quit: two missed 2-minute checks, then a restart `[CODE: packaging/watchdog/monclub_access_watchdog.ps1, $RequiredConsecutiveMisses = 2]`); tray icon → **Quit**. Write down each PC's name and its Access version (Windows Settings → Apps → "MonClubAccess", or "Postes de réception" for a registered PC) -- it tells which **previous** installer each PC needs for a rollback (B4) | Task Manager: no `MonClubAccess.exe`; `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` prints `Disabled` or nothing | a few minutes | -- |
+| A1 | On every PC of the gym, in this order: Config page, untick **"Ouvrir MonClub Access avec Windows"**; if the watchdog exists, disable it (`Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`, gym 45 plan §3.3) -- **before** Quit, because the watchdog restarts Access within minutes of any Quit (it does not know about the tray Quit: two missed checks in a row, then a restart `[CODE: packaging/watchdog/monclub_access_watchdog.ps1, $RequiredConsecutiveMisses = 2]` -- about 2-4 minutes with one 2-minute trigger, possibly sooner with the two of the owner's edit, box below `[UNVERIFIED]`); tray icon → **Quit**. Write down each PC's name and its Access version (Windows Settings → Apps → "MonClubAccess", or "Postes de réception" for a registered PC) -- it tells which **previous** installer each PC needs for a rollback (B4) | Task Manager: no `MonClubAccess.exe`; `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` prints `Disabled` or nothing | a few minutes | -- |
 | A2 | Gym 58: in the folder `tools\c3_panel_scripts` (run it from the USB key): `.\START_EXPORT.cmd -DeviceIp 192.168.0.202 -Label device5 -Auto`, then `.\START_EXPORT.cmd -DeviceIp 192.168.0.203 -Label device6 -Auto`. **Type each IP in full.** Gym 45: `14_export_terminal_readonly.ps1` as in the gym 45 plan B2-B3 | `[OK] complete - nothing was written to the panel`, and no `error:` line above it | not measured -- the file records it | "CONNECT FAILED": check the IP and cable; nothing changed. `PARTIAL export` or an `error:` line: keep the file, call the developer before any erase |
 | A2b | Gym 58, **the reference refusal**: unplug panel 5's network cable **at the panel** (its link light goes off), run its A2 command again, then plug the cable back and run it once more. Same for panel 6. Write both codes on the paper | the unplugged run ends `CONNECT FAILED … (PullLastError=<code>, <n> ms)`; the plugged-back run connects | minutes | the unplugged run connects: that was not the panel's cable |
 | A3 | Copy the whole folder `%ProgramData%\MonClub Access\` of **every** PC to a USB key, labelled with the PC's name. The database is `access\access.db` (every release since 1.0.3); on a PC upgraded from older, check `data\app.db` too -- use whichever holds the members. This copy is the rollback of A7 | the copies | -- | -- |
@@ -190,7 +193,7 @@ measured on a C3-400. If C6 has not started by that time: stop, nothing has chan
 | C2 | Copy each PC's whole `%ProgramData%\MonClub Access\` folder to the USB key, labelled | the copies | minutes | -- |
 | C3 | Export both panels (A2 commands) | `complete - nothing was written`, no `error:` line | not measured (the survey evening measured it) | connect fails: check cable/IP; nothing changed. `PARTIAL` or an `error:` line: call the developer before C6 |
 | C3b | Only if A2b was not done: the reference refusal (A2b), now | both codes on paper | minutes | as A2b |
-| C3c | Only if A7 was not done on an earlier day: **A7 now**, with "Keep MonClub Access running" **unticked**, right after the install `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` must print `Disabled` or nothing (if `Ready`: `Disable-ScheduledTask …`, check again). When A7's checks pass: C1 again on every PC (Quit, watchdog check) | A7's checks, then C1's | not measured | A7's STOP column (nothing has been erased: part F, "the new Access does not start -- before the erase") |
+| C3c | Only if A7 was not done on an earlier day: **A7 now**, with "Keep MonClub Access running" **unticked**, right after the install `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` must print `Disabled` or nothing (if `Ready`: `Disable-ScheduledTask …`, check again). The untick and this check **stay even with a release that keeps a disabled watchdog disabled** (release checklist §3a, `claude/installer-watchdog-fix`): they are the second guard, and the only one if the release lacks that fix. When A7's checks pass: C1 again on every PC (Quit, watchdog check) | A7's checks, then C1's | not measured | A7's STOP column (nothing has been erased: part F, "the new Access does not start -- before the erase") |
 | C4 | Compare each export (A5 command, with the C2 copy of the PC that drives the panels) -- **the cards list and the card self-check come from this run** (the panels still hold "Par abonnement" pins); then once more with `--scheme ACCOUNT`, **only** for `account_pins_already_on_terminal` (its card self-check always reads NOT MEASURED before the switch: the panel holds no account pin yet) | the `cards` list and the card self-check line of the first run; `account_pins_already_on_terminal` 0 in the second | minutes | the ACCOUNT run shows a number > 0: call the developer. The first run's card self-check is BELOW 90 % or NOT MEASURED: the card list is unknown (C5) |
 | C5 | **Go / no-go**: B2b answered the backend's 404 `NOT_FOUND` this evening (or the developer cleared another backend JSON answer -- never an HTML page or no answer, B2b); the new Access has started once on every PC that will run tonight (A7 or C3c: "Postes de réception" shows each with X.Y.Z); every other PC is blocked or unplugged (C1b); you accept the card list -- the **survey list (A5)** is the one the desk worked from, tonight's (C4) is a check: a member on tonight's list but not on the survey's is a question for the developer, not a desk edit (those members are refused by card until their card is sorted out; their QR still works). With a failed card self-check you accept that the card losses are **unknown**, or stop; the erase tool is there; the clock skew in the export is within ±10 s; the clock time is not passed | -- | -- | no: re-tick autostart, `Enable-ScheduledTask …`, restart Access. **Nothing has changed** |
 | C6 | **Erase** panel 5, then panel 6, with the erase tool of the release (blocker 2) | its AFTER counts: `user=0`, `userauthorize=0`, `templatev10=0` | not measured | not empty after a second run: leave that panel for another day (part F, row "Erase started, switch not recorded on any PC") |
@@ -235,17 +238,24 @@ restart is the check you can see.)
 
 **The watchdog and the installer.** Tonight the watchdog stays disabled from C1 / D1 until C17 / D19,
 because it restarts Access after any Quit: it knows nothing of the tray Quit, and after two missed
-2-minute checks it starts Access again `[CODE: packaging/watchdog/monclub_access_watchdog.ps1]`. An
-install undoes a disable: the installer ticks "Keep MonClub Access running" again when it was chosen
-before (`UsePreviousTasks=yes`), and then runs `register_watchdog.ps1`, which deletes the task and
-registers a new, **enabled** one (`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`;
-`register_watchdog.ps1`: `Remove-WatchdogTask`, then `Register-ScheduledTask`) `[CODE]`. With the script
-committed on `master` the new task first runs at the next Windows logon; the owner's pending edit adds
-a trigger that starts at once, so Access would start by itself a few minutes after the install
-(working-tree copy, read 2026-09-26, not committed). Hence: **untick that box at every install tonight
-(C3c, D9) and check the task's state right after**. Unticked, the installer leaves an existing task as
-it is `[CODE: the [Run] entry runs only when the task is ticked]`. Its log, if you need it:
-`%LOCALAPPDATA%\MonClubAccess\logs\watchdog.log`.
+checks in a row it starts Access again `[CODE: packaging/watchdog/monclub_access_watchdog.ps1]`. The
+misses are counted per check, not per minute, and the task now has two repeating 2-minute triggers
+(the logon one and one that starts at registration, `register_watchdog.ps1`, the owner's edit committed
+2026-09-27 as `b30ef60`) `[CODE]`: once both repeat, two checks can come close together, so the restart
+after a Quit can come sooner than two full intervals -- how soon is `[UNVERIFIED]`. Disable first, then
+Quit, as every step says. **An install undid a disable**, as on `master` `d3725fa`: the installer ticks
+"Keep MonClub Access running" again when it was chosen before (`UsePreviousTasks=yes`), and then runs
+`register_watchdog.ps1`, which deleted the task and registered a new, **enabled** one
+(`installer/MonClubAccess.iss` `[Run]` `Tasks: watchdog`) `[CODE]`, and with the trigger that starts at
+registration Access would start by itself a few minutes after the install. **Fixed on branch
+`claude/installer-watchdog-fix` (tick commit `18863bc`, not merged, not released):** a task that was disabled is
+registered again disabled, and the script prints `State: Disabled (kept)` (release checklist §3a)
+`[CODE, TEST with the Task Scheduler stubbed]`. Only a release that contains it is protected. Either
+way: **untick that box at every install tonight (C3c, D9) and check the task's state right after** --
+the second guard. Unticked, the installer leaves an existing task as it is `[CODE: the [Run] entry runs
+only when the task is ticked]`. (A PC that never had Access gets the box **ticked** by default from that
+release on -- not a case tonight: every install is over an existing Access, which keeps its previous
+choice, release checklist §3b.) Its log, if you need it: `%LOCALAPPDATA%\MonClubAccess\logs\watchdog.log`.
 
 ## D. Gym 45 (Oxyfit), the same night if time allows, otherwise early next morning
 
@@ -280,7 +290,7 @@ The PCs that are **not** reinstalled tonight get the plan's §5.2 firewall block
 | D6 | **Erase** each terminal with script 13: whole users, scope all non-admin, type `CLEAR` (plan E5 has the exact menu path). The warning "UNVERIFIED api" is expected. Removing an admin who is not staff: plan E5b, choice `U` only | its log `DONE ok=… failed=0` | **not measured** (the 2026-09-06 script-13 log, if found, gives the time per user, plan B7) | a user hangs 60 s: plan E5's fail column -- that terminal stays on "Par abonnement" for another day |
 | D7 | Check empty, four ways (plan E6): an export, the terminal's own count, a member's finger refused, the comparison's `account_pins_already_on_terminal` = 0 | all four agree | minutes | back to D6 |
 | D8 | **Interlock**: network cables out of both terminals (they keep power), or the firewall block proven on P1 (plan §5.2) | the export now fails to connect | minutes | it still connects: find the right cable |
-| D9 | On every PC that will run Access: the new installer **over the existing Access -- never uninstall first** (the uninstaller deletes the whole `%ProgramData%\MonClub Access` folder: login, history, the rollback). On its pages: **untick "Keep MonClub Access running"** (the installer re-ticks your previous choice and would re-register the watchdog as a new, enabled task, which restarts Access by itself before the retire) and **untick "Launch MonClub Access"**. Right after: `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` | the installer ends; the watchdog `Disabled` or nothing printed; Task Manager: no `MonClubAccess.exe` | not measured | the installer fails: part F, "the new Access does not start -- after the erase". The watchdog reads `Ready` or `Running`: `Disable-ScheduledTask …`, Quit Access if it started, check again -- and if Access ran on that PC before the retire, D14 decides |
+| D9 | On every PC that will run Access: the new installer **over the existing Access -- never uninstall first** (the uninstaller deletes the whole `%ProgramData%\MonClub Access` folder: login, history, the rollback). On its pages: **untick "Keep MonClub Access running"** (the installer re-ticks your previous choice; an installer without the fix of release checklist §3a re-registers the watchdog as a new, **enabled** task, which restarts Access by itself before the retire -- with the fix, a task disabled at D1 stays disabled, and this untick and the check below **stay as the second guard**) and **untick "Launch MonClub Access"**. Right after: `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog' -ErrorAction SilentlyContinue).State` | the installer ends; the watchdog `Disabled` or nothing printed; Task Manager: no `MonClubAccess.exe` | not measured | the installer fails: part F, "the new Access does not start -- after the erase". The watchdog reads `Ready` or `Running`: `Disable-ScheduledTask …`, Quit Access if it started, check again -- and if Access ran on that PC before the retire, D14 decides |
 | D10 | **The retire**, per PC (blocker 3), before Access starts -- see the box below | (a) the action's counts 0; (b) the plan §5.1 counts 0; (c) the renamed folder exists and `data\app.db` is moved | minutes | a failure: put the D3 copy back, stop (plan R2) |
 | D11 | Start Access on P1 (and on each other PC that will run). With a fresh folder (c): log in, and on "Identité du poste" choose **"Ce PC remplace un ancien poste"** and pick that PC's own record | "Postes de réception" shows the new version for it; its « Pilote / Lecteur » page shows one of part H4's two **expected** readings (after "Identité du poste" with (c): H4, a PC registered after its start) | seconds | Access does not open (`%TEMP%\MonClubAccess.log`): part F, "the new Access does not start -- after the erase". The page reads « PC pilote », « PC lecteur » or « REVOKED »: a driver is set at gym 45 -- Quit Access on every PC, call the developer (the way back is the server's commands switch off, H3); nothing is plugged in; if it is not solved within the N3 clock, part F |
 | D12 | "Postes de réception": **revoke** every gym 45 record whose PC is not reinstalled tonight -- that is what lets the server accept "Par personne". **A revoke does NOT stop an old Access from syncing or pushing**: 1.4.32/1.4.33 fetch the members with the gym login, and the revoke only stops that PC's heartbeat (`git show access_1.4.33:access/pc_identity.py`, state `revoked`; `…:app/ui/app.py::_sync_tick` calls `get_sync_data` with the gym login token) `[CODE]`; the server's member sync checks no PC status (backend `GymAccessController`, review 2026-09-26). What keeps those PCs off the terminals is the D1 block (or the PC unplugged) -- never the revoke. The new Access too drives on after a revoke tonight: it stops only in a gym that uses drivers (`app/core/v2/leases.py::LeaseManager._drop_leases`) `[CODE]`, and gym 45 has none (part H) | the verdict on the add-device form: "Tous les PC enregistrés…" | a minute | a PC not reinstalled has no proven block: do not go on until it is blocked or unplugged |
@@ -360,8 +370,8 @@ The ten questions of the first round, then the ones the second and third rounds 
 widens 16 (page 15) and adds 17 (not on the page yet).
 
 1. Which Access version is the release, and who ticks its checklist (release checklist)?
-2. Gym 58's panel erase: a tool in the release, or the ZKTeco software (gym 58 plan E1)? Or does gym 58 wait, and the night is gym 45 only?
-3. Gym 45's retire: release action, SQL by a technician, or a fresh data folder (D10)?
+2. Gym 58's panel erase: a tool in the release, or the ZKTeco software (gym 58 plan E1)? Or does gym 58 wait, and the night is gym 45 only? **Answered 2026-09-27:** an "Erase content" wizard in Access, for C3-400 and MB2000 (release checklist §3a; in progress, not merged).
+3. Gym 45's retire: release action, SQL by a technician, or a fresh data folder (D10)? **Answered 2026-09-27:** the wizard's "forget records" option (release checklist §3b; not merged -- until then D10 (b) or (c)).
 4. Gym 58's PCs: how many, which one drives the panels (runs Access tonight -- not a driver set in the dashboard, part H), and does each come back tonight (plan E3)? Each one that does not is blocked or unplugged (C1b), whatever its version, until it is brought back as C1b says.
 5. Gym 58's QR rescue setting: on or off? The 12 September copy says off but QR entries were allowed every day (plan E2).
 6. Survey evenings before the night: yes / no, and when (A)? At gym 58, when is the new Access pre-installed (A7): that evening, so it runs for days on "Par abonnement" (recommended), or on the night (C3c)?

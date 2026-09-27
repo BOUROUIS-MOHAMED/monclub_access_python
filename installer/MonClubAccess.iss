@@ -57,12 +57,26 @@ WizardStyle=modern
 [Tasks]
 Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"; Flags: checkedonce
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
-; UNCHECKED on purpose. This registers a per-user scheduled task that both starts
-; MonClub Access at logon and restarts it if the backend process dies. There is no
-; autostart entry today, so ticking it changes TWO behaviours at once -- an existing
-; install must never silently acquire a new startup entry on a routine update.
-; UsePreviousTasks=yes means a site that opts in stays opted in on later updates.
-Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Flags: unchecked
+; "Keep MonClub Access running" registers a per-user scheduled task that both starts
+; MonClub Access at logon and restarts it if the backend process dies.
+;
+; TICKED for a NEW install, UNTICKED by default on an existing one (owner decision,
+; 2026-09-26). Hence two entries with the same name, exactly one of them shown
+; (IsFreshInstall below). On an existing install Inno then restores the previous
+; choice from the uninstall key (UsePreviousTasks=yes): ticked stays ticked, unticked
+; stays unticked. An install whose version predates this box has no recorded choice,
+; and the unticked entry keeps it off: a routine update -- the silent in-app one
+; included -- must never give a PC a new startup entry by itself.
+;
+; NOT Flags: checkedonce. It does the opposite of what it sounds like here: a task
+; previously SELECTED comes back unchecked, and a task missing from the previous
+; install's lists falls back to its base state (Inno Setup source,
+; Setup.WizardForm.pas, TWizardForm.CreateTaskButtons).
+;
+; Ticked on an existing install, the [Run] entry below re-registers the task; a task
+; that exists and is DISABLED stays disabled (register_watchdog.ps1).
+Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Check: IsFreshInstall
+Name: "watchdog"; Description: "Keep MonClub Access running (start at logon, restart if it stops)"; GroupDescription: "Reliability:"; Flags: unchecked; Check: not IsFreshInstall
 
 [Dirs]
 Name: "{app}\current"
@@ -79,6 +93,7 @@ Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recurses
 ; valid across an update.
 Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 Source: "..\packaging\watchdog\register_watchdog.ps1";       DestDir: "{app}\watchdog"; Flags: ignoreversion
+Source: "..\packaging\watchdog\monclub_access_watchdog_hidden.vbs"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
@@ -86,6 +101,9 @@ Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks
 
 [Run]
 ; Register the watchdog BEFORE launching the app, and only when the task is ticked.
+; Unticked, an existing task is left exactly as it is. Ticked, the script replaces
+; the task with the current definition, keeping it DISABLED if it was disabled -- an
+; update must never switch the watchdog back on (register_watchdog.ps1).
 ; runascurrentuser keeps it a per-user task (PrivilegesRequired=lowest, and the app
 ; needs the interactive desktop session for its tray icon and Tauri window -- a
 ; SYSTEM task would start it in session 0 where nobody can see it).
@@ -236,6 +254,16 @@ begin
     Result := ExistingInstallRoot
   else
     Result := DefaultInstallRoot();
+end;
+
+function IsFreshInstall(): Boolean;
+begin
+  // Picks which of the two [Tasks] "watchdog" entries is shown: ticked for a
+  // new install, unticked by default otherwise. "Existing" is read both ways
+  // on purpose -- Inno's own uninstall record (PrevAppDir, from 'Inno Setup:
+  // App Path') and the files this script already detects -- so an install
+  // with either one left behind is never mistaken for a new one.
+  Result := (not ExistingInstallDetected) and (WizardForm.PrevAppDir = '');
 end;
 
 procedure ExecAndLog(const CmdLine: string);

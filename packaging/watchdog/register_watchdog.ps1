@@ -19,6 +19,12 @@
 
     Registering a per-user task for yourself needs no elevation.
 
+    A task that already exists and is DISABLED stays disabled: it is registered
+    again with the current definition, still disabled. The installer runs this
+    script on every install and update where its box is ticked, so this is what
+    keeps an update from switching the watchdog back on. To turn it on:
+        Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File register_watchdog.ps1
 
@@ -62,19 +68,76 @@ if (-not (Test-Path -LiteralPath $WatchdogScript)) {
 }
 $WatchdogScript = (Resolve-Path -LiteralPath $WatchdogScript).Path
 
-# -NonInteractive and -WindowStyle Hidden keep a console window from flashing on
-# the gym's front-desk screen every couple of minutes.
-$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$argLine = @(
-    '-NoProfile'
-    '-NonInteractive'
-    '-ExecutionPolicy Bypass'
-    '-WindowStyle Hidden'
-    "-File `"$WatchdogScript`""
-    "-InstallRoot `"$InstallRoot`""
-) -join ' '
+# Launch through wscript.exe, not powershell.exe directly.
+#
+# Task Scheduler starts the action with a normal window, and powershell.exe is a
+# console program, so Windows draws a VISIBLE console before PowerShell has even
+# read -WindowStyle Hidden -- that switch only hides the window afterwards. On the
+# front-desk screen that is a black window flashing every couple of minutes.
+# wscript.exe is a GUI program with no console of its own, and the launcher starts
+# PowerShell with window style 0, so the console is created hidden and never drawn.
+#
+# VBScript can be switched off (group policy, antivirus, later Windows releases).
+# A launcher that silently does nothing would be the worst outcome -- no crash
+# recovery and nobody told -- so prove the whole chain works here, now, and fall
+# back to the direct launch (which flashes, but works) if it does not.
+$psExe      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$launcher   = Join-Path (Split-Path -Parent $WatchdogScript) 'monclub_access_watchdog_hidden.vbs'
 
-$action = New-ScheduledTaskAction -Execute $psExe -Argument $argLine
+function Test-HiddenLauncher {
+    if (-not (Test-Path -LiteralPath $wscriptExe) -or -not (Test-Path -LiteralPath $launcher)) {
+        return $false
+    }
+    # Under %TEMP%, which on a gym PC sits inside a user folder with a space in its
+    # name ("OXYGENE_FIT P1") -- and the probe folder has a space of its own -- so
+    # this also proves the launcher's quoting.
+    $probeDir = Join-Path ([IO.Path]::GetTempPath()) ('mca watchdog probe ' + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+        $probeScript = Join-Path $probeDir 'probe.ps1'
+        $marker      = Join-Path $probeDir 'ran.txt'
+        Set-Content -LiteralPath $probeScript -Encoding ASCII `
+            -Value 'param([string] $Out) Set-Content -LiteralPath $Out -Value ok'
+        $wsArgs = @('//B', '//Nologo', "`"$launcher`"", "`"$probeScript`"", '-Out', "`"$marker`"") -join ' '
+        $p = Start-Process -FilePath $wscriptExe -ArgumentList $wsArgs -PassThru
+        # A blocked script can sit on a prompt nobody can see; never hang the install.
+        if (-not $p.WaitForExit(30000)) {
+            try { $p.Kill() } catch { }
+            return $false
+        }
+        return (Test-Path -LiteralPath $marker)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (Test-HiddenLauncher) {
+    $wsArgLine = @(
+        '//B'
+        '//Nologo'
+        "`"$launcher`""
+        "`"$WatchdogScript`""
+        '-InstallRoot'
+        "`"$InstallRoot`""
+    ) -join ' '
+    $action = New-ScheduledTaskAction -Execute $wscriptExe -Argument $wsArgLine
+    $launchMode = 'hidden (no window)'
+} else {
+    $argLine = @(
+        '-NoProfile'
+        '-NonInteractive'
+        '-ExecutionPolicy Bypass'
+        '-WindowStyle Hidden'
+        "-File `"$WatchdogScript`""
+        "-InstallRoot `"$InstallRoot`""
+    ) -join ' '
+    $action = New-ScheduledTaskAction -Execute $psExe -Argument $argLine
+    $launchMode = 'VISIBLE - the hidden launcher did not work on this PC, so a window will flash at each check'
+    Write-Warning "The hidden launcher did not work on this PC ($launcher). Falling back to a direct PowerShell launch: the watchdog still works, but a window will flash at each check."
+}
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
@@ -94,6 +157,26 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsI
 $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)).Repetition
 
+# A SECOND trigger that starts repeating NOW. The logon trigger above is not
+# enough on its own: an AtLogOn trigger only fires on a FUTURE logon, never for
+# the session that is already open when the task is registered. Every install
+# happens inside such a session (the app's user must be logged in to run it),
+# so with the logon trigger alone the task sat with an empty NextRunTime and
+# never ran until the next reboot -- no crash recovery on install day, while
+# Interval still read PT2M and looked healthy. A manual Start-ScheduledTask
+# runs the action once but does not open the repetition window either.
+#
+# Both triggers are kept on purpose. This one covers the current session and,
+# being a time trigger, normally keeps its schedule across reboots; the logon
+# trigger still guarantees a repeating schedule after every logon if it does
+# not. When both repeat, checks simply run more often. That is harmless: the
+# only action is starting the app when it is absent, and MonClub Access
+# refuses to run twice (single-instance mutex in access/main.py).
+#
+# Same rule as above: NO -RepetitionDuration (empty Duration = indefinite).
+$heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
+
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
@@ -111,18 +194,84 @@ $principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
+# A task someone DISABLED stays disabled. The installer runs this script at every
+# install and update where the box is ticked (UsePreviousTasks=yes re-ticks it),
+# and re-registering used to bring the task back ENABLED -- silently undoing an
+# operator's Disable-ScheduledTask, e.g. the cutover runbook's, whose whole point
+# is that a Quit stays a Quit (the watchdog starts Access again within minutes).
+# So read the state BEFORE removing the task and register the new definition in
+# that same state: the action and triggers are refreshed, but the task stays off
+# until someone runs Enable-ScheduledTask. No task, or an enabled one, is
+# registered enabled, as before.
+$keepDisabled = @(
+    Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -eq 'Disabled' }
+).Count -gt 0
+if ($keepDisabled) {
+    $settings.Enabled = $false
+}
+
+# Keep the current task's definition, to put it back if registering the new one
+# fails. The old task is removed first, so without this a failed registration
+# would leave NO task -- and the next install, box still ticked, would register a
+# new ENABLED one over what had been a disabled watchdog. The exported XML holds
+# the task's own <Enabled> flag, so a disabled task comes back disabled. (Our task
+# lives at the root folder; that is where it is registered below.)
+$previousXml = $null
+if (Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue) {
+    $previousXml = Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
+}
+
 # Re-register rather than update: an older task may have a different action.
 Remove-WatchdogTask
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -Principal $principal `
-    -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
-                  "Stands down while an install or update is in progress.") | Out-Null
+try {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger @($trigger, $heartbeatTrigger) `
+        -Settings $settings `
+        -Principal $principal `
+        -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
+                      "Stands down while an install or update is in progress.") | Out-Null
+} catch {
+    $registerError = $_
+    if ($previousXml) {
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Xml $previousXml | Out-Null
+            Write-Warning "Registering the new task failed; the previous task '$TaskName' was put back as it was."
+        } catch {
+            Write-Warning "Registering the new task failed, and putting the previous task '$TaskName' back failed too: $_"
+        }
+    }
+    throw $registerError
+}
 
-Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
+if ($keepDisabled) {
+    # Settings.Enabled = $false should already register it disabled. Read it back
+    # and disable it explicitly if not: a task that came back enabled is exactly
+    # the defect this guards against.
+    # @() at the call site too: a function's output is unrolled, so one state
+    # comes back as a bare string, and Windows PowerShell 5.1 under StrictMode
+    # has no .Count on a string.
+    function Get-WatchdogStates {
+        Get-ScheduledTask -TaskName $TaskName | ForEach-Object { [string] $_.State }
+    }
+    $states = @(Get-WatchdogStates)
+    if ($states.Count -eq 0 -or @($states | Where-Object { $_ -ne 'Disabled' }).Count -gt 0) {
+        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        $states = @(Get-WatchdogStates)
+    }
+    if ($states.Count -eq 0 -or @($states | Where-Object { $_ -ne 'Disabled' }).Count -gt 0) {
+        throw ("Scheduled task '$TaskName' was disabled before and could not be kept disabled " +
+               "(state now: $($states -join ', ')). Run: Disable-ScheduledTask -TaskName '$TaskName'")
+    }
+    Write-Host "Registered scheduled task '$TaskName' and KEPT IT DISABLED, as it was before."
+    Write-Host "It runs no check until you enable it: Enable-ScheduledTask -TaskName '$TaskName'"
+} else {
+    Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
+}
 Write-Host "Watchdog script: $WatchdogScript"
 Write-Host "Install root:    $InstallRoot"
+Write-Host "Launch mode:     $launchMode"
+Write-Host "State:           $(if ($keepDisabled) { 'Disabled (kept)' } else { 'Enabled' })"
