@@ -43,6 +43,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 import uuid
@@ -167,6 +169,28 @@ def refill_roster(device: Dict[str, Any], cache: Any, *,
     return {"scheme": stats.get("pin_scheme"), "members": len(by_pin),
             "withheld": int(stats.get("withheld_missing_account") or 0),
             "pins": frozenset(str(p) for p in by_pin)}
+
+
+def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
+    """Is the Erase wizard switched on for this gym, on the server? (owner decision 2026-09-27,
+    guide §3.2h). ``(enabled, code, why)``: ONLY a 200 whose JSON ``enabled`` is the boolean
+    ``true`` enables. ``false`` is ``ERASE_NOT_ENABLED``; anything else -- no token, a 404 from an
+    older backend, 401/403, 5xx, a timeout, a body that is not JSON or not that boolean (the
+    string ``"true"`` included) -- is ``ERASE_SWITCH_UNCHECKED``. Never raises."""
+    try:
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        if not auth or not getattr(auth, "token", None):
+            return False, "ERASE_SWITCH_UNCHECKED", "no gym token on this PC"
+        body = app._api().get_erase_wizard_switch(token=auth.token, timeout=15)
+    except Exception as exc:
+        return False, "ERASE_SWITCH_UNCHECKED", str(exc)[:200]
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if enabled is True:
+        return True, None, ""
+    if enabled is False:
+        return False, "ERASE_NOT_ENABLED", "the erase is not enabled for this gym"
+    return False, "ERASE_SWITCH_UNCHECKED", "the server's answer carries no boolean 'enabled'"
 
 
 def held_waiting_count(device_id: Any) -> Optional[int]:
@@ -690,6 +714,15 @@ class EraseWizard:
             return status, {"ok": False,
                             "code": "ADMIN_PASSWORD_UNCHECKABLE" if status == 503 else "ADMIN_PASSWORD",
                             "error": error}
+        # The gym's server switch (owner decision 2026-09-27), after the password so a wrong
+        # password still reads as one. Starts only -- never the preview, never Refill.
+        enabled, code, why = check_erase_switch(self.app)
+        if not enabled:
+            return (403 if code == "ERASE_NOT_ENABLED" else 503), {
+                "ok": False, "code": code,
+                "error": ("the erase is not enabled for this gym: the owner can enable it in the "
+                          "dashboard (access PCs page)") if code == "ERASE_NOT_ENABLED" else
+                         f"whether the erase is enabled for this gym could not be checked: {why}"}
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         run = {
             "runId": run_id, "deviceId": did, "device": ident, "protocol": proto,
@@ -772,6 +805,8 @@ class EraseWizard:
             with self._lock:
                 if self._run is not None and self._run.get("runId") == run_id:
                     self._running = False
+            # Erase backups older than 30 days go, after each run (and at start-up: app.py).
+            prune_erase_backups(self.backup_root(), keep_run_id=run_id)
 
     def _execute_run(self, run_id: str) -> None:
         run = self.status()["run"] or {}
@@ -1330,6 +1365,58 @@ class EraseWizard:
             pass
         return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested,
                      "invalidated": invalidated}
+
+
+BACKUP_KEEP_DAYS = 30
+_RUN_DIR_NAME = re.compile(r"^(\d{8}-\d{6})-[0-9a-f]{6}_device(\d+)$")
+
+
+def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = None,
+                        keep_run_id: Optional[str] = None) -> List[str]:
+    """Delete erase run folders (backup + run.json) older than ``BACKUP_KEEP_DAYS`` (owner decision
+    2026-09-27, guide §3.2h). The age is the run's START, from its run id (local time). NEVER:
+    a folder whose name is not a run's; the run in progress (``keep_run_id``); any run of a
+    turnstile still HELD -- while the holds cannot be read every turnstile reads held, so nothing
+    goes; a run whose ``run.json`` does not read or is not finished (``RUNNING``, or none). An
+    ``INCOMPLETE`` run keeps its hold until Refill (the only release after a delete), so once its
+    turnstile is no longer held it was refilled. Logged by run id, turnstile and state only --
+    never a name, card or template. Returns the run ids deleted. Never raises."""
+    deleted: List[str] = []
+    try:
+        base = Path(root) if root is not None else _default_backup_root()
+        if not base.is_dir():
+            return deleted
+        cutoff = (time.time() if now is None else float(now)) - BACKUP_KEEP_DAYS * 86400.0
+        for folder in sorted(base.iterdir()):
+            try:
+                m = _RUN_DIR_NAME.match(folder.name)
+                if not m or not folder.is_dir():
+                    continue
+                run_id = folder.name.split("_device")[0]
+                did = int(m.group(2))
+                if keep_run_id and run_id == keep_run_id:
+                    continue
+                if time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S")) >= cutoff:
+                    continue
+                if device_hold.is_held(did):
+                    continue
+                state = json.loads((folder / "run.json").read_text(encoding="utf-8")).get("state")
+                if state not in ("DONE", "FAILED", "INCOMPLETE"):
+                    continue
+                shutil.rmtree(folder)
+                deleted.append(run_id)
+                _log.warning("[ERASE] backup of run %s (turnstile %s, %s) deleted: older than %d "
+                             "days", run_id, did, state, BACKUP_KEEP_DAYS)
+                try:
+                    _tel.event("ERASE_STEP", run=run_id, device_id=did, step="backup_deleted",
+                               ok=True, state=str(state))
+                except Exception:
+                    pass
+            except Exception:
+                _log.warning("[ERASE] erase backup folder %s not pruned", folder.name, exc_info=True)
+    except Exception:
+        _log.warning("[ERASE] erase backups not pruned", exc_info=True)
+    return deleted
 
 
 def _begin_erase(did: int, run_id: str, keep_pins: List[str]) -> int:

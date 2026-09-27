@@ -134,6 +134,16 @@ _ROSTER = [
 
 
 @pytest.fixture(autouse=True)
+def erase_switch_on(monkeypatch):
+    """The gym's server switch for the wizard (owner decision 2026-09-27) is ON in these tests;
+    tests/test_erase_wizard_lane1b.py::TestTheGymsServerSwitch covers it."""
+    import app.core.erase_wizard as ew
+    calls: List[int] = []
+    monkeypatch.setattr(ew, "check_erase_switch", lambda app: calls.append(1) or (True, None, ""))
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def refill_cache(monkeypatch):
     """Every wizard test has a member list to refill from; a test changes ``users``."""
     cache = SimpleNamespace(users=[dict(u) for u in _ROSTER], devices=[],

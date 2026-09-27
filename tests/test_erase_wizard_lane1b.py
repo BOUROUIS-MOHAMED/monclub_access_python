@@ -15,7 +15,9 @@ the same fakes as tests/test_erase_wizard.py -- nothing reaches a device:
 """
 from __future__ import annotations
 
+import json
 import logging
+import time
 from types import SimpleNamespace
 from typing import List
 
@@ -25,9 +27,11 @@ import app.core.db as dbmod
 import app.core.erase_wizard as ew
 from app.core import device_hold
 from app.core.v2 import lease_gate as lg
+from app.core.erase_wizard import check_erase_switch as _real_check_erase_switch
 from tests.test_erase_wizard import (  # noqa: F401 -- fixtures are used by name
     FakePanel, _app, _body, _device, _devices, _mb_body, _mb_setup, _own, _panel, _pw_ok,
-    _refill_body, _removed, _setup_c3, _state, _terminal, _wizard, refill_cache, sqlite_db,
+    _refill_body, _removed, _setup_c3, _state, _terminal, _wizard, erase_switch_on, refill_cache,
+    sqlite_db,
 )
 
 
@@ -648,3 +652,212 @@ class TestOfflineIsNotAWrongPassword:
         assert sent["status"] == 503
         assert sent["payload"]["code"] == "ADMIN_PASSWORD_UNCHECKABLE"
         assert "Internet" in sent["payload"]["error"]
+
+
+# ─────────────────────────── owner decision NEW 2: the gym's server switch ───────────────────────────
+
+class _Resp:
+    def __init__(self, status, body=None, text=None):
+        self.status_code = status
+        self._body = body
+        self.text = text if text is not None else ("" if body is None else str(body))
+
+    def json(self):
+        if isinstance(self._body, Exception):
+            raise self._body
+        return self._body
+
+
+class _Session:
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append((url, dict(headers or {}), timeout))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+def _real_api(answer):
+    from app.api.monclub_api import ApiEndpoints, MonClubApi
+    api = MonClubApi(ApiEndpoints(login_url="https://api.example.test/api/v1/public/access/v1/gym/login",
+                                  sync_url="", create_user_fingerprint_url="", latest_release_url=""),
+                     logging.getLogger("t"))
+    api._session = _Session(answer)
+    return api
+
+
+class TestTheGymsServerSwitch:
+    """Only a 200 with the JSON boolean ``enabled: true`` enables a start; Refill is never gated."""
+
+    def _check(self, monkeypatch, answer, token="jwt"):
+        monkeypatch.setattr("access.store.load_auth_token",
+                            lambda: SimpleNamespace(token=token) if token else None)
+        api = _real_api(answer)
+        return _real_check_erase_switch(SimpleNamespace(_api=lambda: api)), api._session.calls
+
+    @pytest.mark.parametrize("answer, enabled, code", [
+        (_Resp(200, {"enabled": True, "updatedAt": "2026-09-27T21:00:00"}), True, None),
+        (_Resp(200, {"enabled": False, "updatedAt": None}), False, "ERASE_NOT_ENABLED"),
+        (_Resp(404, text='{"status":false,"code":"NOT_FOUND"}'), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(401, text="unauthorized"), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(403, text="forbidden"), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(500, text="boom"), False, "ERASE_SWITCH_UNCHECKED"),
+        (TimeoutError("read timed out"), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(200, ValueError("not json"), text="<html>"), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(200, {"enabled": "true"}), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(200, {"enabled": 1}), False, "ERASE_SWITCH_UNCHECKED"),
+        (_Resp(200, [True]), False, "ERASE_SWITCH_UNCHECKED"),
+    ])
+    def test_only_an_explicit_true_enables(self, monkeypatch, answer, enabled, code):
+        (ok, got_code, _why), calls = self._check(monkeypatch, answer)
+        assert (ok, got_code) == (enabled, code)
+        url, headers, timeout = calls[0]
+        assert url == "https://api.example.test/api/v1/manager/gym/access/erase-wizard"
+        assert headers["Authorization"] == "Bearer jwt" and timeout == 15
+
+    def test_no_token_is_unchecked_and_asks_nothing(self, monkeypatch):
+        (ok, code, _w), calls = self._check(monkeypatch, _Resp(200, {"enabled": True}), token=None)
+        assert (ok, code) == (False, "ERASE_SWITCH_UNCHECKED") and calls == []
+
+    @pytest.mark.parametrize("answer, status, code", [
+        ((False, "ERASE_NOT_ENABLED", "off"), 403, "ERASE_NOT_ENABLED"),
+        ((False, "ERASE_SWITCH_UNCHECKED", "timeout"), 503, "ERASE_SWITCH_UNCHECKED"),
+    ])
+    def test_a_start_is_refused_unless_the_switch_is_on(self, sqlite_db, monkeypatch, tmp_path,
+                                                        answer, status, code):
+        monkeypatch.setattr(ew, "check_erase_switch", lambda app: answer)
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        for body in (_body(pv["previewId"]), _body(pv["previewId"], backupOnly=True)):
+            got, out = wiz.start(5, body, verify_password=_pw_ok)
+            assert (got, out["code"]) == (status, code)
+        assert not device_hold.is_held(5) and wiz.status()["run"] is None
+        assert {c[0] for c in panel.calls} == {"count"}
+
+    def test_a_wrong_password_is_said_first_and_the_switch_not_asked(self, sqlite_db, monkeypatch,
+                                                                     tmp_path):
+        asked = []
+        monkeypatch.setattr(ew, "check_erase_switch",
+                            lambda app: asked.append(1) or (False, "ERASE_NOT_ENABLED", "off"))
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        status, out = wiz.start(5, _body(pv["previewId"]),
+                                verify_password=lambda _p: (False, 401, "Mot de passe incorrect"))
+        assert status == 401 and out["code"] == "ADMIN_PASSWORD" and asked == []
+
+    def test_preview_and_refill_are_never_gated(self, sqlite_db, monkeypatch, tmp_path):
+        asked = []
+        monkeypatch.setattr(ew, "check_erase_switch",
+                            lambda app: asked.append(1) or (False, "ERASE_NOT_ENABLED", "off"))
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        assert wiz.preview(5)[0] == 200
+        device_hold.hold(5, reason="erase", run_id="r")
+        assert wiz.refill(5, _refill_body(), verify_password=_pw_ok)[0] == 200
+        assert asked == [] and not device_hold.is_held(5)
+
+
+# ─────────────────────────── owner decision NEW 1: backups kept 30 days ───────────────────────────
+
+def _run_folder(root, run_id, did, state="DONE", with_run=True, names=("Ali Ben Salah",)):
+    folder = root / f"{run_id}_device{did}"
+    folder.mkdir(parents=True)
+    users = ",".join(json.dumps({"name": n}) for n in names)
+    (folder / "backup.json").write_text('{"users": [' + users + ']}', encoding="utf-8")
+    if with_run:
+        (folder / "run.json").write_text(json.dumps({"state": state}), encoding="utf-8")
+    return folder
+
+
+OLD = "20260801-101500-aaaaaa"          # 57 days before NOW
+RECENT = "20260920-101500-bbbbbb"
+NOW = time.mktime(time.strptime("20260927-120000", "%Y%m%d-%H%M%S"))
+
+
+class TestBackupsAreKeptThirtyDays:
+
+    def test_an_old_finished_run_goes_a_recent_one_stays(self, sqlite_db, tmp_path, caplog):
+        root = tmp_path / "erase_backups"
+        old = _run_folder(root, OLD, 5)
+        recent = _run_folder(root, RECENT, 5)
+        with caplog.at_level(logging.WARNING):
+            assert ew.prune_erase_backups(root, now=NOW) == [OLD]
+        assert not old.exists() and recent.exists()
+        assert "Ali" not in caplog.text and OLD in caplog.text, "run id, turnstile, state only"
+
+    @pytest.mark.parametrize("state", ["DONE", "FAILED", "INCOMPLETE"])
+    def test_a_held_turnstiles_runs_are_never_deleted(self, sqlite_db, tmp_path, state):
+        root = tmp_path / "erase_backups"
+        folder = _run_folder(root, OLD, 5, state=state)
+        device_hold.hold(5, reason="erase", run_id="r")
+        assert ew.prune_erase_backups(root, now=NOW) == [] and folder.exists()
+        device_hold.release(5)
+        assert ew.prune_erase_backups(root, now=NOW) == [OLD], (
+            "an INCOMPLETE run keeps its hold until Refill: no hold, it was refilled")
+
+    def test_nothing_goes_while_the_holds_cannot_be_read(self, sqlite_db, tmp_path, monkeypatch):
+        root = tmp_path / "erase_backups"
+        folder = _run_folder(root, OLD, 5)
+        monkeypatch.setattr(device_hold, "_load_failed", True)
+        assert ew.prune_erase_backups(root, now=NOW) == [] and folder.exists()
+
+    @pytest.mark.parametrize("case", ["running", "no_run_json", "bad_run_json", "not_a_run",
+                                      "the_run_in_progress"])
+    def test_what_is_never_deleted(self, sqlite_db, tmp_path, case):
+        root = tmp_path / "erase_backups"
+        if case == "running":
+            folder = _run_folder(root, OLD, 5, state="RUNNING")
+        elif case == "no_run_json":
+            folder = _run_folder(root, OLD, 5, with_run=False)
+        elif case == "bad_run_json":
+            folder = _run_folder(root, OLD, 5, with_run=False)
+            (folder / "run.json").write_text("{not json", encoding="utf-8")
+        elif case == "not_a_run":
+            folder = root / "my_copy_of_a_backup"
+            folder.mkdir(parents=True)
+        else:
+            folder = _run_folder(root, OLD, 5)
+        keep = OLD if case == "the_run_in_progress" else None
+        assert ew.prune_erase_backups(root, now=NOW, keep_run_id=keep) == []
+        assert folder.exists()
+
+    def test_a_run_prunes_the_old_backups_when_it_ends(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        old = _run_folder(wiz.backup_root(), "20200101-000000-cccccc", 6)
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE"
+        assert not old.exists()
+        assert (wiz.backup_root() / f"{wiz.status()['run']['runId']}_device5").exists()
+
+    def test_the_app_prunes_at_start_up_after_the_holds_are_loaded(self, tmp_path, monkeypatch):
+        import app.ui.app as app_module
+        from tests.test_p3b1_app_wiring import _stub_heavy_init
+
+        monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "init.db"), raising=False)
+        _stub_heavy_init(monkeypatch)
+        order: List[str] = []
+
+        class StopInit(Exception):
+            pass
+
+        monkeypatch.setattr(app_module.MainApp, "_apply_date_flips", lambda self, source, **k: None)
+        monkeypatch.setattr(device_hold, "load", lambda **kw: order.append("holds") or frozenset())
+        monkeypatch.setattr(ew, "prune_erase_backups", lambda *a, **k: order.append("prune") or [])
+
+        def recording_after(self, delay_ms, callback):
+            if getattr(callback, "__name__", "") == "_sync_tick":
+                order.append("first_sync_tick")
+                raise StopInit
+            return 1
+
+        monkeypatch.setattr(app_module.MainApp, "after", recording_after)
+        with pytest.raises(StopInit):
+            app_module.MainApp()
+        deadline = time.monotonic() + 5
+        while "prune" not in order and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert order.index("holds") < order.index("prune")
+        dbmod._shutdown_db_writer_for_tests()

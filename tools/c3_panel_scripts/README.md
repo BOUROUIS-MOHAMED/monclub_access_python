@@ -8,7 +8,8 @@
 > « Remplir » both need the internet (the server checks the admin password each time). Admin password, the
 > typed device name and a tick box "MonClub Access is closed on every other PC of this gym until the refill"
 > are required -- the hold only binds the PC that erases (lane 1b). Never uninstall or reinstall Access while
-> a panel is on hold: the uninstaller deletes the hold and the backups. See `guide_for_agents_and_dev.md`
+> a panel is on hold: the uninstaller deletes the hold and the backups. The wizard starts only where the
+> owner switched it on for the gym (dashboard, access PCs page); backups are deleted after 30 days. See `guide_for_agents_and_dev.md`
 > §3.2h. These scripts stay the read-only survey tool.
 
 For the gym 58 cutover ([`docs/plans/2026-09-26_gym58_cutover_plan.md`](../../docs/plans/2026-09-26_gym58_cutover_plan.md)).

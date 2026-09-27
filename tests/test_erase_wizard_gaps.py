@@ -26,7 +26,7 @@ from app.core.v2 import lease_gate as lg
 from tests.test_erase_wizard import (  # noqa: F401 -- fixtures are used by name
     FakePanel, FakeWorker, WizardTerminal, _Recording, _app, _body, _device, _devices, _mb_body,
     _mb_setup, _own, _panel, _pw_ok, _refill_body, _removed, _setup_c3, _state, _terminal,
-    _wizard, refill_cache, sqlite_db,
+    _wizard, erase_switch_on, refill_cache, sqlite_db,
 )
 
 

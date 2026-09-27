@@ -126,7 +126,8 @@ export const liveEraseApi: EraseApi = {
     post<{ ok: boolean; error?: string }>("/auth/verify-admin-password", { password }, 25_000),
   preview: (deviceId) => get<ErasePreview>(`/devices/${deviceId}/erase/preview`),
   start: (deviceId, body) =>
-    post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 30_000),
+    // The server checks the password AND the gym's switch (15 s each at worst) before it answers.
+    post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 60_000),
   status: () => get<{ ok: boolean; running: boolean; run: EraseRun | null }>("/erase/status"),
   refill: (deviceId, password, expectedPinScheme) =>
     post<RefillResult>(`/devices/${deviceId}/erase/refill`, { password, expectedPinScheme }, 30_000),

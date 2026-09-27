@@ -193,6 +193,10 @@ const fr = {
     NOT_SENT: "Une commande n'a pas été envoyée (délai ou connexion perdue).",
     DEVICE_ERROR: "Le terminal a refusé une commande.",
     UNEXPECTED: "Erreur inattendue d'Access.",
+    ERASE_NOT_ENABLED:
+      "L'effacement n'est pas activé pour cette salle — le propriétaire peut l'activer dans le tableau de bord (page PC d'accès).",
+    ERASE_SWITCH_UNCHECKED:
+      "L'activation de l'effacement pour cette salle n'a pas pu être vérifiée : rien n'est effacé. Réessayez (Internet requis).",
   } as Record<string, string>,
   schemes: { ACCOUNT: "Par personne", MEMBERSHIP: "Par abonnement" } as Record<string, string>,
   mbPasses: (n: number) =>
@@ -409,6 +413,10 @@ const en: typeof fr = {
     NOT_SENT: "A command was not sent (timeout or connection lost).",
     DEVICE_ERROR: "The terminal refused a command.",
     UNEXPECTED: "Unexpected Access error.",
+    ERASE_NOT_ENABLED:
+      "Erasing is not enabled for this gym — the owner can enable it in the dashboard (access PCs page).",
+    ERASE_SWITCH_UNCHECKED:
+      "Whether erasing is enabled for this gym could not be checked: nothing is erased. Try again (the internet is needed).",
   },
   schemes: { ACCOUNT: "Par personne (per person)", MEMBERSHIP: "Par abonnement (per membership)" },
   mbPasses: (n: number) =>
