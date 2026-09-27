@@ -95,8 +95,9 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
   §3b). It creates the task **"MonClub Access Watchdog"**, which runs at logon of that user and every 2
   minutes after, and starts Access when it is not running; it stands down while the installer is
   updating and limits how often it restarts (`packaging/watchdog/register_watchdog.ps1`,
-  `monclub_access_watchdog.ps1`). Already installed without it: run
-  `%LOCALAPPDATA%\MonClubAccess\watchdog\register_watchdog.ps1` as that user (no admin needed).
+  `monclub_access_watchdog.ps1`). Already installed without it: as that user (no admin needed),
+  `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\MonClubAccess\watchdog\register_watchdog.ps1"`
+  -- over a task that exists and is disabled, it keeps it disabled: use `Enable-ScheduledTask` then.
   Check: `Get-ScheduledTask -TaskName 'MonClub Access Watchdog'`, and
   `Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime` -- empty means no check will
   run before the next Windows logon. The script on `master` `d3725fa` has only a logon trigger, so right
@@ -168,9 +169,11 @@ uninstaller can delete folders another account's Access created depends on the f
    Watchdog'` (if it exists), tray icon → Quit; Task Manager shows no `MonClubAccess.exe` (runbook A1).
 2. Copy the whole `%ProgramData%\MonClub Access` to the USB key -- that uninstall deletes it.
 3. Uninstall from the other account; log off from it.
-4. In the account that logs on by itself: if `%ProgramData%\MonClub Access` is gone or incomplete, put
-   the copy back **before** Access starts; then start Access, and give autostart back as the runbook's
-   F-end does (the box re-ticked, the watchdog back on by what exists, its `State` `Ready`).
+4. In the account that logs on by itself, **before** Access starts: move whatever is left of
+   `%ProgramData%\MonClub Access` aside (rename it; a partial delete can look complete) and put the whole
+   copy back -- Access was stopped at step 1, so the copy is its latest state. Then start Access, and give
+   autostart back as the runbook's F-end does (the box re-ticked, the watchdog back on by what exists,
+   its `State` `Ready`).
 
 To see which accounts have it, in an **administrator** PowerShell:
 `Get-ChildItem 'C:\Users\*\AppData\Local\MonClubAccess\current\MonClubAccess.exe'` (one line per
@@ -194,7 +197,8 @@ would switch the watchdog back on and Access would restart by itself in the midd
 steps. The last step of each gym (C17, D19) re-enables both: re-tick the box in Access, and the
 watchdog **by what exists now** (runbook part C, "Turning the watchdog back on"): a task there --
 the old one, or the one registered at A7 and disabled at C1 -- `Enable-ScheduledTask -TaskName
-'MonClub Access Watchdog'`; none, and the PC should have it, `register_watchdog.ps1` as in section 3.
+'MonClub Access Watchdog'`; none, and the PC should have it, `register_watchdog.ps1` with the full
+command of section 3 (or of the runbook's box).
 Never `register_watchdog.ps1` over a disabled task to switch it on: it keeps it disabled. Then
 `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').State` must read `Ready` (or `Running`
 during a check) -- `NextRunTime` alone cannot tell a disabled task from an enabled one -- and check
