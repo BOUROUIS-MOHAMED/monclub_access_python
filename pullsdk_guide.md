@@ -440,8 +440,10 @@ def delete_device_data(self, *, table, data, options="") -> int
 only when the panel's rows fit under the shared removal ceiling (`guide_for_agents_and_dev.md`
 §3.2g); the INCREMENTAL "nuke-and-repave" heuristic that used it automatically is gone (P3a-2). And,
 since lane 1 (2026-09-27), the Erase-content wizard, through `PullSDKDevice.erase_table`, on the
-tables an operator chose among `user`, `userauthorize`, `templatev10` and `template` — never a
-parameter, timezone, holiday or `transaction` table — after a verified backup (main guide §3.2h).
+tables an operator chose among `user`, `userauthorize`, `templatev10` and `template` — `user` only
+together with every one of the others that reads, never a parameter, timezone, holiday or
+`transaction` table — after a verified backup whose `user` password values are emptied, and only
+through a worker connected to the IP MonClub records (main guide §3.2h).
 `[CODE: app/core/erase_wizard.py::C3_ERASE_ORDER]` Be certain before calling it.
 
 #### ⛔ `set_device_data` redacts `Template=` before logging

@@ -2,9 +2,10 @@
 
 > **Erasing a panel is not done here.** Since lane 1 (2026-09-27) MonClub Access has an **Erase content**
 > wizard on its Devices page (the bin icon on a turnstile's row): it counts the tables, writes a verified
-> backup file, erases only the tables you tick (`user`, `userauthorize`, `templatev10`, `template`; never the
-> door log `transaction`, parameters, time zones or holidays), checks they are empty, and can hold the panel
-> until you press « Remplir ». Admin password and the typed device name required. See
+> backup file, erases only the tables you tick (`user`, `userauthorize`, `templatev10`, `template` -- ticking
+> `user` ticks the rights and fingerprint tables too; never the door log `transaction`, parameters, time zones
+> or holidays), checks they are empty, and can hold the panel until you press « Remplir » (which needs the
+> internet: the server checks the password). Admin password and the typed device name required. See
 > `guide_for_agents_and_dev.md` §3.2h. These scripts stay the read-only survey tool.
 
 For the gym 58 cutover ([`docs/plans/2026-09-26_gym58_cutover_plan.md`](../../docs/plans/2026-09-26_gym58_cutover_plan.md)).
