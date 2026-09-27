@@ -394,12 +394,16 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
    first (its action exists only in 1.4.35), run the action in its no-engine mode, then step 4.
 3. Install 1.4.35 with the installer's last box **"Launch MonClub Access" unticked** (it is ticked by
    default and would start Access before the retire otherwise `[CODE: installer/MonClubAccess.iss [Run]
-   postinstall]`).
+   postinstall]`) -- and **"Keep MonClub Access running" unticked** (ticked, it registers the watchdog,
+   which starts Access by itself within minutes; runbook A7, C3c, D9), in the session of the Windows
+   account Access is installed under (runbook A1).
 4. Start Access. Its first start marks both devices as seen on MEMBERSHIP and then receives ACCOUNT, so
    its log must show `[T] PIN_SCHEME_SWITCH device_id=8 … cleared_rows=0` and the same for 10 `[CODE:
    db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
    rows after the retire: Quit, retire again.
-5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows.
+5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows, and the watchdog
+   as the runbook's part C box "Turning the watchdog back on" says (by what exists now: a task,
+   `Enable-ScheduledTask`; none, `register_watchdog.ps1`; its `State` must read `Ready`).
 
 ### Phase F -- the days after
 Daily, P1's log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no
@@ -433,6 +437,17 @@ terminal whose cable is out or that is blocked (`local_access_api_v2._handle_dev
 | R7 | **Power lost during E11** (switch recorded, push partial) | At power-on Access starts (start-with-Windows was re-ticked only at E14, so start it by hand); its start-up full pass continues the push: every written chunk is recorded, the chunk in flight is covered by its push intent `[CODE: guide §3.4a]`. Wait for E11's completion lines. | -- |
 | R8 | A terminal **left for another day** (not wiped, or wipe abandoned + R2) | It stays on MEMBERSHIP with its old contents and works overnight and the next days as it does today; finish it with its own E5-E13 on another closed morning. | -- |
 | R9 | Phase D (1.4.35 installed) must be undone | Restore the D0 copy of the data folder, reinstall 1.4.33 (`[UNVERIFIED]` on a migrated database, D2) | -- |
+
+**Every row that stops Access** (R2-R4, R6, R8, R9 with a reinstall) starts with the watchdog off --
+`Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'`, if it exists -- then Quit (runbook part F,
+"The watchdog during a rollback"). **Whichever row ends the day:** R2-R4, R8 and R9 end with Access
+started and give none of its autostart back, and a data folder copied back was copied with
+start-with-Windows unticked (Access then deletes its start-up entry at every start,
+`app/ui/app.py::_sync_startup_registration`) `[CODE]`. So finish with the runbook's **F-end** step on
+every PC that runs Access: re-tick start-with-Windows, the watchdog back on (runbook part C, "Turning the
+watchdog back on": by what exists now, its `State` `Ready`), **resume Windows Update on P1** (paused at E1) -- and the next evening one
+power cycle (runbook E6, autostart checklist §5). Not on a PC that must stay stopped (P2/P3 behind
+their block, D2).
 
 **Restoring the backup instead** (`10_backup_restore_device.ps1` → `[R]`): copy ONE file into
 `backups\` at a time and check that its label matches the IP you type. It writes every user back as

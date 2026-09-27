@@ -34,6 +34,12 @@
     ticks before we act, which covers short legitimate gaps without needing the
     updater to cooperate (it is a compiled binary we do not modify here).
 
+    The misses must also be spread in TIME, not only counted: a miss counts only
+    when it comes at least $MinSecondsBetweenMisses (90 s) after the previous
+    counted one. The task has two repeating 2-minute triggers on different starts
+    (register_watchdog.ps1), so two checks can land seconds apart -- counted per
+    check, a tray Quit could be "confirmed" and Access restarted seconds after it.
+
     A restart-rate cap stops a crash-looping build from being relaunched
     hundreds of times an hour; past the cap the script logs and gives up until
     the window rolls over.
@@ -55,6 +61,11 @@ param(
 
     # Consecutive ticks the app must be absent before we restart it.
     [int] $RequiredConsecutiveMisses = 2,
+
+    # A miss counts only this long after the previous counted miss (see
+    # .DESCRIPTION): below one 2-minute interval, above two checks that landed
+    # close together.
+    [int] $MinSecondsBetweenMisses = 90,
 
     # Restart-rate cap.
     [int] $MaxRestartsPerWindow = 5,
@@ -118,7 +129,9 @@ function Write-Log {
 function Get-NowEpoch { [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
 
 function Read-State {
-    $default = [pscustomobject]@{ misses = 0; restarts = @() }
+    # missAt: epoch seconds of the last COUNTED miss (0 = none), same rule as the
+    # restart stamps -- an integer or nothing.
+    $default = [pscustomobject]@{ misses = 0; missAt = [long] 0; restarts = @() }
     if (-not (Test-Path -LiteralPath $StatePath)) { return $default }
     try {
         $raw = Get-Content -LiteralPath $StatePath -Raw -ErrorAction Stop
@@ -127,6 +140,11 @@ function Read-State {
         $misses = 0
         if ($parsed.PSObject.Properties.Name -contains 'misses') {
             $misses = [int] $parsed.misses
+        }
+        $missAt = [long] 0
+        if ($parsed.PSObject.Properties.Name -contains 'missAt' -and
+            ($parsed.missAt -is [int] -or $parsed.missAt -is [long])) {
+            $missAt = [long] $parsed.missAt
         }
         $restarts = @()
         if ($parsed.PSObject.Properties.Name -contains 'restarts' -and $parsed.restarts) {
@@ -139,7 +157,7 @@ function Read-State {
                 } catch { }
             }
         }
-        return [pscustomobject]@{ misses = $misses; restarts = $restarts }
+        return [pscustomobject]@{ misses = $misses; missAt = $missAt; restarts = $restarts }
     } catch {
         # A corrupt state file must not wedge the watchdog -- start over.
         return $default
@@ -147,12 +165,13 @@ function Read-State {
 }
 
 function Write-State {
-    param([int] $Misses, [long[]] $Restarts)
+    # -MissAt 0 (the default) clears the miss time: every reset of the misses does.
+    param([int] $Misses, [long[]] $Restarts, [long] $MissAt = 0)
     try {
         if (-not (Test-Path -LiteralPath $LogDir)) {
             New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
         }
-        [pscustomobject]@{ misses = $Misses; restarts = @($Restarts) } |
+        [pscustomobject]@{ misses = $Misses; missAt = $MissAt; restarts = @($Restarts) } |
             ConvertTo-Json -Compress |
             Set-Content -LiteralPath $StatePath -Encoding UTF8
     } catch {
@@ -218,7 +237,7 @@ try {
     $state = Read-State
 
     if (Test-ProcessRunning -Names @($AppProcessName)) {
-        if ($state.misses -ne 0) { Write-State -Misses 0 -Restarts $state.restarts }
+        if ($state.misses -ne 0 -or $state.missAt -ne 0) { Write-State -Misses 0 -Restarts $state.restarts }
         exit 0                      # healthy: the overwhelmingly common path, logged silently
     }
 
@@ -244,11 +263,31 @@ try {
         exit 0
     }
 
-    # --- confirm across two ticks before acting ---
+    # --- confirm across two ticks, at least $MinSecondsBetweenMisses apart ---
+    $nowEpoch = Get-NowEpoch
+    if ([int] $state.misses -gt 0) {
+        $sinceLastMiss = $nowEpoch - [long] $state.missAt
+        if ([long] $state.missAt -le 0 -or $sinceLastMiss -lt 0) {
+            # No time for the earlier miss (a state file from an older script, or a
+            # value that was not an integer), or a time in the future (the clock
+            # moved back). Count from now: waiting for the clock to catch up could
+            # stand the watchdog down for as long as the jump.
+            Write-Log 'INFO' ("app not running (miss 1/$RequiredConsecutiveMisses; the earlier miss has no " +
+                              "usable time, so the count starts again) -- will confirm on a later tick")
+            Write-State -Misses 1 -Restarts $state.restarts -MissAt $nowEpoch
+            exit 0
+        }
+        if ($sinceLastMiss -lt $MinSecondsBetweenMisses) {
+            # Two checks that landed close together (two triggers): not a second miss.
+            Write-Log 'INFO' ("app not running -- not counted: only $sinceLastMiss s since the previous miss " +
+                              "(need $MinSecondsBetweenMisses s; miss $($state.misses)/$RequiredConsecutiveMisses)")
+            exit 0
+        }
+    }
     $misses = [int] $state.misses + 1
     if ($misses -lt $RequiredConsecutiveMisses) {
         Write-Log 'INFO' "app not running (miss $misses/$RequiredConsecutiveMisses) -- will confirm next tick"
-        Write-State -Misses $misses -Restarts $state.restarts
+        Write-State -Misses $misses -Restarts $state.restarts -MissAt $nowEpoch
         exit 0
     }
 
@@ -263,7 +302,7 @@ try {
                 'NOT restarting again. This build is crash-looping and needs a human.') `
                -f $recent.Count, $RateWindowMinutes
         Write-Log 'ERROR' $msg
-        Write-State -Misses $misses -Restarts $recent
+        Write-State -Misses $misses -Restarts $recent -MissAt $nowEpoch
         exit 0
     }
 
