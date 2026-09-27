@@ -2482,6 +2482,10 @@ class UltraDeviceWorker(threading.Thread):
             logger.debug("%s per-pin sync state not recorded", self._prefix, exc_info=True)
         self._record_push_results(users=users, result=result, failed_set=failed_set)
 
+    # push_roster's own pin guard (zk_standalone._MAX_PIN_DIGITS): a longer or non-numeric pin is
+    # skipped, never written -- no push result for it.
+    _STANDALONE_MAX_PIN_DIGITS = 9
+
     # The driver's per-pin failure reason (zkemkeeper guide §5) -> the last-push result code
     # (the contract's short machine code, never free text). First prefix that matches wins.
     _PUSH_RESULT_CODES = (
@@ -2510,6 +2514,8 @@ class UltraDeviceWorker(threading.Thread):
                 pin = str(u.get("pin") or "").strip()
                 if not pin:
                     continue
+                if not pin.isdigit() or len(pin) > self._STANDALONE_MAX_PIN_DIGITS:
+                    continue      # the driver skips it unwritten, and names it nowhere (round 3)
                 if pin not in failed_set:
                     rows.append((pin, True, None))
                     continue

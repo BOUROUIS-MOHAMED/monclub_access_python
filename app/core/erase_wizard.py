@@ -541,7 +541,19 @@ class EraseWizard:
             self._running = True
             self._run = run
             self._previews.pop(str(body.get("previewId")), None)
-        self._spawn(lambda: self._execute(run_id))
+        try:
+            self._spawn(lambda: self._execute(run_id))
+        except Exception as exc:
+            # No thread, nothing held yet: never leave a RUNNING run with nobody running it
+            # (every later start, the Refill and the handover would wait on it -- round 3).
+            _log.error("[ERASE] run %s not started", run_id, exc_info=True)
+            with self._lock:
+                self._running = False
+                if self._run is not None and self._run.get("runId") == run_id:
+                    self._run.update(state="FAILED", finishedAt=_now_text(),
+                                     error=f"RUN_NOT_STARTED: {exc} -- nothing was erased")
+            return 503, {"ok": False, "code": "RUN_NOT_STARTED",
+                         "error": f"the erase could not start: {exc}"}
         return 202, {"ok": True, "runId": run_id}
 
     # ------------------------------------------------------------------ the run

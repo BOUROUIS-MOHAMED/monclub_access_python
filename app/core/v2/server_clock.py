@@ -85,7 +85,9 @@ class ServerClock:
                             o, a = float(item[0]), float(item[1])
                         except (TypeError, ValueError, IndexError):
                             continue
-                        if math.isfinite(o) and math.isfinite(a):
+                        # One stamped later than now was taken before the PC clock stepped
+                        # back: dropped, never counted again once the clock catches up.
+                        if math.isfinite(o) and math.isfinite(a) and a <= self._wall():
                             recent.append((o, a))
                     self._recent = recent[-RECENT_MAX:]
                 if row.get("utc_offset_sec") is not None:
@@ -123,7 +125,10 @@ class ServerClock:
             self._samples.append(offset)
             del self._samples[:-WINDOW]
             self._recent.append((offset, wall))
-            self._recent = [(o, a) for o, a in self._recent if wall - a <= RECENT_SEC][-RECENT_MAX:]
+            # Also drops a sample stamped later than now (taken before the PC clock stepped back):
+            # hiding it would only last until the clock caught up with it (review round 3).
+            self._recent = [(o, a) for o, a in self._recent
+                            if 0.0 <= wall - a <= RECENT_SEC][-RECENT_MAX:]
             self._source = str(source)
             self._measured_at = wall
         self._maybe_persist()

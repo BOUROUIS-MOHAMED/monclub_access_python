@@ -559,3 +559,55 @@ class TestAResetRowIsANewerFact:
         db.record_push_intents(device_id=8, rows=[("100", "A", "", "h")], protocol="ZK_STANDALONE")
         ok, at, _corrected, err = dbmod.list_push_results(device_id=8)["100"]
         assert ok is None and err is None and at is not None and abs(at - time.time()) < 60
+
+
+# ─────────────────────────── review round 3 (2026-09-27) ───────────────────────────
+
+def test_a_sample_taken_before_a_clock_step_back_never_returns_to_the_view():
+    """A sample stamped later than the PC's clock (taken before Windows stepped the clock back)
+    is dropped, not merely hidden until the clock catches up with it again."""
+    real = {"t": 1_000_000.0}
+    pc = {"wall": real["t"] + 3600.0}                  # the PC clock runs 1 h ahead
+    clk = ServerClock(wall=lambda: pc["wall"])
+    clk.add_sample(real["t"], pc["wall"], pc["wall"], source="welcome")     # offset -3600
+    real["t"] += 60
+    pc["wall"] = real["t"]                             # stepped back to the real time
+    clk.add_sample(real["t"], pc["wall"], pc["wall"], source="assignment")
+    real["t"] += 3600 - 60 + 10
+    pc["wall"] = real["t"]
+    rep = clk.report()
+    # The good sample is 58 min old, the pre-step one was dropped: nothing recent, so the
+    # window's own figures (it keeps both: offset() is not this view) and no age.
+    assert "ageSec" not in rep and rep["samples"] == 2
+
+
+def test_a_persisted_sample_from_the_future_is_dropped_at_load():
+    t = {"wall": 2_000_000.0}
+    row = {"offset_sec": 1.0, "measured_at": t["wall"] - 10, "source": "rest:x",
+           "recent": [[1.0, t["wall"] - 10], [-3600.0, t["wall"] + 3000]]}
+    clk = ServerClock(wall=lambda: t["wall"], load=lambda: dict(row))
+    t["wall"] += 3100
+    rep = clk.report()
+    assert "ageSec" not in rep and rep["samples"] == 0 and rep["offsetSec"] == pytest.approx(1.0)
+
+
+def test_an_mb2000_pin_the_driver_skips_as_invalid_gets_no_result(db, monkeypatch):
+    """Round 3 (nit): the driver skips a pin of more than 9 digits without writing it and
+    without naming it failed; the engine used to record it true."""
+    term = RefusingTerminal()
+    users = [_user(30001, "A", "101"), _user(1234567890, "B", "102")]
+    drv = _make_driver(term)
+    try:
+        w, _ = _mb_worker(monkeypatch, drv, users)
+        _pass(w)
+    finally:
+        drv.disconnect()
+    r = _results(9)
+    assert r["30001"] == (True, None)
+    assert "1234567890" not in term.users
+    assert r.get("1234567890") in (None, (None, None)), r
+
+
+def test_the_engine_pin_guard_is_the_drivers():
+    from app.sdk.zk_standalone import _MAX_PIN_DIGITS
+    assert ue.UltraDeviceWorker._STANDALONE_MAX_PIN_DIGITS == _MAX_PIN_DIGITS

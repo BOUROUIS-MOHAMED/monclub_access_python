@@ -2004,6 +2004,12 @@ the verified backup and the verified erase. `[CODE]`
   neutralise fallback, which writes a blank disabled user (§3.4). An MB2000 **`INCOMPLETE`** users erase
   keeps the records (nothing may be forgotten after an unverified erase), so it keeps this risk for the pins
   it did delete.
+- While a held turnstile's release waits for Refill, its periodic ownership upload waits too (a turnstile with a
+  pending release is left out of the upload tick): facts written since the last upload — a forget's REMOVED rows, an
+  `INCOMPLETE` reset — stay on this PC until Refill lets the final upload go. Only an explicit force-handover or a
+  revoke could move the turnstile meanwhile; the new PC would then restore the older rows (review round 3).
+- A run thread that cannot start (the 32-bit build's "can't start new thread") answers 503 `RUN_NOT_STARTED` and
+  leaves nothing running and nothing held (review round 3). `[TEST: ::test_a_run_thread_that_cannot_start_leaves_no_run_behind]`
 - A hold stops every member write, **revocations included**: a member revoked while the turnstile is held
   keeps what is still on it (after a fingerprints-only erase, an `INCOMPLETE` run, or "hold") until Refill. There
   is no timeout on a hold; the Devices page shows "Remplir" on its row. Owner question, lane report.
@@ -3424,8 +3430,9 @@ seen − 30 min). No sample in the last 30 minutes: the window's own median and 
 window of 7 that drives `offset()` (every `sentAt` / `observedAt`) is untouched. Each recent sample is kept, and
 persisted (`recent` in the `server_clock` kv row), with its own time, so after a restart a remembered offset counts
 its age from the original measurement; a row persisted before this change has no `recent`, so `ageSec` is left
-out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view; a sample "in the future" (the PC
-clock stepped back) is left out of the view. `[CODE: server_clock.py::report, ::_recent_locked]`
+out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view; a sample stamped later than the
+PC's clock (taken before Windows stepped the clock back) is DROPPED from the view — at each new sample and at load —
+so it never comes back once the clock catches up (review round 3; the window of 7 keeps it, as before). `[CODE: server_clock.py::report, ::_recent_locked]`
 `[TEST: test_v2_last_push.py — the five clock tests, incl. ::test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes,
 ::test_no_sample_in_the_last_30_minutes_sends_no_age; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
 `[TEST: test_v2_clock_and_api.py — incl. ::test_a_clock_skew_refusal_outvotes_earlier_wrong_samples,
@@ -3601,7 +3608,12 @@ reset re-uploaded strictly newer, no bulk re-send after the upgrade, the cap, a 
 with a matching count on the per-pin and targeted paths), ::TestStandaloneTrueNeedsTheVacatedSlotsCleared,
 ::TestAResetRowIsANewerFact]`
 Not done (the master's optional note 5): reporting an MB2000 `pushedFingerIds` of `''` as known only once
-`finger_slots_swept=1`. Listed as "does not prove" (master note 5, nothing built): a turnstile the server labels
+`finger_slots_swept=1`. An MB2000 pin the driver skips as invalid (not digits, or more than 9) is never written and
+gets NO result (`UltraDeviceWorker._STANDALONE_MAX_PIN_DIGITS` = the driver's `_MAX_PIN_DIGITS`; unreachable below
+member/account id 1,000,000,000). **Does not prove** (review round 3, predates lane 1): on the PullSDK BATCH path
+(> 5 pins, the default upsert strategy) a finger the member no longer has is not deleted from the panel, yet the pin
+is `true` — the per-pin and targeted paths clear the pin first; whether a C3 `templatev10` write of other fingers
+leaves the old one in place is `[UNVERIFIED on hardware]`. Listed as "does not prove" (master note 5, nothing built): a turnstile the server labels
 PullSDK but a local protocol override (`device_driver.py`, `MONCLUB_DEVICE_PROTOCOL_OVERRIDES`) drives as
 standalone.
 

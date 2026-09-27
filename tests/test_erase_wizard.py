@@ -1464,3 +1464,26 @@ class TestTheWorkerMustBeOnTheRecordedAddress:
         assert w._connected and w._connected_addr == ("10.0.0.9", 4370)
         w._disconnect()
         assert w._connected_addr is None
+
+
+# ─────────────────────────── review round 3 (2026-09-27) ───────────────────────────
+
+def test_a_run_thread_that_cannot_start_leaves_no_run_behind(sqlite_db, monkeypatch, tmp_path):
+    """Round 3: start() set _running and then spawned outside any try -- a spawn that raised
+    (the 32-bit build's "can't start new thread") left the wizard RUNNING with no thread: no
+    erase, no Refill, and the turnstile's handover waiting, until a restart."""
+    wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+    def _boom(fn):
+        raise RuntimeError("can't start new thread")
+
+    wiz._spawn = _boom
+    _, pv = wiz.preview(5)
+    status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+    assert status == 503 and out["code"] == "RUN_NOT_STARTED"
+    assert wiz.status()["running"] is False and wiz.running_device() is None
+    assert wiz.status()["run"]["state"] == "FAILED" and not device_hold.is_held(5)
+    assert [c for c in panel.calls if c[0] != "count"] == []
+    wiz._spawn = lambda fn: fn()
+    _, pv2 = wiz.preview(5)
+    assert wiz.start(5, _body(pv2["previewId"]), verify_password=_pw_ok)[0] == 202
