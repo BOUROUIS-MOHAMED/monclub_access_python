@@ -538,6 +538,7 @@ class TestAnEarlierHoldIsReleasedOnlyByRefill:
         assert run["state"] == "DONE" and run["holdKept"] is True
         assert any("HELD_BEFORE" in str(s.get("note", "")) for s in run["steps"])
         assert worker.full_sync_requests == []
+        assert 5 in dbmod.list_device_write_holds(), "the durable row is still there"
 
 
 # ─────────────────────────── F8: a release asks the cut pass again ───────────────────────────
@@ -599,6 +600,8 @@ class TestAnAdminPinTheRefillWouldOverwrite:
                 drv.disconnect()
             run = wiz.status()["run"]
             assert run["state"] == state, (refill, run["error"])
+            if state == "FAILED":
+                assert "ADMIN_PIN_IN_ROSTER" in run["error"] and len(term.users) == 4
             device_hold.reset_for_tests()
 
     def test_the_fingerprints_only_erase_is_checked_too(self, sqlite_db, monkeypatch, tmp_path,
@@ -861,3 +864,102 @@ class TestBackupsAreKeptThirtyDays:
             time.sleep(0.01)
         assert order.index("holds") < order.index("prune")
         dbmod._shutdown_db_writer_for_tests()
+
+
+# ─────────────────────────── lane 1b review round 1 ───────────────────────────
+
+class TestReviewRound1:
+
+    def test_the_refill_is_checked_again_right_before_the_first_delete(self, sqlite_db,
+                                                                        monkeypatch, tmp_path,
+                                                                        refill_cache):
+        """Finding 1: a sync that empties the member list during the backup stops the run."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            refill_cache.users = []                      # a successful sync emptied it
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_SOURCE_EMPTY" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+
+    def test_withheld_rows_arriving_during_a_hold_run_stop_it(self, sqlite_db, monkeypatch,
+                                                              tmp_path, refill_cache):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            if not any(u.get("userId") == 99 for u in refill_cache.users):
+                refill_cache.users.append({"userId": 99, "activeMembershipId": 199})
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_WITHHELD" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"]
+
+    def test_a_failed_sync_during_the_backup_does_not_stop_the_run(self, sqlite_db, monkeypatch,
+                                                                   tmp_path):
+        wiz, _w, panel, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            app._last_sync_ok = False                    # a network blip during the backup
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE"
+
+    def test_a_rehearsal_on_a_held_turnstile_leaves_its_hold_row_alone(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        """Finding 4: the row keeps naming the run that may have erased, and its time."""
+        device_hold.hold(5, reason="erase", run_id="earlier-erase")
+        before = dict(sqlite_db.list_device_write_holds()[5])
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE"
+        assert sqlite_db.list_device_write_holds()[5] == before
+
+    def test_a_held_row_keeps_its_since_when_a_real_erase_takes_it_over(self, sqlite_db):
+        device_hold.hold(5, reason="erase", run_id="a")
+        since = sqlite_db.list_device_write_holds()[5]["since"]
+        device_hold.hold(5, reason=device_hold.REASON_ERASE_PREP, run_id="b")
+        row = sqlite_db.list_device_write_holds()[5]
+        assert row == {"reason": "erase", "runId": "b", "since": since}
+
+    def test_an_agent_line_is_never_reported_held(self, sqlite_db, monkeypatch, refill_cache):
+        """Finding 9: no engine writes a pin to an AGENT turnstile."""
+        from access.pc_identity import build_heartbeat_payload
+        app = _heartbeat_app(monkeypatch, refill_cache, _device(did=5))
+        app._ultra_engine = SimpleNamespace(get_status=lambda: {"devices": {}})
+        app._agent_engine = SimpleNamespace(
+            get_status_snapshot=lambda: {5: {"connected": True, "failedPins": 0}})
+        monkeypatch.setattr(device_hold, "_load_failed", True)
+        line = build_heartbeat_payload(app)["turnstiles"][0]
+        assert line == {"gymDeviceId": 5, "reachable": True, "failedPins": 0, "mode": "AGENT"}
+
+    @pytest.mark.parametrize("moved", ["ADDRESS_CHANGED", "ADDRESS_UNKNOWN"])
+    def test_no_pass_is_asked_through_a_worker_on_another_address(self, sqlite_db, monkeypatch,
+                                                                  tmp_path, moved):
+        """Finding 12: after the idle wait the worker is on another address -- FAILED, released,
+        and no pass requested through that worker."""
+        wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real_wait = wiz._wait_idle
+
+        def _wait(did):
+            w = real_wait(did)
+            w._connected_addr = ("192.168.0.99", 4370) if moved == "ADDRESS_CHANGED" else None
+            return w
+        monkeypatch.setattr(wiz, "_wait_idle", _wait)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and moved in run["error"]
+        assert not device_hold.is_held(5) and worker.full_sync_requests == []

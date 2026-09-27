@@ -1821,7 +1821,12 @@ never a second session; **that worker is connected to the address MonClub record
 is in progress (`REFILL_IN_PROGRESS`); the pin scheme reads (the run records it; `PIN_SCHEME_UNREADABLE`
 otherwise); no other run; and **the admin password, checked by the server** (`validate_statistics_password`, the Local DB
 page's call) — the page's own lock is a screen, and offline the password cannot be checked, so nothing is
-erased (503 `ADMIN_PASSWORD_UNCHECKABLE`, lane 1b: never read as a wrong password). The page ticks and locks the C3
+erased (503 `ADMIN_PASSWORD_UNCHECKABLE`, lane 1b: never read as a wrong password). The refusal's code
+(`erase_wizard._password_refusal`, start and Refill): ONLY a 401 is `ADMIN_PASSWORD` (a wrong password —
+`validate_statistics_password` answers False on 401 alone); 503 `ADMIN_PASSWORD_UNCHECKABLE` (offline, or no gym token
+on this PC — the verifier answered 401 "Not authenticated" for that before review round 1); 400
+`ADMIN_PASSWORD_REQUIRED`; any other status (a proxy's 502/504, a 5xx) `ADMIN_PASSWORD_CHECK_FAILED`, shown with the
+server's words. `[TEST: test_erase_wizard_gaps.py::TestTheRefillRoute]` The page ticks and locks the C3
 rights and fingerprint tables when `user` is ticked, fixes "forget" to yes for an MB2000 users erase, and asks the face
 confirmation for an unknown count too. `[TEST: ::TestNothingIsErasedWithout, ::TestTheRightDeviceOnly, ::TestLocalApi,
 ::TestC3UsersNeedsRightsAndFingers, ::TestMb2000UsersEraseForgets, ::TestUnknownFaces,
@@ -1929,7 +1934,10 @@ run folder's `run.json`):
    no member to the turnstile; the door, the scans and the rescues go on (`[TEST: test_erase_wizard_gaps.py::TestTheDoorRunsWhileHeld]`:
    a desk door open, a queued SDK command and a rescue open run while held, and only `_v2_writes_blocked` reads the
    hold in the worker). The row's phase is `erase-prep` (lane 1b, review F1): reads and the backup only, no delete yet.
-   On a turnstile already held for a real erase the row keeps `erase` (the upsert never downgrades it).
+   On a turnstile already held for a real erase the row keeps `erase` (the upsert never downgrades it) and its
+   `created_at` (held since then); a backup-only rehearsal there leaves the row untouched — it keeps naming the run
+   that may have erased — while a real erase takes the run id over (its `begin_device_erase` needs it).
+   `[TEST: ::TestReviewRound1]`
 2. **idle** — waits (≤ 120 s) for a pass already running to end; a push stops at its next chunk (the gate).
 3. **counts before**, then **the backup**: C3 — every row of each chosen table, the count read in the same
    command, rows read must equal it; the `user` table's password values are emptied (the key kept, any
@@ -1950,6 +1958,11 @@ run folder's `run.json`):
    measured `[UNVERIFIED on hardware]`. `[TEST: ::TestMb2000Commands; test_erase_wizard_gaps.py::TestTheSmallerClaims
    — the fingerprints-only path too]`
 3b. **Before the first delete** (lane 1b):
+   - *The refill is checked again* (lane 1b review round 1): the MB2000 backup can be long, and a SUCCESSFUL sync in
+     between can empty the member list or bring withheld ACCOUNT rows. From the counts (not `problem`, where a STALE
+     would mask them): no cache, no member, or withheld rows — under the scheme now, and under ACCOUNT for "hold" —
+     refuse the run (`REFILL_SOURCE_MISSING` / `_EMPTY` / `REFILL_WITHHELD`, `FAILED`, nothing erased). A sync that
+     merely FAILED meanwhile leaves the list as it was and does not stop the run. `[TEST: ::TestReviewRound1]`
    - *MB2000 administrators vs the refill* (review C4, verified): the push writes `SSR_SetUserInfo(1, pin, name, "", 0,
      enabled)` — privilege 0, password emptied (`zk_standalone.py`, the roster push) — so a kept administrator whose pin
      is also a member pin of the refill roster would be demoted and renamed to that member. A kept admin pin found in
@@ -2049,7 +2062,9 @@ roster stamp (the PullSDK engine returns early on a held panel) and the schedule
 until the roster changes. `[TEST: ::TestEveryReleaseForcesTheScheduler]` A `FAILED` or backup-only release also asks
 that pass again at once (`request_full_sync(reason="erase-released")`, best effort; lane 1b, review F8): dropping the
 stamp alone left it to the scheduler's next timer — up to 15 min, and never on a manual-sync gym. A turnstile whose
-earlier hold the run kept asks nothing. `[TEST: test_erase_wizard_lane1b.py::TestAReleaseAsksThePassAgain]`
+earlier hold the run kept asks nothing, and neither does a run that failed because the worker is connected to another
+address (`ADDRESS_CHANGED` / `ADDRESS_UNKNOWN`: no pass through it; the scheduler's own timer still applies, review
+round 1). `[TEST: test_erase_wizard_lane1b.py::TestAReleaseAsksThePassAgain, ::TestReviewRound1]`
 
 A "backup only" run (the rehearsal) does steps 1–3 and releases the hold. `[TEST: ::test_backup_only_erases_nothing]`
 
@@ -4057,9 +4072,16 @@ could not write and keeps for its next try") never appeared. `[CODE]`
   `device_hold.is_held` answers True for — the durable hold loaded at start-up, so it survives a restart;
   EVERY line while the holds could not be read — and sets `failedPins` to the members its refill would
   write (`erase_wizard.held_waiting_count`: `refill_roster` over the sync cache ALREADY in memory,
-  `peek_sync_cache`, never a load — the heartbeat's in-memory rule), recomputed at each heartbeat. When
+  `peek_sync_cache`, never a cache load), recomputed at each heartbeat. When
   that cannot be told (no cache in memory, no device row) the figure is left as it was, `held` still
-  set. Only held lines carry the key. `[CODE]` `[TEST: test_erase_wizard_lane1b.py::TestTheHeartbeatOfAHeldTurnstile]`
+  set. Only held lines carry the key, and never an AGENT line (no engine writes a pin to it; review round 1). The
+  count is made from the cache already in memory, but building the filter's `DeviceSyncEngine` reads the backend
+  settings (`get_backend_global_settings`, its own 30 s cache) — one small database read per held line and heartbeat,
+  inside the heartbeat's try. The cache's device row is the DB row (snake_case), coerced to the payload shape the
+  passes filter (`db._coerce_device_row_to_payload`; `allowedMemberships` was missed before review). The first heartbeat
+  after a start is sent at once: if the sync cache is not in memory yet, a held line has `held` and the worker's figure
+  until the next beat, 5 min later. `[CODE]` `[TEST: test_erase_wizard_lane1b.py::TestTheHeartbeatOfAHeldTurnstile,
+  ::TestReviewRound1::test_an_agent_line_is_never_reported_held]`
   The backend: `GymAccessPcDtos.TurnstileReport` is a 4-component record `{gymDeviceId, reachable,
   failedPins, mode}` and the application's mapper leaves `FAIL_ON_UNKNOWN_PROPERTIES` off
   (`GymAccessPcHeartbeatJsonBindingTest` binds unknown keys at the top level and inside a nested record,

@@ -44,6 +44,8 @@ const fr = {
       ? `En « Par personne » : ${n} membre(s), et ${w} sans numéro de compte, qui ne seraient pas écrits.`
       : `En « Par personne » : ${n} membre(s).`,
   refillCacheAt: (s: string) => `Liste des membres de ce PC enregistrée le ${s}.`,
+  withheldOnlyIfAccount:
+    "Ce blocage ne concerne que « Attendre que j'appuie sur « Remplir » » (prévu pour passer en « Par personne ») : sans changement de schéma, « Remplir maintenant » écrit tout le monde.",
   lockoutHold:
     "Après cet effacement, AUCUN membre ne passe au tourniquet par carte ou par empreinte tant que « Remplir » n'est pas fait (Internet requis).",
   lockoutRefill:
@@ -139,6 +141,8 @@ const fr = {
     ADMIN_PASSWORD_UNCHECKABLE:
       "Pas d'Internet : le serveur MonClub doit vérifier le mot de passe (pour effacer comme pour « Remplir »). Rétablissez la connexion, puis réessayez.",
     ADMIN_PASSWORD: "Mot de passe incorrect.",
+    ADMIN_PASSWORD_REQUIRED: "Saisissez le mot de passe administrateur.",
+    ADMIN_PASSWORD_CHECK_FAILED: "Le serveur MonClub n'a pas pu vérifier le mot de passe : réessayez dans un instant.",
     PREVIEW_EXPIRED: "La lecture de l'étape 1 date de plus de 15 minutes : revenez à l'étape 1 et relisez.",
     WRONG_DEVICE: "Cette lecture concerne un autre tourniquet : relisez l'étape 1.",
     DEVICE_CHANGED: "Le nom, l'adresse ou le SDK du tourniquet a changé depuis l'étape 1 : relisez.",
@@ -178,7 +182,7 @@ const fr = {
       "La dernière synchronisation avec MonClub n'a pas réussi (ou aucune depuis le démarrage d'Access) : la liste des membres peut être incomplète. Synchronisez, puis relisez.",
     REFILL_SOURCE_EMPTY: "Le remplissage n'écrirait aucun membre sur ce tourniquet : rien n'est effacé.",
     REFILL_WITHHELD:
-      "Des membres n'ont pas de numéro de compte dans la liste de ce PC : en « Par personne », le remplissage ne les écrirait pas. La liste des membres doit d'abord être relue en entier ; sans changement de schéma, choisissez « Remplir maintenant ».",
+      "Des membres n'ont pas de numéro de compte dans la liste de ce PC : en « Par personne », le remplissage ne les écrirait pas. La liste des membres doit d'abord être relue en entier.",
     BUSY: "Une synchronisation en cours ne s'est pas terminée à temps : rien n'a été effacé. Réessayez.",
     BACKUP_INCOMPLETE: "La sauvegarde ne correspond pas aux compteurs du terminal : rien n'a été effacé.",
     BACKUP_UNVERIFIABLE: "Le terminal n'a pas donné tous ses compteurs : la sauvegarde ne peut pas être vérifiée, rien n'a été effacé.",
@@ -187,11 +191,11 @@ const fr = {
     RESULTS_NOT_RESET: "L'effacement n'a pas pu être enregistré avant la première suppression : rien n'a été effacé.",
     ADMIN_PIN_IN_ROSTER:
       "Un administrateur du terminal a le même numéro qu'un membre : le remplissage l'écraserait. Changez le numéro de cet administrateur sur le terminal : rien n'a été effacé.",
-    NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent sur le terminal.",
+    NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
     ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
     NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
     NOT_SENT: "Une commande n'a pas été envoyée (délai ou connexion perdue).",
-    DEVICE_ERROR: "Le terminal a refusé une commande.",
+    DEVICE_ERROR: "Une commande au terminal a échoué.",
     UNEXPECTED: "Erreur inattendue d'Access.",
     ERASE_NOT_ENABLED:
       "L'effacement n'est pas activé pour cette salle — le propriétaire peut l'activer dans le tableau de bord (page PC d'accès).",
@@ -266,6 +270,8 @@ const en: typeof fr = {
       ? `Under 'Par personne': ${n} member(s), and ${w} without an account number, who would not be written.`
       : `Under 'Par personne': ${n} member(s).`,
   refillCacheAt: (s: string) => `This PC's member list was saved on ${s}.`,
+  withheldOnlyIfAccount:
+    "This refusal concerns 'Hold until I press Refill' only (meant for a switch to 'Par personne'): with no scheme change, 'Refill now' writes everyone.",
   lockoutHold:
     "After this erase NO member gets through the turnstile by card or fingerprint until Refill is pressed (the internet is needed).",
   lockoutRefill:
@@ -360,6 +366,8 @@ const en: typeof fr = {
     ADMIN_PASSWORD_UNCHECKABLE:
       "No internet: the MonClub server must check the password (to erase and to Refill). Restore the connection, then try again.",
     ADMIN_PASSWORD: "Wrong password.",
+    ADMIN_PASSWORD_REQUIRED: "Enter the administrator password.",
+    ADMIN_PASSWORD_CHECK_FAILED: "The MonClub server could not check the password: try again in a moment.",
     PREVIEW_EXPIRED: "Step 1 was read more than 15 minutes ago: go back to step 1 and read again.",
     WRONG_DEVICE: "This reading is of another turnstile: read step 1 again.",
     DEVICE_CHANGED: "The turnstile's name, address or SDK changed since step 1: read again.",
@@ -399,7 +407,7 @@ const en: typeof fr = {
       "The last sync with MonClub did not succeed (or none ran since Access started): the member list may be incomplete. Synchronize, then read again.",
     REFILL_SOURCE_EMPTY: "The refill would write no member to this turnstile: nothing is erased.",
     REFILL_WITHHELD:
-      "Some members have no account number in this PC's list: under 'Par personne' the refill would not write them. The member list must be read again in full first; with no scheme change, choose 'Refill now'.",
+      "Some members have no account number in this PC's list: under 'Par personne' the refill would not write them. The member list must be read again in full first.",
     BUSY: "A sync in progress did not end in time: nothing was erased. Try again.",
     BACKUP_INCOMPLETE: "The backup does not match the terminal's counters: nothing was erased.",
     BACKUP_UNVERIFIABLE: "The terminal did not report all its counters: the backup cannot be checked, nothing was erased.",
@@ -408,11 +416,11 @@ const en: typeof fr = {
     RESULTS_NOT_RESET: "The erase could not be recorded before its first delete: nothing was erased.",
     ADMIN_PIN_IN_ROSTER:
       "A terminal administrator has the same number as a member: the refill would overwrite it. Change that administrator's number on the terminal: nothing was erased.",
-    NOT_VERIFIED: "The erase could not be verified: rows remain on the terminal.",
+    NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
     ERASE_FAILED: "An erase command failed: part of it may have been erased.",
     NO_ANSWER: "A command was sent and got no answer: it may have acted.",
     NOT_SENT: "A command was not sent (timeout or connection lost).",
-    DEVICE_ERROR: "The terminal refused a command.",
+    DEVICE_ERROR: "A command to the terminal failed.",
     UNEXPECTED: "Unexpected Access error.",
     ERASE_NOT_ENABLED:
       "Erasing is not enabled for this gym — the owner can enable it in the dashboard (access PCs page).",

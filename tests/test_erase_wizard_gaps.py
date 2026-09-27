@@ -305,7 +305,32 @@ class TestTheRefillRoute:
     def test_an_empty_password_is_refused(self, sqlite_db, monkeypatch, tmp_path):
         (status, out), _w = self._ctx(monkeypatch, tmp_path, lambda **k: True,
                                       _refill_body(password=""))
-        assert status == 400 and out["code"] == "ADMIN_PASSWORD" and device_hold.is_held(5)
+        assert status == 400 and out["code"] == "ADMIN_PASSWORD_REQUIRED" and device_hold.is_held(5)
+
+    def test_a_server_failure_is_never_a_wrong_password(self, sqlite_db, monkeypatch, tmp_path):
+        """Review round 1, finding 2: only a 401 is a wrong password."""
+        from app.api.monclub_api import MonClubApiHttpError
+
+        def _bad_gateway(token, password):
+            raise MonClubApiHttpError("validate_statistics_password: HTTP 502", status_code=502)
+        (status, out), _w = self._ctx(monkeypatch, tmp_path, _bad_gateway, _refill_body())
+        assert status == 502 and out["code"] == "ADMIN_PASSWORD_CHECK_FAILED"
+        assert device_hold.is_held(5)
+
+    def test_no_gym_token_cannot_check_and_is_not_a_wrong_password(self, sqlite_db, monkeypatch,
+                                                                  tmp_path):
+        import access.store as store
+        import app.api.local_access_api_v2 as la2
+        from tests.test_erase_wizard import _Ctx
+
+        app = _app({5: FakeWorker(_panel())})
+        app._erase_wizard = _wizard(app, tmp_path)
+        monkeypatch.setattr(store, "load_auth_token", lambda: None)
+        _devices(monkeypatch, _device())
+        device_hold.hold(5, reason="erase", run_id="r")
+        ctx = _Ctx(app, 5, _refill_body())
+        la2._handle_device_erase_refill(ctx)
+        assert ctx.sent[0] == 503 and ctx.sent[1]["code"] == "ADMIN_PASSWORD_UNCHECKABLE"
 
     def test_a_wrong_password_is_refused_by_the_server(self, sqlite_db, monkeypatch, tmp_path):
         (status, out), _w = self._ctx(monkeypatch, tmp_path, lambda token, password: False,

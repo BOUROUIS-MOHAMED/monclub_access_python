@@ -4671,7 +4671,8 @@ def _erase_password_verifier(ctx: _Ctx):
         from access.store import load_auth_token
         auth = load_auth_token()
         if not auth or not auth.token:
-            return False, 401, "Not authenticated"
+            # Not a wrong password: this PC cannot ask the server (lane 1b review round 1).
+            return False, 503, "this PC is not signed in to MonClub: the password cannot be checked"
         try:
             valid = ctx.app._api().validate_statistics_password(token=auth.token, password=password)
         except MonClubApiHttpError as e:

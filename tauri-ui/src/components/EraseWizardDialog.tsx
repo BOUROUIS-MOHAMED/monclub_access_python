@@ -106,7 +106,13 @@ export default function EraseWizardDialog({
   const setLang = (l: Lang) => { setLangState(l); saveLang(l); };
   const schemeName = (sch: string | null | undefined) => (sch ? (t.schemes[sch] ?? sch) : t.unknown);
   // A refusal the operator can act on is shown in the page's language; anything else as sent.
-  const errFor = (e: unknown) => { const c = errCode(e); return (c && t.codes[c]) || errText(e); };
+  const errFor = (e: unknown) => {
+    const c = errCode(e);
+    const said = c ? t.codes[c] : undefined;
+    if (!said) return errText(e);
+    // A check that failed on the server's side keeps the server's own words as a detail.
+    return c === "ADMIN_PASSWORD_CHECK_FAILED" || c === "ERASE_SWITCH_UNCHECKED" ? `${said} (${errText(e)})` : said;
+  };
 
   const [password, setPassword] = useState("");
   const [unlocked, setUnlocked] = useState(false);
@@ -269,15 +275,19 @@ export default function EraseWizardDialog({
       pollStatus();
     } catch (e) {
       if (noAnswer(e)) {
-        // The password check can take the whole client timeout and the server may have started
-        // the run just after: look before saying anything failed (review C6).
+        // The server checks the password and the gym's switch (network calls) before it starts
+        // the run, and may start it after the page stopped waiting: watch the status for another
+        // minute before saying anything failed; the dialog stays open meanwhile (review C6).
         setStartError(t.noAnswerYet);
-        try {
-          const s = await api.status();
-          if (s.run && Number(s.run.deviceId) === deviceId && s.run.runId !== earlierRun) {
-            setStartError(null); setRun(s.run); setStep(4); pollStatus(); return;
-          }
-        } catch { /* fall through to the error */ }
+        for (let i = 0; i < 30; i++) {
+          try {
+            const s = await api.status();
+            if (s.run && Number(s.run.deviceId) === deviceId && s.run.runId !== earlierRun) {
+              setStartError(null); setRun(s.run); setStep(4); pollStatus(); return;
+            }
+          } catch { /* the next look retries */ }
+          await new Promise((r) => window.setTimeout(r, 2000));
+        }
       }
       const c = errCode(e);
       if (c === "PREVIEW_EXPIRED" || c === "DEVICE_CHANGED" || c === "WRONG_DEVICE") {
@@ -352,6 +362,9 @@ export default function EraseWizardDialog({
         <span className="text-muted-foreground">{t.refillCacheAt(refillCheck.cacheUpdatedAt)}</span>
       )}
       {refillProblem && <span className="text-destructive">{t.codes[refillProblem] ?? refillProblem}</span>}
+      {refillProblem && !refillCheck.problem && refill === "hold" && !heldBefore && (
+        <span className="text-muted-foreground">{t.withheldOnlyIfAccount}</span>
+      )}
     </div>
   ) : null;
 

@@ -9733,7 +9733,8 @@ def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] 
     (``synchronous=FULL``): a power cut or a restart between an erase and its refill must not
     let the first pass refill the terminal under the pin scheme recorded before the switch.
     A row already held for a real erase keeps that reason: a second run's ERASE_PREP never
-    downgrades it (a start-up would otherwise release a turnstile a delete may have emptied)."""
+    downgrades it (a start-up would otherwise release a turnstile a delete may have emptied). A
+    held row also keeps its ``created_at``: the turnstile has been held since then."""
     did = int(device_id)
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
@@ -9743,7 +9744,7 @@ def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] 
             "ON CONFLICT(device_id) DO UPDATE SET "
             "reason = CASE WHEN device_write_hold.reason = ? THEN excluded.reason "
             "ELSE device_write_hold.reason END, "
-            "run_id = excluded.run_id, created_at = excluded.created_at",
+            "run_id = excluded.run_id, created_at = device_write_hold.created_at",
             (did, str(reason or HOLD_REASON_ERASE), run_id, now_iso(), HOLD_REASON_ERASE_PREP),
         )
 

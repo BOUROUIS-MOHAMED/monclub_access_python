@@ -539,7 +539,8 @@ def _report_held_turnstiles(devices: dict[int, dict[str, Any]]) -> None:
         return
     for device_id, line in devices.items():
         try:
-            if not device_hold.is_held(device_id):
+            if not device_hold.is_held(device_id) or line.get("mode") == "AGENT":
+                # AGENT: no engine writes a pin to it (§3.10), so no hold concerns it.
                 continue
             line["held"] = True
             waiting = held_waiting_count(device_id)
