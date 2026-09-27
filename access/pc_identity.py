@@ -608,7 +608,12 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     except Exception:
         pass
 
-    _report_held_turnstiles(devices)
+    # Guarded here too, like the three blocks above (lane 1c, review F7): the v1 heartbeat is live
+    # for every gym, and a payload that raises sends nothing -- the PC would look silent.
+    try:
+        _report_held_turnstiles(devices)
+    except Exception:
+        pass
 
     payload: dict[str, Any] = {
         "appVersion": app_version,

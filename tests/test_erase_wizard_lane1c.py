@@ -14,6 +14,8 @@ Guide §3.2h, §3.10. Against the same fakes as tests/test_erase_wizard.py -- no
 * F2   the 30-day prune does not trust the PC clock blindly: a server offset over a day skips it,
        a run dated more than a day in the future is kept, and runs are dated on the
        server-corrected clock where the PC has a measurement;
+* F5   the erase's reset reaches pins known only from a result row or only from an intent row;
+* F7   the live v1 heartbeat still builds when the held-count code raises.
 """
 from __future__ import annotations
 
@@ -482,6 +484,89 @@ class TestThePruneAndTheClock:
         recent = time.time() - 2 * 86400
         os.utime(folder / ew.REFILLED_MARK, (recent, recent))
         assert ew.prune_erase_backups(root) == [] and folder.exists()
+
+
+# ─────────────────────────── F5 / F7 / a review nit: regression tests ───────────────────────────
+
+def _results(db, did):
+    return {p: (r[0], r[3]) for p, r in db.list_push_results(device_id=did).items()}
+
+
+class TestRegressionGuards:
+
+    def test_the_erase_resets_pins_known_only_from_a_result_or_an_intent_row(self, sqlite_db,
+                                                                            monkeypatch, tmp_path):
+        """F5: every earlier test seeded its pins through a sync-state row, so narrowing
+        ``begin_device_erase``'s pin query to that table passed them all. 999 has only a result
+        row (its state and intent rows gone, as ``delete_device_sync_state`` leaves it); 888 only
+        an intent row (one written before lane 1 had no result row)."""
+        sqlite_db.record_push_results(device_id=5, rows=[("999", True, None)])
+        sqlite_db.record_push_intents(device_id=5, rows=[("888", "Name", "8880", "h")],
+                                      protocol="ZK_PULLSDK")
+        sqlite_db._run_db_write_sync("test_drop_result", lambda conn, profile: conn.execute(
+            "DELETE FROM device_push_result WHERE device_id=5 AND pin='888'").rowcount)
+        assert _results(sqlite_db, 5) == {"999": (True, None)}
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.refuse_erase = {"user"}
+        wiz.start(5, _body(_preview(wiz, 5)["previewId"], forget=False), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "INCOMPLETE"
+        got = sqlite_db.list_push_results(device_id=5)
+        for pin in ("999", "888"):
+            ok, at, _corrected, err = got[pin]
+            assert ok is None and err is None and at is not None, (pin, got.get(pin))
+
+    @pytest.mark.parametrize("breaks", ["refill_roster", "is_held", "peek_sync_cache",
+                                        "report_held"])
+    def test_the_heartbeat_builds_when_the_held_count_raises(self, sqlite_db, monkeypatch,
+                                                            refill_cache, breaks):
+        """F7: the v1 heartbeat is live for every gym; a PC whose payload raises sends nothing
+        and looks silent. Whatever the held-turnstile code raises, every line still goes."""
+        import access.pc_identity as pci
+        import app.core.db as dbmod
+        from tests.test_erase_wizard import _device
+        refill_cache.devices = [_device(did=5), _device(did=6, name="B")]
+        monkeypatch.setattr(dbmod, "peek_sync_cache", lambda: refill_cache)
+        snap = {5: {"connected": True, "failed_pins": 2}, 6: {"connected": True, "failed_pins": 0}}
+        app = SimpleNamespace(
+            _update_manager=SimpleNamespace(get_current_version=lambda: "9.9.9"),
+            _agent_engine=SimpleNamespace(get_status_snapshot=lambda: {}),
+            _ultra_engine=SimpleNamespace(get_status=lambda: {"devices": snap}),
+            _last_sync_at=None, _last_sync_ok=True)
+        device_hold.hold(5, reason="erase", run_id="r")
+
+        def _boom(*a, **k):
+            raise RuntimeError(f"{breaks} failed")
+        if breaks == "refill_roster":
+            monkeypatch.setattr(ew, "refill_roster", _boom)
+        elif breaks == "is_held":
+            monkeypatch.setattr(device_hold, "is_held", _boom)
+        elif breaks == "peek_sync_cache":
+            monkeypatch.setattr(dbmod, "peek_sync_cache", _boom)
+        else:
+            monkeypatch.setattr(pci, "_report_held_turnstiles", _boom)
+        payload = pci.build_heartbeat_payload(app)
+        lines = {t["gymDeviceId"]: t for t in payload["turnstiles"]}
+        assert set(lines) == {5, 6}, payload
+        assert lines[6]["failedPins"] == 0 and "held" not in lines[6]
+        if breaks in ("refill_roster", "peek_sync_cache"):
+            assert lines[5]["held"] is True and lines[5]["failedPins"] == 2, "the worker's figure"
+
+    def test_a_member_list_gone_before_the_first_delete_stops_the_run(self, sqlite_db,
+                                                                      monkeypatch, tmp_path):
+        """Review nit: the re-check's REFILL_SOURCE_MISSING branch had no test."""
+        import app.core.db as dbmod
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            monkeypatch.setattr(dbmod, "load_sync_cache", lambda: None)
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "REFILL_SOURCE_MISSING" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
 
 
 # ─────────────────────────── C0: the people the refill will not put back ───────────────────────────
