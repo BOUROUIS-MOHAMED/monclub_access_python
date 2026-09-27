@@ -402,7 +402,8 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
    db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
    rows after the retire: Quit, retire again.
 5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows, and the watchdog
-   as the runbook's F-end says (`Enable-ScheduledTask` where it existed, then the `NextRunTime` check).
+   as the runbook's part C box "Turning the watchdog back on" says (by what exists now: a task,
+   `Enable-ScheduledTask`; none, `register_watchdog.ps1`; its `State` must read `Ready`).
 
 ### Phase F -- the days after
 Daily, P1's log: no `REVOKE_ABORTED`, no `MAINTENANCE_SKIPPED`, no `CAPACITY_FULL`, no
@@ -443,8 +444,8 @@ terminal whose cable is out or that is blocked (`local_access_api_v2._handle_dev
 started and give none of its autostart back, and a data folder copied back was copied with
 start-with-Windows unticked (Access then deletes its start-up entry at every start,
 `app/ui/app.py::_sync_startup_registration`) `[CODE]`. So finish with the runbook's **F-end** step on
-every PC that runs Access: re-tick start-with-Windows, `Enable-ScheduledTask` where the watchdog existed
-(then the `NextRunTime` check), **resume Windows Update on P1** (paused at E1) -- and the next evening one
+every PC that runs Access: re-tick start-with-Windows, the watchdog back on (runbook part C, "Turning the
+watchdog back on": by what exists now, its `State` `Ready`), **resume Windows Update on P1** (paused at E1) -- and the next evening one
 power cycle (runbook E6, autostart checklist §5). Not on a PC that must stay stopped (P2/P3 behind
 their block, D2).
 

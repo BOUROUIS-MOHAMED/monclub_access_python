@@ -70,12 +70,14 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
   per PC (root folder of Task Scheduler), and every account's Access shares one data
   folder, `%ProgramData%\MonClub Access` (`app/core/utils.py::_candidate_data_roots`).
   **Install Access and register the watchdog only under the account that logs on by
-  itself.** A second account's registration either fails (it cannot see or replace the
-  first account's task) or, from an administrator account, replaces it with one that
-  runs only when that other account is logged on `[UNVERIFIED: not tried]`. Uninstalling
-  from another account removes the shared `%ProgramData%\MonClub Access` too
-  (`MonClubAccess.iss` `[UninstallDelete]`) -- the gym's database, login and history --
-  so copy that folder first, and do it on its own day, not a cutover night. The task
+  itself.** A second account's registration probably fails -- it cannot see or replace
+  the first account's task, and the installer asks for no elevation, so an administrator
+  account most likely runs it the same way `[UNVERIFIED: not tried]`. Uninstalling from
+  another account removes the shared `%ProgramData%\MonClub Access` too
+  (`MonClubAccess.iss` `[UninstallDelete]`) -- the gym's database, login and history. Do it
+  on its own day, not a cutover night: stop Access in every account first (start-up box
+  unticked, `Disable-ScheduledTask`, Quit), copy that folder, uninstall, put the copy back
+  before Access starts again (autostart checklist §3a). The task
   name stays the same (not per user): the runbook, the checklists and every PC already
   registered use `'MonClub Access Watchdog'`, and a new name would leave the old task
   running beside the new one after the next update.
@@ -165,7 +167,9 @@ could count as confirmed and be restarted. How close they land is not measured
 (`[UNVERIFIED]`). **Fixed in the check script (`2f3d5bd`):** the second miss counts only
 90 s or more after the first (`-MinSecondsBetweenMisses`, the time kept as integer epoch
 seconds in `watchdog-state.json`, `missAt`), so Access comes back **no sooner than about
-90 s** after the first check that found it gone `[CODE, TEST]`. A PC whose
+90 s** after the first check that found it gone `[CODE, TEST]`. The time is taken when a check
+runs, so a check that starts late (at logon, under a virus scan) can put the next one under 90 s
+later: that adds one 2-minute interval to the restart -- never a stand-down. A PC whose
 `<InstallRoot>\watchdog\` still holds an older check script still counts checks. Either
 way, **disable the task before a Quit that must stick** -- a restart after 90 s is still
 a restart.
@@ -272,12 +276,15 @@ installer calls) against a **stubbed** Task Scheduler — a disabled task comes 
 disabled (also when its check is running: `State = Running`, `Settings.Enabled =
 False`), an enabled or absent one enabled, a failed registration puts the old task
 back, a put-back or a new task that will not stay disabled ends with no task rather
-than an enabled one, every run is logged, priority 5 — and never registers a real
+than an enabled one (also when the put-back itself fails, or a failed registration had
+created the task), every run is logged, priority 5 — and never registers a real
 task: it uses a throwaway task name and fails with `LEAKED` if one reached Windows. It
 also pins the installer's two `watchdog` task lines, `SetupLogging` and `logoutput`,
 no `checkedonce` on any task, and compiles `MonClubAccess.iss` when `ISCC.exe` is
 installed. One test runs the script as the installer does (`powershell -File`) on a path
-that fails before any Task Scheduler cmdlet: it exits non-zero and logs `FAILED`. What
+that fails before any Task Scheduler cmdlet: it exits non-zero and logs `FAILED` (it
+has the same `LEAKED` guard). The watchdog's own checks run under Windows PowerShell 5.1
+when it is there, as the task runs them. What
 Task Scheduler itself does with a task registered with `Settings.Enabled = $false`, or
 with an exported task registered again, was **not** run here; both are read back
 (definition and state) and disabled or removed if they come back enabled. The

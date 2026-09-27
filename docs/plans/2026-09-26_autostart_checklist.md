@@ -127,12 +127,14 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
   `FAILED` with the error; Setup's own log is in `%TEMP%` (`Setup Log <date> #<n>.txt`).
 - **Priority** (from `2f3d5bd`): the task is registered at priority 5, normal. Task Scheduler's default
   is 7, below normal, and Access started by the task probably inherited it `[UNVERIFIED]`
-  (`packaging/watchdog/README.md`, "Priority"). After a watchdog restart (the test in section 5, or kill
-  `MonClubAccess.exe` once and wait), in PowerShell: `Get-Process MonClubAccess | Select PriorityClass`
-  must print `Normal`, and `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').Settings.Priority`
-  `5`. `BelowNormal` / `7`: the task was registered by an older script -- run
-  `%LOCALAPPDATA%\MonClubAccess\watchdog\register_watchdog.ps1` again as that user (it keeps a disabled
-  task disabled) and write both values on the sheet.
+  (`packaging/watchdog/README.md`, "Priority"). Only a restart **by the watchdog** shows it: on a closed
+  evening, never during an erase or a refill, with the task enabled, end `MonClubAccess.exe` once in Task
+  Manager and wait for it to come back (within about 4 minutes) -- after a power cycle the start-up entry may have started Access instead. Then, in
+  PowerShell: `Get-Process MonClubAccess | Select PriorityClass` must print `Normal`, and
+  `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').Settings.Priority` `5`. `BelowNormal` / `7`:
+  the task was registered by an older script -- as that user, `powershell -ExecutionPolicy Bypass -File
+  "$env:LOCALAPPDATA\MonClubAccess\watchdog\register_watchdog.ps1"` (it keeps a disabled task disabled),
+  then end and wait once more. Write both values on the sheet.
 - **"Ouvrir MonClub Access avec Windows"** (Access → Config): a start-up entry for the user; it starts
   Access at logon but does not restart it after a crash. Access rewrites that entry from the box at
   every start (`app.py::_sync_startup_registration`).
@@ -159,16 +161,24 @@ The install is **per Windows user** (`PrivilegesRequired=lowest`: the program go
 
 **The rule:** install Access, and register the watchdog, **only under the account that logs on by
 itself** (section 2). If another account has Access installed, uninstall it there **first** -- on its own
-day, never a cutover night, and only after copying `%ProgramData%\MonClub Access` to the USB key, since
-that uninstall deletes it; put the copy back before the next start of Access `[UNVERIFIED: never
-done; whether one account's uninstaller can delete folders another account's Access created depends on
-the folder's permissions]`. To see which accounts have it, in an **administrator** PowerShell:
+day, never a cutover night, with the gym closed `[UNVERIFIED: never done; whether one account's
+uninstaller can delete folders another account's Access created depends on the folder's permissions]`:
+1. In **every** account that has Access, stop it so nothing writes the data folder or starts it again:
+   untick "Ouvrir MonClub Access avec Windows", `Disable-ScheduledTask -TaskName 'MonClub Access
+   Watchdog'` (if it exists), tray icon → Quit; Task Manager shows no `MonClubAccess.exe` (runbook A1).
+2. Copy the whole `%ProgramData%\MonClub Access` to the USB key -- that uninstall deletes it.
+3. Uninstall from the other account; log off from it.
+4. In the account that logs on by itself: if `%ProgramData%\MonClub Access` is gone or incomplete, put
+   the copy back **before** Access starts; then start Access, and give autostart back as the runbook's
+   F-end does (the box re-ticked, the watchdog back on by what exists, its `State` `Ready`).
+
+To see which accounts have it, in an **administrator** PowerShell:
 `Get-ChildItem 'C:\Users\*\AppData\Local\MonClubAccess\current\MonClubAccess.exe'` (one line per
 account) and `(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').Principal.UserId` (the account the
-task runs as). What a second account's registration does is `[UNVERIFIED]`: a standard account cannot
-see or replace the first account's task, so its registration fails (logged in its own
-`watchdog-register.log`); an administrator account replaces it with one that runs only while **it** is
-logged on.
+task runs as). What a second account's registration does is `[UNVERIFIED]`: it probably cannot see or
+replace the first account's task, so it fails (logged in that account's own `watchdog-register.log`) --
+the installer asks for no elevation (`PrivilegesRequired=lowest`), so an administrator account most
+likely runs it the same way.
 
 **Why one task name, not one per account:** the runbook, these checklists and every PC already
 registered use `'MonClub Access Watchdog'`; a per-account name would leave the old task running beside
@@ -181,9 +191,13 @@ The runbook unticks "Ouvrir MonClub Access avec Windows" and disables the watchd
 (C1, D1), and every install that night is run with **"Keep MonClub Access running" unticked**, followed
 by a check that the task reads `Disabled` or does not exist (runbook C3c, D9) -- otherwise the install
 would switch the watchdog back on and Access would restart by itself in the middle of the night's
-steps. The last step of each gym (C17, D19) re-enables both: re-tick the box in Access, and
-`Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` where the task existed (or, where it never
-existed and the PC should have it, run `register_watchdog.ps1` as in section 3). Then check
+steps. The last step of each gym (C17, D19) re-enables both: re-tick the box in Access, and the
+watchdog **by what exists now** (runbook part C, "Turning the watchdog back on"): a task there --
+the old one, or the one registered at A7 and disabled at C1 -- `Enable-ScheduledTask -TaskName
+'MonClub Access Watchdog'`; none, and the PC should have it, `register_watchdog.ps1` as in section 3.
+Never `register_watchdog.ps1` over a disabled task to switch it on: it keeps it disabled. Then
+`(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').State` must read `Ready` (or `Running`
+during a check) -- `NextRunTime` alone cannot tell a disabled task from an enabled one -- and check
 `NextRunTime` (section 3): empty means the watchdog first runs at the next Windows logon -- that is
 expected with the script on `master` `d3725fa` (a logon trigger only), and is the case every morning
 after a power cut, which starts with a logon. With the owner's second trigger (`b30ef60`), whether
@@ -214,9 +228,9 @@ night, and its row **E6** proves one power cycle (section 5) the next evening.
 8. **Result:** t1 − t0, t2 − t0, t3 − t0 on the sheet. Compare t3 with the gym's opening time: the whole
    chain must finish before the first member.
 
-9. After the power cycle, if the watchdog task exists and is enabled: `Get-Process MonClubAccess | Select
-   PriorityClass` (section 3, "Priority"; `Normal` expected when the watchdog started it) and write it on
-   the sheet.
+9. If the watchdog task exists and is enabled, and the priority is not on the sheet yet: its check of
+   section 3 ("Priority" -- end `MonClubAccess.exe` once and let the watchdog bring it back; the power
+   cycle alone does not show it).
 
 **STOP rules:** the PC stays off → BIOS; it stops at the login screen → auto-logon; Access does not start
 → watchdog / start-up box, and `%LOCALAPPDATA%\MonClubAccess\logs\watchdog.log`: a line
@@ -230,8 +244,8 @@ An update deletes `%LOCALAPPDATA%\MonClubAccess\current\` before copying the new
 (`MonClubAccess.iss::PrepareToInstall`), and the in-app updater swaps the same folder. Power lost in
 that window can leave a PC that **cannot start Access by itself**: the program file is missing (the
 watchdog then stands down at every check, and the start-up entry points at nothing), or it is there
-without the rest (Access fails at start, `%TEMP%\MonClubAccess.log`; the watchdog stops retrying after 5
-restarts in an hour). Nothing repairs it on its own. Recovery, as the account Access is installed for
+without the rest (Access fails at start, `%TEMP%\MonClubAccess.log`; the watchdog restarts it at most 5
+times in any hour, logging `NOT restarting` in between). Nothing repairs it on its own. Recovery, as the account Access is installed for
 (section 3a) -- **never uninstall** (it deletes `%ProgramData%\MonClub Access`):
 1. Run the installer of the version the PC was updating to, over the existing install.
 2. If it answers "MonClub Access version X is already installed on this PC. Nothing will be changed.",
