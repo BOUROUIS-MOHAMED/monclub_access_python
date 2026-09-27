@@ -3344,7 +3344,11 @@ poll is the backstop. Handlers run on
 their own thread. `handlers.py` reuses the desk's code: DOOR_OPEN → the lease-gated `_handle_device_door_open`
 (so §3.1a's claim and deadline apply; `SENT_NO_ANSWER` when the driver answered "sent, no answer"); CARD_SCAN →
 `_handle_scan_quick`; ENROLL_START → `_handle_enroll_start` with the payload as its body (outcome from
-`MainApp._last_enroll_outcome`); ENROLL_CANCEL cancels only the enrolment its command started;
+`MainApp._last_enroll_outcome`; its progress is `{enrollId, scansDone, scansNeeded: 3}` from the
+scanner's structured phase, `handlers.py::enroll_progress` — waiting for or retrying sample n is n-1
+done, `processing` is 3 — and never the desk's free-text step line, which carries mojibake; the phase
+object seen before the start is ignored, because the new worker resets the globals only when its thread
+runs, lane 1 2026-09-27 `[TEST: test_v2_enroll_progress.py]`); ENROLL_CANCEL cancels only the enrolment its command started;
 MEMBERS_RESYNC → a sync (explicit for `{reason:"user-sync"}`); DEVICE_RECONCILE → an explicit full reconcile of
 that turnstile; DEVICE_AUDIT → one read-only listing vs owned pins; LOGS_FLUSH → `flush_now()`;
 REMOVAL_CONFIRM below. `[CODE]` `[TEST: test_v2_commands.py, test_v2_handlers.py]`
