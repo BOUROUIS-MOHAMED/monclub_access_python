@@ -2055,7 +2055,17 @@ run folder's `run.json`):
      enrolled on the terminal since step 1 — ends the run `NOT_REFILLED_CHANGED`, `FAILED`, nothing erased (the operator
      reads step 1 again). That roster excuses its pins only under the scheme it was read with: a pin-scheme switch saved
      since step 1 (during the backup) ends the run `PIN_SCHEME_CHANGED`, `FAILED`, nothing erased — every old pin would
-     otherwise read "not put back" (lane 1c review round 2). Then the run records `notRefilled {count, pins}` — those who left the roster included — and,
+     otherwise read "not put back" (lane 1c review round 2).
+   - *A stop before the first delete once the scheme moved keeps the hold* (lane 1c review round 3,
+     `EraseWizard._scheme_moved`): any `FAILED` run — that one, or a now/auto re-check finding withheld rows under the new
+     scheme — whose turnstile's scheme differs from the run's start (or does not read) keeps the hold and asks no pass,
+     note `HELD_SCHEME_MOVED`: the terminal still holds every pin of the old scheme, and a released pass would write the
+     new scheme's pins beside them. The operator erases again with "hold" (step 1 then lists every old pin as not put
+     back), or sets the scheme back, before « Remplir » — `_refill`'s own end-of-run rule. The hold is still at
+     `erase-prep`, so a restart releases it (§ "A run stopped before any delete leaves no hold"): the protection covers the
+     running session only. With the scheme unchanged a `FAILED` run releases as before. `[TEST:
+     test_erase_wizard_lane1c.py::TestPeopleTheRefillWillNotPutBack::test_a_scheme_switched_since_step_1_stops_the_run_before_any_delete,
+     ::test_any_failure_before_the_first_delete_after_a_switch_keeps_the_hold, ::test_a_failure_with_the_scheme_unchanged_still_releases]` Then the run records `notRefilled {count, pins}` — those who left the roster included — and,
      when there are any, writes the keep mark (above) before `begin_device_erase`. `[TEST: ::TestPeopleTheRefillWillNotPutBack]`
    - *The erase is recorded* (`db.begin_device_erase`, one durable transaction, review F12 + F1): the run's hold row
      moves to `erase` (a delete may run from here), and the last push result (§3.9) of every pin MonClub recorded for
