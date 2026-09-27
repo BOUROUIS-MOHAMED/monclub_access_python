@@ -815,6 +815,24 @@ class TestPeopleTheRefillWillNotPutBack:
         status, _ = wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
         assert status == 202
 
+    def test_a_switch_landing_between_starts_two_reads_is_refused_too(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        """Review round 5 nit: start() read the device row, then the strict scheme; a switch saved
+        between the two would pass the step-1 comparison (old row) and make the run's start
+        scheme the new one. The refill check re-reads the row after the scheme read."""
+        from tests.test_erase_wizard import _device
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        real = wiz._pin_scheme_strict
+
+        def _switch_then_read(did):
+            _account(monkeypatch, 5, _device())          # the switch lands between the reads
+            return real(did)
+        monkeypatch.setattr(wiz, "_pin_scheme_strict", _switch_then_read)
+        status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert status == 409 and out["code"] == "PIN_SCHEME_CHANGED", out
+        assert not device_hold.is_held(5) and worker.full_sync_requests == []
+
     def test_a_scheme_that_does_not_read_after_a_stop_keeps_the_hold_with_its_own_note(
             self, sqlite_db, monkeypatch, tmp_path, refill_cache):
         """Review round 4 nit: an unreadable scheme is not "moved" -- its own note."""

@@ -899,7 +899,10 @@ class EraseWizard:
             return 503, {"ok": False, "code": "PIN_SCHEME_UNREADABLE",
                          "error": f"the turnstile's pin scheme could not be read: {exc}"}
         if not backup_only:
-            check = self._refill_check(did, device)
+            # The device row read again, AFTER the strict scheme read above: a switch landing
+            # between the two would otherwise pass the step-1 comparison below on the old row while
+            # the run's start scheme is already the new one (lane 1c review round 5).
+            check = self._refill_check(did)
             # Compared only when both were computed: no roster now (REFILL_SOURCE_MISSING) or at
             # step 1 (NOT_REFILLED_UNKNOWN) has its own refusal below.
             if ("_pins" in check and preview.get("rosterScheme") is not None
