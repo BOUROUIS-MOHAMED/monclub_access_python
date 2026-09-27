@@ -9197,6 +9197,27 @@ def record_push_results(*, device_id: int, rows: "Iterable[tuple]") -> int:
     return int(_run_db_write_sync("record_push_results", _write))
 
 
+def reset_push_results_for_pins(*, device_id: int, pins: "Iterable[str]") -> int:
+    """A write OUTSIDE the sync -- the local admin route ``users/push`` -- changes what the
+    turnstile holds for these pins without being a MonClub attempt: their last push result becomes
+    UNKNOWN before its first device write, durably, stamped with this moment as an attempt start
+    is (contract revision 4.1 §1.1). Such a write never produces ``true``. Raises on failure: the
+    caller must then not write."""
+    from app.core.v2.server_clock import corrected_now
+
+    did = int(device_id)
+    clean = sorted({str(p).strip() for p in (pins or ()) if str(p or "").strip()})
+    if not clean:
+        return 0
+    at, corrected = corrected_now()
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        _reset_push_results_on(conn, did, clean, at=at, corrected=corrected)
+        return len(clean)
+
+    return int(_run_db_write_sync("reset_push_results_for_pins", _write, durable=True))
+
+
 def reset_device_push_results(*, device_id: int) -> int:
     """Every last push result of one turnstile becomes unknown: this PC acquired it (a DRIVE
     lease's restore) -- its own old result is not the latest any more (contract §1.1)."""

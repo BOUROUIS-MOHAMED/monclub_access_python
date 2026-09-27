@@ -4744,6 +4744,17 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
     if err:
         ctx.send_json(500, {"ok": False, "error": err})
         return
+    # Not a MonClub push attempt (the content is the operator's), but it changes what the
+    # turnstile holds for this pin: its last push result becomes unknown BEFORE the first write,
+    # durably (contract revision 4.1 §1.1). No record, no write.
+    try:
+        from app.core.db import reset_push_results_for_pins
+        reset_push_results_for_pins(device_id=did, pins=[pin])
+    except Exception as e:
+        try: sdk.disconnect()
+        except Exception: pass
+        ctx.send_json(500, {"ok": False, "error": f"the push could not be recorded first: {e}"})
+        return
 
     try:
         # Push user

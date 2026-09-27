@@ -668,3 +668,44 @@ def test_a_loaded_sample_is_retired_by_a_step_after_the_restart(step):
     real["m"] += 400
     t["wall"] += 400
     assert "ageSec" not in clk.report(), "and it never comes back"
+
+
+# ─────────────────────────── contract revision 4.1: the fifth writer ───────────────────────────
+
+class TestTheAdminUsersPushRoute:
+    """``POST /api/v2/devices/{id}/users/push`` writes a user row, door rights and templates for any
+    pin, outside the sync. Not a MonClub attempt -- never ``true`` -- but it changes what the
+    turnstile holds: the pin's result becomes unknown, durably, before the first device write."""
+
+    def _call(self, monkeypatch, sdk):
+        import app.api.local_access_api_v2 as la2
+        monkeypatch.setattr(la2, "_unsupported_for_protocol", lambda *a, **k: False)
+        monkeypatch.setattr(la2, "_connect_device", lambda ctx, did: (sdk, None))
+        sent = []
+        ctx = SimpleNamespace(app=SimpleNamespace(), param_int=lambda name, default=0: 5,
+                              body=lambda: {"pin": "101", "name": "A", "cardNo": "1001"},
+                              send_json=lambda status, payload: sent.append((status, payload)))
+        la2._handle_device_users_push(ctx)
+        return sent
+
+    def test_the_result_is_reset_before_the_first_write_and_never_true(self, db, monkeypatch):
+        db.record_push_results(device_id=5, rows=[("101", True, None)])
+        seen = []
+        sdk = MagicMock()
+        sdk.set_device_data.side_effect = lambda **kw: seen.append(
+            dbmod.list_push_results(device_id=5)["101"]) or 0
+        self._call(monkeypatch, sdk)
+        assert seen, "the route wrote to the turnstile"
+        ok, at, _corr, err = seen[0]
+        assert ok is None and err is None and at is not None, "unknown, and stamped, before the write"
+        assert dbmod.list_push_results(device_id=5)["101"][0] is None, "never true afterwards"
+
+    def test_no_write_when_the_reset_cannot_be_recorded(self, db, monkeypatch):
+        def _broken(**kw):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(dbmod, "reset_push_results_for_pins", _broken)
+        sdk = MagicMock()
+        sent = self._call(monkeypatch, sdk)
+        assert sent and sent[-1][0] == 500
+        assert not sdk.set_device_data.called and sdk.disconnect.called

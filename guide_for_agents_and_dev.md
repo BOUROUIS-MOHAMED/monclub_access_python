@@ -3590,6 +3590,13 @@ Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_resul
   re-sends the row. **A restore** (this PC acquiring the turnstile, once per lease generation) makes every result
   of that turnstile unknown first, with no time (members stay "not known" until their next push: accepted,
   master note 5). **Forget** (§3.2h) deletes them. `[CODE]`
+- **A fifth writer, outside the sync (contract revision 4.1 §1.1): the local admin route `users/push`**
+  (`local_access_api_v2.py::_handle_device_users_push`) writes a user row, door rights and templates for any pin
+  from the request body, with no intent and no sync state. It is not a MonClub attempt and never produces
+  `true`; but it changes what the turnstile holds, so right before its first device write it makes that pin's
+  result unknown, durably, stamped with the moment (`db.py::reset_push_results_for_pins`) — a reset that cannot be
+  recorded means no write (500). A held or handed-over turnstile is refused before any connect (§3.2h). `[CODE]`
+  `[TEST: test_v2_last_push.py::TestTheAdminUsersPushRoute]`
 - **Upload.** The three fields are part of "has this row changed": `v2_ownership_uploaded` gains
   `last_push_ok / last_push_src_at / last_push_error / last_push_sent_at`, the change key being the LOCAL record
   (ok, its own time, code) so a moving clock offset does not re-send rows; a changed row gets an `observedAt`
