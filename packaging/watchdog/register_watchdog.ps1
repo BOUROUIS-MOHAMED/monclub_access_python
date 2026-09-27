@@ -211,17 +211,41 @@ if ($keepDisabled) {
     $settings.Enabled = $false
 }
 
+# Keep the current task's definition, to put it back if registering the new one
+# fails. The old task is removed first, so without this a failed registration
+# would leave NO task -- and the next install, box still ticked, would register a
+# new ENABLED one over what had been a disabled watchdog. The exported XML holds
+# the task's own <Enabled> flag, so a disabled task comes back disabled. (Our task
+# lives at the root folder; that is where it is registered below.)
+$previousXml = $null
+if (Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue) {
+    $previousXml = Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
+}
+
 # Re-register rather than update: an older task may have a different action.
 Remove-WatchdogTask
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger @($trigger, $heartbeatTrigger) `
-    -Settings $settings `
-    -Principal $principal `
-    -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
-                  "Stands down while an install or update is in progress.") | Out-Null
+try {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $action `
+        -Trigger @($trigger, $heartbeatTrigger) `
+        -Settings $settings `
+        -Principal $principal `
+        -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
+                      "Stands down while an install or update is in progress.") | Out-Null
+} catch {
+    $registerError = $_
+    if ($previousXml) {
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Xml $previousXml | Out-Null
+            Write-Warning "Registering the new task failed; the previous task '$TaskName' was put back as it was."
+        } catch {
+            Write-Warning "Registering the new task failed, and putting the previous task '$TaskName' back failed too: $_"
+        }
+    }
+    throw $registerError
+}
 
 if ($keepDisabled) {
     # Settings.Enabled = $false should already register it disabled. Read it back

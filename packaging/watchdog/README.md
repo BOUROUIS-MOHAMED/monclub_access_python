@@ -38,9 +38,15 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
 - **A disabled task stays disabled.** Ticked, the installer runs
   `register_watchdog.ps1`, which replaces the task with the current definition — and
   keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
-  cutover runbook). It prints `State: Disabled (kept)`. Only
-  `Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` turns it back on.
-  Installers built before this change re-registered it **enabled**.
+  cutover runbook). It prints `State: Disabled (kept)`; `Enable-ScheduledTask -TaskName
+  'MonClub Access Watchdog'` turns it back on. The old task is removed before the new
+  one is registered, so the script first exports it and, if the registration fails,
+  registers the old one again from that export (disabled if it was) and still fails
+  the run. A task that was **removed** (`-Remove`, an uninstall) is not "disabled":
+  the next install with the box ticked registers it enabled. The installer does not
+  check the script's exit code and runs it hidden, so on a silent update a failure is
+  seen only in the task's state. Installers built before this change re-registered
+  it **enabled**.
 - Unticked, the installer does not touch an existing task at all.
 
 To register it by hand on a PC that is already installed:
@@ -118,6 +124,13 @@ trigger does not survive a reboot. When both repeat, checks simply run more ofte
 harmless, because the only action is starting an absent app and MonClub Access
 refuses to run twice (single-instance mutex, `access/main.py`).
 
+*Note added 2026-09-27 (review of the paragraph above, not the owner's text):* the
+two-misses rule counts **checks**, not minutes (`$RequiredConsecutiveMisses`,
+`monclub_access_watchdog.ps1`). With two triggers on different starts, two checks can
+land close together, so an absence of well under two minutes -- a tray Quit included --
+can already count as confirmed and be restarted. How close they land is not measured
+(`[UNVERIFIED]`). Disable the task before a Quit that must stick.
+
 **Verified here (2026-09-13):** both triggers registered; `NextRunTime` populated
 immediately; the task then ran **on its own**, two minutes apart, `LastTaskResult = 0`,
 each run writing its log line. (An earlier revision of this note said scheduled
@@ -167,9 +180,11 @@ PowerShell is unavailable.
 
 The same file runs `register_watchdog.ps1` under Windows PowerShell 5.1 (what the
 installer calls) against a **stubbed** Task Scheduler — a disabled task comes back
-disabled, an enabled or absent one enabled — and never registers a real task: it
+disabled, an enabled or absent one enabled, a failed registration puts the old task
+back — and never registers a real task: it
 uses a throwaway task name and fails with `LEAKED` if one reached Windows. It also
 pins the installer's two `watchdog` task lines and compiles `MonClubAccess.iss` when
 `ISCC.exe` is installed. What Task Scheduler itself does with a task registered
-with `Settings.Enabled = $false` was **not** run here; the script reads the state
-back and disables it explicitly if needed.
+with `Settings.Enabled = $false`, or with an exported task registered again, was
+**not** run here; the script reads the state back and disables it explicitly if
+needed.

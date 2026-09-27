@@ -259,7 +259,7 @@ class TestCrashLoopCap:
 
 
 # Runs the SHIPPED register_watchdog.ps1 with the Task Scheduler cmdlets replaced
-# by stubs that keep one fake task in memory. Nothing may reach the real Task
+# by stubs that keep the fake tasks in memory. Nothing may reach the real Task
 # Scheduler, so, in this order:
 #   * ScheduledTasks is imported BEFORE the stubs are defined. Its commands are
 #     functions (a CDXML module); auto-loaded later, they would be "added most
@@ -277,51 +277,83 @@ param(
     [string] $TaskName,
     [string] $InstallRoot,
     [string] $WatchdogScript,
-    [string] $Initial,         # 'none' = no task yet; else its State, e.g. Disabled, Ready
+    [string] $Initial,         # 'none', or the tasks' States, comma-separated: the first
+                               # at the root folder '\', any others in other folders
     [string] $HonourEnabled,   # 'yes': a task registered with Settings.Enabled = $false comes back Disabled
-    [string] $DisableWorks     # 'yes': Disable-ScheduledTask takes effect
+    [string] $DisableWorks,    # 'yes': Disable-ScheduledTask takes effect
+    [string] $RegisterFails    # 'yes': the first (non -Xml) registration throws
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ScheduledTasks
 
 $global:Calls      = New-Object System.Collections.ArrayList
-$global:TaskState  = if ($Initial -eq 'none') { '' } else { $Initial }
+$global:Tasks      = New-Object System.Collections.ArrayList
 $global:Honour     = ($HonourEnabled -eq 'yes')
 $global:DisableOk  = ($DisableWorks -eq 'yes')
+$global:FailNext   = ($RegisterFails -eq 'yes')
 $global:Expected   = $TaskName
 $global:Registered = $null
+if ($Initial -ne 'none') {
+    $i = 0
+    foreach ($s in ($Initial -split ',')) {
+        $path = if ($i -eq 0) { '\' } else { "\Other$i\" }
+        [void] $global:Tasks.Add([pscustomobject]@{ TaskName = $TaskName; TaskPath = $path; State = $s })
+        $i++
+    }
+}
+function global:Set-RootTask([string] $State) {
+    foreach ($t in @($global:Tasks | Where-Object { $_.TaskPath -eq '\' })) { $global:Tasks.Remove($t) }
+    [void] $global:Tasks.Add([pscustomobject]@{ TaskName = $global:Expected; TaskPath = '\'; State = $State })
+}
 
 function global:Get-ScheduledTask {
-    param([string] $TaskName, $ErrorAction)
+    param([string] $TaskName, [string] $TaskPath, $ErrorAction)
     if ($TaskName -ne $global:Expected) { throw "stub: unexpected task name '$TaskName'" }
     [void] $global:Calls.Add('get')
-    if ($global:TaskState) { [pscustomobject]@{ TaskName = $TaskName; State = $global:TaskState } }
+    $global:Tasks | Where-Object { -not $TaskPath -or $_.TaskPath -eq $TaskPath }
+}
+function global:Export-ScheduledTask {
+    param([string] $TaskName, [string] $TaskPath)
+    [void] $global:Calls.Add('export')
+    $t = @($global:Tasks | Where-Object { $_.TaskPath -eq $TaskPath })[0]
+    $enabled = if ($t.State -eq 'Disabled') { 'false' } else { 'true' }
+    "<Task><Settings><Enabled>$enabled</Enabled></Settings></Task>"
 }
 function global:Unregister-ScheduledTask {
     param([string] $TaskName, $Confirm)
     [void] $global:Calls.Add('unregister')
-    $global:TaskState = ''
+    $global:Tasks.Clear()
 }
 function global:Register-ScheduledTask {
-    param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description)
+    param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description, $Xml)
+    if ($Xml) {
+        [void] $global:Calls.Add('register-xml')
+        Set-RootTask $(if ($Xml -match '<Enabled>false</Enabled>') { 'Disabled' } else { 'Ready' })
+        return [pscustomobject]@{ TaskName = $TaskName }
+    }
+    if ($global:FailNext) {
+        $global:FailNext = $false
+        [void] $global:Calls.Add('register-failed')
+        throw 'stub: registration failed'
+    }
     [void] $global:Calls.Add('register')
     $global:Registered = [pscustomobject]@{
         name     = [string] $TaskName
         enabled  = [bool] $Settings.Enabled
         triggers = @($Trigger).Count
     }
-    if ($global:Honour -and -not $Settings.Enabled) { $global:TaskState = 'Disabled' } else { $global:TaskState = 'Ready' }
+    Set-RootTask $(if ($global:Honour -and -not $Settings.Enabled) { 'Disabled' } else { 'Ready' })
     [pscustomobject]@{ TaskName = $TaskName }
 }
 function global:Disable-ScheduledTask {
     param([string] $TaskName)
     [void] $global:Calls.Add('disable')
-    if ($global:DisableOk) { $global:TaskState = 'Disabled' }
+    if ($global:DisableOk) { foreach ($t in $global:Tasks) { $t.State = 'Disabled' } }
 }
 function global:Enable-ScheduledTask {
     param([string] $TaskName)
     [void] $global:Calls.Add('enable')
-    $global:TaskState = 'Ready'
+    foreach ($t in $global:Tasks) { $t.State = 'Ready' }
 }
 function global:Set-ScheduledTask {
     # The script has no reason to call it; if it ever does, fail rather than
@@ -329,8 +361,9 @@ function global:Set-ScheduledTask {
     throw 'stub: Set-ScheduledTask called'
 }
 
-$stubs = 'Get-ScheduledTask', 'Unregister-ScheduledTask', 'Register-ScheduledTask',
-         'Disable-ScheduledTask', 'Enable-ScheduledTask', 'Set-ScheduledTask'
+$stubs = 'Get-ScheduledTask', 'Export-ScheduledTask', 'Unregister-ScheduledTask',
+         'Register-ScheduledTask', 'Disable-ScheduledTask', 'Enable-ScheduledTask',
+         'Set-ScheduledTask'
 foreach ($name in $stubs) {
     $cmd = Get-Command $name
     if ($cmd.CommandType -ne 'Function' -or $cmd.ModuleName) {
@@ -340,8 +373,10 @@ foreach ($name in $stubs) {
 }
 
 $err = ''
+$iv = @(); $wv = @()
 try {
-    & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript 3>$null 6>$null | Out-Null
+    & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript `
+        -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
 } catch {
     $err = $_.Exception.Message
 } finally {
@@ -354,7 +389,8 @@ try {
 $result = [pscustomobject]@{
     calls      = @($global:Calls)
     registered = $global:Registered
-    final      = $global:TaskState
+    final      = (@($global:Tasks | ForEach-Object { [string] $_.State }) -join ',')
+    output     = (@($iv) + @($wv) | ForEach-Object { [string] $_ }) -join "`n"
     error      = $err
 }
 Write-Output ('RESULT ' + ($result | ConvertTo-Json -Compress -Depth 4))
@@ -367,6 +403,7 @@ def _register(
     initial: str,
     honour_enabled: bool = True,
     disable_works: bool = True,
+    register_fails: bool = False,
 ) -> dict:
     """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler."""
     harness = tmp_path / "register_harness.ps1"
@@ -386,7 +423,8 @@ def _register(
          "-WatchdogScript", str(watchdog),
          "-Initial", initial,
          "-HonourEnabled", "yes" if honour_enabled else "no",
-         "-DisableWorks", "yes" if disable_works else "no"],
+         "-DisableWorks", "yes" if disable_works else "no",
+         "-RegisterFails", "yes" if register_fails else "no"],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert "LEAKED" not in out.stdout, (
@@ -397,9 +435,11 @@ def _register(
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT ")]
     assert lines, f"harness gave no result: stdout={out.stdout!r} stderr={out.stderr!r}"
     result = json.loads(lines[-1][len("RESULT "):])
-    assert result["registered"] is not None and result["registered"]["name"] == task, (
+    assert any(c.startswith("register") for c in result["calls"]), (
         f"the script never reached the stubbed Register-ScheduledTask: {result!r}"
     )
+    if result["registered"] is not None:
+        assert result["registered"]["name"] == task, result
     return result
 
 
@@ -424,6 +464,7 @@ class TestRegisterKeepsADisabledTaskDisabled:
         )
         assert r["final"] == "Disabled"
         assert "enable" not in r["calls"]
+        assert re.search(r"State:\s+Disabled \(kept\)", r["output"]), r["output"]
 
     def test_it_is_disabled_again_if_windows_registers_it_enabled(self, tmp_path: Path):
         """Settings.Enabled = $false not honoured -> an explicit Disable-ScheduledTask."""
@@ -438,11 +479,34 @@ class TestRegisterKeepsADisabledTaskDisabled:
         assert "could not be kept disabled" in r["error"], r
         assert "Disable-ScheduledTask" in r["error"]
 
+    def test_a_failed_registration_puts_the_disabled_task_back(self, tmp_path: Path):
+        """The old task is removed before the new one is registered. Without the
+        put-back, a failed registration left no task at all, and the NEXT update
+        (box still ticked) registered a new, enabled one."""
+        r = _register(tmp_path, initial="Disabled", register_fails=True)
+        calls = r["calls"]
+        assert calls.index("export") < calls.index("unregister") < calls.index("register-failed")
+        assert calls.index("register-failed") < calls.index("register-xml"), calls
+        assert r["final"] == "Disabled", r
+        assert "stub: registration failed" in r["error"], (
+            f"the failure must still be reported, not swallowed: {r!r}"
+        )
+        assert "put back" in r["output"], r["output"]
+
+    def test_a_disabled_task_in_another_folder_also_counts(self, tmp_path: Path):
+        """Get-ScheduledTask -TaskName finds the name in every folder; any
+        disabled one keeps the new registration disabled (the safe side)."""
+        r = _register(tmp_path, initial="Ready,Disabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is False, r
+        assert r["final"] == "Disabled"
+
     def test_the_disabled_task_still_gets_the_new_definition(self, tmp_path: Path):
         """Kept off, but not frozen: the action and both triggers are refreshed,
         so a later Enable-ScheduledTask turns on the current watchdog, not an old one."""
         r = _register(tmp_path, initial="Disabled")
         assert r["calls"].index("unregister") < r["calls"].index("register")
+        assert "register-xml" not in r["calls"]
         assert r["registered"]["triggers"] == 2
 
     def test_an_enabled_task_stays_enabled(self, tmp_path: Path):
@@ -451,6 +515,7 @@ class TestRegisterKeepsADisabledTaskDisabled:
         assert r["registered"]["enabled"] is True
         assert r["final"] == "Ready"
         assert "disable" not in r["calls"]
+        assert re.search(r"State:\s+Enabled", r["output"]), r["output"]
 
     def test_a_first_registration_is_enabled(self, tmp_path: Path):
         r = _register(tmp_path, initial="none")
@@ -458,6 +523,7 @@ class TestRegisterKeepsADisabledTaskDisabled:
         assert r["registered"]["enabled"] is True
         assert r["final"] == "Ready"
         assert "unregister" not in r["calls"] and "disable" not in r["calls"]
+        assert "export" not in r["calls"]
 
 
 def _iss_section(text: str, name: str) -> list[str]:
@@ -541,7 +607,13 @@ class TestInstallerWatchdogTask:
         m = re.search(r"function IsFreshInstall\(\): Boolean;.*?\nend;", text, re.S)
         assert m, "IsFreshInstall is gone from the [Code] section"
         body = m.group(0)
-        assert "ExistingInstallDetected" in body and "WizardForm.PrevAppDir" in body, body
+        # Both traces must be ABSENT for "new": an `or`, or a dropped `not`, would
+        # tick the box on an existing install that left only one of them behind.
+        assert re.search(
+            r"Result\s*:=\s*\(\s*not\s+ExistingInstallDetected\s*\)\s+and\s+"
+            r"\(\s*WizardForm\.PrevAppDir\s*=\s*''\s*\)\s*;",
+            body,
+        ), body
 
     def test_the_register_script_runs_only_when_the_box_is_ticked(self):
         text = INSTALLER.read_text(encoding="utf-8", errors="replace")
