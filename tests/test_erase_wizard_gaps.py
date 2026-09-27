@@ -194,6 +194,27 @@ class TestTheRefusalGates:
         assert wiz.status()["run"]["state"] == "DONE"
 
 
+class TestTheBackupReadBack:
+
+    def test_a_backup_that_reads_back_differently_stops_before_any_erase(self, sqlite_db,
+                                                                        monkeypatch, tmp_path):
+        """The hash is checked on the bytes READ BACK: a disk that returns other bytes fails the
+        run before the first delete (review nit)."""
+        from pathlib import Path
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = Path.read_bytes
+
+        def _flipped(self):
+            data = real(self)
+            return data + b" " if self.name == "backup.json" else data
+        monkeypatch.setattr(Path, "read_bytes", _flipped)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "BACKUP_WRITE" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+
+
 class TestTheMb2000RefusalGates:
 
     def test_status_unreadable_at_step_1(self, sqlite_db, monkeypatch, tmp_path):

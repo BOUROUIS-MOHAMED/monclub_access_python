@@ -344,6 +344,7 @@ def test_the_must_not_call_grep_still_counts_three():
     import re
     from pathlib import Path
 
-    src = Path("app/sdk/zk_standalone.py").read_text(encoding="utf-8")
+    src = (Path(__file__).resolve().parents[1] / "app" / "sdk" / "zk_standalone.py").read_text(
+        encoding="utf-8")
     hits = re.findall(r"zk\.SSR_DeleteEnrollData|zk\.SSR_DelUserTmpExt", src)
     assert len(hits) == 3

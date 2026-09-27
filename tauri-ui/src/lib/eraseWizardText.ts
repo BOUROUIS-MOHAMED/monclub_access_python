@@ -220,7 +220,8 @@ const fr = {
   reasons: {
     DOOR_LOG_NOT_SUPPORTED:
       "Ne peut pas être effacé ici : le PC ne sait pas encore prouver quels passages de ce journal ont déjà été envoyés au serveur.",
-    UNREADABLE: "Le terminal n'a pas répondu pour cette table.",
+    UNREADABLE:
+      "Table absente ou illisible sur ce terminal (le terminal n'a pas donné de nombre). Sur un C3, c'est souvent la table v9 « template » : les empreintes sont dans « templatev10 ».",
   } as Record<string, string>,
   unknown: "—",
 };
@@ -440,7 +441,8 @@ const en: typeof fr = {
   reasons: {
     DOOR_LOG_NOT_SUPPORTED:
       "Cannot be erased here: the PC cannot yet prove which events of this log were already sent to the server.",
-    UNREADABLE: "The terminal did not answer for this table.",
+    UNREADABLE:
+      "Table missing or unreadable on this terminal (it gave no count). On a C3 this is often the v9 'template' table: the fingerprints are in 'templatev10'.",
   },
   unknown: "—",
 };
