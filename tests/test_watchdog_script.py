@@ -20,21 +20,34 @@ down with only a log line to say why.
 
 Run with ``-WhatIfOnly`` throughout: the script reports the decision it would
 make and starts nothing.
+
+The last two classes cover how the task gets installed: register_watchdog.ps1
+must keep a task someone disabled disabled (an update used to switch it back
+on), and the installer's "Keep MonClub Access running" box must be ticked for a
+new install only.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import sys
+import uuid
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "packaging" / "watchdog" / "monclub_access_watchdog.ps1"
+REGISTER = REPO / "packaging" / "watchdog" / "register_watchdog.ps1"
+INSTALLER = REPO / "installer" / "MonClubAccess.iss"
 
 pwsh = shutil.which("pwsh") or shutil.which("powershell")
+# The installer's [Run] entry calls powershell.exe, i.e. Windows PowerShell 5.1,
+# so the register script is tested under that shell and nothing else.
+winps = shutil.which("powershell") if sys.platform == "win32" else None
 pytestmark = [
     pytest.mark.skipif(pwsh is None, reason="PowerShell not available"),
     pytest.mark.skipif(not SCRIPT.exists(), reason=f"{SCRIPT} missing"),
@@ -243,3 +256,319 @@ class TestCrashLoopCap:
         (logs / "watchdog-state.json").write_text("not json{{{", encoding="utf-8")
         line = _run(root)
         assert "miss 1/2" in line, f"corrupt state should reset, got: {line!r}"
+
+
+# Runs the SHIPPED register_watchdog.ps1 with the Task Scheduler cmdlets replaced
+# by stubs that keep one fake task in memory. Nothing may reach the real Task
+# Scheduler, so, in this order:
+#   * ScheduledTasks is imported BEFORE the stubs are defined. Its commands are
+#     functions (a CDXML module); auto-loaded later, they would be "added most
+#     recently" and win over the stubs -- and the real Register-ScheduledTask
+#     would run on the machine.
+#   * Every stub is checked to be the command that resolves, before the script runs.
+#   * The task name is a throwaway one, and afterwards the REAL cmdlets
+#     (module-qualified) look for it: found means a stub leaked; it is removed
+#     and the test fails on LEAKED.
+# -WatchdogScript points at a folder without the hidden launcher, so the script
+# takes its direct-launch fallback and starts no wscript probe.
+_REGISTER_HARNESS = r"""
+param(
+    [string] $Script,
+    [string] $TaskName,
+    [string] $InstallRoot,
+    [string] $WatchdogScript,
+    [string] $Initial,         # 'none' = no task yet; else its State, e.g. Disabled, Ready
+    [string] $HonourEnabled,   # 'yes': a task registered with Settings.Enabled = $false comes back Disabled
+    [string] $DisableWorks     # 'yes': Disable-ScheduledTask takes effect
+)
+$ErrorActionPreference = 'Stop'
+Import-Module ScheduledTasks
+
+$global:Calls      = New-Object System.Collections.ArrayList
+$global:TaskState  = if ($Initial -eq 'none') { '' } else { $Initial }
+$global:Honour     = ($HonourEnabled -eq 'yes')
+$global:DisableOk  = ($DisableWorks -eq 'yes')
+$global:Expected   = $TaskName
+$global:Registered = $null
+
+function global:Get-ScheduledTask {
+    param([string] $TaskName, $ErrorAction)
+    if ($TaskName -ne $global:Expected) { throw "stub: unexpected task name '$TaskName'" }
+    [void] $global:Calls.Add('get')
+    if ($global:TaskState) { [pscustomobject]@{ TaskName = $TaskName; State = $global:TaskState } }
+}
+function global:Unregister-ScheduledTask {
+    param([string] $TaskName, $Confirm)
+    [void] $global:Calls.Add('unregister')
+    $global:TaskState = ''
+}
+function global:Register-ScheduledTask {
+    param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description)
+    [void] $global:Calls.Add('register')
+    $global:Registered = [pscustomobject]@{
+        name     = [string] $TaskName
+        enabled  = [bool] $Settings.Enabled
+        triggers = @($Trigger).Count
+    }
+    if ($global:Honour -and -not $Settings.Enabled) { $global:TaskState = 'Disabled' } else { $global:TaskState = 'Ready' }
+    [pscustomobject]@{ TaskName = $TaskName }
+}
+function global:Disable-ScheduledTask {
+    param([string] $TaskName)
+    [void] $global:Calls.Add('disable')
+    if ($global:DisableOk) { $global:TaskState = 'Disabled' }
+}
+function global:Enable-ScheduledTask {
+    param([string] $TaskName)
+    [void] $global:Calls.Add('enable')
+    $global:TaskState = 'Ready'
+}
+function global:Set-ScheduledTask {
+    # The script has no reason to call it; if it ever does, fail rather than
+    # let the real one change a task.
+    throw 'stub: Set-ScheduledTask called'
+}
+
+$stubs = 'Get-ScheduledTask', 'Unregister-ScheduledTask', 'Register-ScheduledTask',
+         'Disable-ScheduledTask', 'Enable-ScheduledTask', 'Set-ScheduledTask'
+foreach ($name in $stubs) {
+    $cmd = Get-Command $name
+    if ($cmd.CommandType -ne 'Function' -or $cmd.ModuleName) {
+        Write-Output "STUB_NOT_IN_EFFECT $name"
+        exit 3
+    }
+}
+
+$err = ''
+try {
+    & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript 3>$null 6>$null | Out-Null
+} catch {
+    $err = $_.Exception.Message
+} finally {
+    $real = ScheduledTasks\Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($real) {
+        ScheduledTasks\Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Output 'LEAKED'
+    }
+}
+$result = [pscustomobject]@{
+    calls      = @($global:Calls)
+    registered = $global:Registered
+    final      = $global:TaskState
+    error      = $err
+}
+Write-Output ('RESULT ' + ($result | ConvertTo-Json -Compress -Depth 4))
+"""
+
+
+def _register(
+    tmp_path: Path,
+    *,
+    initial: str,
+    honour_enabled: bool = True,
+    disable_works: bool = True,
+) -> dict:
+    """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler."""
+    harness = tmp_path / "register_harness.ps1"
+    harness.write_text(_REGISTER_HARNESS, encoding="utf-8")
+    watchdog_dir = tmp_path / "watchdog"          # no hidden launcher in here
+    watchdog_dir.mkdir()
+    watchdog = watchdog_dir / "monclub_access_watchdog.ps1"
+    watchdog.write_text("# stand-in; never run\n", encoding="utf-8")
+    task = f"MonClub TEST {uuid.uuid4().hex}"
+
+    out = subprocess.run(
+        [winps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(harness),
+         "-Script", str(REGISTER),
+         "-TaskName", task,
+         "-InstallRoot", str(tmp_path / "root"),
+         "-WatchdogScript", str(watchdog),
+         "-Initial", initial,
+         "-HonourEnabled", "yes" if honour_enabled else "no",
+         "-DisableWorks", "yes" if disable_works else "no"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert "LEAKED" not in out.stdout, (
+        f"a REAL scheduled task {task!r} was registered (and has been removed): "
+        f"a stub did not take effect. stdout={out.stdout!r}"
+    )
+    assert "STUB_NOT_IN_EFFECT" not in out.stdout, out.stdout
+    lines = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert lines, f"harness gave no result: stdout={out.stdout!r} stderr={out.stderr!r}"
+    result = json.loads(lines[-1][len("RESULT "):])
+    assert result["registered"] is not None and result["registered"]["name"] == task, (
+        f"the script never reached the stubbed Register-ScheduledTask: {result!r}"
+    )
+    return result
+
+
+@pytest.mark.skipif(winps is None, reason="Windows PowerShell (powershell.exe) not available")
+@pytest.mark.skipif(not REGISTER.exists(), reason=f"{REGISTER} missing")
+class TestRegisterKeepsADisabledTaskDisabled:
+    """An update must never switch a disabled watchdog back on.
+
+    The installer runs register_watchdog.ps1 at every install and update where
+    "Keep MonClub Access running" is ticked -- and UsePreviousTasks=yes re-ticks
+    it wherever it was ticked before. The script removes the task and registers a
+    new one, which came back ENABLED: an operator's Disable-ScheduledTask (the
+    cutover runbook's C1 / D1) was undone by the next install, and the watchdog
+    then started Access again a few minutes after every Quit.
+    """
+
+    def test_a_disabled_task_is_registered_again_disabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is False, (
+            f"the task was re-registered ENABLED over a disabled one: {r!r}"
+        )
+        assert r["final"] == "Disabled"
+        assert "enable" not in r["calls"]
+
+    def test_it_is_disabled_again_if_windows_registers_it_enabled(self, tmp_path: Path):
+        """Settings.Enabled = $false not honoured -> an explicit Disable-ScheduledTask."""
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False)
+        assert r["error"] == "", r
+        assert "disable" in r["calls"]
+        assert r["calls"].index("register") < r["calls"].index("disable")
+        assert r["final"] == "Disabled"
+
+    def test_it_fails_loudly_when_the_task_cannot_be_kept_disabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False, disable_works=False)
+        assert "could not be kept disabled" in r["error"], r
+        assert "Disable-ScheduledTask" in r["error"]
+
+    def test_the_disabled_task_still_gets_the_new_definition(self, tmp_path: Path):
+        """Kept off, but not frozen: the action and both triggers are refreshed,
+        so a later Enable-ScheduledTask turns on the current watchdog, not an old one."""
+        r = _register(tmp_path, initial="Disabled")
+        assert r["calls"].index("unregister") < r["calls"].index("register")
+        assert r["registered"]["triggers"] == 2
+
+    def test_an_enabled_task_stays_enabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Ready")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True
+        assert r["final"] == "Ready"
+        assert "disable" not in r["calls"]
+
+    def test_a_first_registration_is_enabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True
+        assert r["final"] == "Ready"
+        assert "unregister" not in r["calls"] and "disable" not in r["calls"]
+
+
+def _iss_section(text: str, name: str) -> list[str]:
+    """The non-comment lines of one [Section] of the .iss, continuations joined."""
+    lines: list[str] = []
+    inside = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            inside = line.lower() == f"[{name.lower()}]"
+            continue
+        if not inside or not line or line.startswith(";"):
+            continue
+        if lines and lines[-1].endswith("\\"):
+            lines[-1] = lines[-1][:-1].rstrip() + " " + line
+        else:
+            lines.append(line)
+    return lines
+
+
+def _iscc() -> str | None:
+    """ISCC.exe, found the way build_installer.ps1 finds it."""
+    import os
+    for candidate in (
+        os.environ.get("INNO_ISCC", ""),
+        r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        r"C:\Program Files\Inno Setup 6\ISCC.exe",
+    ):
+        if candidate and Path(candidate).is_file():
+            return candidate
+    return shutil.which("ISCC.exe")
+
+
+@pytest.mark.skipif(not INSTALLER.exists(), reason=f"{INSTALLER} missing")
+class TestInstallerWatchdogTask:
+    """"Keep MonClub Access running": ticked for a NEW install, and an existing
+    install keeps its previous choice (owner decision, 2026-09-26).
+
+    What Inno Setup does with these lines is its own code, not ours, read from
+    its source (Setup.WizardForm.pas, TWizardForm.CreateTaskButtons, tag
+    is-6_5_4): each entry starts from its base state (ticked unless
+    ``unchecked``); a task in the previous install's "Selected Tasks" is then
+    set to ``not checkedonce``, one in "Deselected Tasks" to unticked; a task in
+    neither keeps its base state. So ``checkedonce`` is the WRONG flag here --
+    it unticks a site that opted in -- and a plain ticked entry would tick the
+    box on the first update of every PC whose version predates it (no
+    ``access_*`` tag contains it yet). These tests pin the lines that give the
+    owner's rule; the compile test proves ISCC accepts them.
+    """
+
+    def _tasks(self) -> list[str]:
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        return [ln for ln in _iss_section(text, "Tasks") if re.search(r'Name:\s*"watchdog"', ln)]
+
+    def test_use_previous_tasks_stays_on(self):
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        setup = [ln.replace(" ", "").lower() for ln in _iss_section(text, "Setup")]
+        assert "useprevioustasks=yes" in setup, (
+            "without UsePreviousTasks=yes an update forgets the previous choice"
+        )
+
+    def test_ticked_only_when_the_install_is_new(self):
+        tasks = self._tasks()
+        assert len(tasks) == 2, f"expected the two watchdog entries, got: {tasks!r}"
+        fresh = [ln for ln in tasks if re.search(r"Check:\s*IsFreshInstall\b", ln)]
+        existing = [ln for ln in tasks if re.search(r"Check:\s*not\s+IsFreshInstall\b", ln)]
+        assert len(fresh) == 1 and len(existing) == 1, tasks
+        assert "unchecked" not in fresh[0], f"a new install must get it ticked: {fresh[0]!r}"
+        assert re.search(r"Flags:[^;]*\bunchecked\b", existing[0]), (
+            f"an existing install with no recorded choice must get it unticked: {existing[0]!r}"
+        )
+
+    def test_checkedonce_is_not_used(self):
+        for ln in self._tasks():
+            assert "checkedonce" not in ln.lower(), (
+                f"checkedonce unticks a previously ticked box on every update: {ln!r}"
+            )
+
+    def test_a_new_install_means_no_trace_of_an_old_one(self):
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"function IsFreshInstall\(\): Boolean;.*?\nend;", text, re.S)
+        assert m, "IsFreshInstall is gone from the [Code] section"
+        body = m.group(0)
+        assert "ExistingInstallDetected" in body and "WizardForm.PrevAppDir" in body, body
+
+    def test_the_register_script_runs_only_when_the_box_is_ticked(self):
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        runs = [ln for ln in _iss_section(text, "Run") if "register_watchdog.ps1" in ln]
+        assert len(runs) == 1, runs
+        assert re.search(r"Tasks:\s*watchdog\b", runs[0]), runs[0]
+        assert "-Remove" not in runs[0]
+
+    def test_the_hidden_launcher_ships_next_to_the_scripts(self):
+        """register_watchdog.ps1 looks for it beside the watchdog script."""
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        files = _iss_section(text, "Files")
+        for name in ("monclub_access_watchdog.ps1", "register_watchdog.ps1",
+                     "monclub_access_watchdog_hidden.vbs"):
+            hits = [ln for ln in files if name in ln]
+            assert len(hits) == 1, f"{name}: {hits!r}"
+            assert re.search(r'DestDir:\s*"\{app\}\\watchdog"', hits[0]), hits[0]
+
+    @pytest.mark.skipif(_iscc() is None, reason="Inno Setup (ISCC.exe) not installed")
+    def test_the_installer_compiles(self, tmp_path: Path):
+        stage = tmp_path / "stage" / "MonClubAccess"
+        stage.mkdir(parents=True)
+        (stage / "MonClubAccess.exe").write_text("stub")
+        out = subprocess.run(
+            [_iscc(), f"/O{tmp_path / 'out'}", "/DAppVersion=0.0.0-test",
+             f"/DStageDir={stage}", "/DOutputBaseFilename=compile_test", str(INSTALLER)],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        assert out.returncode == 0, f"ISCC failed:\n{out.stdout}\n{out.stderr}"
+        assert (tmp_path / "out" / "compile_test.exe").is_file()

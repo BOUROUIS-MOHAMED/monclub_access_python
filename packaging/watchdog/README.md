@@ -21,17 +21,45 @@ These scripts are that missing piece.
 
 ## Installing
 
-Ship it by ticking **"Keep MonClub Access running"** during setup. The task is
-**unchecked by default** — it changes two behaviours at once (start at logon *and*
-restart on death), and an existing install must never silently gain a startup
-entry on a routine update. `UsePreviousTasks=yes` means a site that opts in stays
-opted in.
+Ship it by ticking **"Keep MonClub Access running"** during setup.
+
+- **A new install: ticked by default** (owner decision, 2026-09-26).
+- **An existing install keeps its previous choice** (`UsePreviousTasks=yes`): ticked
+  stays ticked, unticked stays unticked. An install whose version predates the box
+  has no recorded choice and gets it **unticked** — it changes two behaviours at
+  once (start at logon *and* restart on death), and a routine update, the silent
+  in-app one included, must never give a PC a startup entry by itself.
+- "New" means no trace of an old install: neither Inno's uninstall record nor the
+  files (`IsFreshInstall` in `MonClubAccess.iss`). It takes two `[Tasks]` entries
+  with the same name, one of them shown. **Not `checkedonce`**: in Inno Setup's own
+  code a previously *ticked* `checkedonce` task comes back **unticked**, and a task
+  missing from the previous install's record keeps its base state
+  (`Setup.WizardForm.pas`, `CreateTaskButtons`, tag `is-6_5_4`).
+- **A disabled task stays disabled.** Ticked, the installer runs
+  `register_watchdog.ps1`, which replaces the task with the current definition — and
+  keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
+  cutover runbook). It prints `State: Disabled (kept)`. Only
+  `Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'` turns it back on.
+  Installers built before this change re-registered it **enabled**.
+- Unticked, the installer does not touch an existing task at all.
 
 To register it by hand on a PC that is already installed:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File register_watchdog.ps1
 ```
+
+That, too, keeps a disabled task disabled. To turn a disabled task on:
+
+```powershell
+Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
+Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime
+```
+
+`NextRunTime` must be a date and time (see below). Whether the time trigger, whose
+start was the registration moment, gives a `NextRunTime` right after a later
+`Enable-ScheduledTask` is **not verified**; if it is empty, no check runs before the
+next Windows logon (the logon trigger).
 
 and to remove it:
 
@@ -136,3 +164,12 @@ reintroduce date strings.
 `tests/test_watchdog_script.py` drives the script through its decision table with
 `-WhatIfOnly` (it reports what it would do and starts nothing). It skips when
 PowerShell is unavailable.
+
+The same file runs `register_watchdog.ps1` under Windows PowerShell 5.1 (what the
+installer calls) against a **stubbed** Task Scheduler — a disabled task comes back
+disabled, an enabled or absent one enabled — and never registers a real task: it
+uses a throwaway task name and fails with `LEAKED` if one reached Windows. It also
+pins the installer's two `watchdog` task lines and compiles `MonClubAccess.iss` when
+`ISCC.exe` is installed. What Task Scheduler itself does with a task registered
+with `Settings.Enabled = $false` was **not** run here; the script reads the state
+back and disables it explicitly if needed.

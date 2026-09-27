@@ -19,6 +19,12 @@
 
     Registering a per-user task for yourself needs no elevation.
 
+    A task that already exists and is DISABLED stays disabled: it is registered
+    again with the current definition, still disabled. The installer runs this
+    script on every install and update where its box is ticked, so this is what
+    keeps an update from switching the watchdog back on. To turn it on:
+        Enable-ScheduledTask -TaskName 'MonClub Access Watchdog'
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File register_watchdog.ps1
 
@@ -188,6 +194,23 @@ $principal = New-ScheduledTaskPrincipal `
     -LogonType Interactive `
     -RunLevel Limited
 
+# A task someone DISABLED stays disabled. The installer runs this script at every
+# install and update where the box is ticked (UsePreviousTasks=yes re-ticks it),
+# and re-registering used to bring the task back ENABLED -- silently undoing an
+# operator's Disable-ScheduledTask, e.g. the cutover runbook's, whose whole point
+# is that a Quit stays a Quit (the watchdog starts Access again within minutes).
+# So read the state BEFORE removing the task and register the new definition in
+# that same state: the action and triggers are refreshed, but the task stays off
+# until someone runs Enable-ScheduledTask. No task, or an enabled one, is
+# registered enabled, as before.
+$keepDisabled = @(
+    Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -eq 'Disabled' }
+).Count -gt 0
+if ($keepDisabled) {
+    $settings.Enabled = $false
+}
+
 # Re-register rather than update: an older task may have a different action.
 Remove-WatchdogTask
 
@@ -200,7 +223,31 @@ Register-ScheduledTask `
     -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
                   "Stands down while an install or update is in progress.") | Out-Null
 
-Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
+if ($keepDisabled) {
+    # Settings.Enabled = $false should already register it disabled. Read it back
+    # and disable it explicitly if not: a task that came back enabled is exactly
+    # the defect this guards against.
+    # @() at the call site too: a function's output is unrolled, so one state
+    # comes back as a bare string, and Windows PowerShell 5.1 under StrictMode
+    # has no .Count on a string.
+    function Get-WatchdogStates {
+        Get-ScheduledTask -TaskName $TaskName | ForEach-Object { [string] $_.State }
+    }
+    $states = @(Get-WatchdogStates)
+    if ($states.Count -eq 0 -or @($states | Where-Object { $_ -ne 'Disabled' }).Count -gt 0) {
+        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        $states = @(Get-WatchdogStates)
+    }
+    if ($states.Count -eq 0 -or @($states | Where-Object { $_ -ne 'Disabled' }).Count -gt 0) {
+        throw ("Scheduled task '$TaskName' was disabled before and could not be kept disabled " +
+               "(state now: $($states -join ', ')). Run: Disable-ScheduledTask -TaskName '$TaskName'")
+    }
+    Write-Host "Registered scheduled task '$TaskName' and KEPT IT DISABLED, as it was before."
+    Write-Host "It runs no check until you enable it: Enable-ScheduledTask -TaskName '$TaskName'"
+} else {
+    Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
+}
 Write-Host "Watchdog script: $WatchdogScript"
 Write-Host "Install root:    $InstallRoot"
 Write-Host "Launch mode:     $launchMode"
+Write-Host "State:           $(if ($keepDisabled) { 'Disabled (kept)' } else { 'Enabled' })"
