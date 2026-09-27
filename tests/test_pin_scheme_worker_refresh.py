@@ -194,6 +194,9 @@ def test_a_membership_to_account_fast_patch_refreshes_the_worker_before_the_pass
     app.apply_fast_patch_bundle(_switch_bundle("ACCOUNT"))
 
     assert worker._device.get("pinScheme") == "ACCOUNT", "the running worker still holds the old device row"
+    # Every worker driven (lease mode ALL): the scheduler's copy follows too (R2-4's other half,
+    # pinned in review round 3).
+    assert [d.get("pinScheme") for d in world["engine"]._sync_scheduler._devices] == ["ACCOUNT"]
     assert worker._pending_full_sync_request is not None, "the fast patch queued no pass"
     worker._drain_full_sync_commands()
     _assert_only_account_pins(driver)

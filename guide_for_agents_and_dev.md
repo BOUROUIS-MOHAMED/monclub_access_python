@@ -1581,8 +1581,10 @@ Now `[CODE]`:
   after its full `save_sync_cache` (review R2-3). In the fast patch a failed refresh is logged,
   schedules the full reconcile, and still dispatches: the guard below refuses the old scheme's pins,
   and the bundle's revocations are not held back. In the tick and the enrolment fallback it is only
-  logged (R2-2): the end-of-tick refresh and the next sync's device section are the second chances,
-  and until then the guard stops that device's passes.
+  logged (R2-2): the guard stops that device's passes until a later refresh — the end-of-tick one when
+  that tick's final answer still carries the devices section (not after the device-scope follow-up,
+  whose flags replace the first answer's, review R3-F2), the next device section, or an engine
+  restart.
 - **Every push pass re-checks the recorded scheme.** `device_sync.pin_scheme_superseded` compares the
   scheme a pass derived its pins under with `sync_devices.pin_scheme` (`db.get_device_pin_scheme`, one
   primary-key read). MB2000: the full sync at its start (the device copy — nothing removed, nothing
@@ -1602,7 +1604,16 @@ Now `[CODE]`:
   the new scheme is never among them on the MB2000 (`_remove_released_holds` skips pins touched
   mid-push), and one worker drives each PullSDK panel (review R2-1). A worker the watchdog rebuilds
   from a dead worker's copy at the very moment a refresh lands may keep the old copy until the next
-  refresh; its passes are stopped meanwhile `[UNVERIFIED — not reproduced]`. A targeted revoke drained between the save and the refresh
+  refresh; its passes are stopped meanwhile `[UNVERIFIED — not reproduced]`.
+  **Not covered, as on base (review R3-F1):** a sync answer the server built just BEFORE the switch
+  and saved just after the fast patch writes the old scheme back — the database records it again
+  (`PIN_SCHEME_SWITCH previous=ACCOUNT scheme=MEMBERSHIP`), the workers follow the database, and the
+  guard, which compares with the database, lets the pass push the old scheme; the next sync switches
+  back (the stale answer stored its stale devicesVersion). `save_sync_cache_delta`'s device section
+  never consults the fast-patch revisions, for any device field. `[TEST: review round 3 probe, scratch;
+  the same revert on aeeef69]` Timing `[UNVERIFIED]`. The cutover's cables-out interlock and proven
+  restart cover it; a check that no `previous=ACCOUNT` switch line follows the switch would make the
+  restart proof catch it (runbook C13 — lane D's file, not edited here). A targeted revoke drained between the save and the refresh
   names its pin under the previous scheme — what an unwiped terminal holds. A device row that cannot be
   read is not re-checked (logged): a broken database already stops every write at its write-ahead
   intent (§3.4a). `[CODE]`
@@ -2700,9 +2711,10 @@ Now `[CODE]`:
   `Retry-After` (up to 30 min), never the 120 s cadence.
 - **Tighten only** (`_tighten_sync_timer`, loop thread): when v2 comes on (`V2Runtime._set_availability`
   → `ON`), when a socket session ends (`on_disconnected`; a handshake that never succeeds leaves
-  `connected` False, so the cadence is already the 120 s one), and after each successful sync (trust
-  may have just arrived with that save) — each posted through `app.after(0, …)` by
-  `runtime.py::_post_cadence_check`. It brings the armed timer forward when it is due later than the
+  `connected` False, so the cadence is already the 120 s one) — both posted to the loop through
+  `app.after(0, …)` by `runtime.py::_post_cadence_check` — and after each successful sync, called
+  directly by `_on_sync_work_finished` on the loop thread (trust may have just arrived with that save,
+  review R3-F4). It brings the armed timer forward when it is due later than the
   new target, never pushes it back, and never touches a failure retry. A socket that comes back is
   followed by its `welcome` sync, whose tick arms the longer cadence.
 - **DEVICE-mode panels keep their cadence**: a successful `TIMER` tick that refreshed neither members
