@@ -119,10 +119,14 @@ function Get-WatchdogTaskSummary {
 }
 
 # Any error that ends the run is logged, then ends it as before (break rethrows:
-# the caller sees the same error, and powershell -File exits non-zero).
+# the caller sees the same error, and powershell -File exits non-zero). A trap
+# covers the whole script, lines above it too, where the log is not set up yet:
+# the try keeps the trap itself from failing and hiding the original error.
 trap {
-    Write-RegisterLog 'FAILED' ('{0} | Launch mode: {1} | task now: {2}' -f
-        $_.Exception.Message, $launchMode, (Get-WatchdogTaskSummary))
+    try {
+        Write-RegisterLog 'FAILED' ('{0} | Launch mode: {1} | task now: {2}' -f
+            $_.Exception.Message, $launchMode, (Get-WatchdogTaskSummary))
+    } catch { }
     break
 }
 
@@ -302,32 +306,49 @@ if (Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyCon
     $previousXml = Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
 }
 
-# Puts the task that was there before back from its export -- and never leaves an
-# ENABLED task where a disabled one was. Task Scheduler's handling of the exported
-# <Enabled>false</Enabled> has not been run here [UNVERIFIED], so a disabled task is
-# read back, disabled explicitly if it came back enabled, and REMOVED if even that
-# does not hold: no task beats an enabled one (the runbook's checks read "absent"
-# as off, and Enable-ScheduledTask or the next ticked install brings it back).
-# Returns what it left, for the warning and the log.
-function Restore-PreviousWatchdogTask {
-    if (-not $previousXml) { return 'there was no previous task to put back' }
-    try {
-        Register-ScheduledTask -TaskName $TaskName -Xml $previousXml | Out-Null
-    } catch {
-        return "putting the previous task back failed too: $($_.Exception.Message)"
+# Where the task had been DISABLED, never leave an ENABLED one behind, whatever
+# happened before: read back every task of that name, disable it if it is not, and
+# REMOVE it if even that does not hold -- no task beats an enabled one. The next
+# install with the box ticked then registers it again, enabled; acceptable only
+# because this PC just proved it cannot keep that task disabled, and the log and the
+# runbook's state checks show "no task". Returns what it left.
+function Confirm-NoEnabledWatchdogTask {
+    if (@(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).Count -eq 0) {
+        return 'there is no watchdog task now'
     }
-    if (-not $keepDisabled) { return 'the previous task was put back as it was' }
-    if (Test-WatchdogTaskKeptDisabled) { return 'the previous task was put back, disabled' }
+    if (Test-WatchdogTaskKeptDisabled) { return 'the task is disabled' }
     try { Disable-ScheduledTask -TaskName $TaskName | Out-Null } catch { }
-    if (Test-WatchdogTaskKeptDisabled) { return 'the previous task was put back and disabled again' }
+    if (Test-WatchdogTaskKeptDisabled) { return 'the task was disabled again' }
     try {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     } catch {
-        return ("the previous task was put back ENABLED and could not be removed " +
-                "($($_.Exception.Message)); run: Disable-ScheduledTask -TaskName '$TaskName'")
+        return ("a task is ENABLED and could not be removed ($($_.Exception.Message)); " +
+                "run: Disable-ScheduledTask -TaskName '$TaskName'")
     }
-    return ('the previous task was put back enabled and could not be disabled, so it was removed: ' +
-            'there is NO watchdog task now')
+    if (@(Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).Count -gt 0) {
+        return "a task is still there and not disabled; run: Disable-ScheduledTask -TaskName '$TaskName'"
+    }
+    return 'it came back enabled and could not be disabled, so it was removed: there is NO watchdog task now'
+}
+
+# Puts the task that was there before back from its export. Task Scheduler's
+# handling of the exported <Enabled>false</Enabled> has not been run here
+# [UNVERIFIED], so where the task had been disabled every outcome -- the put-back
+# worked or failed -- ends with Confirm-NoEnabledWatchdogTask.
+# Returns what it left, for the warning and the log.
+function Restore-PreviousWatchdogTask {
+    if (-not $previousXml) {
+        $said = 'there was no previous task to put back'
+    } else {
+        try {
+            Register-ScheduledTask -TaskName $TaskName -Xml $previousXml | Out-Null
+            $said = if ($keepDisabled) { 'the previous task was put back' } else { 'the previous task was put back as it was' }
+        } catch {
+            $said = "putting the previous task back failed too: $($_.Exception.Message)"
+        }
+    }
+    if (-not $keepDisabled) { return $said }
+    return "$said; $(Confirm-NoEnabledWatchdogTask)"
 }
 
 # Re-register rather than update: an older task may have a different action.
@@ -364,7 +385,8 @@ if ($keepDisabled) {
             Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
             $left = Restore-PreviousWatchdogTask
         } catch {
-            $left = "the new task could not be removed and may be ENABLED ($($_.Exception.Message))"
+            $left = ("the new task could not be removed ($($_.Exception.Message)); " +
+                     (Confirm-NoEnabledWatchdogTask))
         }
         throw ("Scheduled task '$TaskName' was disabled before and could not be kept disabled; " +
                "$left (task now: $(Get-WatchdogTaskSummary)). If it reads Ready or Running, run: " +

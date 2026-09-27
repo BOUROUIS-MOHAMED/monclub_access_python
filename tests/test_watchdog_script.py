@@ -117,8 +117,11 @@ def _run(root: Path, *extra: str) -> str:
     if log.exists():
         before = len(log.read_text(encoding="utf-8", errors="replace").splitlines())
 
+    # Windows PowerShell 5.1 when there is one: the task runs the check with
+    # powershell.exe (the hidden launcher and its fallback), and 5.1 differs from 7
+    # where it matters here -- ConvertFrom-Json gives Int32, not Int64.
     subprocess.run(
-        [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+        [winps or pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
          "-InstallRoot", str(root), "-WhatIfOnly", *extra],
         capture_output=True, text=True, timeout=120, check=False,
     )
@@ -371,7 +374,10 @@ param(
     [string] $HonourEnabled,   # 'yes': a task registered with Settings.Enabled = $false comes back Disabled
     [string] $DisableWorks,    # 'yes': Disable-ScheduledTask takes effect
     [string] $RegisterFails,   # 'yes': the first (non -Xml) registration throws
-    [string] $XmlHonoured,     # 'yes': a task registered from XML keeps the XML's <Enabled>
+    [string] $XmlHonoured,     # 'yes': a task registered from XML keeps the XML's <Enabled>;
+                               # 'fails': that registration throws
+    [string] $LeavesTask,      # 'yes': the failing registration (RegisterFails) still created
+                               # the new task, enabled, before it threw
     [string] $Mode             # 'register', or 'remove' (-Remove)
 )
 $ErrorActionPreference = 'Stop'
@@ -383,6 +389,8 @@ $global:Honour     = ($HonourEnabled -eq 'yes')
 $global:DisableOk  = ($DisableWorks -eq 'yes')
 $global:FailNext   = ($RegisterFails -eq 'yes')
 $global:XmlOk      = ($XmlHonoured -eq 'yes')
+$global:XmlFails   = ($XmlHonoured -eq 'fails')
+$global:LeavesTask = ($LeavesTask -eq 'yes')
 $global:Expected   = $TaskName
 $global:Registered = $null
 function global:New-FakeTask([string] $Path, [string] $State, [bool] $Enabled) {
@@ -429,6 +437,10 @@ function global:Unregister-ScheduledTask {
 function global:Register-ScheduledTask {
     param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description, $Xml)
     if ($Xml) {
+        if ($global:XmlFails) {
+            [void] $global:Calls.Add('register-xml-failed')
+            throw 'stub: put-back failed'
+        }
         [void] $global:Calls.Add('register-xml')
         Set-RootTask (-not ($global:XmlOk -and $Xml -match '<Enabled>false</Enabled>'))
         return [pscustomobject]@{ TaskName = $TaskName }
@@ -436,6 +448,7 @@ function global:Register-ScheduledTask {
     if ($global:FailNext) {
         $global:FailNext = $false
         [void] $global:Calls.Add('register-failed')
+        if ($global:LeavesTask) { Set-RootTask $true }
         throw 'stub: registration failed'
     }
     [void] $global:Calls.Add('register')
@@ -516,6 +529,8 @@ def _register(
     disable_works: bool = True,
     register_fails: bool = False,
     xml_honoured: bool = True,
+    xml_fails: bool = False,
+    leaves_task: bool = False,
     mode: str = "register",
 ) -> dict:
     """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler.
@@ -542,7 +557,8 @@ def _register(
          "-HonourEnabled", "yes" if honour_enabled else "no",
          "-DisableWorks", "yes" if disable_works else "no",
          "-RegisterFails", "yes" if register_fails else "no",
-         "-XmlHonoured", "yes" if xml_honoured else "no",
+         "-XmlHonoured", "fails" if xml_fails else ("yes" if xml_honoured else "no"),
+         "-LeavesTask", "yes" if leaves_task else "no",
          "-Mode", mode],
         capture_output=True, text=True, timeout=120, check=False,
     )
@@ -650,6 +666,22 @@ class TestRegisterKeepsADisabledTaskDisabled:
         assert "stub: registration failed" in r["error"], r
         assert r["final"] == "", r
 
+    def test_a_failed_put_back_still_leaves_no_enabled_task(self, tmp_path: Path):
+        """A registration that threw after it had created the task (enabled),
+        and a put-back that fails too: whatever is there is read back and
+        disabled -- the put-back failing is no reason to stop there."""
+        r = _register(tmp_path, initial="Disabled", register_fails=True,
+                      leaves_task=True, xml_fails=True)
+        assert "stub: registration failed" in r["error"], r
+        assert "register-xml-failed" in r["calls"], r["calls"]
+        assert r["final"] == "Disabled", r
+
+    def test_a_failed_put_back_and_a_task_that_will_not_disable_leave_none(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", register_fails=True,
+                      leaves_task=True, xml_fails=True, disable_works=False)
+        assert "stub: registration failed" in r["error"], r
+        assert r["final"] == "", r
+
     def test_an_enabled_task_is_put_back_enabled(self, tmp_path: Path):
         """The read-back applies only to a task that was disabled."""
         r = _register(tmp_path, initial="Ready", register_fails=True)
@@ -708,14 +740,29 @@ class TestRegisterLeavesATrace:
         """Run as the installer runs it (powershell -File). It fails before any
         Task Scheduler cmdlet: the watchdog script it is given does not exist."""
         root = tmp_path / "root"
-        out = subprocess.run(
-            [winps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-             "-File", str(REGISTER),
-             "-TaskName", f"MonClub TEST {uuid.uuid4().hex}",
-             "-InstallRoot", str(root),
-             "-WatchdogScript", str(tmp_path / "missing" / "monclub_access_watchdog.ps1")],
-            capture_output=True, text=True, timeout=120, check=False,
-        )
+        task = f"MonClub TEST {uuid.uuid4().hex}"
+        try:
+            out = subprocess.run(
+                [winps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-File", str(REGISTER),
+                 "-TaskName", task,
+                 "-InstallRoot", str(root),
+                 "-WatchdogScript", str(tmp_path / "missing" / "monclub_access_watchdog.ps1")],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+        finally:
+            # No stubs here: if the "not found" check ever moved below the
+            # registration, a real task would have been made. Remove it and fail.
+            leak = subprocess.run(
+                [winps, "-NoProfile", "-NonInteractive", "-Command",
+                 f"$t = ScheduledTasks\\Get-ScheduledTask -TaskName '{task}' -ErrorAction SilentlyContinue; "
+                 f"if ($t) {{ ScheduledTasks\\Unregister-ScheduledTask -TaskName '{task}' -Confirm:$false; "
+                 f"'LEAKED' }}"],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+            assert "LEAKED" not in leak.stdout, (
+                f"a REAL scheduled task {task!r} was registered (and has been removed)"
+            )
         assert out.returncode != 0, (out.returncode, out.stdout, out.stderr)
         log = (root / "logs" / "watchdog-register.log").read_text(encoding="utf-8-sig")
         assert "FAILED" in log and "not found" in log, log
