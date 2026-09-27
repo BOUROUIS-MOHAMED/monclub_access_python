@@ -40,7 +40,8 @@ def _add_only(did):
 def _nothing_happened(wiz, panel, did=5):
     assert not device_hold.is_held(did)
     assert wiz.status()["run"] is None
-    assert {c[0] for c in panel.calls} <= {"count"}, panel.calls
+    # Step 1 counts and reads the user list (lane 1c); no run, so no backup read and no erase.
+    assert {c for c in panel.calls if c[0] != "count"} <= {("read", "user")}, panel.calls
 
 
 # ─────────────────────────── F19: the refusal gates ───────────────────────────
@@ -169,11 +170,12 @@ class TestTheRefusalGates:
         wiz = ew.EraseWizard(app, backup_root=tmp_path / "b", spawn=lambda fn: fn(),
                              sleep=_sleep, mono=lambda: clock["t"])
         _, pv = wiz.preview(5)
+        panel.calls.clear()                       # step 1's own reads (lane 1c) are not the point
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and "BUSY" in run["error"]
         assert clock["t"] > ew.IDLE_WAIT_SEC, "it waited the whole idle budget"
-        assert not device_hold.is_held(5) and {c[0] for c in panel.calls} == {"count"}
+        assert not device_hold.is_held(5) and panel.calls == [], "nothing read, nothing erased"
 
     def test_a_pass_that_ends_lets_the_run_go_on(self, sqlite_db, monkeypatch, tmp_path):
         clock = {"t": 0.0}

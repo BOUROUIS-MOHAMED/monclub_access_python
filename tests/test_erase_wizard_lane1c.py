@@ -3,9 +3,14 @@
 Guide §3.2h, §3.10. Against the same fakes as tests/test_erase_wizard.py -- nothing reaches a device:
 * AGE  the owner's age limit: the member list is stale when the last SUCCESSFUL getSyncData is
        older than max(3 x the effective sync interval, 10 min), on the monotonic clock;
+* C0   the people an erase removes and the refill will NOT put back (not in its roster: staff,
+       cleaners, another system's users) are counted and named at step 1, need their own tick,
+       are bound to the backup before the first delete, and their backup is never pruned;
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
 import time
 import types
@@ -17,10 +22,16 @@ import pytest
 import app.core.erase_wizard as ew
 from app.core import device_hold
 from tests.test_erase_wizard import (  # noqa: F401 -- fixtures are used by name
-    _body, _pw_ok, _setup_c3, erase_switch_on, refill_cache, sqlite_db,
+    _body, _mb_body, _mb_setup, _pw_ok, _setup_c3, _terminal, erase_switch_on, refill_cache,
+    sqlite_db,
 )
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def _step1_only(panel):
+    """Step 1 counts every table and reads the ``user`` list (lane 1c) -- nothing else."""
+    return {c for c in panel.calls if c[0] != "count"} <= {("read", "user")}
 
 
 def _preview(wiz, did):
@@ -169,3 +180,251 @@ class TestTheMemberListMustBeRecent:
         # A failure leaves the stamp alone: the age of the last SUCCESS keeps growing.
         fails = [m.start() for m in re.finditer(r"self\._last_sync_ok = False\n", src)]
         assert fails and all("_last_sync_ok_mono" not in src[f:f + 120] for f in fails)
+
+
+# ─────────────────────────── C0: the people the refill will not put back ───────────────────────────
+
+def _staff_panel():
+    """The default C3 (members 101 and 102, both in the refill roster) plus a cleaner enrolled
+    directly on the panel -- a pin MonClub never wrote and will never write back."""
+    from tests.test_erase_wizard import _panel
+    panel = _panel()
+    panel.tables["user"].append({"Pin": "555", "CardNo": "5550", "Name": "Cleaner Zied"})
+    panel.tables["userauthorize"].append({"Pin": "555", "AuthorizeDoorId": "15"})
+    return panel
+
+
+def _run_dir(wiz):
+    run = wiz.status()["run"]
+    return Path(wiz.backup_root()) / f"{run['runId']}_device{run['deviceId']}"
+
+
+class TestPeopleTheRefillWillNotPutBack:
+
+    def test_step_1_names_who_will_not_be_put_back_on_a_c3(self, sqlite_db, monkeypatch,
+                                                           tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        assert pv["notRefilled"] == {"count": 1, "scheme": "MEMBERSHIP",
+                                     "people": [{"pin": "555", "name": "Cleaner Zied"}]}
+        assert ("read", "user") in panel.calls and _step1_only(panel), panel.calls
+        assert not device_hold.is_held(5)
+
+    def test_nobody_left_out_is_a_zero_and_needs_no_tick(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        assert pv["notRefilled"] == {"count": 0, "scheme": "MEMBERSHIP", "people": []}
+        assert wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)[0] == 202
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["notRefilled"] == {"count": 0, "pins": []}
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists()
+
+    def test_the_mb2000_admins_are_not_counted(self, sqlite_db, monkeypatch, tmp_path):
+        """The fake MB2000: admin 1 (kept by the erase), members 30001/30002 (in the roster) and
+        777, "Old system" -- another system's user, removed by a users erase, never refilled."""
+        wiz, _w, drv = _mb_setup(monkeypatch, tmp_path, _terminal())
+        try:
+            pv = _preview(wiz, 8)
+        finally:
+            drv.disconnect()
+        assert pv["notRefilled"] == {"count": 1, "scheme": "MEMBERSHIP",
+                                     "people": [{"pin": "777", "name": "Old system"}]}
+
+    def test_an_erase_needs_the_tick_when_someone_will_not_come_back(self, sqlite_db,
+                                                                    monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        for tick in (None, False, "yes"):
+            body = _body(pv["previewId"])
+            if tick is not None:
+                body["acceptNotRefilled"] = tick
+            status, out = wiz.start(5, body, verify_password=_pw_ok)
+            assert status == 409 and out["code"] == "NOT_REFILLED_UNCONFIRMED", (tick, out)
+            assert out["count"] == 1
+        assert not device_hold.is_held(5) and _step1_only(panel)
+        status, _ = wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True),
+                              verify_password=_pw_ok)
+        assert status == 202
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["notRefilled"] == {"count": 1, "pins": ["555"]}
+        assert panel.tables["user"] == [], "erased, as the operator accepted"
+
+    def test_a_backup_holding_people_left_out_is_kept_and_named_nowhere(self, sqlite_db,
+                                                                        monkeypatch, tmp_path,
+                                                                        caplog):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        with caplog.at_level(logging.DEBUG):
+            wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        folder = _run_dir(wiz)
+        mark = folder / ew.KEEP_MARK
+        assert mark.exists() and "555" in mark.read_text(encoding="utf-8")
+        assert "Cleaner" not in mark.read_text(encoding="utf-8")
+        assert "Cleaner" not in (folder / "run.json").read_text(encoding="utf-8")
+        assert "Cleaner" not in caplog.text, "names reach the page only (review F29)"
+        assert "Cleaner Zied" in (folder / "backup.json").read_text(encoding="utf-8")
+
+    def test_the_mark_is_on_disk_before_the_first_delete(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        seen = []
+        panel.on_erase = lambda table: seen.append((_run_dir(wiz) / ew.KEEP_MARK).exists())
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        assert seen and all(seen), seen
+
+    def test_a_mark_that_cannot_be_written_erases_nothing(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        real = ew._write_file_durably
+
+        def _write(path, data):
+            if Path(path).name == ew.KEEP_MARK:
+                raise OSError("disk full")
+            return real(path, data)
+        monkeypatch.setattr(ew, "_write_file_durably", _write)
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "KEEP_MARK_NOT_WRITTEN" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+
+    def test_someone_new_outside_the_roster_at_the_backup_stops_the_run(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        """Bound to the backup: a person the operator was not shown -- enrolled on the panel after
+        step 1, or a member a sync took out of the roster -- is never erased unseen."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        panel.tables["user"].append({"Pin": "556", "CardNo": "5560", "Name": "Guard Amine"})
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "NOT_REFILLED_CHANGED" in run["error"], run["error"]
+        assert "Guard" not in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists(), "nothing erased: prunable as usual"
+
+    def test_a_member_a_sync_removed_after_step_1_stops_the_run(self, sqlite_db, monkeypatch,
+                                                                tmp_path, refill_cache):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        assert pv["notRefilled"]["count"] == 0
+        refill_cache.users = [u for u in refill_cache.users if u["activeMembershipId"] != 102]
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "NOT_REFILLED_CHANGED" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"]
+
+    def test_someone_who_left_the_panel_meanwhile_does_not_stop_it(self, sqlite_db, monkeypatch,
+                                                                    tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        panel.tables["user"] = [r for r in panel.tables["user"] if r["Pin"] != "555"]
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["notRefilled"] == {"count": 0, "pins": []}
+
+    def test_a_c3_rights_only_erase_reads_the_user_list_again(self, sqlite_db, monkeypatch,
+                                                              tmp_path):
+        """Without the ``user`` table the backup holds no user rows: the list is read again
+        before the first delete (the cleaner keeps a user row but loses the door rights)."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        panel.calls.clear()
+        wiz.start(5, _body(pv["previewId"], tables=["userauthorize"], forget=False, refill="now",
+                           acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["notRefilled"] == {"count": 1, "pins": ["555"]}
+        reads = [c for c in panel.calls if c[0] == "read"]
+        assert reads == [("read", "userauthorize"), ("read", "user")], reads
+
+    def test_an_unreadable_list_refuses_the_erase_not_the_rehearsal(self, sqlite_db, monkeypatch,
+                                                                    tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            if table == "user" and not wiz.status()["running"]:
+                raise RuntimeError("GetDeviceData FAILED rc=-2")
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        pv = _preview(wiz, 5)
+        assert pv["notRefilled"] is None
+        status, out = wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True),
+                                verify_password=_pw_ok)
+        assert status == 409 and out["code"] == "NOT_REFILLED_UNKNOWN"
+        assert not device_hold.is_held(5)
+        panel.read_table_strict = real
+        status, _ = wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert status == 202 and wiz.status()["run"]["state"] == "DONE"
+
+    def test_a_rehearsal_needs_no_tick(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        assert wiz.start(5, _body(pv["previewId"], backupOnly=True),
+                         verify_password=_pw_ok)[0] == 202
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists(), "nothing erased"
+
+    def test_the_mb2000_users_erase_is_bound_too(self, sqlite_db, monkeypatch, tmp_path):
+        term = _terminal()
+        wiz, _w, drv = _mb_setup(monkeypatch, tmp_path, term)
+        try:
+            pv = _preview(wiz, 8)
+            body = _mb_body(pv["previewId"])
+            body.pop("acceptNotRefilled", None)
+            status, out = wiz.start(8, body, verify_password=_pw_ok)
+            assert status == 409 and out["code"] == "NOT_REFILLED_UNCONFIRMED"
+            status, _ = wiz.start(8, _mb_body(pv["previewId"], acceptNotRefilled=True),
+                                  verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        run = wiz.status()["run"]
+        assert status == 202 and run["state"] == "DONE", run.get("error")
+        assert run["notRefilled"] == {"count": 1, "pins": ["777"]}
+        assert (_run_dir(wiz) / ew.KEEP_MARK).exists()
+
+
+class TestTheirBackupIsNeverPruned:
+
+    @staticmethod
+    def _old_run(root, run_id="20260902-100000-abcdef", did=5, *, mark=True, run_json=True):
+        import os
+        folder = root / f"{run_id}_device{did}"
+        folder.mkdir(parents=True)
+        (folder / "backup.json").write_text("{}", encoding="utf-8")
+        (folder / "run.json").write_text(json.dumps({"state": "DONE"}) if run_json else "{not json",
+                                         encoding="utf-8")
+        if mark:
+            (folder / ew.KEEP_MARK).write_text('{"count": 1, "pins": ["555"]}', encoding="utf-8")
+        old = time.time() - 90 * 86400
+        for f in folder.iterdir():
+            os.utime(f, (old, old))
+        return folder
+
+    @pytest.mark.parametrize("run_json", [True, False])
+    def test_a_marked_folder_is_never_deleted(self, sqlite_db, tmp_path, run_json):
+        root = tmp_path / "b"
+        kept = self._old_run(root, run_json=run_json)
+        gone = self._old_run(root, run_id="20260902-110000-abcdef", mark=False)
+        deleted = ew.prune_erase_backups(root, now=time.time() + 60 * 86400)
+        assert kept.exists() and not gone.exists(), deleted
+        assert deleted == ["20260902-110000-abcdef"]
+
+    def test_a_failed_run_drops_its_mark(self, sqlite_db, monkeypatch, tmp_path):
+        """The mark goes on disk before the erase is recorded; a run that then fails before any
+        delete erased nobody, so its backup is prunable as usual."""
+        def _fails(*a, **k):
+            raise RuntimeError("disk I/O error")
+        monkeypatch.setattr(ew, "_begin_erase", _fails)
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and "RESULTS_NOT_RESET" in run["error"]
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists()
+        assert not [c for c in panel.calls if c[0] == "erase"]
+
+    def test_an_incomplete_run_keeps_its_mark(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        panel.refuse_erase = {"user"}
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "INCOMPLETE"
+        assert (_run_dir(wiz) / ew.KEEP_MARK).exists()

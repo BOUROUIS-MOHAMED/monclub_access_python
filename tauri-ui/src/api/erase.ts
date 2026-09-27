@@ -54,6 +54,10 @@ export interface EraseRun {
   erased: boolean;
   pinScheme: string | null;
   otherPcsClosed?: boolean | null;
+  /** Lane 1c: the pins accepted at step 1, and the people the run really left out (from its
+   *  backup, before the first delete) -- pins only, never a name. */
+  notRefilledAccepted?: string[] | null;
+  notRefilled?: { count: number; pins: string[] } | null;
 }
 
 export interface ErasePreview {
@@ -69,6 +73,16 @@ export interface ErasePreview {
   /** What the refill would write (lane 1b): the server refuses an erase on a ``problem``
    *  (and, for "hold", on an ``accountProblem``). */
   refill?: EraseRefillCheck;
+  /** Lane 1c (review C0): the people on the turnstile that the refill will NOT put back (not in
+   *  its roster under ``scheme``; MB2000 administrators excluded -- the erase keeps them). null:
+   *  the user list did not read, and the server refuses an erase. */
+  notRefilled?: ErasePeopleLeftOut | null;
+}
+
+export interface ErasePeopleLeftOut {
+  count: number;
+  scheme: string | null;
+  people: { pin: string; name: string | null }[];
 }
 
 export interface EraseRefillCheck {
@@ -101,6 +115,8 @@ export interface EraseStartBody {
   backupOnly?: boolean;
   /** Required (true) for an erase: the hold binds this PC only (lane 1b, review C0). */
   otherPcsClosed?: boolean;
+  /** Required (true) for an erase when ``notRefilled.count`` > 0 (lane 1c, review C0). */
+  acceptNotRefilled?: boolean;
 }
 
 export interface EraseHolds {

@@ -64,6 +64,18 @@ const fr = {
     "Après cet effacement, AUCUN membre ne passe au tourniquet par carte ou par empreinte tant que « Remplir » n'est pas fait (Internet requis).",
   lockoutRefill:
     "Pendant l'effacement et jusqu'à la fin du remplissage, les membres ne passent pas au tourniquet par carte ou par empreinte.",
+  // The people the refill will NOT put back (lane 1c, review C0).
+  notRefilledTitle: (n: number, s: string) =>
+    `${n} personne(s) de ce tourniquet ne seront PAS remises par le remplissage : elles ne sont pas dans la liste des membres de MonClub pour ce tourniquet (schéma ${s}) — personnel ou agents d'entretien enregistrés sur le tourniquet, utilisateurs d'un autre système, membres qui n'y ont plus droit. Ce que l'effacement leur retire (utilisateur, carte, droits, empreintes) ne revient pas.`,
+  notRefilledBackup:
+    "Leur seule copie est la sauvegarde de cet effacement : elle est gardée sans limite de durée (jamais supprimée après 30 jours).",
+  notRefilledTick: (n: number) =>
+    `J'ai lu la liste : ces ${n} personne(s) ne seront pas remises par le remplissage.`,
+  notRefilledNone: "Chaque personne de ce tourniquet est dans la liste du remplissage.",
+  notRefilledUnknown:
+    "La liste des utilisateurs du tourniquet n'a pas pu être lue : on ne sait pas qui le remplissage ne remettrait pas. Relisez l'étape 1.",
+  notRefilledKept: (n: number) =>
+    `${n} personne(s) effacée(s) ne sont pas dans la liste du remplissage : la sauvegarde de cet effacement est gardée sans limite de durée.`,
   otherPcsTitle:
     "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet.",
   otherPcsTick:
@@ -122,6 +134,7 @@ const fr = {
     erase_fingerprints: "Empreintes effacées (administrateurs conservés)",
     counts_after: "Comptage après et vérification",
     erase_recorded: "Effacement enregistré : le dernier résultat d'écriture de chaque membre devient « inconnu »",
+    not_refilled: "Personnes hors de la liste du remplissage vérifiées sur la sauvegarde",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
     records_invalidated: "Enregistrements gardés, marqués à réécrire",
@@ -206,6 +219,14 @@ const fr = {
     RESULTS_NOT_RESET: "L'effacement n'a pas pu être enregistré avant la première suppression : rien n'a été effacé.",
     ADMIN_PIN_IN_ROSTER:
       "Un administrateur du terminal a le même numéro qu'un membre : le remplissage l'écraserait. Changez le numéro de cet administrateur sur le terminal : rien n'a été effacé.",
+    NOT_REFILLED_UNKNOWN:
+      "La liste des utilisateurs du tourniquet n'a pas pu être lue : on ne sait pas qui le remplissage ne remettrait pas. Relisez l'étape 1 : rien n'est effacé.",
+    NOT_REFILLED_UNCONFIRMED:
+      "Des personnes de ce tourniquet ne seront pas remises par le remplissage : cochez la case qui le confirme (étape 4).",
+    NOT_REFILLED_CHANGED:
+      "Au moment d'effacer, le tourniquet portait des personnes hors de la liste du remplissage qui n'étaient pas affichées à l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
+    KEEP_MARK_NOT_WRITTEN:
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé.",
     NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
     ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
     NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
@@ -306,6 +327,17 @@ const en: typeof fr = {
     "After this erase NO member gets through the turnstile by card or fingerprint until Refill is pressed (the internet is needed).",
   lockoutRefill:
     "During the erase and until the refill has finished, members do not get through the turnstile by card or fingerprint.",
+  notRefilledTitle: (n: number, s: string) =>
+    `${n} person(s) on this turnstile will NOT be put back by the refill: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. What the erase takes from them (user, card, door rights, fingerprints) does not come back.`,
+  notRefilledBackup:
+    "Their only copy is this erase's backup: it is kept with no time limit (never deleted after 30 days).",
+  notRefilledTick: (n: number) =>
+    `I have read the list: these ${n} person(s) will not be put back by the refill.`,
+  notRefilledNone: "Everyone on this turnstile is in the refill's list.",
+  notRefilledUnknown:
+    "The turnstile's user list could not be read: who the refill would not put back is unknown. Read step 1 again.",
+  notRefilledKept: (n: number) =>
+    `${n} erased person(s) are not in the refill's list: this erase's backup is kept with no time limit.`,
   otherPcsTitle:
     "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile.",
   otherPcsTick:
@@ -364,6 +396,7 @@ const en: typeof fr = {
     erase_fingerprints: "Fingerprints erased (administrators kept)",
     counts_after: "Counts after, and check",
     erase_recorded: "Erase recorded: each member's last write result becomes 'unknown'",
+    not_refilled: "People outside the refill's list checked against the backup",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
     records_invalidated: "Records kept, marked to be written again",
@@ -447,6 +480,14 @@ const en: typeof fr = {
     RESULTS_NOT_RESET: "The erase could not be recorded before its first delete: nothing was erased.",
     ADMIN_PIN_IN_ROSTER:
       "A terminal administrator has the same number as a member: the refill would overwrite it. Change that administrator's number on the terminal: nothing was erased.",
+    NOT_REFILLED_UNKNOWN:
+      "The turnstile's user list could not be read: who the refill would not put back is unknown. Read step 1 again: nothing is erased.",
+    NOT_REFILLED_UNCONFIRMED:
+      "Some people on this turnstile will not be put back by the refill: tick the box that confirms it (step 4).",
+    NOT_REFILLED_CHANGED:
+      "When the erase was about to start, the turnstile held people outside the refill's list who were not shown at step 1: nothing was erased. Read step 1 again.",
+    KEEP_MARK_NOT_WRITTEN:
+      "The mark that keeps the backup with no time limit could not be written: nothing was erased.",
     NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
     ERASE_FAILED: "An erase command failed: part of it may have been erased.",
     NO_ANSWER: "A command was sent and got no answer: it may have acted.",

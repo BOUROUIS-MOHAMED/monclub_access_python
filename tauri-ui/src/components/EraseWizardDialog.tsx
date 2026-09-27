@@ -144,6 +144,8 @@ export default function EraseWizardDialog({
   const [typedName, setTypedName] = useState("");
   // The hold binds THIS PC only: every other Access PC of the gym must be closed (review C0).
   const [otherPcsClosed, setOtherPcsClosed] = useState(false);
+  // The people the refill will NOT put back, accepted by their own tick (lane 1c, review C0).
+  const [acceptNotRefilled, setAcceptNotRefilled] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   // Why the page went back to step 1 by itself (a preview too old or a changed turnstile).
   const [restartNote, setRestartNote] = useState<string | null>(null);
@@ -164,7 +166,7 @@ export default function EraseWizardDialog({
     setPassword(""); setUnlocked(false); setLockError(null); setStep(0); setPreview(null);
     setPreviewError(null); setChosen(new Set()); setForget(null); setRefill(null);
     setAcceptFaces(false); setBackupOnly(false); setTypedName(""); setStartError(null);
-    setOtherPcsClosed(false); setRestartNote(null);
+    setOtherPcsClosed(false); setAcceptNotRefilled(false); setRestartNote(null);
     setRun(null); setRefillMsg(null); setRefillError(null);
     setHoldScheme(undefined); setStillHeld(true); setHoldsUnknown(false);
   }, []);
@@ -249,10 +251,16 @@ export default function EraseWizardDialog({
     : null;
   // Users (or a C3's door rights) erased: no card or finger member passes until the refill.
   const locksOut = chosen.has(usersKey) || chosen.has("userauthorize");
+  // Who the refill will NOT put back (lane 1c, review C0): a new step 1 needs a new tick.
+  const leftOut = preview?.notRefilled ?? null;
+  const leftOutUnknown = !!preview && leftOut === null;
+  const leftOutCount = leftOut?.count ?? 0;
+  useEffect(() => { setAcceptNotRefilled(false); }, [preview]);
 
   const optionsReady = backupOnly || (forget !== null && refill !== null && (!needFaces || acceptFaces));
   const nameOk = preview ? typedName.trim() === preview.device.name : false;
-  const confirmReady = nameOk && (backupOnly || (otherPcsClosed && !refillProblem));
+  const confirmReady = nameOk && (backupOnly || (otherPcsClosed && !refillProblem && !leftOutUnknown
+    && (leftOutCount === 0 || acceptNotRefilled)));
 
   const pollStatus = useCallback(() => {
     if (pollRef.current) window.clearInterval(pollRef.current);
@@ -281,6 +289,7 @@ export default function EraseWizardDialog({
         password, backupOnly: backupOnly || undefined,
         ...(backupOnly ? {} : {
           forget: forget ?? undefined, refill: refill ?? undefined, otherPcsClosed,
+          acceptNotRefilled: leftOutCount > 0 ? acceptNotRefilled : undefined,
         }),
         acceptFaceLoss: needFaces ? acceptFaces : undefined,
       });
@@ -314,7 +323,8 @@ export default function EraseWizardDialog({
     finally { setStarting(false); }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
   }, [api, deviceId, preview, chosen, typedName, password, backupOnly, forget, refill, needFaces,
-      acceptFaces, otherPcsClosed, starting, pollStatus, loadPreview, lang]);
+      acceptFaces, otherPcsClosed, leftOutCount, acceptNotRefilled, starting, pollStatus, loadPreview,
+      lang]);
 
   const doRefill = useCallback(async () => {
     if (refilling || holdScheme === undefined || holdsUnknown) return;
@@ -388,6 +398,27 @@ export default function EraseWizardDialog({
   const lockoutLine = !backupOnly && locksOut ? (
     <p className="text-[12px] font-semibold text-amber-700">{refill === "hold" ? t.lockoutHold : t.lockoutRefill}</p>
   ) : null;
+
+  // Steps 3 and 4: who the refill will NOT put back, by pin and name; the tick in step 4.
+  const leftOutBox = (withTick: boolean) => (backupOnly || !preview ? null : leftOutUnknown ? (
+    <p className="text-[12px] font-semibold text-destructive">{t.notRefilledUnknown}</p>
+  ) : leftOutCount === 0 ? (
+    <p className="text-[12px] text-muted-foreground">{t.notRefilledNone}</p>
+  ) : (
+    <div className="flex flex-col gap-1.5 rounded-xl border border-amber-500/50 bg-amber-500/[0.06] p-2.5 text-[12px]">
+      <p className="font-semibold text-amber-800">{t.notRefilledTitle(leftOutCount, schemeName(leftOut?.scheme))}</p>
+      <ul className="max-h-[120px] overflow-y-auto rounded-lg border border-border bg-background px-2 py-1 font-mono text-[11.5px]">
+        {(leftOut?.people ?? []).map((p) => <li key={p.pin}>{p.pin} — {p.name || t.unknown}</li>)}
+      </ul>
+      <p className="text-muted-foreground">{t.notRefilledBackup}</p>
+      {withTick && (
+        <Choice type="checkbox" name="not-refilled" checked={acceptNotRefilled}
+                onChange={() => setAcceptNotRefilled((v) => !v)}>
+          {t.notRefilledTick(leftOutCount)}
+        </Choice>
+      )}
+    </div>
+  ));
 
   // ── rendering ────────────────────────────────────────────────────────────
   const header = (
@@ -582,6 +613,7 @@ export default function EraseWizardDialog({
             </Choice>
             {refillInfo}
             {lockoutLine}
+            {leftOutBox(false)}
             {needFaces && (
               <Choice type="checkbox" name="faces" checked={acceptFaces} onChange={() => setAcceptFaces((v) => !v)}>
                 <span className="text-amber-700">{facesUnknown ? t.acceptFacesUnknown : t.acceptFaces(faces)}</span>
@@ -612,6 +644,7 @@ export default function EraseWizardDialog({
         </div>
         {refillInfo}
         {lockoutLine}
+        {leftOutBox(true)}
         {!backupOnly && (
           <div className="flex flex-col gap-1.5 rounded-xl border border-destructive/40 bg-destructive/[0.04] p-2.5">
             <p className="text-[12px] font-semibold">{t.otherPcsTitle}</p>
@@ -682,6 +715,9 @@ export default function EraseWizardDialog({
           );
         })()}
         {state === "INCOMPLETE" && <p className="text-[12px] text-muted-foreground">{t.incompleteHelp}</p>}
+        {run?.notRefilled && run.notRefilled.count > 0 && (
+          <p className="text-[12px] text-amber-700">{t.notRefilledKept(run.notRefilled.count)}</p>
+        )}
         {run?.countsBefore && countsTable(true)}
         {run?.backup && (
           <div className="break-all text-[11.5px] text-muted-foreground">

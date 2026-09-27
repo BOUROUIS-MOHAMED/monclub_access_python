@@ -65,7 +65,8 @@ class TestEveryOtherPcMustBeClosed:
                                 verify_password=_pw_ok)
         assert status == 400 and out["code"] == "OTHER_PCS_NOT_CONFIRMED", "only a real true"
         assert not device_hold.is_held(5)
-        assert {c[0] for c in panel.calls} == {"count"}
+        # Step 1's counts and user list (lane 1c) only: no backup read, no erase.
+        assert {c for c in panel.calls if c[0] != "count"} == {("read", "user")}
 
     def test_a_backup_only_rehearsal_does_not_need_it(self, sqlite_db, monkeypatch, tmp_path):
         wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
@@ -122,7 +123,8 @@ class TestTheRefillMustBeAbleToRefill:
                                     verify_password=_pw_ok)
             assert status == 409 and out["code"] == code, (refill, out)
         assert not device_hold.is_held(5) and wiz.status()["run"] is None
-        assert {c[0] for c in panel.calls} == {"count"}, "nothing read beyond step 1, nothing erased"
+        assert {c for c in panel.calls if c[0] != "count"} == {("read", "user")}, (
+            "nothing read beyond step 1 (its counts and user list, lane 1c), nothing erased")
 
     def test_a_process_that_never_synced_is_stale(self, sqlite_db, monkeypatch, tmp_path):
         wiz, _w, _p, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
@@ -446,8 +448,8 @@ class TestAHoldThatNeverErased:
         def _read(*, table, fields="*"):
             seen.append(_hold_reason(5))
             return real(table=table, fields=fields)
+        pv = _preview(wiz, 5)                        # step 1 reads too (lane 1c): hook the run only
         panel.read_table_strict = _read
-        pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         assert seen and set(seen) == {"erase-prep"}, "no delete issued during the backup"
         assert _hold_reason(5) == "erase", "a delete ran: kept until Refill"
@@ -738,7 +740,7 @@ class TestTheGymsServerSwitch:
             got, out = wiz.start(5, body, verify_password=_pw_ok)
             assert (got, out["code"]) == (status, code)
         assert not device_hold.is_held(5) and wiz.status()["run"] is None
-        assert {c[0] for c in panel.calls} == {"count"}
+        assert {c for c in panel.calls if c[0] != "count"} == {("read", "user")}, "step 1 only"
 
     def test_a_wrong_password_is_said_first_and_the_switch_not_asked(self, sqlite_db, monkeypatch,
                                                                      tmp_path):
@@ -965,8 +967,8 @@ class TestReviewRound1:
         def _read(*, table, fields="*"):
             refill_cache.users = []                      # a successful sync emptied it
             return real(table=table, fields=fields)
+        pv = _preview(wiz, 5)                        # step 1 reads too (lane 1c): hook the run only
         panel.read_table_strict = _read
-        pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and "REFILL_SOURCE_EMPTY" in run["error"]
@@ -981,8 +983,8 @@ class TestReviewRound1:
             if not any(u.get("userId") == 99 for u in refill_cache.users):
                 refill_cache.users.append({"userId": 99, "activeMembershipId": 199})
             return real(table=table, fields=fields)
+        pv = _preview(wiz, 5)                        # step 1 reads too (lane 1c): hook the run only
         panel.read_table_strict = _read
-        pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and "REFILL_WITHHELD" in run["error"]
@@ -996,8 +998,8 @@ class TestReviewRound1:
         def _read(*, table, fields="*"):
             app._last_sync_ok = False                    # a network blip during the backup
             return real(table=table, fields=fields)
+        pv = _preview(wiz, 5)                        # step 1 reads too (lane 1c): hook the run only
         panel.read_table_strict = _read
-        pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         assert wiz.status()["run"]["state"] == "DONE"
 
