@@ -39,16 +39,46 @@ Ship it by ticking **"Keep MonClub Access running"** during setup.
   `register_watchdog.ps1`, which replaces the task with the current definition — and
   keeps it **disabled** when someone had disabled it (`Disable-ScheduledTask`, e.g. the
   cutover runbook). It prints `State: Disabled (kept)`; `Enable-ScheduledTask -TaskName
-  'MonClub Access Watchdog'` turns it back on. The old task is removed before the new
-  one is registered, so the script first exports it and, if the registration fails,
-  registers the old one again from that export (disabled if it was) and still fails
-  the run. A task that was **removed** (`-Remove`, an uninstall) is not "disabled":
-  the next install with the box ticked registers it enabled. The installer runs the
-  script hidden and nothing in it reads the script's exit code (Inno's `[Run]` section
-  documents no exit-code handling), so on a silent update a failure is seen only in
-  the task's state. Installers built before this change re-registered
-  it **enabled**.
-- Unticked, the installer does not touch an existing task at all.
+  'MonClub Access Watchdog'` turns it back on. **Ticking the box never re-enables a
+  disabled task; only `Enable-ScheduledTask` does.** "Disabled" is read from the task's
+  definition (`Settings.Enabled = False`) as well as its `State`: Microsoft's
+  `TASK_STATE_DISABLED` means "disabled and no instances of the task are queued or
+  running", so a disabled task caught while a check runs reads `Running` -- the script
+  before this change read `State` only and registered such a task **enabled**
+  (`Test-WatchdogTaskDisabled`) `[CODE, TEST with the Task Scheduler stubbed]`.
+- **A failure never leaves an enabled task where a disabled one was.** The old task is
+  removed before the new one is registered, so the script first exports it. If the
+  registration fails, it registers the old one again from that export; if the new task
+  will not stay disabled, it removes it and puts the old one back the same way. Either
+  put-back is read back: a task that was disabled and came back enabled is disabled
+  again, and **removed** if even that does not hold -- no task rather than an enabled
+  one. The run still fails. A task that was **removed** (`-Remove`, an uninstall) is not
+  "disabled": the next install with the box ticked registers it enabled. Installers
+  built before `18863bc` re-registered it **enabled**.
+- **Every run leaves a trace** in `<InstallRoot>\logs\watchdog-register.log` (below). The
+  installer runs the script hidden and nothing in it reads the script's exit code
+  (Inno's `[Run]` section documents no exit-code handling); its output also goes into
+  Setup's own log (`SetupLogging=yes`, `Flags: logoutput`), in the installing user's
+  `%TEMP%` as `Setup Log <date> #<n>.txt` -- written even by the in-app update, which
+  passes no `/LOG`. Whether `logoutput` captures every line (`Write-Host`, warnings) on a
+  real install is `[UNVERIFIED]`; the script's own log does not depend on it.
+- Unticked, the installer does not touch an existing task at all -- but it still
+  replaces the three files in `<InstallRoot>\watchdog\` (`[Files]` has no task
+  condition), so an existing task runs the new check script.
+- **One Windows account per PC.** The install is per Windows user
+  (`PrivilegesRequired=lowest`, `{localappdata}\MonClubAccess`), but the task name is one
+  per PC (root folder of Task Scheduler), and every account's Access shares one data
+  folder, `%ProgramData%\MonClub Access` (`app/core/utils.py::_candidate_data_roots`).
+  **Install Access and register the watchdog only under the account that logs on by
+  itself.** A second account's registration either fails (it cannot see or replace the
+  first account's task) or, from an administrator account, replaces it with one that
+  runs only when that other account is logged on `[UNVERIFIED: not tried]`. Uninstalling
+  from another account removes the shared `%ProgramData%\MonClub Access` too
+  (`MonClubAccess.iss` `[UninstallDelete]`) -- the gym's database, login and history --
+  so copy that folder first, and do it on its own day, not a cutover night. The task
+  name stays the same (not per user): the runbook, the checklists and every PC already
+  registered use `'MonClub Access Watchdog'`, and a new name would leave the old task
+  running beside the new one after the next update.
 
 To register it by hand on a PC that is already installed:
 
@@ -89,7 +119,9 @@ the app for minutes at a time and relaunch it themselves. Five guards:
 4. `current\MonClubAccess.exe` is missing — the swap is in flight.
 5. The app has been absent for only ONE tick — a restart needs two consecutive
    misses, which covers short legitimate gaps without the updater having to
-   cooperate (it is a compiled binary this change does not touch).
+   cooperate (it is a compiled binary this change does not touch). A miss counts
+   only when it comes at least 90 s after the previous counted one
+   (`-MinSecondsBetweenMisses`): two checks that land close together are one miss.
 
 A rate cap (5 restarts / 60 min) stops a crash-looping build being relaunched
 forever; past it the watchdog logs loudly and stands down.
@@ -126,11 +158,17 @@ harmless, because the only action is starting an absent app and MonClub Access
 refuses to run twice (single-instance mutex, `access/main.py`).
 
 *Note added 2026-09-27 (review of the paragraph above, not the owner's text):* the
-two-misses rule counts **checks**, not minutes (`$RequiredConsecutiveMisses`,
+two-misses rule counted **checks**, not minutes (`$RequiredConsecutiveMisses`,
 `monclub_access_watchdog.ps1`). With two triggers on different starts, two checks can
 land close together, so an absence of well under two minutes -- a tray Quit included --
-can already count as confirmed and be restarted. How close they land is not measured
-(`[UNVERIFIED]`). Disable the task before a Quit that must stick.
+could count as confirmed and be restarted. How close they land is not measured
+(`[UNVERIFIED]`). **Fixed in the check script (`2f3d5bd`):** the second miss counts only
+90 s or more after the first (`-MinSecondsBetweenMisses`, the time kept as integer epoch
+seconds in `watchdog-state.json`, `missAt`), so Access comes back **no sooner than about
+90 s** after the first check that found it gone `[CODE, TEST]`. A PC whose
+`<InstallRoot>\watchdog\` still holds an older check script still counts checks. Either
+way, **disable the task before a Quit that must stick** -- a restart after 90 s is still
+a restart.
 
 **Verified here (2026-09-13):** both triggers registered; `NextRunTime` populated
 immediately; the task then ran **on its own**, two minutes apart, `LastTaskResult = 0`,
@@ -159,10 +197,60 @@ finish in under a second). Then check `logs\watchdog.log` has a new line. The
 safest live test is to kill `MonClubAccess.exe` and confirm it comes back within
 about two ticks.
 
+## Priority
+
+Task Scheduler starts a task's action at the task's priority, **7 by default =
+`BELOW_NORMAL_PRIORITY_CLASS`** (Microsoft, `TaskSettings.Priority`: 4-6 are normal), and a
+process started by a below-normal process inherits that class (Microsoft, "Scheduling
+Priorities"). So Access started by this task -- task → `wscript.exe` → `powershell.exe` →
+`Start-Process` -- probably ran below normal `[UNVERIFIED: the chain was never measured]`,
+while Access makes the door decisions. `register_watchdog.ps1` now sets **priority 5**
+(`2f3d5bd`) `[CODE, TEST with the Task Scheduler stubbed]`. A task registered by an older
+script keeps 7 until the script registers it again (a ticked install, or by hand). Check
+on a PC, after the watchdog has restarted Access:
+
+```powershell
+(Get-ScheduledTask -TaskName 'MonClub Access Watchdog').Settings.Priority   # 5
+Get-Process MonClubAccess | Select PriorityClass                             # Normal
+```
+
+## Power lost during an update
+
+The installer deletes `<InstallRoot>\current\` before it copies the new files
+(`MonClubAccess.iss::PrepareToInstall` → `DeleteTreeIfExists`) `[CODE]`, and
+`MonClubAccessUpdater.exe` swaps the same folder (compiled; not read here). Power lost in
+that window can leave a PC that cannot start Access by itself, and nothing repairs it:
+- `current\MonClubAccess.exe` missing: the watchdog stands down at every check
+  (`watchdog.log`: `... is missing -- current\ may be mid-swap; standing down`) and the
+  "Ouvrir MonClub Access avec Windows" entry points at nothing `[CODE]`;
+- the exe there but other files missing: Access fails at start (`%TEMP%\MonClubAccess.log`);
+  the watchdog retries up to 5 times an hour, then logs `NOT restarting` `[CODE]`.
+
+To recover, as the Windows user Access is installed for (never uninstall first: the
+uninstaller deletes `%ProgramData%\MonClub Access`, the gym's data):
+1. Run the installer of the version the PC was updating to (the release's download, or the
+   USB key) over the existing install.
+2. If it says "MonClub Access version X is already installed on this PC. Nothing will be
+   changed." -- `current\version.json` and the exe were already copied, so it believes the
+   version is there (`MonClubAccess.iss::SameVersionInstalled`) `[CODE]` -- rename
+   `%LOCALAPPDATA%\MonClubAccess\current` to `current_broken` and run it again.
+3. Start Access; check `App started` in the newest log under
+   `%ProgramData%\MonClub Access\data\logs\`, and the watchdog task's state.
+
+`<InstallRoot>\.update-in-progress` may be left behind; the watchdog ignores it after 30
+minutes. None of this has been tried on a PC `[UNVERIFIED]`.
+
 ## Logs
 
 `<InstallRoot>\logs\watchdog.log` (rotated at 1 MB) and
 `<InstallRoot>\logs\watchdog-state.json`.
+
+`<InstallRoot>\logs\watchdog-register.log` (rotated at 1 MB): one line per run of
+`register_watchdog.ps1` -- `OK` with `State: Enabled` or `State: Disabled (kept)`, the
+`Launch mode` and the task's state read back; `WARN` for a put-back; `FAILED` with the
+error and the task's state (a script-scope `trap` writes it, then the run fails as before).
+`-Remove` logs the task's state before and after. Setup's own log (`SetupLogging=yes`) is in
+`%TEMP%` of the user who installed.
 
 Restart timestamps in the state file are **UNIX epoch seconds, never date
 strings**. They were ISO strings once: `ConvertFrom-Json` coerced them to
@@ -181,14 +269,19 @@ PowerShell is unavailable.
 
 The same file runs `register_watchdog.ps1` under Windows PowerShell 5.1 (what the
 installer calls) against a **stubbed** Task Scheduler — a disabled task comes back
-disabled, an enabled or absent one enabled, a failed registration puts the old task
-back — and never registers a real task: it
-uses a throwaway task name and fails with `LEAKED` if one reached Windows. It also
-pins the installer's two `watchdog` task lines and compiles `MonClubAccess.iss` when
-`ISCC.exe` is installed. What Task Scheduler itself does with a task registered
-with `Settings.Enabled = $false`, or with an exported task registered again, was
-**not** run here. After a normal registration the script reads the state back and
-disables the task explicitly if needed; after a put-back it does not -- it relies on
-the `<Enabled>false</Enabled>` inside the exported XML, and still fails the run.
-The put-back covers a task in the root folder only (where this script registers
-it); a same-name task someone moved to another folder is removed but not put back.
+disabled (also when its check is running: `State = Running`, `Settings.Enabled =
+False`), an enabled or absent one enabled, a failed registration puts the old task
+back, a put-back or a new task that will not stay disabled ends with no task rather
+than an enabled one, every run is logged, priority 5 — and never registers a real
+task: it uses a throwaway task name and fails with `LEAKED` if one reached Windows. It
+also pins the installer's two `watchdog` task lines, `SetupLogging` and `logoutput`,
+no `checkedonce` on any task, and compiles `MonClubAccess.iss` when `ISCC.exe` is
+installed. One test runs the script as the installer does (`powershell -File`) on a path
+that fails before any Task Scheduler cmdlet: it exits non-zero and logs `FAILED`. What
+Task Scheduler itself does with a task registered with `Settings.Enabled = $false`, or
+with an exported task registered again, was **not** run here; both are read back
+(definition and state) and disabled or removed if they come back enabled. The
+predicate was run read-only against real tasks on the development PC (a `Ready` one and
+a `Disabled` one; `Settings.Enabled` and `Settings.Priority = 7` read back). The put-back
+covers a task in the root folder only (where this script registers it); a same-name task
+someone moved to another folder is removed but not put back.
