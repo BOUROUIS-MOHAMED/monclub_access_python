@@ -83,6 +83,54 @@ def test_the_app_loads_the_holds_before_the_first_sync_tick(tmp_path, monkeypatc
     assert order == ["holds", "first_sync_tick"]
 
 
+# ─────────────────────── a failed start-up load fails CLOSED (review round 1, finding 10) ───────────────────────
+
+def _unreadable():
+    raise RuntimeError("database is locked")
+
+
+def test_a_failed_load_holds_every_turnstile_until_a_retry_reads(sqlite_db, monkeypatch):
+    device_hold.hold(5, reason="erase", run_id="r")
+    device_hold.reset_for_tests()                         # the next start ...
+    real = dbmod.list_device_write_holds
+    monkeypatch.setattr(dbmod, "list_device_write_holds", _unreadable)
+    with pytest.raises(RuntimeError):
+        device_hold.load()                                # ... cannot read the holds
+    assert device_hold.load_failed() is True
+    assert device_hold.is_held(5) and device_hold.is_held(6), "unknown: every turnstile is held"
+    assert ue._v2_writes_blocked(6) is True
+    assert device_hold.ensure_loaded() is False           # still unreadable: stays closed
+    assert device_hold.is_held(6)
+    monkeypatch.setattr(dbmod, "list_device_write_holds", real)
+    assert device_hold.ensure_loaded() is True
+    assert device_hold.is_held(5) and not device_hold.is_held(6)
+    assert device_hold.load_failed() is False
+
+
+def test_ensure_loaded_reads_nothing_once_the_holds_are_loaded(sqlite_db, monkeypatch):
+    device_hold.load()
+    monkeypatch.setattr(dbmod, "list_device_write_holds", _unreadable)
+    assert device_hold.ensure_loaded() is True            # the flag is clear: no read
+
+
+def test_reset_for_tests_clears_the_failed_flag(sqlite_db, monkeypatch):
+    monkeypatch.setattr(dbmod, "list_device_write_holds", _unreadable)
+    with pytest.raises(RuntimeError):
+        device_hold.load()
+    device_hold.reset_for_tests()
+    assert device_hold.load_failed() is False and not device_hold.is_held(5)
+
+
+def test_every_sync_tick_retries_a_failed_hold_load(monkeypatch):
+    import app.ui.app as app_module
+    calls: List[int] = []
+    monkeypatch.setattr(device_hold, "ensure_loaded", lambda: calls.append(1) or True)
+    fake = SimpleNamespace(reschedule_sync_timer=lambda: None, _sync_work_running=True,
+                           _pending_sync_context=None, logger=MagicMock())
+    app_module.MainApp._sync_tick(fake)
+    assert calls == [1], "retried even when the tick itself is skipped"
+
+
 # ─────────────────────────── the ULTRA worker ───────────────────────────
 
 def test_the_worker_gate_includes_the_hold(sqlite_db):

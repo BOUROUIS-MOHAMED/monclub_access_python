@@ -11,6 +11,10 @@ the ULTRA worker's member drain, full-sync drain, mid-push chunks and maintenanc
 (``ultra_engine._v2_writes_blocked``), and the PullSDK engine's pass, its batch and its targeted
 member sync (``device_sync``). The door, the events and the rescues keep running. Reading it is
 one lookup in an immutable set: no lock, no database -- it sits on the worker loop.
+
+A start-up load that FAILS holds every turnstile (fail closed, review round 1): not knowing which
+turnstile is held must not let the first pass refill one under the pin scheme recorded before the
+switch. ``ensure_loaded`` (every sync tick) retries until the read succeeds.
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ _log = logging.getLogger("zkapp.device_hold")
 
 _lock = threading.Lock()
 _held: FrozenSet[int] = frozenset()
+_load_failed = False
 
 
 def _as_id(value: Any) -> Optional[int]:
@@ -34,26 +39,53 @@ def _as_id(value: Any) -> Optional[int]:
 
 def is_held(device_id: Any) -> bool:
     did = _as_id(device_id)
-    return did is not None and did in _held
+    return did is not None and (_load_failed or did in _held)
 
 
 def held_ids() -> FrozenSet[int]:
+    """The turnstiles recorded on hold. While ``load_failed()`` every turnstile reads as held
+    (``is_held``) and this set is only what was installed before."""
     return _held
 
 
+def load_failed() -> bool:
+    return _load_failed
+
+
 def load() -> FrozenSet[int]:
-    """Install the holds recorded in the database (start-up). A read failure keeps what is
-    installed and is logged: it is re-raised to the caller, which decides."""
-    global _held
+    """Install the holds recorded in the database (start-up). A read failure HOLDS EVERY
+    turnstile until a later ``load`` succeeds, and is re-raised to the caller."""
+    global _held, _load_failed
     from app.core.db import list_device_write_holds
 
-    ids = frozenset(int(d) for d in (list_device_write_holds() or {}))
+    try:
+        ids = frozenset(int(d) for d in (list_device_write_holds() or {}))
+    except Exception:
+        with _lock:
+            _load_failed = True
+        raise
     with _lock:
         _held = ids
+        _load_failed = False
     if ids:
         _log.warning("[HOLD] turnstile(s) on hold since an erase, nothing is written to them "
                      "until Refill: %s", ",".join(str(d) for d in sorted(ids)))
     return ids
+
+
+def ensure_loaded() -> bool:
+    """Retry a failed start-up load (the sync tick). No database read when the holds are
+    loaded. Returns whether they are."""
+    if not _load_failed:
+        return True
+    try:
+        load()
+    except Exception:
+        _log.error("[HOLD] erase holds still unreadable: every turnstile stays on hold",
+                   exc_info=True)
+        return False
+    _log.warning("[HOLD] erase holds read after a failed start-up load")
+    return True
 
 
 def hold(device_id: int, *, reason: str = "erase", run_id: Optional[str] = None) -> None:
@@ -98,6 +130,7 @@ def holds_detail() -> Dict[int, Dict[str, Any]]:
 
 
 def reset_for_tests() -> None:
-    global _held
+    global _held, _load_failed
     with _lock:
         _held = frozenset()
+        _load_failed = False

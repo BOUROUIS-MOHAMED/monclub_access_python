@@ -4701,7 +4701,23 @@ def _handle_erase_status(ctx: _Ctx) -> None:
 
 def _handle_erase_holds(ctx: _Ctx) -> None:
     from app.core.erase_wizard import get_wizard
-    ctx.send_json(200, {"ok": True, "holds": get_wizard(ctx.app).holds()})
+    ctx.send_json(200, {"ok": True, **get_wizard(ctx.app).holds_state()})
+
+
+def _refuse_held_or_frozen(ctx: _Ctx, did: int) -> bool:
+    """A direct user write (a second PullSDK session) to a turnstile an erase holds, or one
+    being handed over, is refused before any connect (guide §3.2h). True = refused (sent)."""
+    from app.core import device_hold
+    from app.core.v2 import lease_gate
+    if device_hold.is_held(did):
+        ctx.send_json(409, {"ok": False, "code": "DEVICE_ON_HOLD",
+                            "error": "this turnstile is on hold after an erase: press Refill first"})
+        return True
+    if lease_gate.writes_frozen(did):
+        ctx.send_json(409, {"ok": False, "code": "HANDOVER_IN_PROGRESS",
+                            "error": "this turnstile is being handed over to another PC"})
+        return True
+    return False
 
 
 def _handle_device_users_push(ctx: _Ctx) -> None:
@@ -4721,6 +4737,8 @@ def _handle_device_users_push(ctx: _Ctx) -> None:
     # roster-scoped and owned by the ULTRA worker, so serving it here would open
     # a SECOND COM session against a terminal the worker already holds.
     if _unsupported_for_protocol(ctx, did, "le push utilisateur direct"):
+        return
+    if _refuse_held_or_frozen(ctx, did):
         return
     sdk, err = _connect_device(ctx, did)
     if err:
@@ -4894,6 +4912,8 @@ def _handle_device_users_delete(ctx: _Ctx) -> None:
         return
 
     if _unsupported_for_protocol(ctx, did, "la suppression utilisateur directe"):
+        return
+    if _refuse_held_or_frozen(ctx, did):
         return
     sdk, err = _connect_device(ctx, did)
     if err:

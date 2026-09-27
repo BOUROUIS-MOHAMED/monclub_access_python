@@ -405,9 +405,11 @@ class TestC3Run:
         assert device_hold.is_held(5) and worker.full_sync_requests == []
         device_hold.reset_for_tests()                     # a restart ...
         assert device_hold.load() == frozenset({5})       # ... finds the hold in the database
-        status, out = wiz.refill(5, {"password": "x"}, verify_password=_pw_bad)
+        status, out = wiz.refill(5, {"password": "x", "expectedPinScheme": None},
+                                 verify_password=_pw_bad)
         assert status == 401 and device_hold.is_held(5)
-        status, out = wiz.refill(5, {"password": "pw"}, verify_password=_pw_ok)
+        status, out = wiz.refill(5, {"password": "pw", "expectedPinScheme": None},
+                                 verify_password=_pw_ok)
         assert status == 200 and out["passRequested"] is True
         assert not device_hold.is_held(5) and dbmod.list_device_write_holds() == {}
         assert worker.full_sync_requests == ["erase-refill"]
@@ -420,7 +422,8 @@ class TestC3Run:
         wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)
         monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda did: "ACCOUNT")
         assert wiz.holds() and wiz.holds()[0]["pinScheme"] == "ACCOUNT"
-        status, out = wiz.refill(5, {"password": "pw"}, verify_password=_pw_ok)
+        status, out = wiz.refill(5, {"password": "pw", "expectedPinScheme": "ACCOUNT"},
+                                 verify_password=_pw_ok)
         assert status == 200 and out["pinScheme"] == "ACCOUNT"
 
     def test_backup_only_erases_nothing(self, sqlite_db, monkeypatch, tmp_path):
@@ -681,3 +684,518 @@ class TestLocalApi:
                 "_handle_device_erase_refill") in specs
         assert {"_handle_device_erase_preview", "_handle_device_erase_start"} <= set(
             LEASE_GATED_HANDLERS)
+
+
+# ─────────────────────────── static: what the wizard may call on a device ───────────────────────────
+
+def test_the_wizard_calls_only_these_driver_methods():
+    """Every device call of the wizard is a lambda/closure over ``drv`` (the ULTRA worker's
+    driver, handed in by request_run_sdk). The complete list of what it may call on it: the
+    strict C3 reads and the one-table erase, the MB2000 reads, the whole-user delete and the
+    finger-slot clear. Anything else -- a parameter write, a transaction delete, a raw DLL
+    call -- fails this test."""
+    import ast
+
+    source = Path(__file__).resolve().parents[1] / "app" / "core" / "erase_wizard.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    called = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name) and node.func.value.id == "drv"}
+    assert called == {"count_table_strict", "read_table_strict", "erase_table",
+                      "read_device_status", "list_device_users", "read_user_templates",
+                      "delete_users", "sweep_finger_slots"}
+    # Every name the CODE uses (docstrings are string constants: they do not count).
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    forbidden = {"clear_device_table", "delete_device_data", "set_device_param",
+                 "set_device_data", "delete_all_transaction_rows", "ClearGLog", "ClearData",
+                 "SSR_DeleteEnrollData", "SSR_DeleteEnrollDataExt", "DeleteDeviceData",
+                 "remove_fingers_by_pin", "push_roster"}
+    assert not (forbidden & names), forbidden & names
+
+
+# ─────────────────────────── review round 1 (2026-09-27): each finding pinned ───────────────────────────
+
+def _state(db, did):
+    return db.list_device_sync_hashes_and_status(device_id=did)
+
+
+def _removed(db, did):
+    with db.get_conn() as conn:
+        return {r[0] for r in conn.execute(
+            "SELECT pin FROM v2_removal_log WHERE device_id=?", (did,)).fetchall()}
+
+
+def _refill_body(scheme=None, **kw):
+    body = {"password": "pw", "expectedPinScheme": scheme}
+    body.update(kw)
+    return body
+
+
+class TestIncompleteRefillsEverything:
+    """Finding 1 (BLOCKER): an INCOMPLETE run (or a restart mid-run) left every record "in
+    sync", so Refill put back nothing the erase had removed."""
+
+    def test_c3_incomplete_invalidates_every_pin_and_refill_pushes_them(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        from app.core.device_sync import count_waiting_pins
+        _own(sqlite_db, 5, ["101", "102"])
+        wiz, _w, panel, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.refuse_erase = {"user"}          # rights and fingers went, the user rows stayed
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "INCOMPLETE" and device_hold.is_held(5)
+        assert _state(sqlite_db, 5) == {"101": ("", False), "102": ("", False)}
+        assert set(sqlite_db.list_confirmed_device_sync_pins(device_id=5)) == {"101", "102"}, (
+            "ownership kept: nothing is forgotten after an unverified erase")
+        assert _removed(sqlite_db, 5) == set()
+        assert any(s["step"] == "records_invalidated" for s in run["steps"])
+        status, _ = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 200 and not device_hold.is_held(5)
+        assert count_waiting_pins({"101": "h", "102": "h"}, _state(sqlite_db, 5)) == 2
+
+    def test_mb2000_incomplete_invalidates_and_keeps_the_recorded_finger_sets(
+            self, sqlite_db, monkeypatch, tmp_path):
+        from app.core.device_sync import count_waiting_pins
+        term = _terminal()
+        _own(sqlite_db, 8, ["30001", "30002"])
+        with sqlite_db.get_conn() as conn:
+            conn.execute("UPDATE device_sync_state SET pushed_finger_ids='0,3' WHERE pin='30001'")
+            conn.commit()
+        wiz, worker, drv = _mb_setup(monkeypatch, tmp_path, term)
+        worker.no_answer = {"erase_delete_users"}      # the delete ran, its answer was lost
+        try:
+            _, pv = wiz.preview(8)
+            wiz.start(8, _mb_body(pv["previewId"]), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert wiz.status()["run"]["state"] == "INCOMPLETE"
+        assert _state(sqlite_db, 8) == {"30001": ("", False), "30002": ("", False)}
+        with sqlite_db.get_conn() as conn:
+            fingers = conn.execute("SELECT pushed_finger_ids FROM device_sync_state "
+                                   "WHERE device_id=8 AND pin='30001'").fetchone()[0]
+        assert fingers == "0,3", "an unverified erase never claims the fingers are known empty"
+        wiz.refill(8, _refill_body(), verify_password=_pw_ok)
+        assert count_waiting_pins({"30001": "h", "30002": "h"}, _state(sqlite_db, 8)) == 2
+
+    def test_a_crash_after_the_erase_started_invalidates_too(self, sqlite_db, monkeypatch,
+                                                             tmp_path):
+        _own(sqlite_db, 5, ["101"])
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+        def _boom(*a, **k):
+            raise RuntimeError("a bug")
+
+        monkeypatch.setattr(wiz, "_verify", _boom)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "INCOMPLETE" and "UNEXPECTED" in run["error"]
+        assert _state(sqlite_db, 5) == {"101": ("", False)} and device_hold.is_held(5)
+
+    def test_a_hold_left_by_a_restart_mid_run_refills_every_pin(self, sqlite_db, monkeypatch,
+                                                               tmp_path):
+        from app.core.device_sync import count_waiting_pins
+        _own(sqlite_db, 5, ["101", "102"])
+        device_hold.hold(5, reason="erase", run_id="crashed-mid-run")
+        device_hold.reset_for_tests()
+        device_hold.load()                              # Access restarted: no run record
+        wiz, worker, _p, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        assert wiz.status()["run"] is None
+        status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 200 and not device_hold.is_held(5)
+        assert count_waiting_pins({"101": "h", "102": "h"}, _state(sqlite_db, 5)) == 2
+        assert app._ultra_engine._sync_scheduler.forced == [5]
+        assert worker.full_sync_requests == ["erase-refill"]
+
+    def test_refill_keeps_the_hold_when_the_records_cannot_be_reset(self, sqlite_db, monkeypatch,
+                                                                    tmp_path):
+        device_hold.hold(5, reason="erase", run_id="r")
+        wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+        def _fail(**k):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(dbmod, "invalidate_device_records", _fail)
+        status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 500 and out["code"] == "RECORDS_NOT_RESET"
+        assert device_hold.is_held(5) and worker.full_sync_requests == []
+
+
+class TestTheLeaseIsCheckedAtEveryWrite:
+    """Finding 2: the lease and the handover freeze were checked at start() only."""
+
+    def _reader(self):
+        lg.install(lg.snapshot_from_assignment(
+            {"gymUsesAssignments": True, "role": "READER", "drive": [], "release": []},
+            source="server"))
+
+    def test_a_lease_lost_mid_erase_stops_before_the_next_table(self, sqlite_db, monkeypatch,
+                                                                tmp_path):
+        _own(sqlite_db, 5, ["101", "102"])
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.on_erase = lambda table: self._reader() if table == "templatev10" else None
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], forget=True, refill="now"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert [c[1] for c in panel.calls if c[0] == "erase"] == ["templatev10"]
+        assert len(panel.tables["userauthorize"]) == 2 and len(panel.tables["user"]) == 2
+        assert run["state"] == "INCOMPLETE" and "NOT_DRIVER" in run["error"]
+        assert _state(sqlite_db, 5) == {"101": ("", False), "102": ("", False)}
+        assert _removed(sqlite_db, 5) == set() and worker.full_sync_requests == []
+        assert device_hold.is_held(5)
+
+    def test_a_handover_freeze_mid_erase_stops_the_run(self, sqlite_db, monkeypatch, tmp_path):
+        _own(sqlite_db, 5, ["101", "102"])
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+        def _freeze(table):
+            monkeypatch.setattr(lg, "writes_frozen", lambda did: int(did) == 5)
+
+        panel.on_erase = _freeze
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], forget=True, refill="hold"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "INCOMPLETE" and "HANDOVER_IN_PROGRESS" in run["error"]
+        assert [c[1] for c in panel.calls if c[0] == "erase"] == ["templatev10"]
+        assert set(_state(sqlite_db, 5)) == {"101", "102"}
+
+    def test_a_lease_lost_after_the_last_erase_forgets_nothing(self, sqlite_db, monkeypatch,
+                                                              tmp_path):
+        _own(sqlite_db, 5, ["101", "102"])
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.on_erase = lambda table: self._reader() if table == "user" else None
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], forget=True, refill="now"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert panel.tables["user"] == []
+        assert run["state"] == "INCOMPLETE" and "NOT_DRIVER" in run["error"]
+        assert set(_state(sqlite_db, 5)) == {"101", "102"} and _removed(sqlite_db, 5) == set()
+        assert worker.full_sync_requests == []
+
+    def test_the_guard_runs_on_the_worker_thread_just_before_the_write(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        """request_run_sdk queues the call: a check made before queuing leaves a gap."""
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        real = worker.request_run_sdk
+
+        def _lose_then_run(fn, *, label, timeout):
+            if label == "erase_erase_templatev10":
+                self._reader()                        # lost while the command sat queued
+            return real(fn, label=label, timeout=timeout)
+
+        worker.request_run_sdk = _lose_then_run
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert [c for c in panel.calls if c[0] == "erase"] == []
+        run = wiz.status()["run"]
+        assert run["state"] == "INCOMPLETE" and "NOT_DRIVER" in run["error"]
+
+    def test_a_handover_release_waits_while_an_erase_runs(self, sqlite_db, monkeypatch, tmp_path):
+        from app.core.v2.ownership import OwnershipSync
+        wiz, _w, _p, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        app._erase_wizard = wiz
+        wiz._spawn = lambda fn: None                  # the run is still going
+        own = OwnershipSync(SimpleNamespace(app=app))
+        assert own._worker_idle(5) is True
+        _, pv = wiz.preview(5)
+        assert wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)[0] == 202
+        assert wiz.running_device() == 5
+        assert own._worker_idle(5) is False and own._worker_idle(6) is True
+
+
+class TestForgetKeepsWhatStaysOnTheTerminal:
+    """Finding 3: forget retired an admin pin the wizard deliberately kept."""
+
+    def test_the_kept_admins_records_are_not_retired(self, sqlite_db, monkeypatch, tmp_path):
+        term = _terminal()                       # pin "1" is an admin (privilege 14)
+        _own(sqlite_db, 8, ["1", "30001"])
+        wiz, _w, drv = _mb_setup(monkeypatch, tmp_path, term)
+        try:
+            _, pv = wiz.preview(8)
+            wiz.start(8, _mb_body(pv["previewId"], forget=True), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert wiz.status()["run"]["state"] == "DONE"
+        assert "1" in term.users and ("1", 0) in term.fingers
+        assert set(_state(sqlite_db, 8)) == {"1"}, "the admin's record stays, untouched"
+        assert _state(sqlite_db, 8)["1"] == ("h", True)
+        assert _removed(sqlite_db, 8) == {"30001"}
+
+    def test_retire_leaves_every_row_of_a_kept_pin(self, sqlite_db):
+        _own(sqlite_db, 3, ["1", "2"])
+        sqlite_db.record_push_intents(device_id=3, rows=[("1", "A", "", "h1"), ("2", "B", "", "h2")],
+                                      protocol="ZK_STANDALONE")
+        out = sqlite_db.retire_device_records(device_id=3, keep_pins=["1"])
+        assert out["removals_logged"] == 1
+        with sqlite_db.get_conn() as conn:
+            left = {t: {r[0] for r in conn.execute(f"SELECT pin FROM {t} WHERE device_id=3")}
+                    for t in ("device_sync_state", "device_push_intent")}
+        assert left == {"device_sync_state": {"1"}, "device_push_intent": {"1"}}
+        assert _removed(sqlite_db, 3) == {"2"}
+
+
+class TestC3UsersNeedsRightsAndFingers:
+    """Finding 4: erasing the C3 ``user`` table alone left the old pins' rights and fingers."""
+
+    @pytest.mark.parametrize("tables,forget", [
+        (["user"], True), (["user"], False), (["user", "userauthorize"], True),
+        (["user", "templatev10"], False)])
+    def test_user_without_every_readable_rights_and_finger_table_is_refused(
+            self, sqlite_db, monkeypatch, tmp_path, tables, forget):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        status, out = wiz.start(5, _body(pv["previewId"], tables=tables, forget=forget),
+                                verify_password=_pw_ok)
+        assert status == 400 and out["code"] == "USER_NEEDS_RIGHTS_AND_FINGERS"
+        assert set(out["required"]) == {"userauthorize", "templatev10"}
+        assert [c for c in panel.calls if c[0] != "count"] == []
+
+    def test_an_unreadable_table_is_not_required(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)   # "template" absent
+        _, pv = wiz.preview(5)
+        status, _ = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert status == 202 and wiz.status()["run"]["state"] == "DONE"
+
+
+class TestUnknownFaces:
+    """Finding 5: an unreadable face counter was read as 0."""
+
+    def test_an_unreadable_face_count_needs_the_loss_accepted(self, sqlite_db, monkeypatch,
+                                                              tmp_path):
+        term = _terminal()
+        term.faces = 3
+        real = term.GetDeviceStatus
+        term.GetDeviceStatus = lambda m, idx, box: False if int(idx) == 21 else real(m, idx, box)
+        wiz, _w, drv = _mb_setup(monkeypatch, tmp_path, term)
+        try:
+            _, pv = wiz.preview(8)
+            assert pv["extra"].get("faces") is None
+            status, out = wiz.start(8, _mb_body(pv["previewId"]), verify_password=_pw_ok)
+            assert status == 409 and out["code"] == "FACES_UNKNOWN" and len(term.users) == 4
+            _, pv = wiz.preview(8)
+            status, _ = wiz.start(8, _mb_body(pv["previewId"], acceptFaceLoss=True),
+                                  verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert status == 202 and wiz.status()["run"]["acceptFaceLoss"] is True
+
+
+class TestRefillPinScheme:
+    """Finding 6: Refill had no pin-scheme interlock."""
+
+    def _held(self, monkeypatch, tmp_path, sqlite_db):
+        wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], refill="hold"), verify_password=_pw_ok)
+        assert device_hold.is_held(5)
+        return wiz, worker
+
+    def test_refill_needs_the_scheme_the_page_showed(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, worker = self._held(monkeypatch, tmp_path, sqlite_db)
+        status, out = wiz.refill(5, {"password": "pw"}, verify_password=_pw_ok)
+        assert status == 400 and out["code"] == "PIN_SCHEME_REQUIRED" and device_hold.is_held(5)
+
+    def test_a_scheme_that_moved_since_the_page_read_it_is_refused(self, sqlite_db, monkeypatch,
+                                                                   tmp_path):
+        wiz, worker = self._held(monkeypatch, tmp_path, sqlite_db)
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda did: "MEMBERSHIP")
+        status, out = wiz.refill(5, _refill_body("ACCOUNT"), verify_password=_pw_ok)
+        assert status == 409 and out["code"] == "PIN_SCHEME_CHANGED"
+        assert out["pinScheme"] == "MEMBERSHIP"
+        assert device_hold.is_held(5) and worker.full_sync_requests == []
+        status, out = wiz.refill(5, _refill_body("MEMBERSHIP"), verify_password=_pw_ok)
+        assert status == 200 and out["pinScheme"] == "MEMBERSHIP"
+
+    def test_an_unreadable_scheme_refuses_the_refill(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, worker = self._held(monkeypatch, tmp_path, sqlite_db)
+
+        def _broken(did):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", _broken)
+        status, out = wiz.refill(5, _refill_body(None), verify_password=_pw_ok)
+        assert status == 503 and out["code"] == "PIN_SCHEME_UNREADABLE" and device_hold.is_held(5)
+
+    @pytest.mark.parametrize("refill", ["now", "auto"])
+    def test_a_scheme_switched_during_the_run_keeps_the_hold(self, sqlite_db, monkeypatch,
+                                                             tmp_path, refill):
+        wiz, worker, panel, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.on_erase = lambda table: monkeypatch.setattr(dbmod, "get_device_pin_scheme",
+                                                           lambda did: "ACCOUNT")
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], refill=refill), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["holdKept"] is True
+        assert device_hold.is_held(5) and worker.full_sync_requests == []
+        assert any(str(s.get("note", "")).startswith("PIN_SCHEME_CHANGED") for s in run["steps"])
+
+
+class TestEveryReleaseForcesTheScheduler:
+    """Finding 7: a FAILED or backup-only run released the hold without force_resync."""
+
+    def test_a_failed_run(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, panel, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        panel.short_read = {"user"}
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "FAILED" and not device_hold.is_held(5)
+        assert app._ultra_engine._sync_scheduler.forced == [5]
+
+    def test_a_backup_only_run(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"], backupOnly=True), verify_password=_pw_ok)
+        assert app._ultra_engine._sync_scheduler.forced == [5]
+
+
+class TestDirectWritesRefuseAHeldTurnstile:
+    """Finding 8: users/push and users/delete opened a second PullSDK session on a held panel."""
+
+    @pytest.mark.parametrize("handler", ["_handle_device_users_push", "_handle_device_users_delete"])
+    @pytest.mark.parametrize("why", ["hold", "frozen"])
+    def test_refused_before_any_connect(self, sqlite_db, monkeypatch, handler, why):
+        import app.api.local_access_api_v2 as la2
+        connects = []
+        monkeypatch.setattr(la2, "_connect_device", lambda ctx, did: connects.append(did) or (
+            None, "should not connect"))
+        monkeypatch.setattr(la2, "_unsupported_for_protocol", lambda *a, **k: False)
+        if why == "hold":
+            device_hold.hold(5, reason="erase", run_id="r")
+        else:
+            monkeypatch.setattr(lg, "writes_frozen", lambda did: int(did) == 5)
+        ctx = _Ctx(SimpleNamespace(), 5, {"pin": "101"})
+        getattr(la2, handler)(ctx)
+        assert ctx.sent[0] == 409 and connects == []
+        assert ctx.sent[1]["code"] == ("DEVICE_ON_HOLD" if why == "hold" else "HANDOVER_IN_PROGRESS")
+
+
+class _Recording:
+    """Proxy over the real MB2000 driver: records each call's ``timeout_sec``."""
+
+    def __init__(self, drv, log):
+        self._drv, self._log = drv, log
+
+    def __getattr__(self, name):
+        target = getattr(self._drv, name)
+        if not callable(target):
+            return target
+
+        def _call(*a, **k):
+            self._log.append((name, k.get("timeout_sec")))
+            return target(*a, **k)
+        return _call
+
+
+class TestMb2000Commands:
+    """Finding 9: driver timeouts left at the 10 s default; a failed delete chunk went on."""
+
+    def test_every_driver_call_has_a_timeout_inside_the_command_budget(self, sqlite_db,
+                                                                       monkeypatch, tmp_path):
+        term = _terminal()
+        wiz, worker, drv = _mb_setup(monkeypatch, tmp_path, term)
+        calls: List[tuple] = []
+        budgets: List[tuple] = []
+        worker.drv = _Recording(drv, calls)
+        real = worker.request_run_sdk
+
+        def _budget(fn, *, label, timeout):
+            before = len(calls)
+            out = real(fn, label=label, timeout=timeout)
+            budgets.extend((c, timeout) for c in calls[before:])
+            return out
+
+        worker.request_run_sdk = _budget
+        try:
+            _, pv = wiz.preview(8)
+            wiz.start(8, _mb_body(pv["previewId"]), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert wiz.status()["run"]["state"] == "DONE"
+        seen = {name for (name, _t), _b in budgets}
+        assert {"read_device_status", "list_device_users", "read_user_templates",
+                "delete_users"} <= seen
+        for (name, t), budget in budgets:
+            assert t is not None and 0 < t < budget, (name, t, budget)
+
+    def test_a_failed_delete_chunk_stops_the_erase(self, sqlite_db, monkeypatch, tmp_path):
+        import app.core.erase_wizard as ew
+        monkeypatch.setattr(ew, "MB_DELETE_PINS_PER_CALL", 1)
+        term = _terminal()
+        wiz, worker, drv = _mb_setup(monkeypatch, tmp_path, term)
+        deletes: List[list] = []
+        real_drv = drv
+
+        class _Failing:
+            def __getattr__(self, name):
+                return getattr(real_drv, name)
+
+            def delete_users(self, pins, **k):
+                deletes.append(list(pins))
+                return {"ok": False, "deleted": 0, "failed": len(pins), "failed_pins": list(pins),
+                        "errors": ["timeout"]}
+
+        worker.drv = _Failing()
+        try:
+            _, pv = wiz.preview(8)
+            wiz.start(8, _mb_body(pv["previewId"]), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        run = wiz.status()["run"]
+        assert len(deletes) == 1, "the first failed chunk stops the erase"
+        assert run["state"] == "INCOMPLETE"
+        erase_step = [s for s in run["steps"] if s["step"] == "erase"][0]
+        assert erase_step["uncertain"] is True
+
+
+class TestBackupRedactsPasswords:
+    """Finding 12: the C3 backup read the ``user`` table's Password values in plain JSON."""
+
+    def test_c3_password_values_are_not_written(self, sqlite_db, monkeypatch, tmp_path):
+        panel = _panel()
+        panel.tables["user"] = [{"Pin": "101", "CardNo": "1001", "Password": "1234"},
+                                {"Pin": "102", "CardNo": "1002", "password": ""}]
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=panel)
+        _, pv = wiz.preview(5)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        raw = Path(run["backup"]["path"]).read_text(encoding="utf-8")
+        assert "1234" not in raw
+        data = json.loads(raw)
+        assert data["rows"]["user"][0]["Password"] == ""
+        assert data["redacted"] == {"user.Password": 1}
+
+
+class TestMb2000UsersEraseForgets:
+    """Finding 13: "keep" after an MB2000 users erase was allowed on the server."""
+
+    def test_keep_is_refused(self, sqlite_db, monkeypatch, tmp_path):
+        term = _terminal()
+        wiz, _w, drv = _mb_setup(monkeypatch, tmp_path, term)
+        try:
+            _, pv = wiz.preview(8)
+            status, out = wiz.start(8, _mb_body(pv["previewId"], forget=False),
+                                    verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert status == 400 and out["code"] == "USERS_ERASE_NEEDS_FORGET" and len(term.users) == 4
+
+
+class TestRefillWhileTheHoldsAreUnknown:
+    """Finding 10 (the wizard side): while the start-up hold load has failed, every turnstile
+    reads as held -- Refill must not reset and release one that never was."""
+
+    def test_refill_is_refused(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, worker, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+
+        def _broken():
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(dbmod, "list_device_write_holds", _broken)
+        with pytest.raises(RuntimeError):
+            device_hold.load()
+        assert device_hold.is_held(5)
+        status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 503 and out["code"] == "HOLDS_UNKNOWN" and worker.full_sync_requests == []
+        assert wiz.holds_state()["loadFailed"] is True

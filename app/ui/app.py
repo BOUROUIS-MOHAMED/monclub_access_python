@@ -686,8 +686,9 @@ class MainApp:
 
             device_hold.load()
         except Exception:
-            self.logger.error("[HOLD] erase holds NOT loaded at start-up: a held turnstile may "
-                              "be written to", exc_info=True)
+            self.logger.error("[HOLD] erase holds NOT read at start-up: every turnstile is held "
+                              "(nothing written to any) until they read -- retried every sync "
+                              "tick", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
         try:
             self._arm_midnight_date_flip()
@@ -3206,6 +3207,13 @@ class MainApp:
 
     def _sync_tick(self):
         self.reschedule_sync_timer()
+        # A failed start-up hold load holds every turnstile; retry it here (no read once loaded).
+        try:
+            from app.core import device_hold
+
+            device_hold.ensure_loaded()
+        except Exception:
+            self.logger.error("[HOLD] hold retry failed", exc_info=True)
 
         if self._sync_work_running:
             if self._pending_sync_context is not None:

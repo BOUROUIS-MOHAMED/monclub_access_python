@@ -9719,37 +9719,43 @@ def list_device_write_holds() -> Dict[int, Dict[str, Any]]:
     return {int(r[0]): {"reason": str(r[1] or ""), "runId": r[2], "since": r[3]} for r in rows}
 
 
-def retire_device_records(*, device_id: int) -> Dict[str, int]:
+def retire_device_records(*, device_id: int, keep_pins: Iterable[str] = ()) -> Dict[str, int]:
     """FORGET what MonClub recorded about one turnstile, after a VERIFIED erase of its users.
 
     Every pin with a sync-state or push-intent row was on the terminal or may have been, and the
     erase removed it: each is logged in ``v2_removal_log`` in this same transaction (the ownership
     backup's REMOVED fact, §3.9 -- a row that merely vanished is never uploaded as removed, and a
     new driver's restore would otherwise adopt it as owned and in sync). Then the state, intent,
-    content-mirror and loss re-add rows of that turnstile go. The pin-scheme switch history stays.
+    content-mirror, loss re-add and push-result rows of that turnstile go. The pin-scheme switch
+    history stays. ``keep_pins`` -- users the erase deliberately LEFT on the terminal (the MB2000
+    administrators) -- keep every row and are never logged removed (review round 1).
     Never call it for an erase that was not verified: forgetting pins still on the terminal
     strands them there for good (§3.2c)."""
     did = int(device_id)
+    keep = sorted({str(p) for p in (keep_pins or ())})
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[str, int]:
         pins = {str(r[0]) for r in conn.execute(
             "SELECT pin FROM device_sync_state WHERE device_id=?", (did,)).fetchall()}
         pins |= {str(r[0]) for r in conn.execute(
             "SELECT pin FROM device_push_intent WHERE device_id=?", (did,)).fetchall()}
+        pins -= set(keep)
         for pin in sorted(pins):
             _log_v2_removal(conn, did, pin)
+        spare = f" AND pin NOT IN ({','.join(['?'] * len(keep))})" if keep else ""
+
+        def _delete(table: str) -> int:
+            return int(conn.execute(f"DELETE FROM {table} WHERE device_id=?{spare}",
+                                    (did, *keep)).rowcount or 0)
+
         out = {
-            "state": int(conn.execute("DELETE FROM device_sync_state WHERE device_id=?",
-                                      (did,)).rowcount or 0),
-            "intents": int(conn.execute("DELETE FROM device_push_intent WHERE device_id=?",
-                                        (did,)).rowcount or 0),
-            "mirror": int(conn.execute("DELETE FROM device_content_mirror WHERE device_id=?",
-                                       (did,)).rowcount or 0),
-            "readd": int(conn.execute("DELETE FROM v2_readd WHERE device_id=?",
-                                      (did,)).rowcount or 0),
-            "results": int(conn.execute("DELETE FROM device_push_result WHERE device_id=?",
-                                        (did,)).rowcount or 0),
+            "state": _delete("device_sync_state"),
+            "intents": _delete("device_push_intent"),
+            "mirror": _delete("device_content_mirror"),
+            "readd": _delete("v2_readd"),
+            "results": _delete("device_push_result"),
             "removals_logged": len(pins),
+            "kept": len(keep),
         }
         profile.update(out)
         return out
@@ -9757,20 +9763,25 @@ def retire_device_records(*, device_id: int) -> Dict[str, int]:
     return dict(_run_db_write_sync("retire_device_records", _write, durable=True))
 
 
-def invalidate_device_records(*, device_id: int, fingers_erased: bool) -> int:
+def invalidate_device_records(*, device_id: int, fingers_erased: bool,
+                              keep_pins: Iterable[str] = ()) -> int:
     """KEEP MonClub's ownership records of an erased turnstile, but make the next pass write
     every pin again: the hard-reset UPDATE (hashes cleared, ``last_ok=0``; ownership and removal
     evidence kept, §3.2c). When the fingerprints were erased, each pin's resident finger set is
     known EMPTY (``''``, not NULL = unknown) and swept: a recorded set would make the next push
-    clear slots that are already empty, which answer False and fail on every retry (§7 R1-20)."""
+    clear slots that are already empty, which answer False and fail on every retry (§7 R1-20) --
+    except ``keep_pins``, whose fingers the erase left on the terminal (the MB2000 admins).
+    Also the Erase wizard's INCOMPLETE and Refill reset, with ``fingers_erased=False``."""
     did = int(device_id)
+    keep = sorted({str(p) for p in (keep_pins or ())})
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         n = _clear_device_sync_hashes_on(conn, did)
         if fingers_erased:
+            spare = f" AND pin NOT IN ({','.join(['?'] * len(keep))})" if keep else ""
             conn.execute(
                 "UPDATE device_sync_state SET pushed_finger_ids='', finger_slots_swept=1 "
-                "WHERE device_id=?", (did,))
+                f"WHERE device_id=?{spare}", (did, *keep))
         return int(n)
 
     return int(_run_db_write_sync("invalidate_device_records", _write, durable=True))

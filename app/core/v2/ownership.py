@@ -427,8 +427,17 @@ class OwnershipSync:
     # ------------------------------------------------------------------ release
     def _worker_idle(self, did: int) -> bool:
         """No pass is writing to the turnstile: the ULTRA worker's full sync (either SDK: its
-        private DeviceSync engine included) and the DEVICE-mode DeviceSync engine (review R3)."""
+        private DeviceSync engine included) and the DEVICE-mode DeviceSync engine (review R3),
+        nor an Erase-content run (its INCOMPLETE reset must reach the final upload, §3.2h)."""
         app = self.rt.app
+        wizard = getattr(app, "_erase_wizard", None)
+        running = getattr(wizard, "running_device", None) if wizard is not None else None
+        if callable(running):
+            try:
+                if running() == did:
+                    return False
+            except Exception:
+                return False
         eng = getattr(app, "_ultra_engine", None)
         worker = (getattr(eng, "_workers", None) or {}).get(did) if eng is not None else None
         if worker is not None and (bool(getattr(worker, "_full_sync_running", False))

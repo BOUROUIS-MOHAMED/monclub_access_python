@@ -23,8 +23,11 @@ model -- guide §2):
 Order of one run (each step logged, and written to the run's ``run.json``):
   hold (nothing is written to the turnstile from here: device_hold) -> idle (no pass running)
   -> counts before -> BACKUP of the chosen tables to a file, re-read and hash-checked (a failure
-  stops everything: nothing erased, hold released) -> erase -> counts after -> VERIFY (an
-  unverified erase keeps the hold and forgets nothing) -> records (forget / keep) -> refill.
+  stops everything: nothing erased, hold released) -> erase -> counts after -> VERIFY -> records
+  (forget / keep) -> refill. An erase that started and did not end verified (INCOMPLETE, a crash)
+  keeps the hold, forgets nothing and makes every recorded pin "not in sync", so the refill
+  writes everything again (review round 1). The lease and the handover freeze are checked again
+  on the worker thread just before every erase command, and before the records.
 
 Every device call goes through the ULTRA worker's own connection (``request_run_sdk``) -- never a
 second session -- in short commands, so the worker serves the door and the scans between them.
@@ -69,6 +72,13 @@ IDLE_WAIT_SEC = 120.0
 T_COUNT = 30.0
 T_READ = 120.0
 T_ERASE = 120.0
+# The DRIVER's own timeout of each MB2000 command, below its budget above so the driver's
+# timeout fires first (a request_run_sdk timeout abandons the STA thread). Chosen, not measured.
+TD_STATUS = 20.0
+TD_LIST = 60.0
+TD_TEMPLATES = 90.0
+TD_DELETE = 90.0
+TD_SWEEP = 30.0
 MB_TEMPLATE_PINS_PER_CALL = 2      # 20 SSR_GetUserTmpStr per STA command
 MB_DELETE_PINS_PER_CALL = 20       # 20 SSR_DeleteEnrollData(…, 12) per STA command
 MB_SWEEP_SLOTS_PER_CALL = 3        # as the daily finger sweep (§3.4c)
@@ -179,6 +189,46 @@ class EraseWizard:
         return None
 
     @staticmethod
+    def _write_refusal(device_id: int) -> Optional[Tuple[str, str]]:
+        """The lease conditions a WRITE needs, read again at the moment of the write."""
+        if not lease_gate.device_allowed(device_id):
+            return "NOT_DRIVER", "this PC no longer drives this turnstile"
+        if lease_gate.writes_frozen(device_id):
+            return "HANDOVER_IN_PROGRESS", "this turnstile is being handed over to another PC"
+        blocked = lease_gate.removals_blocked(device_id)
+        if blocked:
+            return "ADD_ONLY", f"removals are not allowed on this turnstile ({blocked})"
+        return None
+
+    def _write_call(self, worker: Any, did: int, fn: Callable[[Any], Any], *, label: str,
+                    timeout: float) -> Any:
+        """A device WRITE: the lease is checked here and again on the worker thread, just before
+        ``fn`` runs -- the command waits in the worker's queue, and the lease can move meanwhile."""
+        refused = self._write_refusal(did)
+        if refused:
+            raise StepError(*refused)
+        seen: Dict[str, Tuple[str, str]] = {}
+
+        def _guarded(drv):
+            why = self._write_refusal(did)
+            if why:
+                seen["refused"] = why
+                return None
+            return fn(drv)
+
+        out = self._call(worker, _guarded, label=label, timeout=timeout)
+        if "refused" in seen:
+            raise StepError(*seen["refused"])
+        return out
+
+    def running_device(self) -> Optional[int]:
+        """The turnstile a run is working on now (a handover's final upload waits for it)."""
+        with self._lock:
+            if self._running and self._run:
+                return int(self._run.get("deviceId") or 0) or None
+            return None
+
+    @staticmethod
     def _call(worker: Any, fn: Callable[[Any], Any], *, label: str, timeout: float) -> Any:
         res = worker.request_run_sdk(fn, label=f"erase_{label}", timeout=timeout) or {}
         if res.get("ok"):
@@ -205,7 +255,7 @@ class EraseWizard:
             return {"tables": self._call(worker, _fn, label="count", timeout=T_COUNT), "extra": {}}
 
         def _fn_mb(drv):
-            return drv.read_device_status()
+            return drv.read_device_status(timeout_sec=TD_STATUS)
         res = self._call(worker, _fn_mb, label="status", timeout=T_COUNT) or {}
         if not res.get("ok"):
             raise StepError("STATUS_UNREADABLE",
@@ -279,11 +329,18 @@ class EraseWizard:
 
     @staticmethod
     def _pin_scheme(did: int) -> Optional[str]:
+        """For display only: None when unreadable."""
         try:
             from app.core.db import get_device_pin_scheme
             return get_device_pin_scheme(did)
         except Exception:
             return None
+
+    @staticmethod
+    def _pin_scheme_strict(did: int) -> Optional[str]:
+        """For a decision: a read error propagates (None = the device has no row)."""
+        from app.core import db as _db
+        return _db.get_device_pin_scheme(did)
 
     @staticmethod
     def _hold_of(did: int) -> Optional[Dict[str, Any]]:
@@ -293,6 +350,10 @@ class EraseWizard:
             return dict(device_hold.holds_detail().get(did) or {"reason": "erase"})
         except Exception:
             return {"reason": "erase"}
+
+    def holds_state(self) -> Dict[str, Any]:
+        """The holds, and whether the start-up load failed (then EVERY turnstile is held)."""
+        return {"holds": self.holds(), "loadFailed": bool(device_hold.load_failed())}
 
     def holds(self) -> List[Dict[str, Any]]:
         out = []
@@ -369,18 +430,46 @@ class EraseWizard:
                 # Forgetting pins that are still on the terminal would strand them (§3.2c).
                 return 400, {"ok": False, "code": "FORGET_NEEDS_USERS",
                              "error": f"'forget' needs the {users_table!r} table erased too"}
+            if proto == PROTO_PULLSDK and users_table in tables:
+                # The user rows gone, their door rights and fingers would stay on the panel and
+                # belong to whoever gets the same pin next (ACCOUNT pins reuse membership
+                # numbers, §3.2e) -- with or without "forget" (review round 1).
+                required = [t for t in C3_ERASE_ORDER
+                            if t != users_table and rows.get(t, {}).get("erasable")]
+                missing = [t for t in required if t not in tables]
+                if missing:
+                    return 400, {"ok": False, "code": "USER_NEEDS_RIGHTS_AND_FINGERS",
+                                 "required": required, "missing": missing,
+                                 "error": f"erasing {users_table!r} needs {missing} erased too"}
+            if proto == PROTO_STANDALONE and users_table in tables and forget is False:
+                # Kept records of deleted members: the next pass deletes pins that are gone, and
+                # a refused delete writes a blank disabled user instead (§3.4, review round 1).
+                return 400, {"ok": False, "code": "USERS_ERASE_NEEDS_FORGET",
+                             "error": "erasing the terminal's users needs 'forget'"}
             if refill not in REFILL_OPTIONS:
                 return 400, {"ok": False, "code": "REFILL_REQUIRED",
                              "error": "choose when the turnstile is refilled"}
         extra = preview["counts"].get("extra") or {}
         if (proto == PROTO_STANDALONE and users_table in tables and not backup_only
-                and (extra.get("faces") or 0) > 0 and not body.get("acceptFaceLoss")):
-            return 409, {"ok": False, "code": "FACES_PRESENT",
-                         "error": f"{extra.get('faces')} face template(s) on the terminal: no backup "
-                                  "exists for a face; confirm their loss to go on"}
+                and not body.get("acceptFaceLoss")):
+            faces = extra.get("faces")
+            if faces is None:
+                # Status 21 did not answer: faces may be there, and no backup exists for one.
+                return 409, {"ok": False, "code": "FACES_UNKNOWN",
+                             "error": "the terminal did not report its face count: faces may be "
+                                      "lost (no backup exists for a face); confirm to go on"}
+            if int(faces) > 0:
+                return 409, {"ok": False, "code": "FACES_PRESENT",
+                             "error": f"{faces} face template(s) on the terminal: no backup "
+                                      "exists for a face; confirm their loss to go on"}
         refused = self._refusal(did, need_writes=not backup_only)
         if refused:
             return refused
+        try:
+            scheme = self._pin_scheme_strict(did)
+        except Exception as exc:
+            return 503, {"ok": False, "code": "PIN_SCHEME_UNREADABLE",
+                         "error": f"the turnstile's pin scheme could not be read: {exc}"}
         ok, status, error = verify_password(str(body.get("password") or ""))
         if not ok:
             return status, {"ok": False, "code": "ADMIN_PASSWORD", "error": error}
@@ -393,7 +482,7 @@ class EraseWizard:
             "state": "RUNNING", "step": "start", "startedAt": _now_text(), "finishedAt": None,
             "steps": [], "countsBefore": None, "countsAfter": None, "backup": None,
             "progress": None, "error": None, "holdKept": None, "erased": False,
-            "pinScheme": self._pin_scheme(did),
+            "pinScheme": scheme,
         }
         with self._lock:
             if self._running:
@@ -467,7 +556,7 @@ class EraseWizard:
             self._update(erased=True)
             erase_error = None
             try:
-                self._erase(worker, proto, tables, backup)
+                self._erase(worker, did, proto, tables, backup)
             except StepError as exc:
                 erase_error = exc
                 self._step("erase", False, code=exc.code, error=exc.message,
@@ -478,25 +567,42 @@ class EraseWizard:
             self._update(countsAfter=after)
             verified, why = self._verify(worker, proto, tables, backup, after)
             self._step("counts_after", verified, verified=verified, why=why, **_flat(after))
-            if erase_error is not None or not verified:
-                raise StepError("NOT_VERIFIED",
-                                (erase_error.message if erase_error else "") or why
-                                or "the erase could not be verified")
-            self._records(worker, did, proto, tables, bool(run["forget"]))
-            self._refill(worker, did, str(run["refill"]))
+            if erase_error is not None:
+                raise erase_error                 # its own code: NOT_DRIVER, ERASE_FAILED, ...
+            if not verified:
+                raise StepError("NOT_VERIFIED", why or "the erase could not be verified")
+            self._records(worker, did, proto, tables, bool(run["forget"]), backup)
+            self._refill(worker, did, str(run["refill"]), run.get("pinScheme"))
         except StepError as exc:
             if erase_started:
                 # Something may have been erased: keep the hold, forget nothing (an unverified
-                # erase followed by a forget is the stranded-pin failure, §3.2c).
+                # erase followed by a forget is the stranded-pin failure, §3.2c), and make every
+                # recorded pin "not in sync" so the refill writes it again.
+                self._invalidate(did)
                 self._finish("INCOMPLETE", release=False, error=f"{exc.code}: {exc.message}")
             else:
                 self._finish("FAILED", release=not held_before,
                              error=f"{exc.code}: {exc.message} -- nothing was erased")
         except Exception as exc:  # noqa: BLE001 - a bug must never leave the run "RUNNING"
             _log.error("[ERASE] run %s crashed", run_id, exc_info=True)
+            if erase_started:
+                self._invalidate(did)
             self._finish("INCOMPLETE" if erase_started else "FAILED",
                          release=(not erase_started and not held_before),
                          error=f"UNEXPECTED: {type(exc).__name__}: {exc}")
+
+    def _invalidate(self, did: int) -> None:
+        """After an erase that did not end verified: the hard-reset UPDATE (hashes cleared,
+        ``last_ok=0``; ownership, removal evidence and the recorded finger sets kept -- whether
+        the fingers went is not known). Durable."""
+        from app.core import db as _db
+        try:
+            n = _db.invalidate_device_records(device_id=did, fingers_erased=False)
+            self._step("records_invalidated", True, invalidated=int(n))
+        except Exception as exc:
+            _log.error("[ERASE] records of turnstile %s NOT invalidated: Refill resets them", did,
+                       exc_info=True)
+            self._step("records_invalidated", False, error=str(exc)[:200])
 
     def _finish(self, state: str, *, release: bool, error: Optional[str] = None,
                 note: Optional[str] = None) -> None:
@@ -507,6 +613,14 @@ class EraseWizard:
                 device_hold.release(did)
             except Exception:
                 _log.error("[ERASE] hold of turnstile %s NOT released", did, exc_info=True)
+            else:
+                # A pass the hold cut short may have reported success with its roster stamp:
+                # without this the scheduler skips the turnstile until the roster changes.
+                try:
+                    self._force_scheduler(did)
+                except Exception:
+                    _log.warning("[ERASE] scheduler not forced for turnstile %s", did,
+                                 exc_info=True)
         kept = device_hold.is_held(did)
         self._update(state=state, finishedAt=_now_text(), error=error, holdKept=kept)
         self._step("finish", state == "DONE", state=state, holdKept=kept,
@@ -559,7 +673,7 @@ class EraseWizard:
                             "rowCounts": rows}}
 
     def _backup_c3(self, worker: Any, tables: List[str]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"rows": {}, "rowCounts": {}}
+        out: Dict[str, Any] = {"rows": {}, "rowCounts": {}, "redacted": {}}
         for t in tables:
             def _fn(drv, _t=t):
                 n = int(drv.count_table_strict(table=_t))
@@ -569,7 +683,7 @@ class EraseWizard:
             if len(rows) != n:
                 raise StepError("BACKUP_INCOMPLETE",
                                 f"table {t}: {len(rows)} row(s) read, the panel counts {n}")
-            out["rows"][t] = rows
+            out["rows"][t] = _redact_passwords(t, rows, out["redacted"])
             out["rowCounts"][t] = n
         return out
 
@@ -578,7 +692,7 @@ class EraseWizard:
         every template of every user, admins included. Verified against the terminal's own
         counters: users, admins and fingerprints must all agree, every pin must be numeric (a
         wrong out-param order would list names as pins: backing up -- and targeting -- garbage)."""
-        res = self._call(worker, lambda drv: drv.list_device_users(timeout_sec=60.0),
+        res = self._call(worker, lambda drv: drv.list_device_users(timeout_sec=TD_LIST),
                          label="list_users", timeout=T_READ) or {}
         if not res.get("ok"):
             raise StepError("BACKUP_INCOMPLETE",
@@ -610,8 +724,8 @@ class EraseWizard:
         chunks = _chunks(pins, MB_TEMPLATE_PINS_PER_CALL)
         for i, part in enumerate(chunks):
             self._update(progress={"phase": "backup_fingers", "done": i, "total": len(chunks)})
-            got = self._call(worker, lambda drv, _p=part: drv.read_user_templates(_p),
-                             label="read_templates", timeout=T_READ) or {}
+            got = self._call(worker, lambda drv, _p=part: drv.read_user_templates(
+                _p, timeout_sec=TD_TEMPLATES), label="read_templates", timeout=T_READ) or {}
             if not got.get("ok"):
                 raise StepError("BACKUP_INCOMPLETE",
                                 f"fingerprint read failed: {got.get('error') or 'no answer'}")
@@ -628,31 +742,33 @@ class EraseWizard:
                 "rowCounts": {"users": len(users_out), "fingerprints": n_read}}
 
     # ------------------------------------------------------------------ erase
-    def _erase(self, worker: Any, proto: str, tables: List[str], backup: Dict[str, Any]) -> None:
+    def _erase(self, worker: Any, did: int, proto: str, tables: List[str],
+               backup: Dict[str, Any]) -> None:
         if proto == PROTO_PULLSDK:
             for t in C3_ERASE_ORDER:
                 if t in tables:
-                    self._call(worker, lambda drv, _t=t: drv.erase_table(table=_t),
-                               label=f"erase_{t}", timeout=T_ERASE)
+                    self._write_call(worker, did, lambda drv, _t=t: drv.erase_table(table=_t),
+                                     label=f"erase_{t}", timeout=T_ERASE)
                     self._step(f"erase_{t}", True)
             return
         content = backup["content"]
         members = [u["pin"] for u in content["users"] if int(u["privilege"]) <= 0]
         if "users" in tables:
             chunks = _chunks(members, MB_DELETE_PINS_PER_CALL)
-            failed: List[str] = []
             for i, part in enumerate(chunks):
                 self._update(progress={"phase": "erase_users", "done": i, "total": len(chunks)})
-                res = self._call(worker, lambda drv, _p=part: drv.delete_users(_p, timeout_sec=90.0),
-                                 label="delete_users", timeout=T_ERASE) or {}
-                failed += [str(p) for p in (res.get("failed_pins") or [])]
-                if not res.get("ok") and not res.get("failed_pins"):
-                    raise StepError("ERASE_FAILED", f"user delete failed: {res.get('errors')}",
-                                    uncertain=True)
+                res = self._write_call(
+                    worker, did, lambda drv, _p=part: drv.delete_users(_p, timeout_sec=TD_DELETE),
+                    label="delete_users", timeout=T_ERASE) or {}
+                if not res.get("ok") or res.get("failed_pins"):
+                    # Stop at the first chunk that did not fully go: a timeout reports every pin
+                    # failed although some may have been deleted.
+                    failed = [str(p) for p in (res.get("failed_pins") or [])]
+                    raise StepError("ERASE_FAILED",
+                                    f"user delete failed in chunk {i + 1}/{len(chunks)} "
+                                    f"({len(failed)} pin(s), e.g. {failed[:5]}): "
+                                    f"{res.get('errors') or res.get('error')}", uncertain=True)
             self._update(progress=None)
-            if failed:
-                raise StepError("ERASE_FAILED", f"{len(failed)} user(s) not deleted "
-                                                f"(e.g. {failed[:5]})")
             self._step("erase_users", True, deleted=len(members))
             return
         # fingerprints only: the recorded slots of every non-admin user, never an admin's.
@@ -663,9 +779,9 @@ class EraseWizard:
             self._update(progress={"phase": "erase_fingers", "done": i, "total": len(slots)})
             parts = _chunks(fids, MB_SWEEP_SLOTS_PER_CALL)
             for j, part in enumerate(parts):
-                res = self._call(
-                    worker, lambda drv, _pin=pin, _p=part, _last=(j == len(parts) - 1):
-                    drv.sweep_finger_slots(_pin, _p, refresh=_last),
+                res = self._write_call(
+                    worker, did, lambda drv, _pin=pin, _p=part, _last=(j == len(parts) - 1):
+                    drv.sweep_finger_slots(_pin, _p, refresh=_last, timeout_sec=TD_SWEEP),
                     label="clear_fingers", timeout=T_ERASE) or {}
                 if not res.get("ok"):
                     raise StepError("ERASE_FAILED",
@@ -684,7 +800,7 @@ class EraseWizard:
         admins = [u for u in content["users"] if int(u["privilege"]) > 0]
         admin_fps = sum(len(content["templates"].get(u["pin"]) or []) for u in admins)
         if "users" in tables:
-            res = self._call(worker, lambda drv: drv.list_device_users(timeout_sec=60.0),
+            res = self._call(worker, lambda drv: drv.list_device_users(timeout_sec=TD_LIST),
                              label="list_users_after", timeout=T_READ) or {}
             if not res.get("ok"):
                 return False, "the user listing after the erase failed"
@@ -700,17 +816,26 @@ class EraseWizard:
         return True, ""
 
     # ------------------------------------------------------------------ records + refill
-    def _records(self, worker: Any, did: int, proto: str, tables: List[str], forget: bool) -> None:
+    def _records(self, worker: Any, did: int, proto: str, tables: List[str], forget: bool,
+                 backup: Dict[str, Any]) -> None:
         from app.core import db as _db
+        refused = self._write_refusal(did)
+        if refused:
+            # The lease moved after the erase: this PC must not rewrite its record of the
+            # turnstile as if it still drove it (INCOMPLETE: the hashes are invalidated).
+            raise StepError(*refused)
         users_erased = USERS_TABLE[proto] in tables
         fingers_erased = users_erased or bool(FINGER_TABLES & set(tables))
+        # The MB2000 administrators stay on the terminal with their fingers: their records stay.
+        kept = ([str(u["pin"]) for u in (backup.get("content") or {}).get("users") or []
+                 if int(u.get("privilege") or 0) > 0] if proto == PROTO_STANDALONE else [])
         if forget:
-            out = _db.retire_device_records(device_id=did)
+            out = _db.retire_device_records(device_id=did, keep_pins=kept)
             self._step("forget", True, **{k: int(v) for k, v in out.items()})
         else:
             n = _db.invalidate_device_records(device_id=did, fingers_erased=(
-                proto == PROTO_STANDALONE and fingers_erased))
-            self._step("keep_records", True, invalidated=int(n))
+                proto == PROTO_STANDALONE and fingers_erased), keep_pins=kept)
+            self._step("keep_records", True, invalidated=int(n), kept=len(kept))
         if users_erased:
             # The terminal's user table is empty now: the server's ownership record of it starts
             # a new generation (the same report a PullSDK table clear already makes, §3.9).
@@ -731,36 +856,91 @@ class EraseWizard:
         if sched is not None and hasattr(sched, "force_resync"):
             sched.force_resync(did)
 
-    def _refill(self, worker: Any, did: int, refill: str) -> None:
+    def _refill(self, worker: Any, did: int, refill: str, run_scheme: Optional[str]) -> None:
         if refill == REFILL_HOLD:
             self._finish("DONE", release=False, note="on hold until Refill is pressed")
             return
+        # The pin scheme must still be the one the run started under: a switch recorded during
+        # the run (or a stale answer reverting one, §3.2e) would refill the other numbering.
+        try:
+            scheme = self._pin_scheme_strict(did)
+        except Exception as exc:
+            self._finish("DONE", release=False,
+                         note=f"PIN_SCHEME_UNREADABLE: kept on hold, press Refill ({exc})")
+            return
+        if scheme != run_scheme:
+            self._finish("DONE", release=False,
+                         note=f"PIN_SCHEME_CHANGED: {run_scheme} at the start, {scheme} now -- "
+                              "kept on hold, press Refill")
+            return
         device_hold.release(did)
-        self._force_scheduler(did)
+        try:
+            self._force_scheduler(did)
+        except Exception:
+            _log.warning("[ERASE] scheduler not forced for turnstile %s", did, exc_info=True)
         if refill == REFILL_NOW:
-            worker.request_full_sync(reason="erase-refill")
-            self._step("refill", True, mode="now")
+            # Released and verified: a pass that cannot be queued now is only late (the next
+            # scheduled pass refills), never a reason to call the run INCOMPLETE.
+            try:
+                requested = bool(worker.request_full_sync(reason="erase-refill"))
+            except Exception as exc:
+                _log.warning("[ERASE] refill pass not requested on turnstile %s", did,
+                             exc_info=True)
+                requested, why = False, str(exc)[:200]
+            else:
+                why = ""
+            self._step("refill", requested, mode="now", pinScheme=str(scheme),
+                       **({"error": why} if why else {}))
         else:
-            self._step("refill", True, mode="auto")
+            self._step("refill", True, mode="auto", pinScheme=str(scheme))
         self._finish("DONE", release=False)
 
     def refill(self, device_id: int, body: Dict[str, Any], *,
                verify_password: Callable[[str], Tuple[bool, int, str]]) -> Tuple[int, Dict[str, Any]]:
-        """The Refill button: release a hold and push the turnstile now."""
+        """The Refill button: reset the turnstile's records, release its hold, push it now.
+
+        The page sends the pin scheme it showed (``expectedPinScheme``, read from /erase/holds);
+        a scheme that moved since is refused. The records are ALWAYS reset first (the hard-reset
+        UPDATE, durable): a hold can come from a run that ended INCOMPLETE or was cut by a
+        restart, and then every pin must be written again. A reset that fails keeps the hold."""
         did = int(device_id)
+        body = dict(body or {})
+        if device_hold.load_failed():
+            return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
+                         "error": "the erase holds could not be read: every turnstile stays held"}
         with self._lock:
             if self._running and self._run and int(self._run.get("deviceId") or 0) == did:
                 return 409, {"ok": False, "code": "RUN_IN_PROGRESS",
                              "error": "an erase of this turnstile is still running"}
         if not device_hold.is_held(did):
             return 409, {"ok": False, "code": "NOT_ON_HOLD", "error": "this turnstile is not on hold"}
+        if "expectedPinScheme" not in body:
+            return 400, {"ok": False, "code": "PIN_SCHEME_REQUIRED",
+                         "error": "send the pin scheme the page showed (expectedPinScheme)"}
+        expected = body.get("expectedPinScheme")
+        expected = None if expected is None else str(expected)
         # No lease or worker condition: releasing a hold writes nothing by itself. A turnstile
         # this PC no longer drives stays unwritten by the lease gate; one with no running worker
         # is refilled by the first pass once its worker starts.
-        ok, status, error = verify_password(str((body or {}).get("password") or ""))
+        ok, status, error = verify_password(str(body.get("password") or ""))
         if not ok:
             return status, {"ok": False, "code": "ADMIN_PASSWORD", "error": error}
-        scheme = self._pin_scheme(did)
+        try:
+            scheme = self._pin_scheme_strict(did)
+        except Exception as exc:
+            return 503, {"ok": False, "code": "PIN_SCHEME_UNREADABLE",
+                         "error": f"the turnstile's pin scheme could not be read: {exc}"}
+        if scheme != expected:
+            return 409, {"ok": False, "code": "PIN_SCHEME_CHANGED", "pinScheme": scheme,
+                         "error": f"the pin scheme is {scheme} now, the page showed {expected}"}
+        from app.core import db as _db
+        try:
+            invalidated = int(_db.invalidate_device_records(device_id=did, fingers_erased=False))
+        except Exception as exc:
+            _log.error("[ERASE] Refill of turnstile %s: records not reset, hold kept", did,
+                       exc_info=True)
+            return 500, {"ok": False, "code": "RECORDS_NOT_RESET",
+                         "error": f"MonClub's records of this turnstile could not be reset: {exc}"}
         device_hold.release(did)
         self._force_scheduler(did)
         worker = self._worker(did)
@@ -770,14 +950,31 @@ class EraseWizard:
                 requested = bool(worker.request_full_sync(reason="erase-refill"))
             except Exception:
                 _log.warning("[ERASE] refill pass not requested on turnstile %s", did, exc_info=True)
-        _log.warning("[ERASE] turnstile %s released by Refill (pinScheme=%s, pass requested=%s)",
-                     did, scheme, requested)
+        _log.warning("[ERASE] turnstile %s released by Refill (pinScheme=%s, %d record(s) reset, "
+                     "pass requested=%s)", did, scheme, invalidated, requested)
         try:
             _tel.event("ERASE_STEP", run="refill", device_id=did, step="refill_pressed", ok=True,
-                       pin_scheme=str(scheme), requested=requested)
+                       pin_scheme=str(scheme), requested=requested, invalidated=invalidated)
         except Exception:
             pass
-        return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested}
+        return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested,
+                     "invalidated": invalidated}
+
+
+def _redact_passwords(table: str, rows: List[Dict[str, Any]],
+                      redacted: Dict[str, int]) -> List[Dict[str, Any]]:
+    """Copies of ``rows`` with every password value emptied (key kept, any case): the backup
+    is for MonClub's own refill, which never needs one. Counts the values emptied."""
+    out = []
+    for row in rows or []:
+        row = dict(row)
+        for key in list(row):
+            if str(key).lower() == "password":
+                if str(row[key] or ""):
+                    redacted[f"{table}.{key}"] = redacted.get(f"{table}.{key}", 0) + 1
+                row[key] = ""
+        out.append(row)
+    return out
 
 
 def _flat(counts: Dict[str, Any]) -> Dict[str, Any]:

@@ -559,7 +559,11 @@ or an exception fails the WHOLE read (`ok False`), never "no finger". `read_devi
 `_read_device_status` on demand (an index that does not read is absent). `[CODE]` `[TEST:
 tests/test_device_hold.py::test_the_mb2000_listing_carries_the_privilege_and_templates_read_by_slot,
 ::test_an_unexpected_template_shape_fails_the_whole_read]` The shape and the duration on an MB2000 are
-`[UNVERIFIED]` — about 1,800 users × 10 reads at gym 45.
+`[UNVERIFIED]` — about 1,800 users × 10 reads at gym 45. The wizard passes each call its own
+`timeout_sec` (status 20 s, listing 60 s, templates 90 s, `delete_users` 90 s for 20 users, a sweep
+30 s), below its `request_run_sdk` budget, so the driver's own timeout fires first; chosen, not measured.
+A `delete_users` that does not fully go stops the wizard's erase there. `[CODE]`
+`[TEST: tests/test_erase_wizard.py::TestMb2000Commands]`
 
 **Fails closed.** A failed enumeration must NEVER read as an empty device — that would
 delete every member under MIRROR. `[CODE]`

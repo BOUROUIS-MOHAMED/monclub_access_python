@@ -59,7 +59,7 @@ This file is only useful while it is true. If you change any of the following, y
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `app.py::ultra_devices_for_this_pc`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
-| The Erase-content wizard or the write hold (`app/core/erase_wizard.py`, `app/core/device_hold.py`, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::retire_device_records`, `::invalidate_device_records`, the hold in `ultra_engine.py::_v2_writes_blocked`, `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()`, the `erase` routes and handlers, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
+| The Erase-content wizard or the write hold (`app/core/erase_wizard.py`, `app/core/device_hold.py`, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::retire_device_records`, `::invalidate_device_records`, the hold in `ultra_engine.py::_v2_writes_blocked`, `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`) | §3.10 |
 | The test / verification commands | §9 Verifying this guide |
 
@@ -1808,54 +1808,109 @@ does not need them.
 **Before anything runs** (`EraseWizard.start`), all of: a preview of THIS turnstile younger than 15
 min, whose id, name, address, port and protocol have not changed; the typed name equal to the
 turnstile's name (trimmed, exact); tables that the preview showed erasable; for "forget", the users
-table among them; on an MB2000 with faces (status 21) and the users table chosen, the faces' loss
-accepted (no face backup exists); this PC drives the turnstile, it is not being handed over and not
-add-only (§3.9); a running, connected ULTRA worker drives it — every call goes through its connection
-(`request_run_sdk`), never a second session; no other run; and **the admin password, checked by the
-server** (`validate_statistics_password`, the Local DB page's call) — the page's own lock is a screen, and
-offline the password cannot be checked, so nothing is erased (503). `[TEST: ::TestNothingIsErasedWithout,
-::TestTheRightDeviceOnly, ::TestLocalApi]`
+table among them; **on a C3, `user` only together with every rights and fingerprint table the preview
+could read** (`USER_NEEDS_RIGHTS_AND_FINGERS`, with or without "forget": left behind, an old pin's door
+rights and fingers would pass to whoever gets the same pin next — ACCOUNT pins reuse membership numbers,
+§3.2e); **on an MB2000, the users erase only with "forget"** (`USERS_ERASE_NEEDS_FORGET`, see the
+residuals); on an MB2000 with the users table chosen, the faces' loss accepted when status 21 reports
+faces (`FACES_PRESENT`) **or does not answer** (`FACES_UNKNOWN`: an unreadable count is not zero, and no
+face backup exists); this PC drives the turnstile, it is not being handed over and not add-only (§3.9); a
+running, connected ULTRA worker drives it — every call goes through its connection (`request_run_sdk`),
+never a second session; the pin scheme reads (the run records it; `PIN_SCHEME_UNREADABLE` otherwise); no
+other run; and **the admin password, checked by the server** (`validate_statistics_password`, the Local DB
+page's call) — the page's own lock is a screen, and offline the password cannot be checked, so nothing is
+erased (503). The page ticks and locks the C3 rights and fingerprint tables when `user` is ticked, fixes
+"forget" to yes for an MB2000 users erase, and asks the face confirmation for an unknown count too.
+`[TEST: ::TestNothingIsErasedWithout, ::TestTheRightDeviceOnly, ::TestLocalApi,
+::TestC3UsersNeedsRightsAndFingers, ::TestMb2000UsersEraseForgets, ::TestUnknownFaces]`
+
+**What the wizard may call on a device** is pinned by an AST test: its `drv.` calls are exactly the strict
+C3 count and read, the one-table erase, the MB2000 status read, listing and template read, the whole-user
+delete and the finger-slot clear; no forbidden name (a parameter or `set_device_data` write, a raw
+`DeleteDeviceData`, the finger-index delete, `ClearGLog`, `push_roster`) appears in its code (docstrings
+do not count). `[TEST: ::test_the_wizard_calls_only_these_driver_methods]`
 
 **The run** (its own thread; each step logged `[ERASE] run=… step=…`, `[T] ERASE_STEP`, and written to the
 run folder's `run.json`):
 
 1. **hold** — `device_hold.hold`: a durable row, then the in-memory gate (below). From here MonClub writes
-   nothing to the turnstile; the door, the scans and the rescues go on.
+   no member to the turnstile; the door, the scans and the rescues go on.
 2. **idle** — waits (≤ 120 s) for a pass already running to end; a push stops at its next chunk (the gate).
 3. **counts before**, then **the backup**: C3 — every row of each chosen table, the count read in the same
-   command, rows read must equal it; MB2000 — the user listing (must equal status 2, every pin numeric ≤ 9
-   digits, every privilege an integer, the admins listed must equal status 1: a wrong out-param order would
-   back up — and target — garbage), then every template of every user, admins included, 2 users (20
-   `SSR_GetUserTmpStr`) per command, whose total must equal status 3. Written to
+   command, rows read must equal it; the `user` table's password values are emptied (the key kept, any
+   case) and counted in `redacted` — MonClub's refill never needs one, and the MB2000 backup leaves them out
+   too; MB2000 — the user listing (must equal status 2, every pin numeric ≤ 9 digits, every privilege an
+   integer, the admins listed must equal status 1: a wrong out-param order would back up — and target —
+   garbage), then every template of every user, admins included, 2 users (20 `SSR_GetUserTmpStr`) per
+   command, whose total must equal status 3. Written to
    `<data root>\access\erase_backups\<run>_device<id>\backup.json` (+ `.sha256`), fsynced, renamed, read
    back and hash-checked. **Any failure here: nothing erased, the hold released** (kept if the turnstile was
    already on hold), state `FAILED`. The file holds names, cards and fingerprint templates: biometric data,
    on the gym PC only. `[TEST: ::test_a_verified_backup, ::test_the_backup_is_written_and_checked_before_the_first_erase,
-   ::TestMb2000::test_a_listing_whose_admin_count_disagrees_is_not_trusted, ::test_a_template_count_that_disagrees_stops_before_any_erase]`
+   ::TestMb2000::test_a_listing_whose_admin_count_disagrees_is_not_trusted, ::test_a_template_count_that_disagrees_stops_before_any_erase,
+   ::TestBackupRedactsPasswords]`
+   Each MB2000 command carries the driver's own `timeout_sec` (status 20 s, listing 60 s, templates 90 s,
+   delete 90 s, sweep 30 s), below the wizard's `request_run_sdk` budgets (30 / 120 / 120 s), so the
+   driver's timeout fires first — a `request_run_sdk` timeout abandons the STA thread (§3.1a). Chosen, not
+   measured `[UNVERIFIED on hardware]`. `[TEST: ::TestMb2000Commands]`
 4. **erase**, then **counts after** and **verify**: C3 — every chosen table counts 0; MB2000 — a fresh listing
    shows no non-admin user and status 2 equals the admins kept, and status 3 equals the admins' templates.
-   **Anything else — a refused or unanswered command (`sent, no answer`), a row left — is `INCOMPLETE`: the
-   hold is kept and nothing is forgotten** (an unverified erase followed by a forget is the stranded-pin
-   failure of §3.2c). `[TEST: ::TestC3Run::test_an_erase_that_leaves_rows_keeps_the_hold_and_forgets_nothing,
-   ::test_an_unanswered_erase_is_never_read_as_done]`
-5. **records** — *forget*: `db.retire_device_records`, one durable transaction: a `v2_removal_log` row for
-   every pin with a state or intent row (the ownership backup's REMOVED fact, §3.9), then the turnstile's
-   `device_sync_state`, `device_push_intent`, `device_content_mirror` and `v2_readd` rows go; the pin-scheme
-   history stays. *keep*: `db.invalidate_device_records` — the hard-reset UPDATE (hashes cleared,
-   `last_ok=0`, ownership kept, §3.2c), and on an MB2000 whose fingers went, `pushed_finger_ids=''` (known
-   empty) and `finger_slots_swept=1`, so the refill never clears an already-empty slot that answers False
-   (§7 R1-20). A users erase is also reported to the server (`ownership.note_wipe`, the report a PullSDK
-   table clear makes). `[TEST: ::test_forget_retires_the_records_through_the_removal_log_and_reports_the_wipe,
-   ::test_keep_records_invalidates_every_pin_and_keeps_ownership]`
-6. **refill** — *now*: hold released, the scheduler's roster hash dropped (`force_resync`), a full pass
-   requested (`request_full_sync(reason="erase-refill")`); *next sync*: released and `force_resync` only —
-   without it the scheduler skips the unchanged roster; a manual-sync gym waits for "Synchroniser"; *hold*:
-   kept, durably, until the **Refill** button (`/erase/refill`: the admin password again, checked by the
-   server; it needs no connection to the turnstile, so it works with the cables out). The button and the
-   page name the pin scheme the database records at that moment — the refill pushes that scheme, since the
-   workers follow the database (§3.2e). An MB2000 refill is capped at `_FULL_SYNC_MAX_PINS_PER_PASS` = 50
-   pins a pass (§3.4e): several passes. `[TEST: ::test_refill_now, ::test_refill_at_the_next_sync,
-   ::test_hold_until_refill_survives_a_restart_and_refill_needs_the_password, ::test_the_refill_names_the_scheme_recorded_now]`
+   **Every erase command is lease-checked twice** (`EraseWizard._write_call`): on the wizard thread before
+   it is queued, and on the worker thread just before it runs — the command waits in the worker's queue and
+   the lease can move meanwhile. A refusal (`NOT_DRIVER`, `HANDOVER_IN_PROGRESS`, `ADD_ONLY`) stops the run.
+   An MB2000 delete command that did not fully go stops the erase there, marked uncertain (a timeout
+   reports every pin failed although some may be gone). **Any of these, or a row left, or a command that got
+   no answer (`sent, no answer`), is `INCOMPLETE`: the hold is kept, nothing is forgotten, and every recorded
+   pin of the turnstile is made "not in sync"** (`_invalidate` → `db.invalidate_device_records(
+   fingers_erased=False)`: the hard-reset UPDATE, durable; ownership and the recorded finger sets kept —
+   whether the fingers went is not known), so the refill writes every pin again. A crash after the first
+   erase command does the same. Before review round 1 an INCOMPLETE left every record "in sync" and Refill
+   put back nothing the erase had removed (a C3 pass only notices a missing `user` row; an MB2000 pin whose
+   record matches is skipped). `[TEST: ::TestC3Run::test_an_erase_that_leaves_rows_keeps_the_hold_and_forgets_nothing,
+   ::test_an_unanswered_erase_is_never_read_as_done, ::TestIncompleteRefillsEverything,
+   ::TestTheLeaseIsCheckedAtEveryWrite, ::TestMb2000Commands::test_a_failed_delete_chunk_stops_the_erase]`
+5. **records** — the lease is checked again first (a refusal: `INCOMPLETE`, above). *forget*:
+   `db.retire_device_records`, one durable transaction: a `v2_removal_log` row for every pin with a state or
+   intent row (the ownership backup's REMOVED fact, §3.9), then the turnstile's `device_sync_state`,
+   `device_push_intent`, `device_content_mirror`, `v2_readd` and `device_push_result` rows go; the pin-scheme
+   history stays. **The MB2000 administrators the erase left on the terminal (`keep_pins`, from the backup)
+   keep every row and are never logged REMOVED** — before review round 1 an admin pin with a MonClub record
+   was retired and reported removed while it stayed on the terminal. *keep*: `db.invalidate_device_records`
+   — the hard-reset UPDATE (hashes cleared, `last_ok=0`, ownership kept, §3.2c), and on an MB2000 whose
+   fingers went, `pushed_finger_ids=''` (known empty) and `finger_slots_swept=1` — the kept admins excepted —
+   so the refill never clears an already-empty slot that answers False (§7 R1-20). A users erase is also
+   reported to the server (`ownership.note_wipe`, the report a PullSDK table clear makes).
+   `[TEST: ::test_forget_retires_the_records_through_the_removal_log_and_reports_the_wipe,
+   ::test_keep_records_invalidates_every_pin_and_keeps_ownership, ::TestForgetKeepsWhatStaysOnTheTerminal]`
+6. **refill** — *now* / *next sync*: the pin scheme is read again first; if it is not the one the run
+   started under (a switch recorded during the run, or a stale answer reverting one, §3.2e) or does not
+   read, the run ends `DONE` **with the hold kept** (note `PIN_SCHEME_CHANGED` / `PIN_SCHEME_UNREADABLE`):
+   the operator presses Refill. Otherwise the hold is released, the scheduler's roster hash dropped
+   (`force_resync`) and, for *now*, a full pass requested (`request_full_sync(reason="erase-refill")`);
+   *next sync* relies on `force_resync` — without it the scheduler skips the unchanged roster; a manual-sync
+   gym waits for "Synchroniser". *hold*: kept, durably, until the **Refill** button. An MB2000 refill is
+   capped at `_FULL_SYNC_MAX_PINS_PER_PASS` = 50 pins a pass (§3.4e): several passes. `[TEST: ::test_refill_now,
+   ::test_refill_at_the_next_sync, ::TestRefillPinScheme::test_a_scheme_switched_during_the_run_keeps_the_hold]`
+
+**The Refill button** (`/erase/refill`, `EraseWizard.refill`). The page reads the pin scheme from
+`/erase/holds` (never the run's start value), shows it, and sends it back as `expectedPinScheme`; the server
+refuses a missing one (400 `PIN_SCHEME_REQUIRED`), one that moved since (409 `PIN_SCHEME_CHANGED` with the
+scheme now — the page re-reads and shows it) and an unreadable one (503). Then the admin password, checked
+by the server: **Refill needs the internet** — offline it answers 503 and the turnstile stays held (an
+owner question, lane report). Then it **always resets the turnstile's records first**
+(`invalidate_device_records(fingers_erased=False)`, durable) — a hold can come from an `INCOMPLETE` run or
+from a restart mid-run, which leaves no run record — and only then releases the hold, drops the scheduler's
+roster hash and requests a full pass. A reset that fails answers 500 `RECORDS_NOT_RESET` and keeps the hold.
+It needs no connection to the turnstile (the cables may be out); the refill pushes the scheme the database
+records, since the workers follow the database (§3.2e). `[TEST: ::test_hold_until_refill_survives_a_restart_and_refill_needs_the_password,
+::test_the_refill_names_the_scheme_recorded_now, ::TestRefillPinScheme,
+::TestIncompleteRefillsEverything::test_a_hold_left_by_a_restart_mid_run_refills_every_pin,
+::test_refill_keeps_the_hold_when_the_records_cannot_be_reset]`
+
+**Every release of a hold by the wizard** (a `FAILED` run, a backup-only run, a refill) also drops the
+scheduler's roster hash (`force_resync`): a pass the hold cut short may have reported success with its
+roster stamp (the PullSDK engine returns early on a held panel) and the scheduler would skip the turnstile
+until the roster changes. `[TEST: ::TestEveryReleaseForcesTheScheduler]`
 
 A "backup only" run (the rehearsal) does steps 1–3 and releases the hold. `[TEST: ::test_backup_only_erases_nothing]`
 
@@ -1864,11 +1919,22 @@ cached roles, before the first sync tick can start a worker — the cutover rest
 and the refill. It closes the gates a handover's write freeze closes: `ultra_engine._v2_writes_blocked`
 (member drain, full-sync drain — a queued pass waits, it is not dropped —, the chunk yield, the pre-push
 check, the member push, the maintenance slot), `DeviceSyncEngine._sync_one_device` at its start (no session:
-the scheduler fallback lands there) and before its batch, `sync_member_on_connected_sdk` (deferred), and the
-remote `DEVICE_RECONCILE` (`FAILED DEVICE_ON_HOLD`). One immutable-set lookup, no lock, no database.
-`[TEST: test_device_hold.py]` A failed load at start-up is logged at ERROR and installs nothing: a held
-turnstile could then be written to `[CODE]` — `init_db` has just succeeded at that point, so it would take
-a database that reads and then does not.
+the scheduler fallback lands there) and before its batch, `sync_member_on_connected_sdk` (deferred), the
+remote `DEVICE_RECONCILE` (`FAILED DEVICE_ON_HOLD`), and the local API's direct PullSDK user writes
+(`users/push`, `users/delete`: 409 `DEVICE_ON_HOLD`, or `HANDOVER_IN_PROGRESS` during a handover, before any
+connect — no page calls them). One immutable-set lookup, no lock, no database. The door, the clock and the
+re-entry settings are not member writes and are not held. `[TEST: test_device_hold.py,
+test_erase_wizard.py::TestDirectWritesRefuseAHeldTurnstile]` **A failed load at start-up holds EVERY
+turnstile** (fail closed, review round 1: `is_held` answers True for any id while `load_failed()`), logged
+at ERROR; `MainApp._sync_tick` retries it every tick through `device_hold.ensure_loaded()`, which reads
+nothing once the holds are loaded; meanwhile Refill answers 503 `HOLDS_UNKNOWN` and `/erase/holds` reports
+`loadFailed`. `[TEST: test_device_hold.py — the four fail-closed tests;
+test_erase_wizard.py::TestRefillWhileTheHoldsAreUnknown]`
+
+**A handover waits for a run.** `OwnershipSync._worker_idle` answers False while
+`EraseWizard.running_device()` is that turnstile, so the release's final upload comes after the run and
+carries an `INCOMPLETE` reset (a reset row uploads `pushedHash: null`, and a restore adopts it as such, so
+the new driver writes the pin). `[TEST: ::TestTheLeaseIsCheckedAtEveryWrite::test_a_handover_release_waits_while_an_erase_runs]`
 
 **Not the removal ceiling.** The wizard's erase is the operator's manual wipe (§3.2c: the cutover must be
 one); it does not go through `push_safety.check_bulk_removal`. Its rails are the password, the typed name,
@@ -1882,10 +1948,20 @@ the verified backup and the verified erase. `[CODE]`
   backup. Its duration is unmeasured: ~1,800 users × 10 reads `[UNVERIFIED]` (script 14's own
   `msPerFingerRead`, when run, gives it).
 - A C3 table larger than the read ladder's last step (8 MB) cannot be backed up, so it cannot be erased.
-- "Keep records" after an MB2000 users erase: departed members' owned rows stay, so the next pass's removal
-  step deletes pins that are no longer there; what `SSR_DeleteEnrollData(…, 12)` answers for a missing pin is
-  `[UNVERIFIED]`, and a False sends the pin to the neutralise fallback, which writes a blank disabled user
-  (§3.4). The page steers to "forget" when the users are erased.
+- A C3 rights or fingerprint table that did not read at step 1 is not required with `user`: if it failed
+  only that once, its rows stay. Read again (step 1) before erasing.
+- A **forced** lease move (no release, so no final upload): between the server moving the lease and this
+  PC's next check — at most one erase command, a C3 table or 20 MB2000 users — that command still runs, and
+  the new driver may restore the old hashes before this PC uploads its `INCOMPLETE` reset (the lost-turnstile
+  upload sends it later, changes only, §3.9).
+- A handover waits for a running backup to end: the reads are not lease-checked (the first erase command
+  then refuses). An MB2000 template backup's duration is unmeasured `[UNVERIFIED]`.
+- "Keep records" after an MB2000 users erase is refused (`USERS_ERASE_NEEDS_FORGET`): the departed members'
+  owned rows would stay, so the next pass's removal step would delete pins that are no longer there; what
+  `SSR_DeleteEnrollData(…, 12)` answers for a missing pin is `[UNVERIFIED]`, and a False sends the pin to the
+  neutralise fallback, which writes a blank disabled user (§3.4). An MB2000 **`INCOMPLETE`** users erase
+  keeps the records (nothing may be forgotten after an unverified erase), so it keeps this risk for the pins
+  it did delete.
 - `fingerprint_push_status` rows (the PullSDK per-finger push outcomes) are not touched by "forget".
 - The waiting count (§3.10) is cleared by the run and refilled by the next pass.
 
@@ -4403,7 +4479,7 @@ releases, restores, read-backs, loss checks); none is a `[T]` event.
 
 | Event | Where | Carries |
 |---|---|---|
-| `ERASE_STEP` | `erase_wizard.py::EraseWizard._step`, `::refill` | `run device_id step ok` + the step's own scalar fields: `n_<table>` counts (before/after; `-1` = unreadable), `path sha256 rows` (backup), `code error uncertain` (a failed erase), `verified why`, `state holdKept` (`finish`), `mode` (refill), `state/intent/mirror/readd/removals_logged` (forget). `step` ∈ `hold`, `idle`, `counts_before`, `backup`, `erase_<table>`, `erase_users`, `erase_fingerprints`, `erase`, `counts_after`, `forget`, `keep_records`, `wipe_reported`, `refill`, `finish`, and `refill_pressed` (`run=refill`, the Refill button). One line per step; the same step is written to the run folder's `run.json` (§3.2h). No member name, card or template. |
+| `ERASE_STEP` | `erase_wizard.py::EraseWizard._step`, `::refill` | `run device_id step ok` + the step's own scalar fields: `n_<table>` counts (before/after; `-1` = unreadable), `path sha256 rows` (backup), `code error uncertain` (a failed erase), `verified why`, `state holdKept note` (`finish`; `note` `PIN_SCHEME_CHANGED…` when a refill was held back), `mode pinScheme` (refill), `state/intents/mirror/readd/results/removals_logged/kept` (forget), `invalidated kept` (keep_records), `invalidated` (records_invalidated, after an `INCOMPLETE`). `step` ∈ `hold`, `idle`, `counts_before`, `backup`, `erase_<table>`, `erase_users`, `erase_fingerprints`, `erase`, `counts_after`, `forget`, `keep_records`, `records_invalidated`, `wipe_reported`, `refill`, `finish`, and `refill_pressed` (`run=refill`, the Refill button: `pin_scheme requested invalidated`). One line per step; the same step is written to the run folder's `run.json` (§3.2h). No member name, card or template. |
 
 `REVOKE_DONE pins` now counts only what the removal step removed first; held old pins removed after
 the push are in `RENEWAL_HOLD removed_after_push` (§3.4f). `REVOKE_ABORTED` has a new `path`,
