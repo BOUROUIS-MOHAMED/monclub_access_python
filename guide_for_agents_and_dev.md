@@ -1881,8 +1881,11 @@ each read, so the password check and the switch check can each take about 30 s o
 **Erase backups are kept 30 days** (owner decision 2026-09-27, NEW 1; `erase_wizard.prune_erase_backups`, at start-up on
 its own thread after the holds are loaded, and after every run). A run folder goes 30 days after the LATEST of its run's
 start (the run id's local time) and the last write of any file in it — the run's end, and `refilled_at.txt`, which
-Refill writes into every run folder of the turnstile it releases (`_mark_refilled`): a turnstile held longer than 30
-days keeps its backups 30 days after Refill (review round 2). Never: a held turnstile's runs (while the holds cannot be
+Refill writes into every run folder of the turnstile BEFORE it releases it (`_mark_refilled`; after, a prune in between
+found the folder neither held nor marked — review round 3): a turnstile held longer than 30 days keeps its backups 30
+days after Refill (review round 2). A mark that cannot be written is logged at ERROR and reported in Refill's answer
+(`backupsMarked: false`); Refill still releases — a held turnstile must always be refillable. The mark also restarts the
+30 days of that turnstile's older runs. Never: a held turnstile's runs (while the holds cannot be
 read every turnstile reads held, so nothing goes); the run in progress; a folder whose name is not a run's; a run id
 before `20260901` (`_NO_RUN_BEFORE`: no run predates the wizard, so that is a PC clock that was wrong — its age cannot
 be told). A run whose `run.json` is unreadable or still `RUNNING` goes once old enough and not held: no run of this

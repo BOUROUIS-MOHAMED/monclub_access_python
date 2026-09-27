@@ -823,6 +823,48 @@ class TestBackupsAreKeptThirtyDays:
         assert folder.exists(), "29 days after the refill: kept"
         assert ew.prune_erase_backups(root, now=refilled_at + 31 * 86400) == [mine]
 
+    def test_the_mark_is_written_before_the_release(self, sqlite_db, tmp_path, monkeypatch):
+        """Review round 3: a prune landing between the release and the mark found the folder
+        neither held nor marked."""
+        monkeypatch.setattr(ew, "_NO_RUN_BEFORE", "20000101")
+        run = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - 45 * 86400))
+        root = tmp_path / "erase_backups"
+        folder = _run_folder(root, f"{run}-aaaaaa", 5, state="INCOMPLETE")
+        device_hold.hold(5, reason="erase", run_id=f"{run}-aaaaaa")
+        wiz = ew.EraseWizard(_app({}), backup_root=root, spawn=lambda fn: fn(),
+                             sleep=lambda s: None)
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda did: None)
+        pruned = []
+        real_release = device_hold.release
+
+        def _release_then_prune(did):
+            out = real_release(did)
+            pruned.extend(ew.prune_erase_backups(root))      # a prune in the gap
+            return out
+        monkeypatch.setattr(device_hold, "release", _release_then_prune)
+        status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 200 and out["backupsMarked"] is True
+        assert pruned == [] and folder.exists()
+
+    def test_a_mark_that_cannot_be_written_is_reported_and_refill_still_goes(
+            self, sqlite_db, tmp_path, monkeypatch):
+        root = tmp_path / "erase_backups"
+        _run_folder(root, OLD, 5, state="INCOMPLETE")
+        device_hold.hold(5, reason="erase", run_id=OLD)
+        wiz = ew.EraseWizard(_app({}), backup_root=root, spawn=lambda fn: fn(),
+                             sleep=lambda s: None)
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda did: None)
+        from pathlib import Path
+        real = Path.write_bytes
+
+        def _refuse(self, data):
+            if self.name == ew.REFILLED_MARK:
+                raise PermissionError("denied")
+            return real(self, data)
+        monkeypatch.setattr(Path, "write_bytes", _refuse)
+        status, out = wiz.refill(5, _refill_body(), verify_password=_pw_ok)
+        assert status == 200 and out["backupsMarked"] is False and not device_hold.is_held(5)
+
     def test_a_run_dated_before_the_wizard_is_a_wrong_clock_and_is_kept(self, sqlite_db,
                                                                         tmp_path):
         """Review round 2, finding 2: a dead CMOS battery stamps a run in 2000; once the clock

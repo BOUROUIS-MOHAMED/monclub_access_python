@@ -108,6 +108,8 @@ export interface RefillResult {
   pinScheme: string | null;
   passRequested: boolean;
   invalidated?: number;
+  /** Lane 1b: the backups' 30 days now count from this Refill (false: a mark could not be written). */
+  backupsMarked?: boolean;
 }
 
 export interface EraseApi {

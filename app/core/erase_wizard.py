@@ -1377,8 +1377,9 @@ class EraseWizard:
                        exc_info=True)
             return 500, {"ok": False, "code": "RECORDS_NOT_RESET",
                          "error": f"MonClub's records of this turnstile could not be reset: {exc}"}
+        # The backups' 30 days count from now (NEW 1): marked BEFORE the release (review round 3).
+        marked = _mark_refilled(self.backup_root(), did)
         device_hold.release(did)
-        _mark_refilled(self.backup_root(), did)        # the 30 days count from now (NEW 1)
         self._force_scheduler(did)
         worker = self._worker(did)
         requested = False
@@ -1397,7 +1398,7 @@ class EraseWizard:
         except Exception:
             pass
         return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested,
-                     "invalidated": invalidated}
+                     "invalidated": invalidated, "backupsMarked": marked}
 
 
 BACKUP_KEEP_DAYS = 30
@@ -1409,13 +1410,16 @@ _NO_RUN_BEFORE = "20260901"
 REFILLED_MARK = "refilled_at.txt"
 
 
-def _mark_refilled(root: Path, device_id: int) -> None:
-    """Refill released this turnstile: its run folders' 30 days count from NOW, not from the
-    erase (a turnstile can stay held longer, and a refill can take several passes). One small
-    file per folder; best effort."""
+def _mark_refilled(root: Path, device_id: int) -> bool:
+    """Refill is about to release this turnstile: its run folders' 30 days count from NOW, not
+    from the erase (a turnstile can stay held longer). Written BEFORE the release, so no prune can
+    find the folder unheld and unmarked (review round 3). One small file per folder. Returns
+    whether every folder of the turnstile got it; a failure is logged at ERROR and reported by
+    Refill, never a reason to keep the turnstile empty."""
+    ok = True
     try:
         if not root.is_dir():
-            return
+            return True
         stamp = _now_text().encode("ascii")
         for folder in root.iterdir():
             m = _RUN_DIR_NAME.match(folder.name)
@@ -1423,11 +1427,14 @@ def _mark_refilled(root: Path, device_id: int) -> None:
                 try:
                     (folder / REFILLED_MARK).write_bytes(stamp)
                 except Exception:
-                    _log.warning("[ERASE] refill mark not written in %s", folder.name,
-                                 exc_info=True)
+                    ok = False
+                    _log.error("[ERASE] refill mark not written in %s: its backup may be "
+                               "deleted 30 days after the erase, not after Refill", folder.name,
+                               exc_info=True)
     except Exception:
-        _log.warning("[ERASE] refill marks not written for turnstile %s", device_id,
-                     exc_info=True)
+        _log.error("[ERASE] refill marks not written for turnstile %s", device_id, exc_info=True)
+        return False
+    return ok
 
 
 def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = None,
@@ -1435,7 +1442,7 @@ def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = N
     """Delete erase run folders (backup + run.json) older than ``BACKUP_KEEP_DAYS`` (owner decision
     2026-09-27, guide §3.2h). The age counts from the LATEST of: the run's start (its run id, local
     time) and the last write of any file in its folder -- the run's end, and the refill mark Refill
-    writes -- so a backup stays 30 days after its turnstile was refilled. NEVER: a folder whose
+    writes -- so a backup stays 30 days after Refill was pressed. NEVER: a folder whose
     name is not a run's; a run id before ``_NO_RUN_BEFORE`` (a wrong clock); the run in progress
     (``keep_run_id``); any run of a turnstile still HELD -- while the holds cannot be read every
     turnstile reads held, so nothing goes. A run whose ``run.json`` is unreadable or still says
