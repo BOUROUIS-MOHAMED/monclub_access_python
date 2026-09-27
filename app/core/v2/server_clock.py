@@ -18,6 +18,13 @@ report it in the heartbeat.
   keep ``sentAt`` ahead of the server after a restart.
 * The offset itself is persisted, and reused after a restart only while younger than
   ``PERSISTED_MAX_AGE_SEC`` (a PC that was off all night has no measurement of today).
+* The heartbeat's report is a VIEW over the samples of the last ``RECENT_SEC`` (30 min, PC
+  clock): their median, their count and the age of the oldest (master correction 3,
+  2026-09-27 -- with the socket up the guaranteed samples are the 600 s assignment refreshes,
+  so the window of 7 spans an hour and its oldest sample never met the dashboard's 30-minute
+  freshness rule). The window that drives ``offset()`` is not touched. Each recent sample is
+  persisted with its own time, so a remembered offset counts its age from the original
+  measurement. No sample in the last 30 minutes: the window's own figures, without ``ageSec``.
 """
 from __future__ import annotations
 
@@ -25,13 +32,15 @@ import math
 import statistics
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 MAX_RTT_SEC = 5.0
 WINDOW = 7
 SLEW_RATE = 0.1
 PERSISTED_MAX_AGE_SEC = 12 * 3600.0
 PERSIST_EVERY_SEC = 60.0
+RECENT_SEC = 1800.0
+RECENT_MAX = 500
 _SANE_OFFSET_SEC = 10 * 365 * 86400.0
 
 
@@ -49,10 +58,8 @@ class ServerClock:
         self._persist = persist
         self._lock = threading.Lock()
         self._samples: List[float] = []
-        # When each sample was taken (PC wall clock), parallel to ``_samples``: the heartbeat's
-        # ``ageSec`` is the age of the OLDEST one in the window (lane 1, last-push contract §5.1).
-        self._sample_walls: List[float] = []
-        self._persisted_oldest_at: Optional[float] = None
+        # (offset, PC wall time) of every sample of the last RECENT_SEC: the heartbeat's view.
+        self._recent: List[Tuple[float, float]] = []
         self._source = ""
         self._measured_at = 0.0
         self._utc_offset: Optional[int] = None
@@ -69,10 +76,18 @@ class ServerClock:
                     self._persisted_offset = float(off)
                     self._source = str(row.get("source") or "persisted")
                     self._measured_at = at
-                    oldest = row.get("oldest_at")
-                    # A row saved before 2026-09-27 has no oldest_at: its age is then unknown
-                    # (``measured_at`` is the NEWEST sample's time, which would call it fresh).
-                    self._persisted_oldest_at = float(oldest) if oldest is not None else None
+                    # A row saved before 2026-09-27 has no "recent": its samples' ages are
+                    # unknown (``measured_at`` is the NEWEST sample's time, which would call it
+                    # fresh), so the view has nothing to report an age from.
+                    recent = []
+                    for item in row.get("recent") or []:
+                        try:
+                            o, a = float(item[0]), float(item[1])
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        if math.isfinite(o) and math.isfinite(a):
+                            recent.append((o, a))
+                    self._recent = recent[-RECENT_MAX:]
                 if row.get("utc_offset_sec") is not None:
                     self._utc_offset = int(row["utc_offset_sec"])
             except Exception:
@@ -99,18 +114,18 @@ class ServerClock:
         if abs(offset) > _SANE_OFFSET_SEC:
             return False
         with self._lock:
+            wall = self._wall()
             if authoritative:
                 self._samples = []
-                self._sample_walls = []
+                self._recent = []
                 self._persisted_offset = None
-                self._persisted_oldest_at = None
                 self._last_issued = None
             self._samples.append(offset)
-            self._sample_walls.append(self._wall())
             del self._samples[:-WINDOW]
-            del self._sample_walls[:-WINDOW]
+            self._recent.append((offset, wall))
+            self._recent = [(o, a) for o, a in self._recent if wall - a <= RECENT_SEC][-RECENT_MAX:]
             self._source = str(source)
-            self._measured_at = self._wall()
+            self._measured_at = wall
         self._maybe_persist()
         return True
 
@@ -150,27 +165,26 @@ class ServerClock:
             self._last_issued_mono = mono
             return candidate
 
+    def _recent_locked(self) -> List[Tuple[float, float]]:
+        """The samples taken in the last RECENT_SEC on the PC's own clock, inclusive. One taken
+        "in the future" (the PC clock stepped back) has no age: left out."""
+        now = self._wall()
+        return [(o, a) for o, a in self._recent if 0.0 <= now - a <= RECENT_SEC]
+
     def report(self) -> Optional[Dict[str, Any]]:
-        """The heartbeat's ``clockOffsetSec`` block; None before any measurement."""
+        """The heartbeat's ``clockOffset`` block (a view, see the module docstring); None
+        before any measurement."""
         with self._lock:
+            source = self._source or "persisted"
+            recent = self._recent_locked()
+            if recent:
+                age = self._wall() - min(a for _o, a in recent)
+                return {"offsetSec": round(float(statistics.median(o for o, _a in recent)), 3),
+                        "samples": len(recent), "source": source, "ageSec": round(age, 1)}
             off = self._offset_locked()
             if off is None:
                 return None
-            out: Dict[str, Any] = {"offsetSec": round(off, 3), "samples": len(self._samples),
-                                   "source": self._source or "persisted"}
-            oldest = self._oldest_sample_at_locked()
-            if oldest is not None:
-                age = self._wall() - oldest
-                # Measured on the PC's own clock; a negative age (the PC clock stepped back) is
-                # not an age: left out, like an unknown one.
-                if math.isfinite(age) and age >= 0.0:
-                    out["ageSec"] = round(age, 1)
-            return out
-
-    def _oldest_sample_at_locked(self) -> Optional[float]:
-        if self._samples:
-            return min(self._sample_walls) if self._sample_walls else None
-        return self._persisted_oldest_at
+            return {"offsetSec": round(off, 3), "samples": len(self._samples), "source": source}
 
     # ------------------------------------------------------------------ persistence
     def _maybe_persist(self) -> None:
@@ -190,7 +204,7 @@ class ServerClock:
                 return
             row = {"offset_sec": off, "measured_at": self._measured_at, "source": self._source,
                    "samples": len(self._samples), "utc_offset_sec": self._utc_offset,
-                   "oldest_at": self._oldest_sample_at_locked()}
+                   "recent": [[o, a] for o, a in self._recent_locked()]}
             self._last_persist_mono = self._mono()
         try:
             self._persist(row)

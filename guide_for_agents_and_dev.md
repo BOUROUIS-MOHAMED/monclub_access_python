@@ -3368,11 +3368,19 @@ attempt's `sentAt` and the capped value is what the ownership upload records (P2
 back"). The heartbeat gains `clockOffset {offsetSec, samples, source}` (server − PC, s) once measured; backend
 `c7d4b532`'s `HeartbeatRequest` has no such field and Jackson's default drops it (§3.1b) `[UNVERIFIED by a live
 request]`. Since lane 1 (2026-09-27, backend contract `docs/plans/2026-09-27-ownership-last-push-contract.md` §5.1 on
-branch `claude/v2-last-push-and-clock`) it also carries `ageSec`: the age, on the PC's own clock, of the OLDEST
-sample in the median window (each sample's wall time is kept beside it; an authoritative `CLOCK_SKEW` sample restarts
-both). A remembered offset counts from its persisted `oldest_at`; a row persisted before this change has none, so
-`ageSec` is left out, as it is when the age would be negative. `[CODE: server_clock.py::report]`
-`[TEST: test_v2_last_push.py — the three clock tests; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
+branch `claude/v2-last-push-and-clock`) it also carries `ageSec`. **The block is a heartbeat-only VIEW over the
+samples taken in the last 30 minutes on the PC's own clock** (`RECENT_SEC`, inclusive; master correction 3,
+2026-09-27, before contract revision 4): `offsetSec` = their median, `samples` = their count, `ageSec` = the age
+of the OLDEST of them. Why: with the socket up the guaranteed samples are the 600 s assignment refreshes, so the
+window of 7 spanned about an hour and its oldest sample never met the dashboard's freshness rule (measured ≥ last
+seen − 30 min). No sample in the last 30 minutes: the window's own median and count, **without** `ageSec`. The
+window of 7 that drives `offset()` (every `sentAt` / `observedAt`) is untouched. Each recent sample is kept, and
+persisted (`recent` in the `server_clock` kv row), with its own time, so after a restart a remembered offset counts
+its age from the original measurement; a row persisted before this change has no `recent`, so `ageSec` is left
+out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view; a sample "in the future" (the PC
+clock stepped back) is left out of the view. `[CODE: server_clock.py::report, ::_recent_locked]`
+`[TEST: test_v2_last_push.py — the five clock tests, incl. ::test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes,
+::test_no_sample_in_the_last_30_minutes_sends_no_age; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
 `[TEST: test_v2_clock_and_api.py — incl. ::test_a_clock_skew_refusal_outvotes_earlier_wrong_samples,
 ::test_fact_times_are_capped_at_the_sent_at_of_each_attempt; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]`
 Parsing is lenient (`timefmt.py`): the socket sends 0–3 fraction digits with an offset, REST `LocalDateTime`s
@@ -3504,19 +3512,30 @@ Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_resul
   (`set_user_info_false` → `USER_WRITE_FAILED`, `template_refused_f…` → `TEMPLATE_REFUSED`,
   `template_version_mismatch_f…`, `finger_remove_…` → `FINGER_CLEAR_FAILED`, a capacity-withheld finger →
   `CAPACITY_FULL`, a wedged chunk → `TIMEOUT`; a chunk never sent, `not_attempted`, gets none). PullSDK — the
-  per-pin path and the targeted push (`_push_pin_to_connected_sdk`) per pin; the batch path in Phase D, where a pin
-  is `true` only when its user row AND its door rights were EXPLICITLY confirmed (the SDK answered the batch
-  without it, or its retry succeeded) and no template failed — a pin with no recorded answer stays `null`, never
-  the state's "no error = ok". The unchanged-pin backfill, a restore, a read-back promotion, a hash clear and a
-  deferral write no result. `[CODE]`
+  per-pin path (≤ 5 pins) and the targeted push (`_push_pin_to_connected_sdk`, live through
+  `sync_member_on_connected_sdk`) per pin; the batch path in Phase D. **`true` is a positive set** on every
+  PullSDK path: the user row written (or its force-retry succeeded), the door authorization answered with NO
+  error, no template error. `_push_userauthorize` answers `(1, None)` or `(0, error)` and never raises: the
+  per-pin and targeted paths used to count an error as complete when `ok_count == len(door_ids)` — any error is
+  now `false AUTHORIZE_FAILED` (master correction 2, 2026-09-27); in Phase D a pin whose outcome is FAILED
+  without a code is `false OTHER`, and a pin with no recorded answer stays `null`, never the state's "no
+  error = ok". MB2000: `true` only for a pin not in the driver's `failed_pins`, which include a refused vacated
+  finger slot (`finger_remove_…` → `FINGER_CLEAR_FAILED`). The unchanged-pin backfill, a restore, a read-back
+  promotion, a hash clear and a deferral write no result. `[CODE]`
 - **An attempt that starts makes the result unknown**, in `record_push_intents`' own durable transaction, before
-  the device write (both SDKs): an interrupted attempt never leaves the previous `true` standing, and a failed intent
-  write rolls the reset back with it. **A restore** (this PC acquiring the turnstile, once per lease generation)
-  makes every result of that turnstile unknown first. **Forget** (§3.2h) deletes them. `[CODE]`
+  the device write — so it covers every intent caller of both SDKs: an interrupted attempt never leaves the
+  previous `true` standing, and a failed intent write rolls the reset back with it. **The reset keeps the attempt's
+  START time** (`corrected_now()`, taken before the transaction), and the upload stamps the reset row's
+  `observedAt` no earlier than it — never "previous upload + 1 ms", which lost to another PC's later `true` in
+  today's multi-writer mode (master correction 4). The start time is part of the change key, so every new attempt
+  re-sends the row. **A restore** (this PC acquiring the turnstile, once per lease generation) makes every result
+  of that turnstile unknown first, with no time (members stay "not known" until their next push: accepted,
+  master note 5). **Forget** (§3.2h) deletes them. `[CODE]`
 - **Upload.** The three fields are part of "has this row changed": `v2_ownership_uploaded` gains
   `last_push_ok / last_push_src_at / last_push_error / last_push_sent_at`, the change key being the LOCAL record
-  (ok, its own time, code) so a moving clock offset does not re-send rows; a changed row gets a strictly newer
-  `observedAt` by the existing rule; a re-send keeps the `lastPushAt` it sent. `lastPushAt` goes on the server's
+  (ok, its own time, code) so a moving clock offset does not re-send rows; a changed row gets an `observedAt`
+  no earlier than its last push event (a result, or a reset's start) and strictly newer than what it uploaded
+  before; a re-send keeps the `lastPushAt` it sent. `lastPushAt` goes on the server's
   clock (the record's corrected time, or its PC time plus the offset at upload) and `api.py::_cap_fact_times` caps
   it at `sentAt` like `observedAt`. A REMOVED fact carries `null`. Rows uploaded before the upgrade compare as
   `(null, null, null)`, so nothing is re-sent in bulk. An older backend ignores the keys (Jackson's default, §3.1b).
@@ -3530,7 +3549,14 @@ Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_resul
 `[TEST: test_v2_last_push.py — the reset in the intent transaction and its rollback, the code filter, the MB2000
 outcomes (a refused user row, a refused template, the backfill, an interrupted attempt, a wedged and an unsent
 chunk), the PullSDK batch, per-pin and targeted paths, the restore reset, the upload fields and types, a flip and a
-reset re-uploaded strictly newer, no bulk re-send after the upgrade, the cap, a full re-send, a REMOVED row]`
+reset re-uploaded strictly newer, no bulk re-send after the upgrade, the cap, a full re-send, a REMOVED row;
+::TestTrueNeedsTheDoorRights (an authorize error in the discovery AND in the fallback of one batch pass, and an error
+with a matching count on the per-pin and targeted paths), ::TestStandaloneTrueNeedsTheVacatedSlotsCleared,
+::TestAResetRowIsANewerFact]`
+Not done (the master's optional note 5): reporting an MB2000 `pushedFingerIds` of `''` as known only once
+`finger_slots_swept=1`. Listed as "does not prove" (master note 5, nothing built): a turnstile the server labels
+PullSDK but a local protocol override (`device_driver.py`, `MONCLUB_DEVICE_PROTOCOL_OVERRIDES`) drives as
+standalone.
 
 *The pin-scheme cutoff (2026-09-27).* `ownership.py::local_facts` reads the device's latest
 `device_pin_scheme_switch.switched_at` (PC local time) and leaves out every fact from before it: `device_sync_state`

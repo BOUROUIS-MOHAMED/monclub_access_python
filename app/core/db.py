@@ -9108,11 +9108,18 @@ def record_push_intents(
         ))
     if not params:
         return 0
+    try:
+        from app.core.v2.server_clock import corrected_now
+        reset_at, reset_corrected = corrected_now()
+    except Exception:
+        reset_at, reset_corrected = time.time(), False
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
         # Lane 1: an attempt STARTS here, so its last result is no longer known -- in this same
-        # durable transaction, before the device write (last-push contract §1.1).
-        _reset_push_results_on(conn, did, [prm[1] for prm in params])
+        # durable transaction, before the device write (last-push contract §1.1). The reset keeps
+        # the start time: the upload stamps the row no earlier (master correction 4).
+        _reset_push_results_on(conn, did, [prm[1] for prm in params],
+                               at=reset_at, corrected=reset_corrected)
         conn.executemany(
             """
             INSERT INTO device_push_intent
@@ -9138,13 +9145,20 @@ def record_push_intents(
 _PUSH_RESULT_CODE = re.compile(r"^[A-Z0-9_]{1,32}$")
 
 
-def _reset_push_results_on(conn: sqlite3.Connection, device_id: int, pins: "Iterable[str]") -> None:
-    """Make the last push result of these pins UNKNOWN (inside the caller's transaction)."""
+def _reset_push_results_on(conn: sqlite3.Connection, device_id: int, pins: "Iterable[str]", *,
+                           at: Optional[float] = None, corrected: bool = False) -> None:
+    """Make the last push result of these pins UNKNOWN (inside the caller's transaction).
+
+    ``at`` -- the attempt START, on the corrected clock when ``corrected`` -- stays on the row
+    with ``ok`` NULL: the upload stamps the reset row no earlier than it, so the server takes it
+    over another PC's later ``true`` (master correction 4, 2026-09-27)."""
     conn.executemany(
         "INSERT INTO device_push_result (device_id, pin, ok, at, corrected, error) "
-        "VALUES (?, ?, NULL, NULL, 0, NULL) "
-        "ON CONFLICT(device_id, pin) DO UPDATE SET ok=NULL, at=NULL, corrected=0, error=NULL",
-        [(int(device_id), str(p)) for p in pins],
+        "VALUES (?, ?, NULL, ?, ?, NULL) "
+        "ON CONFLICT(device_id, pin) DO UPDATE SET ok=NULL, at=excluded.at, "
+        "corrected=excluded.corrected, error=NULL",
+        [(int(device_id), str(p), None if at is None else float(at), 1 if corrected else 0)
+         for p in pins],
     )
 
 
@@ -9197,7 +9211,8 @@ def reset_device_push_results(*, device_id: int) -> int:
 
 
 def list_push_results(*, device_id: int) -> Dict[str, tuple]:
-    """{pin: (ok: bool | None, at: float | None, corrected: bool, error: str | None)}."""
+    """{pin: (ok: bool | None, at: float | None, corrected: bool, error: str | None)}. ``ok``
+    None with an ``at`` = reset at an attempt start at that time; with none = reset by a restore."""
     did = int(device_id)
     with get_conn() as conn:
         rows = conn.execute(

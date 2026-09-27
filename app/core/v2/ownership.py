@@ -256,8 +256,21 @@ class OwnershipSync:
             # carries none (the server ignores them there, contract §1.1).
             lp = f.get("lastPush") if f["state"] != "REMOVED" else None
             lp_ok = None if (lp is None or lp[0] is None or lp[1] is None) else bool(lp[0])
+            # The time of the last push event (a result, or the reset at an attempt's START), on
+            # the server's clock: a changed row's observedAt is never earlier (master correction
+            # 4, 2026-09-27) -- a reset stamped "previous upload + 1 ms" loses to another PC's
+            # later ``true`` in today's multi-writer mode.
+            event_at: Optional[float] = None
+            if lp is not None and lp[1] is not None:
+                event_at = float(lp[1]) if lp[2] else float(lp[1]) + offset
+                if not math.isfinite(event_at):
+                    event_at = None
             if lp_ok is None:
-                push_key: Tuple = (None, None, None)
+                # A reset at an attempt start carries its start time in the change key, so every
+                # new attempt re-sends the row; a restore's reset (no time) keeps the old key.
+                reset_at = float(lp[1]) if (lp is not None and lp[0] is None and lp[1] is not None
+                                            and math.isfinite(float(lp[1]))) else None
+                push_key: Tuple = (None, reset_at, None)
                 lp_at_sent: Optional[float] = None
             else:
                 code = lp[3] if lp_ok is False else None
@@ -276,6 +289,8 @@ class OwnershipSync:
             if same and not full:
                 continue
             at = f["at"] if f["corrected"] else f["at"] + offset
+            if event_at is not None and not same:
+                at = max(at, event_at)
             if before is not None:
                 if same:
                     at = before[3]                    # a re-send keeps its recorded time

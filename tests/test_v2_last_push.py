@@ -15,6 +15,10 @@ row now carries ``lastPushOk`` / ``lastPushAt`` / ``lastPushError``:
 * the three fields are part of "has this row changed", a changed row gets a newer observedAt, and
   lastPushAt is capped at sentAt like observedAt;
 * the heartbeat's clockOffset gains ``ageSec``, the age of the OLDEST sample in the median window.
+
+Master corrections (2026-09-27, before contract revision 4): ``true`` needs the door authorization
+read from ``_push_userauthorize``'s (0, error) answer everywhere; a reset row is stamped at the attempt
+start; the heartbeat's clockOffset is a VIEW over the samples of the last 30 minutes.
 """
 from __future__ import annotations
 
@@ -67,8 +71,8 @@ def test_a_failed_intent_write_resets_nothing(db, monkeypatch):
     db.record_push_results(device_id=8, rows=[("100", True, None)])
     real = dbmod._reset_push_results_on
 
-    def reset_then_fail(conn, did, pins):
-        real(conn, did, pins)
+    def reset_then_fail(conn, did, pins, **kw):
+        real(conn, did, pins, **kw)
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(dbmod, "_reset_push_results_on", reset_then_fail)
@@ -382,16 +386,20 @@ def test_the_clock_report_carries_the_age_of_the_oldest_sample():
     assert rep["samples"] == 2
 
 
-def test_the_age_follows_the_window_and_restarts_after_a_clock_skew_refusal():
+def test_the_view_counts_every_sample_of_the_last_30_minutes_and_restarts_after_a_skew_refusal():
+    """The heartbeat view is not the median window: all 9 samples of the last 30 minutes count
+    (the window of 7 that drives ``offset()`` keeps only 7). A CLOCK_SKEW refusal restarts both."""
     t = {"wall": 1_000_000.0}
     clk = ServerClock(wall=lambda: t["wall"])
-    for _ in range(9):                   # WINDOW is 7: the two oldest drop out
+    for _ in range(9):
         clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="rest:x")
         t["wall"] += 10
-    assert clk.report()["ageSec"] == pytest.approx(70.0)
+    rep = clk.report()
+    assert rep["ageSec"] == pytest.approx(90.0) and rep["samples"] == 9
     clk.add_sample(t["wall"] - 400, t["wall"], t["wall"], source="clock_skew", authoritative=True)
     t["wall"] += 3
-    assert clk.report()["ageSec"] == pytest.approx(3.0)
+    rep = clk.report()
+    assert rep["ageSec"] == pytest.approx(3.0) and rep["samples"] == 1
 
 
 def test_a_remembered_offset_counts_its_age_from_its_original_measurement():
@@ -405,7 +413,149 @@ def test_a_remembered_offset_counts_its_age_from_its_original_measurement():
     t["wall"] += 600
     again = ServerClock(wall=lambda: t["wall"], load=lambda: dict(saved))
     rep = again.report()
-    assert rep["samples"] == 0 and rep["ageSec"] == pytest.approx(630.0)
+    # The remembered samples (each with its own time) still count in the view after a restart.
+    assert rep["samples"] == 2 and rep["ageSec"] == pytest.approx(630.0)
     older = ServerClock(wall=lambda: t["wall"],
-                        load=lambda: {k: v for k, v in saved.items() if k != "oldest_at"})
-    assert "ageSec" not in older.report(), "unknown age: left out"
+                        load=lambda: {k: v for k, v in saved.items() if k != "recent"})
+    rep = older.report()
+    assert "ageSec" not in rep and rep["samples"] == 0, "a row saved before: unknown age, left out"
+
+
+def test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes():
+    """Correction 3: with the socket up the guaranteed samples are the assignment refreshes, one
+    every 600 s. The window of 7 then spans an hour, so its oldest sample never passed the
+    dashboard's 30-minute freshness rule. The view reports only the last 30 minutes."""
+    t = {"wall": 1_000_000.0}
+    clk = ServerClock(wall=lambda: t["wall"])
+    for i in range(8):                   # minutes 0, 10, ..., 70; offsets 1 .. 8 s
+        clk.add_sample(t["wall"] + (i + 1), t["wall"], t["wall"], source="assignment")
+        if i < 7:
+            t["wall"] += 600
+    rep = clk.report()
+    assert rep["ageSec"] == pytest.approx(1800.0) and rep["ageSec"] <= 1800.0
+    assert rep["samples"] == 4                        # minutes 40, 50, 60, 70
+    assert rep["offsetSec"] == pytest.approx(6.5)     # their median
+    assert clk.offset() == pytest.approx(5.0), "the window that drives sentAt keeps its 7 samples"
+
+
+def test_no_sample_in_the_last_30_minutes_sends_no_age():
+    t = {"wall": 1_000_000.0}
+    clk = ServerClock(wall=lambda: t["wall"])
+    clk.add_sample(t["wall"] + 5, t["wall"], t["wall"], source="welcome")
+    t["wall"] += 600
+    clk.add_sample(t["wall"] + 7, t["wall"], t["wall"], source="assignment")
+    t["wall"] += 35 * 60
+    rep = clk.report()
+    assert "ageSec" not in rep
+    assert rep["samples"] == 2 and rep["offsetSec"] == pytest.approx(6.0), "the window's own figures"
+
+
+# ─────────────────────────── master corrections (2026-09-27, before contract revision 4) ───────────────────────────
+
+class TestTrueNeedsTheDoorRights:
+    """Correction 2: on PullSDK ``true`` needs the user row, the door authorization AND the
+    templates, each positively confirmed; ``_push_userauthorize`` answers ``(0, error)`` without
+    raising, and every place that calls it must read that answer."""
+
+    def test_an_authorize_error_in_discovery_and_in_the_fallback_is_false(self, db):
+        from tests.test_account_pin_device_sites import _sdk
+        sdk = _sdk()
+        ams = list(range(101, 109))                        # > 5 pins: the batch path
+        sdk.set_device_data_batch.side_effect = (
+            lambda *, table, rows, chunk_size=50, progress_cb=None: (len(rows), []))
+
+        def set_data(*, table, data, options=""):
+            # Every pattern of 101 (the pattern discovery) and of 104 (the per-pin fallback
+            # that follows a failed discovery) is refused: both answer (0, error).
+            if table == "userauthorize" and (data.startswith("Pin=101\t")
+                                             or data.startswith("Pin=104\t")):
+                raise RuntimeError("SetDeviceData FAILED table=userauthorize rc=-1")
+            return 0
+        sdk.set_device_data.side_effect = set_data
+        _run_pull(_pull_users(*ams), sdk)
+        r = _results(1)
+        assert r["101"] == (False, "AUTHORIZE_FAILED"), "discovery's (0, error) is read"
+        assert r["104"] == (False, "AUTHORIZE_FAILED"), "the fallback's (0, error) is read"
+        assert all(r[str(a)] == (True, None) for a in ams if a not in (101, 104))
+
+    @pytest.mark.parametrize("path", ["per_pin", "targeted"])
+    def test_any_authorize_error_is_false_even_with_a_count(self, db, path):
+        """``auth_complete`` used to be ``ok_count == len(door_ids)`` when an error came back:
+        an error with a matching count read as complete. Any error is now a failure."""
+        from app.core.device_sync import DeviceSyncEngine
+        from tests.test_account_pin_device_sites import _cache, _engine, _pullsdk_device, _sdk
+        with patch.object(DeviceSyncEngine, "_push_userauthorize",
+                          lambda self, sdk, **kw: (1, "partial answer")):
+            if path == "per_pin":
+                _run_pull(_pull_users(101), _sdk())
+            else:
+                _cache(db, _pull_users(101))
+                assert _engine().sync_member_on_connected_sdk(
+                    sdk=_sdk(), device=_pullsdk_device(), member_id=101) is False
+        assert _results(1)["101"] == (False, "AUTHORIZE_FAILED")
+
+
+class TestStandaloneTrueNeedsTheVacatedSlotsCleared:
+
+    def test_a_refused_vacated_slot_is_false(self, db, monkeypatch):
+        class _NoClear(RefusingTerminal):
+            def SSR_DelUserTmpExt(self, machine, pin, finger_id):
+                if (str(pin), int(finger_id)) == ("30001", 1):
+                    self._rec("SSR_DelUserTmpExt", machine, pin, finger_id)
+                    return False
+                return super().SSR_DelUserTmpExt(machine, pin, finger_id)
+
+        term = _NoClear()
+        users = [_user(30001, "A", "101", [_tpl(0, "AAAA"), _tpl(1, "BBBB")])]
+        drv = _make_driver(term)
+        try:
+            w, cache = _mb_worker(monkeypatch, drv, users)
+            _pass(w)
+            assert _results(9)["30001"] == (True, None)
+            cache.users = [_user(30001, "A", "101", [_tpl(0, "AAAA")])]   # finger 1 revoked
+            w.request_full_sync(reason="timer", fingerprint_hash="h2")
+            assert w._drain_full_sync_commands(limit=1) == 1
+        finally:
+            drv.disconnect()
+        assert _results(9)["30001"] == (False, "FINGER_CLEAR_FAILED")
+
+
+class TestAResetRowIsANewerFact:
+    """Correction 4: a result reset at an attempt start is uploaded with an observedAt no earlier
+    than that START (corrected clock) -- not the previous upload + 1 ms -- so the server takes it
+    over another PC's later ``true``. Every new attempt re-sends it."""
+
+    def test_the_reset_row_is_stamped_at_the_attempt_start(self, db):
+        _state(db, 8, "100", updated="2026-09-20 10:00:00")
+        db.record_push_results(device_id=8, rows=[("100", True, None)])
+        api = FakeApi()
+        sync = own.OwnershipSync(_rt(api))
+        sync.upload(8)
+        before = timefmt.to_epoch(_rows_of(api)["100"]["observedAt"])
+        time.sleep(0.05)
+        t_start = time.time()
+        db.record_push_intents(device_id=8, rows=[("100", "A", "", "h1")], protocol="ZK_STANDALONE")
+        sync.upload(8)
+        row = _rows_of(api)["100"]
+        assert row["lastPushOk"] is None and row["lastPushAt"] is None
+        at = timefmt.to_epoch(row["observedAt"])
+        assert at >= t_start - 0.01 and at > before + 0.01, "the attempt start, not previous + 1 ms"
+
+    def test_every_new_attempt_re_sends_the_reset_row(self, db):
+        _state(db, 8, "100")
+        db.record_push_intents(device_id=8, rows=[("100", "A", "", "h1")], protocol="ZK_STANDALONE")
+        api = FakeApi()
+        sync = own.OwnershipSync(_rt(api))
+        sync.upload(8)
+        first = timefmt.to_epoch(_rows_of(api)["100"]["observedAt"])
+        assert sync.upload(8) == {"rows": 0}, "unchanged: not re-sent"
+        time.sleep(0.05)
+        db.record_push_intents(device_id=8, rows=[("100", "A", "", "h2")], protocol="ZK_STANDALONE")
+        sync.upload(8)
+        assert timefmt.to_epoch(_rows_of(api)["100"]["observedAt"]) > first
+
+    def test_the_reset_keeps_its_time_on_the_result_row(self, db):
+        db.record_push_results(device_id=8, rows=[("100", True, None)])
+        db.record_push_intents(device_id=8, rows=[("100", "A", "", "h")], protocol="ZK_STANDALONE")
+        ok, at, _corrected, err = dbmod.list_push_results(device_id=8)["100"]
+        assert ok is None and err is None and at is not None and abs(at - time.time()) < 60

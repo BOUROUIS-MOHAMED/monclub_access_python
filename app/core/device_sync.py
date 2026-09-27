@@ -1403,12 +1403,14 @@ class DeviceSyncEngine:
                 device_id=device_id,
             )
             if auth_err:
-                auth_complete = (auth_ok_count == len(door_ids))
+                # Any error is a failure (master correction 2, 2026-09-27): the old test,
+                # ok_count == len(door_ids), read an error as complete when the counts matched.
+                auth_complete = False
                 self.logger.warning(
                     "[DeviceSync] Device id=%s Pin=%s authorize %s: %s/%s doors - %s",
                     device_id,
                     pin,
-                    "PARTIAL" if not auth_complete else "warn",
+                    "FAILED",
                     auth_ok_count,
                     len(door_ids),
                     auth_err,
@@ -4181,7 +4183,11 @@ class DeviceSyncEngine:
                     for pin in pins_sorted:
                         if pin in _result_codes:
                             _results.append((pin, False, _result_codes[pin]))
+                        elif (pin_outcomes.get(pin) or {}).get("status") == "FAILED":
+                            _results.append((pin, False, "OTHER"))    # a failure with no code
                         elif pin in _user_ok and pin in _auth_ok:
+                            # The positive set: user row (A) and door rights (B) confirmed, no
+                            # template error (C, which records a code above).
                             _results.append((pin, True, None))
                     if _results:
                         try:
@@ -4284,10 +4290,11 @@ class DeviceSyncEngine:
                                 device_id=int(dev_id) if dev_id is not None else 0,
                             )
                             if auth_err:
-                                auth_complete = (auth_ok_count == len(door_ids))
+                                # Any error is a failure (master correction 2, as above).
+                                auth_complete = False
                                 self.logger.warning(
                                     f"[DeviceSync] Device id={dev_id} Pin={pin} authorize "
-                                    f"{'PARTIAL' if not auth_complete else 'warn'}: "
+                                    f"FAILED: "
                                     f"{auth_ok_count}/{len(door_ids)} doors — {auth_err}")
                         except Exception as ex:
                             auth_complete = False
