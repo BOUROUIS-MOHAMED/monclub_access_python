@@ -2074,7 +2074,8 @@ ownership or erase it. `[CODE: db.py::init_db, ::record_push_intents …]`
 device write: `_run_standalone_full_sync`, `_run_standalone_member_sync` and the ACCOUNT re-push on
 the MB2000 (`_record_push_intents`); before Phase A and before a single-pin push on PullSDK. If the
 intent cannot be recorded, nothing is written that pass (`[T] PUSH_INTENT_FAILED` on MB2000; the
-PullSDK pass fails before any write). The job runs with `PRAGMA synchronous=FULL`
+PullSDK pass fails before any write). The same transaction makes each of those pins' last push result
+unknown (lane 1, 2026-09-27, §3.9 "The last push result"). The job runs with `PRAGMA synchronous=FULL`
 (`_run_db_write_sync(durable=True)`): every connection here is WAL + `synchronous=NORMAL`, under
 which a commit is not fsynced and can roll back after a power loss; FULL syncs the WAL on commit.
 SQLite refuses to change the level inside a transaction (measured on the bundled 3.38.4: "Safety
@@ -3290,7 +3291,12 @@ offset is persisted (`v2_kv` `server_clock`) and reused after a restart only whi
 attempt's `sentAt` and the capped value is what the ownership upload records (P2c-2's "write the clamped time
 back"). The heartbeat gains `clockOffset {offsetSec, samples, source}` (server − PC, s) once measured; backend
 `c7d4b532`'s `HeartbeatRequest` has no such field and Jackson's default drops it (§3.1b) `[UNVERIFIED by a live
-request]`. `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
+request]`. Since lane 1 (2026-09-27, backend contract `docs/plans/2026-09-27-ownership-last-push-contract.md` §5.1 on
+branch `claude/v2-last-push-and-clock`) it also carries `ageSec`: the age, on the PC's own clock, of the OLDEST
+sample in the median window (each sample's wall time is kept beside it; an authoritative `CLOCK_SKEW` sample restarts
+both). A remembered offset counts from its persisted `oldest_at`; a row persisted before this change has none, so
+`ageSec` is left out, as it is when the age would be negative. `[CODE: server_clock.py::report]`
+`[TEST: test_v2_last_push.py — the three clock tests; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
 `[TEST: test_v2_clock_and_api.py — incl. ::test_a_clock_skew_refusal_outvotes_earlier_wrong_samples,
 ::test_fact_times_are_capped_at_the_sent_at_of_each_attempt; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]`
 Parsing is lenient (`timefmt.py`): the socket sends 0–3 fraction digits with an offset, REST `LocalDateTime`s
@@ -3409,6 +3415,46 @@ under) — the new driver's restore does not see them — pages of 1,000; `obser
 offset, strictly newer than this PC's last upload of that pin when the state changed. A PullSDK table clear
 posts `/ownership/wiped`. `[CODE]` `[TEST: test_v2_ownership.py, test_v2_review0.py::test_an_older_removal_never_resurfaces_after_a_later_upload]`
 `[TEST: e2e — 25 pins stored, an unchanged record sent nothing, a removal stored REMOVED]`
+
+*The last push result (lane 1, 2026-09-27).* APPLIED is sticky — `ownership_confirmed` never goes back to 0 — so
+the server could not tell "the member is there" from "MonClub once put the member there and the last push failed".
+Backend contract `docs/plans/2026-09-27-ownership-last-push-contract.md` (branch `claude/v2-last-push-and-clock`,
+revision 3.1, §1): every uploaded state row now carries `lastPushOk` (`true`/`false`/`null`), `lastPushAt` (server
+clock, `…Z`, or `null`) and `lastPushError` (a short code `^[A-Z0-9_]{1,32}$`, only with `false`, else `null`).
+Stored in `device_push_result` (`db.py::record_push_results`, `::list_push_results`). `[CODE]`
+- **Only a real write produces a result**, recorded where its outcome is decided: MB2000 —
+  `ultra_engine.py::_record_standalone_pin_state` (every chunk of a full sync, its tail, the targeted member
+  push, the ACCOUNT revoke re-push) through `::_record_push_results`, the driver's per-pin reason mapped to a code
+  (`set_user_info_false` → `USER_WRITE_FAILED`, `template_refused_f…` → `TEMPLATE_REFUSED`,
+  `template_version_mismatch_f…`, `finger_remove_…` → `FINGER_CLEAR_FAILED`, a capacity-withheld finger →
+  `CAPACITY_FULL`, a wedged chunk → `TIMEOUT`; a chunk never sent, `not_attempted`, gets none). PullSDK — the
+  per-pin path and the targeted push (`_push_pin_to_connected_sdk`) per pin; the batch path in Phase D, where a pin
+  is `true` only when its user row AND its door rights were EXPLICITLY confirmed (the SDK answered the batch
+  without it, or its retry succeeded) and no template failed — a pin with no recorded answer stays `null`, never
+  the state's "no error = ok". The unchanged-pin backfill, a restore, a read-back promotion, a hash clear and a
+  deferral write no result. `[CODE]`
+- **An attempt that starts makes the result unknown**, in `record_push_intents`' own durable transaction, before
+  the device write (both SDKs): an interrupted attempt never leaves the previous `true` standing, and a failed intent
+  write rolls the reset back with it. **A restore** (this PC acquiring the turnstile, once per lease generation)
+  makes every result of that turnstile unknown first. **Forget** (§3.2h) deletes them. `[CODE]`
+- **Upload.** The three fields are part of "has this row changed": `v2_ownership_uploaded` gains
+  `last_push_ok / last_push_src_at / last_push_error / last_push_sent_at`, the change key being the LOCAL record
+  (ok, its own time, code) so a moving clock offset does not re-send rows; a changed row gets a strictly newer
+  `observedAt` by the existing rule; a re-send keeps the `lastPushAt` it sent. `lastPushAt` goes on the server's
+  clock (the record's corrected time, or its PC time plus the offset at upload) and `api.py::_cap_fact_times` caps
+  it at `sentAt` like `observedAt`. A REMOVED fact carries `null`. Rows uploaded before the upgrade compare as
+  `(null, null, null)`, so nothing is re-sent in bulk. An older backend ignores the keys (Jackson's default, §3.1b).
+  `[CODE]`
+- **Found and fixed on the way (the contract's "lane 1 checks both").** Templates: every Phase C failure does
+  set `error_message` `[CODE]`. Door rights: on the batch path `_push_userauthorize` never raises — it answers
+  `(0, error)` — and both the pattern-discovery push of the first pin and the per-pin fallback ignored that
+  answer, so a pin whose door rights the panel refused was recorded in sync and never retried. Both now record
+  it FAILED (`AUTHORIZE_FAILED`), so it is retried like any refused pin. `[CODE: device_sync.py::_sync_one_device,
+  Phase B]` Never seen on a C3-400 `[UNVERIFIED]`.
+`[TEST: test_v2_last_push.py — the reset in the intent transaction and its rollback, the code filter, the MB2000
+outcomes (a refused user row, a refused template, the backfill, an interrupted attempt, a wedged and an unsent
+chunk), the PullSDK batch, per-pin and targeted paths, the restore reset, the upload fields and types, a flip and a
+reset re-uploaded strictly newer, no bulk re-send after the upgrade, the cap, a full re-send, a REMOVED row]`
 
 *The pin-scheme cutoff (2026-09-27).* `ownership.py::local_facts` reads the device's latest
 `device_pin_scheme_switch.switched_at` (PC local time) and leaves out every fact from before it: `device_sync_state`

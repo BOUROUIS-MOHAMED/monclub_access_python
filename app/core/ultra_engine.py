@@ -2469,6 +2469,53 @@ class UltraDeviceWorker(threading.Thread):
             save_device_sync_state_batch(device_id=self._device_id, rows=rows)
         except Exception:
             logger.debug("%s per-pin sync state not recorded", self._prefix, exc_info=True)
+        self._record_push_results(users=users, result=result, failed_set=failed_set)
+
+    # The driver's per-pin failure reason (zkemkeeper guide §5) -> the last-push result code
+    # (the contract's short machine code, never free text). First prefix that matches wins.
+    _PUSH_RESULT_CODES = (
+        ("set_user_info_false", "USER_WRITE_FAILED"),
+        ("template_version_mismatch_f", "TEMPLATE_VERSION_MISMATCH"),
+        ("template_refused_f", "TEMPLATE_REFUSED"),
+        ("finger_remove_", "FINGER_CLEAR_FAILED"),
+        ("capacity_withheld", "CAPACITY_FULL"),
+        ("chunk_wedged_or_unconfirmed", "TIMEOUT"),
+        ("exception:", "OTHER"),
+    )
+
+    def _record_push_results(self, *, users: list[Dict[str, Any]], result: Dict[str, Any],
+                             failed_set: set[str]) -> None:
+        """The last push result of each pin THIS write attempted (last-push contract §1.1), from
+        the same outcome the state write just used: confirmed -> True; failed -> False with a
+        code. A pin never sent (``not_attempted``: the push stopped before its chunk) gets no
+        result -- its intent already made it unknown. Never raises."""
+        try:
+            res = result if isinstance(result, dict) else {}
+            reasons = res.get("failed_reasons") if isinstance(res.get("failed_reasons"), dict) else {}
+            text = " ".join([str(res.get("error") or "")]
+                            + [str(e) for e in (res.get("errors") or [])]).lower()
+            rows: list[tuple] = []
+            for u in users or []:
+                pin = str(u.get("pin") or "").strip()
+                if not pin:
+                    continue
+                if pin not in failed_set:
+                    rows.append((pin, True, None))
+                    continue
+                reason = str(reasons.get(pin) or "")
+                if reason == "not_attempted":
+                    continue
+                code = next((c for prefix, c in self._PUSH_RESULT_CODES
+                             if reason.startswith(prefix)), None)
+                if code is None:
+                    code = ("TIMEOUT" if ("wedge" in text or "timed out" in text or "timeout" in text)
+                            else "DEVICE_UNREACHABLE" if "not connected" in text else "OTHER")
+                rows.append((pin, False, code))
+            if rows:
+                from app.core.db import record_push_results
+                record_push_results(device_id=self._device_id, rows=rows)
+        except Exception:
+            logger.debug("%s last push results not recorded", self._prefix, exc_info=True)
 
     @staticmethod
     def _standalone_failed_pins_from_result(
@@ -2746,10 +2793,14 @@ class UltraDeviceWorker(threading.Thread):
             return result
         out = dict(result)
         failed = list(out.get("failed_pins") or [])
+        reasons = dict(out.get("failed_reasons") or {}) if isinstance(out.get("failed_reasons"), dict) else {}
         for p in hit:
             if p not in failed:
                 failed.append(p)
+                # Named for the last-push result only (CAPACITY_FULL); nothing decides on it.
+                reasons.setdefault(p, "capacity_withheld")
         out["failed_pins"] = failed
+        out["failed_reasons"] = reasons
         out["ok"] = False
         return out
 

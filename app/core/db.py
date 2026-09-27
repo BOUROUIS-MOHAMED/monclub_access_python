@@ -8,6 +8,7 @@ import logging
 import os
 import pathlib
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -953,6 +954,12 @@ def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    # Lane 1 (2026-09-27, the last-push contract §1): which result the upload last SENT for each
+    # row -- ``last_push_src_at`` is the local record's own time (the change key, stable whatever
+    # the clock offset does), ``last_push_sent_at`` the server-clock value sent (capped).
+    for _col, _ddl in (("last_push_ok", "INTEGER"), ("last_push_src_at", "REAL"),
+                       ("last_push_error", "TEXT"), ("last_push_sent_at", "REAL")):
+        _ensure_column(conn, "v2_ownership_uploaded", _col, f"{_col} {_ddl}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS v2_removal_log (
@@ -960,6 +967,24 @@ def _create_v2_realtime_tables(conn: sqlite3.Connection) -> None:
             pin            TEXT NOT NULL,
             removed_at     REAL NOT NULL,
             corrected      INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (device_id, pin)
+        );
+        """
+    )
+    # Lane 1 (2026-09-27): the outcome of the LAST push attempt of each pin to each turnstile
+    # (the ownership upload's lastPushOk / lastPushAt / lastPushError). ok NULL = unknown: never
+    # attempted by this PC, an attempt started and not finished (reset with its write-ahead
+    # intent), or reset when this PC acquired the turnstile. ``at``: when the attempt ended, on
+    # the server-corrected clock when measured (``corrected=1``), else the PC's.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_push_result (
+            device_id      INTEGER NOT NULL,
+            pin            TEXT NOT NULL,
+            ok             INTEGER,
+            at             REAL,
+            corrected      INTEGER NOT NULL DEFAULT 0,
+            error          TEXT,
             PRIMARY KEY (device_id, pin)
         );
         """
@@ -9085,6 +9110,9 @@ def record_push_intents(
         return 0
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        # Lane 1: an attempt STARTS here, so its last result is no longer known -- in this same
+        # durable transaction, before the device write (last-push contract §1.1).
+        _reset_push_results_on(conn, did, [prm[1] for prm in params])
         conn.executemany(
             """
             INSERT INTO device_push_intent
@@ -9105,6 +9133,82 @@ def record_push_intents(
         return len(params)
 
     return int(_run_db_write_sync("record_push_intents", _write, durable=True))
+
+
+_PUSH_RESULT_CODE = re.compile(r"^[A-Z0-9_]{1,32}$")
+
+
+def _reset_push_results_on(conn: sqlite3.Connection, device_id: int, pins: "Iterable[str]") -> None:
+    """Make the last push result of these pins UNKNOWN (inside the caller's transaction)."""
+    conn.executemany(
+        "INSERT INTO device_push_result (device_id, pin, ok, at, corrected, error) "
+        "VALUES (?, ?, NULL, NULL, 0, NULL) "
+        "ON CONFLICT(device_id, pin) DO UPDATE SET ok=NULL, at=NULL, corrected=0, error=NULL",
+        [(int(device_id), str(p)) for p in pins],
+    )
+
+
+def record_push_results(*, device_id: int, rows: "Iterable[tuple]") -> int:
+    """Record the outcome of push attempts: ``rows`` = ``(pin, ok: bool, code)``. Only where the
+    outcome of a real write is decided (last-push contract §1.1) -- never from a state write that is
+    not an attempt. ``code`` (only with ok False) must be a short machine code
+    ``^[A-Z0-9_]{1,32}$``; anything else is stored ``OTHER`` -- free text never leaves the PC."""
+    from app.core.v2.server_clock import corrected_now
+
+    did = int(device_id)
+    at, corrected = corrected_now()
+    params = []
+    seen: set = set()
+    for row in rows or []:
+        pin = str(row[0] if row[0] is not None else "").strip()
+        if not pin or pin in seen:
+            continue
+        seen.add(pin)
+        ok = bool(row[1])
+        code = None
+        if not ok:
+            code = str(row[2] or "").strip() if len(row) > 2 else ""
+            if not _PUSH_RESULT_CODE.match(code or ""):
+                code = "OTHER"
+        params.append((did, pin, 1 if ok else 0, float(at), 1 if corrected else 0, code))
+    if not params:
+        return 0
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        conn.executemany(
+            "INSERT OR REPLACE INTO device_push_result (device_id, pin, ok, at, corrected, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)", params)
+        return len(params)
+
+    return int(_run_db_write_sync("record_push_results", _write))
+
+
+def reset_device_push_results(*, device_id: int) -> int:
+    """Every last push result of one turnstile becomes unknown: this PC acquired it (a DRIVE
+    lease's restore) -- its own old result is not the latest any more (contract §1.1)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> int:
+        return int(conn.execute(
+            "UPDATE device_push_result SET ok=NULL, at=NULL, corrected=0, error=NULL "
+            "WHERE device_id=?", (did,)).rowcount or 0)
+
+    return int(_run_db_write_sync("reset_device_push_results", _write, durable=True))
+
+
+def list_push_results(*, device_id: int) -> Dict[str, tuple]:
+    """{pin: (ok: bool | None, at: float | None, corrected: bool, error: str | None)}."""
+    did = int(device_id)
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pin, ok, at, corrected, error FROM device_push_result WHERE device_id=?",
+            (did,)).fetchall()
+    return {
+        str(r[0]): (None if r[1] is None else bool(int(r[1])),
+                    None if r[2] is None else float(r[2]), bool(int(r[3] or 0)),
+                    None if r[4] is None else str(r[4]))
+        for r in rows
+    }
 
 
 def list_push_intents(*, device_id: int) -> Dict[str, Dict[str, Any]]:
@@ -9643,6 +9747,8 @@ def retire_device_records(*, device_id: int) -> Dict[str, int]:
                                        (did,)).rowcount or 0),
             "readd": int(conn.execute("DELETE FROM v2_readd WHERE device_id=?",
                                       (did,)).rowcount or 0),
+            "results": int(conn.execute("DELETE FROM device_push_result WHERE device_id=?",
+                                        (did,)).rowcount or 0),
             "removals_logged": len(pins),
         }
         profile.update(out)

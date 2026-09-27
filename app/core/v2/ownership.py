@@ -40,11 +40,19 @@ then the turnstile stays add-only.
 
 Wipe: a PullSDK table clear posts ``/ownership/wiped`` (``note_wipe``); the next uploads go to
 the new generation.
+
+Last push result (lane 1, 2026-09-27; backend contract docs/plans/2026-09-27-ownership-last-push-
+contract.md §1): every state row also carries ``lastPushOk`` / ``lastPushAt`` / ``lastPushError`` from
+``device_push_result`` -- the outcome of this PC's LAST push attempt of that pin, recorded where the
+push outcome is decided, made unknown when an attempt starts (the write-ahead intent) and when this PC
+acquires the turnstile (a restore). The three are part of "has this row changed"; ``lastPushAt`` goes on
+the server's clock and is capped at ``sentAt`` like ``observedAt``. An older server ignores the keys.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -101,6 +109,11 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
         switches = []
     cutoff = _local_to_epoch(switches[-1].get("switched_at")) if switches else None
     facts: Dict[str, Dict[str, Any]] = {}
+    try:
+        from app.core.db import list_push_results
+        results = list_push_results(device_id=did)
+    except Exception:
+        results = {}
     with get_conn() as conn:
         for pin, h, fingers, owned, updated in conn.execute(
                 "SELECT pin, desired_hash, pushed_finger_ids, ownership_confirmed, updated_at "
@@ -110,7 +123,8 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
                 continue
             facts[str(pin)] = {"state": "APPLIED" if int(owned or 0) == 1 else "FAILED",
                                "pushedHash": h or None, "pushedFingerIds": fingers,
-                               "at": at, "corrected": False}
+                               "at": at, "corrected": False,
+                               "lastPush": results.get(str(pin))}
         for pin, updated in conn.execute(
                 "SELECT pin, updated_at FROM device_push_intent WHERE device_id = ?", (did,)).fetchall():
             if str(pin) in facts and facts[str(pin)]["state"] == "APPLIED":
@@ -119,7 +133,8 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
             if at is None or (cutoff is not None and at < cutoff):
                 continue
             facts[str(pin)] = {"state": "INTENT", "pushedHash": None, "pushedFingerIds": None,
-                               "at": at, "corrected": False}
+                               "at": at, "corrected": False,
+                               "lastPush": results.get(str(pin))}
         for pin, removed_at, corrected in conn.execute(
                 "SELECT pin, removed_at, corrected FROM v2_removal_log WHERE device_id = ?", (did,)).fetchall():
             if str(pin) in facts:
@@ -190,21 +205,34 @@ class OwnershipSync:
         from app.core.db import get_conn
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT pin, state, pushed_hash, pushed_finger_ids, observed_at FROM v2_ownership_uploaded "
+                "SELECT pin, state, pushed_hash, pushed_finger_ids, observed_at, last_push_ok, "
+                "last_push_src_at, last_push_error, last_push_sent_at FROM v2_ownership_uploaded "
                 "WHERE device_id = ? AND pin_scheme = ? AND generation = ?", (did, scheme, generation)).fetchall()
-        return {str(r[0]): (r[1], r[2], r[3], float(r[4])) for r in rows}
+        return {str(r[0]): (r[1], r[2], r[3], float(r[4]),
+                            (None if r[5] is None else bool(int(r[5])),
+                             None if r[6] is None else float(r[6]), r[7]),
+                            None if r[8] is None else float(r[8]))
+                for r in rows}
 
     def _record_uploaded(self, did: int, scheme: str, generation: int, rows: List[Dict[str, Any]],
-                         epochs: Dict[str, float]) -> None:
+                         epochs: Dict[str, float],
+                         push_keys: Optional[Dict[str, Tuple]] = None) -> None:
+        """Record the rows as SENT. ``push_keys``: pin -> the last-push change key
+        ``(ok, local record time, code)`` of what was sent; ``lastPushAt`` is taken from the sent
+        row itself (capped at that attempt's ``sentAt``)."""
         from app.core.db import _run_db_write_sync
 
         def op(conn, _p):
             for r in rows:
+                key = (push_keys or {}).get(r["pin"]) or (None, None, None)
+                sent_at = timefmt.to_epoch(r.get("lastPushAt")) if r.get("lastPushAt") else None
                 conn.execute(
                     "INSERT OR REPLACE INTO v2_ownership_uploaded (device_id, pin_scheme, generation, pin, state, "
-                    "pushed_hash, pushed_finger_ids, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "pushed_hash, pushed_finger_ids, observed_at, last_push_ok, last_push_src_at, "
+                    "last_push_error, last_push_sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (did, scheme, generation, r["pin"], r["state"], r.get("pushedHash"), r.get("pushedFingerIds"),
-                     epochs[r["pin"]]))
+                     epochs[r["pin"]], None if key[0] is None else (1 if key[0] else 0), key[1], key[2],
+                     sent_at))
         _run_db_write_sync("v2_ownership_uploaded", op)
 
     def build_rows(self, did: int, scheme: str, generation: int, *, full: bool) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
@@ -214,6 +242,7 @@ class OwnershipSync:
         prev = self._uploaded(did, scheme, generation)
         rows: List[Dict[str, Any]] = []
         epochs: Dict[str, float] = {}
+        self._push_keys: Dict[str, Tuple] = {}
         for pin, f in sorted(local_facts(did, offset=offset).items()):
             if not pin.isdigit() or len(pin) > 24:
                 continue
@@ -222,13 +251,28 @@ class OwnershipSync:
             if h is not None and not (str(h).isalnum() and len(str(h)) <= 64):
                 h = None
             before = prev.get(pin)
+            # The last push result (contract §1). Its change key is the LOCAL record (ok, the
+            # record's own time, code) -- stable whatever the clock offset does; a REMOVED fact
+            # carries none (the server ignores them there, contract §1.1).
+            lp = f.get("lastPush") if f["state"] != "REMOVED" else None
+            lp_ok = None if (lp is None or lp[0] is None or lp[1] is None) else bool(lp[0])
+            if lp_ok is None:
+                push_key: Tuple = (None, None, None)
+                lp_at_sent: Optional[float] = None
+            else:
+                code = lp[3] if lp_ok is False else None
+                push_key = (lp_ok, float(lp[1]), code)
+                lp_at_sent = min(float(lp[1]) if lp[2] else float(lp[1]) + offset, now)
+                if not math.isfinite(lp_at_sent):
+                    push_key, lp_at_sent, lp_ok = (None, None, None), None, None
             if (f["state"] == "REMOVED" and before is not None and before[0] != "REMOVED"
                     and (f["at"] if f["corrected"] else f["at"] + offset) <= before[3]):
                 # A removal logged BEFORE the state this PC already uploaded (the pin was written
                 # again, then its state row went without a device removal -- a prune): not a
                 # newer fact. Bumping it past the upload would claim a removal that never happened.
                 continue
-            same = before is not None and before[:3] == (f["state"], h, fingers)
+            same = (before is not None and before[:3] == (f["state"], h, fingers)
+                    and before[4] == push_key)
             if same and not full:
                 continue
             at = f["at"] if f["corrected"] else f["at"] + offset
@@ -239,8 +283,14 @@ class OwnershipSync:
                     at = before[3] + 0.001            # a changed state must be strictly newer
             at = min(at, now)                          # never later than sentAt
             epochs[pin] = at
+            if same and before is not None and before[5] is not None and push_key[0] is not None:
+                lp_at_sent = before[5]                 # a re-send keeps the lastPushAt it sent
+            self._push_keys[pin] = push_key
             rows.append({"pin": pin, "state": f["state"], "pushedHash": h, "pushedFingerIds": fingers,
-                         "observedAt": timefmt.format_utc(at)})
+                         "observedAt": timefmt.format_utc(at),
+                         "lastPushOk": lp_ok,
+                         "lastPushAt": timefmt.format_utc(lp_at_sent) if lp_at_sent is not None else None,
+                         "lastPushError": push_key[2] if lp_ok is False else None})
         return rows, epochs
 
     def _last_uploaded_meta(self, did: int) -> Optional[Dict[str, Any]]:
@@ -270,6 +320,7 @@ class OwnershipSync:
             self._forget(did)
             return {"skipped": "scheme_or_generation_unknown", "server": scheme, "local": local_scheme}
         rows, epochs = self.build_rows(did, scheme, generation, full=final)
+        push_keys = dict(getattr(self, "_push_keys", None) or {})
         pages = [rows[i:i + PAGE_ROWS] for i in range(0, len(rows), PAGE_ROWS)] or [[]]
         if not final and not rows:
             return {"rows": 0}
@@ -294,7 +345,7 @@ class OwnershipSync:
                 t = timefmt.to_epoch(r.get("observedAt")) if isinstance(r, dict) else None
                 if t is not None and r.get("pin") in epochs:
                     epochs[r["pin"]] = t
-            self._record_uploaded(did, scheme, generation, sent_rows, epochs)
+            self._record_uploaded(did, scheme, generation, sent_rows, epochs, push_keys)
         return summary
 
     # ------------------------------------------------------------------ restore
@@ -305,6 +356,11 @@ class OwnershipSync:
 
         after, adopted = 0, 0
         local_scheme = self._device_scheme(did)
+        # Lane 1 (last-push contract §1.1): this PC acquires the turnstile -- its own old push
+        # results (the confirmed pins the restore skips included) are not the latest any more.
+        # Before the first page: a restore that stops half-way has reset them already.
+        from app.core.db import reset_device_push_results
+        reset_device_push_results(device_id=did)
         while True:
             page = self.api.ownership_page(did, after, 1000)
             if local_scheme and page.get("pinScheme") and page.get("pinScheme") != local_scheme:

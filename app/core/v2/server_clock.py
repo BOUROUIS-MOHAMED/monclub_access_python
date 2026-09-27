@@ -21,6 +21,7 @@ report it in the heartbeat.
 """
 from __future__ import annotations
 
+import math
 import statistics
 import threading
 import time
@@ -48,6 +49,10 @@ class ServerClock:
         self._persist = persist
         self._lock = threading.Lock()
         self._samples: List[float] = []
+        # When each sample was taken (PC wall clock), parallel to ``_samples``: the heartbeat's
+        # ``ageSec`` is the age of the OLDEST one in the window (lane 1, last-push contract §5.1).
+        self._sample_walls: List[float] = []
+        self._persisted_oldest_at: Optional[float] = None
         self._source = ""
         self._measured_at = 0.0
         self._utc_offset: Optional[int] = None
@@ -64,6 +69,10 @@ class ServerClock:
                     self._persisted_offset = float(off)
                     self._source = str(row.get("source") or "persisted")
                     self._measured_at = at
+                    oldest = row.get("oldest_at")
+                    # A row saved before 2026-09-27 has no oldest_at: its age is then unknown
+                    # (``measured_at`` is the NEWEST sample's time, which would call it fresh).
+                    self._persisted_oldest_at = float(oldest) if oldest is not None else None
                 if row.get("utc_offset_sec") is not None:
                     self._utc_offset = int(row["utc_offset_sec"])
             except Exception:
@@ -92,10 +101,14 @@ class ServerClock:
         with self._lock:
             if authoritative:
                 self._samples = []
+                self._sample_walls = []
                 self._persisted_offset = None
+                self._persisted_oldest_at = None
                 self._last_issued = None
             self._samples.append(offset)
+            self._sample_walls.append(self._wall())
             del self._samples[:-WINDOW]
+            del self._sample_walls[:-WINDOW]
             self._source = str(source)
             self._measured_at = self._wall()
         self._maybe_persist()
@@ -143,8 +156,21 @@ class ServerClock:
             off = self._offset_locked()
             if off is None:
                 return None
-            return {"offsetSec": round(off, 3), "samples": len(self._samples),
-                    "source": self._source or "persisted"}
+            out: Dict[str, Any] = {"offsetSec": round(off, 3), "samples": len(self._samples),
+                                   "source": self._source or "persisted"}
+            oldest = self._oldest_sample_at_locked()
+            if oldest is not None:
+                age = self._wall() - oldest
+                # Measured on the PC's own clock; a negative age (the PC clock stepped back) is
+                # not an age: left out, like an unknown one.
+                if math.isfinite(age) and age >= 0.0:
+                    out["ageSec"] = round(age, 1)
+            return out
+
+    def _oldest_sample_at_locked(self) -> Optional[float]:
+        if self._samples:
+            return min(self._sample_walls) if self._sample_walls else None
+        return self._persisted_oldest_at
 
     # ------------------------------------------------------------------ persistence
     def _maybe_persist(self) -> None:
@@ -163,7 +189,8 @@ class ServerClock:
             if off is None:
                 return
             row = {"offset_sec": off, "measured_at": self._measured_at, "source": self._source,
-                   "samples": len(self._samples), "utc_offset_sec": self._utc_offset}
+                   "samples": len(self._samples), "utc_offset_sec": self._utc_offset,
+                   "oldest_at": self._oldest_sample_at_locked()}
             self._last_persist_mono = self._mono()
         try:
             self._persist(row)

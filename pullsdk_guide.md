@@ -564,6 +564,13 @@ the **first** row of a chunk fails with a *structural* error — `rc=-100`, `-10
 marked failed without being attempted. `[CODE]` A progress callback fires after every
 chunk, successful or fallback. `[CODE]`
 
+**Door rights on the batch path (lane 1, 2026-09-27).** `_push_userauthorize` never raises: it answers
+`(ok_count, error)`, `(0, error)` when no field pattern worked. Phase B's pattern discovery (the first pin) and
+its per-pin fallback used to ignore that answer, so a pin whose `userauthorize` row the panel refused was
+recorded in sync and never retried. Both now record it FAILED. Each pin's last push result (main guide §3.9) is
+`true` on this path only when its user row and its door rights were explicitly confirmed. `[CODE]`
+`[TEST: tests/test_v2_last_push.py::TestPullSdk]`
+
 A full sync (`DeviceSyncEngine._sync_one_device`) deletes its stale pins through
 `_bulk_delete_pins` BEFORE writing the user rows (Phase A) — except, since P3b-1, the old
 MEMBERSHIP pin of a person whose new pin that pass still has to write: it is deleted after Phase D,

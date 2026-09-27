@@ -13,6 +13,7 @@ from app.core.v2 import lease_gate as _lease_gate
 from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
 from app.core.db import (
+    record_push_results,
     list_device_pin_scheme_switches,
     list_fingerprints,
     list_fingerprints_by_pins,
@@ -181,6 +182,15 @@ from app.core.pin_scheme import (  # noqa: E402  (re-exported)
     device_pin_scheme,
     normalize_pin_scheme,
 )
+
+
+def _record_push_result(device_id: Any, pin: str, ok: bool, code: str | None) -> None:
+    """One pin's last push result (last-push contract §1.1). Never raises: a result that
+    cannot be written leaves the attempt's reset (unknown) standing, never a stale True."""
+    try:
+        record_push_results(device_id=int(device_id), rows=[(pin, bool(ok), code)])
+    except Exception:
+        logging.getLogger(__name__).debug("last push result not recorded", exc_info=True)
 
 
 def count_waiting_pins(desired_hashes: Dict[str, str], state: Dict[str, tuple]) -> int:
@@ -1321,6 +1331,7 @@ class DeviceSyncEngine:
         full_name = _safe_one_line(user.get("fullName") or "") or f"U{pin}"
         card = _pin_str(user.get("firstCardId") or "")
         auth_err: str | None = None
+        attempt_started = False
 
         try:
             # WRITE-AHEAD (P3a-2): durable before the first device write below; if it
@@ -1329,6 +1340,7 @@ class DeviceSyncEngine:
                 device_id=device_id, protocol="ZK_PULLSDK",
                 rows=[(pin, full_name, _normalize_device_card(card), desired_hash)],
             )
+            attempt_started = True
             self._delete_pin_unconditional(
                 sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
             )
@@ -1434,6 +1446,9 @@ class DeviceSyncEngine:
                 error=None if push_ok else ((auth_err or "authorize incomplete")
                                             if not auth_complete else tpl_err),
             )
+            _record_push_result(device_id, pin, push_ok,
+                                None if push_ok else ("AUTHORIZE_FAILED" if not auth_complete
+                                                      else "TEMPLATE_REFUSED"))
             try:
                 upsert_device_mirror_pin(
                     device_id=device_id,
@@ -1464,6 +1479,10 @@ class DeviceSyncEngine:
                 ok=False,
                 error=str(exc),
             )
+            if attempt_started:
+                # The intent was written, so the attempt began and failed. Before it, nothing
+                # was attempted: the previous result stands (the reset rolled back with it).
+                _record_push_result(device_id, pin, False, "OTHER")
             try:
                 upsert_device_mirror_pin(
                     device_id=device_id,
@@ -3118,6 +3137,11 @@ class DeviceSyncEngine:
         batch_started_perf = time.perf_counter()
         pins_sorted: List[str] = []
         pin_outcomes: Dict[str, Dict[str, Any]] = {}
+        # Last-push result (lane 1, contract §1.1): pins whose user row / door rights the SDK
+        # explicitly confirmed on the batch path, and the code of each recorded failure.
+        _user_ok: Set[str] = set()
+        _auth_ok: Set[str] = set()
+        _result_codes: Dict[str, str] = {}
         batch_error: str | None = None
         # P3a-2 removal outcome of this pass: pins a refused removal step kept on the
         # device (REVOKE_ABORTED), pins whose delete failed (kept for the retry), and
@@ -3822,6 +3846,8 @@ class DeviceSyncEngine:
 
                 if user_rows:
                     _total_pins = len(pins_sorted)
+                    # Last-push result (contract §1.1): a pin is confirmed only by an explicit
+                    # answer -- here, its user row in a batch the SDK returned without it.
 
                     def _user_progress_cb(ok_so_far: int, _batch_total: int) -> None:
                         # Map user-phase progress to 0..total: the user push is the
@@ -3837,6 +3863,8 @@ class DeviceSyncEngine:
                         progress_cb=_user_progress_cb,
                     )
                     pushed_users = ok_u
+                    _failed_u_pins = {_batch_row_field(r, "Pin") for r in (failed_u or [])}
+                    _user_ok.update(p for p in pin_to_user if p not in _failed_u_pins)
 
                     if not failed_u and profile.name_supported is None and use_name:
                         # Name field accepted — cache this discovery
@@ -3874,6 +3902,9 @@ class DeviceSyncEngine:
                             progress_cb=_retry_progress_cb,
                         )
                         pushed_users += ok_r
+                        _failed_r_pins = {_batch_row_field(r, "Pin") for r in (failed_r or [])}
+                        _user_ok.update(_batch_row_field(r, "Pin") for r in retry_rows
+                                        if _batch_row_field(r, "Pin") not in _failed_r_pins)
                         if ok_r > 0:
                             # Confirmed: Name field not supported on this firmware
                             profile.name_supported = False
@@ -3898,7 +3929,9 @@ class DeviceSyncEngine:
                                         mp.append(f"CardNo={card_valid}")
                                     sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
                                     pushed_users += 1
+                                    _user_ok.add(pin)
                                 except Exception as ex:
+                                    _result_codes[pin] = "USER_WRITE_FAILED"
                                     pin_outcomes[pin] = {
                                         "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                         "status": "FAILED",
@@ -3925,7 +3958,9 @@ class DeviceSyncEngine:
                                     mp.append(f"CardNo={card_valid}")
                                 sdk.set_device_data(table="user", data="\t".join(mp) + "\r\n", options="")
                                 pushed_users += 1
+                                _user_ok.add(pin)
                             except Exception as ex:
+                                _result_codes[pin] = "USER_WRITE_FAILED"
                                 pin_outcomes[pin] = {
                                     "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                     "status": "FAILED",
@@ -3943,11 +3978,24 @@ class DeviceSyncEngine:
                     if profile.authorize_body_index is None and pins_sorted:
                         # No cached pattern — discover by pushing first user individually
                         first_pin = pins_sorted[0]
-                        self._push_userauthorize(
+                        _d_ok, _d_err = self._push_userauthorize(
                             sdk, pin=first_pin, door_bitmask=door_bitmask,
                             authorize_timezone_id=int(authorize_timezone_id),
                             device_id=int(dev_id) if dev_id is not None else 0,
                         )
+                        # Lane 1 (2026-09-27): _push_userauthorize never raises -- it answers
+                        # (0, error) -- and this answer was ignored, so a first pin whose door
+                        # rights the panel refused was recorded in sync (no retry).
+                        if _d_ok and not _d_err:
+                            _auth_ok.add(first_pin)
+                        else:
+                            _result_codes[first_pin] = "AUTHORIZE_FAILED"
+                            pin_outcomes[first_pin] = {
+                                "full_name": _safe_one_line((desired.get(first_pin) or {}).get("fullName") or "") or f"U{first_pin}",
+                                "status": "FAILED",
+                                "error_message": f"authorize failed: {_d_err or 'no pattern'}",
+                                "duration_ms": 0,
+                            }
                         profile = self._get_firmware_profile(int(dev_id) if dev_id is not None else 0)
                         remaining_pins = pins_sorted[1:]
                     else:
@@ -3978,11 +4026,15 @@ class DeviceSyncEngine:
                                 table="userauthorize", rows=auth_rows, chunk_size=50,
                                 progress_cb=_auth_progress_cb,
                             )
+                            _failed_a_pins = {_batch_row_field(r, "Pin") for r in (failed_a or [])}
+                            _auth_ok.update(_batch_row_field(r, "Pin") for r in auth_rows
+                                            if _batch_row_field(r, "Pin") not in _failed_a_pins)
                             if failed_a:
                                 for row in failed_a:
                                     pin = _batch_row_field(row, "Pin")
                                     if not pin:
                                         continue
+                                    _result_codes[pin] = "AUTHORIZE_FAILED"
                                     pin_outcomes[pin] = {
                                         "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                         "status": "FAILED",
@@ -3995,12 +4047,17 @@ class DeviceSyncEngine:
                         # No cached pattern available — fall back to per-pin authorize
                         for pin in remaining_pins:
                             try:
-                                self._push_userauthorize(
+                                _p_ok, _p_err = self._push_userauthorize(
                                     sdk, pin=pin, door_bitmask=door_bitmask,
                                     authorize_timezone_id=int(authorize_timezone_id),
                                     device_id=int(dev_id) if dev_id is not None else 0,
                                 )
+                                if not _p_ok or _p_err:
+                                    # Its (0, error) answer was ignored too (lane 1, as above).
+                                    raise PullSDKError(f"authorize failed: {_p_err or 'no pattern'}")
+                                _auth_ok.add(pin)
                             except Exception as ex:
+                                _result_codes[pin] = "AUTHORIZE_FAILED"
                                 pin_outcomes[pin] = {
                                     "full_name": _safe_one_line((desired.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                     "status": "FAILED",
@@ -4023,6 +4080,7 @@ class DeviceSyncEngine:
                                 pushed_templates += ok_count
                                 if errs:
                                     warn_templates_users += 1
+                                    _result_codes[pin] = "TEMPLATE_REFUSED"
                                     # A refused template is a FAILED sync, not a warning.
                                     # Phase D derives last_ok from pin_outcomes, so leaving
                                     # this as a log line is what stamped a non-working
@@ -4045,6 +4103,7 @@ class DeviceSyncEngine:
                                         pass
                             except Exception as ex:
                                 warn_templates_users += 1
+                                _result_codes[pin] = "FINGER_WRITE_FAILED"
                                 pin_outcomes[pin] = {
                                     "full_name": _safe_one_line((pin_to_user.get(pin) or {}).get("fullName") or "") or f"U{pin}",
                                     "status": "FAILED",
@@ -4115,6 +4174,22 @@ class DeviceSyncEngine:
                                 "[DeviceSync] Device id=%s save_device_sync_state_batch failed "
                                 "(%d rows): %s", dev_id, len(_batch_state_rows), _batch_err
                             )
+                    # Last push results (contract §1.1): a recorded failure is False; a pin is True
+                    # only when its user row AND its door rights were explicitly confirmed (and no
+                    # template failed); anything else -- no answer recorded -- stays unknown.
+                    _results = []
+                    for pin in pins_sorted:
+                        if pin in _result_codes:
+                            _results.append((pin, False, _result_codes[pin]))
+                        elif pin in _user_ok and pin in _auth_ok:
+                            _results.append((pin, True, None))
+                    if _results:
+                        try:
+                            record_push_results(device_id=did, rows=_results)
+                        except Exception as _res_err:
+                            self.logger.warning(
+                                "[DeviceSync] Device id=%s last push results not recorded: %s",
+                                dev_id, _res_err)
                     if _batch_mirror_rows:
                         try:
                             upsert_device_mirror_batch(device_id=did, rows=_batch_mirror_rows)
@@ -4240,6 +4315,9 @@ class DeviceSyncEngine:
                                     pass
 
                         push_ok = auth_complete and tpl_err is None
+                        _record_push_result(did, pin, push_ok,
+                                            None if push_ok else ("AUTHORIZE_FAILED" if not auth_complete
+                                                                  else "TEMPLATE_REFUSED"))
                         if push_ok:
                             save_device_sync_state(
                                 device_id=did, pin=pin,
@@ -4301,6 +4379,7 @@ class DeviceSyncEngine:
                             device_id=did, pin=pin,
                             desired_hash=None, ok=False, error=str(ex),
                         )
+                        _record_push_result(did, pin, False, "OTHER")
                         pin_outcomes[pin] = {
                             "full_name": full_name,
                             "status": "FAILED",
