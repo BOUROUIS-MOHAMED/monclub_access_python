@@ -53,6 +53,7 @@ export interface EraseRun {
   holdKept: boolean | null;
   erased: boolean;
   pinScheme: string | null;
+  otherPcsClosed?: boolean | null;
 }
 
 export interface ErasePreview {
@@ -65,6 +66,21 @@ export interface ErasePreview {
   hold: EraseHold | null;
   run: EraseRun | null;
   limits: { doorLogs?: string; mbPinsPerPass?: number | null };
+  /** What the refill would write (lane 1b): the server refuses an erase on a ``problem``
+   *  (and, for "hold", on an ``accountProblem``). */
+  refill?: EraseRefillCheck;
+}
+
+export interface EraseRefillCheck {
+  scheme: string | null;
+  members: number | null;
+  withheld: number | null;
+  /** Under 'Par personne' (ACCOUNT), when the scheme now is another. */
+  ifAccount?: { members: number; withheld: number };
+  lastSyncOk: boolean;
+  cacheUpdatedAt: string | null;
+  problem: string | null;
+  accountProblem: string | null;
 }
 
 export interface EraseStartBody {
@@ -76,6 +92,8 @@ export interface EraseStartBody {
   password: string;
   acceptFaceLoss?: boolean;
   backupOnly?: boolean;
+  /** Required (true) for an erase: the hold binds this PC only (lane 1b, review C0). */
+  otherPcsClosed?: boolean;
 }
 
 export interface EraseHolds {
@@ -90,6 +108,8 @@ export interface RefillResult {
   pinScheme: string | null;
   passRequested: boolean;
   invalidated?: number;
+  /** Lane 1b: the backups' 30 days now count from this Refill (false: a mark could not be written). */
+  backupsMarked?: boolean;
 }
 
 export interface EraseApi {
@@ -108,7 +128,8 @@ export const liveEraseApi: EraseApi = {
     post<{ ok: boolean; error?: string }>("/auth/verify-admin-password", { password }, 25_000),
   preview: (deviceId) => get<ErasePreview>(`/devices/${deviceId}/erase/preview`),
   start: (deviceId, body) =>
-    post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 30_000),
+    // The server checks the password AND the gym's switch (15 s each at worst) before it answers.
+    post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 60_000),
   status: () => get<{ ok: boolean; running: boolean; run: EraseRun | null }>("/erase/status"),
   refill: (deviceId, password, expectedPinScheme) =>
     post<RefillResult>(`/devices/${deviceId}/erase/refill`, { password, expectedPinScheme }, 30_000),

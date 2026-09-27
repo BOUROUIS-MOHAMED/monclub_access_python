@@ -21,16 +21,21 @@ model -- guide §2):
   there a documented MB2000 log clear (``ClearGLog`` is only in script 13, marked unverified).
 
 Order of one run (each step logged, and written to the run's ``run.json``):
-  hold (nothing is written to the turnstile from here: device_hold) -> idle (no pass running)
-  -> counts before -> BACKUP of the chosen tables to a file, re-read and hash-checked (a failure
-  stops everything: nothing erased, hold released) -> erase -> counts after -> VERIFY -> records
-  (forget / keep) -> refill. An erase that started and did not end verified (INCOMPLETE, a crash)
-  keeps the hold, forgets nothing and makes every recorded pin "not in sync", so the refill
-  writes everything again (review round 1). The lease and the handover freeze are checked again
-  on the worker thread just before every erase command, and before the records.
+  hold (phase ERASE_PREP; nothing is written to the turnstile from here: device_hold) -> idle (no
+  pass running) -> counts before -> BACKUP of the chosen tables to a file, re-read and hash-checked
+  (a failure stops everything: nothing erased, hold released) -> [MB2000: no kept admin pin in the
+  refill roster] -> the erase RECORDED (hold phase ERASE, every recorded pin's last push result
+  unknown; one durable write, or no erase) -> erase -> counts after -> VERIFY -> records (forget /
+  keep) -> refill. An erase that started and did not end verified (INCOMPLETE, a crash) keeps the
+  hold, forgets nothing and makes every recorded pin "not in sync", so the refill writes everything
+  again (review round 1). The lease and the handover freeze are checked again on the worker thread
+  just before every erase command, and before the records. Before any of it (lane 1b): every other
+  Access PC of the gym confirmed closed, and a refill that can put the members back.
 
 Every device call goes through the ULTRA worker's own connection (``request_run_sdk``) -- never a
-second session -- in short commands, so the worker serves the door and the scans between them.
+second session -- one command at a time, and the worker serves the door and the scans BETWEEN
+commands only: a whole-table C3 read or delete, or an MB2000 listing, blocks the door for its
+whole duration (guide §3.2h "What the wizard does to the door").
 """
 from __future__ import annotations
 
@@ -38,10 +43,13 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.core import device_hold
@@ -129,6 +137,100 @@ def _device_identity(device: Dict[str, Any], proto: Optional[str]) -> Dict[str, 
         "port": str(device.get("portNumber") or device.get("port_number") or "").strip(),
         "protocol": proto,
     }
+
+
+PIN_SCHEME_ACCOUNT = "ACCOUNT"
+
+
+def refill_roster(device: Dict[str, Any], cache: Any, *,
+                  scheme: Optional[str] = None) -> Dict[str, Any]:
+    """What a refill pass would write to this turnstile (lane 1b, review C1).
+
+    The SAME source and filter both refill passes use: the sync cache's member rows through
+    ``DeviceSyncEngine._filter_users_for_device`` (the MB2000 full sync's
+    ``_build_standalone_roster`` and the PullSDK pass's ``_sync_one_device``), on a COPY of the
+    device row (the filter writes ``doorIds`` into it) and quietly (no withheld WARNING, no
+    ``PIN_SCHEME_ACCOUNT_WITHHELD`` event: this only measures). ``scheme`` forces a pin scheme --
+    what the refill would write after a switch. Before the pass's own exclusions (members an
+    explicit revocation or the recently-removed guard leaves out), so it can only be higher.
+    {scheme, members, withheld, pins}."""
+    from app.core.device_sync import DeviceSyncEngine
+
+    dev = dict(device or {})
+    if scheme is not None:
+        dev.pop("pin_scheme", None)
+        dev["pinScheme"] = scheme
+    stats: Dict[str, Any] = {}
+    engine = DeviceSyncEngine(cfg=SimpleNamespace(), logger=_log)
+    by_pin = engine._filter_users_for_device(
+        users=list(getattr(cache, "users", None) or []), device=dev, default_door_id=1,
+        stats_out=stats, quiet=True,
+    )
+    return {"scheme": stats.get("pin_scheme"), "members": len(by_pin),
+            "withheld": int(stats.get("withheld_missing_account") or 0),
+            "pins": frozenset(str(p) for p in by_pin)}
+
+
+# The verifier's text when this PC has no gym token (local_access_api_v2._erase_password_verifier).
+NOT_SIGNED_IN = "this PC is not signed in to MonClub"
+
+
+def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
+    """The refusal of a password check, with a code the page translates. A 401 is a wrong password
+    (``validate_statistics_password`` answers False on a 401 alone; whether the backend also answers
+    401 for a rejected gym token is [UNVERIFIED]); a 503 is "could not be asked" (offline) or, with
+    the verifier's ``NOT_SIGNED_IN`` text, a PC with no gym token; a 400 is no password; any other
+    status is the server failing the check (a proxy's 502/504, a 5xx) -- never "wrong password"
+    (lane 1b review rounds 1-2)."""
+    code = {401: "ADMIN_PASSWORD", 400: "ADMIN_PASSWORD_REQUIRED",
+            503: "ADMIN_PASSWORD_UNCHECKABLE"}.get(int(status or 0), "ADMIN_PASSWORD_CHECK_FAILED")
+    if code == "ADMIN_PASSWORD_UNCHECKABLE" and str(error or "").startswith(NOT_SIGNED_IN):
+        code = "PC_NOT_SIGNED_IN"                  # not "no internet": the PC has no gym token
+    return int(status or 503), {"ok": False, "code": code, "error": error}
+
+
+def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
+    """Is the Erase wizard switched on for this gym, on the server? (owner decision 2026-09-27,
+    guide §3.2h). ``(enabled, code, why)``: ONLY a 200 whose JSON ``enabled`` is the boolean
+    ``true`` enables. ``false`` is ``ERASE_NOT_ENABLED``; anything else -- no token, a 404 from an
+    older backend, 401/403, 5xx, a timeout, a body that is not JSON or not that boolean (the
+    string ``"true"`` included) -- is ``ERASE_SWITCH_UNCHECKED``. Never raises."""
+    try:
+        from access.store import load_auth_token
+        auth = load_auth_token()
+        if not auth or not getattr(auth, "token", None):
+            return False, "ERASE_SWITCH_UNCHECKED", "no gym token on this PC"
+        body = app._api().get_erase_wizard_switch(token=auth.token, timeout=15)
+    except Exception as exc:
+        return False, "ERASE_SWITCH_UNCHECKED", str(exc)[:200]
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if enabled is True:
+        return True, None, ""
+    if enabled is False:
+        return False, "ERASE_NOT_ENABLED", "the erase is not enabled for this gym"
+    return False, "ERASE_SWITCH_UNCHECKED", "the server's answer carries no boolean 'enabled'"
+
+
+def held_waiting_count(device_id: Any) -> Optional[int]:
+    """For the heartbeat of a HELD turnstile (lane 1b, review F0/F7/F14/F26): how many members
+    its refill would write -- all of them wait while it is held. In memory only (the heartbeat's
+    rule): the sync cache already loaded, never a load. None when it cannot be told."""
+    try:
+        from app.core.db import _coerce_device_row_to_payload, peek_sync_cache
+
+        cache = peek_sync_cache()
+        if cache is None:
+            return None
+        did = int(device_id)
+        row = next((d for d in (getattr(cache, "devices", None) or [])
+                    if isinstance(d, dict) and str(d.get("id")) == str(did)), None)
+        if row is None:
+            return None
+        # The cache holds the DB row (snake_case: ``allowed_memberships``, ``pin_scheme``); the
+        # passes filter the payload shape (``allowedMemberships``) -- the same coercion they get.
+        return int(refill_roster(_coerce_device_row_to_payload(row), cache)["members"])
+    except Exception:
+        return None
 
 
 class EraseWizard:
@@ -351,6 +453,8 @@ class EraseWizard:
             "run": self.status().get("run"),
             "limits": {"doorLogs": "DOOR_LOG_NOT_SUPPORTED",
                        "mbPinsPerPass": self._pins_per_pass(proto)},
+            # What the refill would write (step 3 and 4 show it; start() refuses on a problem).
+            "refill": self._public_refill(self._refill_check(did, device)),
         }
 
     @staticmethod
@@ -377,6 +481,91 @@ class EraseWizard:
         """For a decision: a read error propagates (None = the device has no row)."""
         from app.core import db as _db
         return _db.get_device_pin_scheme(did)
+
+    def _refill_check(self, did: int, device: Optional[Dict[str, Any]] = None
+                      ) -> Dict[str, Any]:
+        """Can the refill really refill this turnstile? (lane 1b, review C1)
+
+        Everything an erase removes comes back only from the refill pass, which writes the
+        members of THIS PC's sync cache (``refill_roster``). A pass finds no cache: it is skipped
+        and the emptied terminal stays empty; ACCOUNT rows without ``mainAccountId`` are withheld
+        and never written, and the "N waiting" count cannot name them. So, before any erase:
+        ``problem`` for the refill under the scheme recorded now, ``accountProblem`` for one
+        under "Par personne" (ACCOUNT) after a switch -- the cutover's "hold, switch, Refill".
+        ``lastSyncOk``: the app's last getSyncData succeeded (False until the first sync of this
+        process) -- a cache a failed or missing sync left behind may miss members."""
+        out: Dict[str, Any] = {
+            "scheme": None, "members": None, "withheld": None,
+            "lastSyncOk": getattr(self.app, "_last_sync_ok", None) is True,
+            "cacheUpdatedAt": None, "problem": None, "accountProblem": None,
+        }
+        device = device if device is not None else self._device(did)
+        try:
+            from app.core import db as _db
+            cache = _db.load_sync_cache()
+        except Exception:
+            _log.warning("[ERASE] sync cache unreadable for the refill check", exc_info=True)
+            cache = None
+        if cache is None or not device:
+            out["problem"] = out["accountProblem"] = "REFILL_SOURCE_MISSING"
+            return out
+        out["cacheUpdatedAt"] = str(getattr(cache, "updated_at", "") or "") or None
+        try:
+            now = refill_roster(device, cache)
+            acct = (now if now["scheme"] == PIN_SCHEME_ACCOUNT
+                    else refill_roster(device, cache, scheme=PIN_SCHEME_ACCOUNT))
+        except Exception:
+            _log.warning("[ERASE] refill roster not computed", exc_info=True)
+            out["problem"] = out["accountProblem"] = "REFILL_SOURCE_MISSING"
+            return out
+        out.update(scheme=now["scheme"], members=now["members"], withheld=now["withheld"])
+        if now["scheme"] != PIN_SCHEME_ACCOUNT:
+            out["ifAccount"] = {"members": acct["members"], "withheld": acct["withheld"]}
+        out["_pins"] = {"now": now["pins"], "account": acct["pins"]}
+
+        def _problem(roster: Dict[str, Any]) -> Optional[str]:
+            if not out["lastSyncOk"]:
+                return "REFILL_SOURCE_STALE"
+            if not roster["members"]:
+                return "REFILL_SOURCE_EMPTY"
+            if roster["withheld"]:
+                return "REFILL_WITHHELD"
+            return None
+
+        out["problem"] = _problem(now)
+        out["accountProblem"] = _problem(acct)
+        return out
+
+    @staticmethod
+    def _public_refill(check: Dict[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in check.items() if not k.startswith("_")}
+
+    @staticmethod
+    def _refill_refusal(check: Dict[str, Any], refill: Optional[str]
+                        ) -> Optional[Tuple[int, Dict[str, Any]]]:
+        """The refusal of an erase whose refill could not put the members back. For "hold" the
+        scheme at Refill is not known yet: both the scheme now and ACCOUNT must be refillable."""
+        code, under = check.get("problem"), check.get("scheme")
+        if not code and refill == REFILL_HOLD and check.get("accountProblem"):
+            code, under = check["accountProblem"], PIN_SCHEME_ACCOUNT
+        if not code:
+            return None
+        members = check.get("members") if under == check.get("scheme") else (
+            (check.get("ifAccount") or {}).get("members"))
+        withheld = check.get("withheld") if under == check.get("scheme") else (
+            (check.get("ifAccount") or {}).get("withheld"))
+        why = {
+            "REFILL_SOURCE_MISSING": "this PC has no member list (sync cache) to refill the "
+                                     "turnstile from",
+            "REFILL_SOURCE_STALE": "the last sync with MonClub did not succeed (or none ran since "
+                                   "Access started): the member list may be out of date",
+            "REFILL_SOURCE_EMPTY": f"the refill would write no member under {under}",
+            "REFILL_WITHHELD": f"{withheld} member row(s) have no account number (mainAccountId): "
+                               f"under {under} the refill would not write them",
+        }.get(str(code), str(code))
+        return 409, {"ok": False, "code": code, "pinScheme": under, "members": members,
+                     "withheld": withheld,
+                     "error": f"nothing erased: {why} -- the refill could not put everyone back"}
 
     @staticmethod
     def _hold_of(did: int) -> Optional[Dict[str, Any]]:
@@ -493,6 +682,20 @@ class EraseWizard:
             if refill not in REFILL_OPTIONS:
                 return 400, {"ok": False, "code": "REFILL_REQUIRED",
                              "error": "choose when the turnstile is refilled"}
+            if body.get("otherPcsClosed") is not True:
+                # The hold binds THIS PC only. Without driver assignments (v2 off, the cutover
+                # night) every Access PC of the gym runs a worker for every ULTRA turnstile and
+                # would keep writing to it during the erase, and refill it right after, under
+                # its own records (lane 1b, review C0). No local check can see them.
+                return 400, {"ok": False, "code": "OTHER_PCS_NOT_CONFIRMED",
+                             "error": "confirm that MonClub Access is closed on every other PC of "
+                                      "this gym, and stays closed until Refill"}
+            if refill in (REFILL_NOW, REFILL_AUTO) and device_hold.is_held(did):
+                # An earlier erase left it on hold: only the Refill button -- which shows and
+                # checks the pin scheme -- releases it, never a second run (review F2).
+                return 409, {"ok": False, "code": "HELD_USE_REFILL",
+                             "error": "this turnstile is on hold after an earlier erase: choose "
+                                      "'hold until Refill', then press Refill"}
         extra = preview["counts"].get("extra") or {}
         if (proto == PROTO_STANDALONE and users_table in tables and not backup_only
                 and not body.get("acceptFaceLoss")):
@@ -517,15 +720,31 @@ class EraseWizard:
         except Exception as exc:
             return 503, {"ok": False, "code": "PIN_SCHEME_UNREADABLE",
                          "error": f"the turnstile's pin scheme could not be read: {exc}"}
+        if not backup_only:
+            # Every erasable table is something only the refill puts back: no erase the refill
+            # could not undo (lane 1b, review C1).
+            refused = self._refill_refusal(self._refill_check(did, device), refill)
+            if refused:
+                return refused
         ok, status, error = verify_password(str(body.get("password") or ""))
         if not ok:
-            return status, {"ok": False, "code": "ADMIN_PASSWORD", "error": error}
+            return _password_refusal(status, error)
+        # The gym's server switch (owner decision 2026-09-27), after the password so a wrong
+        # password still reads as one. Starts only -- never the preview, never Refill.
+        enabled, code, why = check_erase_switch(self.app)
+        if not enabled:
+            return (403 if code == "ERASE_NOT_ENABLED" else 503), {
+                "ok": False, "code": code,
+                "error": ("the erase is not enabled for this gym: the owner can enable it in the "
+                          "dashboard (access PCs page)") if code == "ERASE_NOT_ENABLED" else
+                         f"whether the erase is enabled for this gym could not be checked: {why}"}
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         run = {
             "runId": run_id, "deviceId": did, "device": ident, "protocol": proto,
             "tables": tables, "forget": None if backup_only else forget,
             "refill": None if backup_only else refill, "backupOnly": backup_only,
             "acceptFaceLoss": bool(body.get("acceptFaceLoss")),
+            "otherPcsClosed": None if backup_only else True,
             "state": "RUNNING", "step": "start", "startedAt": _now_text(), "finishedAt": None,
             "steps": [], "countsBefore": None, "countsAfter": None, "backup": None,
             "progress": None, "error": None, "holdKept": None, "erased": False,
@@ -593,6 +812,18 @@ class EraseWizard:
             _log.warning("[ERASE] run record not written", exc_info=True)
 
     def _execute(self, run_id: str) -> None:
+        try:
+            self._execute_run(run_id)
+        finally:
+            # Whatever happened -- even a failure inside _finish itself -- the run is over: never
+            # leave "running" standing, which would refuse every later start and Refill.
+            with self._lock:
+                if self._run is not None and self._run.get("runId") == run_id:
+                    self._running = False
+            # Erase backups older than 30 days go, after each run (and at start-up: app.py).
+            prune_erase_backups(self.backup_root(), keep_run_id=run_id)
+
+    def _execute_run(self, run_id: str) -> None:
         run = self.status()["run"] or {}
         did, proto = int(run["deviceId"]), run["protocol"]
         tables, backup_only = list(run["tables"]), bool(run["backupOnly"])
@@ -600,7 +831,13 @@ class EraseWizard:
         erase_started = False
         try:
             # 1. HOLD: from here MonClub writes nothing to this turnstile (door and scans go on).
-            device_hold.hold(did, reason="erase", run_id=run_id)
+            # Phase ERASE_PREP: no delete issued yet -- a restart before the first delete
+            # releases it (review F1). A turnstile already held for a real erase keeps ERASE.
+            # A rehearsal on a turnstile already held leaves its hold row as it is: the row names
+            # the run that may have erased (review round 1, finding 4). A real erase takes it over
+            # (its first delete must find ITS run id there, db.begin_device_erase).
+            if not (held_before and backup_only):
+                device_hold.hold(did, reason=device_hold.REASON_ERASE_PREP, run_id=run_id)
             self._step("hold", True, heldBefore=held_before)
             worker = self._wait_idle(did)
             moved = self._address_refusal(worker, run["device"])
@@ -617,11 +854,22 @@ class EraseWizard:
             if backup_only:
                 self._finish("DONE", release=not held_before, note="backup only: nothing erased")
                 return
+            kept = self._kept_admins(proto, backup)
+            self._recheck_before_delete(did, str(run["refill"]), kept)
+            # The last durable write before the first delete: the hold moves to ERASE (a restart
+            # keeps it from here) and every recorded pin's last push result becomes unknown --
+            # the erase is an attempt start for all of them (review F12). No write, no erase.
+            try:
+                reset = _begin_erase(did, run_id, kept)
+            except Exception as exc:
+                raise StepError("RESULTS_NOT_RESET",
+                                f"the erase could not be recorded before its first delete: {exc}")
+            self._step("erase_recorded", True, resultsReset=int(reset), kept=len(kept))
             erase_started = True
             self._update(erased=True)
             erase_error = None
             try:
-                self._erase(worker, did, proto, tables, backup)
+                self._erase(worker, did, proto, tables, backup, before)
             except StepError as exc:
                 erase_error = exc
                 self._step("erase", False, code=exc.code, error=exc.message,
@@ -637,7 +885,8 @@ class EraseWizard:
             if not verified:
                 raise StepError("NOT_VERIFIED", why or "the erase could not be verified")
             self._records(worker, did, proto, tables, bool(run["forget"]), backup)
-            self._refill(worker, did, str(run["refill"]), run.get("pinScheme"))
+            self._refill(worker, did, str(run["refill"]), run.get("pinScheme"),
+                         held_before=held_before)
         except StepError as exc:
             if erase_started:
                 # Something may have been erased: keep the hold, forget nothing (an unverified
@@ -646,8 +895,10 @@ class EraseWizard:
                 self._invalidate(did)
                 self._finish("INCOMPLETE", release=False, error=f"{exc.code}: {exc.message}")
             else:
+                # Not on a worker the run just saw connected to ANOTHER address: no pass through it.
                 self._finish("FAILED", release=not held_before,
-                             error=f"{exc.code}: {exc.message} -- nothing was erased")
+                             error=f"{exc.code}: {exc.message} -- nothing was erased",
+                             ask_pass=exc.code not in ("ADDRESS_CHANGED", "ADDRESS_UNKNOWN"))
         except Exception as exc:  # noqa: BLE001 - a bug must never leave the run "RUNNING"
             _log.error("[ERASE] run %s crashed", run_id, exc_info=True)
             if erase_started:
@@ -655,6 +906,56 @@ class EraseWizard:
             self._finish("INCOMPLETE" if erase_started else "FAILED",
                          release=(not erase_started and not held_before),
                          error=f"UNEXPECTED: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:
+        """The users the erase leaves on the terminal: the MB2000 administrators (privilege > 0,
+        from the verified backup). None on a C3 (no such notion there)."""
+        if proto != PROTO_STANDALONE:
+            return []
+        return [str(u["pin"]) for u in (backup.get("content") or {}).get("users") or []
+                if int(u.get("privilege") or 0) > 0]
+
+    def _recheck_before_delete(self, did: int, refill: str, kept: List[str]) -> None:
+        """Right before the first delete (the backup can take long): the refill must still be able
+        to refill (start()'s check, minus STALE -- one failed sync during a long MB2000 backup
+        leaves the member list as it was, while a SUCCESSFUL one can empty it or bring withheld
+        rows; lane 1b review round 1, finding 1), and an MB2000
+        administrator the erase keeps must not also be a member the refill writes -- the push writes
+        ``SSR_SetUserInfo(1, pin, name, "", 0, enabled)``, privilege 0, password emptied, so the
+        refill would demote the admin to that member (review C4). Both under the scheme now and,
+        for "hold", under ACCOUNT too (the scheme at Refill is not known yet). Raised before any
+        delete: FAILED, nothing erased."""
+        check = self._refill_check(did)
+        if "_pins" not in check:
+            raise StepError("REFILL_SOURCE_MISSING", "the refill roster could not be read any more: "
+                                                     "nothing erased")
+        # From the counts, not ``problem``: a STALE there would mask an emptied roster.
+        rosters_now = [(check.get("scheme"), check.get("members"), check.get("withheld"))]
+        if refill == REFILL_HOLD and check.get("ifAccount"):
+            acct = check["ifAccount"]
+            rosters_now.append((PIN_SCHEME_ACCOUNT, acct.get("members"), acct.get("withheld")))
+        for under, members, withheld in rosters_now:
+            code = ("REFILL_SOURCE_EMPTY" if not members
+                    else "REFILL_WITHHELD" if withheld else None)
+            if code:
+                raise StepError(code, f"the refill could not put everyone back any more (under "
+                                      f"{under}: {members} member(s), {withheld} withheld): "
+                                      "nothing erased")
+        if not kept:
+            return
+        pins = check["_pins"]
+        rosters = [("now", check.get("scheme"))]
+        if refill == REFILL_HOLD:
+            rosters.append(("account", PIN_SCHEME_ACCOUNT))
+        for key, scheme in rosters:
+            clash = sorted(set(kept) & set(pins.get(key) or ()))
+            if clash:
+                raise StepError("ADMIN_PIN_IN_ROSTER",
+                                f"{len(clash)} terminal administrator pin(s) are also member pins "
+                                f"under {scheme} (e.g. {clash[:3]}): the refill would overwrite "
+                                "them as members -- change those administrators' pins on the "
+                                "terminal first")
 
     def _invalidate(self, did: int) -> None:
         """After an erase that did not end verified: the hard-reset UPDATE (hashes cleared,
@@ -670,7 +971,7 @@ class EraseWizard:
             self._step("records_invalidated", False, error=str(exc)[:200])
 
     def _finish(self, state: str, *, release: bool, error: Optional[str] = None,
-                note: Optional[str] = None) -> None:
+                note: Optional[str] = None, ask_pass: bool = True) -> None:
         run = self.status()["run"] or {}
         did = int(run.get("deviceId") or 0)
         if release:
@@ -686,6 +987,15 @@ class EraseWizard:
                 except Exception:
                     _log.warning("[ERASE] scheduler not forced for turnstile %s", did,
                                  exc_info=True)
+                # ... and ask for that pass again now: dropping the stamp alone leaves it to the
+                # scheduler's next timer (up to 15 min; never on a manual-sync gym, review F8).
+                try:
+                    worker = self._worker(did) if ask_pass else None
+                    if worker is not None:
+                        worker.request_full_sync(reason="erase-released")
+                except Exception:
+                    _log.warning("[ERASE] pass not requested after the release of turnstile %s",
+                                 did, exc_info=True)
         kept = device_hold.is_held(did)
         self._update(state=state, finishedAt=_now_text(), error=error, holdKept=kept)
         self._step("finish", state == "DONE", state=state, holdKept=kept,
@@ -775,7 +1085,9 @@ class EraseWizard:
         bad = [str(u.get("pin")) for u in users
                if not (str(u.get("pin") or "").isdigit() and len(str(u.get("pin"))) <= 9)]
         if bad:
-            raise StepError("BACKUP_UNTRUSTED", f"listing has non-numeric pins (e.g. {bad[:3]}): "
+            # A count only: a wrong out-param order lists NAMES as pins, and this text reaches
+            # the app log, telemetry and run.json (review F29).
+            raise StepError("BACKUP_UNTRUSTED", f"{len(bad)} listed pin(s) are not numeric: "
                                                 "the read cannot be trusted")
         if any(not isinstance(u.get("privilege"), int) for u in users):
             raise StepError("BACKUP_UNTRUSTED", "a user's privilege did not read: admins "
@@ -808,10 +1120,18 @@ class EraseWizard:
 
     # ------------------------------------------------------------------ erase
     def _erase(self, worker: Any, did: int, proto: str, tables: List[str],
-               backup: Dict[str, Any]) -> None:
+               backup: Dict[str, Any], before: Dict[str, Any]) -> None:
         if proto == PROTO_PULLSDK:
+            counted = before.get("tables") or {}
             for t in C3_ERASE_ORDER:
                 if t in tables:
+                    if counted.get(t) == 0:
+                        # Nothing to erase, and the call itself may be refused: a C3 without the
+                        # v9 ``template`` table -- the FULL_REPLACE clear treats that refusal as
+                        # "table may not exist" -- would end the run INCOMPLETE after
+                        # templatev10 is gone (review C5). The verify still requires 0 after.
+                        self._step(f"erase_{t}", True, skipped="empty")
+                        continue
                     self._write_call(worker, did, lambda drv, _t=t: drv.erase_table(table=_t),
                                      label=f"erase_{t}", timeout=T_ERASE)
                     self._step(f"erase_{t}", True)
@@ -892,8 +1212,7 @@ class EraseWizard:
         users_erased = USERS_TABLE[proto] in tables
         fingers_erased = users_erased or bool(FINGER_TABLES & set(tables))
         # The MB2000 administrators stay on the terminal with their fingers: their records stay.
-        kept = ([str(u["pin"]) for u in (backup.get("content") or {}).get("users") or []
-                 if int(u.get("privilege") or 0) > 0] if proto == PROTO_STANDALONE else [])
+        kept = self._kept_admins(proto, backup)
         if forget:
             out = _db.retire_device_records(device_id=did, keep_pins=kept)
             self._step("forget", True, **{k: int(v) for k, v in out.items()})
@@ -910,8 +1229,16 @@ class EraseWizard:
                 self._step("wipe_reported", True)
             except Exception as exc:
                 self._step("wipe_reported", False, error=str(exc)[:200])
+        self._set_waiting(worker, did)
+
+    def _set_waiting(self, worker: Any, did: int) -> None:
+        """Every recorded pin was forgotten or reset: the "N waiting" figure is the whole roster
+        the refill will write, until its pass counts again -- never None, which the heartbeat
+        sends as 0 (review F0). A pass that never runs (no worker, a lease or scheme stop) keeps
+        this figure. Unknown when the roster cannot be read."""
+        members = self._refill_check(did).get("members")
         try:
-            worker._waiting_pins = None
+            worker._waiting_pins = int(members) if isinstance(members, int) else None
         except Exception:
             pass
 
@@ -921,9 +1248,16 @@ class EraseWizard:
         if sched is not None and hasattr(sched, "force_resync"):
             sched.force_resync(did)
 
-    def _refill(self, worker: Any, did: int, refill: str, run_scheme: Optional[str]) -> None:
+    def _refill(self, worker: Any, did: int, refill: str, run_scheme: Optional[str], *,
+                held_before: bool = False) -> None:
         if refill == REFILL_HOLD:
             self._finish("DONE", release=False, note="on hold until Refill is pressed")
+            return
+        if held_before:
+            # An earlier erase's hold is released only by the Refill button, which shows the
+            # pin scheme and checks it (review F2; start() already refuses now/auto then).
+            self._finish("DONE", release=False,
+                         note="HELD_BEFORE: on hold since an earlier erase -- press Refill")
             return
         # The pin scheme must still be the one the run started under: a switch recorded during
         # the run (or a stale answer reverting one, §3.2e) would refill the other numbering.
@@ -1013,7 +1347,7 @@ class EraseWizard:
         # is refilled by the first pass once its worker starts.
         ok, status, error = verify_password(str(body.get("password") or ""))
         if not ok:
-            return status, {"ok": False, "code": "ADMIN_PASSWORD", "error": error}
+            return _password_refusal(status, error)
         # The password was a network call: look again (review round 2, R2-1).
         with self._lock:
             if self._running and self._run and int(self._run.get("deviceId") or 0) == did:
@@ -1043,11 +1377,15 @@ class EraseWizard:
                        exc_info=True)
             return 500, {"ok": False, "code": "RECORDS_NOT_RESET",
                          "error": f"MonClub's records of this turnstile could not be reset: {exc}"}
+        # The backups' 30 days count from now (NEW 1): marked BEFORE the release (review round 3).
+        marked = _mark_refilled(self.backup_root(), did)
         device_hold.release(did)
         self._force_scheduler(did)
         worker = self._worker(did)
         requested = False
         if worker is not None:
+            # Released: the whole roster waits until the refill pass counts (review F0).
+            self._set_waiting(worker, did)
             try:
                 requested = bool(worker.request_full_sync(reason="erase-refill"))
             except Exception:
@@ -1060,7 +1398,107 @@ class EraseWizard:
         except Exception:
             pass
         return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested,
-                     "invalidated": invalidated}
+                     "invalidated": invalidated, "backupsMarked": marked}
+
+
+BACKUP_KEEP_DAYS = 30
+_RUN_DIR_NAME = re.compile(r"^(\d{8}-\d{6})-[0-9a-f]{6}_device(\d+)$")
+# No run can predate the wizard (September 2026): a run id before this is a PC clock that was
+# wrong at the time (a dead CMOS battery), and its age cannot be told -- never pruned
+# automatically (lane 1b review round 2).
+_NO_RUN_BEFORE = "20260901"
+REFILLED_MARK = "refilled_at.txt"
+
+
+def _mark_refilled(root: Path, device_id: int) -> bool:
+    """Refill is about to release this turnstile: its run folders' 30 days count from NOW, not
+    from the erase (a turnstile can stay held longer). Written BEFORE the release, so no prune can
+    find the folder unheld and unmarked (review round 3). One small file per folder. Returns
+    whether every folder of the turnstile got it; a failure is logged at ERROR and reported by
+    Refill, never a reason to keep the turnstile empty."""
+    ok = True
+    try:
+        if not root.is_dir():
+            return True
+        stamp = _now_text().encode("ascii")
+        for folder in root.iterdir():
+            m = _RUN_DIR_NAME.match(folder.name)
+            if m and int(m.group(2)) == int(device_id) and folder.is_dir():
+                try:
+                    (folder / REFILLED_MARK).write_bytes(stamp)
+                except Exception:
+                    ok = False
+                    _log.error("[ERASE] refill mark not written in %s: its backup may be "
+                               "deleted 30 days after the erase, not after Refill", folder.name,
+                               exc_info=True)
+    except Exception:
+        _log.error("[ERASE] refill marks not written for turnstile %s", device_id, exc_info=True)
+        return False
+    return ok
+
+
+def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = None,
+                        keep_run_id: Optional[str] = None) -> List[str]:
+    """Delete erase run folders (backup + run.json) older than ``BACKUP_KEEP_DAYS`` (owner decision
+    2026-09-27, guide §3.2h). The age counts from the LATEST of: the run's start (its run id, local
+    time) and the last write of any file in its folder -- the run's end, and the refill mark Refill
+    writes -- so a backup stays 30 days after Refill was pressed. NEVER: a folder whose
+    name is not a run's; a run id before ``_NO_RUN_BEFORE`` (a wrong clock); the run in progress
+    (``keep_run_id``); any run of a turnstile still HELD -- while the holds cannot be read every
+    turnstile reads held, so nothing goes. A run whose ``run.json`` is unreadable or still says
+    ``RUNNING`` goes too once old enough and not held: no run of this process is that old, so it
+    is a run a power cut or a crash ended -- its biometric copy is not kept forever (review round
+    2). Logged by run id, turnstile and state only -- never a name, card or template. Returns the
+    run ids deleted. Never raises."""
+    deleted: List[str] = []
+    try:
+        base = Path(root) if root is not None else _default_backup_root()
+        if not base.is_dir():
+            return deleted
+        cutoff = (time.time() if now is None else float(now)) - BACKUP_KEEP_DAYS * 86400.0
+        for folder in sorted(base.iterdir()):
+            try:
+                m = _RUN_DIR_NAME.match(folder.name)
+                if not m or not folder.is_dir():
+                    continue
+                run_id = folder.name.split("_device")[0]
+                did = int(m.group(2))
+                if keep_run_id and run_id == keep_run_id:
+                    continue
+                if m.group(1)[:8] < _NO_RUN_BEFORE:
+                    continue
+                newest = max([time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))]
+                             + [f.stat().st_mtime for f in folder.iterdir() if f.is_file()])
+                if newest >= cutoff:
+                    continue
+                if device_hold.is_held(did):
+                    continue
+                try:
+                    state = str(json.loads((folder / "run.json").read_text(encoding="utf-8"))
+                                .get("state") or "UNKNOWN")
+                except Exception:
+                    state = "UNREADABLE"
+                shutil.rmtree(folder)
+                deleted.append(run_id)
+                _log.warning("[ERASE] backup of run %s (turnstile %s, %s) deleted: older than %d "
+                             "days", run_id, did, state, BACKUP_KEEP_DAYS)
+                try:
+                    _tel.event("ERASE_STEP", run=run_id, device_id=did, step="backup_deleted",
+                               ok=True, state=state)
+                except Exception:
+                    pass
+            except Exception:
+                _log.warning("[ERASE] erase backup folder %s not pruned", folder.name, exc_info=True)
+    except Exception:
+        _log.warning("[ERASE] erase backups not pruned", exc_info=True)
+    return deleted
+
+
+def _begin_erase(did: int, run_id: str, keep_pins: List[str]) -> int:
+    """``db.begin_device_erase``: the hold to ERASE and the push results reset, one durable
+    transaction (a module function so a test can make it fail)."""
+    from app.core import db as _db
+    return int(_db.begin_device_erase(device_id=did, run_id=run_id, keep_pins=keep_pins))
 
 
 def _redact_passwords(table: str, rows: List[Dict[str, Any]],

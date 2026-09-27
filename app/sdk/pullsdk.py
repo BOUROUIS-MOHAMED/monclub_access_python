@@ -1387,10 +1387,17 @@ class PullSDKDevice:
             assert self._sdk is not None
             return list(self._sdk.get_device_data_rows(table=table, fields=fields) or [])
 
+    # The only tables erase_table will ever clear (lane 1b, review F17): the member tables. Never a
+    # parameter, timezone, holiday or ``transaction`` (door log) table, whatever the caller asks.
+    ERASABLE_TABLES = frozenset({"user", "userauthorize", "templatev10", "template"})
+
     def erase_table(self, *, table: str) -> int:
         """``DeleteDeviceData(h, table, "", "")``: EVERY row of ONE table (``clear_device_table``).
-        Raises on a negative rc. Only the Erase-content wizard calls it, on the tables the
-        operator chose -- never a parameter, timezone or holiday table (erase_wizard.C3_TABLES)."""
+        Raises on a negative rc, and -- before any connect -- on a table outside
+        ``ERASABLE_TABLES``. Only the Erase-content wizard calls it, on the tables the operator
+        chose (erase_wizard.C3_ERASE_ORDER)."""
+        if str(table) not in self.ERASABLE_TABLES:
+            raise PullSDKError(f"erase {table!r}: not a member table -- refused")
         with self._sdk_lock:
             if not self.ensure_connected():
                 raise PullSDKError(f"erase {table}: not connected")

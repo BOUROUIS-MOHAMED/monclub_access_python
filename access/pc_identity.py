@@ -524,6 +524,32 @@ def _qr_roster_check_report() -> dict[str, Any] | None:
         return None
 
 
+def _report_held_turnstiles(devices: dict[int, dict[str, Any]]) -> None:
+    """A turnstile the Erase wizard holds (``device_hold``: loaded from the durable hold at
+    start-up, so this survives a restart; EVERY turnstile while the holds could not be read)
+    writes nothing until Refill: every member its refill would write is waiting. So its line
+    carries ``held: true`` and ``failedPins`` = that roster's size, recomputed at each heartbeat
+    from memory (lane 1b, review F0/F7/F14/F26) -- the pass that would count it cannot run while
+    held, and the worker's own figure would read 0. Unknown size: the figure is left as it is.
+    Only held lines get the key. Never raises."""
+    try:
+        from app.core import device_hold
+        from app.core.erase_wizard import held_waiting_count
+    except Exception:
+        return
+    for device_id, line in devices.items():
+        try:
+            if not device_hold.is_held(device_id) or line.get("mode") == "AGENT":
+                # AGENT: no engine writes a pin to it (§3.10), so no hold concerns it.
+                continue
+            line["held"] = True
+            waiting = held_waiting_count(device_id)
+            if waiting is not None:
+                line["failedPins"] = _failed_pin_count(waiting)
+        except Exception:
+            continue
+
+
 def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     """Build telemetry only from existing in-memory app snapshots."""
 
@@ -581,6 +607,8 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
             current["failedPins"] = _failed_pin_count(failed)
     except Exception:
         pass
+
+    _report_held_turnstiles(devices)
 
     payload: dict[str, Any] = {
         "appVersion": app_version,

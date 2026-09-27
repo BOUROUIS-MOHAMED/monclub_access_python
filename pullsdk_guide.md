@@ -443,8 +443,9 @@ since lane 1 (2026-09-27), the Erase-content wizard, through `PullSDKDevice.eras
 tables an operator chose among `user`, `userauthorize`, `templatev10` and `template` — `user` only
 together with every one of the others that reads, never a parameter, timezone, holiday or
 `transaction` table — after a verified backup whose `user` password values are emptied, and only
-through a worker connected to the IP MonClub records (main guide §3.2h).
-`[CODE: app/core/erase_wizard.py::C3_ERASE_ORDER]` Be certain before calling it.
+through a worker connected to the IP MonClub records (main guide §3.2h); `erase_table` itself refuses any
+other table (`PullSDKDevice.ERASABLE_TABLES`, lane 1b), and a chosen table that counted 0 gets no call.
+`[CODE: app/core/erase_wizard.py::C3_ERASE_ORDER, app/sdk/pullsdk.py::PullSDKDevice.erase_table]` Be certain before calling it.
 
 #### ⛔ `set_device_data` redacts `Template=` before logging
 
@@ -768,6 +769,17 @@ Only the wizard calls them, through the ULTRA worker's own connection (`request_
 Never run against a C3-400 `[UNVERIFIED]`: whether `DeleteDeviceData(h, "user", "", "")` also empties
 `userauthorize` on that firmware is not known; the wizard erases each chosen table itself and counts
 each one after.
+
+Since lane 1b (2026-09-27): `erase_table` refuses — before any connect — every table outside
+`PullSDKDevice.ERASABLE_TABLES` = `user`, `userauthorize`, `templatev10`, `template` (`PullSDKError`), whatever the
+caller asks: the rail no longer rests on the caller's list alone. `[CODE]` `[TEST:
+tests/test_erase_wizard.py::test_the_driver_refuses_any_other_table_before_connecting]` And the wizard sends no
+`DeleteDeviceData` to a chosen table its own count read as 0 just before: the `FULL_REPLACE` clear already treats a
+template-table refusal as "table may not exist" (`device_sync.py::_sync_one_device`, `clear %s skipped`), and what
+`GetDeviceDataCount` answers for a table the firmware lacks — 0, or a refusal that makes it "—" — is `[UNVERIFIED]` on a
+C3-400; the wizard's verify still requires 0 after (main guide §3.2h, review C5). A whole-table read or delete is ONE
+command on the ULTRA worker: no RTLog poll, no door open for its whole duration, which nothing here bounds but the DLL
+(`[UNVERIFIED]` on ~1,800 users; the log's `SDK_CMD op=erase_… dur_ms=` measures it).
 
 ### Transactions
 

@@ -2100,6 +2100,7 @@ class DeviceSyncEngine:
         device: Dict[str, Any],
         default_door_id: int,
         stats_out: Dict[str, Any] | None = None,
+        quiet: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Returns dict(pin -> user).
@@ -2128,6 +2129,10 @@ class DeviceSyncEngine:
         be kept.
 
         Also ensures device has a usable doorIds list (fallback to default_door_id).
+
+        ``quiet``: count only -- no WARNING and no ``PIN_SCHEME_ACCOUNT_WITHHELD`` event. For a
+        caller that only measures what a pass WOULD write (the Erase wizard's refill check, the
+        heartbeat of a held turnstile, lane 1b), so the signal stays one line per real pass.
         """
         allowed_raw = device.get("allowedMemberships") or []
         allowed_set: Set[int] = set()
@@ -2255,7 +2260,7 @@ class DeviceSyncEngine:
                 if len(dropped_sample) < 10:
                     dropped_sample.append({"pin": pin, "droppedFromMemberships": sorted(
                         {str(am) for am in lost.values()})})
-            if dropped_cards:
+            if dropped_cards and not quiet:
                 (self.logger or logging.getLogger("zkapp")).warning(
                     "[DeviceSync] device id=%s pinScheme=ACCOUNT: %d card(s) do not reach the "
                     "terminal -- a device user holds ONE card (firstCardId) and a person's "
@@ -2264,7 +2269,7 @@ class DeviceSyncEngine:
                     device.get("id"), dropped_cards, dropped_sample,
                 )
 
-            if withheld:
+            if withheld and not quiet:
                 log = self.logger or logging.getLogger("zkapp")
                 log.warning(
                     "[DeviceSync] device id=%s pinScheme=ACCOUNT: WITHHELD %d deliverable "
@@ -4048,6 +4053,11 @@ class DeviceSyncEngine:
                     elif remaining_pins:
                         # No cached pattern available — fall back to per-pin authorize
                         for pin in remaining_pins:
+                            # Up to 4 SetDeviceData per pin when the panel refuses every pattern:
+                            # serve the door and the scans between pins, as every other push loop
+                            # does -- this one ran the whole roster door-blind (lane 1b, review F9).
+                            self._maybe_yield_doors()
+                            self._maybe_yield_rtlog()
                             try:
                                 _p_ok, _p_err = self._push_userauthorize(
                                     sdk, pin=pin, door_bitmask=door_bitmask,

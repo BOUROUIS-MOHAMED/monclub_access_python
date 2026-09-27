@@ -680,15 +680,26 @@ class MainApp:
             self.logger.warning("[V2] cached roles not loaded at start-up", exc_info=True)
         # Lane 1 (Erase-content wizard): a turnstile an erase left on hold stays on hold across
         # a restart -- the cutover restarts Access between the erase and the refill. Installed,
-        # like the roles, before the first sync tick can start a worker (guide §3.2h).
+        # like the roles, before the first sync tick can start a worker (guide §3.2h). A hold whose
+        # run stopped before its first delete command is released here: nothing was erased
+        # (lane 1b, review F1) -- no erase of this process can be preparing yet.
         try:
             from app.core import device_hold
 
-            device_hold.load()
+            device_hold.load(release_unstarted=True)
         except Exception:
             self.logger.error("[HOLD] erase holds NOT read at start-up: every turnstile is held "
                               "(nothing written to any) until they read -- retried every sync "
                               "tick", exc_info=True)
+        # Erase backups older than 30 days go (owner decision 2026-09-27), after the holds are
+        # installed (a held turnstile's backups are never deleted), off the start-up path.
+        try:
+            from app.core.erase_wizard import prune_erase_backups
+
+            threading.Thread(target=prune_erase_backups, name="erase-backup-prune",
+                             daemon=True).start()
+        except Exception:
+            self.logger.warning("[ERASE] erase backups not pruned at start-up", exc_info=True)
         self.after(_DATE_FLIP_TICK_MS, self._date_flip_tick)
         try:
             self._arm_midnight_date_flip()

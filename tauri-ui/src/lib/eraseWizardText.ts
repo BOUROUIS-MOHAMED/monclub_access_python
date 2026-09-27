@@ -10,7 +10,7 @@ const fr = {
   steps: ["Contenu", "Choix", "Options", "Confirmer", "Exécution"],
   lockTitle: "Réservé à l'administrateur",
   lockText:
-    "Saisissez le mot de passe administrateur de la salle. Le serveur le vérifie de nouveau au moment d'effacer.",
+    "Saisissez le mot de passe administrateur de la salle. Le serveur MonClub le vérifie ici, puis de nouveau au moment d'effacer et pour « Remplir » : l'effacement comme le remplissage demandent Internet.",
   password: "Mot de passe administrateur",
   unlock: "Déverrouiller",
   checking: "Vérification…",
@@ -36,6 +36,34 @@ const fr = {
   refillHold: "Attendre que j'appuie sur « Remplir »",
   refillHoldHelp:
     "Pour la nuit de bascule : effacer, passer le tourniquet en « Par personne », redémarrer Access, puis « Remplir ».",
+  heldAlready:
+    "Ce tourniquet est déjà en attente depuis un effacement : seul le bouton « Remplir » le libère. Choisissez « Attendre que j'appuie sur « Remplir » ».",
+  refillWillWrite: (n: number, s: string) => `Le remplissage écrira ${n} membre(s) sur ce tourniquet (schéma ${s}).`,
+  refillIfAccount: (n: number, w: number) =>
+    w > 0
+      ? `En « Par personne » : ${n} membre(s), et ${w} sans numéro de compte, qui ne seraient pas écrits.`
+      : `En « Par personne » : ${n} membre(s).`,
+  refillCacheAt: (s: string) => `Liste des membres de ce PC enregistrée le ${s}.`,
+  withheldOnlyIfAccount:
+    "Ce blocage ne concerne que « Attendre que j'appuie sur « Remplir » » (prévu pour passer en « Par personne ») : sans changement de schéma, « Remplir maintenant » écrit tout le monde.",
+  lockoutHold:
+    "Après cet effacement, AUCUN membre ne passe au tourniquet par carte ou par empreinte tant que « Remplir » n'est pas fait (Internet requis).",
+  lockoutRefill:
+    "Pendant l'effacement et jusqu'à la fin du remplissage, les membres ne passent pas au tourniquet par carte ou par empreinte.",
+  otherPcsTitle:
+    "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet.",
+  otherPcsTick:
+    "MonClub Access est fermé sur tous les autres PC de cette salle, et le restera jusqu'au remplissage.",
+  deviceLine: (name: string, ip: string, port: string, sdk: string) =>
+    `Tourniquet : ${name} — adresse ${ip}:${port} — ${sdk}. L'effacement est lié à cette adresse.`,
+  sdkNames: { ZK_PULLSDK: "PullSDK (contrôleur C3)", ZK_STANDALONE: "zkemkeeper (terminal autonome)" } as Record<string, string>,
+  phases: {
+    backup_fingers: "Sauvegarde des empreintes",
+    erase_users: "Effacement des utilisateurs",
+    erase_fingers: "Effacement des empreintes",
+  } as Record<string, string>,
+  errorDetail: "Détail",
+  noAnswerYet: "Pas de réponse à temps : lecture de l'état de l'effacement…",
   refillAutoHelp: "En synchronisation manuelle, le remplissage attend le prochain « Synchroniser ».",
   acceptFaces: (n: number) =>
     `J'accepte la perte de ${n} visage(s) : aucune sauvegarde n'existe pour un visage.`,
@@ -79,6 +107,7 @@ const fr = {
     erase_users: "Utilisateurs effacés (administrateurs conservés)",
     erase_fingerprints: "Empreintes effacées (administrateurs conservés)",
     counts_after: "Comptage après et vérification",
+    erase_recorded: "Effacement enregistré : le dernier résultat d'écriture de chaque membre devient « inconnu »",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
     records_invalidated: "Enregistrements gardés, marqués à réécrire",
@@ -109,6 +138,70 @@ const fr = {
     RUN_IN_PROGRESS: "Un effacement est déjà en cours.",
     HOLD_CHANGED: "La mise en attente de ce tourniquet a changé entre-temps : fermez et rouvrez la fenêtre.",
     HOLDS_UNKNOWN: "Access n'a pas pu relire les mises en attente : rien n'est effacé ni rempli pour l'instant.",
+    ADMIN_PASSWORD_UNCHECKABLE:
+      "Pas d'Internet : le serveur MonClub doit vérifier le mot de passe (pour effacer comme pour « Remplir »). Rétablissez la connexion, puis réessayez.",
+    ADMIN_PASSWORD: "Mot de passe incorrect.",
+    ADMIN_PASSWORD_REQUIRED: "Saisissez le mot de passe administrateur.",
+    PC_NOT_SIGNED_IN: "Ce PC n'est pas connecté à MonClub : le mot de passe ne peut pas être vérifié. Reconnectez ce PC, puis réessayez.",
+    ADMIN_PASSWORD_CHECK_FAILED: "Le serveur MonClub n'a pas pu vérifier le mot de passe : réessayez dans un instant.",
+    PREVIEW_EXPIRED: "La lecture de l'étape 1 date de plus de 15 minutes : revenez à l'étape 1 et relisez.",
+    WRONG_DEVICE: "Cette lecture concerne un autre tourniquet : relisez l'étape 1.",
+    DEVICE_CHANGED: "Le nom, l'adresse ou le SDK du tourniquet a changé depuis l'étape 1 : relisez.",
+    NO_DEVICE: "Tourniquet inconnu.",
+    NO_DEVICE_NAME: "Ce tourniquet n'a pas de nom dans MonClub : nommez-le avant d'effacer.",
+    NAME_MISMATCH: "Le nom tapé n'est pas celui de ce tourniquet.",
+    NO_TABLES: "Choisissez au moins une table.",
+    UNKNOWN_TABLE: "Table inconnue.",
+    NOT_ERASABLE: "Cette table ne peut pas être effacée par l'assistant.",
+    DOOR_LOG_NOT_SUPPORTED: "Le journal des passages ne peut pas être effacé ici.",
+    UNREADABLE: "Le terminal n'a pas répondu pour cette table : relisez l'étape 1.",
+    FORGET_REQUIRED: "Choisissez si MonClub oublie ses enregistrements.",
+    FORGET_NEEDS_USERS: "« Oublier » demande que les utilisateurs soient effacés aussi.",
+    USER_NEEDS_RIGHTS_AND_FINGERS: "Effacer les utilisateurs demande d'effacer aussi les droits et les empreintes lisibles.",
+    USERS_ERASE_NEEDS_FORGET: "Effacer les utilisateurs d'un terminal autonome demande « Oublier ».",
+    REFILL_REQUIRED: "Choisissez quand le tourniquet est rempli.",
+    FACES_UNKNOWN: "Le terminal n'a pas donné son nombre de visages : acceptez leur perte éventuelle (étape 3).",
+    FACES_PRESENT: "Des visages sont enregistrés et ne peuvent pas être sauvegardés : acceptez leur perte (étape 3).",
+    NOT_DRIVER: "Ce PC ne pilote pas ce tourniquet.",
+    HANDOVER_IN_PROGRESS: "Ce tourniquet est en cours de passage à un autre PC.",
+    ADD_ONLY: "Ce tourniquet n'accepte que des ajouts pour l'instant (changement de PC pilote non terminé) : aucun effacement.",
+    NO_WORKER: "Aucune connexion Access en cours avec ce tourniquet sur ce PC.",
+    NOT_CONNECTED: "Le tourniquet n'est pas connecté.",
+    UNSUPPORTED_PROTOCOL: "Le SDK de ce tourniquet n'est pas pris en charge par l'assistant.",
+    STATUS_UNREADABLE: "Le terminal n'a pas donné ses compteurs : relisez dans un instant.",
+    PIN_SCHEME_UNREADABLE: "Le schéma de numérotation de ce tourniquet n'a pas pu être lu : réessayez.",
+    PIN_SCHEME_REQUIRED: "Relisez la fenêtre : le schéma affiché manque.",
+    RUN_NOT_STARTED: "L'effacement n'a pas pu démarrer : rien n'a été effacé. Réessayez.",
+    NOT_ON_HOLD: "Ce tourniquet n'est plus en attente.",
+    RECORDS_NOT_RESET: "Les enregistrements de MonClub n'ont pas pu être remis à zéro : le tourniquet reste en attente. Réessayez.",
+    OTHER_PCS_NOT_CONFIRMED: "Confirmez que MonClub Access est fermé sur tous les autres PC de cette salle.",
+    HELD_USE_REFILL:
+      "Ce tourniquet est déjà en attente depuis un effacement : choisissez « Attendre que j'appuie sur « Remplir » », puis appuyez sur « Remplir ».",
+    REFILL_SOURCE_MISSING:
+      "Ce PC n'a pas de liste des membres pour remplir le tourniquet : rien n'est effacé. Synchronisez, puis relisez.",
+    REFILL_SOURCE_STALE:
+      "La dernière synchronisation avec MonClub n'a pas réussi (ou aucune depuis le démarrage d'Access) : la liste des membres peut être incomplète. Synchronisez, puis relisez.",
+    REFILL_SOURCE_EMPTY: "Le remplissage n'écrirait aucun membre sur ce tourniquet : rien n'est effacé.",
+    REFILL_WITHHELD:
+      "Des membres n'ont pas de numéro de compte dans la liste de ce PC : en « Par personne », le remplissage ne les écrirait pas. La liste des membres doit d'abord être relue en entier.",
+    BUSY: "Une synchronisation en cours ne s'est pas terminée à temps : rien n'a été effacé. Réessayez.",
+    BACKUP_INCOMPLETE: "La sauvegarde ne correspond pas aux compteurs du terminal : rien n'a été effacé.",
+    BACKUP_UNVERIFIABLE: "Le terminal n'a pas donné tous ses compteurs : la sauvegarde ne peut pas être vérifiée, rien n'a été effacé.",
+    BACKUP_UNTRUSTED: "La liste lue sur le terminal n'est pas fiable : rien n'a été effacé.",
+    BACKUP_WRITE: "Le fichier de sauvegarde n'a pas pu être écrit ou relu : rien n'a été effacé.",
+    RESULTS_NOT_RESET: "L'effacement n'a pas pu être enregistré avant la première suppression : rien n'a été effacé.",
+    ADMIN_PIN_IN_ROSTER:
+      "Un administrateur du terminal a le même numéro qu'un membre : le remplissage l'écraserait. Changez le numéro de cet administrateur sur le terminal : rien n'a été effacé.",
+    NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
+    ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
+    NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
+    NOT_SENT: "Une commande n'a pas été envoyée (délai ou connexion perdue).",
+    DEVICE_ERROR: "Une commande au terminal a échoué.",
+    UNEXPECTED: "Erreur inattendue d'Access.",
+    ERASE_NOT_ENABLED:
+      "L'effacement n'est pas activé pour cette salle — le propriétaire peut l'activer dans le tableau de bord (page PC d'accès).",
+    ERASE_SWITCH_UNCHECKED:
+      "L'activation de l'effacement pour cette salle n'a pas pu être vérifiée : rien n'est effacé. Réessayez (Internet requis).",
   } as Record<string, string>,
   schemes: { ACCOUNT: "Par personne", MEMBERSHIP: "Par abonnement" } as Record<string, string>,
   mbPasses: (n: number) =>
@@ -117,6 +210,8 @@ const fr = {
     "Vérifiez les nombres ci-dessous, puis relancez l'assistant ou appuyez sur « Remplir » : MonClub réécrira tous ses membres. Rien n'a été oublié.",
   refilled: "Remplissage lancé.",
   refilledWith: (s: string) => `Remplissage lancé, schéma ${s}.`,
+  backupsNotMarked:
+    "Attention : la date du remplissage n'a pas pu être notée dans les sauvegardes ; elles seront supprimées 30 jours après l'effacement.",
   notOnHold: "Ce tourniquet n'est plus en attente.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -132,7 +227,8 @@ const fr = {
   reasons: {
     DOOR_LOG_NOT_SUPPORTED:
       "Ne peut pas être effacé ici : le PC ne sait pas encore prouver quels passages de ce journal ont déjà été envoyés au serveur.",
-    UNREADABLE: "Le terminal n'a pas répondu pour cette table.",
+    UNREADABLE:
+      "Table absente ou illisible sur ce terminal (le terminal n'a pas donné de nombre). Sur un C3, c'est souvent la table v9 « template » : les empreintes sont dans « templatev10 ».",
   } as Record<string, string>,
   unknown: "—",
 };
@@ -143,7 +239,7 @@ const en: typeof fr = {
   steps: ["Content", "Choose", "Options", "Confirm", "Run"],
   lockTitle: "Administrator only",
   lockText:
-    "Enter the gym's administrator password. The server checks it again when the erase starts.",
+    "Enter the gym's administrator password. The MonClub server checks it here, then again when the erase starts and for Refill: the erase and the refill both need the internet.",
   password: "Administrator password",
   unlock: "Unlock",
   checking: "Checking…",
@@ -169,6 +265,34 @@ const en: typeof fr = {
   refillHold: "Hold until I press Refill",
   refillHoldHelp:
     "For the cutover night: erase, switch the turnstile to 'Par personne', restart Access, then Refill.",
+  heldAlready:
+    "This turnstile is already on hold after an erase: only the Refill button releases it. Choose 'Hold until I press Refill'.",
+  refillWillWrite: (n: number, s: string) => `The refill will write ${n} member(s) to this turnstile (scheme ${s}).`,
+  refillIfAccount: (n: number, w: number) =>
+    w > 0
+      ? `Under 'Par personne': ${n} member(s), and ${w} without an account number, who would not be written.`
+      : `Under 'Par personne': ${n} member(s).`,
+  refillCacheAt: (s: string) => `This PC's member list was saved on ${s}.`,
+  withheldOnlyIfAccount:
+    "This refusal concerns 'Hold until I press Refill' only (meant for a switch to 'Par personne'): with no scheme change, 'Refill now' writes everyone.",
+  lockoutHold:
+    "After this erase NO member gets through the turnstile by card or fingerprint until Refill is pressed (the internet is needed).",
+  lockoutRefill:
+    "During the erase and until the refill has finished, members do not get through the turnstile by card or fingerprint.",
+  otherPcsTitle:
+    "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile.",
+  otherPcsTick:
+    "MonClub Access is closed on every other PC of this gym, and stays closed until the refill.",
+  deviceLine: (name: string, ip: string, port: string, sdk: string) =>
+    `Turnstile: ${name} — address ${ip}:${port} — ${sdk}. The erase is tied to this address.`,
+  sdkNames: { ZK_PULLSDK: "PullSDK (C3 controller)", ZK_STANDALONE: "zkemkeeper (standalone terminal)" },
+  phases: {
+    backup_fingers: "Backing up fingerprints",
+    erase_users: "Erasing users",
+    erase_fingers: "Erasing fingerprints",
+  },
+  errorDetail: "Detail",
+  noAnswerYet: "No answer in time: reading the erase status…",
   refillAutoHelp: "With manual sync, the refill waits for the next 'Synchronize'.",
   acceptFaces: (n: number) =>
     `I accept the loss of ${n} face template(s): no backup exists for a face.`,
@@ -212,6 +336,7 @@ const en: typeof fr = {
     erase_users: "Users erased (administrators kept)",
     erase_fingerprints: "Fingerprints erased (administrators kept)",
     counts_after: "Counts after, and check",
+    erase_recorded: "Erase recorded: each member's last write result becomes 'unknown'",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
     records_invalidated: "Records kept, marked to be written again",
@@ -241,6 +366,70 @@ const en: typeof fr = {
     RUN_IN_PROGRESS: "An erase is already running.",
     HOLD_CHANGED: "This turnstile's hold changed meanwhile: close and reopen the dialog.",
     HOLDS_UNKNOWN: "Access could not read the holds back: nothing is erased or refilled for now.",
+    ADMIN_PASSWORD_UNCHECKABLE:
+      "No internet: the MonClub server must check the password (to erase and to Refill). Restore the connection, then try again.",
+    ADMIN_PASSWORD: "Wrong password.",
+    ADMIN_PASSWORD_REQUIRED: "Enter the administrator password.",
+    PC_NOT_SIGNED_IN: "This PC is not signed in to MonClub: the password cannot be checked. Sign this PC in again, then try again.",
+    ADMIN_PASSWORD_CHECK_FAILED: "The MonClub server could not check the password: try again in a moment.",
+    PREVIEW_EXPIRED: "Step 1 was read more than 15 minutes ago: go back to step 1 and read again.",
+    WRONG_DEVICE: "This reading is of another turnstile: read step 1 again.",
+    DEVICE_CHANGED: "The turnstile's name, address or SDK changed since step 1: read again.",
+    NO_DEVICE: "Unknown turnstile.",
+    NO_DEVICE_NAME: "This turnstile has no name in MonClub: name it before erasing.",
+    NAME_MISMATCH: "The typed name is not this turnstile's name.",
+    NO_TABLES: "Choose at least one table.",
+    UNKNOWN_TABLE: "Unknown table.",
+    NOT_ERASABLE: "This table cannot be erased by the wizard.",
+    DOOR_LOG_NOT_SUPPORTED: "The door log cannot be erased here.",
+    UNREADABLE: "The terminal did not answer for this table: read step 1 again.",
+    FORGET_REQUIRED: "Choose whether MonClub forgets its records.",
+    FORGET_NEEDS_USERS: "'Forget' needs the users erased too.",
+    USER_NEEDS_RIGHTS_AND_FINGERS: "Erasing the users needs every readable rights and fingerprint table erased too.",
+    USERS_ERASE_NEEDS_FORGET: "Erasing a standalone terminal's users needs 'Forget'.",
+    REFILL_REQUIRED: "Choose when the turnstile is refilled.",
+    FACES_UNKNOWN: "The terminal did not report its face count: accept the possible loss of faces (step 3).",
+    FACES_PRESENT: "Faces are enrolled and cannot be backed up: accept their loss (step 3).",
+    NOT_DRIVER: "This PC does not drive this turnstile.",
+    HANDOVER_IN_PROGRESS: "This turnstile is being handed over to another PC.",
+    ADD_ONLY: "This turnstile accepts additions only for now (a change of driving PC is not finished): no erase.",
+    NO_WORKER: "Access has no running connection to this turnstile on this PC.",
+    NOT_CONNECTED: "The turnstile is not connected.",
+    UNSUPPORTED_PROTOCOL: "This turnstile's SDK is not supported by the wizard.",
+    STATUS_UNREADABLE: "The terminal did not report its counters: read again in a moment.",
+    PIN_SCHEME_UNREADABLE: "This turnstile's pin scheme could not be read: try again.",
+    PIN_SCHEME_REQUIRED: "Read the dialog again: the scheme shown is missing.",
+    RUN_NOT_STARTED: "The erase could not start: nothing was erased. Try again.",
+    NOT_ON_HOLD: "This turnstile is no longer on hold.",
+    RECORDS_NOT_RESET: "MonClub's records could not be reset: the turnstile stays on hold. Try again.",
+    OTHER_PCS_NOT_CONFIRMED: "Confirm that MonClub Access is closed on every other PC of this gym.",
+    HELD_USE_REFILL:
+      "This turnstile is already on hold after an erase: choose 'Hold until I press Refill', then press Refill.",
+    REFILL_SOURCE_MISSING:
+      "This PC has no member list to refill the turnstile from: nothing is erased. Synchronize, then read again.",
+    REFILL_SOURCE_STALE:
+      "The last sync with MonClub did not succeed (or none ran since Access started): the member list may be incomplete. Synchronize, then read again.",
+    REFILL_SOURCE_EMPTY: "The refill would write no member to this turnstile: nothing is erased.",
+    REFILL_WITHHELD:
+      "Some members have no account number in this PC's list: under 'Par personne' the refill would not write them. The member list must be read again in full first.",
+    BUSY: "A sync in progress did not end in time: nothing was erased. Try again.",
+    BACKUP_INCOMPLETE: "The backup does not match the terminal's counters: nothing was erased.",
+    BACKUP_UNVERIFIABLE: "The terminal did not report all its counters: the backup cannot be checked, nothing was erased.",
+    BACKUP_UNTRUSTED: "The list read from the terminal cannot be trusted: nothing was erased.",
+    BACKUP_WRITE: "The backup file could not be written or read back: nothing was erased.",
+    RESULTS_NOT_RESET: "The erase could not be recorded before its first delete: nothing was erased.",
+    ADMIN_PIN_IN_ROSTER:
+      "A terminal administrator has the same number as a member: the refill would overwrite it. Change that administrator's number on the terminal: nothing was erased.",
+    NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
+    ERASE_FAILED: "An erase command failed: part of it may have been erased.",
+    NO_ANSWER: "A command was sent and got no answer: it may have acted.",
+    NOT_SENT: "A command was not sent (timeout or connection lost).",
+    DEVICE_ERROR: "A command to the terminal failed.",
+    UNEXPECTED: "Unexpected Access error.",
+    ERASE_NOT_ENABLED:
+      "Erasing is not enabled for this gym — the owner can enable it in the dashboard (access PCs page).",
+    ERASE_SWITCH_UNCHECKED:
+      "Whether erasing is enabled for this gym could not be checked: nothing is erased. Try again (the internet is needed).",
   },
   schemes: { ACCOUNT: "Par personne (per person)", MEMBERSHIP: "Par abonnement (per membership)" },
   mbPasses: (n: number) =>
@@ -249,6 +438,8 @@ const en: typeof fr = {
     "Check the counts below, then run the wizard again or press Refill: MonClub writes all its members again. Nothing was forgotten.",
   refilled: "Refill started.",
   refilledWith: (s: string) => `Refill started, scheme ${s}.`,
+  backupsNotMarked:
+    "Warning: the refill date could not be noted in the backups; they will be deleted 30 days after the erase.",
   notOnHold: "This turnstile is no longer on hold.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -264,7 +455,8 @@ const en: typeof fr = {
   reasons: {
     DOOR_LOG_NOT_SUPPORTED:
       "Cannot be erased here: the PC cannot yet prove which events of this log were already sent to the server.",
-    UNREADABLE: "The terminal did not answer for this table.",
+    UNREADABLE:
+      "Table missing or unreadable on this terminal (it gave no count). On a C3 this is often the v9 'template' table: the fingerprints are in 'templatev10'.",
   },
   unknown: "—",
 };

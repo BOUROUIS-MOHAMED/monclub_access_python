@@ -550,6 +550,32 @@ class MonClubApi:
             body=txt,
         )
 
+    def get_erase_wizard_switch(self, *, token: str, timeout: int = 15) -> Any:
+        """The gym's switch for the Erase-content wizard (owner decision, 2026-09-27; guide §3.2h).
+
+        ``GET {base}/manager/gym/access/erase-wizard`` -- ``base`` exactly as
+        ``validate_statistics_password`` builds it (``{scheme}://{host}/api/v1``), the same gym token.
+        Returns the parsed JSON body of a 200 (the caller decides: only ``enabled`` the JSON boolean
+        ``true`` enables). Raises MonClubApiHttpError on any other status (a 404 from an older
+        backend included) and MonClubApiError on a transport failure or a body that is not JSON."""
+        from urllib.parse import urlparse
+        parsed = urlparse(self.endpoints.login_url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+        prefix = ('/' + '/'.join(path_parts[:2])) if len(path_parts) >= 2 else ''
+        url = f"{parsed.scheme}://{parsed.netloc}{prefix}/manager/gym/access/erase-wizard"
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            r = self._session.get(url, headers=headers, timeout=timeout)
+        except Exception as e:
+            raise MonClubApiError(f"erase wizard switch request failed: {e}") from e
+        if r.status_code != 200:
+            raise MonClubApiHttpError(f"erase wizard switch: HTTP {r.status_code}",
+                                      status_code=r.status_code, body=(r.text or "").strip()[:200])
+        try:
+            return r.json()
+        except Exception as e:
+            raise MonClubApiError(f"erase wizard switch: the answer is not JSON: {e}") from e
+
     def create_user_fingerprint(self, *, token: str, payload: Dict[str, Any], timeout: int = 25) -> Dict[str, Any]:
         url = (self.endpoints.create_user_fingerprint_url or "").strip()
         if not url:
