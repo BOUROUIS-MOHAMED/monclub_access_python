@@ -64,6 +64,17 @@ const fr = {
     "Après cet effacement, AUCUN membre ne passe au tourniquet par carte ou par empreinte tant que « Remplir » n'est pas fait (Internet requis).",
   lockoutRefill:
     "Pendant l'effacement et jusqu'à la fin du remplissage, les membres ne passent pas au tourniquet par carte ou par empreinte.",
+  // Fingerprints only (lane 1c, review nit): the cards keep working.
+  lockoutFingersHold:
+    "Après cet effacement, les membres qui passent par empreinte ne passent plus tant que « Remplir » n'est pas fait (Internet requis). Les cartes continuent de fonctionner.",
+  lockoutFingersRefill:
+    "Pendant l'effacement et jusqu'à la fin du remplissage, les membres qui passent par empreinte ne passent pas. Les cartes continuent de fonctionner.",
+  // Why a finished run kept its hold (the run's finish note, lane 1c review nit).
+  finishNotes: {
+    HELD_BEFORE: "Le tourniquet était déjà en attente depuis un effacement précédent : il le reste. Appuyez sur « Remplir ».",
+    PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
+    PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
+  } as Record<string, string>,
   // The people the refill will NOT put back (lane 1c, review C0).
   notRefilledTitle: (n: number, s: string) =>
     `${n} personne(s) de ce tourniquet ne seront PAS remises par le remplissage : elles ne sont pas dans la liste des membres de MonClub pour ce tourniquet (schéma ${s}) — personnel ou agents d'entretien enregistrés sur le tourniquet, utilisateurs d'un autre système, membres qui n'y ont plus droit. Ce que l'effacement leur retire (utilisateur, carte, droits, empreintes) ne revient pas.`,
@@ -255,7 +266,7 @@ const fr = {
   // What « Remplir » reports (lane 1c, review F1): warnings, never a refusal.
   refillWarn: {
     REFILL_WITHHELD: (n: number, s: string) =>
-      `Attention : ${n} membre(s) n'ont pas de numéro de compte dans la liste de ce PC : en ${s}, ils ne sont pas écrits sur le tourniquet.`,
+      `Attention : ${n} membre(s) n'ont pas de numéro de compte dans la liste de ce PC : en « ${s} », ils ne sont pas écrits sur le tourniquet.`,
     REFILL_SOURCE_STALE: () =>
       "Attention : la liste des membres de ce PC n'est pas récente : le remplissage écrit la liste qu'il a ; la prochaine synchronisation réussie apportera les changements.",
     REFILL_SOURCE_MISSING: () =>
@@ -264,7 +275,7 @@ const fr = {
       "Attention : la liste des membres de ce PC ne contient aucun membre pour ce tourniquet : rien n'y est écrit.",
   } as Record<string, (n: number, s: string) => string>,
   adminClash: (pins: string[], s: string) =>
-    `${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en ${s} (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. Changez leur numéro sur le terminal, ou confirmez ci-dessous.`,
+    `${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en « ${s} » (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. Changez leur numéro sur le terminal, ou confirmez ci-dessous.`,
   confirmAdminOverwrite: (pins: string[]) =>
     `Je confirme : les administrateurs ${pins.join(", ")} seront remplacés par les membres du même numéro.`,
   refillWarnAdmins: (pins: string[]) =>
@@ -351,6 +362,15 @@ const en: typeof fr = {
     "After this erase NO member gets through the turnstile by card or fingerprint until Refill is pressed (the internet is needed).",
   lockoutRefill:
     "During the erase and until the refill has finished, members do not get through the turnstile by card or fingerprint.",
+  lockoutFingersHold:
+    "After this erase, members who pass by fingerprint do not get through until Refill is pressed (the internet is needed). Cards keep working.",
+  lockoutFingersRefill:
+    "During the erase and until the refill has finished, members who pass by fingerprint do not get through. Cards keep working.",
+  finishNotes: {
+    HELD_BEFORE: "The turnstile was already on hold after an earlier erase: it stays on hold. Press Refill.",
+    PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
+    PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
+  },
   notRefilledTitle: (n: number, s: string) =>
     `${n} person(s) on this turnstile will NOT be put back by the refill: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. What the erase takes from them (user, card, door rights, fingerprints) does not come back.`,
   notRefilledBackup:

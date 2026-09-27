@@ -420,8 +420,13 @@ export default function EraseWizardDialog({
     </div>
   ) : null;
 
-  const lockoutLine = !backupOnly && locksOut ? (
-    <p className="text-[12px] font-semibold text-amber-700">{refill === "hold" ? t.lockoutHold : t.lockoutRefill}</p>
+  // Fingerprints only (an MB2000 "fingerprints", a C3 fingerprint table): the cards keep working.
+  const fingersOut = !locksOut && ["fingerprints", "templatev10", "template"].some((k) => chosen.has(k));
+  const lockoutLine = !backupOnly && (locksOut || fingersOut) ? (
+    <p className="text-[12px] font-semibold text-amber-700">
+      {locksOut ? (refill === "hold" ? t.lockoutHold : t.lockoutRefill)
+        : (refill === "hold" ? t.lockoutFingersHold : t.lockoutFingersRefill)}
+    </p>
   ) : null;
 
   // Steps 3 and 4: who the refill will NOT put back, by pin and name; the tick in step 4.
@@ -753,6 +758,18 @@ export default function EraseWizardDialog({
           );
         })()}
         {state === "INCOMPLETE" && <p className="text-[12px] text-muted-foreground">{t.incompleteHelp}</p>}
+        {(() => {
+          // A DONE run that kept its hold says why (its finish note: "CODE: detail").
+          const note = run?.steps.find((s) => s.step === "finish")?.note;
+          const { code, detail } = splitRunError(typeof note === "string" ? note : "");
+          const said = code ? t.finishNotes[code] : undefined;
+          return said ? (
+            <div className="flex flex-col gap-0.5 text-[12px] text-amber-700">
+              <span className="font-semibold">{said}</span>
+              <span className="text-[11px] opacity-80">{t.errorDetail}{t.colon} {code} — {detail}</span>
+            </div>
+          ) : null;
+        })()}
         {run?.notRefilled && run.notRefilled.count > 0 && (
           <p className="text-[12px] text-amber-700">{t.notRefilledKept(run.notRefilled.count)}</p>
         )}

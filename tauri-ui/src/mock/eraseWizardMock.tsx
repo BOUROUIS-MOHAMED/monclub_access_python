@@ -67,7 +67,14 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = [],
           members: d.protocol === "ZK_PULLSDK" ? 1688 : 1836, withheld: 0,
           ...(holds.has(did) ? {} : { ifAccount: { members: d.protocol === "ZK_PULLSDK" ? 1601 : 1742, withheld: 0 } }),
           lastSyncOk: true, cacheUpdatedAt: "2026-09-27 23:30:12", problem: null, accountProblem: null,
+          // Lane 1c: the list's age and its limit (illustrative).
+          staleWhy: null, lastSyncAgeSec: 240, syncMaxAgeSec: 2700,
         },
+        // Lane 1c: who the refill will not put back (illustrative people, not a real terminal).
+        notRefilled: d.protocol === "ZK_PULLSDK"
+          ? { count: 0, scheme: "MEMBERSHIP", people: [] }
+          : { count: 2, scheme: "MEMBERSHIP", people: [
+            { pin: "777", name: "Agent entretien" }, { pin: "9001", name: "Ancien système" }] },
       };
       return p;
     },
@@ -75,6 +82,10 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = [],
       const d = DEVICES.find((x) => x.id === did)!;
       if (body.typedName !== d.name) throw new Error("the typed name is not this turnstile's name");
       if (!body.backupOnly && body.otherPcsClosed !== true) throw new Error("OTHER_PCS_NOT_CONFIRMED");
+      if (!body.backupOnly && d.protocol === "ZK_STANDALONE" && body.acceptNotRefilled !== true) {
+        throw Object.assign(new Error("2 person(s) are not in the refill roster"),
+          { code: "NOT_REFILLED_UNCONFIRMED", payload: { count: 2 } });
+      }
       const before = counts(d);
       const failC3 = opts.incomplete && d.protocol === "ZK_PULLSDK";
       const after: EraseCounts = d.protocol === "ZK_PULLSDK"
@@ -133,7 +144,10 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = [],
           { code: "PIN_SCHEME_CHANGED", payload: { pinScheme: "ACCOUNT" } });
       }
       holds.delete(did); onHolds(new Set(holds));
-      return { ok: true, pinScheme: "ACCOUNT", passRequested: true, invalidated: 1838 };
+      // Lane 1c: what the refill writes, with one illustrative warning (withheld rows).
+      return { ok: true, pinScheme: "ACCOUNT", passRequested: true, invalidated: 1838,
+               refill: { scheme: "ACCOUNT", members: 1742, withheld: 3, problem: "REFILL_WITHHELD" },
+               adminPins: [], adminCheck: did === 8 ? "CHECKED" : "NOT_APPLICABLE" };
     },
     // A turnstile on hold after the cutover's switch: the refill will write "Par personne" pins.
     async holds() {
