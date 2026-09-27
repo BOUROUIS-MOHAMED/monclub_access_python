@@ -3702,6 +3702,19 @@ both, the 20 s loop exiting cleanly. The door path runs none of lane B's code (t
 the push passes); offline the v2 runtime stays `UNKNOWN`, so this start-up is the power-on path with the
 safety sync off — a start-up in safety mode is not on these harnesses: unmeasured.
 
+**Lane 1 (`claude/erase-wizard-and-v2-gaps` at `97ed4d5`, 2026-09-27)**, the same two harnesses rebuilt after
+this section's description (scratch, not in the repo: the real `UltraDeviceWorker.run()` over the fake MB2000,
+and `create_access_app()` on a warm data root with the network blocked), base `d3725fa` (an export of master)
+and the branch interleaved, same interpreter `[TEST: measurement, not pass/fail]`: scan → decision base median
+231.5–231.7 ms (p95 486.5–543.4, max ≤ 571.9), branch 230.6–231.7 ms (p95 542.2–546.2, max ≤ 560.9), 0 lost
+of 150 in every run (3 runs each); desk door open median base 0.75–0.91 ms (max ≤ 7.6), branch 0.57–0.89 ms
+(max ≤ 5.8), 150/150 opened in every run; `create_access_app()` after one warm-up run each (base 1022 ms,
+branch 777 ms, not counted), 5 runs each: base 578–740 ms, branch 549–747 ms — overlapping ranges, no
+difference this noise can show. The worker loop reads `device_hold.is_held` (a set lookup and one boolean)
+in its write gates (`_v2_writes_blocked`), not in the scan decision; the start-up adds the hold load. An
+earlier run at `954763b`, before the round-1 fixes, gave the same picture (scan median base 230.5–231.0 ms,
+branch 230.6–230.9 ms; start-up base 552–805 ms, branch 577–676 ms, 3 runs each).
+
 ### 3.10 The heartbeat's turnstile line — "N waiting" (lane 1, 2026-09-27)
 
 `pc_identity.py::build_heartbeat_payload` sends one `turnstiles[]` line per device, `{gymDeviceId,
