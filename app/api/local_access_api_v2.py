@@ -1351,17 +1351,20 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
 
     Body: { "password": "<plain-text>" }
     Returns 200 { ok: true } on success, 401 { ok: false, error: "..." } on wrong password.
+    Every refusal carries a ``code`` the Erase wizard's lock screen translates (lane 1c, review
+    F6); the statuses and texts are unchanged for the other callers.
     """
     body = ctx.body()
     password = _safe_str(body.get("password"), "")
     if not password:
-        ctx.send_json(400, {"ok": False, "error": "password is required"})
+        ctx.send_json(400, {"ok": False, "code": "ADMIN_PASSWORD_REQUIRED",
+                            "error": "password is required"})
         return
 
     from access.store import load_auth_token
     auth = load_auth_token()
     if not auth or not auth.token:
-        ctx.send_json(401, {"ok": False, "error": "Not authenticated"})
+        ctx.send_json(401, {"ok": False, "code": "PC_NOT_SIGNED_IN", "error": "Not authenticated"})
         return
 
     try:
@@ -1370,10 +1373,12 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
         if valid:
             ctx.send_json(200, {"ok": True})
         else:
-            ctx.send_json(401, {"ok": False, "error": "Mot de passe incorrect"})
+            ctx.send_json(401, {"ok": False, "code": "ADMIN_PASSWORD",
+                                "error": "Mot de passe incorrect"})
     except MonClubApiHttpError as e:
         ctx.app.logger.warning("verify_admin_password: HTTP %s", e.status_code)
-        ctx.send_json(e.status_code, {"ok": False, "error": str(e)})
+        ctx.send_json(e.status_code, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
+                                      "error": str(e)})
     except MonClubApiError as e:
         # The server could not be reached (MonClubApiError is the PARENT of the HTTP error, so
         # this is the no-answer case): not a wrong password -- say that the internet is needed,

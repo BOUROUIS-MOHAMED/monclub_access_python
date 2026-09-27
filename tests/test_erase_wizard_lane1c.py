@@ -551,6 +551,36 @@ class TestRegressionGuards:
         if breaks in ("refill_roster", "peek_sync_cache"):
             assert lines[5]["held"] is True and lines[5]["failedPins"] == 2, "the worker's figure"
 
+    @pytest.mark.parametrize("case, status, code", [
+        ("no_password", 400, "ADMIN_PASSWORD_REQUIRED"),
+        ("no_token", 401, "PC_NOT_SIGNED_IN"),
+        ("wrong", 401, "ADMIN_PASSWORD"),
+        ("http_502", 502, "ADMIN_PASSWORD_CHECK_FAILED"),
+    ])
+    def test_the_lock_screens_route_answers_with_a_code(self, monkeypatch, case, status, code):
+        """Review F6: the wizard's lock screen calls /auth/verify-admin-password, whose answers
+        had no code but offline -- the page showed the server's French text on the English page.
+        The statuses and texts stay (the Local DB page reads them); each answer gains a code."""
+        from app.api import local_access_api_v2 as api_mod
+        from app.api.monclub_api import MonClubApiHttpError
+
+        class _Api:
+            def validate_statistics_password(self, **k):
+                if case == "http_502":
+                    raise MonClubApiHttpError("validate_statistics_password: HTTP 502",
+                                              status_code=502)
+                return False
+
+        monkeypatch.setattr("access.store.load_auth_token",
+                            lambda: None if case == "no_token" else SimpleNamespace(token="t"))
+        sent = {}
+        ctx = SimpleNamespace(body=lambda: {"password": "" if case == "no_password" else "pw"},
+                              app=SimpleNamespace(_api=lambda: _Api(), logger=logging.getLogger("t")),
+                              send_json=lambda s, p: sent.update(status=s, payload=p))
+        api_mod._handle_auth_verify_admin_password(ctx)
+        assert sent["status"] == status and sent["payload"]["code"] == code
+        assert sent["payload"]["ok"] is False and sent["payload"]["error"]
+
     def test_a_member_list_gone_before_the_first_delete_stops_the_run(self, sqlite_db,
                                                                       monkeypatch, tmp_path):
         """Review nit: the re-check's REFILL_SOURCE_MISSING branch had no test."""
