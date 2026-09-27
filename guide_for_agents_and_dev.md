@@ -1948,7 +1948,10 @@ Since lane 1c `[CODE]`:
   routes and socket, `app/core/v2/api.py`, `runtime.py`), and the start-up prune runs before the v2 runtime sets its clock
   (about 12 s after launch): the PC clock alone, as before. A PC clock set forward by 30 days or more then deletes the
   backups of unheld, unmarked turnstiles; a clock wrong by days, then corrected, shortens or lengthens the 30 days by that
-  much.
+  much. With a measurement too, a PC clock stepped forward after the last sample goes unseen until the next one:
+  `offset()` is the median of samples taken before the step (so it stays small) and `now()` follows the stepped wall clock
+  — `server_clock` detects such steps (`_age_of`, `STEP_TOLERANCE_SEC`) for its report only (lane 1c review round 1; not
+  changed: v2 is off at every gym today).
 
 **Owner decisions, 2026-09-27** (the lane 1 report's section 07, answered through the master session): door logs are
 never erasable; the erase and Refill stay online-only (the server checks the password); an MB2000 users erase forces
@@ -2046,10 +2049,12 @@ run folder's `run.json`):
    - *The people the refill does not put back, bound to the backup* (lane 1c, review C0; `_bind_not_refilled`): from the
      BACKUP — what is really erased — against the roster now: the MB2000 backup's users, the C3 backup's `user` rows, or,
      for a C3 erase without the `user` table (its backup holds no user rows), the list read once more here. Only the pins
-     accepted at step 1 may be among them: anyone else — a user enrolled on the terminal since step 1, a member a sync took
-     out of the roster since — ends the run `NOT_REFILLED_CHANGED`, `FAILED`, nothing erased (the operator reads step 1
-     again; rare, near a date flip). Then the run records `notRefilled {count, pins}` and, when there are any, writes the
-     keep mark (above) before `begin_device_erase`. `[TEST: ::TestPeopleTheRefillWillNotPutBack]`
+     accepted at step 1 may be among them — or a member step 1 saw in the roster who left it since (a right that ended at
+     the midnight date flip during a long MB2000 backup: a normal pass would remove them too; lane 1c review round 1; the
+     step-1 roster's pins are kept with the run, `EraseWizard._run_step1_roster`, not in its record). Anyone else — a user
+     enrolled on the terminal since step 1 — ends the run `NOT_REFILLED_CHANGED`, `FAILED`, nothing erased (the operator
+     reads step 1 again). Then the run records `notRefilled {count, pins}` — those who left the roster included — and,
+     when there are any, writes the keep mark (above) before `begin_device_erase`. `[TEST: ::TestPeopleTheRefillWillNotPutBack]`
    - *The erase is recorded* (`db.begin_device_erase`, one durable transaction, review F12 + F1): the run's hold row
      moves to `erase` (a delete may run from here), and the last push result (§3.9) of every pin MonClub recorded for
      this turnstile — sync state, intent or result rows, the MB2000 admins kept excepted — becomes UNKNOWN, stamped with
@@ -2135,8 +2140,11 @@ MB2000 it reads the administrators the hold's run kept from that run's verified 
 connection; a held turnstile's backups are never pruned) and intersects them with that roster: a clash answers 409
 `ADMIN_PIN_IN_ROSTER` with the pins — nothing reset, marked or released — until the operator confirms exactly those pins
 (`confirmAdminPins`; review C4 at Refill: the push writes `SSR_SetUserInfo(…, privilege 0)` over the admin). `adminCheck`:
-`CHECKED`, `NOT_APPLICABLE` (a C3 has no administrators), `UNREADABLE` (no backup or no roster: a warning, not a
-refusal). `[TEST: test_erase_wizard_lane1c.py::TestRefillChecksAgain]`
+`CHECKED`, `NOT_APPLICABLE` (a C3 has no administrators — also read from the backup's protocol when the device row is
+gone), `UNREADABLE` (no backup or no roster: a warning, not a refusal). The administrators are the backup's, never the
+terminal's: an administrator whose number was changed on the terminal since still reads as a clash (the page says so:
+confirm once the number is changed), and one enrolled after the erase is not checked. `[TEST:
+test_erase_wizard_lane1c.py::TestRefillChecksAgain]`
 It needs no connection to the turnstile (the cables may be out); the refill pushes the scheme the database
 records, since the workers follow the database (§3.2e). **Refill and a run never overlap** (review round 2): the
 password is a network call, and a run started meanwhile used to have its hold released and a pass requested under
@@ -4160,6 +4168,16 @@ code (its hold gate is unchanged); the start-up adds one read of `device_write_h
 write only when there is one to release) and starts the backup-prune thread. The later commits (`699080e`, review round
 1) touch neither path. Not measured: the heartbeat of a held turnstile (it filters the roster once per held line every
 5 min) and the PullSDK authorize fallback's new yields (they only add door service between pins).
+
+**Lane 1c (`claude/erase-wizard-final`, measured at `e6c0ac8`, 2026-09-28)** — the same two scratch harnesses (lane
+1b's, reused unchanged), base `e5e3328` (a `git archive` export) and the branch interleaved, same interpreter, the PC
+shared with other sessions `[TEST: measurement, not pass/fail]`: scan → decision base median 231.3–234.2 ms (p95
+542.3–546.0, max ≤ 589.9), branch 231.6–231.7 ms (p95 542.3–545.7, max ≤ 558.2), 0 lost of 150 in every run (3 runs
+each); desk door open median base 0.39–0.64 ms (max ≤ 2.65), branch 0.46–0.76 ms (max ≤ 6.67), 150/150 in every run;
+`create_access_app()` after one warm-up each (base 871 ms, branch 830 ms, not counted), 5 runs: base 553–955 ms, branch
+567–791 ms — overlapping ranges, no difference this noise can show. The worker loop runs none of lane 1c's code; the
+start-up adds one attribute (`_last_sync_ok_mono`). Not measured: the wizard's new step-1 user-list read — a device
+command, door-blind for its length (§3.2h, field test).
 
 ### 3.10 The heartbeat's turnstile line — "N waiting" (lane 1, 2026-09-27)
 
