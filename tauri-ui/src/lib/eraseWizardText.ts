@@ -210,6 +210,8 @@ const fr = {
     "Vérifiez les nombres ci-dessous, puis relancez l'assistant ou appuyez sur « Remplir » : MonClub réécrira tous ses membres. Rien n'a été oublié.",
   refilled: "Remplissage lancé.",
   refilledWith: (s: string) => `Remplissage lancé, schéma ${s}.`,
+  backupsNotMarked:
+    "Attention : la date du remplissage n'a pas pu être notée dans les sauvegardes ; elles seront supprimées 30 jours après l'effacement.",
   notOnHold: "Ce tourniquet n'est plus en attente.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -436,6 +438,8 @@ const en: typeof fr = {
     "Check the counts below, then run the wizard again or press Refill: MonClub writes all its members again. Nothing was forgotten.",
   refilled: "Refill started.",
   refilledWith: (s: string) => `Refill started, scheme ${s}.`,
+  backupsNotMarked:
+    "Warning: the refill date could not be noted in the backups; they will be deleted 30 days after the erase.",
   notOnHold: "This turnstile is no longer on hold.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {

@@ -1884,7 +1884,7 @@ start (the run id's local time) and the last write of any file in it — the run
 Refill writes into every run folder of the turnstile BEFORE it releases it (`_mark_refilled`; after, a prune in between
 found the folder neither held nor marked — review round 3): a turnstile held longer than 30 days keeps its backups 30
 days after Refill (review round 2). A mark that cannot be written is logged at ERROR and reported in Refill's answer
-(`backupsMarked: false`); Refill still releases — a held turnstile must always be refillable. The mark also restarts the
+(`backupsMarked: false`, which the page shows as a warning); Refill still releases — a held turnstile must always be refillable. The mark also restarts the
 30 days of that turnstile's older runs. Never: a held turnstile's runs (while the holds cannot be
 read every turnstile reads held, so nothing goes); the run in progress; a folder whose name is not a run's; a run id
 before `20260901` (`_NO_RUN_BEFORE`: no run predates the wizard, so that is a PC clock that was wrong — its age cannot

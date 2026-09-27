@@ -308,7 +308,8 @@ export default function EraseWizardDialog({
     setRefilling(true); setRefillError(null);
     try {
       const res = await api.refill(deviceId, password, holdScheme);
-      setRefillMsg(t.refilledWith(schemeName(res.pinScheme)));
+      setRefillMsg(t.refilledWith(schemeName(res.pinScheme))
+        + (res.backupsMarked === false ? ` ${t.backupsNotMarked}` : ""));
       onChanged?.();
       if (mode === "erase" && run) setRun({ ...run, holdKept: false });
       setStillHeld(false);
