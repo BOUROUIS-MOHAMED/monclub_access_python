@@ -1967,9 +1967,16 @@ the new driver writes the pin). It also answers False while the turnstile is **h
 the hold lives in this PC's `device_write_hold` only — no upload, release or restore carries it — so a new
 driver would refill the erased turnstile at once under ITS recorded scheme, before the switch the old one.
 The release therefore waits for Refill; the hold panel says so. `[TEST: ::test_a_handover_release_waits_while_an_erase_runs,
-::TestAHeldTurnstileIsNotHandedOver]` Whether and when the server forces a move whose release never comes is
-not in this repo `[UNKNOWN — asked of the architecture session, 2026-09-27]`; a forced move would reach a new
-PC that is not held. Runbook rule: press Refill (or finish) before moving a held turnstile.
+::TestAHeldTurnstileIsNotHandedOver]` The server never moves a turnstile on a timer: a pending move stays
+`RELEASING` until the outgoing PC releases it (after its final upload); it ends otherwise only by an explicit owner
+action — "force handover", a move saved again with force, or a revoke of either PC — and every forced path leaves the
+new driver add-only, which still ADDS members, so a forced move of a held turnstile refills it under the new PC's
+scheme `[COMMENT: the architecture session's reading of backend main 63d053b3, AccessLeaseService.java
+setDrivers/forceHandover/acknowledgeRelease, 2026-09-27; not read in this repo]`. Runbook rule: press Refill (or
+finish the scheme switch) BEFORE moving a held turnstile; never force-handover a turnstile held on its PC. The
+cutover night runs with no driver PCs (no leases), so this matters once drivers are assigned. Follow-up idea, not
+built: report the hold per turnstile in the heartbeat's `turnstiles[]`, so the dashboard can say "held on PC X until
+Refill" instead of a plain pending move.
 
 **Not the removal ceiling.** The wizard's erase is the operator's manual wipe (§3.2c: the cutover must be
 one); it does not go through `push_safety.check_bulk_removal`. Its rails are the password, the typed name,
