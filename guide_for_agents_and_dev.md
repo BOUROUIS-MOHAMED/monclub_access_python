@@ -3803,7 +3803,12 @@ branch 777 ms, not counted), 5 runs each: base 578–740 ms, branch 549–747 ms
 difference this noise can show. The worker loop reads `device_hold.is_held` (a set lookup and one boolean)
 in its write gates (`_v2_writes_blocked`), not in the scan decision; the start-up adds the hold load. An
 earlier run at `954763b`, before the round-1 fixes, gave the same picture (scan median base 230.5–231.0 ms,
-branch 230.6–230.9 ms; start-up base 552–805 ms, branch 577–676 ms, 3 runs each).
+branch 230.6–230.9 ms; start-up base 552–805 ms, branch 577–676 ms, 3 runs each). **Re-measured at the final
+`1f363e1`** (after review rounds 2–5: the worker's `_connected_addr`, the hold lock), same harnesses, the PC busier
+(other sessions running): scan → decision base median 231.2–233.0 ms (p95 539.9–552.1, max ≤ 607.5), branch
+231.0–231.9 ms (p95 542.1–542.5, max ≤ 806.3, one outlier), 0 lost in every run; desk door open median base
+0.75–1.17 ms (max ≤ 46.8), branch 0.83–1.17 ms (max ≤ 67.8), 150/150 in every run; `create_access_app()` after a
+warm-up each, 5 runs: base 665–1528 ms, branch 602–1297 ms — overlapping, dominated by the load, no difference shown.
 
 ### 3.10 The heartbeat's turnstile line — "N waiting" (lane 1, 2026-09-27)
 
