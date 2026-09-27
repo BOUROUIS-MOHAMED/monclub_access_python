@@ -133,6 +133,15 @@ export interface RefillResult {
   invalidated?: number;
   /** Lane 1b: the backups' 30 days now count from this Refill (false: a mark could not be written). */
   backupsMarked?: boolean;
+  /** Lane 1c (review F1): what this refill writes, under the scheme it pushes -- reported, never a
+   *  refusal (``problem``: REFILL_SOURCE_MISSING / _STALE / _EMPTY, REFILL_WITHHELD). */
+  refill?: {
+    scheme: string | null; members: number | null; withheld: number | null; problem: string | null;
+    staleWhy?: string | null; lastSyncAgeSec?: number | null; syncMaxAgeSec?: number;
+  };
+  /** MB2000 administrators the refill writes members over (confirmed with ``confirmAdminPins``). */
+  adminPins?: string[];
+  adminCheck?: "CHECKED" | "NOT_APPLICABLE" | "UNREADABLE";
 }
 
 export interface EraseApi {
@@ -141,8 +150,10 @@ export interface EraseApi {
   start(deviceId: number, body: EraseStartBody): Promise<{ ok: boolean; runId: string }>;
   status(): Promise<{ ok: boolean; running: boolean; run: EraseRun | null }>;
   /** ``expectedPinScheme``: the scheme the page SHOWED (read from holds()); the server refuses
-   *  with 409 PIN_SCHEME_CHANGED when it moved since. */
-  refill(deviceId: number, password: string, expectedPinScheme: string | null): Promise<RefillResult>;
+   *  with 409 PIN_SCHEME_CHANGED when it moved since. ``confirmAdminPins``: the administrator
+   *  pins a 409 ADMIN_PIN_IN_ROSTER named, confirmed by the operator (lane 1c). */
+  refill(deviceId: number, password: string, expectedPinScheme: string | null,
+         confirmAdminPins?: string[]): Promise<RefillResult>;
   holds(): Promise<EraseHolds>;
 }
 
@@ -154,7 +165,8 @@ export const liveEraseApi: EraseApi = {
     // The server checks the password AND the gym's switch (15 s each at worst) before it answers.
     post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 60_000),
   status: () => get<{ ok: boolean; running: boolean; run: EraseRun | null }>("/erase/status"),
-  refill: (deviceId, password, expectedPinScheme) =>
-    post<RefillResult>(`/devices/${deviceId}/erase/refill`, { password, expectedPinScheme }, 30_000),
+  refill: (deviceId, password, expectedPinScheme, confirmAdminPins) =>
+    post<RefillResult>(`/devices/${deviceId}/erase/refill`,
+      { password, expectedPinScheme, ...(confirmAdminPins ? { confirmAdminPins } : {}) }, 30_000),
   holds: () => get<EraseHolds>("/erase/holds"),
 };

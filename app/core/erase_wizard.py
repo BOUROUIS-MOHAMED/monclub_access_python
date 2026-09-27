@@ -1579,6 +1579,21 @@ class EraseWizard:
         if scheme != expected:
             return 409, {"ok": False, "code": "PIN_SCHEME_CHANGED", "pinScheme": scheme,
                          "error": f"the pin scheme is {scheme} now, the page showed {expected}"}
+        # What this refill will write, under the scheme it pushes (lane 1c, review F1): the erase
+        # was checked under the scheme of its start, and the switch's own sync, or a switch during
+        # a now/auto run, can change the roster since. Reported, never refused -- refusing leaves
+        # the turnstile empty anyway -- except a kept administrator the refill would overwrite.
+        recheck = self._refill_recheck(did, scheme, hold_run)
+        clash = recheck["adminPins"]
+        confirmed = body.get("confirmAdminPins")
+        confirmed = {str(p) for p in confirmed} if isinstance(confirmed, list) else set()
+        if clash and not set(clash) <= confirmed:
+            return 409, {"ok": False, "code": "ADMIN_PIN_IN_ROSTER", "adminPins": clash,
+                         "pinScheme": scheme,
+                         "error": f"{len(clash)} terminal administrator pin(s) are also member pins "
+                                  f"under {scheme} ({clash[:5]}): the refill would write those "
+                                  "members over them, privilege 0 -- change those administrators' "
+                                  "pins on the terminal, or confirm the overwrite"}
         from app.core import db as _db
         try:
             invalidated = int(_db.invalidate_device_records(device_id=did, fingers_erased=False))
@@ -1607,8 +1622,71 @@ class EraseWizard:
                        pin_scheme=str(scheme), requested=requested, invalidated=invalidated)
         except Exception:
             pass
+        if recheck["refill"]["problem"] or clash or recheck["adminCheck"] == "UNREADABLE":
+            _log.warning("[ERASE] Refill of turnstile %s under %s: %s member(s), %s withheld, "
+                         "problem=%s, %d administrator pin(s) overwritten (confirmed), admins %s",
+                         did, scheme, recheck["refill"]["members"], recheck["refill"]["withheld"],
+                         recheck["refill"]["problem"], len(clash), recheck["adminCheck"])
         return 200, {"ok": True, "pinScheme": scheme, "passRequested": requested,
-                     "invalidated": invalidated, "backupsMarked": marked}
+                     "invalidated": invalidated, "backupsMarked": marked,
+                     "refill": recheck["refill"], "adminPins": clash,
+                     "adminCheck": recheck["adminCheck"]}
+
+    def _refill_recheck(self, did: int, scheme: Optional[str],
+                        hold_run: Optional[str]) -> Dict[str, Any]:
+        """Refill's own check (lane 1c, review F1), under ``scheme`` -- the scheme it verified
+        and pushes. ``refill``: members and withheld rows of the refill roster, ``problem``
+        (REFILL_SOURCE_MISSING / _STALE / _EMPTY, REFILL_WITHHELD) and the list's age -- to
+        report. ``adminPins``: the MB2000 administrators the hold's run kept on the terminal
+        (from its verified backup: Refill needs no connection) whose pin is also a member pin
+        of that roster -- the push would write the member over them, privilege 0 (review C4).
+        ``adminCheck``: CHECKED, NOT_APPLICABLE (a C3 has no administrators) or UNREADABLE (no
+        backup to read them from, or no roster to compare)."""
+        refill: Dict[str, Any] = {"scheme": scheme, "members": None, "withheld": None,
+                                  "problem": None}
+        refill.update(self._sync_staleness())
+        device = self._device(did)
+        roster = None
+        try:
+            from app.core import db as _db
+            cache = _db.load_sync_cache()
+            if cache is not None and device:
+                roster = refill_roster(device, cache, scheme=scheme)
+        except Exception:
+            _log.warning("[ERASE] Refill of turnstile %s: refill roster not computed", did,
+                         exc_info=True)
+        if roster is None:
+            refill["problem"] = "REFILL_SOURCE_MISSING"
+        else:
+            refill.update(members=roster["members"], withheld=roster["withheld"])
+            refill["problem"] = ("REFILL_SOURCE_STALE" if refill["staleWhy"]
+                                 else "REFILL_SOURCE_EMPTY" if not roster["members"]
+                                 else "REFILL_WITHHELD" if roster["withheld"] else None)
+        proto = _protocol_of(device) if device else None
+        if proto == PROTO_PULLSDK:
+            return {"refill": refill, "adminPins": [], "adminCheck": "NOT_APPLICABLE"}
+        admins = self._held_run_admins(did, hold_run)
+        if admins is None or roster is None:
+            return {"refill": refill, "adminPins": [], "adminCheck": "UNREADABLE"}
+        return {"refill": refill, "adminPins": sorted(admins & set(roster["pins"]), key=_pin_key),
+                "adminCheck": "CHECKED"}
+
+    def _held_run_admins(self, did: int, run_id: Optional[str]) -> Optional[set]:
+        """The administrators (privilege > 0) an MB2000 run's verified backup lists -- the ones
+        its users erase kept. None when that backup cannot be read."""
+        if not run_id:
+            return None
+        try:
+            path = self.backup_root() / f"{run_id}_device{int(did)}" / "backup.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("protocol") != PROTO_STANDALONE:
+                return None
+            return {str(u["pin"]) for u in data.get("users") or []
+                    if int(u.get("privilege") or 0) > 0}
+        except Exception:
+            _log.warning("[ERASE] backup of run %s (turnstile %s) not read for the Refill check",
+                         run_id, did, exc_info=True)
+            return None
 
 
 BACKUP_KEEP_DAYS = 30

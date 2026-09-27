@@ -154,6 +154,11 @@ export default function EraseWizardDialog({
   const [refillMsg, setRefillMsg] = useState<string | null>(null);
   const [refillError, setRefillError] = useState<string | null>(null);
   const [refilling, setRefilling] = useState(false);
+  // What « Remplir » reported (lane 1c, review F1): warnings, never a refusal ...
+  const [refillWarnings, setRefillWarnings] = useState<string[]>([]);
+  // ... except a kept MB2000 administrator it would overwrite: named by the server, confirmed here.
+  const [adminClash, setAdminClash] = useState<string[] | null>(null);
+  const [confirmAdmins, setConfirmAdmins] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   // The hold's pin scheme is ALWAYS read from /erase/holds (never the run's start value): the
@@ -168,6 +173,7 @@ export default function EraseWizardDialog({
     setAcceptFaces(false); setBackupOnly(false); setTypedName(""); setStartError(null);
     setOtherPcsClosed(false); setAcceptNotRefilled(false); setRestartNote(null);
     setRun(null); setRefillMsg(null); setRefillError(null);
+    setRefillWarnings([]); setAdminClash(null); setConfirmAdmins(false);
     setHoldScheme(undefined); setStillHeld(true); setHoldsUnknown(false);
   }, []);
 
@@ -327,12 +333,21 @@ export default function EraseWizardDialog({
       lang]);
 
   const doRefill = useCallback(async () => {
-    if (refilling || holdScheme === undefined || holdsUnknown) return;
+    if (refilling || holdScheme === undefined || holdsUnknown || (!!adminClash && !confirmAdmins)) return;
     setRefilling(true); setRefillError(null);
     try {
-      const res = await api.refill(deviceId, password, holdScheme);
+      const res = await api.refill(deviceId, password, holdScheme,
+                                   adminClash && confirmAdmins ? adminClash : undefined);
       setRefillMsg(t.refilledWith(schemeName(res.pinScheme))
         + (res.backupsMarked === false ? ` ${t.backupsNotMarked}` : ""));
+      const warn: string[] = [];
+      const problem = res.refill?.problem;
+      if (problem && t.refillWarn[problem]) {
+        warn.push(t.refillWarn[problem](res.refill?.withheld ?? 0, schemeName(res.refill?.scheme ?? res.pinScheme)));
+      }
+      if (res.adminPins && res.adminPins.length > 0) warn.push(t.refillWarnAdmins(res.adminPins));
+      if (res.adminCheck === "UNREADABLE") warn.push(t.refillWarnAdminsUnchecked);
+      setRefillWarnings(warn); setAdminClash(null); setConfirmAdmins(false);
       onChanged?.();
       if (mode === "erase" && run) setRun({ ...run, holdKept: false });
       setStillHeld(false);
@@ -341,7 +356,14 @@ export default function EraseWizardDialog({
       if (errCode(e) === "PIN_SCHEME_CHANGED") {
         const now = (e as { payload?: { pinScheme?: string | null } | null }).payload?.pinScheme ?? null;
         setRefillError(t.schemeChanged(schemeName(now)));
+        setAdminClash(null); setConfirmAdmins(false);
         void loadHold();
+      } else if (errCode(e) === "ADMIN_PIN_IN_ROSTER") {
+        // Nothing released: the server names the administrators; the next press sends them back.
+        const p = (e as { payload?: { adminPins?: unknown; pinScheme?: string | null } | null }).payload;
+        const pins = Array.isArray(p?.adminPins) ? p.adminPins.map(String) : [];
+        setAdminClash(pins); setConfirmAdmins(false);
+        setRefillError(t.adminClash(pins, schemeName(p?.pinScheme ?? holdScheme)));
       } else if (noAnswer(e)) {
         // It may have gone through after the page stopped waiting: read the hold again (C6).
         setRefillError(t.noAnswerYet);
@@ -349,7 +371,8 @@ export default function EraseWizardDialog({
       } else setRefillError(errFor(e));
     }
     finally { setRefilling(false); }
-  }, [api, deviceId, password, refilling, holdScheme, holdsUnknown, t, onChanged, mode, run, preview, loadHold]);
+  }, [api, deviceId, password, refilling, holdScheme, holdsUnknown, adminClash, confirmAdmins, t, onChanged,
+      mode, run, preview, loadHold]);
 
   // Erase mode: a hold panel (a held turnstile at step 1, or a run that kept the hold) shows the
   // scheme read from /erase/holds NOW, and Refill sends that one.
@@ -478,16 +501,29 @@ export default function EraseWizardDialog({
           <span className="text-muted-foreground">{t.mbPasses(preview.limits.mbPinsPerPass)}</span>
         ) : null}
         <span className="text-muted-foreground">{t.handoverWaits}</span>
+        {refillError && <span className="text-destructive">{refillError}</span>}
+        {adminClash && adminClash.length > 0 && (
+          <Choice type="checkbox" name="confirm-admins" checked={confirmAdmins}
+                  onChange={() => setConfirmAdmins((v) => !v)}>
+            {t.confirmAdminOverwrite(adminClash)}
+          </Choice>
+        )}
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" onClick={() => void doRefill()}
-                  disabled={refilling || holdScheme === undefined || holdsUnknown}>
+                  disabled={refilling || holdScheme === undefined || holdsUnknown || (!!adminClash && !confirmAdmins)}>
             {refilling ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : null}{t.refillButton}
           </Button>
           <span className="text-[11px] text-muted-foreground">{t.refillNeedsInternet}</span>
         </div>
-        {refillError && <span className="text-destructive">{refillError}</span>}
       </AlertDescription>
     </Alert>
+  ) : null;
+
+  const refillDone = refillMsg ? (
+    <>
+      <Alert><CheckCircle2 className="h-4 w-4 text-emerald-600" /><AlertDescription>{refillMsg}</AlertDescription></Alert>
+      {refillWarnings.map((w) => <p key={w} className="text-[12px] font-semibold text-amber-700">{w}</p>)}
+    </>
   ) : null;
 
   const countsTable = (withAfter: boolean) => {
@@ -542,7 +578,7 @@ export default function EraseWizardDialog({
         {previewError && <Alert variant="destructive"><AlertDescription>{previewError}</AlertDescription></Alert>}
         {!loading && !refillMsg && holdPanel(stillHeld)}
         {!loading && !stillHeld && !refillMsg && <p className="text-[12.5px] text-muted-foreground">{t.notOnHold}</p>}
-        {refillMsg && <Alert><CheckCircle2 className="h-4 w-4 text-emerald-600" /><AlertDescription>{refillMsg}</AlertDescription></Alert>}
+        {refillDone}
         <DialogFooter><Button variant="outline" onClick={onClose}>{t.close}</Button></DialogFooter>
       </div>
     );
@@ -725,7 +761,7 @@ export default function EraseWizardDialog({
           </div>
         )}
         {run && run.state !== "RUNNING" && run.holdKept && holdPanel(true)}
-        {refillMsg && <Alert><CheckCircle2 className="h-4 w-4 text-emerald-600" /><AlertDescription>{refillMsg}</AlertDescription></Alert>}
+        {refillDone}
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={busy}>{t.close}</Button>
         </DialogFooter>

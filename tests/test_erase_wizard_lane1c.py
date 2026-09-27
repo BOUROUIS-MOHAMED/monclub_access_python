@@ -8,6 +8,9 @@ Guide §3.2h, §3.10. Against the same fakes as tests/test_erase_wizard.py -- no
        are bound to the backup before the first delete, and their backup is never pruned;
 * C1   the "other PCs closed" tick names what relaunches a quit Access: the watchdog task and
        the start with Windows (runbook C1 / D1);
+* F1   Refill checks again, under the scheme it will push, before it releases: withheld rows and a
+       stale or missing list are reported (never refused -- refusing leaves the turnstile empty),
+       and a kept MB2000 administrator the refill would overwrite is refused until confirmed;
 """
 from __future__ import annotations
 
@@ -213,6 +216,147 @@ class TestTheOtherPcsTickNamesTheWatchdog:
         # The script names the task the tick tells the operator to disable.
         reg = (REPO / "packaging" / "watchdog" / "register_watchdog.ps1").read_text(encoding="utf-8")
         assert "[string] $TaskName = 'MonClub Access Watchdog'" in reg
+
+
+# ─────────────────────────── F1: Refill checks again ───────────────────────────
+
+def _account(monkeypatch, did, device):
+    """The cutover's switch recorded: the device row and the scheme read both say ACCOUNT."""
+    from tests.test_erase_wizard import _devices
+    import app.core.db as dbmod
+    _devices(monkeypatch, dict(device, pinScheme="ACCOUNT"))
+    monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda d: "ACCOUNT")
+
+
+def _refill(wiz, did, scheme, **kw):
+    body = {"password": "pw", "expectedPinScheme": scheme}
+    body.update(kw)
+    return wiz.refill(did, body, verify_password=_pw_ok)
+
+
+class TestRefillChecksAgain:
+
+    def _c3_held(self, monkeypatch, tmp_path, sqlite_db):
+        wiz, worker, panel, app = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        wiz.start(5, _body(_preview(wiz, 5)["previewId"], refill="hold"), verify_password=_pw_ok)
+        assert wiz.status()["run"]["state"] == "DONE" and device_hold.is_held(5)
+        return wiz, worker
+
+    def test_it_reports_what_it_will_write(self, sqlite_db, monkeypatch, tmp_path):
+        from tests.test_erase_wizard import _device
+        wiz, _w = self._c3_held(monkeypatch, tmp_path, sqlite_db)
+        _account(monkeypatch, 5, _device())
+        status, out = _refill(wiz, 5, "ACCOUNT")
+        assert status == 200 and not device_hold.is_held(5)
+        refill = out["refill"]
+        assert refill["scheme"] == "ACCOUNT" and refill["members"] == 4
+        assert refill["withheld"] == 0 and refill["problem"] is None
+        assert out["adminCheck"] == "NOT_APPLICABLE" and out["adminPins"] == []
+
+    def test_withheld_rows_after_the_switch_are_reported_not_refused(self, sqlite_db, monkeypatch,
+                                                                    tmp_path, refill_cache):
+        """F1's scenario: the erase passed its ACCOUNT check; the switch's own sync then brought
+        rows with no mainAccountId. Refill releases anyway (refusing leaves the turnstile empty)
+        and says how many are withheld -- the heartbeat's count cannot name them."""
+        from tests.test_erase_wizard import _device
+        wiz, worker = self._c3_held(monkeypatch, tmp_path, sqlite_db)
+        _account(monkeypatch, 5, _device())
+        refill_cache.users.append({"userId": 15, "activeMembershipId": 103, "fullName": "No acct"})
+        status, out = _refill(wiz, 5, "ACCOUNT")
+        assert status == 200 and not device_hold.is_held(5)
+        assert out["refill"]["withheld"] == 1 and out["refill"]["problem"] == "REFILL_WITHHELD"
+        assert worker.full_sync_requests == ["erase-refill"]
+
+    @pytest.mark.parametrize("case, problem", [
+        ("stale", "REFILL_SOURCE_STALE"), ("missing", "REFILL_SOURCE_MISSING"),
+        ("empty", "REFILL_SOURCE_EMPTY")])
+    def test_a_list_it_cannot_trust_is_reported_not_refused(self, sqlite_db, monkeypatch, tmp_path,
+                                                            refill_cache, case, problem):
+        import app.core.db as dbmod
+        wiz, _w = self._c3_held(monkeypatch, tmp_path, sqlite_db)
+        if case == "stale":
+            wiz.app._last_sync_ok_mono = time.monotonic() - 7200
+        elif case == "missing":
+            monkeypatch.setattr(dbmod, "load_sync_cache", lambda: None)
+        else:
+            refill_cache.users = []
+        status, out = _refill(wiz, 5, None)          # no scheme row in these fakes: None
+        assert status == 200 and not device_hold.is_held(5)
+        assert out["refill"]["problem"] == problem
+
+    def _mb_held(self, monkeypatch, tmp_path, sqlite_db):
+        term = _terminal()
+        wiz, worker, drv = _mb_setup(monkeypatch, tmp_path, term)
+        try:
+            wiz.start(8, _mb_body(_preview(wiz, 8)["previewId"]), verify_password=_pw_ok)
+        finally:
+            drv.disconnect()
+        assert wiz.status()["run"]["state"] == "DONE" and device_hold.is_held(8)
+        return wiz, worker
+
+    def test_an_admin_the_refill_would_overwrite_is_refused_until_confirmed(self, sqlite_db,
+                                                                         monkeypatch, tmp_path,
+                                                                         refill_cache):
+        """C4 at Refill: the terminal kept administrator 1; after the switch a member's account
+        number is 1, so the refill would write that member over the admin, privilege 0."""
+        import app.core.db as dbmod
+        from tests.test_erase_wizard import _device
+        wiz, worker = self._mb_held(monkeypatch, tmp_path, sqlite_db)
+        _account(monkeypatch, 8, _device(did=8, name="Sortie", ip="192.168.1.247",
+                                         proto="ZK_STANDALONE"))
+        refill_cache.users.append({"userId": 16, "activeMembershipId": 30003, "mainAccountId": 1,
+                                   "fullName": "Member one"})
+        reset = []
+        real = dbmod.invalidate_device_records
+        monkeypatch.setattr(dbmod, "invalidate_device_records",
+                            lambda **kw: reset.append(kw) or real(**kw))
+        for confirm in (None, [], ["2"]):
+            kw = {} if confirm is None else {"confirmAdminPins": confirm}
+            status, out = _refill(wiz, 8, "ACCOUNT", **kw)
+            assert status == 409 and out["code"] == "ADMIN_PIN_IN_ROSTER", (confirm, out)
+            assert out["adminPins"] == ["1"] and out["pinScheme"] == "ACCOUNT"
+        assert device_hold.is_held(8) and reset == [] and worker.full_sync_requests == []
+        status, out = _refill(wiz, 8, "ACCOUNT", confirmAdminPins=["1"])
+        assert status == 200 and not device_hold.is_held(8)
+        assert out["adminPins"] == ["1"] and out["adminCheck"] == "CHECKED"
+
+    def test_no_clash_no_question(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w = self._mb_held(monkeypatch, tmp_path, sqlite_db)
+        status, out = _refill(wiz, 8, None)          # no scheme row in these fakes: None
+        assert status == 200 and out["adminPins"] == [] and out["adminCheck"] == "CHECKED"
+
+    def test_an_unreadable_backup_is_a_warning(self, sqlite_db, monkeypatch, tmp_path):
+        """A held turnstile's backup is never pruned; if it still cannot be read, the admins
+        cannot be checked -- said, not refused (the turnstile would stay empty)."""
+        import shutil
+        wiz, _w = self._mb_held(monkeypatch, tmp_path, sqlite_db)
+        shutil.rmtree(_run_dir(wiz))
+        status, out = _refill(wiz, 8, None)          # no scheme row in these fakes: None
+        assert status == 200 and not device_hold.is_held(8)
+        assert out["adminCheck"] == "UNREADABLE" and out["adminPins"] == []
+
+    def test_a_scheme_switched_mid_run_is_checked_under_the_new_scheme(self, sqlite_db,
+                                                                       monkeypatch, tmp_path,
+                                                                       refill_cache):
+        """F1's now/auto case: the switch lands during the run, the run keeps the hold
+        (PIN_SCHEME_CHANGED) -- it was only ever checked under MEMBERSHIP. Refill checks the
+        new scheme."""
+        from tests.test_erase_wizard import _device
+        import app.core.db as dbmod
+        wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+
+        def _switch(table):                          # once per erased table: idempotent
+            _account(monkeypatch, 5, _device())
+            if not any(u["userId"] == 15 for u in refill_cache.users):
+                refill_cache.users.append({"userId": 15, "activeMembershipId": 103})
+        panel.on_erase = _switch
+        wiz.start(5, _body(pv["previewId"], refill="now"), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["holdKept"] is True
+        assert dbmod.get_device_pin_scheme(5) == "ACCOUNT"
+        status, out = _refill(wiz, 5, "ACCOUNT")
+        assert status == 200 and out["refill"]["withheld"] == 1
 
 
 # ─────────────────────────── C0: the people the refill will not put back ───────────────────────────

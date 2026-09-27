@@ -248,6 +248,25 @@ const fr = {
   refilledWith: (s: string) => `Remplissage lancé, schéma ${s}.`,
   backupsNotMarked:
     "Attention : la date du remplissage n'a pas pu être notée dans les sauvegardes ; elles seront supprimées 30 jours après l'effacement.",
+  // What « Remplir » reports (lane 1c, review F1): warnings, never a refusal.
+  refillWarn: {
+    REFILL_WITHHELD: (n: number, s: string) =>
+      `Attention : ${n} membre(s) n'ont pas de numéro de compte dans la liste de ce PC : en ${s}, ils ne sont pas écrits sur le tourniquet.`,
+    REFILL_SOURCE_STALE: () =>
+      "Attention : la liste des membres de ce PC n'est pas récente : le remplissage écrit la liste qu'il a ; la prochaine synchronisation réussie apportera les changements.",
+    REFILL_SOURCE_MISSING: () =>
+      "Attention : ce PC n'a pas de liste des membres : le tourniquet reste vide jusqu'à ce qu'une synchronisation en apporte une.",
+    REFILL_SOURCE_EMPTY: () =>
+      "Attention : la liste des membres de ce PC ne contient aucun membre pour ce tourniquet : rien n'y est écrit.",
+  } as Record<string, (n: number, s: string) => string>,
+  adminClash: (pins: string[], s: string) =>
+    `${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en ${s} (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. Changez leur numéro sur le terminal, ou confirmez ci-dessous.`,
+  confirmAdminOverwrite: (pins: string[]) =>
+    `Je confirme : les administrateurs ${pins.join(", ")} seront remplacés par les membres du même numéro.`,
+  refillWarnAdmins: (pins: string[]) =>
+    `Administrateurs remplacés par des membres (confirmé) : ${pins.join(", ")}.`,
+  refillWarnAdminsUnchecked:
+    "Les administrateurs du terminal n'ont pas pu être vérifiés (sauvegarde illisible) : un administrateur qui a le numéro d'un membre sera remplacé par ce membre.",
   notOnHold: "Ce tourniquet n'est plus en attente.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -510,6 +529,24 @@ const en: typeof fr = {
   refilledWith: (s: string) => `Refill started, scheme ${s}.`,
   backupsNotMarked:
     "Warning: the refill date could not be noted in the backups; they will be deleted 30 days after the erase.",
+  refillWarn: {
+    REFILL_WITHHELD: (n: number, s: string) =>
+      `Warning: ${n} member(s) have no account number in this PC's list: under ${s} they are not written to the turnstile.`,
+    REFILL_SOURCE_STALE: () =>
+      "Warning: this PC's member list is not recent: the refill writes the list it has; the next successful sync brings the changes.",
+    REFILL_SOURCE_MISSING: () =>
+      "Warning: this PC has no member list: the turnstile stays empty until a sync brings one.",
+    REFILL_SOURCE_EMPTY: () =>
+      "Warning: this PC's member list holds no member for this turnstile: nothing is written to it.",
+  },
+  adminClash: (pins: string[], s: string) =>
+    `${pins.length} terminal administrator(s) have the same number as a member under ${s} (${pins.join(", ")}): the refill would write those members over them, without administrator rights. Change their number on the terminal, or confirm below.`,
+  confirmAdminOverwrite: (pins: string[]) =>
+    `I confirm: administrators ${pins.join(", ")} will be replaced by the members with the same number.`,
+  refillWarnAdmins: (pins: string[]) =>
+    `Administrators replaced by members (confirmed): ${pins.join(", ")}.`,
+  refillWarnAdminsUnchecked:
+    "The terminal's administrators could not be checked (backup unreadable): an administrator who has a member's number will be replaced by that member.",
   notOnHold: "This turnstile is no longer on hold.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
