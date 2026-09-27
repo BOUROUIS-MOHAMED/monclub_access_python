@@ -39,6 +39,20 @@ const fr = {
   heldAlready:
     "Ce tourniquet est déjà en attente depuis un effacement : seul le bouton « Remplir » le libère. Choisissez « Attendre que j'appuie sur « Remplir » ».",
   refillWillWrite: (n: number, s: string) => `Le remplissage écrira ${n} membre(s) sur ce tourniquet (schéma ${s}).`,
+  // The list's time, in the refill line (lane 1c): the last SUCCESSFUL sync, and the limit.
+  listAge: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+    (ageSec === null || ageSec === undefined
+      ? "Liste des membres : aucune synchronisation réussie depuis le démarrage d'Access."
+      : `Liste des membres reçue de MonClub ${ageSec < 60 ? "il y a moins d'une minute" : `il y a ${Math.floor(ageSec / 60)} min`}`
+        + (maxSec ? ` (elle doit dater de moins de ${Math.round(maxSec / 60)} min).` : ".")),
+  stale: {
+    TOO_OLD: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+      `La liste des membres n'est pas récente : la dernière synchronisation réussie date de ${Math.floor((ageSec ?? 0) / 60)} min (limite ${Math.round((maxSec ?? 600) / 60)} min). Attendez la prochaine synchronisation, puis relisez : rien n'est effacé.`,
+    LAST_SYNC_FAILED: () =>
+      "La dernière synchronisation avec MonClub n'a pas réussi : la liste des membres peut être incomplète. Attendez la prochaine synchronisation réussie, puis relisez : rien n'est effacé.",
+    NO_SYNC_YET: () =>
+      "Aucune synchronisation avec MonClub n'a encore réussi depuis le démarrage d'Access : la liste des membres peut être incomplète. Attendez la prochaine synchronisation, puis relisez : rien n'est effacé.",
+  } as Record<string, (ageSec: number | null | undefined, maxSec: number | null | undefined) => string>,
   refillIfAccount: (n: number, w: number) =>
     w > 0
       ? `En « Par personne » : ${n} membre(s), et ${w} sans numéro de compte, qui ne seraient pas écrits.`
@@ -180,7 +194,7 @@ const fr = {
     REFILL_SOURCE_MISSING:
       "Ce PC n'a pas de liste des membres pour remplir le tourniquet : rien n'est effacé. Synchronisez, puis relisez.",
     REFILL_SOURCE_STALE:
-      "La dernière synchronisation avec MonClub n'a pas réussi (ou aucune depuis le démarrage d'Access) : la liste des membres peut être incomplète. Synchronisez, puis relisez.",
+      "La liste des membres de ce PC n'est pas récente (dernière synchronisation en échec, trop ancienne, ou aucune depuis le démarrage d'Access) : attendez la prochaine synchronisation, puis relisez. Rien n'est effacé.",
     REFILL_SOURCE_EMPTY: "Le remplissage n'écrirait aucun membre sur ce tourniquet : rien n'est effacé.",
     REFILL_WITHHELD:
       "Des membres n'ont pas de numéro de compte dans la liste de ce PC : en « Par personne », le remplissage ne les écrirait pas. La liste des membres doit d'abord être relue en entier.",
@@ -268,6 +282,19 @@ const en: typeof fr = {
   heldAlready:
     "This turnstile is already on hold after an erase: only the Refill button releases it. Choose 'Hold until I press Refill'.",
   refillWillWrite: (n: number, s: string) => `The refill will write ${n} member(s) to this turnstile (scheme ${s}).`,
+  listAge: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+    (ageSec === null || ageSec === undefined
+      ? "Member list: no successful sync since Access started."
+      : `Member list received from MonClub ${ageSec < 60 ? "less than a minute ago" : `${Math.floor(ageSec / 60)} min ago`}`
+        + (maxSec ? ` (it must be less than ${Math.round(maxSec / 60)} min old).` : ".")),
+  stale: {
+    TOO_OLD: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+      `The member list is not recent: the last successful sync was ${Math.floor((ageSec ?? 0) / 60)} min ago (limit ${Math.round((maxSec ?? 600) / 60)} min). Wait for the next sync, then read again: nothing is erased.`,
+    LAST_SYNC_FAILED: () =>
+      "The last sync with MonClub did not succeed: the member list may be incomplete. Wait for the next successful sync, then read again: nothing is erased.",
+    NO_SYNC_YET: () =>
+      "No sync with MonClub has succeeded since Access started: the member list may be incomplete. Wait for the next sync, then read again: nothing is erased.",
+  },
   refillIfAccount: (n: number, w: number) =>
     w > 0
       ? `Under 'Par personne': ${n} member(s), and ${w} without an account number, who would not be written.`
@@ -408,7 +435,7 @@ const en: typeof fr = {
     REFILL_SOURCE_MISSING:
       "This PC has no member list to refill the turnstile from: nothing is erased. Synchronize, then read again.",
     REFILL_SOURCE_STALE:
-      "The last sync with MonClub did not succeed (or none ran since Access started): the member list may be incomplete. Synchronize, then read again.",
+      "This PC's member list is not recent (the last sync failed, is too old, or none succeeded since Access started): wait for the next sync, then read again. Nothing is erased.",
     REFILL_SOURCE_EMPTY: "The refill would write no member to this turnstile: nothing is erased.",
     REFILL_WITHHELD:
       "Some members have no account number in this PC's list: under 'Par personne' the refill would not write them. The member list must be read again in full first.",

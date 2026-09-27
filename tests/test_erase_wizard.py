@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -117,9 +118,11 @@ class FakeSched:
 
 
 def _app(workers):
+    # A getSyncData that succeeded just now (lane 1c: the member list's age limit reads the
+    # monotonic stamp app.py records with the success).
     return SimpleNamespace(_ultra_engine=SimpleNamespace(running=True, _workers=workers,
                                                          _sync_scheduler=FakeSched()),
-                           _last_sync_ok=True)
+                           _last_sync_ok=True, _last_sync_ok_mono=time.monotonic())
 
 
 # What the refill would write (lane 1b, review C1): the sync cache's members. Membership pins

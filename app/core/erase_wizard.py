@@ -141,6 +141,11 @@ def _device_identity(device: Dict[str, Any], proto: Optional[str]) -> Dict[str, 
 
 PIN_SCHEME_ACCOUNT = "ACCOUNT"
 
+# The member list's age limit (owner decision 2026-09-27, lane 1c): stale when the last SUCCESSFUL
+# getSyncData is older than max(3 x the effective sync interval, 10 min).
+SYNC_MAX_AGE_INTERVALS = 3
+SYNC_MAX_AGE_FLOOR_SEC = 600
+
 
 def refill_roster(device: Dict[str, Any], cache: Any, *,
                   scheme: Optional[str] = None) -> Dict[str, Any]:
@@ -482,6 +487,40 @@ class EraseWizard:
         from app.core import db as _db
         return _db.get_device_pin_scheme(did)
 
+    def _sync_max_age_sec(self) -> int:
+        """max(3 x the effective sync interval, 10 min) (owner decision 2026-09-27). The interval
+        is the app's own (``MainApp._sync_base_interval_sec``: the server's
+        ``agentSyncBackendRefreshMin`` if any, else ``cfg.sync_interval_sec``) -- the one the
+        sync timer uses. Unreadable: the 10-min floor, the strictest limit."""
+        try:
+            interval = int(self.app._sync_base_interval_sec())
+        except Exception:
+            interval = 0
+        return max(SYNC_MAX_AGE_INTERVALS * max(0, interval), SYNC_MAX_AGE_FLOOR_SEC)
+
+    def _sync_staleness(self) -> Dict[str, Any]:
+        """Is this PC's member list recent enough to refill from? (lane 1c) ``staleWhy``:
+        ``NO_SYNC_YET`` (no successful getSyncData recorded since Access started),
+        ``LAST_SYNC_FAILED`` (the last one failed), ``TOO_OLD`` (the last success is older than
+        ``_sync_max_age_sec`` -- a sync that hangs records no failure), else None. The age is
+        read on the monotonic clock ``app.py`` stamps it with (``_last_sync_ok_mono``) -- never
+        this wizard's injectable ``_mono``, never the PC's wall clock."""
+        limit = self._sync_max_age_sec()
+        stamp = getattr(self.app, "_last_sync_ok_mono", None)
+        age: Optional[int] = None
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            age = max(0, int(time.monotonic() - float(stamp)))
+        if getattr(self.app, "_last_sync_ok", None) is not True:
+            ran = getattr(self.app, "_last_sync_at", None) is not None or age is not None
+            why: Optional[str] = "LAST_SYNC_FAILED" if ran else "NO_SYNC_YET"
+        elif age is None:
+            why = "NO_SYNC_YET"
+        elif age > limit:
+            why = "TOO_OLD"
+        else:
+            why = None
+        return {"staleWhy": why, "lastSyncAgeSec": age, "syncMaxAgeSec": limit}
+
     def _refill_check(self, did: int, device: Optional[Dict[str, Any]] = None
                       ) -> Dict[str, Any]:
         """Can the refill really refill this turnstile? (lane 1b, review C1)
@@ -493,12 +532,15 @@ class EraseWizard:
         ``problem`` for the refill under the scheme recorded now, ``accountProblem`` for one
         under "Par personne" (ACCOUNT) after a switch -- the cutover's "hold, switch, Refill".
         ``lastSyncOk``: the app's last getSyncData succeeded (False until the first sync of this
-        process) -- a cache a failed or missing sync left behind may miss members."""
+        process) -- a cache a failed or missing sync left behind may miss members. ``staleWhy``
+        (``_sync_staleness``): why the list is stale -- that flag, or the age of the last success
+        past the owner's limit (lane 1c)."""
         out: Dict[str, Any] = {
             "scheme": None, "members": None, "withheld": None,
             "lastSyncOk": getattr(self.app, "_last_sync_ok", None) is True,
             "cacheUpdatedAt": None, "problem": None, "accountProblem": None,
         }
+        out.update(self._sync_staleness())
         device = device if device is not None else self._device(did)
         try:
             from app.core import db as _db
@@ -524,7 +566,7 @@ class EraseWizard:
         out["_pins"] = {"now": now["pins"], "account": acct["pins"]}
 
         def _problem(roster: Dict[str, Any]) -> Optional[str]:
-            if not out["lastSyncOk"]:
+            if out["staleWhy"]:
                 return "REFILL_SOURCE_STALE"
             if not roster["members"]:
                 return "REFILL_SOURCE_EMPTY"
@@ -554,17 +596,26 @@ class EraseWizard:
             (check.get("ifAccount") or {}).get("members"))
         withheld = check.get("withheld") if under == check.get("scheme") else (
             (check.get("ifAccount") or {}).get("withheld"))
+        stale = {
+            "TOO_OLD": f"the member list is not recent: the last successful sync with MonClub was "
+                       f"{check.get('lastSyncAgeSec')} s ago, the limit is "
+                       f"{check.get('syncMaxAgeSec')} s -- wait for the next sync",
+            "LAST_SYNC_FAILED": "the last sync with MonClub did not succeed: the member list may "
+                                "be out of date",
+        }.get(str(check.get("staleWhy")), "no sync with MonClub has succeeded since Access "
+                                         "started: the member list may be out of date")
         why = {
             "REFILL_SOURCE_MISSING": "this PC has no member list (sync cache) to refill the "
                                      "turnstile from",
-            "REFILL_SOURCE_STALE": "the last sync with MonClub did not succeed (or none ran since "
-                                   "Access started): the member list may be out of date",
+            "REFILL_SOURCE_STALE": stale,
             "REFILL_SOURCE_EMPTY": f"the refill would write no member under {under}",
             "REFILL_WITHHELD": f"{withheld} member row(s) have no account number (mainAccountId): "
                                f"under {under} the refill would not write them",
         }.get(str(code), str(code))
         return 409, {"ok": False, "code": code, "pinScheme": under, "members": members,
-                     "withheld": withheld,
+                     "withheld": withheld, "staleWhy": check.get("staleWhy"),
+                     "lastSyncAgeSec": check.get("lastSyncAgeSec"),
+                     "syncMaxAgeSec": check.get("syncMaxAgeSec"),
                      "error": f"nothing erased: {why} -- the refill could not put everyone back"}
 
     @staticmethod

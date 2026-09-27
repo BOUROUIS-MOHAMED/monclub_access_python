@@ -81,6 +81,13 @@ export interface EraseRefillCheck {
   cacheUpdatedAt: string | null;
   problem: string | null;
   accountProblem: string | null;
+  /** Lane 1c: why the member list is stale (REFILL_SOURCE_STALE) -- the last sync failed, none
+   *  succeeded since Access started, or the last success is older than ``syncMaxAgeSec``. */
+  staleWhy?: "NO_SYNC_YET" | "LAST_SYNC_FAILED" | "TOO_OLD" | null;
+  /** Seconds since the last successful sync (monotonic clock); null when none. */
+  lastSyncAgeSec?: number | null;
+  /** max(3 x the sync interval, 10 min), in seconds. */
+  syncMaxAgeSec?: number;
 }
 
 export interface EraseStartBody {

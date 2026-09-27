@@ -105,9 +105,22 @@ export default function EraseWizardDialog({
   const t = ERASE_TEXT[lang];
   const setLang = (l: Lang) => { setLangState(l); saveLang(l); };
   const schemeName = (sch: string | null | undefined) => (sch ? (t.schemes[sch] ?? sch) : t.unknown);
+  // A stale member list says why (lane 1c: the age limit, a failed sync, no sync yet).
+  type StaleSrc = { staleWhy?: unknown; lastSyncAgeSec?: unknown; syncMaxAgeSec?: unknown } | null | undefined;
+  const problemText = (code: string, src: StaleSrc) => {
+    const why = typeof src?.staleWhy === "string" ? src.staleWhy : null;
+    const num = (v: unknown) => (typeof v === "number" ? v : null);
+    if (code === "REFILL_SOURCE_STALE" && why && t.stale[why]) {
+      return t.stale[why](num(src?.lastSyncAgeSec), num(src?.syncMaxAgeSec));
+    }
+    return t.codes[code] ?? code;
+  };
   // A refusal the operator can act on is shown in the page's language; anything else as sent.
   const errFor = (e: unknown) => {
     const c = errCode(e);
+    if (c === "REFILL_SOURCE_STALE") {
+      return problemText(c, (e as { payload?: StaleSrc }).payload);
+    }
     const said = c ? t.codes[c] : undefined;
     if (!said) return errText(e);
     // A check that failed on the server's side keeps the server's own words as a detail.
@@ -354,6 +367,9 @@ export default function EraseWizardDialog({
       {refillCheck.members !== null && (
         <span className="font-semibold">{t.refillWillWrite(refillCheck.members, schemeName(refillCheck.scheme))}</span>
       )}
+      <span className={cn(refillCheck.staleWhy ? "text-destructive" : "text-muted-foreground")}>
+        {t.listAge(refillCheck.lastSyncAgeSec, refillCheck.syncMaxAgeSec)}
+      </span>
       {refillCheck.ifAccount && (
         <span className={cn(refillCheck.ifAccount.withheld > 0 && "text-amber-700")}>
           {t.refillIfAccount(refillCheck.ifAccount.members, refillCheck.ifAccount.withheld)}
@@ -362,7 +378,7 @@ export default function EraseWizardDialog({
       {refillCheck.cacheUpdatedAt && (
         <span className="text-muted-foreground">{t.refillCacheAt(refillCheck.cacheUpdatedAt)}</span>
       )}
-      {refillProblem && <span className="text-destructive">{t.codes[refillProblem] ?? refillProblem}</span>}
+      {refillProblem && <span className="text-destructive">{problemText(refillProblem, refillCheck)}</span>}
       {refillProblem && !refillCheck.problem && refill === "hold" && !heldBefore && (
         <span className="text-muted-foreground">{t.withheldOnlyIfAccount}</span>
       )}
