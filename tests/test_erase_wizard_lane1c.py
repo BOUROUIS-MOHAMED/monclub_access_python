@@ -11,6 +11,9 @@ Guide §3.2h, §3.10. Against the same fakes as tests/test_erase_wizard.py -- no
 * F1   Refill checks again, under the scheme it will push, before it releases: withheld rows and a
        stale or missing list are reported (never refused -- refusing leaves the turnstile empty),
        and a kept MB2000 administrator the refill would overwrite is refused until confirmed;
+* F2   the 30-day prune does not trust the PC clock blindly: a server offset over a day skips it,
+       a run dated more than a day in the future is kept, and runs are dated on the
+       server-corrected clock where the PC has a measurement;
 """
 from __future__ import annotations
 
@@ -357,6 +360,128 @@ class TestRefillChecksAgain:
         assert dbmod.get_device_pin_scheme(5) == "ACCOUNT"
         status, out = _refill(wiz, 5, "ACCOUNT")
         assert status == 200 and out["refill"]["withheld"] == 1
+
+
+# ─────────────────────────── F2: the prune and the clock ───────────────────────────
+
+class _Clock:
+    """A server clock the PC measured: ``offset`` (server - PC), ``now`` the corrected time."""
+
+    def __init__(self, offset, now=None):
+        self._offset, self._now = float(offset), now
+
+    def has_sample(self):
+        return True
+
+    def offset(self):
+        return self._offset
+
+    def now(self):
+        return (time.time() + self._offset) if self._now is None else float(self._now)
+
+
+def _folder(root, run_id, did=5, *, recorded=None, mtime=None, state="DONE"):
+    """A run folder. ``recorded``: the lane-1c epochs in run.json (startedAtEpoch,
+    writtenAtEpoch); ``mtime``: every file's modification time."""
+    import os
+    folder = root / f"{run_id}_device{did}"
+    folder.mkdir(parents=True)
+    (folder / "backup.json").write_text("{}", encoding="utf-8")
+    rec = {"state": state}
+    if recorded is not None:
+        rec.update(startedAtEpoch=recorded, writtenAtEpoch=recorded, clockCorrected=True)
+    (folder / "run.json").write_text(json.dumps(rec), encoding="utf-8")
+    if mtime is not None:
+        for f in folder.iterdir():
+            os.utime(f, (mtime, mtime))
+    return folder
+
+
+class TestThePruneAndTheClock:
+
+    @pytest.fixture(autouse=True)
+    def _no_clock(self, monkeypatch):
+        from app.core.v2 import server_clock
+        monkeypatch.setattr(server_clock, "_default", None)
+        monkeypatch.setattr(ew, "_NO_RUN_BEFORE", "20000101")
+
+    @staticmethod
+    def _run_id(days_ago):
+        return time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - days_ago * 86400)) + "-abcdef"
+
+    def test_a_pc_clock_a_year_ahead_the_server_knows_about_deletes_nothing(self, sqlite_db,
+                                                                         monkeypatch, tmp_path,
+                                                                         caplog):
+        """Scenario (a): the PC clock set a year forward. With a server measurement the offset
+        says so, and nothing is pruned -- not even a folder that looks 400 days old."""
+        from app.core.v2 import server_clock
+        root = tmp_path / "b"
+        folder = _folder(root, self._run_id(45), mtime=time.time() - 45 * 86400)
+        monkeypatch.setattr(server_clock, "_default", _Clock(offset=-365 * 86400))
+        with caplog.at_level(logging.WARNING):
+            assert ew.prune_erase_backups(root) == []
+        assert folder.exists() and "off the server" in caplog.text
+
+    @pytest.mark.parametrize("offset_h, pruned", [(23, True), (25, False)])
+    def test_the_limit_is_one_day(self, sqlite_db, monkeypatch, tmp_path, offset_h, pruned):
+        from app.core.v2 import server_clock
+        root = tmp_path / "b"
+        folder = _folder(root, self._run_id(45), mtime=time.time() - 45 * 86400)
+        monkeypatch.setattr(server_clock, "_default", _Clock(offset=-offset_h * 3600))
+        assert (ew.prune_erase_backups(root) != []) is pruned
+        assert folder.exists() is not pruned
+
+    def test_now_is_the_server_corrected_time(self, sqlite_db, monkeypatch, tmp_path):
+        """The PC clock 20 h behind (under the limit): a folder the PC dates 29.5 days old is
+        30.3 days old on the server's clock -- it goes."""
+        from app.core.v2 import server_clock
+        root = tmp_path / "b"
+        folder = _folder(root, self._run_id(29.5), mtime=time.time() - 29.5 * 86400)
+        monkeypatch.setattr(server_clock, "_default", _Clock(offset=20 * 3600))
+        assert ew.prune_erase_backups(root) == [folder.name.split("_device")[0]]
+
+    def test_a_run_dated_more_than_a_day_ahead_is_kept(self, sqlite_db, tmp_path, caplog):
+        """A folder dated in the future was written by a clock ahead of this one: its age cannot
+        be told -- kept, and the others are pruned as usual."""
+        root = tmp_path / "b"
+        ahead = _folder(root, self._run_id(45), recorded=time.time() + 3 * 86400)
+        old = _folder(root, self._run_id(46), recorded=time.time() - 46 * 86400)
+        with caplog.at_level(logging.WARNING):
+            deleted = ew.prune_erase_backups(root)
+        assert ahead.exists() and not old.exists() and len(deleted) == 1
+        assert "in the future" in caplog.text
+
+    def test_the_recorded_times_win_over_the_file_times(self, sqlite_db, tmp_path):
+        """Scenario (b): the PC clock was behind when the files were written (their mtimes look
+        45 days old), but the run was dated on the corrected clock 5 days ago: kept."""
+        root = tmp_path / "b"
+        folder = _folder(root, self._run_id(45), recorded=time.time() - 5 * 86400,
+                         mtime=time.time() - 45 * 86400)
+        assert ew.prune_erase_backups(root) == [] and folder.exists()
+
+    def test_a_run_and_a_refill_record_the_corrected_time(self, sqlite_db, monkeypatch, tmp_path):
+        from app.core.v2 import server_clock
+        monkeypatch.setattr(server_clock, "_default", _Clock(offset=0, now=1_900_000_000.0))
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        wiz.start(5, _body(_preview(wiz, 5)["previewId"], refill="hold"), verify_password=_pw_ok)
+        rec = json.loads((_run_dir(wiz) / "run.json").read_text(encoding="utf-8"))
+        assert rec["startedAtEpoch"] == 1_900_000_000.0 and rec["clockCorrected"] is True
+        assert rec["writtenAtEpoch"] == 1_900_000_000.0
+        status, _ = wiz.refill(5, {"password": "pw", "expectedPinScheme": None},
+                               verify_password=_pw_ok)
+        assert status == 200
+        mark = json.loads((_run_dir(wiz) / ew.REFILLED_MARK).read_text(encoding="utf-8"))
+        assert mark["at"] == 1_900_000_000.0 and mark["corrected"] is True
+
+    def test_a_lane_1b_mark_still_counts_by_its_file_time(self, sqlite_db, tmp_path):
+        """Folders written before lane 1c keep the old rule: the run id and every file's time."""
+        import os
+        root = tmp_path / "b"
+        folder = _folder(root, self._run_id(45), mtime=time.time() - 45 * 86400)
+        (folder / ew.REFILLED_MARK).write_text("2026-09-27 21:00:00", encoding="utf-8")
+        recent = time.time() - 2 * 86400
+        os.utime(folder / ew.REFILLED_MARK, (recent, recent))
+        assert ew.prune_erase_backups(root) == [] and folder.exists()
 
 
 # ─────────────────────────── C0: the people the refill will not put back ───────────────────────────

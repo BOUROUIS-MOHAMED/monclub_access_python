@@ -112,6 +112,19 @@ def _now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _corrected_epoch() -> Tuple[float, bool]:
+    """(epoch, corrected): the server-corrected time when this process has a measurement of the
+    server's clock (``server_clock.corrected_now``, the removal log's time), else the PC's. The
+    run folders are dated with it, so the 30-day prune does not rest on the PC clock alone where
+    a measurement exists (lane 1c, review F2)."""
+    try:
+        from app.core.v2.server_clock import corrected_now
+        at, corrected = corrected_now()
+        return float(at), bool(corrected)
+    except Exception:
+        return time.time(), False
+
+
 def _chunks(items: List[Any], n: int) -> List[List[Any]]:
     return [items[i:i + n] for i in range(0, len(items), max(1, n))]
 
@@ -884,7 +897,11 @@ class EraseWizard:
                           "dashboard (access PCs page)") if code == "ERASE_NOT_ENABLED" else
                          f"whether the erase is enabled for this gym could not be checked: {why}"}
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        started_at, corrected = _corrected_epoch()
         run = {
+            # The run's date for the 30-day prune (lane 1c, review F2): server-corrected when
+            # the PC has a measurement (clockCorrected), else the PC clock, as the run id.
+            "startedAtEpoch": started_at, "clockCorrected": corrected,
             "runId": run_id, "deviceId": did, "device": ident, "protocol": proto,
             "tables": tables, "forget": None if backup_only else forget,
             "refill": None if backup_only else refill, "backupOnly": backup_only,
@@ -956,7 +973,11 @@ class EraseWizard:
         try:
             d = self._run_dir(run)
             d.mkdir(parents=True, exist_ok=True)
-            _write_file_durably(d / "run.json", json.dumps(run, ensure_ascii=False, indent=1)
+            # The last write's time, on the corrected clock where there is one: what the prune
+            # dates the folder by (lane 1c, review F2), not the files' mtimes.
+            at, _corrected = _corrected_epoch()
+            record = dict(run, writtenAtEpoch=at)
+            _write_file_durably(d / "run.json", json.dumps(record, ensure_ascii=False, indent=1)
                                 .encode("utf-8"))
         except Exception:
             _log.warning("[ERASE] run record not written", exc_info=True)
@@ -1708,7 +1729,10 @@ def _mark_refilled(root: Path, device_id: int) -> bool:
     try:
         if not root.is_dir():
             return True
-        stamp = _now_text().encode("ascii")
+        # When Refill released it, on the corrected clock where there is one (lane 1c, review
+        # F2): the prune reads this, not the file's mtime.
+        at, corrected = _corrected_epoch()
+        stamp = json.dumps({"at": at, "corrected": corrected, "text": _now_text()}).encode("ascii")
         for folder in root.iterdir():
             m = _RUN_DIR_NAME.match(folder.name)
             if m and int(m.group(2)) == int(device_id) and folder.is_dir():
@@ -1723,6 +1747,64 @@ def _mark_refilled(root: Path, device_id: int) -> bool:
         _log.error("[ERASE] refill marks not written for turnstile %s", device_id, exc_info=True)
         return False
     return ok
+
+
+# The prune's clock guards (lane 1c, review F2), both at the owner's "more than one day".
+PRUNE_MAX_CLOCK_OFFSET_SEC = 86400.0
+PRUNE_FUTURE_TOLERANCE_SEC = 86400.0
+
+
+def _prune_now() -> Tuple[Optional[float], str]:
+    """(now, why) for the prune: the server-corrected time when this process has a measurement
+    of the server's clock, else the PC's; None when that measurement puts the PC clock more than
+    a day off the server's -- then no age can be trusted and nothing is pruned. With no
+    measurement (v2 off: no sample ever) this is the PC clock alone [CODE]."""
+    try:
+        from app.core.v2 import server_clock as _sc
+        clk = _sc.get_default()
+        if clk is not None and clk.has_sample():
+            off = clk.offset()
+            if off is not None and abs(float(off)) > PRUNE_MAX_CLOCK_OFFSET_SEC:
+                return None, f"the PC clock is {float(off):+.0f} s off the server's"
+            return float(clk.now()), ""
+    except Exception:
+        _log.warning("[ERASE] server clock unreadable for the backup prune", exc_info=True)
+    return time.time(), ""
+
+
+def _recorded_epoch(value: Any) -> Optional[float]:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _folder_times(folder: Path, run_stamp: str) -> List[float]:
+    """When a run folder was last dated. A run of lane 1c on: the epochs it recorded -- the run's
+    start and last write (``run.json``) and the refill mark's ``at`` -- on the corrected clock
+    where there was a measurement, never the files' mtimes. An earlier run (none recorded): its
+    run id's local time and every file's mtime, the refill mark's included, as before."""
+    times: List[float] = []
+    try:
+        rec = json.loads((folder / "run.json").read_text(encoding="utf-8"))
+        for key in ("startedAtEpoch", "writtenAtEpoch"):
+            at = _recorded_epoch(rec.get(key)) if isinstance(rec, dict) else None
+            if at is not None:
+                times.append(at)
+    except Exception:
+        pass
+    mark = folder / REFILLED_MARK
+    mark_at: Optional[float] = None
+    if mark.is_file():
+        try:
+            mark_at = _recorded_epoch(json.loads(mark.read_text(encoding="utf-8")).get("at"))
+        except Exception:
+            mark_at = None                       # lane 1b's plain-text mark: its mtime
+        if mark_at is None:
+            mark_at = mark.stat().st_mtime
+    if not times:
+        times = [time.mktime(time.strptime(run_stamp, "%Y%m%d-%H%M%S"))]
+        times += [f.stat().st_mtime for f in folder.iterdir() if f.is_file()]
+    if mark_at is not None:
+        times.append(mark_at)
+    return times
 
 
 def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = None,
@@ -1743,7 +1825,14 @@ def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = N
         base = Path(root) if root is not None else _default_backup_root()
         if not base.is_dir():
             return deleted
-        cutoff = (time.time() if now is None else float(now)) - BACKUP_KEEP_DAYS * 86400.0
+        if now is None:
+            now, why = _prune_now()
+            if now is None:
+                _log.warning("[ERASE] erase backups not pruned: %s -- their ages cannot be told",
+                             why)
+                return deleted
+        now = float(now)
+        cutoff = now - BACKUP_KEEP_DAYS * 86400.0
         for folder in sorted(base.iterdir()):
             try:
                 m = _RUN_DIR_NAME.match(folder.name)
@@ -1758,12 +1847,21 @@ def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = N
                 if (folder / KEEP_MARK).exists():
                     # It erased people the refill does not put back: their only copy (lane 1c).
                     continue
-                newest = max([time.mktime(time.strptime(m.group(1), "%Y%m%d-%H%M%S"))]
-                             + [f.stat().st_mtime for f in folder.iterdir() if f.is_file()])
+                # The hold before the times (review nit): Refill writes its mark BEFORE it
+                # releases, so a folder seen unheld here already carries that mark.
+                if device_hold.is_held(did):
+                    continue
+                newest = max(_folder_times(folder, m.group(1)))
+                if newest > now + PRUNE_FUTURE_TOLERANCE_SEC:
+                    # Dated by a clock ahead of this one (the PC clock went back since): its age
+                    # cannot be told -- kept (lane 1c, review F2).
+                    _log.warning("[ERASE] backup of run %s (turnstile %s) not pruned: dated %.0f s "
+                                 "in the future of this clock", run_id, did, newest - now)
+                    continue
                 if newest >= cutoff:
                     continue
                 if device_hold.is_held(did):
-                    continue
+                    continue                     # held meanwhile: never delete a held turnstile's
                 try:
                     state = str(json.loads((folder / "run.json").read_text(encoding="utf-8"))
                                 .get("state") or "UNKNOWN")
