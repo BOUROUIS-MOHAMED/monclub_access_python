@@ -62,19 +62,76 @@ if (-not (Test-Path -LiteralPath $WatchdogScript)) {
 }
 $WatchdogScript = (Resolve-Path -LiteralPath $WatchdogScript).Path
 
-# -NonInteractive and -WindowStyle Hidden keep a console window from flashing on
-# the gym's front-desk screen every couple of minutes.
-$psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$argLine = @(
-    '-NoProfile'
-    '-NonInteractive'
-    '-ExecutionPolicy Bypass'
-    '-WindowStyle Hidden'
-    "-File `"$WatchdogScript`""
-    "-InstallRoot `"$InstallRoot`""
-) -join ' '
+# Launch through wscript.exe, not powershell.exe directly.
+#
+# Task Scheduler starts the action with a normal window, and powershell.exe is a
+# console program, so Windows draws a VISIBLE console before PowerShell has even
+# read -WindowStyle Hidden -- that switch only hides the window afterwards. On the
+# front-desk screen that is a black window flashing every couple of minutes.
+# wscript.exe is a GUI program with no console of its own, and the launcher starts
+# PowerShell with window style 0, so the console is created hidden and never drawn.
+#
+# VBScript can be switched off (group policy, antivirus, later Windows releases).
+# A launcher that silently does nothing would be the worst outcome -- no crash
+# recovery and nobody told -- so prove the whole chain works here, now, and fall
+# back to the direct launch (which flashes, but works) if it does not.
+$psExe      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$wscriptExe = Join-Path $env:SystemRoot 'System32\wscript.exe'
+$launcher   = Join-Path (Split-Path -Parent $WatchdogScript) 'monclub_access_watchdog_hidden.vbs'
 
-$action = New-ScheduledTaskAction -Execute $psExe -Argument $argLine
+function Test-HiddenLauncher {
+    if (-not (Test-Path -LiteralPath $wscriptExe) -or -not (Test-Path -LiteralPath $launcher)) {
+        return $false
+    }
+    # Under %TEMP%, which on a gym PC sits inside a user folder with a space in its
+    # name ("OXYGENE_FIT P1") -- and the probe folder has a space of its own -- so
+    # this also proves the launcher's quoting.
+    $probeDir = Join-Path ([IO.Path]::GetTempPath()) ('mca watchdog probe ' + [guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+        $probeScript = Join-Path $probeDir 'probe.ps1'
+        $marker      = Join-Path $probeDir 'ran.txt'
+        Set-Content -LiteralPath $probeScript -Encoding ASCII `
+            -Value 'param([string] $Out) Set-Content -LiteralPath $Out -Value ok'
+        $wsArgs = @('//B', '//Nologo', "`"$launcher`"", "`"$probeScript`"", '-Out', "`"$marker`"") -join ' '
+        $p = Start-Process -FilePath $wscriptExe -ArgumentList $wsArgs -PassThru
+        # A blocked script can sit on a prompt nobody can see; never hang the install.
+        if (-not $p.WaitForExit(30000)) {
+            try { $p.Kill() } catch { }
+            return $false
+        }
+        return (Test-Path -LiteralPath $marker)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (Test-HiddenLauncher) {
+    $wsArgLine = @(
+        '//B'
+        '//Nologo'
+        "`"$launcher`""
+        "`"$WatchdogScript`""
+        '-InstallRoot'
+        "`"$InstallRoot`""
+    ) -join ' '
+    $action = New-ScheduledTaskAction -Execute $wscriptExe -Argument $wsArgLine
+    $launchMode = 'hidden (no window)'
+} else {
+    $argLine = @(
+        '-NoProfile'
+        '-NonInteractive'
+        '-ExecutionPolicy Bypass'
+        '-WindowStyle Hidden'
+        "-File `"$WatchdogScript`""
+        "-InstallRoot `"$InstallRoot`""
+    ) -join ' '
+    $action = New-ScheduledTaskAction -Execute $psExe -Argument $argLine
+    $launchMode = 'VISIBLE - the hidden launcher did not work on this PC, so a window will flash at each check'
+    Write-Warning "The hidden launcher did not work on this PC ($launcher). Falling back to a direct PowerShell launch: the watchdog still works, but a window will flash at each check."
+}
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
 
@@ -93,6 +150,26 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsI
 # reading Repetition.Interval back (see README).
 $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)).Repetition
+
+# A SECOND trigger that starts repeating NOW. The logon trigger above is not
+# enough on its own: an AtLogOn trigger only fires on a FUTURE logon, never for
+# the session that is already open when the task is registered. Every install
+# happens inside such a session (the app's user must be logged in to run it),
+# so with the logon trigger alone the task sat with an empty NextRunTime and
+# never ran until the next reboot -- no crash recovery on install day, while
+# Interval still read PT2M and looked healthy. A manual Start-ScheduledTask
+# runs the action once but does not open the repetition window either.
+#
+# Both triggers are kept on purpose. This one covers the current session and,
+# being a time trigger, normally keeps its schedule across reboots; the logon
+# trigger still guarantees a repeating schedule after every logon if it does
+# not. When both repeat, checks simply run more often. That is harmless: the
+# only action is starting the app when it is absent, and MonClub Access
+# refuses to run twice (single-instance mutex in access/main.py).
+#
+# Same rule as above: NO -RepetitionDuration (empty Duration = indefinite).
+$heartbeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
 
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -117,7 +194,7 @@ Remove-WatchdogTask
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger @($trigger, $heartbeatTrigger) `
     -Settings $settings `
     -Principal $principal `
     -Description ("Restarts MonClub Access if its backend process dies, and starts it at logon. " +
@@ -126,3 +203,4 @@ Register-ScheduledTask `
 Write-Host "Registered scheduled task '$TaskName' (every $IntervalMinutes min, and at logon)."
 Write-Host "Watchdog script: $WatchdogScript"
 Write-Host "Install root:    $InstallRoot"
+Write-Host "Launch mode:     $launchMode"

@@ -17,6 +17,7 @@ These scripts are that missing piece.
 |---|---|
 | `monclub_access_watchdog.ps1` | One check: restart the app if it is down and nothing else is going on. |
 | `register_watchdog.ps1` | Register / remove the per-user scheduled task that runs it. |
+| `monclub_access_watchdog_hidden.vbs` | Starts each check with no window. The task runs it through `wscript.exe`: launching `powershell.exe` directly makes Windows draw a console before `-WindowStyle Hidden` takes effect, so a window flashed at every check. `register_watchdog.ps1` tests the launcher when it registers the task and falls back to the direct (flashing) launch if VBScript is unavailable, printing `Launch mode:`. |
 
 ## Installing
 
@@ -76,19 +77,34 @@ direction and repetition is silently dropped, leaving a task that runs once at
 logon and never again — autostart with no crash recovery, while still claiming
 both.
 
-**What could NOT be verified here:** that the task actually *executes*. On the
-development machine every `powershell.exe` (5.1) scheduled task hangs before its
-first statement — including a three-line probe script that only writes a file, so
-it is the invocation environment on that box, not this script. The script itself
-runs correctly under 5.1 when launched directly.
+**The trap that `Interval = PT2M` does not show.** An `-AtLogOn` trigger only fires
+on a *future* logon, never for the session that is already open when the task is
+registered -- and every install happens inside such a session. With that trigger
+alone the task registered, read back `Interval = PT2M`, looked healthy, and had an
+**empty `NextRunTime`**: no check ran until the next reboot, so there was no crash
+recovery on install day. A manual `Start-ScheduledTask` runs the action once but does
+not open the repetition window either. `register_watchdog.ps1` therefore adds a
+second, time-based trigger that starts repeating immediately. The logon trigger
+stays, so a repeating schedule is guaranteed after every logon even if the time
+trigger does not survive a reboot. When both repeat, checks simply run more often --
+harmless, because the only action is starting an absent app and MonClub Access
+refuses to run twice (single-instance mutex, `access/main.py`).
+
+**Verified here (2026-09-13):** both triggers registered; `NextRunTime` populated
+immediately; the task then ran **on its own**, two minutes apart, `LastTaskResult = 0`,
+each run writing its log line. (An earlier revision of this note said scheduled
+`powershell.exe` tasks hung on the development machine; that no longer reproduces.)
+
+**Not verified here:** a real gym PC, and the schedule after a reboot and logon.
 
 So on the first gym PC you enable this on, confirm it end to end:
 
 ```powershell
-Get-ScheduledTask 'MonClub Access Watchdog' | ForEach-Object { $_.Triggers.Repetition }
+Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime, LastRunTime
 ```
 
-`Interval` must be `PT2M`; an empty `Duration` means indefinite, which is correct.
+`NextRunTime` must be a date and time. **Empty means nothing will ever run**, even
+though `Triggers.Repetition` still reads `PT2M`.
 Then force a run and check it completes and logs:
 
 ```powershell

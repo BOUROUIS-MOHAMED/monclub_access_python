@@ -79,6 +79,7 @@ Source: "{#StageDir}\*"; DestDir: "{app}\current"; Flags: ignoreversion recurses
 ; valid across an update.
 Source: "..\packaging\watchdog\monclub_access_watchdog.ps1"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 Source: "..\packaging\watchdog\register_watchdog.ps1";       DestDir: "{app}\watchdog"; Flags: ignoreversion
+Source: "..\packaging\watchdog\monclub_access_watchdog_hidden.vbs"; DestDir: "{app}\watchdog"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks: startmenuicon
