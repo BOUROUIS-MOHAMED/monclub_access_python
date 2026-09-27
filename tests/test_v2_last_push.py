@@ -590,7 +590,7 @@ def test_a_persisted_sample_from_the_future_is_dropped_at_load():
     t = {"wall": 2_000_000.0}
     row = {"offset_sec": 1.0, "measured_at": t["wall"] - 10, "source": "rest:x",
            "recent": [[1.0, t["wall"] - 10], [-3600.0, t["wall"] + 3000]]}
-    clk = ServerClock(wall=lambda: t["wall"], load=lambda: dict(row))
+    clk = _paired(t, load=lambda: dict(row))
     t["wall"] += 3100
     rep = clk.report()
     assert "ageSec" not in rep and rep["samples"] == 0 and rep["offsetSec"] == pytest.approx(1.0)
@@ -650,3 +650,21 @@ def test_a_forward_step_also_retires_the_samples_before_it():
     t["mono"] += 30
     t["wall"] += 30 + 3600                             # the PC clock jumps 1 h forward
     assert "ageSec" not in clk.report()
+
+
+@pytest.mark.parametrize("step", [-300.0, -30.0])
+def test_a_loaded_sample_is_retired_by_a_step_after_the_restart(step):
+    """Review round 5: a sample loaded from disk had no monotonic time, so a wall-clock step after
+    the restart went unseen -- a step back larger than its age hid it until the clock caught up,
+    then it came back; a smaller one understated its age. Loaded samples are pinned at load."""
+    t = {"wall": 3_000_000.0}
+    row = {"offset_sec": -300.0, "measured_at": t["wall"] - 60, "source": "rest:x",
+           "recent": [[-300.0, t["wall"] - 60]]}
+    real = {"m": 500.0}
+    clk = ServerClock(wall=lambda: t["wall"], mono=lambda: real["m"], load=lambda: dict(row))
+    assert clk.report()["ageSec"] == pytest.approx(60.0), "loaded: aged on the wall clock"
+    t["wall"] += step                                  # Windows steps the clock after the restart
+    assert "ageSec" not in clk.report()
+    real["m"] += 400
+    t["wall"] += 400
+    assert "ageSec" not in clk.report(), "and it never comes back"

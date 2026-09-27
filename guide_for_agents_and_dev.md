@@ -3434,10 +3434,12 @@ out. An authoritative `CLOCK_SKEW` sample restarts both the window and the view.
 the monotonic time it was taken: its age is measured on that clock, and once the PC's wall clock has been stepped
 since — wall minus monotonic moved by more than `STEP_TOLERANCE_SEC` (2 s), either way — it leaves the view for good,
 whether or not a sample lands before the clock catches up (review rounds 3-4; the window of 7 keeps it, as before).
-A sample loaded from disk has no monotonic time: its age is on the wall clock, and one stamped later than now is
-dropped at load; a step between the save and the restart is not detected. `[CODE: server_clock.py::report, ::_recent_locked, ::_age_of]`
-`[TEST: test_v2_last_push.py — the five clock tests, incl. ::test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes,
-::test_no_sample_in_the_last_30_minutes_sends_no_age; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
+A sample loaded from disk is pinned to the new process's monotonic clock at load (its age then = wall now minus
+its time), so a step after the restart retires it too; one stamped later than now is dropped at load; a step
+between the save and the restart is not detected (review round 5). `[CODE: server_clock.py::report, ::_recent_locked, ::_age_of]`
+`[TEST: test_v2_last_push.py — the clock tests, incl. ::test_one_sample_every_ten_minutes_keeps_the_age_within_30_minutes,
+::test_no_sample_in_the_last_30_minutes_sends_no_age, ::test_a_pre_step_sample_leaves_the_view_even_with_no_sample_before_the_catch_up,
+::test_a_forward_step_also_retires_the_samples_before_it, ::test_a_loaded_sample_is_retired_by_a_step_after_the_restart; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]` `[CODE: server_clock.py, api.py::_cap_fact_times, access/pc_identity.py::_clock_offset_report]`
 `[TEST: test_v2_clock_and_api.py — incl. ::test_a_clock_skew_refusal_outvotes_earlier_wrong_samples,
 ::test_fact_times_are_capped_at_the_sent_at_of_each_attempt; test_v2_runtime.py::test_the_heartbeat_carries_the_measured_offset_only_once_measured]`
 Parsing is lenient (`timefmt.py`): the socket sends 0–3 fraction digits with an offset, REST `LocalDateTime`s

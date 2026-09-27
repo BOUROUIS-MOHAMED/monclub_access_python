@@ -25,11 +25,12 @@ report it in the heartbeat.
   freshness rule). The window that drives ``offset()`` is not touched. Each recent sample is
   persisted with its own time, so a remembered offset counts its age from the original
   measurement. No sample in the last 30 minutes: the window's own figures, without ``ageSec``.
-  A sample of this process also keeps the MONOTONIC time it was taken: its age is measured on
-  that clock, and once the PC's wall clock has been stepped since (wall - mono moved by more
-  than ``STEP_TOLERANCE_SEC``, either way) the sample describes a clock that is gone and leaves
-  the view (review rounds 3-4). A sample loaded from disk has no monotonic time: its age is
-  measured on the wall clock, and one stamped later than now is dropped at load.
+  Each sample also keeps the MONOTONIC time it was taken (a loaded one is pinned to this
+  process's monotonic clock at load): its age is measured on that clock, and once the PC's wall
+  clock has been stepped since (wall - mono moved by more than ``STEP_TOLERANCE_SEC``, either
+  way) the sample describes a clock that is gone and leaves the view (review rounds 3-5). A
+  loaded sample stamped later than now is dropped at load; a step between the save and the
+  restart is not detected.
 """
 from __future__ import annotations
 
@@ -64,9 +65,9 @@ class ServerClock:
         self._persist = persist
         self._lock = threading.Lock()
         self._samples: List[float] = []
-        # (offset, PC wall time, monotonic time or None when loaded) of every sample of the last
-        # RECENT_SEC: the heartbeat's view.
-        self._recent: List[Tuple[float, float, Optional[float]]] = []
+        # (offset, PC wall time, monotonic time -- a loaded one pinned at load) of every sample of
+        # the last RECENT_SEC: the heartbeat's view.
+        self._recent: List[Tuple[float, float, float]] = []
         self._source = ""
         self._measured_at = 0.0
         self._utc_offset: Optional[int] = None
@@ -87,15 +88,19 @@ class ServerClock:
                     # unknown (``measured_at`` is the NEWEST sample's time, which would call it
                     # fresh), so the view has nothing to report an age from.
                     recent = []
+                    w0, m0 = self._wall(), self._mono()
                     for item in row.get("recent") or []:
                         try:
                             o, a = float(item[0]), float(item[1])
                         except (TypeError, ValueError, IndexError):
                             continue
                         # One stamped later than now was taken before the PC clock stepped
-                        # back: dropped, never counted again once the clock catches up.
-                        if math.isfinite(o) and math.isfinite(a) and a <= self._wall():
-                            recent.append((o, a, None))
+                        # back: dropped. The others are pinned to THIS process's monotonic
+                        # clock at load (age w0 - a now), so a wall-clock step after the restart
+                        # retires them like any sample (review round 5); a step between the
+                        # save and the restart is not detected.
+                        if math.isfinite(o) and math.isfinite(a) and a <= w0:
+                            recent.append((o, a, m0 - (w0 - a)))
                     self._recent = recent[-RECENT_MAX:]
                 if row.get("utc_offset_sec") is not None:
                     self._utc_offset = int(row["utc_offset_sec"])
@@ -176,17 +181,14 @@ class ServerClock:
             return candidate
 
     @staticmethod
-    def _age_of(sample: Tuple[float, float, Optional[float]], wall: float,
+    def _age_of(sample: Tuple[float, float, float], wall: float,
                 mono: float) -> Optional[float]:
         """The age of a view sample, or None when it is not in the view: older than RECENT_SEC
         (inclusive bound), "in the future", or taken before a step of the PC's wall clock."""
         _o, a, m = sample
-        if m is not None:
-            if abs((wall - mono) - (a - m)) > STEP_TOLERANCE_SEC:
-                return None                   # the wall clock was stepped since: another clock
-            age = mono - m
-        else:
-            age = wall - a
+        if abs((wall - mono) - (a - m)) > STEP_TOLERANCE_SEC:
+            return None                       # the wall clock was stepped since: another clock
+        age = mono - m
         return age if 0.0 <= age <= RECENT_SEC else None
 
     def _recent_locked(self) -> List[Tuple[float, float, float]]:
