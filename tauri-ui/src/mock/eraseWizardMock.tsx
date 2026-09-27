@@ -61,12 +61,20 @@ function makeApi(onHolds: (h: Set<number>) => void, initialHeld: number[] = [],
         pinScheme: holds.has(did) ? "ACCOUNT" : "MEMBERSHIP", tables: rows(d), extra: counts(d).extra,
         hold: holds.has(did) ? { reason: "erase", since: "2026-09-27 23:41:07" } : null, run,
         limits: { mbPinsPerPass: d.protocol === "ZK_STANDALONE" ? 50 : null },
+        // Lane 1b: what the refill would write (illustrative numbers).
+        refill: {
+          scheme: holds.has(did) ? "ACCOUNT" : "MEMBERSHIP",
+          members: d.protocol === "ZK_PULLSDK" ? 1688 : 1836, withheld: 0,
+          ...(holds.has(did) ? {} : { ifAccount: { members: d.protocol === "ZK_PULLSDK" ? 1601 : 1742, withheld: 0 } }),
+          lastSyncOk: true, cacheUpdatedAt: "2026-09-27 23:30:12", problem: null, accountProblem: null,
+        },
       };
       return p;
     },
     async start(did, body: EraseStartBody) {
       const d = DEVICES.find((x) => x.id === did)!;
       if (body.typedName !== d.name) throw new Error("the typed name is not this turnstile's name");
+      if (!body.backupOnly && body.otherPcsClosed !== true) throw new Error("OTHER_PCS_NOT_CONFIRMED");
       const before = counts(d);
       const failC3 = opts.incomplete && d.protocol === "ZK_PULLSDK";
       const after: EraseCounts = d.protocol === "ZK_PULLSDK"

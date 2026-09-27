@@ -42,6 +42,22 @@ function errText(e: unknown): string {
   return String(e);
 }
 
+// The request never got an answer (the client's own timeout, or no network): the server may
+// still have acted -- never read it as "refused".
+function noAnswer(e: unknown): boolean {
+  if (errCode(e)) return false;
+  const name = e && typeof e === "object" ? String((e as { name?: unknown }).name ?? "") : "";
+  const msg = errText(e).toLowerCase();
+  return name === "AbortError" || name === "TimeoutError" || name === "TypeError"
+    || msg.includes("timed out") || msg.includes("failed to fetch") || msg.includes("network");
+}
+
+// A run's error is "CODE: detail" (server side, English): the code is translated, the detail kept.
+function splitRunError(error: string): { code: string | null; detail: string } {
+  const m = /^([A-Z][A-Z0-9_]*):\s*([\s\S]*)$/.exec(error);
+  return m ? { code: m[1], detail: m[2] } : { code: null, detail: error };
+}
+
 function LangSwitch({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   return (
     <div className="flex overflow-hidden rounded-lg border border-border text-[11px] font-bold">
@@ -107,7 +123,11 @@ export default function EraseWizardDialog({
   const [acceptFaces, setAcceptFaces] = useState(false);
   const [backupOnly, setBackupOnly] = useState(false);
   const [typedName, setTypedName] = useState("");
+  // The hold binds THIS PC only: every other Access PC of the gym must be closed (review C0).
+  const [otherPcsClosed, setOtherPcsClosed] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  // Why the page went back to step 1 by itself (a preview too old or a changed turnstile).
+  const [restartNote, setRestartNote] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   const [run, setRun] = useState<EraseRun | null>(null);
   const [refillMsg, setRefillMsg] = useState<string | null>(null);
@@ -125,6 +145,7 @@ export default function EraseWizardDialog({
     setPassword(""); setUnlocked(false); setLockError(null); setStep(0); setPreview(null);
     setPreviewError(null); setChosen(new Set()); setForget(null); setRefill(null);
     setAcceptFaces(false); setBackupOnly(false); setTypedName(""); setStartError(null);
+    setOtherPcsClosed(false); setRestartNote(null);
     setRun(null); setRefillMsg(null); setRefillError(null);
     setHoldScheme(undefined); setStillHeld(true); setHoldsUnknown(false);
   }, []);
@@ -137,7 +158,8 @@ export default function EraseWizardDialog({
     try { setPreview(await api.preview(deviceId)); }
     catch (e) { setPreview(null); setPreviewError(errFor(e)); }
     finally { setLoading(false); }
-  }, [api, deviceId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
+  }, [api, deviceId, lang]);
 
   // Refill mode reads the hold list, not the preview: the preview needs the turnstile connected,
   // and on the cutover night its cables may be out when the operator comes to press Refill.
@@ -150,7 +172,8 @@ export default function EraseWizardDialog({
       setStillHeld(!!h || !!res.loadFailed); setHoldScheme(h ? (h.pinScheme ?? null) : undefined);
     } catch (e) { setPreviewError(errFor(e)); }
     finally { setLoading(false); }
-  }, [api, deviceId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
+  }, [api, deviceId, lang]);
 
   const unlock = useCallback(async () => {
     if (!password.trim() || checking) return;
@@ -159,9 +182,14 @@ export default function EraseWizardDialog({
       const res = await api.verifyPassword(password);
       if (res.ok) { setUnlocked(true); if (mode === "refill") void loadHold(); else void loadPreview(); }
       else setLockError(res.error || "—");
-    } catch (e) { setLockError(errText(e)); }
+    } catch (e) {
+      // Offline: the server answers ADMIN_PASSWORD_UNCHECKABLE, or nothing answers in time --
+      // either way the internet is missing, not the right password (review F25).
+      setLockError(noAnswer(e) ? t.codes.ADMIN_PASSWORD_UNCHECKABLE : errFor(e));
+    }
     finally { setChecking(false); }
-  }, [api, password, checking, loadPreview, loadHold, mode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
+  }, [api, password, checking, loadPreview, loadHold, mode, lang]);
 
   const protocol = preview?.device.protocol;
   const usersKey = protocol === "ZK_STANDALONE" ? "users" : "user";
@@ -191,8 +219,21 @@ export default function EraseWizardDialog({
     });
   }, [preview, requiredByUser]);
 
+  // Already on hold after an earlier erase: only the Refill button releases it (the server refuses
+  // now/auto: HELD_USE_REFILL, review F2).
+  const heldBefore = !!preview?.hold;
+  useEffect(() => { if (heldBefore && (refill === "now" || refill === "auto")) setRefill(null); }, [heldBefore, refill]);
+  // What the refill would write (lane 1b, review C1); the server refuses an erase it could not undo.
+  const refillCheck = preview?.refill;
+  const refillProblem = refillCheck
+    ? (refillCheck.problem ?? (refill === "hold" ? refillCheck.accountProblem : null))
+    : null;
+  // Users (or a C3's door rights) erased: no card or finger member passes until the refill.
+  const locksOut = chosen.has(usersKey) || chosen.has("userauthorize");
+
   const optionsReady = backupOnly || (forget !== null && refill !== null && (!needFaces || acceptFaces));
   const nameOk = preview ? typedName.trim() === preview.device.name : false;
+  const confirmReady = nameOk && (backupOnly || (otherPcsClosed && !refillProblem));
 
   const pollStatus = useCallback(() => {
     if (pollRef.current) window.clearInterval(pollRef.current);
@@ -214,19 +255,43 @@ export default function EraseWizardDialog({
   const start = useCallback(async () => {
     if (!preview || starting) return;
     setStarting(true); setStartError(null);
+    const earlierRun = preview.run?.runId ?? null;
     try {
       await api.start(deviceId, {
         previewId: preview.previewId, tables: Array.from(chosen), typedName: typedName.trim(),
         password, backupOnly: backupOnly || undefined,
-        ...(backupOnly ? {} : { forget: forget ?? undefined, refill: refill ?? undefined }),
+        ...(backupOnly ? {} : {
+          forget: forget ?? undefined, refill: refill ?? undefined, otherPcsClosed,
+        }),
         acceptFaceLoss: needFaces ? acceptFaces : undefined,
       });
       setStep(4);
       pollStatus();
-    } catch (e) { setStartError(errFor(e)); }
+    } catch (e) {
+      if (noAnswer(e)) {
+        // The password check can take the whole client timeout and the server may have started
+        // the run just after: look before saying anything failed (review C6).
+        setStartError(t.noAnswerYet);
+        try {
+          const s = await api.status();
+          if (s.run && Number(s.run.deviceId) === deviceId && s.run.runId !== earlierRun) {
+            setStartError(null); setRun(s.run); setStep(4); pollStatus(); return;
+          }
+        } catch { /* fall through to the error */ }
+      }
+      const c = errCode(e);
+      if (c === "PREVIEW_EXPIRED" || c === "DEVICE_CHANGED" || c === "WRONG_DEVICE") {
+        // Step 1 must be read again: go there and read it now (F27).
+        setRestartNote(errFor(e)); setStartError(null); setTypedName(""); setOtherPcsClosed(false);
+        setStep(0); void loadPreview();
+        return;
+      }
+      setStartError(errFor(e));
+    }
     finally { setStarting(false); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
   }, [api, deviceId, preview, chosen, typedName, password, backupOnly, forget, refill, needFaces,
-      acceptFaces, starting, pollStatus]);
+      acceptFaces, otherPcsClosed, starting, pollStatus, loadPreview, lang]);
 
   const doRefill = useCallback(async () => {
     if (refilling || holdScheme === undefined || holdsUnknown) return;
@@ -242,6 +307,10 @@ export default function EraseWizardDialog({
       if (errCode(e) === "PIN_SCHEME_CHANGED") {
         const now = (e as { payload?: { pinScheme?: string | null } | null }).payload?.pinScheme ?? null;
         setRefillError(t.schemeChanged(schemeName(now)));
+        void loadHold();
+      } else if (noAnswer(e)) {
+        // It may have gone through after the page stopped waiting: read the hold again (C6).
+        setRefillError(t.noAnswerYet);
         void loadHold();
       } else setRefillError(errFor(e));
     }
@@ -266,7 +335,29 @@ export default function EraseWizardDialog({
     return s;
   });
 
-  const busy = run?.state === "RUNNING";
+  // Not closable while the start request is out either: the server may be starting the run.
+  const busy = run?.state === "RUNNING" || starting;
+
+  const refillInfo = refillCheck && !backupOnly ? (
+    <div className="flex flex-col gap-0.5 rounded-xl border border-border p-2.5 text-[12px]">
+      {refillCheck.members !== null && (
+        <span className="font-semibold">{t.refillWillWrite(refillCheck.members, schemeName(refillCheck.scheme))}</span>
+      )}
+      {refillCheck.ifAccount && (
+        <span className={cn(refillCheck.ifAccount.withheld > 0 && "text-amber-700")}>
+          {t.refillIfAccount(refillCheck.ifAccount.members, refillCheck.ifAccount.withheld)}
+        </span>
+      )}
+      {refillCheck.cacheUpdatedAt && (
+        <span className="text-muted-foreground">{t.refillCacheAt(refillCheck.cacheUpdatedAt)}</span>
+      )}
+      {refillProblem && <span className="text-destructive">{t.codes[refillProblem] ?? refillProblem}</span>}
+    </div>
+  ) : null;
+
+  const lockoutLine = !backupOnly && locksOut ? (
+    <p className="text-[12px] font-semibold text-amber-700">{refill === "hold" ? t.lockoutHold : t.lockoutRefill}</p>
+  ) : null;
 
   // ── rendering ────────────────────────────────────────────────────────────
   const header = (
@@ -398,13 +489,14 @@ export default function EraseWizardDialog({
     body = (
       <div className="flex flex-col gap-3">
         <p className="text-[12px] text-muted-foreground">{t.readOnly}</p>
+        {restartNote && <Alert className="border-amber-500/40 bg-amber-500/[0.08]"><AlertDescription className="text-[12px]">{restartNote}</AlertDescription></Alert>}
         {previewError && <Alert variant="destructive"><AlertDescription>{previewError}</AlertDescription></Alert>}
         {loading && !preview ? <Loader2 className="h-5 w-5 animate-spin text-primary" /> : countsTable(false)}
         {extraLines}
         {preview?.hold && holdPanel(true)}
         <DialogFooter>
           <Button variant="outline" onClick={() => void loadPreview()} disabled={loading}>{t.reread}</Button>
-          <Button onClick={() => setStep(1)} disabled={!preview}>{t.next}</Button>
+          <Button onClick={() => { setRestartNote(null); setStep(1); }} disabled={!preview}>{t.next}</Button>
         </DialogFooter>
       </div>
     );
@@ -450,13 +542,16 @@ export default function EraseWizardDialog({
               {forgetForced && <div className="text-[11px] text-muted-foreground">{t.forgetForcedMb}</div>}
             </Choice>
             <div className="mt-1 text-[12.5px] font-bold">{t.refillTitle}</div>
-            <Choice name="refill" checked={refill === "now"} onChange={() => setRefill("now")}>{t.refillNow}</Choice>
-            <Choice name="refill" checked={refill === "auto"} onChange={() => setRefill("auto")}>
+            {heldBefore && <p className="text-[12px] text-amber-700">{t.heldAlready}</p>}
+            <Choice name="refill" checked={refill === "now"} disabled={heldBefore} onChange={() => setRefill("now")}>{t.refillNow}</Choice>
+            <Choice name="refill" checked={refill === "auto"} disabled={heldBefore} onChange={() => setRefill("auto")}>
               {t.refillAuto}<div className="text-[11px] text-muted-foreground">{t.refillAutoHelp}</div>
             </Choice>
             <Choice name="refill" checked={refill === "hold"} onChange={() => setRefill("hold")}>
               {t.refillHold}<div className="text-[11px] text-muted-foreground">{t.refillHoldHelp}</div>
             </Choice>
+            {refillInfo}
+            {lockoutLine}
             {needFaces && (
               <Choice type="checkbox" name="faces" checked={acceptFaces} onChange={() => setAcceptFaces((v) => !v)}>
                 <span className="text-amber-700">{facesUnknown ? t.acceptFacesUnknown : t.acceptFaces(faces)}</span>
@@ -476,11 +571,26 @@ export default function EraseWizardDialog({
       <div className="flex flex-col gap-3">
         <div className="rounded-xl border border-border p-3 text-[12.5px]">
           <div className="mb-1 font-bold">{t.summary}</div>
+          <div className="mb-1 font-semibold">
+            {t.deviceLine(preview.device.name, preview.device.ip || t.unknown, preview.device.port || "4370",
+                          t.sdkNames[preview.device.protocol] ?? preview.device.protocol)}
+          </div>
           <div>{t.willErase}{t.colon} <b>{Array.from(chosen).map((k) => t.tableLabels[k] ?? k).join(", ")}</b></div>
           {!backupOnly && <div>{t.willForget}{t.colon} <b>{forget ? t.forgotten : t.kept}</b></div>}
           {!backupOnly && <div>{t.willRefill}{t.colon} <b>{refillLabel}</b></div>}
           {backupOnly && <div className="font-semibold">{t.backupOnly}</div>}
         </div>
+        {refillInfo}
+        {lockoutLine}
+        {!backupOnly && (
+          <div className="flex flex-col gap-1.5 rounded-xl border border-destructive/40 bg-destructive/[0.04] p-2.5">
+            <p className="text-[12px] font-semibold">{t.otherPcsTitle}</p>
+            <Choice type="checkbox" name="other-pcs" checked={otherPcsClosed}
+                    onChange={() => setOtherPcsClosed((v) => !v)}>
+              {t.otherPcsTick}
+            </Choice>
+          </div>
+        )}
         <Alert className="border-primary/30 bg-primary/[0.04]">
           <ShieldAlert className="h-4 w-4 text-primary" />
           <AlertDescription className="text-[12px]">
@@ -499,7 +609,7 @@ export default function EraseWizardDialog({
         <DialogFooter>
           <Button variant="outline" onClick={() => setStep(2)}>{t.back}</Button>
           <Button variant={backupOnly ? "default" : "destructive"} onClick={() => void start()}
-                  disabled={!nameOk || starting}>
+                  disabled={!confirmReady || starting}>
             {starting ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Trash2 className="mr-1.5 h-4 w-4" />}
             {backupOnly ? t.backupButton : t.erase}
           </Button>
@@ -516,7 +626,7 @@ export default function EraseWizardDialog({
           <Icon className={cn("h-5 w-5", state === "RUNNING" && "animate-spin")} />{t.states[state] ?? state}
         </div>
         {run?.progress && (
-          <div className="text-[12px] text-muted-foreground">{run.progress.phase} — {t.progress(run.progress.done, run.progress.total)}</div>
+          <div className="text-[12px] text-muted-foreground">{t.phases[run.progress.phase] ?? run.progress.phase} — {t.progress(run.progress.done, run.progress.total)}</div>
         )}
         <ol className="flex max-h-[180px] flex-col gap-1 overflow-y-auto text-[12px]">
           {(run?.steps ?? []).map((s, i) => (
@@ -528,7 +638,19 @@ export default function EraseWizardDialog({
             </li>
           ))}
         </ol>
-        {run?.error && <Alert variant="destructive"><AlertDescription className="text-[12px]">{run.error}</AlertDescription></Alert>}
+        {run?.error && (() => {
+          // The code in the page's language, the server's own text as a detail line (F27).
+          const { code, detail } = splitRunError(run.error);
+          const said = code ? t.codes[code] : undefined;
+          return (
+            <Alert variant="destructive">
+              <AlertDescription className="flex flex-col gap-1 text-[12px]">
+                <span className="font-semibold">{said ?? run.error}</span>
+                {said && <span className="text-[11px] opacity-80">{t.errorDetail}{t.colon} {code} — {detail}</span>}
+              </AlertDescription>
+            </Alert>
+          );
+        })()}
         {state === "INCOMPLETE" && <p className="text-[12px] text-muted-foreground">{t.incompleteHelp}</p>}
         {run?.countsBefore && countsTable(true)}
         {run?.backup && (
