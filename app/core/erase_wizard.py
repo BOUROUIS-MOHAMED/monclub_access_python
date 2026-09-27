@@ -339,6 +339,10 @@ class EraseWizard:
         self._previews: Dict[str, Dict[str, Any]] = {}
         self._run: Optional[Dict[str, Any]] = None       # the current or last run record
         self._running = False
+        # The refill roster's pins as step 1 saw them, for the current run (lane 1c): a member who
+        # leaves the roster since is not "someone the operator was not shown" (_bind_not_refilled).
+        # Kept here, not in the run record: it can hold ~1,800 pins, and the page polls the record.
+        self._run_step1_roster: frozenset = frozenset()
         # Turnstiles whose Refill is between its checks and its release: no erase may start on
         # them (review round 2, R2-1 -- the password round trip is a network call).
         self._refilling: set = set()
@@ -559,7 +563,8 @@ class EraseWizard:
                 self._previews.pop(k, None)
             self._previews[preview_id] = {
                 "device": ident, "counts": counts, "at": now,
-                "notRefilled": None if left_out is None else frozenset(p["pin"] for p in left_out)}
+                "notRefilled": None if left_out is None else frozenset(p["pin"] for p in left_out),
+                "rosterPins": frozenset(pins_now or ())}
         return 200, {
             "ok": True, "previewId": preview_id, "device": ident,
             "pinScheme": self._pin_scheme(did),
@@ -960,6 +965,7 @@ class EraseWizard:
                              "error": "this turnstile is being refilled"}
             self._running = True
             self._run = run
+            self._run_step1_roster = frozenset(preview.get("rosterPins") or ())
             self._previews.pop(str(body.get("previewId")), None)
         try:
             self._spawn(lambda: self._execute(run_id))
@@ -1176,9 +1182,11 @@ class EraseWizard:
                            check: Dict[str, Any]) -> None:
         """Right before the first delete (lane 1c, review C0): the people this erase removes and
         the refill does not write back, from the BACKUP (what is really erased) against the roster
-        now. Only the pins the operator accepted at step 1 may be among them: anyone else -- a
-        user enrolled on the terminal since, a member a sync took out of the roster since -- stops
-        the run (``NOT_REFILLED_CHANGED``, FAILED, nothing erased). When some remain, their run
+        now. Only the pins the operator accepted at step 1 may be among them -- or a member step 1
+        saw in the roster who left it since (a right that ended at the midnight date flip during a
+        long MB2000 backup: a normal pass would remove them too; review round 1 of lane 1c). Anyone
+        else -- a user enrolled on the terminal since step 1 -- stops the run
+        (``NOT_REFILLED_CHANGED``, FAILED, nothing erased). When some remain, their run
         folder gets ``KEEP_MARK`` (durably, or no erase): the backup is their only copy, and the
         prune never deletes a marked folder. A C3 erase without the ``user`` table has no user
         rows in its backup: the list is read once more here. Pins only -- never a name -- in the
@@ -1196,7 +1204,10 @@ class EraseWizard:
             people = terminal_people(proto, content.get("users") or [])
         left = sorted({p["pin"] for p in not_refilled(people, (check.get("_pins") or {})
                                                       .get("now"))}, key=_pin_key)
-        unseen = sorted(set(left) - set(run.get("notRefilledAccepted") or ()), key=_pin_key)
+        with self._lock:
+            step1_roster = set(self._run_step1_roster)
+        unseen = sorted(set(left) - set(run.get("notRefilledAccepted") or ()) - step1_roster,
+                        key=_pin_key)
         if unseen:
             raise StepError("NOT_REFILLED_CHANGED",
                             f"{len(unseen)} person(s) on the terminal are not in the refill roster "
@@ -1645,10 +1656,11 @@ class EraseWizard:
         if clash and not set(clash) <= confirmed:
             return 409, {"ok": False, "code": "ADMIN_PIN_IN_ROSTER", "adminPins": clash,
                          "pinScheme": scheme,
-                         "error": f"{len(clash)} terminal administrator pin(s) are also member pins "
-                                  f"under {scheme} ({clash[:5]}): the refill would write those "
-                                  "members over them, privilege 0 -- change those administrators' "
-                                  "pins on the terminal, or confirm the overwrite"}
+                         "error": f"{len(clash)} terminal administrator pin(s) in the erase's backup "
+                                  f"are also member pins under {scheme} ({clash[:5]}): the refill "
+                                  "would write those members over them, privilege 0 -- this reads "
+                                  "the backup, not the terminal: confirm once their numbers were "
+                                  "changed on the terminal, or to have them replaced"}
         from app.core import db as _db
         try:
             invalidated = int(_db.invalidate_device_records(device_id=did, fingers_erased=False))
@@ -1720,28 +1732,36 @@ class EraseWizard:
         proto = _protocol_of(device) if device else None
         if proto == PROTO_PULLSDK:
             return {"refill": refill, "adminPins": [], "adminCheck": "NOT_APPLICABLE"}
-        admins = self._held_run_admins(did, hold_run)
+        backup_proto, admins = self._held_run_admins(did, hold_run)
+        if proto is None and backup_proto == PROTO_PULLSDK:
+            # No device row any more: the backup says a C3 -- no administrators (review round 1).
+            return {"refill": refill, "adminPins": [], "adminCheck": "NOT_APPLICABLE"}
         if admins is None or roster is None:
             return {"refill": refill, "adminPins": [], "adminCheck": "UNREADABLE"}
         return {"refill": refill, "adminPins": sorted(admins & set(roster["pins"]), key=_pin_key),
                 "adminCheck": "CHECKED"}
 
-    def _held_run_admins(self, did: int, run_id: Optional[str]) -> Optional[set]:
-        """The administrators (privilege > 0) an MB2000 run's verified backup lists -- the ones
-        its users erase kept. None when that backup cannot be read."""
+    def _held_run_admins(self, did: int, run_id: Optional[str]
+                         ) -> Tuple[Optional[str], Optional[set]]:
+        """(protocol, administrators) from the hold's run's verified backup: the administrators
+        (privilege > 0) an MB2000 users erase kept -- as the backup lists them, since Refill does
+        not read the terminal (its cables may be out): an administrator whose number was changed
+        on the terminal since still reads here, one enrolled since does not. Administrators None on
+        a C3 backup, or when the backup cannot be read (protocol None then)."""
         if not run_id:
-            return None
+            return None, None
         try:
             path = self.backup_root() / f"{run_id}_device{int(did)}" / "backup.json"
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("protocol") != PROTO_STANDALONE:
-                return None
-            return {str(u["pin"]) for u in data.get("users") or []
-                    if int(u.get("privilege") or 0) > 0}
+            proto = data.get("protocol")
+            if proto != PROTO_STANDALONE:
+                return (str(proto) if proto else None), None
+            return proto, {str(u["pin"]) for u in data.get("users") or []
+                           if int(u.get("privilege") or 0) > 0}
         except Exception:
             _log.warning("[ERASE] backup of run %s (turnstile %s) not read for the Refill check",
                          run_id, did, exc_info=True)
-            return None
+            return None, None
 
 
 BACKUP_KEEP_DAYS = 30

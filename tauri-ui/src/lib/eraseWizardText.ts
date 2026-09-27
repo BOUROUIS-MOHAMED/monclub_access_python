@@ -275,11 +275,11 @@ const fr = {
       "Attention : la liste des membres de ce PC ne contient aucun membre pour ce tourniquet : rien n'y est écrit.",
   } as Record<string, (n: number, s: string) => string>,
   adminClash: (pins: string[], s: string) =>
-    `${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en « ${s} » (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. Changez leur numéro sur le terminal, ou confirmez ci-dessous.`,
+    `D'après la sauvegarde de l'effacement, ${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en « ${s} » (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. « Remplir » ne relit pas le terminal : changez leur numéro sur le terminal puis confirmez ci-dessous, ou confirmez pour qu'ils soient remplacés.`,
   confirmAdminOverwrite: (pins: string[]) =>
-    `Je confirme : les administrateurs ${pins.join(", ")} seront remplacés par les membres du même numéro.`,
+    `Je confirme pour les administrateurs ${pins.join(", ")} : leur numéro a été changé sur le terminal, ou ils seront remplacés par les membres du même numéro.`,
   refillWarnAdmins: (pins: string[]) =>
-    `Administrateurs remplacés par des membres (confirmé) : ${pins.join(", ")}.`,
+    `Administrateurs confirmés (numéro changé sur le terminal, ou remplacés par le membre du même numéro) : ${pins.join(", ")}.`,
   refillWarnAdminsUnchecked:
     "Les administrateurs du terminal n'ont pas pu être vérifiés (sauvegarde illisible) : un administrateur qui a le numéro d'un membre sera remplacé par ce membre.",
   notOnHold: "Ce tourniquet n'est plus en attente.",
@@ -568,11 +568,11 @@ const en: typeof fr = {
       "Warning: this PC's member list holds no member for this turnstile: nothing is written to it.",
   },
   adminClash: (pins: string[], s: string) =>
-    `${pins.length} terminal administrator(s) have the same number as a member under ${s} (${pins.join(", ")}): the refill would write those members over them, without administrator rights. Change their number on the terminal, or confirm below.`,
+    `According to the erase's backup, ${pins.length} terminal administrator(s) have the same number as a member under '${s}' (${pins.join(", ")}): the refill would write those members over them, without administrator rights. Refill does not read the terminal again: change their number on the terminal then confirm below, or confirm to have them replaced.`,
   confirmAdminOverwrite: (pins: string[]) =>
-    `I confirm: administrators ${pins.join(", ")} will be replaced by the members with the same number.`,
+    `I confirm for administrators ${pins.join(", ")}: their number was changed on the terminal, or they will be replaced by the members with the same number.`,
   refillWarnAdmins: (pins: string[]) =>
-    `Administrators replaced by members (confirmed): ${pins.join(", ")}.`,
+    `Administrators confirmed (number changed on the terminal, or replaced by the member with the same number): ${pins.join(", ")}.`,
   refillWarnAdminsUnchecked:
     "The terminal's administrators could not be checked (backup unreadable): an administrator who has a member's number will be replaced by that member.",
   notOnHold: "This turnstile is no longer on hold.",

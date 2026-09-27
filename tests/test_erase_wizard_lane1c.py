@@ -330,6 +330,17 @@ class TestRefillChecksAgain:
         status, out = _refill(wiz, 8, None)          # no scheme row in these fakes: None
         assert status == 200 and out["adminPins"] == [] and out["adminCheck"] == "CHECKED"
 
+    def test_a_c3_without_its_device_row_is_not_an_admin_warning(self, sqlite_db, monkeypatch,
+                                                                 tmp_path):
+        """Review round 1 (lane 1c): with the device row gone the protocol is read from the hold's
+        backup -- a C3 has no administrators, so no « could not be checked » warning."""
+        from tests.test_erase_wizard import _devices
+        wiz, _w = self._c3_held(monkeypatch, tmp_path, sqlite_db)
+        _devices(monkeypatch)                       # no device row any more
+        status, out = _refill(wiz, 5, None)
+        assert status == 200 and out["adminCheck"] == "NOT_APPLICABLE"
+        assert out["refill"]["problem"] == "REFILL_SOURCE_MISSING"
+
     def test_an_unreadable_backup_is_a_warning(self, sqlite_db, monkeypatch, tmp_path):
         """A held turnstile's backup is never pruned; if it still cannot be read, the admins
         cannot be checked -- said, not refused (the turnstile would stay empty)."""
@@ -718,15 +729,35 @@ class TestPeopleTheRefillWillNotPutBack:
         assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
         assert not (_run_dir(wiz) / ew.KEEP_MARK).exists(), "nothing erased: prunable as usual"
 
-    def test_a_member_a_sync_removed_after_step_1_stops_the_run(self, sqlite_db, monkeypatch,
-                                                                tmp_path, refill_cache):
+    def test_a_member_who_left_the_roster_since_step_1_does_not_stop_it(self, sqlite_db,
+                                                                         monkeypatch, tmp_path,
+                                                                         refill_cache):
+        """Review round 1 (lane 1c): a member whose right ended since step 1 -- the midnight date
+        flip during a long MB2000 backup -- left MonClub's roster; a normal pass would remove them
+        too. They were not "someone MonClub cannot put back", so the run goes on; they still count
+        as not put back, and their backup is kept."""
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         pv = _preview(wiz, 5)
         assert pv["notRefilled"]["count"] == 0
         refill_cache.users = [u for u in refill_cache.users if u["activeMembershipId"] != 102]
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         run = wiz.status()["run"]
+        assert run["state"] == "DONE", run.get("error")
+        assert run["notRefilled"] == {"count": 1, "pins": ["102"]}
+        assert (_run_dir(wiz) / ew.KEEP_MARK).exists()
+
+    def test_a_member_of_step_1_does_not_cover_a_new_stranger(self, sqlite_db, monkeypatch,
+                                                              tmp_path, refill_cache):
+        """The step-1 roster excuses only its own pins: a person enrolled on the panel since step
+        1 still stops the run, even while members leave the roster."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        pv = _preview(wiz, 5)
+        refill_cache.users = [u for u in refill_cache.users if u["activeMembershipId"] != 102]
+        panel.tables["user"].append({"Pin": "556", "CardNo": "5560", "Name": "Guard Amine"})
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        run = wiz.status()["run"]
         assert run["state"] == "FAILED" and "NOT_REFILLED_CHANGED" in run["error"]
+        assert "556" in run["error"] and "102" not in run["error"]
         assert not [c for c in panel.calls if c[0] == "erase"]
 
     def test_someone_who_left_the_panel_meanwhile_does_not_stop_it(self, sqlite_db, monkeypatch,
