@@ -136,11 +136,36 @@ def root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _now() -> int:
+    import time
+    return int(time.time())
+
+
+def _state(root: Path) -> dict:
+    return json.loads(
+        (root / "logs" / "watchdog-state.json").read_text(encoding="utf-8-sig")
+    )
+
+
+def _seed_state(root: Path, **fields) -> None:
+    logs = root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "watchdog-state.json").write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _age_first_miss(root: Path, seconds: int) -> None:
+    """Move the recorded miss *seconds* into the past: the next check, that much later."""
+    st = _state(root)
+    st["missAt"] = int(st["missAt"]) - seconds
+    _seed_state(root, **st)
+
+
 class TestRestartsOnlyAfterConfirmation:
-    def test_first_miss_waits_and_second_restarts(self, root: Path):
+    def test_first_miss_waits_and_a_later_second_miss_restarts(self, root: Path):
         first = _run(root)
         assert "miss 1/2" in first, f"expected a first-miss hold, got: {first!r}"
 
+        _age_first_miss(root, 120)           # the next check, one 2-minute interval later
         second = _run(root)
         assert "WHATIF: would start" in second, (
             f"expected a restart on the confirming tick, got: {second!r}"
@@ -149,6 +174,75 @@ class TestRestartsOnlyAfterConfirmation:
     def test_a_single_tick_never_restarts(self, root: Path):
         """One missed sample is not evidence -- the updater's own gap looks like this."""
         assert "would start" not in _run(root)
+
+
+class TestMissesAreSpacedInTime:
+    """Two misses must be ~90 s apart, not merely two checks.
+
+    The task has two repeating 2-minute triggers (the logon one and the owner's
+    one that starts at registration, register_watchdog.ps1), on different
+    starts, so two checks can land seconds apart. Counted per check, a tray
+    Quit could then be "confirmed" and Access restarted seconds after it.
+    """
+
+    def test_a_second_miss_seconds_after_the_first_is_not_counted(self, root: Path):
+        assert "miss 1/2" in _run(root)
+        second = _run(root)
+        assert "would start" not in second, (
+            f"two checks seconds apart restarted the app: {second!r}"
+        )
+        assert "not counted" in second, second
+        assert _state(root)["misses"] == 1
+
+    def test_a_second_miss_90_s_after_the_first_counts(self, root: Path):
+        _seed_state(root, misses=1, missAt=_now() - 95, restarts=[])
+        assert "WHATIF: would start" in _run(root)
+
+    def test_a_second_miss_80_s_after_the_first_does_not(self, root: Path):
+        _seed_state(root, misses=1, missAt=_now() - 80, restarts=[])
+        line = _run(root)
+        assert "would start" not in line and "not counted" in line, line
+
+    def test_the_miss_time_is_stored_as_epoch_seconds(self, root: Path):
+        """Integers, never date strings: the culture bug of the restart stamps
+        (README, "Logs") applies to every time in this file."""
+        _run(root)
+        st = _state(root)
+        assert isinstance(st["missAt"], int), st
+        assert abs(st["missAt"] - _now()) < 120, st
+
+    def test_a_miss_time_in_the_future_starts_the_count_again(self, root: Path):
+        """The clock moved back: re-anchor on now rather than wait for the
+        clock to catch up (which would stand the watchdog down for as long)."""
+        _seed_state(root, misses=1, missAt=_now() + 3600, restarts=[])
+        line = _run(root)
+        assert "would start" not in line, line
+        assert "miss 1/2" in line, line
+        assert _state(root)["missAt"] <= _now() + 60
+
+    def test_a_miss_recorded_without_a_time_starts_the_count_again(self, root: Path):
+        """A state file written by an older watchdog script: misses, no time."""
+        _seed_state(root, misses=1, restarts=[])
+        line = _run(root)
+        assert "would start" not in line, line
+        assert "miss 1/2" in line, line
+        assert isinstance(_state(root)["missAt"], int)
+
+    def test_a_miss_time_that_is_not_an_integer_is_not_trusted(self, root: Path):
+        _seed_state(root, misses=1, missAt="2026-09-27T10:00:00", restarts=[])
+        line = _run(root)
+        assert "would start" not in line, line
+        assert "miss 1/2" in line, line
+
+    def test_a_stand_down_clears_the_first_miss(self, root: Path):
+        _seed_state(root, misses=1, missAt=_now() - 120, restarts=[])
+        (root / ".update-in-progress").write_text("")
+        assert "standing down" in _run(root)
+        st = _state(root)
+        assert st["misses"] == 0 and not st.get("missAt"), st
+        (root / ".update-in-progress").unlink()
+        line = _run(root)
+        assert "miss 1/2" in line and "would start" not in line, line
 
 
 class TestStandDownGuards:
@@ -204,11 +298,8 @@ class TestCrashLoopCap:
         import time
         now = int(time.time())
         stamps = [now - (minutes_ago + i) * 60 for i in range(count)]
-        logs = root / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        (logs / "watchdog-state.json").write_text(
-            json.dumps({"misses": 1, "restarts": stamps}), encoding="utf-8"
-        )
+        # missAt: the first miss one check (2 min) ago, so this tick confirms it.
+        _seed_state(root, misses=1, missAt=now - 120, restarts=stamps)
 
     def test_repeated_restarts_inside_the_window_stop(self, root: Path):
         """A crash-looping build must not be relaunched forever."""
@@ -238,11 +329,7 @@ class TestCrashLoopCap:
         import datetime
         now = datetime.datetime.now()
         stamps = [(now - datetime.timedelta(minutes=90 + i)).isoformat() for i in range(5)]
-        logs = root / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        (logs / "watchdog-state.json").write_text(
-            json.dumps({"misses": 1, "restarts": stamps}), encoding="utf-8"
-        )
+        _seed_state(root, misses=1, missAt=_now() - 120, restarts=stamps)
 
         line = _run(root)
         assert "NOT restarting" not in line, (
@@ -277,11 +364,15 @@ param(
     [string] $TaskName,
     [string] $InstallRoot,
     [string] $WatchdogScript,
-    [string] $Initial,         # 'none', or the tasks' States, comma-separated: the first
-                               # at the root folder '\', any others in other folders
+    [string] $Initial,         # 'none', or the tasks, comma-separated: the first at the root
+                               # folder '\', any others in other folders. Each is a State,
+                               # optionally ':true' / ':false' for the definition's
+                               # Settings.Enabled (default: false for 'Disabled' only)
     [string] $HonourEnabled,   # 'yes': a task registered with Settings.Enabled = $false comes back Disabled
     [string] $DisableWorks,    # 'yes': Disable-ScheduledTask takes effect
-    [string] $RegisterFails    # 'yes': the first (non -Xml) registration throws
+    [string] $RegisterFails,   # 'yes': the first (non -Xml) registration throws
+    [string] $XmlHonoured,     # 'yes': a task registered from XML keeps the XML's <Enabled>
+    [string] $Mode             # 'register', or 'remove' (-Remove)
 )
 $ErrorActionPreference = 'Stop'
 Import-Module ScheduledTasks
@@ -291,19 +382,30 @@ $global:Tasks      = New-Object System.Collections.ArrayList
 $global:Honour     = ($HonourEnabled -eq 'yes')
 $global:DisableOk  = ($DisableWorks -eq 'yes')
 $global:FailNext   = ($RegisterFails -eq 'yes')
+$global:XmlOk      = ($XmlHonoured -eq 'yes')
 $global:Expected   = $TaskName
 $global:Registered = $null
+function global:New-FakeTask([string] $Path, [string] $State, [bool] $Enabled) {
+    # State is the runtime state; Settings.Enabled is the definition, as on a real
+    # task (a disabled task whose check is running can read 'Running').
+    [pscustomobject]@{
+        TaskName = $global:Expected; TaskPath = $Path; State = $State
+        Settings = [pscustomobject]@{ Enabled = $Enabled }
+    }
+}
 if ($Initial -ne 'none') {
     $i = 0
     foreach ($s in ($Initial -split ',')) {
-        $path = if ($i -eq 0) { '\' } else { "\Other$i\" }
-        [void] $global:Tasks.Add([pscustomobject]@{ TaskName = $TaskName; TaskPath = $path; State = $s })
+        $parts   = $s -split ':'
+        $enabled = if ($parts.Count -gt 1) { $parts[1] -eq 'true' } else { $parts[0] -ne 'Disabled' }
+        $path    = if ($i -eq 0) { '\' } else { "\Other$i\" }
+        [void] $global:Tasks.Add((New-FakeTask $path $parts[0] $enabled))
         $i++
     }
 }
-function global:Set-RootTask([string] $State) {
+function global:Set-RootTask([bool] $Enabled) {
     foreach ($t in @($global:Tasks | Where-Object { $_.TaskPath -eq '\' })) { $global:Tasks.Remove($t) }
-    [void] $global:Tasks.Add([pscustomobject]@{ TaskName = $global:Expected; TaskPath = '\'; State = $State })
+    [void] $global:Tasks.Add((New-FakeTask '\' $(if ($Enabled) { 'Ready' } else { 'Disabled' }) $Enabled))
 }
 
 function global:Get-ScheduledTask {
@@ -316,7 +418,7 @@ function global:Export-ScheduledTask {
     param([string] $TaskName, [string] $TaskPath)
     [void] $global:Calls.Add('export')
     $t = @($global:Tasks | Where-Object { $_.TaskPath -eq $TaskPath })[0]
-    $enabled = if ($t.State -eq 'Disabled') { 'false' } else { 'true' }
+    $enabled = if ($t.Settings.Enabled) { 'true' } else { 'false' }
     "<Task><Settings><Enabled>$enabled</Enabled></Settings></Task>"
 }
 function global:Unregister-ScheduledTask {
@@ -328,7 +430,7 @@ function global:Register-ScheduledTask {
     param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description, $Xml)
     if ($Xml) {
         [void] $global:Calls.Add('register-xml')
-        Set-RootTask $(if ($Xml -match '<Enabled>false</Enabled>') { 'Disabled' } else { 'Ready' })
+        Set-RootTask (-not ($global:XmlOk -and $Xml -match '<Enabled>false</Enabled>'))
         return [pscustomobject]@{ TaskName = $TaskName }
     }
     if ($global:FailNext) {
@@ -341,19 +443,22 @@ function global:Register-ScheduledTask {
         name     = [string] $TaskName
         enabled  = [bool] $Settings.Enabled
         triggers = @($Trigger).Count
+        priority = [int] $Settings.Priority
     }
-    Set-RootTask $(if ($global:Honour -and -not $Settings.Enabled) { 'Disabled' } else { 'Ready' })
+    Set-RootTask (-not ($global:Honour -and -not $Settings.Enabled))
     [pscustomobject]@{ TaskName = $TaskName }
 }
 function global:Disable-ScheduledTask {
     param([string] $TaskName)
     [void] $global:Calls.Add('disable')
-    if ($global:DisableOk) { foreach ($t in $global:Tasks) { $t.State = 'Disabled' } }
+    if ($global:DisableOk) {
+        foreach ($t in $global:Tasks) { $t.State = 'Disabled'; $t.Settings.Enabled = $false }
+    }
 }
 function global:Enable-ScheduledTask {
     param([string] $TaskName)
     [void] $global:Calls.Add('enable')
-    foreach ($t in $global:Tasks) { $t.State = 'Ready' }
+    foreach ($t in $global:Tasks) { $t.State = 'Ready'; $t.Settings.Enabled = $true }
 }
 function global:Set-ScheduledTask {
     # The script has no reason to call it; if it ever does, fail rather than
@@ -375,8 +480,13 @@ foreach ($name in $stubs) {
 $err = ''
 $iv = @(); $wv = @()
 try {
-    & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript `
-        -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
+    if ($Mode -eq 'remove') {
+        & $Script -TaskName $TaskName -InstallRoot $InstallRoot -Remove `
+            -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
+    } else {
+        & $Script -TaskName $TaskName -InstallRoot $InstallRoot -WatchdogScript $WatchdogScript `
+            -InformationVariable iv -WarningVariable wv 3>$null 6>$null | Out-Null
+    }
 } catch {
     $err = $_.Exception.Message
 } finally {
@@ -390,6 +500,7 @@ $result = [pscustomobject]@{
     calls      = @($global:Calls)
     registered = $global:Registered
     final      = (@($global:Tasks | ForEach-Object { [string] $_.State }) -join ',')
+    enabled    = (@($global:Tasks | ForEach-Object { [string] $_.Settings.Enabled }) -join ',')
     output     = (@($iv) + @($wv) | ForEach-Object { [string] $_ }) -join "`n"
     error      = $err
 }
@@ -404,12 +515,18 @@ def _register(
     honour_enabled: bool = True,
     disable_works: bool = True,
     register_fails: bool = False,
+    xml_honoured: bool = True,
+    mode: str = "register",
 ) -> dict:
-    """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler."""
+    """Run the shipped register_watchdog.ps1 once against a stubbed Task Scheduler.
+
+    The result also carries ``log``: the script's own log under the install
+    root (``logs/watchdog-register.log``), "" when it wrote none.
+    """
     harness = tmp_path / "register_harness.ps1"
     harness.write_text(_REGISTER_HARNESS, encoding="utf-8")
     watchdog_dir = tmp_path / "watchdog"          # no hidden launcher in here
-    watchdog_dir.mkdir()
+    watchdog_dir.mkdir(exist_ok=True)
     watchdog = watchdog_dir / "monclub_access_watchdog.ps1"
     watchdog.write_text("# stand-in; never run\n", encoding="utf-8")
     task = f"MonClub TEST {uuid.uuid4().hex}"
@@ -424,7 +541,9 @@ def _register(
          "-Initial", initial,
          "-HonourEnabled", "yes" if honour_enabled else "no",
          "-DisableWorks", "yes" if disable_works else "no",
-         "-RegisterFails", "yes" if register_fails else "no"],
+         "-RegisterFails", "yes" if register_fails else "no",
+         "-XmlHonoured", "yes" if xml_honoured else "no",
+         "-Mode", mode],
         capture_output=True, text=True, timeout=120, check=False,
     )
     assert "LEAKED" not in out.stdout, (
@@ -435,11 +554,14 @@ def _register(
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith("RESULT ")]
     assert lines, f"harness gave no result: stdout={out.stdout!r} stderr={out.stderr!r}"
     result = json.loads(lines[-1][len("RESULT "):])
-    assert any(c.startswith("register") for c in result["calls"]), (
-        f"the script never reached the stubbed Register-ScheduledTask: {result!r}"
-    )
+    if mode == "register":
+        assert any(c.startswith("register") for c in result["calls"]), (
+            f"the script never reached the stubbed Register-ScheduledTask: {result!r}"
+        )
     if result["registered"] is not None:
         assert result["registered"]["name"] == task, result
+    log = tmp_path / "root" / "logs" / "watchdog-register.log"
+    result["log"] = log.read_text(encoding="utf-8-sig") if log.exists() else ""
     return result
 
 
@@ -478,6 +600,125 @@ class TestRegisterKeepsADisabledTaskDisabled:
         r = _register(tmp_path, initial="Disabled", honour_enabled=False, disable_works=False)
         assert "could not be kept disabled" in r["error"], r
         assert "Disable-ScheduledTask" in r["error"]
+
+    def test_failing_loudly_never_leaves_the_new_task_enabled(self, tmp_path: Path):
+        """Before it throws, the new (enabled) task is removed and the old one --
+        exported disabled -- is put back."""
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False, disable_works=False)
+        assert "could not be kept disabled" in r["error"], r
+        assert "Ready" not in r["final"].split(","), r
+        assert r["final"] == "Disabled", r
+        calls = r["calls"]
+        last_unregister = len(calls) - 1 - calls[::-1].index("unregister")
+        assert calls.index("register") < last_unregister < calls.index("register-xml"), calls
+
+    def test_if_the_put_back_comes_back_enabled_too_no_task_is_left(self, tmp_path: Path):
+        """Nothing keeps it disabled: no task at all beats an enabled one."""
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False,
+                      disable_works=False, xml_honoured=False)
+        assert "could not be kept disabled" in r["error"], r
+        assert r["final"] == "", r
+
+    def test_a_disabled_task_whose_check_is_running_stays_disabled(self, tmp_path: Path):
+        """TASK_STATE_DISABLED means "disabled, and no instance queued or
+        running", so a disabled task whose check is running reads 'Running'.
+        Keep-disabled is read from the definition (Settings.Enabled)."""
+        r = _register(tmp_path, initial="Running:false")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is False, (
+            f"a disabled task caught mid-check was re-registered ENABLED: {r!r}"
+        )
+        assert r["final"] == "Disabled", r
+        assert re.search(r"State:\s+Disabled \(kept\)", r["output"]), r["output"]
+
+    def test_an_enabled_task_whose_check_is_running_stays_enabled(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Running:true")
+        assert r["error"] == "", r
+        assert r["registered"]["enabled"] is True, r
+        assert r["final"] == "Ready", r
+
+    def test_a_put_back_that_comes_back_enabled_is_disabled_again(self, tmp_path: Path):
+        """The put-back after a failed registration is read back too."""
+        r = _register(tmp_path, initial="Disabled", register_fails=True, xml_honoured=False)
+        assert "stub: registration failed" in r["error"], r
+        assert r["calls"].index("register-xml") < r["calls"].index("disable"), r["calls"]
+        assert r["final"] == "Disabled", r
+
+    def test_a_put_back_that_stays_enabled_is_removed(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", register_fails=True,
+                      xml_honoured=False, disable_works=False)
+        assert "stub: registration failed" in r["error"], r
+        assert r["final"] == "", r
+
+    def test_an_enabled_task_is_put_back_enabled(self, tmp_path: Path):
+        """The read-back applies only to a task that was disabled."""
+        r = _register(tmp_path, initial="Ready", register_fails=True)
+        assert "stub: registration failed" in r["error"], r
+        assert r["final"] == "Ready", r
+        assert "disable" not in r["calls"], r
+
+    def test_the_task_runs_at_normal_priority(self, tmp_path: Path):
+        """Task Scheduler's default priority is 7 (below normal), and the
+        process the task starts -- and, it is believed, Access started from it
+        -- runs at that class. 5 is a normal-priority value."""
+        r = _register(tmp_path, initial="none")
+        assert r["registered"]["priority"] == 5, r
+
+
+@pytest.mark.skipif(winps is None, reason="Windows PowerShell (powershell.exe) not available")
+@pytest.mark.skipif(not REGISTER.exists(), reason=f"{REGISTER} missing")
+class TestRegisterLeavesATrace:
+    """The installer runs the script hidden, and nothing reads its exit code:
+    the outcome must be written where someone can find it afterwards --
+    ``<InstallRoot>\\logs\\watchdog-register.log``."""
+
+    def test_a_kept_disabled_registration_is_logged(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled")
+        assert "OK" in r["log"], r["log"]
+        assert "State: Disabled (kept)" in r["log"], r["log"]
+        assert "Launch mode:" in r["log"], r["log"]
+
+    def test_an_enabled_registration_is_logged(self, tmp_path: Path):
+        r = _register(tmp_path, initial="none")
+        assert "OK" in r["log"] and "State: Enabled" in r["log"], r["log"]
+
+    def test_a_failure_is_logged_with_its_error(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", honour_enabled=False, disable_works=False)
+        assert "FAILED" in r["log"], r["log"]
+        assert "could not be kept disabled" in r["log"], r["log"]
+
+    def test_a_failed_registration_and_its_put_back_are_logged(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Disabled", register_fails=True)
+        assert "FAILED" in r["log"] and "stub: registration failed" in r["log"], r["log"]
+        assert "put back" in r["log"], r["log"]
+
+    def test_a_removal_is_logged(self, tmp_path: Path):
+        r = _register(tmp_path, initial="Ready", mode="remove")
+        assert r["error"] == "", r
+        assert r["final"] == "", r
+        assert "Remove" in r["log"], r["log"]
+        assert "task before: Ready" in r["log"] and "after: no task" in r["log"], r["log"]
+
+    def test_the_log_keeps_earlier_runs(self, tmp_path: Path):
+        _register(tmp_path, initial="none")
+        r = _register(tmp_path, initial="Disabled")
+        assert r["log"].count("OK") >= 2, r["log"]
+
+    def test_a_failure_exits_non_zero_and_is_logged(self, tmp_path: Path):
+        """Run as the installer runs it (powershell -File). It fails before any
+        Task Scheduler cmdlet: the watchdog script it is given does not exist."""
+        root = tmp_path / "root"
+        out = subprocess.run(
+            [winps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(REGISTER),
+             "-TaskName", f"MonClub TEST {uuid.uuid4().hex}",
+             "-InstallRoot", str(root),
+             "-WatchdogScript", str(tmp_path / "missing" / "monclub_access_watchdog.ps1")],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        assert out.returncode != 0, (out.returncode, out.stdout, out.stderr)
+        log = (root / "logs" / "watchdog-register.log").read_text(encoding="utf-8-sig")
+        assert "FAILED" in log and "not found" in log, log
 
     def test_a_failed_registration_puts_the_disabled_task_back(self, tmp_path: Path):
         """The old task is removed before the new one is registered. Without the
@@ -597,7 +838,12 @@ class TestInstallerWatchdogTask:
         )
 
     def test_checkedonce_is_not_used(self):
-        for ln in self._tasks():
+        """Not on any task: the Start Menu shortcut used it, and was unticked at
+        every update of a PC where it had been ticked."""
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        tasks = _iss_section(text, "Tasks")
+        assert any(re.search(r'Name:\s*"startmenuicon"', ln) for ln in tasks), tasks
+        for ln in tasks:
             assert "checkedonce" not in ln.lower(), (
                 f"checkedonce unticks a previously ticked box on every update: {ln!r}"
             )
@@ -621,6 +867,19 @@ class TestInstallerWatchdogTask:
         assert len(runs) == 1, runs
         assert re.search(r"Tasks:\s*watchdog\b", runs[0]), runs[0]
         assert "-Remove" not in runs[0]
+
+    def test_setup_always_writes_its_log(self):
+        """The in-app update starts the installer with /VERYSILENT and no /LOG
+        (shared/update_runtime.py): without SetupLogging it leaves no log at all."""
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        setup = [ln.replace(" ", "").lower() for ln in _iss_section(text, "Setup")]
+        assert "setuplogging=yes" in setup, setup
+
+    def test_the_register_script_output_goes_to_the_setup_log(self):
+        text = INSTALLER.read_text(encoding="utf-8", errors="replace")
+        runs = [ln for ln in _iss_section(text, "Run") if "register_watchdog.ps1" in ln]
+        assert len(runs) == 1, runs
+        assert re.search(r"Flags:[^;]*\blogoutput\b", runs[0]), runs[0]
 
     def test_the_hidden_launcher_ships_next_to_the_scripts(self):
         """register_watchdog.ps1 looks for it beside the watchdog script."""

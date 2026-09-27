@@ -53,9 +53,18 @@ OutputBaseFilename={#OutputBaseFilename}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+; Always write Setup's log (%TEMP%\Setup Log <date> #<n>.txt), as /LOG would. The
+; in-app update starts this installer with /VERYSILENT and no /LOG
+; (shared/update_runtime.py), so without it a silent update left no log at all --
+; including the watchdog registration's output ([Run], Flags: logoutput).
+SetupLogging=yes
 
 [Tasks]
-Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"; Flags: checkedonce
+; Start Menu shortcut: ticked for a new install; an existing install keeps its previous
+; choice (UsePreviousTasks=yes). It used Flags: checkedonce, which unticked it at every
+; update of a PC where it had been ticked (Inno Setup source, see the watchdog entries
+; below). An update records that choice, so a PC already updated once keeps it unticked.
+Name: "startmenuicon"; Description: "Create a &Start Menu shortcut"; GroupDescription: "Additional icons:"
 Name: "desktopicon"; Description: "Create a &Desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 ; "Keep MonClub Access running" registers a per-user scheduled task that both starts
 ; MonClub Access at logon and restarts it if the backend process dies.
@@ -107,10 +116,12 @@ Name: "{userdesktop}\MonClubAccess"; Filename: "{app}\current\{#MainExe}"; Tasks
 ; runascurrentuser keeps it a per-user task (PrivilegesRequired=lowest, and the app
 ; needs the interactive desktop session for its tray icon and Tauri window -- a
 ; SYSTEM task would start it in session 0 where nobody can see it).
+; logoutput: the script's output goes into Setup's log (SetupLogging=yes). Nothing reads
+; its exit code; the script also writes its outcome to {app}\logs\watchdog-register.log.
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\watchdog\register_watchdog.ps1"" -InstallRoot ""{app}"""; \
   StatusMsg: "Registering the MonClub Access watchdog..."; \
-  Flags: runhidden runascurrentuser waituntilterminated; \
+  Flags: runhidden runascurrentuser waituntilterminated logoutput; \
   Tasks: watchdog
 
 Filename: "{app}\current\{#MainExe}"; Description: "Launch MonClub Access"; Flags: nowait postinstall
