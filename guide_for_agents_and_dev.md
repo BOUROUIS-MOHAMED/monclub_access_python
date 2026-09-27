@@ -2056,11 +2056,13 @@ run folder's `run.json`):
      reads step 1 again). That roster excuses its pins only under the scheme it was read with: a pin-scheme switch saved
      since step 1 (during the backup) ends the run `PIN_SCHEME_CHANGED`, `FAILED`, nothing erased — every old pin would
      otherwise read "not put back" (lane 1c review round 2).
-   - *A stop before the first delete once the scheme moved keeps the hold* (lane 1c review round 3,
-     `EraseWizard._scheme_moved`): any `FAILED` run — that one, or a now/auto re-check finding withheld rows under the new
-     scheme — whose turnstile's scheme differs from the run's start (or does not read) keeps the hold and asks no pass,
-     note `HELD_SCHEME_MOVED`: the terminal still holds every pin of the old scheme, and a released pass would write the
-     new scheme's pins beside them. The operator erases again with "hold" (step 1 then lists every old pin as not put
+   - *A stop before the first delete once the scheme moved keeps the hold* (lane 1c review rounds 3-4,
+     `EraseWizard._scheme_moved_note`): any `FAILED` run — that one, or a now/auto re-check finding withheld rows under the
+     new scheme — whose turnstile's scheme differs from the run's start keeps the hold and asks no pass, note
+     `HELD_SCHEME_MOVED` (a scheme that does not read: the same, note `HELD_SCHEME_UNREADABLE`, "check the scheme, then
+     Refill"): the terminal still holds every pin of the old scheme, and a released pass would write the new scheme's pins
+     beside them. The run's start scheme is step 1's: `start()` refuses a switch saved between step 1 and START (409
+     `PIN_SCHEME_CHANGED`, nothing held, the page reads step 1 again; a backup-only rehearsal is not refused). The operator erases again with "hold" (step 1 then lists every old pin as not put
      back), or sets the scheme back, before « Remplir » — `_refill`'s own end-of-run rule. The hold is still at
      `erase-prep`, so a restart releases it (§ "A run stopped before any delete leaves no hold"): the protection covers the
      running session only. With the scheme unchanged a `FAILED` run releases as before. `[TEST:
