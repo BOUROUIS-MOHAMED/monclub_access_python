@@ -750,11 +750,13 @@ def test_the_enrolment_fallback_sync_flips_after_its_full_save(tmp_path, monkeyp
         _find_user_membership=lambda _uid: (None, None),
         _request_running_ultra_sync=lambda **_kw: None,
         _apply_date_flips=lambda source, **_kw: order.append(("flip", source)),
+        # lane B (review R2-3): the full save writes device rows too; the workers follow first
+        _refresh_running_ultra_devices=lambda **kw: order.append(("refresh", kw.get("reason"))) or True,
     )
 
     MainApp._remote_enroll_worker(self_obj, 35, 1, "", "zk9500", None, "e-p3b1")
 
-    assert order == ["fetch", ("save", "v2"), ("flip", "save")]
+    assert order == ["fetch", ("save", "v2"), ("refresh", "enroll-save"), ("flip", "save")]
 
 
 # ================================================================== 7. the heartbeat

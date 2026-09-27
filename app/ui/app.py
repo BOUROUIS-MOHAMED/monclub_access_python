@@ -98,6 +98,7 @@ from shared.api.monclub_api import MonClubApi, MonClubApiConflictError, MonClubA
 from app.core.change_detector import ChangeDetectorService
 from app.core.log_sync_request_poller import LogSyncRequestPoller
 from app.core.sync_retry import sync_retry_delay_sec
+from app.core.sync_cadence import healthy_sync_delay_sec, safety_target_sec
 from app.core.sync_observability import (
     SyncTriggerContext,
     build_sync_response_summary,
@@ -109,8 +110,10 @@ from app.core.sync_scope import (
     apply_trigger_hint_to_version_tokens,
     device_membership_scope_changed,
     member_cache_is_stale,
+    member_id_set_digest,
     strip_all_member_version_tokens,
     strip_member_version_tokens,
+    token_id_set_digest,
 )
 from app.core.utils import LOG_DIR
 
@@ -1141,6 +1144,56 @@ class MainApp:
             )
         return started
 
+    def _refresh_running_ultra_devices(self, *, reason: str) -> bool:
+        """Hand the running ULTRA workers the device rows the database holds now.
+
+        A worker pushes from its own copy of its device row. A GYM_DEVICE fast patch or a
+        sync's device section changes the database at once -- a pinScheme switch included --
+        so the copies are refreshed BEFORE any pass is queued on them, not at the end of the
+        next sync tick (release checklist §3a, guide §3.2e). True when refreshed, or when no
+        ULTRA engine runs; False when the rows could not be read or applied (logged). The push
+        passes re-check the recorded scheme themselves, so a stale copy never writes pins of a
+        scheme the database no longer records.
+        """
+        with self._ultra_lock:
+            engine = getattr(self, "_ultra_engine", None)
+            if engine is None or not getattr(engine, "running", False):
+                return True
+            try:
+                from app.core.db import list_sync_devices_payload
+
+                # Only devices that already have a worker: refresh_devices also replaces the
+                # scheduler's device list, and the scheduler pushes a device WITHOUT a worker over
+                # its own session (review R1-F2). A device added or switched to ULTRA gets its
+                # worker when the next sync tick restarts the engine, as before. Not filtered by
+                # the lease here: refresh_devices applies it to the scheduler list only (R1-F5).
+                workers = {int(i) for i in (getattr(engine, "_workers", None) or {})}
+                devices = []
+                for d in list_sync_devices_payload():
+                    if not isinstance(d, dict) or str(d.get("accessDataMode", "")).strip().upper() != "ULTRA":
+                        continue
+                    try:
+                        if int(d.get("id")) in workers:
+                            devices.append(d)
+                    except (TypeError, ValueError):
+                        continue
+                # The scheduler's list is replaced only when every worker is driven -- the
+                # condition the end-of-tick refresh has always had. While a lease is away its list
+                # would lose that device, and nothing put it back once the lease returned (review
+                # R2-4); the next tick restarts or refreshes the engine as before.
+                from app.core.v2 import lease_gate
+
+                driven = {int(d.get("id")) for d in lease_gate.filter_devices(devices)}
+                refreshed = int(engine.refresh_devices(
+                    devices, update_scheduler=(driven == workers)) or 0)
+            except Exception:
+                self.logger.warning(
+                    "[ULTRA] worker device rows not refreshed (%s)", reason, exc_info=True,
+                )
+                return False
+        self.logger.info("[ULTRA] refreshed %d worker device row(s) (%s)", refreshed, reason)
+        return True
+
     def _defer_ultra_reconnects(self, *, trigger_source: str, duration_sec: float = 20.0) -> int:
         if not _should_defer_ultra_reconnects(trigger_source):
             return 0
@@ -1334,10 +1387,19 @@ class MainApp:
         sync_run_id: int | None,
         final_status: str,
         trigger_context: SyncTriggerContext,
+        brought_changes: bool = True,
     ) -> None:
         if sync_run_id is None:
             return
         if str(final_status or "").strip().upper() != "SUCCESS":
+            return
+        if (not brought_changes
+                and str(getattr(trigger_context, "trigger_source", "") or "").strip().upper() == "TIMER"
+                and self._v2_safety_sync() is not None):
+            # A v2 safety tick runs every 2-10 min (guide §3.6): the desk's success sound and
+            # confetti are not played for one that brought nothing (review R1-F1); one that did
+            # still plays them, as the probe's sync for that change did (R2-5). Outside safety
+            # mode the 30-min timer sync plays them as before.
             return
         self.publish_feedback_event(
             "sync_completed_success",
@@ -1466,6 +1528,34 @@ class MainApp:
             return  # already armed
         self._daily_sync_check()
 
+    def change_detection_gated(self) -> bool:
+        """Is the 45 s members-version probe off? While the v2 safety sync runs (guide §3.6), and
+        only then: notices announce changes within seconds while the socket is up, and the data
+        sync runs every 120 s while it is down. Called by the probe's own thread before each poll;
+        the change of state is logged once."""
+        gated = self._v2_safety_sync() is not None
+        if gated != getattr(self, "_change_detection_gated_last", False):
+            self._change_detection_gated_last = gated
+            self.logger.info(
+                "[ChangeDetector] %s",
+                "paused: the v2 safety sync replaces the 45 s probe"
+                if gated else "resumed: the v2 safety sync is not active",
+            )
+        return gated
+
+    def _daily_sync_gated(self) -> bool:
+        """Is the in-memory 22:00 job off today? While the v2 safety sync runs, unless the gym is
+        in manual sync mode: there the 22:00 job is the only automatic push of the day (a safety
+        sync is a TIMER sync, which manual mode never pushes), so it stays. guide §3.6."""
+        if self._v2_safety_sync() is None:
+            return False
+        try:
+            from app.core.settings_reader import get_backend_global_settings
+
+            return not bool((get_backend_global_settings() or {}).get("manual_sync_mode", False))
+        except Exception:
+            return False
+
     def _daily_sync_check(self) -> None:
         try:
             from datetime import datetime
@@ -1473,6 +1563,16 @@ class MainApp:
             now = datetime.now()  # local time (gym PC clock)
             today = now.date().isoformat()
             if now.hour >= self._daily_sync_hour and self._daily_sync_last_run_date != today:
+                if self._daily_sync_gated():
+                    # Not marked as run: if the safety sync stops later today (a v1 answer, the
+                    # switch turned off), the job still fires tonight.
+                    if getattr(self, "_daily_sync_gated_logged", None) != today:
+                        self._daily_sync_gated_logged = today
+                        self.logger.info(
+                            "[DailySync] Not fired today: v2 safety mode is on (the safety sync "
+                            "replaces it; guide §3.6)"
+                        )
+                    return
                 self._daily_sync_last_run_date = today
                 self.logger.info(
                     "[DailySync] Firing scheduled daily auto-sync (>= %02d:00 local)",
@@ -1906,6 +2006,29 @@ class MainApp:
         if db_result.get("ignored") == "duplicate_bundle":
             return {"ok": True, "duplicate": True, **db_result}
 
+        # A device item -- a pinScheme switch among them -- reaches the running workers BEFORE
+        # anything queues a pass on their device copies: the date flip below may queue one
+        # itself (review R1-F6), the dispatch further down does (release checklist §3a, guide
+        # §3.2e). Every item the bundle carries counts, applied or not: the database is the
+        # truth either way and re-reading it is idempotent. A failed refresh still dispatches:
+        # the passes refuse pins of a scheme the database no longer records, and the full
+        # reconcile scheduled below refreshes the copies.
+        worker_refresh_failed = False
+        try:
+            if any(
+                isinstance(item, dict) and (
+                    str(item.get("entityType") or "").strip().upper() == "GYM_DEVICE"
+                    or (isinstance(item.get("impact"), dict)
+                        and bool(item["impact"].get("requiresDeviceRescope")))
+                )
+                for item in list((bundle or {}).get("items") or [])
+            ):
+                worker_refresh_failed = not self._refresh_running_ultra_devices(
+                    reason="FAST_PATCH_BUNDLE")
+        except Exception:
+            self.logger.warning("[FastPatch] worker device refresh failed", exc_info=True)
+            worker_refresh_failed = True
+
         # P3b-1: an upsert can put a held membership back on sync_users (e.g. on its freeze
         # day); the flip re-applies the gym date before anything is dispatched.
         self._apply_date_flips("fast-patch")
@@ -1943,6 +2066,8 @@ class MainApp:
                 for item_index, item in enumerate(raw_items)
                 if isinstance(item, dict)
             }
+            if worker_refresh_failed:
+                _schedule_full_reconcile("worker_device_refresh_failed")
             raw_applied_count = db_result.get("applied")
             raw_skipped_count = db_result.get("skipped")
             counts_valid = (
@@ -2788,6 +2913,8 @@ class MainApp:
 
         base_interval = self._sync_base_interval_sec()
         if after_failure:
+            # The retry steps and the Retry-After clamp keep the healthy INTERVAL as their cap,
+            # never the v2 safety cadence below: an outage or a 429 is not retried faster.
             interval = sync_retry_delay_sec(
                 self._sync_fail_count,
                 base_interval,
@@ -2799,8 +2926,79 @@ class MainApp:
                 interval, self._sync_fail_count, self._sync_retry_after_sec, base_interval,
             )
         else:
-            self._sync_after_id = self.after(base_interval * 1000, self._sync_tick)
-            self.logger.info(f"Sync scheduled every {base_interval} sec")
+            safety = self._v2_safety_sync()
+            interval = healthy_sync_delay_sec(base_interval, safety)
+            self._sync_after_id = self.after(int(interval * 1000), self._sync_tick)
+            if safety is None:
+                self.logger.info(f"Sync scheduled every {base_interval} sec")
+            else:
+                self.logger.info(
+                    "Sync scheduled in %.0fs (v2 safety sync: socket %s, reconcileSec=%s; "
+                    "healthy interval %ss)", interval,
+                    "up" if safety["socket_connected"] else "down", safety["reconcile_sec"],
+                    base_interval,
+                )
+        self._sync_timer_due_mono = time.monotonic() + float(interval)
+
+    def _v2_safety_sync(self) -> Optional[Dict[str, Any]]:
+        """``{"reconcile_sec", "socket_connected"}`` while this PC is v2-on AND trusted, else None.
+
+        v2-on: the v2 runtime's ``availability`` is ON (the server answers the v2 PC routes --
+        the commands switch). Trusted: the stored protocol-2 windows are trusted (the dates
+        switch, a members section applied) and the server sent a positive
+        ``syncMeta.reconcileSec``. ONE predicate for the timer cadence (app/core/sync_cadence.py),
+        the members-version probe and the 22:00 job, so the probe can never be off while the
+        cadence is the long one. Any doubt -- no runtime yet, UNKNOWN or OFF, an unreadable
+        state -- answers None: today's behaviour. guide §3.6.
+        """
+        try:
+            runtime = getattr(self, "_v2_runtime", None)
+            if runtime is None or getattr(runtime, "availability", None) != "ON":
+                return None
+            from app.core.db import get_access_v2_state
+
+            state = get_access_v2_state() or {}
+            if state.get("trusted") is not True:
+                return None
+            reconcile_sec = state.get("reconcile_sec")
+            if isinstance(reconcile_sec, bool) or not isinstance(reconcile_sec, int) or reconcile_sec <= 0:
+                return None
+            notice = getattr(runtime, "notice", None)
+            return {"reconcile_sec": int(reconcile_sec),
+                    "socket_connected": bool(getattr(notice, "connected", False))}
+        except Exception:
+            return None
+
+    def _tighten_sync_timer(self, reason: str) -> None:
+        """Bring the next healthy sync forward when the safety cadence got shorter.
+
+        Called on the loop thread when the notice socket drops, when v2 comes on, and after each
+        successful sync (trust may have just arrived with a save). It never pushes a sync back --
+        a longer cadence waits for the next tick -- and never touches a failure retry: the
+        failure schedule owns the timer then. guide §3.6.
+        """
+        try:
+            if self._sync_fail_count > 0:
+                return
+            safety = self._v2_safety_sync()
+            if safety is None:
+                return
+            now = time.monotonic()
+            due = getattr(self, "_sync_timer_due_mono", None)
+            if (self._sync_after_id is not None and due is not None
+                    and due - now <= safety_target_sec(safety)):
+                return
+            delay = healthy_sync_delay_sec(self._sync_base_interval_sec(), safety)
+            if self._sync_after_id is not None:
+                try:
+                    self.after_cancel(self._sync_after_id)
+                except Exception:
+                    pass
+            self._sync_after_id = self.after(int(delay * 1000), self._sync_tick)
+            self._sync_timer_due_mono = now + delay
+            self.logger.info("[SYNC] v2 safety sync: next data sync in %.0fs (%s)", delay, reason)
+        except Exception:
+            self.logger.debug("[SYNC] safety timer not tightened (%s)", reason, exc_info=True)
 
     def _ensure_sync_timer(self):
         """Arm the healthy sync timer only if none is armed (startup, access/runtime.py).
@@ -2842,6 +3040,117 @@ class MainApp:
         last = self._last_tick_device_reconcile_mono
         return last is None or time.monotonic() - last >= _OFFLINE_RECONCILE_INTERVAL_SEC
 
+    def _safety_tick_device_reconcile_due(self, tick_started_mono: float) -> bool:
+        """May a successful TIMER tick that refreshed nothing reconcile the DEVICE-mode panels?
+
+        Outside the v2 safety sync every such tick does, as before: the timer ticks one healthy
+        interval apart. Inside it the timer ticks every 2-10 min, so only a tick that started at
+        least one healthy interval after the last dispatched reconcile does -- the old cadence.
+        """
+        if self._v2_safety_sync() is None:
+            return True
+        last = self._last_tick_device_reconcile_mono
+        return last is None or tick_started_mono - last >= self._sync_base_interval_sec()
+
+    def _missing_member_action(
+        self, *, server_ids, local_ids, source: str,
+    ) -> Tuple[Optional[str], set]:
+        """Decide what the members the server lists and this PC lacks call for.
+
+        ``("full_refresh", ids)``: members missing that no full refresh has failed to bring.
+        ``("suppressed", ids)``: members a FULL members section just carried and the PC still does
+        not hold -- rows it could not store, which another full refresh cannot fix; remembered, and
+        never refreshed for again while they stay missing (a member that arrives, or leaves the
+        server's list, is forgotten). ``(None, set())``: nothing new. guide §3.6.
+        """
+        missing = {int(m) for m in server_ids} - {int(m) for m in local_ids}
+        unfixed = getattr(self, "_missing_members_unfixed", None)
+        if unfixed is None:
+            unfixed = self._missing_members_unfixed = set()
+        unfixed &= missing
+        if not missing:
+            return None, set()
+        new = missing - unfixed
+        if source == "full":
+            unfixed |= missing
+            return ("suppressed", new) if new else (None, set())
+        return ("full_refresh", new) if new else (None, set())
+
+    def _check_missing_members(self, *, data: Dict[str, Any], refresh: Dict[str, Any],
+                               outcome: Dict[str, Any], members_token: Any,
+                               trigger_hint: Any = None) -> None:
+        """After a successful sync: is a member the server lists missing on this PC? (lane B)
+
+        Compared with ``sync_users`` + ``sync_users_held`` (``db.list_local_member_ids``):
+        * a members section applied with a valid authority -- its validated ids
+          (``outcome["authoritative_member_ids"]``: a delta's validMemberIds, a full answer's
+          users[]); a full answer's gap is reported, never refreshed again;
+        * no members section, protocol-2 windows trusted -- ``member_access_window``, the server's
+          set of the day (replaced whole by each members section);
+        * no members section, not trusted, a P1a token -- its id-set digest; a digest cannot tell a
+          missing member from an extra row, so a mismatch asks ONE delta answer per token value
+          (``probeMemberSet``), whose validMemberIds then decide. The probe counts as asked only
+          once a sync that CARRIED it has completed: a pending request can be replaced by a
+          later automatic one before it runs (review R1-F4).
+        A missing member asks an immediate FULL member refresh (``forceMemberRefresh``). This only
+        reads; the refresh it asks for is the ordinary one, with its H-006 and previous-day guards.
+        """
+        try:
+            from app.core.db import get_access_v2_state, list_local_member_ids, list_member_window_ids
+
+            if isinstance(trigger_hint, dict) and trigger_hint.get("probeMemberSet"):
+                self._member_set_probed_token = members_token
+            if refresh.get("members"):
+                if outcome.get("members_delete_refused") or not outcome.get(
+                        "authoritative_member_ids_valid", False):
+                    return   # the refusal already dropped the member tokens (§3.4)
+                server_ids = outcome.get("authoritative_member_ids")
+                if not isinstance(server_ids, (list, tuple, set)):
+                    return
+                source = "delta" if data.get("membersDeltaMode") else "full"
+            elif (get_access_v2_state() or {}).get("trusted") is True:
+                server_ids, source = list_member_window_ids(), "windows"
+            else:
+                digest = token_id_set_digest(members_token)
+                if digest is None or member_id_set_digest(list_local_member_ids()) == digest:
+                    return
+                if getattr(self, "_member_set_probed_token", None) == members_token:
+                    return   # a probe for this token already came back
+                self._report_missing_members(source="digest", action="probe", ids=None)
+                self._request_member_refresh({"reason": "member-set-probe", "probeMemberSet": True})
+                return
+            action, ids = self._missing_member_action(
+                server_ids=server_ids, local_ids=list_local_member_ids(), source=source)
+            if action is None:
+                return
+            self._report_missing_members(source=source, action=action, ids=ids)
+            if action == "full_refresh":
+                self._request_member_refresh({"reason": "missing-members", "forceMemberRefresh": True})
+        except Exception:
+            self.logger.warning("[SYNC] missing-member check failed (nothing asked)", exc_info=True)
+
+    def _report_missing_members(self, *, source: str, action: str, ids) -> None:
+        sample = ",".join(str(m) for m in sorted(ids)[:20]) if ids else None
+        if action == "suppressed":
+            self.logger.warning(
+                "[SYNC] %d member(s) the server's full list names are still not stored on this PC "
+                "after a full refresh -- reported, not refreshed again: %s", len(ids), sample)
+        elif action == "probe":
+            self.logger.warning(
+                "[SYNC] the local member set does not match the server token's id-set digest -- "
+                "asking one delta answer to name the difference")
+        else:
+            self.logger.warning(
+                "[SYNC] %d member(s) the server lists are missing on this PC (%s) -- asking a full "
+                "member refresh: %s", len(ids), source, sample)
+        _tel.warn("MEMBERS_MISSING", source=source, action=action,
+                  count=len(ids) if ids is not None else None, sample=sample)
+
+    def _request_member_refresh(self, hint: Dict[str, Any]) -> None:
+        """Posted to the loop: the next sync carries ``hint`` (sync_scope strips the tokens)."""
+        self.after(0, lambda: self.request_sync_now(
+            trigger_source="MISSING_MEMBERS", run_type="TRIGGERED", trigger_hint=dict(hint)))
+
     def _on_sync_work_finished(self):
         """Loop-thread follow-up to a finished sync worker (posted from its finally).
 
@@ -2876,6 +3185,9 @@ class MainApp:
             )
             self._cancel_pending_rerun()
             self._sync_rerun_after_id = self.after(int(delay * 1000), self._sync_tick)
+        # The healthy timer was armed when this sync STARTED; the save may have just made this PC
+        # v2-trusted (or changed reconcileSec): bring the next safety sync forward if so.
+        self._tighten_sync_timer("sync")
 
     def _cancel_pending_rerun(self):
         if self._sync_rerun_after_id is not None:
@@ -3052,9 +3364,9 @@ class MainApp:
                 if _manual_sync_mode and _is_user_initiated_sync:
                     version_tokens = strip_all_member_version_tokens(version_tokens) or None
 
-                # First sync (no tokens) transfers full payload - allow more time.
-                # Delta syncs (tokens present) are small and fast - keep tight timeout.
-                sync_timeout = 60 if version_tokens else 60
+                # One read timeout for every getSyncData, full or delta (the two branches of the
+                # old expression were both 60).
+                sync_timeout = 60
 
                 self.logger.info(
                     "[SYNC-DEBUG] >>> Sending sync request. version_tokens=%s",
@@ -3104,6 +3416,12 @@ class MainApp:
                 _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
                 _cache_write_ms = int((time.perf_counter() - _cache_write_started) * 1000)
                 _log_sync_cache_write_profile(self.logger, _cache_write_ms)
+                if refresh.get("devices"):
+                    # The running workers' device copies follow the saved rows now -- before the
+                    # date flip, which may queue a pass itself (review R1-F6), and not at the end
+                    # of this tick (after the attendance upload): a pass drained in between would
+                    # build from the old copy (guide §3.2e).
+                    self._refresh_running_ultra_devices(reason="sync-save")
                 # P3b-1: the save may have changed the windows, their trust or the rows; apply
                 # the gym date to what it stored before anything below reads or pushes it.
                 self._apply_date_flips("save")
@@ -3138,6 +3456,8 @@ class MainApp:
                             duration_sec=20.0,
                         )
                         _cache_write_outcome = save_sync_cache_delta(data, refresh) or {}
+                        if refresh.get("devices"):
+                            self._refresh_running_ultra_devices(reason="sync-save")
                         self._apply_date_flips("save")
                         invalidate_sync_cache()
                         refresh_sync_cache_async()
@@ -3234,6 +3554,15 @@ class MainApp:
                 # are recognised on the next request (membersVersion, not currentMembersVersion).
                 if new_tokens:
                     save_version_tokens(new_tokens)
+
+                # A member the server lists and this PC lacks -> an immediate full member refresh
+                # (lane B, guide §3.6). Read-only; after the save, its date flip and the tokens.
+                self._check_missing_members(
+                    data=data, refresh=refresh, outcome=_cache_write_outcome,
+                    members_token=(new_tokens or {}).get("membersVersion")
+                    or (stored_version_tokens or {}).get("membersVersion"),
+                    trigger_hint=trigger_context.trigger_hint,
+                )
 
                 sync_response_summary = build_sync_response_summary(
                     data=data,
@@ -3347,6 +3676,19 @@ class MainApp:
                                     "devicesDispatched": 0,
                                     "skippedReason": "NO_MEMBER_DELTA",
                                 }
+                        elif (
+                            sync_online
+                            and trigger_context.trigger_source == "TIMER"
+                            and not (refresh.get("members") or refresh.get("devices"))
+                            and not self._safety_tick_device_reconcile_due(tick_started_mono)
+                        ):
+                            # A v2 safety tick (every 2-10 min, guide §3.6) that brought nothing
+                            # new: the DEVICE-mode panels keep their healthy-interval reconcile
+                            # (a PullSDK session, a full Pin read and SetDeviceParam writes each).
+                            self.logger.info(
+                                "[DeviceSync] Skipped: v2 safety sync tick with no change; panels "
+                                "were reconciled less than one healthy interval ago."
+                            )
                         elif (
                             not sync_online
                             and not _is_user_initiated_sync
@@ -3649,6 +3991,7 @@ class MainApp:
                         sync_run_id=sync_run_id,
                         final_status=final_status,
                         trigger_context=trigger_context,
+                        brought_changes=any(bool(v) for v in refresh.values()),
                     )
                     prune_sync_run_history(retention_days=30)
                     prune_push_batch_history(retention_days=30)
@@ -4162,6 +4505,14 @@ class MainApp:
                     api = self._api()
                     data = api.get_sync_data(token=auth.token)
                     save_sync_cache(data)
+                    # A full save writes the device rows too (a pinScheme switch among them):
+                    # the workers follow it before the flip, as after a sync save (guide §3.2e,
+                    # review R2-3). Best effort: it must never fail the enrolment.
+                    try:
+                        self._refresh_running_ultra_devices(reason="enroll-save")
+                    except Exception:
+                        self.logger.warning("[ULTRA] worker device rows not refreshed (enroll-save)",
+                                            exc_info=True)
                     self._apply_date_flips("save")
                     _enroll_add_log("Sync OK ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦")
                 except Exception as e:

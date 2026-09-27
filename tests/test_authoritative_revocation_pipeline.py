@@ -658,6 +658,9 @@ def _run_main_sync_dispatch(
         # P3b-1: the date precheck before the fetch and the flip after each save
         _maybe_apply_date_flips=MagicMock(),
         _apply_date_flips=MagicMock(),
+        # lane B: the missing-member check after the tokens are saved (its own tests:
+        # tests/test_missing_member_check.py)
+        _check_missing_members=MagicMock(),
     )
 
     monkeypatch.setattr(app_module.threading, "Thread", _InlineThread)

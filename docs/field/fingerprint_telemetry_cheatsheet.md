@@ -199,6 +199,19 @@ grep -F "[T] PIN_SCHEME_SWITCH" app-*.log
 scheme's pins; the terminal keeps the old scheme's users until an operator wipes it. Door events stamped
 before the switch are read under `previous`. `[CODE: app/core/db.py::_record_device_pin_scheme_switch]`
 
+**Did a push stop because the scheme changed under it?**
+
+```bash
+grep -F "[T] PIN_SCHEME_PASS_STOPPED" app-*.log
+```
+
+`worker=ULTRA:<id>` (the ULTRA worker of that turnstile: an MB2000, or a PullSDK panel at `path=full_sync`)
+or `device_id=` (the PullSDK sync engine), `path=`, `scheme=` the scheme the stopped pass had derived its
+pins under. Nothing more was written by that pass; the next pass pushes the new scheme. One or two of
+these right after a `PIN_SCHEME_SWITCH` are expected. On the MB2000 the chunk already in flight (at most 10
+members) may still have gone out under the old scheme; the cutover runbook's cables-out interlock and its
+proven restart are what keep that from ever reaching a turnstile. `[CODE: app/core/device_sync.py::pin_scheme_superseded; guide §3.2e]`
+
 > **Per-pin success lines are deliberately not emitted.** The STA thread pumps no COM
 > messages while a command runs and the log handler writes inline, so a line per member on
 > a 928-member push would widen that window — a behaviour change, not instrumentation.
@@ -587,6 +600,26 @@ grep -F "[T] RENEWAL_HOLD" app-*.log
 
 The Access UI shows « Horloge du PC suspecte » while the clock is suspect; fix the Windows date and
 time. `[CODE: app/core/db.py::apply_local_date_flips; access_dates.py::evaluate_gym_date]`
+
+---
+
+## 6c. A member the server lists and the PC lacks (lane B)
+
+After every successful sync the PC compares the server's member list with its own (guide §3.6 "The
+missing-member check").
+
+```bash
+grep -F "[T] MEMBERS_MISSING" app-*.log
+```
+
+| `action` | Means |
+|---|---|
+| `full_refresh` | `count` members (`sample` = their membership ids) are on the server's list and not on this PC: the next sync re-downloads the whole member list. A second line right after it for the same ids should not appear -- if it does as `suppressed`, see below |
+| `probe` | (PCs without trusted protocol-2 dates) the token's id-set digest disagrees with the PC's list: one extra delta sync names the difference. Once per token |
+| `suppressed` | members the server's FULL list carried that the PC still did not store: another refresh cannot fix them, so they are reported once per start and left. Send the log to a developer |
+
+`source` says what was compared: `delta` / `full` (a members section), `windows` (protocol-2 days, no
+members section), `digest` (the token). `[CODE: app/ui/app.py::_check_missing_members]`
 
 ---
 

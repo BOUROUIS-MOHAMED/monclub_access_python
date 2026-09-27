@@ -2128,7 +2128,7 @@ class UltraDeviceWorker(threading.Thread):
         full sync and recorded in device_sync_state after each push.
 
         Reuses DeviceSyncEngine._filter_users_for_device (allowedMemberships /
-        VALID_ONLY policy / pin derivation under the device's pinScheme, guide §3.2b) and
+        pin derivation under the device's pinScheme, guide §3.2b) and
         _collect_templates_for_pin (cache fingerprints -> local SQLite fallback)
         so a standalone device sees exactly the roster a PullSDK panel would.
         Cards are passed RAW (digits handled by the driver): the 4-byte CardNo
@@ -2845,6 +2845,27 @@ class UltraDeviceWorker(threading.Thread):
             if p:
                 sink.add(p)
 
+    def _pass_scheme_stopped(self, scheme: str | None, *, where: str) -> bool:
+        """True when a write whose pins were derived under ``scheme`` must not happen.
+
+        The database records the device's pinScheme the moment a fast patch or a sync saves the
+        switch; this worker's device copy follows only when the app refreshes it. A pass built
+        from the old copy would write old-scheme pins onto a terminal wiped for the new scheme,
+        where they collide with other people's pins (guide §3.2b, §3.2e). Logged and reported
+        each time it stops a write; the next pass is built from the refreshed copy.
+        """
+        from app.core.device_sync import pin_scheme_superseded
+
+        if pin_scheme_superseded(getattr(self, "_device_id", None), scheme) is None:
+            return False
+        logger.warning(
+            "%s %s not sent: its pins were derived under pinScheme=%s and the database records "
+            "another scheme now (guide §3.2e)", self._prefix, where, scheme,
+        )
+        _tel.warn("PIN_SCHEME_PASS_STOPPED", worker=getattr(self, "_tel_wid", ""), path=where,
+                  scheme=scheme)
+        return True
+
     def _standalone_push_yield(self) -> set[str]:
         """``push_roster``'s between_chunks hook for a standalone full sync.
 
@@ -2863,6 +2884,11 @@ class UltraDeviceWorker(threading.Thread):
             # P3b-2 (review R11): the lease went away mid-push -- drop every chunk not sent yet.
             logger.warning("%s push stopped between chunks: this PC no longer writes to this "
                            "turnstile (lease)", self._prefix)
+            return set(getattr(self, "_pass_all_pins", None) or ())
+        if self._pass_scheme_stopped(getattr(self, "_pass_pin_scheme", None),
+                                     where="between_chunks"):
+            # The pinScheme was switched mid-push (guide §3.2e): the pins not sent yet were
+            # derived under the old scheme -- drop them all, like a lost lease.
             return set(getattr(self, "_pass_all_pins", None) or ())
         self._in_push_yield = True
         touched: set[str] = set()
@@ -3184,6 +3210,7 @@ class UltraDeviceWorker(threading.Thread):
         bracket: bool,
         between_chunks: "Callable[[], Any] | None" = None,
         withheld: Dict[str, set[int]] | None = None,
+        pin_scheme: str | None = None,
     ) -> Dict[str, Any]:
         """push_roster, recording each chunk's outcome as soon as the chunk returns.
 
@@ -3191,6 +3218,10 @@ class UltraDeviceWorker(threading.Thread):
         cut mid-push lost every confirmation of the chunks already on the terminal.
         A driver without the ``on_chunk`` hook (or pins never sent after an early
         stop) is recorded from the aggregate result afterwards, as before.
+
+        ``pin_scheme``: the scheme ``users``' pins were derived under. Nothing is sent when the
+        database records another one now, and the between-chunks yield re-checks it (guide
+        §3.2e).
         """
         wanted = {str(u.get("pin") or "").strip() for u in users}
         recorded: set[str] = set()
@@ -3228,11 +3259,19 @@ class UltraDeviceWorker(threading.Thread):
             return {"ok": False, "pushed": 0, "failed": 0, "templates_failed": 0, "skipped_pin": 0,
                     "chunks_wedged": 0, "errors": ["driver lease lost"], "failed_pins": [],
                     "superseded_pins": sorted(all_pins), "user_written": []}
+        if self._pass_scheme_stopped(pin_scheme, where="push"):
+            # The pinScheme was switched after this pass derived its pins (guide §3.2e): the
+            # same shape as a lost lease -- nothing sent, no state written, no roster hash.
+            return {"ok": False, "pushed": 0, "failed": 0, "templates_failed": 0, "skipped_pin": 0,
+                    "chunks_wedged": 0, "errors": ["pinScheme changed"], "failed_pins": [],
+                    "superseded_pins": sorted(all_pins), "user_written": []}
         self._pass_all_pins = all_pins
+        self._pass_pin_scheme = pin_scheme
         try:
             result = self._sdk.push_roster(users, templates_by_pin, **kwargs)
         finally:
             self._pass_all_pins = None
+            self._pass_pin_scheme = None
         self._note_template_version_problems(users, result)
         # A pin the between-chunks yield handled itself (P3a-2 item 6) was never sent by
         # this push; recording it from this result would overwrite the newer state the
@@ -3513,6 +3552,28 @@ class UltraDeviceWorker(threading.Thread):
                 duration_ms=0.0,
                 error=error,
             )
+            self._finalize_full_sync_revokes(
+                normalized_revoked_ids,
+                ok=False,
+                excluded_ids=normalized_excluded_ids,
+            )
+            self._notify_full_sync_finished(
+                reason=reason,
+                ok=False,
+                fingerprint_hash=None,
+                duration_ms=0.0,
+                error=error,
+                revoked_ids=normalized_revoked_ids,
+            )
+            return
+        from app.core.device_sync import device_pin_scheme
+
+        if self._pass_scheme_stopped(device_pin_scheme(self._device), where="full_sync"):
+            # This worker's device copy predates a pinScheme switch the database already
+            # records (guide §3.2e): no removal, no push from it. The app refreshes the copy
+            # and queues the next pass; the revocations stay pending for it.
+            error = "pinScheme changed -- device copy not refreshed yet"
+            self._mark_full_sync_finished(reason=reason, ok=False, duration_ms=0.0, error=error)
             self._finalize_full_sync_revokes(
                 normalized_revoked_ids,
                 ok=False,
@@ -3876,6 +3937,7 @@ class UltraDeviceWorker(threading.Thread):
                             removals=removals, bracket=bracket,
                             between_chunks=self._standalone_push_yield,
                             withheld=capacity_withheld,
+                            pin_scheme=_roster_stats.get("pin_scheme"),
                         )
                     finally:
                         self._pass_touched_pins = None
@@ -4339,6 +4401,10 @@ class UltraDeviceWorker(threading.Thread):
                     member_id, reason="member not visible in the sync cache",
                 )
                 return
+            # The scheme these pins were derived under (read now: nothing rebuilds a roster
+            # between here and the push on this path).
+            member_scheme = (getattr(self, "_last_standalone_roster_stats", None) or {}).get(
+                "pin_scheme")
             # Served between two chunks of a full-sync push (P3a-2 item 6): these pins'
             # data in that push is now older than this update's. No-op otherwise.
             self._note_push_superseded(u.get("pin") for u in users)
@@ -4367,6 +4433,11 @@ class UltraDeviceWorker(threading.Thread):
             if _v2_writes_blocked(getattr(self, "_device_id", None)):
                 # P3b-2 (review R11): the lease went away after the drain -- no write.
                 self._defer_member_sync(member_id, reason="driver lease lost")
+                return
+            if self._pass_scheme_stopped(member_scheme, where="member_sync"):
+                # The device copy predates a pinScheme switch (guide §3.2e): the pass the app
+                # queues after refreshing it pushes this member under the new scheme.
+                self._defer_member_sync(member_id, reason="pinScheme changed")
                 return
             if not self._record_push_intents(users, hashes_by_pin):
                 # Write-ahead (P3a-2): no record, no write. Flagged for the full sync.
@@ -4680,6 +4751,7 @@ class UltraDeviceWorker(threading.Thread):
         users, templates_by_pin, hashes_by_pin = self._build_standalone_roster(
             SimpleNamespace(users=remaining)
         )
+        repush_scheme = (getattr(self, "_last_standalone_roster_stats", None) or {}).get("pin_scheme")
         entry = next((u for u in users if str(u.get("pin") or "").strip() == acct), None)
         if entry is None:
             from app.core.device_sync import DeviceSyncEngine, account_roster_withheld_for_device
@@ -4703,6 +4775,12 @@ class UltraDeviceWorker(threading.Thread):
                 self.request_full_sync(reason="revoke-roster-incomplete", revoked_ids={member_id})
                 return False, acct
             return None, acct
+        if self._pass_scheme_stopped(repush_scheme, where="account_revoke"):
+            # The device copy says ACCOUNT but the database records another scheme now (guide
+            # §3.2e): no re-push of an account pin. The revocation stays pending for the pass
+            # built from the refreshed copy.
+            self.request_full_sync(reason="revoke-failed", revoked_ids={member_id})
+            return False, acct
         _tel.event("MEMBER_REVOKE_REQUESTED", worker=self._tel_wid, member_id=member_id, pin=acct)
         templates = {acct: templates_by_pin[acct]} if acct in (templates_by_pin or {}) else {}
         ok = False
@@ -5608,10 +5686,31 @@ class UltraDeviceWorker(threading.Thread):
                     continue
                 cache = _sync_cache_without_revoked_ids(cache, excluded_ids)
 
-                from app.core.device_sync import DeviceSyncEngine
+                from app.core.device_sync import DeviceSyncEngine, device_pin_scheme
 
                 device_copy = dict(self._device or {})
                 device_copy["accessDataMode"] = "DEVICE"
+                if self._pass_scheme_stopped(device_pin_scheme(device_copy), where="full_sync"):
+                    # guide §3.2e: this device copy predates a pinScheme switch the database
+                    # already records -- no revoke, no push from it; the revocations stay
+                    # pending for the pass built from the refreshed copy.
+                    error = "pinScheme changed -- device copy not refreshed yet"
+                    self._mark_full_sync_finished(
+                        reason=reason, ok=False, duration_ms=0.0, error=error,
+                    )
+                    self._finalize_full_sync_revokes(
+                        revoked_ids, ok=False, excluded_ids=excluded_ids
+                    )
+                    self._notify_full_sync_finished(
+                        reason=reason,
+                        ok=False,
+                        fingerprint_hash=None,
+                        duration_ms=0.0,
+                        error=error,
+                        revoked_ids=revoked_ids,
+                    )
+                    drained += 1
+                    continue
                 filtered_cache_attrs = dict(getattr(cache, "__dict__", {}))
                 filtered_cache_attrs["devices"] = [device_copy]
                 filtered_cache = SimpleNamespace(**filtered_cache_attrs)
@@ -8006,8 +8105,12 @@ class UltraSyncScheduler:
             self._sync_all(reason="startup")
 
         while not self._stop.is_set():
-            # Find the shortest interval among all ULTRA devices
-            min_interval = 15 * 60  # default 15 min
+            # The shortest interval among all ULTRA devices, CAPPED at 15 min: the seed is
+            # not only the no-device default -- with the per-device default of 30 min
+            # (ultra_sync_interval_minutes) the timer pass still runs every 15 min, which
+            # /api/v2/ultra/status does not show (it reports the setting). A local pass: a
+            # device whose roster hash is unchanged is skipped. Kept as it is (lane B, 2026-09-26).
+            min_interval = 15 * 60
             for d in self._devices:
                 settings = d.get("_settings", {})
                 interval = int(settings.get("ultra_sync_interval_minutes", 30)) * 60
@@ -8047,11 +8150,6 @@ class UltraSyncScheduler:
             elif not self._manual_sync_mode():
                 self._sync_all(reason="timer")
 
-    def _check_worker_health(self):
-        """Deprecated: worker restarts are handled exclusively by the watchdog thread.
-        Kept as no-op for backward compat in case external code calls it."""
-        pass
-
     def _sync_all(
         self,
         *,
@@ -8089,11 +8187,6 @@ class UltraSyncScheduler:
             "all" if device_ids is None else len(device_ids),
         )
         t0 = time.time()
-        # Check worker health before each sync cycle
-        try:
-            self._check_worker_health()
-        except Exception as e:
-            self._logger.warning("[ULTRA] _check_worker_health error: %s", e)
         synced = 0
         skipped = 0
         failed = 0
@@ -8622,7 +8715,7 @@ class UltraEngine:
         )
         self._watchdog_thread.start()
 
-    def refresh_devices(self, devices: List[Dict[str, Any]]) -> int:
+    def refresh_devices(self, devices: List[Dict[str, Any]], *, update_scheduler: bool = True) -> int:
         """Refresh each running ULTRA worker's device snapshot in place.
 
         Workers cache the device dict at construction (self._device), which is
@@ -8632,6 +8725,9 @@ class UltraEngine:
         worker snapshots stay stale, so newly-allowed members get filtered out
         and pin-deleted instead of pushed. Call this after every sync that
         returned a refreshed devices section.
+
+        ``update_scheduler=False`` refreshes the workers' copies only and leaves the scheduler's
+        device list as it is (the app's refresh while not every worker is driven, review R2-4).
 
         Returns the number of workers refreshed.
         """
@@ -8643,10 +8739,15 @@ class UltraEngine:
         def _adm(d):
             return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
 
-        ultra_devices = _lease_gate.filter_devices([d for d in (devices or []) if _adm(d) == "ULTRA"])
+        ultra_all = [d for d in (devices or []) if _adm(d) == "ULTRA"]
+        # The scheduler's list follows the lease (a turnstile this PC does not drive is never
+        # pushed); a worker's device COPY does not: it is data, and a worker left with an old
+        # copy while its lease was away would have every later pass stopped by the pinScheme
+        # guard once the lease came back (review R1-F5, guide §3.2e). Writes stay lease-gated.
+        ultra_devices = _lease_gate.filter_devices(ultra_all)
 
         refreshed = 0
-        for d in ultra_devices:
+        for d in ultra_all:
             try:
                 device_id = int(d.get("id", 0))
             except (TypeError, ValueError):
@@ -8671,7 +8772,7 @@ class UltraEngine:
                 "[ULTRA] refreshed %d worker device snapshot(s) in place", refreshed
             )
 
-        if self._sync_scheduler is not None:
+        if self._sync_scheduler is not None and update_scheduler:
             try:
                 self._sync_scheduler.update_devices(ultra_devices)
             except Exception as exc:
@@ -8684,8 +8785,8 @@ class UltraEngine:
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
 
-        This is the SOLE restart mechanism.  UltraSyncScheduler._check_worker_health
-        is now a no-op — all restarts go through this watchdog to avoid race conditions.
+        This is the SOLE restart mechanism: every restart goes through this watchdog, to
+        avoid races between restarters.
         """
         self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
         while not self._stop_event.wait(self._watchdog_interval_sec):

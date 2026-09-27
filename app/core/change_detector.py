@@ -102,6 +102,17 @@ class ChangeDetectorService:
                 self._stop_event.wait(timeout=self._poll_interval)
 
     def _poll_once(self) -> None:
+        # Off while the v2 safety sync runs (guide §3.6): the notice socket announces changes
+        # within seconds while it is up, and the data sync runs every 120 s while it is down.
+        # Only an explicit True closes it: a gate that cannot answer leaves the probe on --
+        # today's behaviour.
+        gated = getattr(self._app, "change_detection_gated", None)
+        if callable(gated):
+            try:
+                if gated() is True:
+                    return
+            except Exception:
+                pass
         if _requests is None:
             self._logger.warning(
                 "[ChangeDetector] 'requests' library not available — skipping poll"

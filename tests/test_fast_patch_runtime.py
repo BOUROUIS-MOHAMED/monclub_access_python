@@ -111,11 +111,16 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
     monkeypatch.setattr("app.core.db.apply_fast_patch_bundle", lambda bundle: {"applied": 1, "skipped": 0, "ignored": None})
     monkeypatch.setattr("app.core.db.invalidate_sync_cache", invalidate)
 
+    order = []
     app = SimpleNamespace(
         logger=MagicMock(),
         reset_runtime_fast_patch_caches=MagicMock(),
         _apply_date_flips=MagicMock(),  # P3b-1: the flip after the db apply
-        _request_running_ultra_sync=MagicMock(return_value=True),
+        _request_running_ultra_sync=MagicMock(
+            side_effect=lambda **_kw: order.append("dispatch") or True),
+        # guide §3.2e: the workers' device rows are refreshed BEFORE the pass is queued.
+        _refresh_running_ultra_devices=MagicMock(
+            side_effect=lambda **_kw: order.append("refresh") or True),
         _defer_ultra_reconnects=MagicMock(),
         request_sync_now=MagicMock(),
     )
@@ -145,6 +150,8 @@ def test_apply_fast_patch_bundle_requests_device_rescope_sync(monkeypatch):
         device_ids={7},
         reason="FAST_PATCH_BUNDLE",
     )
+    app._refresh_running_ultra_devices.assert_called_once_with(reason="FAST_PATCH_BUNDLE")
+    assert order == ["refresh", "dispatch"]
 
 
 def test_apply_fast_patch_bundle_routes_membership_delete_as_authoritative_revoke(monkeypatch):

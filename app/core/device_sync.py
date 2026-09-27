@@ -182,6 +182,48 @@ from app.core.pin_scheme import (  # noqa: E402  (re-exported)
 )
 
 
+class PinSchemeSwitchedError(RuntimeError):
+    """A PullSDK pass stopped before a write: the device's pinScheme changed after the pass read
+    its device row (``pin_scheme_superseded``). Raised, not returned, so every caller reads the
+    pass as failed -- a normal return would be recorded as an in-sync panel."""
+
+
+def pin_scheme_superseded(device_id: Any, scheme: Any) -> str | None:
+    """Why a pass that derived its pins under ``scheme`` must not write to this device, or None.
+
+    A device's pinScheme can change while a pass is queued or already pushing: a GYM_DEVICE fast
+    patch or a sync's device section records the switch in the database at once, while a
+    worker's device copy follows only when the app refreshes it. Pins derived under the old
+    scheme, written to a terminal wiped for the new one, collide with other people's new-scheme
+    pins (guide §3.2b, §3.2e). So every push pass asks this before it writes, and between chunks.
+
+    ``"switched"``: the database records another scheme -- do not write. None: write -- the
+    schemes agree, ``scheme`` is None (the caller derived nothing), the device has no row
+    (nothing recorded to compare with, as before), or the row could not be read (logged; no
+    new rail for a broken database: every write path already refuses to write when it cannot
+    record its write-ahead intent, guide §3.4a).
+    """
+    if scheme is None:
+        return None
+    try:
+        did = int(device_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        from app.core import db as _db
+
+        recorded = _db.get_device_pin_scheme(did)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "[DeviceSync] device_id=%s: recorded pinScheme unreadable (%s) -- not re-checked "
+            "this time", did, exc,
+        )
+        return None
+    if recorded is None:
+        return None
+    return "switched" if recorded != normalize_pin_scheme(scheme) else None
+
+
 def derive_member_pin(user: Dict[str, Any], scheme: str) -> Tuple[str, str | None]:
     """THE derivation: ``(pin, source)`` for one roster row under ``scheme``.
 
@@ -1457,6 +1499,14 @@ class DeviceSyncEngine:
             )
             self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
             return False
+        try:
+            self._raise_if_pin_scheme_switched(normalized_device, where="member_sync")
+        except PinSchemeSwitchedError:
+            # A device copy older than a pinScheme switch names pins under the old scheme --
+            # for 110 ids another person's (guide §3.2b). Deferred, never finalised: the pass
+            # built from the refreshed copy handles it.
+            self._last_member_sync_outcome = MEMBER_SYNC_DEFERRED
+            return False
 
         # The request names a MEMBERSHIP; the device row is keyed by the device's pinScheme.
         # Under MEMBERSHIP they are the same number (unchanged). Under ACCOUNT the pin is the
@@ -2011,9 +2061,12 @@ class DeviceSyncEngine:
 
         Filters:
         - allowedMemberships (if provided) uses user.membershipId
-        - validFrom/validTo ONLY when pushingToDevicePolicy == "VALID_ONLY"
-          (default: push ALL members with an activeMembershipId regardless of
-          expiry — the PC/ULTRA engine handles real-time validity at scan time)
+        - no date filter: every member of the list is pushed whatever its
+          validFrom/validTo. The list is the server's deliverable set of the day
+          (P3b-1's flips hold and restore rows by date, guide §3.8). A
+          ``pushingToDevicePolicy == "VALID_ONLY"`` filter lived here; no backend
+          enum value is VALID_ONLY (``AccessSoftwareInDeviceDataModePushingPolicy``,
+          every version), so it never ran and was removed (lane B, 2026-09-26).
         - pin must be digits (controllers expect numeric Pin)
 
         PIN: ``derive_member_pin`` under the DEVICE's ``pinScheme`` (``device_pin_scheme``).
@@ -2043,15 +2096,7 @@ class DeviceSyncEngine:
             door_ids = [int(default_door_id)]
         device["doorIds"] = door_ids  # keep for downstream use
 
-        # Validity-date filter: ONLY apply when explicitly opted in via
-        # pushingToDevicePolicy="VALID_ONLY".  The default (null / any other
-        # value) pushes every member so the full roster is on the device and
-        # the PC-side logic decides access at scan time.
-        policy = str(device.get("pushingToDevicePolicy") or "").strip().upper()
-        filter_by_validity = (policy == "VALID_ONLY")
-
         scheme = device_pin_scheme(device)
-        now = datetime.now(tz=timezone.utc)
         out: Dict[str, Dict[str, Any]] = {}
         sources: Dict[str, str] = {}
         withheld = 0
@@ -2065,13 +2110,6 @@ class DeviceSyncEngine:
             mid = _to_int(u.get("membershipId"), default=None)
             if allowed_set and (mid is None or int(mid) not in allowed_set):
                 return False
-            if filter_by_validity:
-                vf = _parse_dt_any(u.get("validFrom") or "")
-                vt = _parse_dt_any(u.get("validTo") or "")
-                if vf and now < vf:
-                    return False
-                if vt and now > vt:
-                    return False
             return True
 
         if scheme != PIN_SCHEME_ACCOUNT:
@@ -2997,6 +3035,21 @@ class DeviceSyncEngine:
         payload = "\n".join(fingerprint_parts)
         return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest(), len(desired)
 
+    def _raise_if_pin_scheme_switched(self, device: Dict[str, Any], *, where: str) -> None:
+        """Raise ``PinSchemeSwitchedError`` when ``device`` (the copy this pass derives its pins
+        from) declares another pinScheme than the database records now (guide §3.2e)."""
+        dev_id = (device or {}).get("id")
+        scheme = device_pin_scheme(device)
+        why = pin_scheme_superseded(dev_id, scheme)
+        if why is None:
+            return
+        self.logger.warning(
+            "[DeviceSync] Device id=%s: %s not sent -- its pins were derived under pinScheme=%s "
+            "and the database records another scheme now (guide §3.2e)", dev_id, where, scheme,
+        )
+        _tel.warn("PIN_SCHEME_PASS_STOPPED", device_id=dev_id, path=where, scheme=scheme)
+        raise PinSchemeSwitchedError("pinScheme changed -- nothing written")
+
     def _sync_one_device(
         self,
         *,
@@ -3021,6 +3074,7 @@ class DeviceSyncEngine:
             self.logger.info(
                 "[DeviceSync] Device id=%s handover in progress -> no push this pass", dev_id)
             return None
+        self._raise_if_pin_scheme_switched(device, where="sync")
         dev_name = device.get("name") or ""
         ip = (device.get("ipAddress") or "").strip()
         port = _to_int(device.get("portNumber"), default=4370) or 4370
@@ -3378,6 +3432,11 @@ class DeviceSyncEngine:
                 door_bitmask,
             )
 
+            # guide §3.2e: re-checked before the removal steps too (review R1-F3) -- the stale
+            # set and a FULL_REPLACE clear below were computed from this pass's device copy, and
+            # a switch recorded during the panel read above makes them old-scheme decisions.
+            self._raise_if_pin_scheme_switched(device, where="removal")
+
             # ── P1: Policy-driven removal decisions (P3a-2: ONE ceiling, no automatic wipe) ──
             # FULL_REPLACE  → clear all tables, but only when the rows on the panel fit
             #                 under the shared removal ceiling: a clear deletes EVERY row,
@@ -3609,6 +3668,12 @@ class DeviceSyncEngine:
                 batch_error = "driver lease lost mid-pass"
                 pins_sorted = []
                 pins_to_sync = set()
+            if pins_sorted:
+                # guide §3.2e: a switch recorded since the start of this pass (checked there
+                # too, before any device I/O) -- the pins below were derived under the old
+                # scheme. There is no abort inside the batch itself: a switch landing during
+                # it still sees that batch through.
+                self._raise_if_pin_scheme_switched(device, where="batch")
 
             # WRITE-AHEAD (P3a-2 item 3, guide §3.4a): durable BEFORE the first write of
             # this pass. Phase D records state (and clears these) only after phases A-C,

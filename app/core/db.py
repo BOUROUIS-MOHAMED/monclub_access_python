@@ -1234,6 +1234,27 @@ def list_sync_upcoming_credentials() -> List[Dict[str, Any]]:
     return out
 
 
+def list_local_member_ids() -> set[int]:
+    """Every membership this PC holds of the server's list: ``sync_users`` + ``sync_users_held``
+    (a held row is still in the server's list, P3b-1). Positive ids only. The missing-member
+    check compares this with the server's set (app.py ``_check_missing_members``)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT active_membership_id FROM sync_users "
+            "UNION SELECT active_membership_id FROM sync_users_held"
+        ).fetchall()
+    return {int(r[0]) for r in rows if r[0] is not None and int(r[0]) > 0}
+
+
+def list_member_window_ids() -> set[int]:
+    """The memberships of ``member_access_window``: the server's set of the day as of the last
+    members section (replaced whole by each one; a fast patch drops its membership's window).
+    Meaningful only while ``access_v2_state.trusted``."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT active_membership_id FROM member_access_window").fetchall()
+    return {int(r[0]) for r in rows if r[0] is not None and int(r[0]) > 0}
+
+
 def count_member_cache_rows() -> int:
     """sync_users + sync_users_held: what the server still counts as delivered to this PC.
 
@@ -5027,6 +5048,24 @@ def _record_device_pin_scheme_switch(cur: sqlite3.Cursor, d: dict) -> bool:
     except Exception:
         pass
     return True
+
+
+def get_device_pin_scheme(device_id: int) -> Optional[str]:
+    """The pinScheme this database records for a device now (``sync_devices.pin_scheme``,
+    normalised), None when the device has no row. One primary-key read.
+
+    The column every device write sets in the same transaction as the switch record
+    (``_insert_device_row``), and the value the device payload projects as ``pinScheme``. A
+    push pass compares the scheme it derived its pins under with this before it writes
+    (guide §3.2e); a read error propagates, so the caller can refuse the write.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT pin_scheme FROM sync_devices WHERE id = ?", (int(device_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return normalize_pin_scheme(row[0])
 
 
 def list_device_pin_scheme_switches(*, device_id: int | None = None) -> Dict[int, List[Dict[str, Any]]]:
