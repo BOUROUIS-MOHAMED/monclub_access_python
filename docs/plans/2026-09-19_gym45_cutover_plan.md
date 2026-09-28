@@ -32,7 +32,8 @@ driver PCs and readers -- the night runs without drivers (runbook part H).
 > - **§6:** runbook part F comes first. R4's "wipe again (E5-E6)" and R6's "script 13 again" mean the
 >   wizard again (runbook part F, gym 45 "Every other row"); after a power cut during the wizard's erase,
 >   the hold stays until « Remplir » (a hold whose run stopped before its first delete is released at the
->   next start -- guide §3.2h).
+>   next start -- unless its turnstile's scheme moved, or P1 starts signed out of MonClub: then it is kept,
+>   guide §3.2h).
 
 Every claim is graded as in the guides: `[CODE]` (an executable statement, named), `[TEST]`,
 `[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated;
@@ -440,6 +441,10 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
    its log must show `[T] PIN_SCHEME_SWITCH device_id=8 … cleared_rows=0` and the same for 10 `[CODE:
    db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
    rows after the retire: Quit, retire again.
+4b. **Restart it, proven** (runbook part C's box "Proving a restart", with its « Pilote / Lecteur » page
+   reading -- « PC lecteur » when a driver is set by then, §7 D2), and no later `PIN_SCHEME_SWITCH …
+   previous=ACCOUNT scheme=MEMBERSHIP` line (runbook C13, D15). Only then step 5 -- the order runbook C1b
+   brings a gym 58 PC back in (lane 1f review, 2026-09-28).
 5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows, and the watchdog
    as the runbook's part C box "Turning the watchdog back on" says (by what exists now: a task,
    `Enable-ScheduledTask`; none, `register_watchdog.ps1`; its `State` must read `Ready`).
