@@ -65,9 +65,12 @@ def _scheme(monkeypatch, value):
 
 
 def _signed_in(db, *listed):
-    """This PC signed in to MonClub (a gym token) with the turnstiles ``listed`` in its list: only
-    then does a missing device row mean "deleted in MonClub" (lane 1f, review C1)."""
+    """This PC signed in to MonClub (a gym token) with the turnstiles ``listed`` in its list,
+    written whole by a sync (lane 1g: the marker only a full device replace writes): only then
+    does a missing device row mean "deleted in MonClub" (lane 1f, review C1)."""
     db.save_auth_token(email="gym@example.test", token="tok-lane1f")
+    db._run_db_write_sync("test_device_list_whole",
+                          lambda conn, profile: db._mark_device_list_replaced(conn))
     for did in listed:
         _device_row(db, did, "MEMBERSHIP")
 
@@ -385,8 +388,9 @@ class TestASchemeMovedStopOnATurnstileHeldBefore:
 
     def test_a_row_already_at_erase_keeps_its_reason_and_says_press_refill(self, sqlite_db,
                                                                             monkeypatch, tmp_path):
-        """An earlier run may have deleted (row ``erase``): « Remplir » is the normal next step
-        there, not refused -- the note must not say it is (HELD_BEFORE, as ``_refill`` says)."""
+        """An earlier run may have deleted (row ``erase``): « Remplir » is not refused there, so the
+        note must not say it is -- but the scheme moved during this run, so neither a plain "press
+        Refill": its own code (lane 1g, review C2 of lane 1f: HELD_BEFORE_SCHEME_MOVED)."""
         db = sqlite_db
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, db)
         _scheme(monkeypatch, "MEMBERSHIP")
@@ -395,7 +399,7 @@ class TestASchemeMovedStopOnATurnstileHeldBefore:
         pv = _preview(wiz, 5)
         _moved_during_backup(monkeypatch, panel)
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
-        assert _note(wiz).startswith("HELD_BEFORE:"), _note(wiz)
+        assert _note(wiz).startswith("HELD_BEFORE_SCHEME_MOVED:"), _note(wiz)
         assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
         _restart()
         assert _refill(wiz, "ACCOUNT")[0] == 200

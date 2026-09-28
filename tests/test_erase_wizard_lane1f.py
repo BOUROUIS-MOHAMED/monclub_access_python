@@ -140,7 +140,8 @@ class TestARunStoppedWhileSignedOut:
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         note = _note(wiz)
         assert not note.startswith("HELD_DEVICE_GONE:"), note
-        assert note.startswith("HELD_SCHEME_MOVED:"), note
+        # Lane 1g (review C3 of lane 1f): no row is not a scheme -- not "moved to None".
+        assert note.startswith("HELD_SCHEME_UNREADABLE:") and "None" not in note, note
         assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_SCHEME_MOVED
         _restart()
         assert device_hold.is_held(5)
@@ -178,7 +179,7 @@ class TestADurableWriteThatFailsOnARowAlreadyKept:
         pv = _preview(wiz, 5)
         _moved_during_backup(monkeypatch, panel)
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
-        assert _note(wiz).startswith("HELD_BEFORE:"), _note(wiz)
+        assert _note(wiz).startswith("HELD_BEFORE_SCHEME_MOVED:"), _note(wiz)
         assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
 
     def test_a_row_at_erase_scheme_moved_keeps_the_plain_note(self, sqlite_db, monkeypatch,

@@ -36,6 +36,8 @@ Lane 1f (review of lane 1e, C1): an ``erase-prep`` row whose turnstile has no ``
 is released at start-up only while that list can say the turnstile was deleted in MonClub -- the PC
 signed in, the list not empty (``db._device_list_is_authoritative``). A logout empties the list: the
 row is then left at ``erase-prep``, held, until a start that can read the scheme (or Refill).
+Lane 1g (review of lane 1f, C1): and the list written WHOLE since the logout (``sync_device_list_state``,
+written by a full device replace only) -- one row a fast patch put into the emptied list is not it.
 """
 from __future__ import annotations
 

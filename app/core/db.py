@@ -817,6 +817,81 @@ def _run_one_shot_credentials_resend(conn: sqlite3.Connection) -> None:
         logging.getLogger(__name__).error("[DB] one-shot credentials re-send failed: %s", exc)
 
 
+# The turnstile list was last written WHOLE (lane 1g, review C1 of lane 1f): one row, written only
+# by a full replace of ``sync_devices`` -- ``_save_sync_cache`` with a payload, and
+# ``save_sync_cache_delta`` when its devices section refreshes -- in the same transaction as the
+# rows, and deleted by ``save_sync_cache(None)`` (the logout) in the transaction that empties
+# them. A fast patch (one GYM_DEVICE upsert or delete) never writes it: after a logout and a
+# login, a single row it inserts into the emptied list is not "the list". Not the
+# ``devicesVersion`` token: the logout clears the tokens in a separate step whose failure it
+# swallows, which would leave the token saying "a full list" over an emptied one (fail open).
+_DEVICE_LIST_STATE_DDL = """
+    CREATE TABLE IF NOT EXISTS sync_device_list_state (
+        id          INTEGER PRIMARY KEY CHECK (id=1),
+        replaced_at TEXT NOT NULL
+    );
+"""
+_DEVICE_LIST_MARKER_REFRESH_STEP = "devices_refresh_for_full_list_marker"
+
+
+def _mark_device_list_replaced(cur: Any) -> None:
+    """Record that ``sync_devices`` was just replaced whole (the caller's transaction)."""
+    cur.execute(
+        "INSERT INTO sync_device_list_state (id, replaced_at) VALUES (1, ?) "
+        "ON CONFLICT(id) DO UPDATE SET replaced_at=excluded.replaced_at",
+        (now_iso(),),
+    )
+
+
+def _force_one_device_refresh_for_list_marker(conn: sqlite3.Connection) -> bool:
+    """Drop ``devicesVersion`` ONCE, on the first start of a build with the full-list marker.
+
+    WHY. A database upgraded from an earlier build has its turnstile list but no marker, and the
+    backend re-sends the device section only when ``devicesVersion`` moves -- upgrading the client
+    does not move it. Until then no missing row could read as "deleted in MonClub": fail closed,
+    but for days. Without the token the next ``getSyncData`` sends the section in full
+    (``_ensure_pin_scheme_column`` relies on the same), and that replace writes the marker.
+
+    ONE-SHOT and ATOMIC like ``_force_one_credentials_resend``: the DELETE before the step's row,
+    both in the transaction ``init_db`` commits. A fresh database runs it too (an empty DELETE).
+    Returns True when the step ran (its row was written by this call)."""
+    conn.execute(_ONE_SHOT_STEPS_DDL)
+    if conn.execute(
+        "SELECT 1 FROM local_one_shot_steps WHERE name = ?", (_DEVICE_LIST_MARKER_REFRESH_STEP,),
+    ).fetchone():
+        return False
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_version_tokens (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    dropped = int(conn.execute(
+        "DELETE FROM sync_version_tokens WHERE key = ?", ("devicesVersion",),
+    ).rowcount or 0)
+    written = int(conn.execute(
+        "INSERT OR IGNORE INTO local_one_shot_steps (name, done_at) VALUES (?, ?)",
+        (_DEVICE_LIST_MARKER_REFRESH_STEP, now_iso()),
+    ).rowcount or 0)
+    if dropped:
+        logging.getLogger(__name__).warning(
+            "[DB] dropped the stored devicesVersion once so the next getSyncData re-sends the "
+            "whole turnstile list and records it as whole (guide §3.2h, lane 1g)."
+        )
+    return bool(written)
+
+
+def _run_one_shot_device_refresh_for_list_marker(conn: sqlite3.Connection) -> None:
+    """``init_db``'s call: a failure is logged and startup goes on (the marker then comes with the
+    next device change in MonClub; until then a missing row is never read as deleted)."""
+    try:
+        _force_one_device_refresh_for_list_marker(conn)
+    except Exception as exc:
+        logging.getLogger(__name__).error("[DB] one-shot device list refresh failed: %s", exc)
+
+
 def _member_main_account_id(u: Dict[str, Any]) -> Any:
     """The mainAccountId a member dict carries: camelCase from the backend payload,
     snake_case from a cached row. None when absent."""
@@ -3199,6 +3274,10 @@ def init_db() -> None:
         # One full credentials re-send, so the grant-aware diff rewrites the grant lists the
         # previous build left stale. Once per database. guide §3.1b "The upgrade window".
         _run_one_shot_credentials_resend(conn)
+        # The turnstile list's "written whole" marker (lane 1g), and one device re-send so an
+        # upgraded database gets it at its next sync.
+        conn.execute(_DEVICE_LIST_STATE_DDL)
+        _run_one_shot_device_refresh_for_list_marker(conn)
 
         # Phase 2: firmware profile cache
         # Keyed by device_id (stable int) — not IP (DHCP can reassign IPs).
@@ -5169,6 +5248,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             cur.execute("DELETE FROM sync_users")
             cur.execute("DELETE FROM sync_memberships")
             cur.execute("DELETE FROM sync_devices")
+            cur.execute("DELETE FROM sync_device_list_state")      # lane 1g: no whole list now
             cur.execute("DELETE FROM sync_infrastructures")
             cur.execute("DELETE FROM sync_gym_access_credentials")
             cur.execute("DELETE FROM sync_device_door_presets")
@@ -5470,6 +5550,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         # devices + synced door presets
         for d in devices:
             _insert_device_row(cur, d)
+        _mark_device_list_replaced(cur)                     # lane 1g: the list is whole
 
         # infrastructures
         for inf in infrastructures:
@@ -6895,6 +6976,7 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                 cur.execute("DELETE FROM sync_device_door_presets")
                 for d in (data.get("devices") or []):
                     _insert_device_row(cur, d)
+                _mark_device_list_replaced(cur)                 # lane 1g: the list is whole
 
         creds_summary: Dict[str, Any] | None = None
         # Conditional: credentials
@@ -9856,15 +9938,20 @@ def keep_erase_hold_after_scheme_move(*, device_id: int, run_id: str) -> Optiona
 
 def _device_list_is_authoritative(conn: sqlite3.Connection) -> bool:
     """Whether a turnstile missing from ``sync_devices`` was deleted in MonClub (lane 1f, review
-    C1): only while this PC is signed in (a gym token in ``auth_state``) AND its turnstile list holds
-    at least one row. The Access logout deletes the token, then empties the list
-    (``_handle_auth_logout`` -> ``save_sync_cache(None)``, whose failure it swallows); the TV logout
-    deletes the token alone. Either way a missing row then says nothing about the turnstile. Read
-    errors propagate."""
+    C1): only while this PC is signed in (a gym token in ``auth_state``), its turnstile list was
+    last written WHOLE (``sync_device_list_state``, lane 1g -- review C1 of lane 1f) and holds at
+    least one row. The Access logout deletes the token, then empties the list and its marker
+    (``_handle_auth_logout`` -> ``save_sync_cache(None)``, whose failure it swallows -- the list
+    and the marker then stay together); the TV logout deletes the token alone. After a login, a
+    fast patch can put ONE row into the emptied list before the first full sync
+    (``_apply_fast_patch_item``, GYM_DEVICE upsert): that partial list writes no marker. Either
+    way a missing row then says nothing about the turnstile. Read errors propagate."""
     signed_in = conn.execute(
         "SELECT 1 FROM auth_state WHERE id=1 AND COALESCE(token_protected, '') <> '' LIMIT 1"
     ).fetchone() is not None
-    return signed_in and conn.execute("SELECT 1 FROM sync_devices LIMIT 1").fetchone() is not None
+    return (signed_in
+            and conn.execute("SELECT 1 FROM sync_device_list_state WHERE id=1").fetchone() is not None
+            and conn.execute("SELECT 1 FROM sync_devices LIMIT 1").fetchone() is not None)
 
 
 def device_list_is_authoritative() -> bool:
@@ -9896,10 +9983,12 @@ def release_unstarted_erase_holds(
     every row held -- fail closed).
 
     A turnstile with no device row (lane 1f, review C1) is released only while the list can say it
-    was deleted in MonClub (``_device_list_is_authoritative``: signed in, the list not empty). A
-    logout empties that list and deletes the token, and the scheme may have moved meanwhile: the row
-    is then left as it is, at ERASE_PREP -- held, and read again by the next start (which releases
-    or keeps it once the PC is signed in and its list not empty), or released by Refill, which checks
+    was deleted in MonClub (``_device_list_is_authoritative``: signed in, the list written whole --
+    lane 1g -- and not empty). A logout empties that list and deletes the token, and the scheme may
+    have moved meanwhile; after the login a fast patch may put back a single row before the first
+    full sync (a partial list). The row is then left as it is, at ERASE_PREP -- held, and read
+    again by the next start (which releases or keeps it once the PC is signed in and its list
+    written whole), or released by Refill, which checks
     the scheme it records. Reported in ``undecided_out`` ({device_id: run_id}). Residual: a list
     that is not empty is not checked for freshness -- a switch saved while this PC was off is not in
     it yet, and the row is released (guide §3.2h)."""

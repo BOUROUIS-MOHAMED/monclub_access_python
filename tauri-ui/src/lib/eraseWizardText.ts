@@ -76,6 +76,10 @@ const fr = {
   // Why a finished run kept its hold (the run's finish note, lane 1c review nit).
   finishNotes: {
     HELD_BEFORE: "Le tourniquet était déjà en attente depuis un effacement précédent : il le reste. Appuyez sur « Remplir ».",
+    // Lane 1g (review C2 of lane 1f): the same earlier hold, but the scheme moved (or could not be
+    // read) during this run -- « Remplir » only under step 1's scheme; nothing refuses it otherwise.
+    HELD_BEFORE_SCHEME_MOVED:
+      "Le tourniquet était déjà en attente depuis un effacement précédent, qui a pu effacer : il le reste. Pendant cette opération, arrêtée avant toute suppression, le schéma de numérotation a changé ou n'a pas pu être relu. « Remplir » seulement une fois le schéma revenu à celui de l'étape 1 (vérifiez-le dans le tableau de bord) ; s'il a changé, remettez-le dans le tableau de bord, puis effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
     PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
     PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
     // Lane 1e (master review C0): « Remplir » is refused on these holds until the scheme is the
@@ -170,7 +174,7 @@ const fr = {
     counts_after: "Comptage après et vérification",
     erase_recorded: "Effacement enregistré : le dernier résultat d'écriture de chaque membre devient « inconnu »",
     // Lane 1f (review C2): the keep mark could not be written, and no delete was issued.
-    erase_record_undone: "Enregistrement de l'effacement annulé : aucune suppression n'a été faite",
+    erase_record_undone: "Annulation de l'enregistrement de l'effacement (aucune suppression faite)",
     not_refilled: "Personnes hors de la liste du remplissage vérifiées sur la sauvegarde",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
@@ -277,7 +281,7 @@ const fr = {
     KEEP_MARK_NOT_WRITTEN:
       "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : l'effacement a été annulé avant toute suppression, rien n'a été effacé. Réessayez ; si cela recommence, appelez le développeur (le disque de ce PC est peut-être plein).",
     KEEP_MARK_NOT_WRITTEN_HELD:
-      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé. L'effacement était déjà enregistré et n'a pas pu être annulé : le tourniquet reste en attente. « Remplir » réécrit tout le monde — seulement si le schéma de numérotation est toujours celui de l'étape 1 ; s'il a changé, effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : cette opération n'a rien effacé (un effacement précédent a pu le faire). L'effacement était déjà enregistré et n'a pas pu être annulé : le tourniquet reste en attente. « Remplir » réécrit tout le monde — seulement si le schéma de numérotation est toujours celui de l'étape 1 ; s'il a changé, remettez-le dans le tableau de bord, puis effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
     HELD_SCHEME_MOVED:
       "« Remplir » refusé : rien n'a été effacé sur ce tourniquet, et il porte encore les numéros d'un autre schéma que celui enregistré maintenant. Remettez ce schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou réessayez « Remplir » pour le libérer sans rien effacer).",
     TLS_CLOCK:
@@ -413,6 +417,8 @@ const en: typeof fr = {
     "During the erase and until the refill has finished, members who pass by fingerprint do not get through. Cards keep working.",
   finishNotes: {
     HELD_BEFORE: "The turnstile was already on hold after an earlier erase: it stays on hold. Press Refill.",
+    HELD_BEFORE_SCHEME_MOVED:
+      "The turnstile was already on hold after an earlier erase, which may have deleted: it stays on hold. During this run, stopped before any delete, the pin scheme changed or could not be read. Refill only once the scheme is step 1's again (check it in the dashboard); if it changed, set it back in the dashboard, then erase again with 'Hold until I press Refill'.",
     PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
     PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
     HELD_SCHEME_MOVED:
@@ -500,7 +506,7 @@ const en: typeof fr = {
     erase_fingerprints: "Fingerprints erased (administrators kept)",
     counts_after: "Counts after, and check",
     erase_recorded: "Erase recorded: each member's last write result becomes 'unknown'",
-    erase_record_undone: "Erase record undone: no delete was made",
+    erase_record_undone: "Undo of the erase record (no delete made)",
     not_refilled: "People outside the refill's list checked against the backup",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
@@ -601,7 +607,7 @@ const en: typeof fr = {
     KEEP_MARK_NOT_WRITTEN:
       "The mark that keeps the backup with no time limit could not be written: the erase was undone before any delete, nothing was erased. Try again; if it happens again, call the developer (this PC's disk may be full).",
     KEEP_MARK_NOT_WRITTEN_HELD:
-      "The mark that keeps the backup with no time limit could not be written: nothing was erased. The erase was already recorded and could not be undone: the turnstile stays on hold. Refill writes everyone again — only while the numbering scheme is still the one of step 1; if it changed, erase again with 'Hold until I press Refill'.",
+      "The mark that keeps the backup with no time limit could not be written: this run erased nothing (an earlier erase may have). The erase was already recorded and could not be undone: the turnstile stays on hold. Refill writes everyone again — only while the numbering scheme is still the one of step 1; if it changed, set it back in the dashboard, then erase again with 'Hold until I press Refill'.",
     HELD_SCHEME_MOVED:
       "Refill refused: nothing was erased on this turnstile, and it still holds the numbers of another scheme than the one recorded now. Set that scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or press Refill again to release it without erasing anything).",
     TLS_CLOCK:

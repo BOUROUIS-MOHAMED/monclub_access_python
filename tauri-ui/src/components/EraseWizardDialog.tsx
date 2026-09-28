@@ -791,7 +791,10 @@ export default function EraseWizardDialog({
             </Alert>
           );
         })()}
-        {state === "INCOMPLETE" && <p className="text-[12px] text-muted-foreground">{t.incompleteHelp}</p>}
+        {/* Not under KEEP_MARK_NOT_WRITTEN_HELD (lane 1g, review C4 of lane 1f): its own text says
+            when « Remplir » is safe, and that run stopped before any count after. */}
+        {state === "INCOMPLETE" && splitRunError(run?.error ?? "").code !== "KEEP_MARK_NOT_WRITTEN_HELD"
+          && <p className="text-[12px] text-muted-foreground">{t.incompleteHelp}</p>}
         {(() => {
           // A DONE run that kept its hold says why (its finish note: "CODE: detail").
           const note = run?.steps.find((s) => s.step === "finish")?.note;
