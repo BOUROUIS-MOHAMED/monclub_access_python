@@ -168,6 +168,11 @@ export default function EraseWizardDialog({
   const [holdScheme, setHoldScheme] = useState<string | null | undefined>(undefined);
   const [stillHeld, setStillHeld] = useState(true);
   const [holdsUnknown, setHoldsUnknown] = useState(false);
+  // Lane 1e (master review C0): the hold ROW's reason and the scheme its terminal holds -- a hold
+  // kept because the scheme moved before any delete says so after a restart too (the run's finish
+  // note does not survive one), and « Remplir » waits for that scheme (the server refuses it too).
+  const [holdReason, setHoldReason] = useState<string | null>(null);
+  const [holdTerminal, setHoldTerminal] = useState<string | null>(null);
 
   const reset = useCallback(() => {
     setPassword(""); setUnlocked(false); setLockError(null); setStep(0); setPreview(null);
@@ -177,6 +182,7 @@ export default function EraseWizardDialog({
     setRun(null); setRefillMsg(null); setRefillError(null);
     setRefillWarnings([]); setAdminClash(null); setConfirmAdmins(false);
     setHoldScheme(undefined); setStillHeld(true); setHoldsUnknown(false);
+    setHoldReason(null); setHoldTerminal(null);
   }, []);
 
   useEffect(() => { if (!open) reset(); }, [open, reset]);
@@ -199,6 +205,7 @@ export default function EraseWizardDialog({
       const h = (res.holds ?? []).find((x) => Number(x.deviceId) === deviceId);
       setHoldsUnknown(!!res.loadFailed);
       setStillHeld(!!h || !!res.loadFailed); setHoldScheme(h ? (h.pinScheme ?? null) : undefined);
+      setHoldReason(h?.reason ?? null); setHoldTerminal(h?.terminalScheme ?? null);
     } catch (e) { setPreviewError(errFor(e)); }
     finally { setLoading(false); }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- errFor follows `lang`
@@ -340,8 +347,14 @@ export default function EraseWizardDialog({
       acceptFaces, otherPcsClosed, leftOutCount, acceptNotRefilled, starting, pollStatus, loadPreview,
       lang]);
 
+  // Nothing was erased on a hold kept because the scheme moved: « Remplir » only under the scheme
+  // its terminal holds (the server refuses otherwise: HELD_SCHEME_MOVED).
+  const schemeMoved = holdReason === "erase-scheme-moved";
+  const schemeMovedBlocked = schemeMoved && (holdTerminal === null || holdTerminal !== holdScheme);
+
   const doRefill = useCallback(async () => {
-    if (refilling || holdScheme === undefined || holdsUnknown || (!!adminClash && !confirmAdmins)) return;
+    if (refilling || holdScheme === undefined || holdsUnknown || schemeMovedBlocked
+        || (!!adminClash && !confirmAdmins)) return;
     setRefilling(true); setRefillError(null);
     try {
       const res = await api.refill(deviceId, password, holdScheme,
@@ -366,6 +379,10 @@ export default function EraseWizardDialog({
         setRefillError(t.schemeChanged(schemeName(now)));
         setAdminClash(null); setConfirmAdmins(false);
         void loadHold();
+      } else if (errCode(e) === "HELD_SCHEME_MOVED") {
+        // The scheme moved again since the page read the hold: read it again (lane 1e).
+        setRefillError(errFor(e));
+        void loadHold();
       } else if (errCode(e) === "ADMIN_PIN_IN_ROSTER") {
         // Nothing released: the server names the administrators; the next press sends them back.
         const p = (e as { payload?: { adminPins?: unknown; pinScheme?: string | null } | null }).payload;
@@ -379,8 +396,8 @@ export default function EraseWizardDialog({
       } else setRefillError(errFor(e));
     }
     finally { setRefilling(false); }
-  }, [api, deviceId, password, refilling, holdScheme, holdsUnknown, adminClash, confirmAdmins, t, onChanged,
-      mode, run, preview, loadHold]);
+  }, [api, deviceId, password, refilling, holdScheme, holdsUnknown, schemeMovedBlocked, adminClash,
+      confirmAdmins, t, onChanged, mode, run, preview, loadHold]);
 
   // Erase mode: a hold panel (a held turnstile at step 1, or a run that kept the hold) shows the
   // scheme read from /erase/holds NOW, and Refill sends that one.
@@ -510,6 +527,13 @@ export default function EraseWizardDialog({
         {holdsUnknown
           ? <span className="text-destructive">{t.holdsUnknown}</span>
           : <span>{t.schemeNote(holdScheme === undefined ? t.unknown : schemeName(holdScheme))}</span>}
+        {!holdsUnknown && schemeMoved && (
+          <span className={cn("font-semibold", schemeMovedBlocked ? "text-destructive" : "text-amber-700")}>
+            {schemeMovedBlocked
+              ? t.schemeMovedHold(holdTerminal === null ? null : schemeName(holdTerminal), schemeName(holdScheme))
+              : t.schemeMovedBack(schemeName(holdTerminal))}
+          </span>
+        )}
         {protocol === "ZK_STANDALONE" && preview?.limits?.mbPinsPerPass ? (
           <span className="text-muted-foreground">{t.mbPasses(preview.limits.mbPinsPerPass)}</span>
         ) : null}
@@ -523,7 +547,8 @@ export default function EraseWizardDialog({
         )}
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" onClick={() => void doRefill()}
-                  disabled={refilling || holdScheme === undefined || holdsUnknown || (!!adminClash && !confirmAdmins)}>
+                  disabled={refilling || holdScheme === undefined || holdsUnknown || schemeMovedBlocked
+                            || (!!adminClash && !confirmAdmins)}>
             {refilling ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : null}{t.refillButton}
           </Button>
           <span className="text-[11px] text-muted-foreground">{t.refillNeedsInternet}</span>

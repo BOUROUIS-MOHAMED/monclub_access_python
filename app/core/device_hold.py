@@ -24,6 +24,13 @@ stopped before any delete AFTER the pin scheme moved (or could not be read) keep
 -- the terminal still holds the old scheme's pins -- and moves its row to ``REASON_SCHEME_MOVED``,
 which no start releases (lane 1d, master review F0). The rows a start does release had their erase
 backup's keep mark dropped too (``erase_wizard.drop_keep_marks_of_unstarted_runs``, review F3).
+
+Lane 1e (master review of lane 1d, C0): the row records the scheme the terminal's pins were written
+under when the hold began (``pin_scheme``). A start does NOT release an ``erase-prep`` row whose
+turnstile's scheme moved since -- a run cut before it saw the move: it keeps it as
+``REASON_SCHEME_MOVED`` (``db.release_unstarted_erase_holds``). And Refill releases a
+``REASON_SCHEME_MOVED`` row only while the scheme recorded now is that one again
+(``EraseWizard._refill_marked``).
 """
 from __future__ import annotations
 
@@ -79,12 +86,15 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
     from app.core.db import list_device_write_holds, release_unstarted_erase_holds
 
     released: Dict[int, Optional[str]] = {}
+    kept: Dict[int, Dict[str, Optional[str]]] = {}
     # Under the lock for the read AND the install: a hold() or release() landing between the
     # two would otherwise be overwritten by a stale read (review round 2, R2-5).
     with _lock:
         if release_unstarted:
             try:
-                released = dict(release_unstarted_erase_holds() or {})
+                kept_out: Dict[int, Dict[str, Optional[str]]] = {}
+                released = dict(release_unstarted_erase_holds(kept_out=kept_out) or {})
+                kept = kept_out
             except Exception:
                 _log.error("[HOLD] holds of runs stopped before any erase NOT released: they stay "
                            "held until Refill", exc_info=True)
@@ -104,11 +114,27 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
                        step="released_at_start", ok=True)
         except Exception:
             pass
-    if released:
-        # Nobody was erased by those runs: a keep mark one left behind goes (review F3).
+    for did, info in sorted(kept.items()):
+        _log.warning("[HOLD] turnstile %s kept on hold at start-up: its erase run %s stopped before "
+                     "any delete command, and its pin scheme moved since (the terminal holds %s "
+                     "pins, MonClub records %s now) -- nothing was erased; held until Refill, which "
+                     "waits for the scheme to be %s again, or an erase with 'hold'", did,
+                     info.get("runId"), info.get("terminalScheme"), info.get("scheme"),
+                     info.get("terminalScheme"))
+        try:
+            from app.core import telemetry as _tel
+            _tel.event("ERASE_STEP", run=str(info.get("runId") or ""), device_id=did,
+                       step="kept_at_start", ok=True, pin_scheme=str(info.get("scheme") or ""))
+        except Exception:
+            pass
+    stopped = dict(released)
+    stopped.update({did: info.get("runId") for did, info in kept.items()})
+    if stopped:
+        # Nobody was erased by those runs -- released or kept, none had left ``erase-prep``: a keep
+        # mark one left behind goes (review F3).
         try:
             from app.core.erase_wizard import drop_keep_marks_of_unstarted_runs
-            drop_keep_marks_of_unstarted_runs(released)
+            drop_keep_marks_of_unstarted_runs(stopped)
         except Exception:
             _log.warning("[HOLD] keep marks of the released runs not checked", exc_info=True)
     if ids:
@@ -132,9 +158,12 @@ def ensure_loaded() -> bool:
     return True
 
 
-def hold(device_id: int, *, reason: str = "erase", run_id: Optional[str] = None) -> None:
+def hold(device_id: int, *, reason: str = "erase", run_id: Optional[str] = None,
+         pin_scheme: Optional[str] = None) -> None:
     """Hold a turnstile. The database row is written (durably) BEFORE the in-memory gate, so a
-    crash cannot leave a hold that the next start forgets."""
+    crash cannot leave a hold that the next start forgets. ``pin_scheme``: the scheme the
+    terminal's pins were written under -- recorded by a NEW row only (``db.set_device_write_hold``,
+    lane 1e)."""
     global _held
     did = _as_id(device_id)
     if did is None:
@@ -142,7 +171,7 @@ def hold(device_id: int, *, reason: str = "erase", run_id: Optional[str] = None)
     from app.core.db import set_device_write_hold
 
     with _lock:
-        set_device_write_hold(device_id=did, reason=reason, run_id=run_id)
+        set_device_write_hold(device_id=did, reason=reason, run_id=run_id, pin_scheme=pin_scheme)
         _held = frozenset(_held | {did})
     _log.warning("[HOLD] turnstile %s on hold (%s, run %s): nothing is written to it", did,
                  reason, run_id)

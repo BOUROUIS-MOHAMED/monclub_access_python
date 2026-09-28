@@ -2618,10 +2618,18 @@ def init_db() -> None:
                 device_id INTEGER PRIMARY KEY,
                 reason TEXT NOT NULL,
                 run_id TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                pin_scheme TEXT
             );
             """
         )
+        # Lane 1e (master review C0): the pin scheme the terminal's member pins were written under
+        # when the hold began (``set_device_write_hold``). Not through ``_ensure_column``, which
+        # swallows a failure: every hold read names this column, and a table without it would make
+        # the start-up load fail -- which holds EVERY turnstile. A failure here stops the start
+        # instead, as any failed migration does (owner decision 2026-09-25).
+        if "pin_scheme" not in set(_table_columns(conn, "device_write_hold")):
+            conn.execute("ALTER TABLE device_write_hold ADD COLUMN pin_scheme TEXT")
 
         # -----------------------------
         # realtime rtlog cursor
@@ -9729,27 +9737,36 @@ HOLD_REASON_ERASE = "erase"
 # Lane 1d (master review F0): a run that stopped before its first delete after the pin scheme moved
 # (or could not be read) keeps its hold -- the terminal still holds every old-scheme pin. Not
 # ERASE (no delete ran), and never released by a start: only Refill, or a later run's erase record.
+# Lane 1e (master review C0): Refill releases it only while the scheme recorded now is the one the
+# row records the terminal was written under (``pin_scheme``; ``EraseWizard._refill_marked``).
 HOLD_REASON_SCHEME_MOVED = "erase-scheme-moved"
 
 
-def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None) -> None:
+def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None,
+                          pin_scheme: Optional[str] = None) -> None:
     """Hold a turnstile: MonClub writes nothing to it until the hold is cleared. Durable
     (``synchronous=FULL``): a power cut or a restart between an erase and its refill must not
     let the first pass refill the terminal under the pin scheme recorded before the switch.
     A row already held for a real erase keeps that reason: a second run's ERASE_PREP never
     downgrades it (a start-up would otherwise release a turnstile a delete may have emptied). A
-    held row also keeps its ``created_at``: the turnstile has been held since then."""
+    held row also keeps its ``created_at``: the turnstile has been held since then.
+
+    ``pin_scheme`` (lane 1e, master review C0): the scheme the terminal's member pins were written
+    under when the hold BEGAN -- the erase run's start scheme. Written by the INSERT only: a later
+    run that takes the row over (its erase record needs its own run id) never replaces it, not even
+    a NULL, since until an erase is recorded the terminal still holds the pins of the first one."""
     did = int(device_id)
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> None:
         conn.execute(
-            "INSERT INTO device_write_hold (device_id, reason, run_id, created_at) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO device_write_hold (device_id, reason, run_id, created_at, pin_scheme) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(device_id) DO UPDATE SET "
             "reason = CASE WHEN device_write_hold.reason = ? THEN excluded.reason "
             "ELSE device_write_hold.reason END, "
             "run_id = excluded.run_id, created_at = device_write_hold.created_at",
-            (did, str(reason or HOLD_REASON_ERASE), run_id, now_iso(), HOLD_REASON_ERASE_PREP),
+            (did, str(reason or HOLD_REASON_ERASE), run_id, now_iso(),
+             None if pin_scheme is None else str(pin_scheme), HOLD_REASON_ERASE_PREP),
         )
 
     _run_db_write_sync("set_device_write_hold", _write, durable=True)
@@ -9812,29 +9829,60 @@ def keep_erase_hold_after_scheme_move(*, device_id: int, run_id: str) -> Optiona
     return _run_db_write_sync("keep_erase_hold_after_scheme_move", _write, durable=True)
 
 
-def release_unstarted_erase_holds() -> Dict[int, Optional[str]]:
+def release_unstarted_erase_holds(
+        *, kept_out: Optional[Dict[int, Dict[str, Optional[str]]]] = None,
+) -> Dict[int, Optional[str]]:
     """Start-up only (lane 1b, review F1): delete every hold still at ERASE_PREP -- a run that
     stopped (power cut, crash, kill) before its first delete command, a backup-only rehearsal
     included. Nothing was erased, so nothing waits for Refill, and a hold left there would block
     every member write, revocations included, until someone presses Refill online. Must never
     run while an erase of this process could be in its preparation. Returns {device_id: run_id}.
     A plain read first: the durable write job runs only when there is something to release (every
-    start-up calls this)."""
+    start-up calls this).
+
+    EXCEPT a row whose turnstile's scheme moved since its hold began (lane 1e, master review C0):
+    its ``pin_scheme`` is recorded, the turnstile still has its ``sync_devices`` row, and that row's
+    scheme (normalised as ``get_device_pin_scheme`` reads it) is another one. That run was cut
+    before it could see the move (``EraseWizard._scheme_moved_note``); the terminal still holds
+    every pin of the old scheme, and a pass released now would write the new scheme's pins beside
+    them. Such a row moves to SCHEME_MOVED, in the same write, and is reported in ``kept_out``
+    ({device_id: {runId, terminalScheme, scheme}}). A row that records no scheme (written before
+    lane 1e) and a turnstile with no device row (deleted in MonClub) are released as before. A
+    read that fails raises: nothing is released (the caller keeps every row held -- fail closed)."""
     with get_conn() as conn:
         if conn.execute("SELECT 1 FROM device_write_hold WHERE reason=? LIMIT 1",
                         (HOLD_REASON_ERASE_PREP,)).fetchone() is None:
             return {}
 
-    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Dict[int, Optional[str]]:
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]
+               ) -> Tuple[Dict[int, Optional[str]], Dict[int, Dict[str, Optional[str]]]]:
         rows = conn.execute(
-            "SELECT device_id, run_id FROM device_write_hold WHERE reason=?",
+            "SELECT device_id, run_id, pin_scheme FROM device_write_hold WHERE reason=?",
             (HOLD_REASON_ERASE_PREP,)).fetchall()
-        conn.execute("DELETE FROM device_write_hold WHERE reason=?", (HOLD_REASON_ERASE_PREP,))
-        out = {int(r[0]): (None if r[1] is None else str(r[1])) for r in rows}
-        profile["released"] = len(out)
-        return out
+        released: Dict[int, Optional[str]] = {}
+        kept: Dict[int, Dict[str, Optional[str]]] = {}
+        for r in rows:
+            did, run_id, held = int(r[0]), (None if r[1] is None else str(r[1])), r[2]
+            device = conn.execute("SELECT pin_scheme FROM sync_devices WHERE id=? LIMIT 1",
+                                  (did,)).fetchone()
+            now = None if device is None else normalize_pin_scheme(device[0])
+            if held is not None and now is not None and now != normalize_pin_scheme(held):
+                conn.execute("UPDATE device_write_hold SET reason=? WHERE device_id=? AND reason=?",
+                             (HOLD_REASON_SCHEME_MOVED, did, HOLD_REASON_ERASE_PREP))
+                kept[did] = {"runId": run_id, "terminalScheme": normalize_pin_scheme(held),
+                             "scheme": now}
+            else:
+                conn.execute("DELETE FROM device_write_hold WHERE device_id=? AND reason=?",
+                             (did, HOLD_REASON_ERASE_PREP))
+                released[did] = run_id
+        profile["released"] = len(released)
+        profile["kept"] = len(kept)
+        return released, kept
 
-    return dict(_run_db_write_sync("release_unstarted_erase_holds", _write, durable=True))
+    released, kept = _run_db_write_sync("release_unstarted_erase_holds", _write, durable=True)
+    if kept_out is not None:
+        kept_out.update(kept)
+    return dict(released)
 
 
 def clear_device_write_hold(*, device_id: int) -> int:
@@ -9849,12 +9897,16 @@ def clear_device_write_hold(*, device_id: int) -> int:
 
 
 def list_device_write_holds() -> Dict[int, Dict[str, Any]]:
-    """{device_id: {reason, runId, since}} for every held turnstile."""
+    """{device_id: {reason, runId, since, terminalScheme}} for every held turnstile.
+    ``terminalScheme``: the scheme the terminal's pins were written under when the hold began
+    (``set_device_write_hold``, lane 1e), None when the row does not record it."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT device_id, reason, run_id, created_at FROM device_write_hold"
+            "SELECT device_id, reason, run_id, created_at, pin_scheme FROM device_write_hold"
         ).fetchall()
-    return {int(r[0]): {"reason": str(r[1] or ""), "runId": r[2], "since": r[3]} for r in rows}
+    return {int(r[0]): {"reason": str(r[1] or ""), "runId": r[2], "since": r[3],
+                        "terminalScheme": None if r[4] is None else normalize_pin_scheme(r[4])}
+            for r in rows}
 
 
 def retire_device_records(*, device_id: int, keep_pins: Iterable[str] = ()) -> Dict[str, int]:

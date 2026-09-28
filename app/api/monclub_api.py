@@ -46,6 +46,13 @@ class MonClubApiHttpError(MonClubApiError):
         self.body = str(body or "")
 
 
+class MonClubTokenRejectedError(MonClubApiHttpError):
+    """HTTP 401 from the backend's JWT filter: the gym login this PC sends was refused (missing,
+    invalid, expired, session expired, gym not found) -- the request never reached the route. Its
+    body is the filter's JSON ``{"status": false, "errorMsg": ..., "code": "UNAUTHORIZED"}``
+    (backend ``JwtAuthenticationFilter.write401``), never a route's own answer."""
+
+
 class MonClubApiConflictError(MonClubApiHttpError):
     """HTTP 409 on a lifecycle mutation — the target moved under us (stale @Version or a
     business conflict). Subclasses HttpError so existing handlers still catch it, but the
@@ -521,6 +528,14 @@ class MonClubApi:
 
         Returns True if the password is correct, False if wrong (401).
         Raises MonClubApiHttpError for unexpected HTTP errors.
+
+        A 401 is a wrong password only when the ROUTE answered it (backend
+        ``AccountAuthenticationService.validateStatisticsPassword``: 401 "Wrong password"). The
+        backend's JWT filter also answers 401 -- for the gym login itself, before the route
+        (``JwtAuthenticationFilter.write401``, JSON ``code: "UNAUTHORIZED"``) -- and that one raises
+        ``MonClubTokenRejectedError``: the Erase wizard and the lock screen then say this PC is
+        not signed in, not "wrong password" (lane 1e, master review F5; read on backend main
+        f1482fd1 -- what production runs is not known here).
         """
         from urllib.parse import urlparse
         parsed = urlparse(self.endpoints.login_url)
@@ -542,6 +557,16 @@ class MonClubApi:
         if r.status_code == 200:
             return True
         if r.status_code == 401:
+            txt = (r.text or "").strip()
+            try:
+                body = json.loads(txt) if txt else None
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get("code") == "UNAUTHORIZED":
+                raise MonClubTokenRejectedError(
+                    "validate_statistics_password: the gym login was refused "
+                    f"(HTTP 401 UNAUTHORIZED: {str(body.get('errorMsg') or '')[:80]})",
+                    status_code=401, body=txt[:200])
             return False
         txt = (r.text or "").strip()
         raise MonClubApiHttpError(

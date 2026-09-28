@@ -192,12 +192,16 @@ export default function DevicesPage() {
   // Erase-content wizard (lane 1, 2026-09-27) and the turnstiles an erase left on hold.
   const [eraseDialog, setEraseDialog] = useState<{ deviceId: number; deviceName: string; mode: "erase" | "refill" } | null>(null);
   const [heldIds, setHeldIds] = useState<Set<number>>(new Set());
+  // Each hold's reason (lane 1e): "erase-scheme-moved" is a hold where NOTHING was erased.
+  const [holdReasons, setHoldReasons] = useState<Map<number, string>>(new Map());
   // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
   const [holdsUnknown, setHoldsUnknown] = useState(false);
   const reloadHolds = useCallback(async () => {
     try {
       const res = await liveEraseApi.holds();
-      setHeldIds(new Set((res.holds ?? []).map((h) => Number(h.deviceId)).filter((n) => Number.isFinite(n))));
+      const held = (res.holds ?? []).filter((h) => Number.isFinite(Number(h.deviceId)));
+      setHeldIds(new Set(held.map((h) => Number(h.deviceId))));
+      setHoldReasons(new Map(held.map((h) => [Number(h.deviceId), String(h.reason ?? "")])));
       setHoldsUnknown(!!res.loadFailed);
     } catch { /* an older Access API without the wizard: no hold is shown */ }
   }, []);
@@ -660,7 +664,9 @@ export default function DevicesPage() {
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>
-                              En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir ».
+                              {holdReasons.get(Number(did)) === "erase-scheme-moved"
+                                ? "En attente : le schéma de numérotation a changé pendant un effacement, avant toute suppression — rien n'a été effacé. « Remplir » n'est accepté que sous le schéma d'avant (la fenêtre l'explique)."
+                                : "En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir »."}
                             </TooltipContent>
                           </Tooltip>
                         )}
