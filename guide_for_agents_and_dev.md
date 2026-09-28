@@ -1909,7 +1909,8 @@ included; a TLS failure (`requests`' SSLError, a ConnectionError, or `ssl.SSLErr
 (review nit: something answered with a certificate that does not check out; `erase_wizard.is_tls_failure`) and reads
 `ERASE_SWITCH_UNCHECKED` with its text as the detail line -- and the erase / Refill password check
 (`local_access_api_v2._erase_password_verifier`) answers a TLS failure 502, `ADMIN_PASSWORD_CHECK_FAILED`, not 503 « Pas
-d'Internet » (review round 1) `[TEST: test_erase_wizard_lane1d.py::TestTheNits]`; anything else — no token, 401/403, 5xx, a
+d'Internet » (review round 1), and so does the lock screen's own route, `_handle_auth_verify_admin_password` -- the first
+call of an erase and of « Remplir » (review round 2) `[TEST: test_erase_wizard_lane1d.py::TestTheNits]`; anything else — no token, 401/403, 5xx, a
 body that is not JSON, `"true"` as a string — stays `ERASE_SWITCH_UNCHECKED` ("réponse inattendue du serveur", the
 server's words as a detail line). The switch is OFF by default on the server: until lane 3c's backend route
 (`GET /api/v1/manager/gym/access/erase-wizard`) is deployed EVERY start is refused `ERASE_SWITCH_MISSING` (today's
@@ -2002,7 +2003,7 @@ their tick gating Erase; the watchdog tick; Refill's warnings and the administra
 note of a run that kept its hold (`HELD_BEFORE`, `PIN_SCHEME_CHANGED`, `PIN_SCHEME_UNREADABLE`); a lockout line for a
 fingerprints-only erase; `noAnswer()` never reads an HTTP answer (`ApiError`) as "no answer". The lock screen's route
 (`/auth/verify-admin-password`) now answers every refusal with a code — `ADMIN_PASSWORD_REQUIRED`, `PC_NOT_SIGNED_IN`,
-`ADMIN_PASSWORD`, `ADMIN_PASSWORD_CHECK_FAILED` (its generic 500 too since lane 1d), statuses and texts unchanged for the
+`ADMIN_PASSWORD`, `ADMIN_PASSWORD_CHECK_FAILED` (its generic 500 too since lane 1d, and a TLS failure, 502), statuses and texts unchanged for the
 Local DB page (review F6) — so the English page no longer shows "Mot de passe incorrect" raw.
 Lane 1d (review nits), FR/EN: the not-put-back title says what the chosen tables take from those people -- the user
 (a users erase), or only their door rights and / or fingerprints, their user and card staying

@@ -1380,6 +1380,14 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
         ctx.send_json(e.status_code, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
                                       "error": str(e)})
     except MonClubApiError as e:
+        # A TLS failure got an answer (a certificate that does not check out): the server's check
+        # failed -- not "no internet" (lane 1d, review round 2; the Erase wizard's lock screen).
+        from app.core.erase_wizard import is_tls_failure
+        if is_tls_failure(e):
+            ctx.app.logger.warning("verify_admin_password: TLS failure: %s", e)
+            ctx.send_json(502, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
+                                "error": f"the admin password could not be checked (TLS): {e}"})
+            return
         # The server could not be reached (MonClubApiError is the PARENT of the HTTP error, so
         # this is the no-answer case): not a wrong password -- say that the internet is needed,
         # with a code the Erase wizard translates (lane 1b, review F25).

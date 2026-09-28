@@ -427,6 +427,33 @@ class TestTheNits:
         assert (ok, got_status) == (False, status), error
         assert ew._password_refusal(got_status, error)[1]["code"] == code
 
+    @pytest.mark.parametrize("cause, status, code", [
+        (__import__("requests").exceptions.SSLError("certificate verify failed"), 502,
+         "ADMIN_PASSWORD_CHECK_FAILED"),
+        (__import__("requests").exceptions.ConnectionError("no route"), 503,
+         "ADMIN_PASSWORD_UNCHECKABLE"),
+    ])
+    def test_the_lock_screen_does_not_read_a_tls_failure_as_no_internet(self, monkeypatch, cause,
+                                                                        status, code):
+        """Review round 2 of lane 1d: the wizard's lock screen (/auth/verify-admin-password) is
+        the first call of an erase and of « Remplir » -- a TLS failure must not read « Pas
+        d'Internet » there either."""
+        import logging
+        from types import SimpleNamespace
+        from app.api import local_access_api_v2 as api_mod
+        from app.api.monclub_api import MonClubApiError
+
+        class _Api:
+            def validate_statistics_password(self, **k):
+                raise MonClubApiError(f"validate_statistics_password failed: {cause}") from cause
+        monkeypatch.setattr("access.store.load_auth_token", lambda: SimpleNamespace(token="t"))
+        sent = {}
+        ctx = SimpleNamespace(body=lambda: {"password": "pw"},
+                              app=SimpleNamespace(_api=lambda: _Api(), logger=logging.getLogger("t")),
+                              send_json=lambda s, p: sent.update(status=s, payload=p))
+        api_mod._handle_auth_verify_admin_password(ctx)
+        assert (sent["status"], sent["payload"]["code"]) == (status, code), sent
+
     def test_the_lock_screens_generic_500_carries_a_code(self, monkeypatch):
         import logging
         from types import SimpleNamespace
