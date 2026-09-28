@@ -1987,7 +1987,11 @@ Since lane 1c `[CODE]`:
   delete (`KEEP_MARK_NOT_WRITTEN`) -- released, or kept with its scheme guard when the scheme moved or the turnstile was
   held before. A row that was already at `erase` (an earlier run may have deleted), or an undo that fails, ends
   `INCOMPLETE` and held (`KEEP_MARK_NOT_WRITTEN_HELD`: « Remplir » writes everyone, only under the scheme of the erase's
-  start -- no code guards an `erase` row, which C13b's normal « Remplir » needs). `erased` is set only once the mark is
+  start -- no code guards an `erase` row, which C13b's normal « Remplir » needs). Since lane 1g (review of lane 1f,
+  C4/C5) its page text says « cette opération n'a rien effacé (un effacement précédent a pu le faire) » and, the scheme
+  changed, « remettez-le … puis effacez à nouveau », the dialog's generic `incompleteHelp` (« …appuyez sur « Remplir » »)
+  is not shown under that code, and the step's label names the step (« Annulation de l'enregistrement de l'effacement
+  (aucune suppression faite) ») -- its icon carries the result. `erased` is set only once the mark is
   written. Residual `[CODE]`: the push results `begin_device_erase` reset stay unknown after an undo (their earlier
   values are not kept) -- "unknown", never a false "on the turnstile". `[TEST: test_erase_wizard_lane1e.py::
   TestTheKeepMarkComesAfterTheEraseRecord; mutation checked: no undo]` — and the prune never deletes a marked folder,
@@ -2162,7 +2166,11 @@ run folder's `run.json`):
      (review of lane 1e, C1) neither is a row missing while the list cannot say so -- the PC signed out, or its list
      empty (`db.device_list_is_authoritative`: a logout deletes the token and empties `sync_devices`; the TV logout
      deletes the token alone): the hold is then made durable (`erase-scheme-moved`). `[TEST:
-     test_erase_wizard_lane1f.py::TestARunStoppedWhileSignedOut]` Residual `[CODE]`: like any hold, it blocks every member write, revocations included,
+     test_erase_wizard_lane1f.py::TestARunStoppedWhileSignedOut]` Since lane 1g (review of lane 1f, C1) the list must also
+     have been written WHOLE since the logout (the `sync_device_list_state` marker, below), and the note of such a stop is
+     `HELD_SCHEME_UNREADABLE` (C3: no device row is not a scheme -- lane 1f wrote "moved from MEMBERSHIP to None", and
+     the page said the scheme had changed). `[TEST: test_erase_wizard_lane1f.py::TestARunStoppedWhileSignedOut::
+     test_a_missing_row_is_not_read_as_deleted; test_erase_wizard_lane1g.py::TestAPartialListAfterAReLogin]` Residual `[CODE]`: like any hold, it blocks every member write, revocations included,
      across restarts until « Remplir » — the page's note says so. `[TEST: test_erase_wizard_lane1d.py::
      TestAHoldKeptAfterASchemeMoveSurvivesARestart — both notes reloaded with release_unstarted=True, the unchanged-scheme
      control, the row rules, Refill releases it, a failed write]` With the scheme unchanged a `FAILED` run releases as
@@ -2185,11 +2193,14 @@ run folder's `run.json`):
      (runbook C6): set the scheme back, then erase again with "hold" (its erase record moves the row to `erase`); or
      « Remplir » under the old scheme to release it without erasing. A run on a turnstile already held makes its stop
      durable too (F7: lane 1d skipped `held_before` runs, and a row taken over at `erase-prep` stayed releasable) --
-     except that on a row at `erase` (an earlier run may have deleted) the note is `HELD_BEFORE`: « Remplir » is the
-     normal step there. A turnstile deleted in MonClub during the run, its row at `erase-prep`, gets `HELD_DEVICE_GONE`
+     except that on a row at `erase` (an earlier run may have deleted) the note is `HELD_BEFORE_SCHEME_MOVED` since
+     lane 1g (review of lane 1f, C2; lane 1e and 1f gave `_refill`'s `HELD_BEFORE`, « Appuyez sur « Remplir » »): no
+     code refuses « Remplir » on an `erase` row, but the scheme moved (or could not be read) during this run -- « Remplir »
+     only once the scheme is step 1's again, else set it back and erase again with "hold". `HELD_BEFORE` stays `_refill`'s
+     DONE note, where "press Refill" is right. A turnstile deleted in MonClub during the run, its row at `erase-prep`, gets `HELD_DEVICE_GONE`
      (nothing to do; the next start releases it -- signed in with its list, lane 1f). Since lane 1f (nit N1) a durable
-     write that fails on a row read at `erase` or `erase-scheme-moved` keeps that row's own note (`HELD_BEFORE`, the
-     plain one): that write moves `erase-prep` rows only, so only they get the `_SESSION` note. The finish note names the scheme the ROW records for the terminal (a run
+     write that fails on a row read at `erase` or `erase-scheme-moved` keeps that row's own note (`HELD_BEFORE_SCHEME_MOVED`
+     since lane 1g, the plain one): that write moves `erase-prep` rows only, so only they get the `_SESSION` note. The finish note names the scheme the ROW records for the terminal (a run
      that took an earlier hold over keeps the first run's) and one recovery: set that scheme back, then erase again with
      "hold" (or « Remplir », erasing nothing). `[TEST: test_erase_wizard_lane1e.py::TestRemplirOnASchemeMovedHold,
      ::TestASchemeMovedStopOnATurnstileHeldBefore, ::TestATurnstileRemovedDuringTheRun, ::TestTheHoldColumnMigration;
@@ -2339,7 +2350,21 @@ hold at start-up …`, `[T] ERASE_STEP step=kept_at_start`; its keep mark goes a
 nobody). A row that records no scheme (written before lane 1e) is released as before; a read that fails releases
 nothing (every row stays held, retried at the next load). A turnstile with no device row is released only while the
 list can say it was deleted in MonClub (lane 1f, review of lane 1e, C1: `db._device_list_is_authoritative` -- a gym
-token in `auth_state` AND at least one `sync_devices` row). A logout deletes the token and empties that list
+token in `auth_state` AND at least one `sync_devices` row; since lane 1g, review of lane 1f, C1, AND the row of
+`sync_device_list_state`: written only by a full replace of `sync_devices` -- `_save_sync_cache` with a payload, and
+`save_sync_cache_delta` when its devices section refreshes -- in the same transaction as the rows, and deleted by
+`save_sync_cache(None)` in the transaction that empties them. A fast patch never writes it: after a logout and a login
+one GYM_DEVICE upsert (`_apply_fast_patch_item`; the dashboard posts it to 127.0.0.1 after any device save, and the
+route is auth-exempt) put a single row into the emptied list, and lane 1f then released another turnstile's cut row as
+"deleted" at the next start. Not the `devicesVersion` token: the logout clears the tokens in a separate step whose
+failure it swallows (fail open). An H-006-refused full save writes nothing, the marker included. Residual `[CODE]`: an
+upgraded database has no marker until its next device refresh (a device change in MonClub, or the first sync after a
+login); until then no missing turnstile reads as deleted -- a cut run's row of a turnstile deleted in MonClub stays
+held (fail closed; « Remplir », or the start after that refresh, releases it). No one-shot `devicesVersion` drop: it was
+tried and moved the other one-shot steps' tested state for little gain `[TEST: test_erase_wizard_lane1g.py::
+TestAPartialListAfterAReLogin, ::TestTheMarker]`). A read of it that raises at start-up
+releases nothing -- every row stays held, the write rolled back `[TEST: test_erase_wizard_lane1g.py::
+TestTheStartUpReadThatRaises]`. A logout deletes the token and empties that list
 (`_handle_auth_logout` → `save_sync_cache(None)`), the TV logout deletes the token alone: a start then leaves the row
 at `erase-prep` (`release_unstarted_erase_holds(undecided_out=…)`, `[HOLD] turnstile N kept on hold at start-up … cannot
 tell whether its pin scheme moved`, `[T] ERASE_STEP step=undecided_at_start`), held until a start signed in with the

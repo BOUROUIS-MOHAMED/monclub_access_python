@@ -442,7 +442,7 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
    db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
    rows after the retire: Quit, retire again.
 4b. **Restart it, proven** (runbook part C's box "Proving a restart", with its « Pilote / Lecteur » page
-   reading -- « PC lecteur » when a driver is set by then, §7 D2), and no later `PIN_SCHEME_SWITCH …
+   reading -- the box's later-day sentence: « PC lecteur » when a driver is set by then, §7 D2), and no later `PIN_SCHEME_SWITCH …
    previous=ACCOUNT scheme=MEMBERSHIP` line (runbook C13, D15). Only then step 5 -- the order runbook C1b
    brings a gym 58 PC back in (lane 1f review, 2026-09-28).
 5. Remove the block; its one re-push rewrites every member. Re-tick start-with-Windows, and the watchdog
@@ -482,7 +482,7 @@ terminal whose cable is out or that is blocked (`local_access_api_v2._handle_dev
 | R5 | After opening | A full second procedure | the old system's users (the goal) |
 | R6 | **Power lost during E5** (a terminal mid-erase) | At power-on: Access stays stopped (start-with-Windows unticked, watchdog off). Re-run script 13 on that terminal (it re-reads the users and deletes what is left `[CODE]`), then E6. If the day is over: R2 for that terminal before opening. | -- |
 | R7 | **Power lost during E11** (switch recorded, push partial) | At power-on Access starts (start-with-Windows was re-ticked only at E14, so start it by hand); its start-up full pass continues the push: every written chunk is recorded, the chunk in flight is covered by its push intent `[CODE: guide §3.4a]`. Wait for E11's completion lines. | -- |
-| R8 | A terminal **left for another day** (not wiped, or wipe abandoned + R2) | It stays on MEMBERSHIP with its old contents and works overnight and the next days as it does today; finish it with its own E5-E13 on another closed morning. | -- |
+| R8 | A terminal **left for another day** (not wiped, or wipe abandoned + R2; on the cutover night also a terminal runbook D6's « To stop there » released while the other ended « Terminé »: its « Remplir » already asked the full re-push, so no R2) | It stays on MEMBERSHIP with its old contents and works overnight and the next days as it does today; finish it with its own E5-E13 on another closed morning. | -- |
 | R9 | Phase D (1.4.35 installed) must be undone | Restore the D0 copy of the data folder, reinstall 1.4.33 (`[UNVERIFIED]` on a migrated database, D2) | -- |
 
 **Every row that stops Access** (R2-R4, R6, R8, R9 with a reinstall) starts with the watchdog off --
