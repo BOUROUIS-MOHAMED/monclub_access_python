@@ -32,8 +32,8 @@ driver PCs and readers -- the night runs without drivers (runbook part H).
 > - **§6:** runbook part F comes first. R4's "wipe again (E5-E6)" and R6's "script 13 again" mean the
 >   wizard again (runbook part F, gym 45 "Every other row"); after a power cut during the wizard's erase,
 >   the hold stays until « Remplir » (a hold whose run stopped before its first delete is released at the
->   next start -- unless its turnstile's scheme moved, or P1 starts signed out of MonClub: then it is kept,
->   guide §3.2h).
+>   next start -- unless its turnstile's scheme moved, or P1 starts after a full logout (its turnstile list
+>   empty): then it is kept, guide §3.2h).
 
 Every claim is graded as in the guides: `[CODE]` (an executable statement, named), `[TEST]`,
 `[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated;
