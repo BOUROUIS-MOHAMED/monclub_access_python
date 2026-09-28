@@ -318,7 +318,9 @@ through MonClub, re-enable a template MonClub has but does not deliver
 
 ### Phase D -- upgrade, ≥ 2 opening days before the cutover
 *Not on the cutover night (the banner at the top): the runbook installs on P1 on the night, before the
-erase (D6). D2's log checks still apply to a P1 left on the new Access (runbook N3).*
+erase (D6). D2's log checks still apply to a P1 left on the new Access (runbook N3), but not D2's « go back »:
+the night takes no D0 copy, so `TEMPLATE_VERSION_MISMATCH` then means stop, call the developer (E11's fail column),
+and the old Access comes back only as runbook N3 allows -- no « Effacer » pressed on either terminal that night.*
 D0. Just before installing: Quit Access on P1 and copy its data folder (as B4). This copy is Phase
 D's rollback.
 D1. Install 1.4.35 on P1 (and on P2/P3 only if D2 brings them back). Check /access-pcs.
