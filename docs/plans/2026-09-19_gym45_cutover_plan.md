@@ -421,7 +421,9 @@ Started as they are, each would record the switch, re-push every account pin onc
 removal step like §2; on 1.4.32/1.4.33 it pushes membership pins onto the account terminals `[CODE]`.
 For each PC that D2 brings back, with the gym closed and its §5.2 block still on:
 1. Access stopped on it (untick start-with-Windows, Quit, watchdog off, the §5.1 rename test).
-2. Retire its rows for 8 and 10. **D3 was decided on 2026-09-27 as the Erase wizard's « forget »**
+2. Retire its rows for each of 8 and 10 switched to « Par personne » by then (a terminal the night left
+   « Par abonnement », runbook D6's « Then, by the other terminal », keeps its rows -- lane 1h, 2026-09-28).
+   **D3 was decided on 2026-09-27 as the Erase wizard's « forget »**
    (runbook D10 (a)), which retires only the PC that runs the erase -- P1. P2 and P3 run no erase, so
    for them it is one of (lane 1e, master review F6):
    - §5.1's SQL (D3 (b), runbook D10 (b)), **on the version it runs** (1.4.33: `device_sync_state`
@@ -437,9 +439,11 @@ For each PC that D2 brings back, with the gym closed and its §5.2 block still o
    postinstall]`) -- and **"Keep MonClub Access running" unticked** (ticked, it registers the watchdog,
    which starts Access by itself within minutes; runbook A7, C3c, D9), in the session of the Windows
    account Access is installed under (runbook A1).
-4. Start Access. Its first start marks both devices as seen on MEMBERSHIP and then receives ACCOUNT, so
-   its log must show `[T] PIN_SCHEME_SWITCH device_id=8 … cleared_rows=0` and the same for 10 `[CODE:
-   db._ensure_pin_scheme_column, ::_record_device_pin_scheme_switch]`. `cleared_rows` ≠ 0 → it wrote
+4. Start Access. Its first start marks each device as seen on MEMBERSHIP and then receives ACCOUNT for
+   each one switched, so its log must show `[T] PIN_SCHEME_SWITCH device_id=8 … cleared_rows=0` for 8 and
+   the same for 10 -- for each terminal switched to « Par personne » by then (a terminal still « Par
+   abonnement »: no line for it, expected; lane 1h) `[CODE: db._ensure_pin_scheme_column,
+   ::_record_device_pin_scheme_switch records nothing when the scheme is unchanged]`. `cleared_rows` ≠ 0 → it wrote
    rows after the retire: Quit, retire again.
 4b. **Restart it, proven** (runbook part C's box "Proving a restart", with its « Pilote / Lecteur » page
    reading -- the box's later-day sentence: « PC lecteur » when a driver is set by then, §7 D2), and no later `PIN_SCHEME_SWITCH …
