@@ -386,11 +386,12 @@ class TestASchemeMovedStopOnATurnstileHeldBefore:
         row = _hold_row(db, 5)
         assert row["reason"] == db.HOLD_REASON_SCHEME_MOVED and row["runId"] == run["runId"], row
 
-    def test_a_row_already_at_erase_keeps_its_reason_and_says_press_refill(self, sqlite_db,
-                                                                            monkeypatch, tmp_path):
+    def test_a_row_already_at_erase_keeps_its_reason_and_says_refill_only_under_step_1s_scheme(
+            self, sqlite_db, monkeypatch, tmp_path):
         """An earlier run may have deleted (row ``erase``): « Remplir » is not refused there, so the
         note must not say it is -- but the scheme moved during this run, so neither a plain "press
-        Refill": its own code (lane 1g, review C2 of lane 1f: HELD_BEFORE_SCHEME_MOVED)."""
+        Refill": its own code (lane 1g, review C2 of lane 1f: HELD_BEFORE_SCHEME_MOVED), whose text
+        says « Remplir » only once the scheme is step 1's again."""
         db = sqlite_db
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, db)
         _scheme(monkeypatch, "MEMBERSHIP")
@@ -402,6 +403,13 @@ class TestASchemeMovedStopOnATurnstileHeldBefore:
         assert _note(wiz).startswith("HELD_BEFORE_SCHEME_MOVED:"), _note(wiz)
         assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
         _restart()
+        # A KNOWN GAP pinned, not the contract: Refill under the moved scheme is still accepted on
+        # an ``erase`` row -- no code guard there (the cutover's own « Remplir », C13b, is on an
+        # ``erase`` row under the NEW scheme, so the scheme the row records cannot refuse it);
+        # the note, the hold panel's « …schéma enregistré maintenant : … » line and the runbook
+        # (C6 / D6 « Incomplet ») are the only guard (lane 1g C2 residual; lane 1h, critic 2). A
+        # future guard (keyed on the run's outcome, INCOMPLETE vs DONE, not on the row's scheme)
+        # flips this assert.
         assert _refill(wiz, "ACCOUNT")[0] == 200
 
     def test_a_row_already_scheme_moved_keeps_the_plain_note(self, sqlite_db, monkeypatch,

@@ -820,8 +820,9 @@ def _run_one_shot_credentials_resend(conn: sqlite3.Connection) -> None:
 # The turnstile list was last written WHOLE (lane 1g, review C1 of lane 1f): one row, written only
 # by a full replace of ``sync_devices`` -- ``_save_sync_cache`` with a payload, and
 # ``save_sync_cache_delta`` when its devices section refreshes -- in the same transaction as the
-# rows, and deleted by ``save_sync_cache(None)`` (the logout) in the transaction that empties
-# them. A fast patch (one GYM_DEVICE upsert or delete) never writes it: after a logout and a
+# rows, and deleted in the transaction that empties them: by ``save_sync_cache(None)`` (the
+# logout), and -- lane 1h, review C1 of lane 1g -- by either writer when the answer carries no
+# device list. A fast patch (one GYM_DEVICE upsert or delete) never writes it: after a logout and a
 # login, a single row it inserts into the emptied list is not "the list". Not the
 # ``devicesVersion`` token: the logout clears the tokens in a separate step whose failure it
 # swallows, which would leave the token saying "a full list" over an emptied one (fail open).
@@ -5501,9 +5502,13 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         for d in devices:
             _insert_device_row(cur, d)
         if isinstance(data.get("devices"), list):
-            # lane 1g: the list is whole -- only when the answer carried one (a payload with no
-            # device list empties the table and says nothing about it).
+            # lane 1g: the list is whole -- only when the answer carried one.
             _mark_device_list_replaced(cur)
+        else:
+            # lane 1h (review of lane 1g, C1): a payload with no device list emptied the table
+            # above -- the marker of the list it replaced goes with it, in this transaction (a
+            # later fast patch's single row would otherwise count as the whole list).
+            cur.execute("DELETE FROM sync_device_list_state")
 
         # infrastructures
         for inf in infrastructures:
@@ -6931,6 +6936,9 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                     _insert_device_row(cur, d)
                 if isinstance(data.get("devices"), list):
                     _mark_device_list_replaced(cur)             # lane 1g: the list is whole
+                else:
+                    # lane 1h (C1): emptied without a new list -- no whole list now
+                    cur.execute("DELETE FROM sync_device_list_state")
 
         creds_summary: Dict[str, Any] | None = None
         # Conditional: credentials
@@ -9976,7 +9984,9 @@ def release_unstarted_erase_holds(
                 if authoritative is None:
                     authoritative = _device_list_is_authoritative(conn)
                 if not authoritative:
-                    undecided[did] = run_id          # signed out, or no list: left as it is
+                    # signed out, or the list not written whole since the last logout or
+                    # upgrade (lane 1h, C2): left as it is
+                    undecided[did] = run_id
                     continue
             conn.execute("DELETE FROM device_write_hold WHERE device_id=? AND reason=?",
                          (did, HOLD_REASON_ERASE_PREP))

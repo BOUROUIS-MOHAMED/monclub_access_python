@@ -138,12 +138,14 @@ class TestTheMarker:
 
     def test_an_answer_without_a_device_list_writes_none(self, sqlite_db):
         """Review of lane 1g: a payload with no ``devices`` key empties the table but says nothing
-        about the list -- no marker (a later fast patch's single row would count as whole)."""
+        about the list -- no marker (a later fast patch's single row would count as whole). Lane 1h
+        (review C1): a marker already there is deleted too -- tests/test_erase_wizard_lane1h.py.
+        The delta's payload is not ``{}``, which returns before any write."""
         db = sqlite_db
         db.save_sync_cache({"users": []})
         assert not _marker(db)
         refresh = {"members": False, "devices": True, "credentials": False, "settings": False}
-        db.save_sync_cache_delta({}, refresh)
+        db.save_sync_cache_delta({"_clientReceivedAtEpoch": 1790000000}, refresh)
         assert not _marker(db) and _device_ids(db) == []
 
     def test_a_fast_patch_leaves_it_as_it_was(self, sqlite_db):
