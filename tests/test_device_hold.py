@@ -132,18 +132,20 @@ def test_a_load_racing_a_hold_keeps_the_in_memory_gate(sqlite_db, monkeypatch):
     def _read_then_a_hold_lands():
         out = real()
         if not raced:
-            raced.append(1)
-            threading.Thread(target=lambda: device_hold.hold(5, reason="erase", run_id="r"),
-                             daemon=True).start()
+            thread = threading.Thread(
+                target=lambda: device_hold.hold(5, reason="erase", run_id="r"), daemon=True)
+            raced.append(thread)
+            thread.start()
             time.sleep(0.2)                     # the hold waits for the load to finish
         return out
 
     monkeypatch.setattr(device_hold, "_load_failed", True)
     monkeypatch.setattr(dbmod, "list_device_write_holds", _read_then_a_hold_lands)
     assert device_hold.ensure_loaded() is True
-    deadline = time.monotonic() + 5
-    while 5 not in real() and time.monotonic() < deadline:
-        time.sleep(0.02)
+    # Wait for the hold to RETURN (lane 1e): its row is written just before its gate, both under
+    # the lock, so a poll of the row alone could look between the two and fail spuriously.
+    raced[0].join(timeout=5)
+    assert not raced[0].is_alive()
     monkeypatch.setattr(dbmod, "list_device_write_holds", real)
     assert 5 in real() and device_hold.is_held(5), "the row and the gate agree"
 
