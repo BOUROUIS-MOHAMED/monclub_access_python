@@ -692,11 +692,13 @@ class MainApp:
                               "(nothing written to any) until they read -- retried every sync "
                               "tick", exc_info=True)
         # Erase backups older than 30 days go (owner decision 2026-09-27), after the holds are
-        # installed (a held turnstile's backups are never deleted), off the start-up path.
+        # installed (a held turnstile's backups are never deleted), off the start-up path. The
+        # thread first waits (bounded) for the v2 runtime's server clock, so a PC clock more than
+        # a day off prunes nothing here either (lane 1d, master review F1).
         try:
-            from app.core.erase_wizard import prune_erase_backups
+            from app.core.erase_wizard import prune_erase_backups_at_startup
 
-            threading.Thread(target=prune_erase_backups, name="erase-backup-prune",
+            threading.Thread(target=prune_erase_backups_at_startup, name="erase-backup-prune",
                              daemon=True).start()
         except Exception:
             self.logger.warning("[ERASE] erase backups not pruned at start-up", exc_info=True)

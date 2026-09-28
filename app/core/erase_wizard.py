@@ -251,11 +251,34 @@ def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
     return int(status or 503), {"ok": False, "code": code, "error": error}
 
 
+def is_tls_failure(exc: BaseException) -> bool:
+    """The exception or its cause is a TLS failure: ``ssl``'s own SSLError (an OSError) or
+    ``requests``' SSLError (a ConnectionError). Something answered, with a certificate that does
+    not check out -- never "no internet" (lane 1d, review nits)."""
+    import ssl
+    try:
+        from requests.exceptions import SSLError as _ReqSSLError
+    except Exception:
+        _ReqSSLError = None                                   # type: ignore[assignment]
+    for err in (exc, getattr(exc, "__cause__", None)):
+        if err is None:
+            continue
+        if isinstance(err, ssl.SSLError) or (_ReqSSLError is not None
+                                             and isinstance(err, _ReqSSLError)):
+            return True
+    return False
+
+
 def _no_answer(exc: BaseException) -> bool:
     """A request that got no answer at all -- the exception or its cause is a connection that
     failed or timed out: ``requests``' ConnectionError / Timeout, or a socket error. Any other
     ``requests`` error (they all derive from OSError: a body that is not JSON, a redirect loop)
-    DID get an answer."""
+    DID get an answer. A TLS failure (``requests``' SSLError, a ConnectionError, or ``ssl``'s own,
+    an OSError) is not "no answer" either: something answered with a certificate that does not
+    check out -- "check the internet" would send the technician the wrong way (lane 1d, review
+    nit, ``is_tls_failure``). A proxy that does not answer (ProxyError) stays no answer."""
+    if is_tls_failure(exc):
+        return False
     try:
         from requests.exceptions import ConnectionError as _ConnErr, RequestException, Timeout
     except Exception:
@@ -514,6 +537,11 @@ class EraseWizard:
         except StepError as exc:
             _log.warning("[ERASE] the terminal's user list did not read: %s", exc.message)
             return None
+        except Exception:
+            # Any other failure (a worker gone mid-call) is "unread" too, never a raw error: the
+            # start then refuses NOT_REFILLED_UNKNOWN (lane 1d, review nit).
+            _log.warning("[ERASE] the terminal's user list did not read", exc_info=True)
+            return None
         return terminal_people(proto, list(rows or []))
 
     @staticmethod
@@ -543,17 +571,23 @@ class EraseWizard:
         refused = self._refusal(did, need_writes=False)
         if refused:
             return refused
+        # The worker looked up once (lane 1d, review nit): one that leaves the engine after the
+        # check above is never dereferenced as None -- its commands fail as device errors instead.
+        worker = self._worker(did)
+        if worker is None:
+            return 409, {"ok": False, "code": "NO_WORKER",
+                         "error": "no running ULTRA worker drives this turnstile on this PC"}
         ident = _device_identity(device, proto)
-        moved = self._address_refusal(self._worker(did), ident)
+        moved = self._address_refusal(worker, ident)
         if moved:
             return 409, {"ok": False, "code": moved[0], "error": moved[1]}
         try:
-            counts = self._counts(self._worker(did), proto)
+            counts = self._counts(worker, proto)
         except StepError as exc:
             return 503, {"ok": False, "code": exc.code, "error": exc.message}
         # Who the refill will not put back (lane 1c, review C0): the terminal's users against the
         # refill roster -- read here so steps 3 and 4 can name them before anything starts.
-        people = self._read_people(self._worker(did), proto)
+        people = self._read_people(worker, proto)
         check = self._refill_check(did, device)
         pins_now = (check.get("_pins") or {}).get("now")
         left_out = None if people is None or pins_now is None else not_refilled(people, pins_now)
@@ -1131,6 +1165,9 @@ class EraseWizard:
                 # Nothing erased: nobody lost, the backup is prunable as any other.
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
+                if note and not held_before:
+                    note = self._keep_hold_across_restarts(did, run_id, note,
+                                                           durable=not self._device_gone(did))
                 # Not on a worker the run just saw connected to ANOTHER address: no pass through it.
                 self._finish("FAILED", release=not (held_before or note),
                              error=f"{exc.code}: {exc.message} -- nothing was erased",
@@ -1144,6 +1181,9 @@ class EraseWizard:
             else:
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
+                if note and not held_before:
+                    note = self._keep_hold_across_restarts(did, run_id, note,
+                                                           durable=not self._device_gone(did))
             self._finish("INCOMPLETE" if erase_started else "FAILED",
                          release=(not erase_started and not held_before and not note),
                          error=f"UNEXPECTED: {type(exc).__name__}: {exc}", note=note)
@@ -1167,6 +1207,45 @@ class EraseWizard:
         return (f"HELD_SCHEME_MOVED: the pin scheme moved from {run_scheme} to {now} during the run, "
                 "before any delete -- kept on hold, the terminal still holds the old scheme's pins: "
                 "erase again with 'hold', or set the scheme back, before pressing Refill")
+
+    @staticmethod
+    def _device_gone(did: int) -> bool:
+        """The turnstile's row was read and is not there any more (deleted in MonClub). A row
+        that does not read is NOT gone: the caller then keeps the hold durable (fail closed)."""
+        try:
+            from app.core.db import get_sync_device_payload
+            return get_sync_device_payload(int(did)) is None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _keep_hold_across_restarts(did: int, run_id: str, note: str, *,
+                                   durable: bool = True) -> str:
+        """The hold a scheme-moved stop keeps must outlive a restart (lane 1d, master review F0):
+        its row is still at ``erase-prep``, which the next start releases -- and the gyms power
+        off every night. Moved durably to ``erase-scheme-moved`` (``db.
+        keep_erase_hold_after_scheme_move``: that run's own row only). Not for a turnstile whose
+        row is gone (``durable`` False: no Refill could be pressed for it; review round 1 of lane
+        1d), and a write that fails: the hold then lasts this session only, and the note says so
+        under its own code, ``HELD_SCHEME_MOVED_SESSION`` / ``HELD_SCHEME_UNREADABLE_SESSION`` --
+        the page's line for the plain code promises a hold that outlives a restart."""
+        from app.core import db as _db
+        why = "the turnstile is no longer in MonClub"
+        if durable:
+            try:
+                reason = _db.keep_erase_hold_after_scheme_move(device_id=did, run_id=run_id)
+            except Exception:
+                _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable",
+                           run_id, did, exc_info=True)
+                reason = None
+            if reason and reason != _db.HOLD_REASON_ERASE_PREP:
+                return note
+            why = "the hold could not be made durable"
+        _log.error("[ERASE] run %s: turnstile %s is held for this session only (%s) -- a restart "
+                   "of Access releases it", run_id, did, why)
+        code, sep, rest = note.partition(":")
+        return (f"{code}_SESSION{sep}{rest} -- NOT kept across a restart of Access ({why}): "
+                "erase again or press Refill before any restart")
 
     @staticmethod
     def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:
@@ -1988,6 +2067,83 @@ def prune_erase_backups(root: Optional[Path] = None, *, now: Optional[float] = N
     except Exception:
         _log.warning("[ERASE] erase backups not pruned", exc_info=True)
     return deleted
+
+
+# The start-up prune waits this long, at most, for this process to measure the server's clock
+# (lane 1d, master review F1). Chosen, not measured: the v2 runtime installs its clock 12 s after
+# launch (access/runtime.py) and asks the server at once; a PC whose server never answers (v2 off --
+# every gym today -- or no internet) prunes on its own clock after it, as the prune after a run does.
+STARTUP_PRUNE_CLOCK_WAIT_SEC = 180.0
+STARTUP_PRUNE_POLL_SEC = 5.0
+
+
+def prune_erase_backups_at_startup(root: Optional[Path] = None, *,
+                                   wait_sec: float = STARTUP_PRUNE_CLOCK_WAIT_SEC,
+                                   poll_sec: float = STARTUP_PRUNE_POLL_SEC,
+                                   sleep: Callable[[float], None] = time.sleep,
+                                   mono: Callable[[], float] = time.monotonic) -> List[str]:
+    """The prune ``app.py`` starts at every start-up, on its own thread (lane 1d, master review F1).
+
+    The prune after a run judges the PC clock against the server's (``_prune_now``: nothing goes
+    while the PC clock is more than a day off). At start-up there was no server clock yet -- the
+    v2 runtime sets it about 12 s later -- so the prune that runs every morning after the power
+    comes back used the PC clock alone, on v2 PCs too. It now waits, at most ``wait_sec``, until
+    this process has a measurement of the server's clock (``server_clock.get_default()`` with a
+    sample), then runs the same ``prune_erase_backups``. A PC that never gets one prunes on its own
+    clock after the wait, exactly as the prune after a run does -- skipping it instead would keep
+    biometric backups past the owner's 30 days at every gym today. Never raises."""
+    try:
+        deadline = mono() + max(0.0, float(wait_sec))
+        while True:
+            try:
+                from app.core.v2 import server_clock as _sc
+                clk = _sc.get_default()
+                if clk is not None and clk.has_sample():
+                    break
+            except Exception:
+                _log.warning("[ERASE] server clock unreadable before the start-up prune",
+                             exc_info=True)
+                break
+            if mono() >= deadline:
+                _log.info("[ERASE] start-up prune: no measurement of the server's clock after "
+                          "%.0f s -- the PC clock alone, as after a run", float(wait_sec))
+                break
+            sleep(max(0.0, float(poll_sec)))
+    except Exception:
+        _log.warning("[ERASE] start-up prune: the wait for the server clock failed", exc_info=True)
+    return prune_erase_backups(root)
+
+
+def drop_keep_marks_of_unstarted_runs(released: Dict[int, Optional[str]],
+                                      root: Optional[Path] = None) -> List[str]:
+    """The start-up release of the holds (``device_hold.load``) names the runs that stopped before
+    their first delete command -- their hold row was still ``erase-prep``. Such a run erased
+    nobody, yet a power cut or a kill between its keep mark (``_bind_not_refilled``) and its
+    erase record (``_begin_erase``) left the mark, and the prune never deletes a marked folder: a
+    biometric backup kept for good for no one (lane 1d, master review F3). The mark goes; the
+    30 days apply as to any run. The release is the only proof that no delete ran -- never
+    ``run.json``, whose writes are best effort. Returns the run ids whose mark went. Never raises."""
+    dropped: List[str] = []
+    try:
+        base = Path(root) if root is not None else _default_backup_root()
+        for did, run_id in sorted((released or {}).items()):
+            if not run_id:
+                continue
+            try:
+                mark = base / f"{run_id}_device{int(did)}" / KEEP_MARK
+                if mark.is_file():
+                    mark.unlink()
+                    dropped.append(str(run_id))
+                    _log.warning("[ERASE] run %s (turnstile %s) stopped before any delete: its "
+                                 "keep mark is removed, its backup goes after 30 days as usual",
+                                 run_id, did)
+            except Exception:
+                _log.warning("[ERASE] keep mark of run %s not removed: its backup stays", run_id,
+                             exc_info=True)
+    except Exception:
+        _log.warning("[ERASE] keep marks of the runs released at start-up not checked",
+                     exc_info=True)
+    return dropped
 
 
 def _begin_erase(did: int, run_id: str, keep_pins: List[str]) -> int:

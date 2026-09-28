@@ -4,6 +4,10 @@
 
 export type Lang = "fr" | "en";
 
+// What an erase takes from the people the refill does not put back (lane 1d, review nit): the
+// user itself, or only door rights and / or fingerprints -- their user and card then stay.
+export type NotRefilledWhat = "users" | "rights" | "fingers" | "rightsFingers";
+
 const fr = {
   colon: " :",
   title: "Effacer le contenu",
@@ -75,22 +79,33 @@ const fr = {
     PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
     PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
     HELD_SCHEME_MOVED:
-      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, même après un redémarrage d'Access, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
     HELD_SCHEME_UNREADABLE:
-      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
+    // The same holds, kept for this session only (lane 1d): the durable write failed, or the
+    // turnstile is no longer in MonClub.
+    HELD_SCHEME_MOVED_SESSION:
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, mais cette attente ne tiendra PAS après un redémarrage d'Access. N'appuyez pas sur « Remplir » tel quel, et ne redémarrez pas Access : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+    HELD_SCHEME_UNREADABLE_SESSION:
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé), mais cette attente ne tiendra PAS après un redémarrage d'Access. Vérifiez le schéma dans le tableau de bord avant tout redémarrage, puis « Remplir » (ou effacez à nouveau avec « Attendre… » s'il a changé).",
   } as Record<string, string>,
   // The people the refill will NOT put back (lane 1c, review C0).
-  notRefilledTitle: (n: number, s: string) =>
-    `${n} personne(s) de ce tourniquet ne seront PAS remises par le remplissage : elles ne sont pas dans la liste des membres de MonClub pour ce tourniquet (schéma ${s}) — personnel ou agents d'entretien enregistrés sur le tourniquet, utilisateurs d'un autre système, membres qui n'y ont plus droit. Ce que l'effacement leur retire (utilisateur, carte, droits, empreintes) ne revient pas.`,
+  notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
+    `${n} personne(s) de ce tourniquet ${{
+      users: "ne seront PAS remises par le remplissage",
+      rights: "perdront leurs droits d'accès, et le remplissage ne les leur rendra PAS",
+      fingers: "perdront leurs empreintes, et le remplissage ne les leur rendra PAS",
+      rightsFingers: "perdront leurs droits d'accès et leurs empreintes, et le remplissage ne les leur rendra PAS",
+    }[what]} : elles ne sont pas dans la liste des membres de MonClub pour ce tourniquet (schéma ${s}) — personnel ou agents d'entretien enregistrés sur le tourniquet, utilisateurs d'un autre système, membres qui n'y ont plus droit. ${what === "users" ? "Ce que l'effacement leur retire (utilisateur, carte, droits, empreintes) ne revient pas." : "Leur utilisateur et leur carte restent sur le tourniquet."}`,
   notRefilledBackup:
     "Leur seule copie est la sauvegarde de cet effacement : elle est gardée sans limite de durée (jamais supprimée après 30 jours).",
   notRefilledTick: (n: number) =>
-    `J'ai lu la liste : ces ${n} personne(s) ne seront pas remises par le remplissage.`,
+    `J'ai lu la liste : le remplissage ne rendra pas à ces ${n} personne(s) ce que l'effacement leur retire.`,
   notRefilledNone: "Chaque personne de ce tourniquet est dans la liste du remplissage.",
   notRefilledUnknown:
     "La liste des utilisateurs du tourniquet n'a pas pu être lue : on ne sait pas qui le remplissage ne remettrait pas. Relisez l'étape 1.",
   notRefilledKept: (n: number) =>
-    `${n} personne(s) effacée(s) ne sont pas dans la liste du remplissage : la sauvegarde de cet effacement est gardée sans limite de durée.`,
+    `${n} personne(s) hors de la liste du remplissage ont perdu ce que cet effacement leur a retiré : la sauvegarde de cet effacement est gardée sans limite de durée.`,
   otherPcsTitle:
     "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet. Quitter ne suffit pas : le watchdog d'Access le relance en quelques minutes, et le démarrage avec Windows à la prochaine ouverture de session.",
   otherPcsTick:
@@ -377,21 +392,30 @@ const en: typeof fr = {
     PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
     PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
     HELD_SCHEME_MOVED:
-      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, even after Access restarts, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
     HELD_SCHEME_UNREADABLE:
-      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
+    HELD_SCHEME_MOVED_SESSION:
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, but this hold will NOT last through a restart of Access. Do not press Refill as it is, and do not restart Access: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+    HELD_SCHEME_UNREADABLE_SESSION:
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased), but this hold will NOT last through a restart of Access. Check the scheme in the dashboard before any restart, then Refill (or erase again with 'Hold…' if it changed).",
   },
-  notRefilledTitle: (n: number, s: string) =>
-    `${n} person(s) on this turnstile will NOT be put back by the refill: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. What the erase takes from them (user, card, door rights, fingerprints) does not come back.`,
+  notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
+    `${n} person(s) on this turnstile ${{
+      users: "will NOT be put back by the refill",
+      rights: "will lose their door rights, and the refill will NOT give them back",
+      fingers: "will lose their fingerprints, and the refill will NOT give them back",
+      rightsFingers: "will lose their door rights and fingerprints, and the refill will NOT give them back",
+    }[what]}: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. ${what === "users" ? "What the erase takes from them (user, card, door rights, fingerprints) does not come back." : "Their user and card stay on the turnstile."}`,
   notRefilledBackup:
     "Their only copy is this erase's backup: it is kept with no time limit (never deleted after 30 days).",
   notRefilledTick: (n: number) =>
-    `I have read the list: these ${n} person(s) will not be put back by the refill.`,
+    `I have read the list: the refill will not give these ${n} person(s) back what the erase takes from them.`,
   notRefilledNone: "Everyone on this turnstile is in the refill's list.",
   notRefilledUnknown:
     "The turnstile's user list could not be read: who the refill would not put back is unknown. Read step 1 again.",
   notRefilledKept: (n: number) =>
-    `${n} erased person(s) are not in the refill's list: this erase's backup is kept with no time limit.`,
+    `${n} person(s) outside the refill's list lost what this erase took from them: this erase's backup is kept with no time limit.`,
   otherPcsTitle:
     "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile. Quitting is not enough: Access's watchdog starts it again within minutes, and the start with Windows at the next logon.",
   otherPcsTick:

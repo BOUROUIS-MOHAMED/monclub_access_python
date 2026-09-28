@@ -951,7 +951,10 @@ class TestBackupsAreKeptThirtyDays:
 
         monkeypatch.setattr(app_module.MainApp, "_apply_date_flips", lambda self, source, **k: None)
         monkeypatch.setattr(device_hold, "load", lambda **kw: order.append("holds") or frozenset())
-        monkeypatch.setattr(ew, "prune_erase_backups", lambda *a, **k: order.append("prune") or [])
+        # Lane 1d (master review F1): the start-up entry point, which waits for the server clock
+        # before it runs prune_erase_backups (tests/test_erase_wizard_lane1d.py).
+        monkeypatch.setattr(ew, "prune_erase_backups_at_startup",
+                            lambda *a, **k: order.append("prune") or [])
 
         def recording_after(self, delay_ms, callback):
             if getattr(callback, "__name__", "") == "_sync_tick":

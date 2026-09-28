@@ -8,6 +8,32 @@ the time; execution is a separate, later step. Written 2026-09-19 against Access
 Third round 2026-09-26 on Access `master` `aeeef69` (P3b-2 merged): §3.3, E10 and D2 re-read against
 driver PCs and readers -- the night runs without drivers (runbook part H).
 
+> **The cutover night follows the runbook's order, not this plan's** (added 2026-09-28, sixth round of the
+> runbook, Access `master` `aa015e5`): [`2026-09-26_cutover_night_runbook.md`](2026-09-26_cutover_night_runbook.md)
+> part D (D1-D19) and part F. This plan keeps the evidence and the commands the runbook cites -- Phase B
+> (the survey), §3.3, §5.1-§5.3 (the retire SQL, the firewall block, P2/P3 later), E10's switch line,
+> E10b's proven restart, E11's completion lines, E12's verify, §6's half-states. Where they differ, the
+> runbook wins:
+> - **No Phase D soak.** The new Access is installed and started on P1 on the night, **before** the erase,
+>   still on "Par abonnement" (runbook D6, N1). A stop before the erase leaves P1 on it: runbook N3.
+> - **The erase is the Erase wizard in Access** (Devices page, the bin icon; release checklist §3a), with
+>   "hold until « Remplir »" -- not script 13 at E5, and not with Access stopped: the wizard runs inside
+>   P1's Access, through its own connection. It keeps the administrators (privilege > 0) as script 13 does,
+>   backs the terminal up first, and needs the gym's server switch (runbook B2c) `[CODE: app/core/erase_wizard.py]`.
+> - **P1's retire is the wizard's « forget »**, forced for an MB2000 users erase and done inside D6 after
+>   the erase is verified (runbook D10) -- not §5.1 with Access stopped at E8. So §2's order changes in one
+>   place: the retire comes before the cut (D8), and the hold keeps P1 from writing any member until
+>   « Remplir ». §5.1 (or a fresh data folder) stays for a PC that runs Access without having run the erase.
+> - **P1 runs from D6 on**: E10's "Start Access on P1" is already done; E10's line and E10b's restart are
+>   runbook D14-D15, and « Remplir » (D15b) comes **before** the cables go in (D16 = E11).
+> - **E5b** (an administrator deleted with script 7) needs Access stopped on P1: between runbook D1 and D6,
+>   while P1's Access is quit -- never while the wizard runs. The runbook's "change that administrator's
+>   number" is the terminal's own menu, not E5b.
+> - **§6:** runbook part F comes first. R4's "wipe again (E5-E6)" and R6's "script 13 again" mean the
+>   wizard again (runbook part F, gym 45 "Every other row"); after a power cut during the wizard's erase,
+>   the hold stays until « Remplir » (a hold whose run stopped before its first delete is released at the
+>   next start -- guide §3.2h).
+
 Every claim is graded as in the guides: `[CODE]` (an executable statement, named), `[TEST]`,
 `[FIELD]` (a dated measurement), `[COMMENT]` (prose only), `[OWNER]` (the owner said so, dated;
 nobody has checked it), `[UNVERIFIED]`, `[UNKNOWN]`.
@@ -290,6 +316,8 @@ through MonClub, re-enable a template MonClub has but does not deliver
 `terminal_only_via_own_pin` must be done before D1 (G9).
 
 ### Phase D -- upgrade, ≥ 2 opening days before the cutover
+*Not on the cutover night (the banner at the top): the runbook installs on P1 on the night, before the
+erase (D6). D2's log checks still apply to a P1 left on the new Access (runbook N3).*
 D0. Just before installing: Quit Access on P1 and copy its data folder (as B4). This copy is Phase
 D's rollback.
 D1. Install 1.4.35 on P1 (and on P2/P3 only if D2 brings them back). Check /access-pcs.
@@ -307,6 +335,9 @@ The terminals already hold that content; each finger is cleared then rewritten, 
 completion lines of E11 before opening.
 
 ### Phase E -- the cutover (gym closed, power on)
+*On the cutover night the order is the runbook's D1-D19 (the banner at the top): E5's script 13 and E8's
+§5.1 are the Erase wizard's run and its « forget » inside runbook D6; E10 runs from D6 on; « Remplir »
+(runbook D15b) before E11.*
 **Window.** Its length is: the B2-measured read time (E2) + a quick read (E3, E6) + the erase time
 (B7, or unmeasured) + the fixed steps + the re-push (D4, or unmeasured) + the E12 read. If any term is
 still unmeasured, the gym stays closed until E13 is done (D1). A **go/no-go clock** guards E5: if the
@@ -415,6 +446,9 @@ on /access-pcs stops moving: that says nothing about the block, which only `wf.m
 enrolled? membership deliverable?). Delete the biometric backup files per D7.
 
 ## 6. Half-states and rollback
+
+*On the cutover night, runbook part F comes first (the banner at the top): a terminal the Erase wizard
+holds takes no push until « Remplir », and « Remplir » needs the internet.*
 
 **Which states the gym can open in:** only (a) before E5 -- nothing changed -- and (b) after E13 passed.
 Anything between refuses members at that terminal (device 8 "Sortie" is the exit). If the gym must open

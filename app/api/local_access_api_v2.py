@@ -1380,6 +1380,14 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
         ctx.send_json(e.status_code, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
                                       "error": str(e)})
     except MonClubApiError as e:
+        # A TLS failure got an answer (a certificate that does not check out): the server's check
+        # failed -- not "no internet" (lane 1d, review round 2; the Erase wizard's lock screen).
+        from app.core.erase_wizard import is_tls_failure
+        if is_tls_failure(e):
+            ctx.app.logger.warning("verify_admin_password: TLS failure: %s", e)
+            ctx.send_json(502, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
+                                "error": f"the admin password could not be checked (TLS): {e}"})
+            return
         # The server could not be reached (MonClubApiError is the PARENT of the HTTP error, so
         # this is the no-answer case): not a wrong password -- say that the internet is needed,
         # with a code the Erase wizard translates (lane 1b, review F25).
@@ -1390,7 +1398,8 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
                                      "réessayez."})
     except Exception as e:
         ctx.app.logger.exception("verify_admin_password failed")
-        ctx.send_json(500, {"ok": False, "error": str(e)})
+        # The password could not be checked: never read as a wrong one (lane 1d, review nit).
+        ctx.send_json(500, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED", "error": str(e)})
 
 
 # ==================== 3) CONFIG ====================
@@ -4684,6 +4693,12 @@ def _erase_password_verifier(ctx: _Ctx):
         except MonClubApiHttpError as e:
             return False, int(getattr(e, "status_code", 0) or 503), str(e)
         except Exception as e:
+            # A TLS failure got an answer (a certificate that does not check out): the server's
+            # check failed -- not "no internet" (lane 1d, review round 1). 502 reads
+            # ADMIN_PASSWORD_CHECK_FAILED (erase_wizard._password_refusal).
+            from app.core.erase_wizard import is_tls_failure
+            if is_tls_failure(e):
+                return False, 502, f"the admin password could not be checked (TLS): {e}"
             # Offline or the server failing: the password cannot be checked -- no erase.
             return False, 503, f"the admin password could not be checked: {e}"
         return (True, 200, "") if valid else (False, 401, "Mot de passe incorrect")
