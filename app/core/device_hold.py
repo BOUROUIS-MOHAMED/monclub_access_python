@@ -141,8 +141,9 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
     for did, run_id in sorted(undecided.items()):
         _log.warning("[HOLD] turnstile %s kept on hold at start-up: its erase run %s stopped before "
                      "any delete command, and this PC cannot tell whether its pin scheme moved "
-                     "since -- signed out of MonClub, or no turnstile list (a logout empties it) -- "
-                     "nothing was erased; held until a start signed in with the list, or Refill",
+                     "since -- signed out of MonClub, or its turnstile list not written whole "
+                     "since the last logout or upgrade (the next device refresh writes it) -- "
+                     "nothing was erased; held until a start after that refresh, or Refill",
                      did, run_id)
         try:
             from app.core import telemetry as _tel

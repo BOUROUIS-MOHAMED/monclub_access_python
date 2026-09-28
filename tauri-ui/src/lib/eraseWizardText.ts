@@ -199,8 +199,11 @@ const fr = {
     (terminal
       ? `Rien n'a été effacé sur ce tourniquet : le schéma de numérotation a changé pendant un effacement, avant toute suppression. Il porte encore les numéros « ${terminal} », et le schéma enregistré maintenant est « ${now} ». « Remplir » est refusé tant que le schéma n'est pas revenu à « ${terminal} » : remettez-le dans le tableau de bord, puis effacez à nouveau le tourniquet avec « Attendre que j'appuie sur « Remplir » » (ou, le schéma remis, « Remplir » pour le libérer sans rien effacer).`
       : "Rien n'a été effacé sur ce tourniquet, et le schéma avec lequel ses numéros ont été écrits n'est pas enregistré : « Remplir » est refusé. Effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » »."),
+  // Lane 1h (review C4 of lane 1g): neutral about the cause -- the row is also stored as
+  // erase-scheme-moved when the scheme could not be read (a logout during the run), and it does
+  // not record which.
   schemeMovedBack: (terminal: string) =>
-    `Rien n'a été effacé sur ce tourniquet : le schéma avait changé pendant un effacement, avant toute suppression. Il est revenu à « ${terminal} », celui de ses numéros : « Remplir » le libère et remet tout le monde, sans rien effacer. Pour continuer la bascule, effacez-le plutôt à nouveau avec « Attendre que j'appuie sur « Remplir » ».`,
+    `Rien n'a été effacé sur ce tourniquet : le schéma avait changé, ou n'avait pas pu être relu, pendant un effacement, avant toute suppression. Il est maintenant « ${terminal} », celui de ses numéros : « Remplir » le libère et remet tout le monde, sans rien effacer. Pour continuer la bascule, effacez-le plutôt à nouveau avec « Attendre que j'appuie sur « Remplir » ».`,
   holdsUnknown:
     "Access n'a pas pu relire les mises en attente : tous les tourniquets restent en attente jusqu'à la prochaine lecture réussie.",
   refillNeedsInternet: "Le remplissage demande Internet : le serveur vérifie le mot de passe.",
@@ -529,7 +532,7 @@ const en: typeof fr = {
       ? `Nothing was erased on this turnstile: the pin scheme changed during an erase, before any delete. It still holds '${terminal}' numbers, and the scheme recorded now is '${now}'. Refill is refused until the scheme is '${terminal}' again: set it back in the dashboard, then erase the turnstile again with 'Hold until I press Refill' (or, once it is set back, Refill to release it without erasing anything).`
       : "Nothing was erased on this turnstile, and the scheme its numbers were written under is not recorded: Refill is refused. Erase it again with 'Hold until I press Refill'."),
   schemeMovedBack: (terminal: string) =>
-    `Nothing was erased on this turnstile: the scheme changed during an erase, before any delete. It is back to '${terminal}', the scheme of its numbers: Refill releases it and puts everyone back, without erasing anything. To go on with the switch, erase it again with 'Hold until I press Refill' instead.`,
+    `Nothing was erased on this turnstile: the scheme changed, or could not be read, during an erase, before any delete. It is now '${terminal}', the scheme of its numbers: Refill releases it and puts everyone back, without erasing anything. To go on with the switch, erase it again with 'Hold until I press Refill' instead.`,
   holdsUnknown:
     "Access could not read the holds back: every turnstile stays on hold until the next successful read.",
   refillNeedsInternet: "Refill needs the internet: the server checks the password.",
