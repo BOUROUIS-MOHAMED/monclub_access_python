@@ -408,7 +408,8 @@ class TestASchemeMovedStopOnATurnstileHeldBefore:
         # ``erase`` row under the NEW scheme, so the scheme the row records cannot refuse it);
         # the note, the hold panel's « …schéma enregistré maintenant : … » line and the runbook
         # (C6 / D6 « Incomplet ») are the only guard (lane 1g C2 residual; lane 1h, critic 2). A
-        # future guard flips this assert.
+        # future guard (keyed on the run's outcome, INCOMPLETE vs DONE, not on the row's scheme)
+        # flips this assert.
         assert _refill(wiz, "ACCOUNT")[0] == 200
 
     def test_a_row_already_scheme_moved_keeps_the_plain_note(self, sqlite_db, monkeypatch,

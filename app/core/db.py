@@ -820,8 +820,9 @@ def _run_one_shot_credentials_resend(conn: sqlite3.Connection) -> None:
 # The turnstile list was last written WHOLE (lane 1g, review C1 of lane 1f): one row, written only
 # by a full replace of ``sync_devices`` -- ``_save_sync_cache`` with a payload, and
 # ``save_sync_cache_delta`` when its devices section refreshes -- in the same transaction as the
-# rows, and deleted by ``save_sync_cache(None)`` (the logout) in the transaction that empties
-# them. A fast patch (one GYM_DEVICE upsert or delete) never writes it: after a logout and a
+# rows, and deleted in the transaction that empties them: by ``save_sync_cache(None)`` (the
+# logout), and -- lane 1h, review C1 of lane 1g -- by either writer when the answer carries no
+# device list. A fast patch (one GYM_DEVICE upsert or delete) never writes it: after a logout and a
 # login, a single row it inserts into the emptied list is not "the list". Not the
 # ``devicesVersion`` token: the logout clears the tokens in a separate step whose failure it
 # swallows, which would leave the token saying "a full list" over an emptied one (fail open).

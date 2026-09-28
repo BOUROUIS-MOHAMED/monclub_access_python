@@ -152,9 +152,9 @@ class TestTheUpgradePath:
 
 
 def test_the_marker_table_is_created_by_init_db_on_a_database_without_it(tmp_path, monkeypatch):
-    """The DDL itself, on a bare database file that already has the older tables: not under a
-    swallowed try (a missing table would make every authority read raise -- fail closed, but every
-    cut row would then stay held)."""
+    """The DDL itself: ``init_db`` on a database that has the older tables but not this one creates
+    it with its two columns, empty -- the table alone, without the rows ``TestTheUpgradePath``
+    seeds."""
     path = tmp_path / "old.db"
     monkeypatch.setattr(dbmod, "_DB_PATH", str(path), raising=False)
     dbmod.init_db()

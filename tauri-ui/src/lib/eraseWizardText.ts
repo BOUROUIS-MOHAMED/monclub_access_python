@@ -78,8 +78,9 @@ const fr = {
     HELD_BEFORE: "Le tourniquet était déjà en attente depuis un effacement précédent : il le reste. Appuyez sur « Remplir ».",
     // Lane 1g (review C2 of lane 1f): the same earlier hold, but the scheme moved (or could not be
     // read) during this run -- « Remplir » only under step 1's scheme; nothing refuses it otherwise.
+    // Lane 1h: checked on this PC's hold panel (schemeNote, P1's own list), not the dashboard alone.
     HELD_BEFORE_SCHEME_MOVED:
-      "Le tourniquet était déjà en attente depuis un effacement précédent, qui a pu effacer : il le reste. Pendant cette opération, arrêtée avant toute suppression, le schéma de numérotation a changé ou n'a pas pu être relu. « Remplir » seulement une fois le schéma revenu à celui de l'étape 1 (vérifiez-le dans le tableau de bord) ; s'il a changé, remettez-le dans le tableau de bord, puis effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
+      "Le tourniquet était déjà en attente depuis un effacement précédent, qui a pu effacer : il le reste. Pendant cette opération, arrêtée avant toute suppression, le schéma de numérotation a changé ou n'a pas pu être relu. « Remplir » seulement une fois le schéma revenu à celui de l'étape 1 (vérifiez-le sur la ligne « …schéma enregistré maintenant » du panneau « Remplir » de ce PC, pas seulement dans le tableau de bord) ; s'il a changé, remettez-le dans le tableau de bord, puis effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
     PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
     PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
     // Lane 1e (master review C0): « Remplir » is refused on these holds until the scheme is the
@@ -421,7 +422,7 @@ const en: typeof fr = {
   finishNotes: {
     HELD_BEFORE: "The turnstile was already on hold after an earlier erase: it stays on hold. Press Refill.",
     HELD_BEFORE_SCHEME_MOVED:
-      "The turnstile was already on hold after an earlier erase, which may have deleted: it stays on hold. During this run, stopped before any delete, the pin scheme changed or could not be read. Refill only once the scheme is step 1's again (check it in the dashboard); if it changed, set it back in the dashboard, then erase again with 'Hold until I press Refill'.",
+      "The turnstile was already on hold after an earlier erase, which may have deleted: it stays on hold. During this run, stopped before any delete, the pin scheme changed or could not be read. Refill only once the scheme is step 1's again (check it on the 'scheme recorded now' line of this PC's Refill panel, not only in the dashboard); if it changed, set it back in the dashboard, then erase again with 'Hold until I press Refill'.",
     PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
     PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
     HELD_SCHEME_MOVED:
