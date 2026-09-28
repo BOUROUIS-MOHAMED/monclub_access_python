@@ -538,7 +538,7 @@ class TestAnEarlierHoldIsReleasedOnlyByRefill:
         wiz.start(5, _body(pv["previewId"], refill="now"), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "DONE" and run["holdKept"] is True
-        assert any("HELD_BEFORE" in str(s.get("note", "")) for s in run["steps"])
+        assert any(str(s.get("note", "")).startswith("HELD_BEFORE:") for s in run["steps"])
         assert worker.full_sync_requests == []
         assert 5 in dbmod.list_device_write_holds(), "the durable row is still there"
 

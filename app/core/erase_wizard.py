@@ -1326,6 +1326,15 @@ class EraseWizard:
             return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop, "
                     f"before any delete -- kept on hold, the terminal holds the {terminal} scheme's "
                     f"pins: {what}")
+        if now is None and run_scheme is not None:
+            # No device row (lane 1g, review C3 of lane 1f): not a scheme. A logout during the run
+            # empties the list, and a list that cannot say "deleted" keeps the row (``_device_gone``,
+            # checked after this note) -- "moved from MEMBERSHIP to None" told the operator the
+            # scheme had changed when it had not. A run that recorded no scheme (no row at its
+            # start either) compares None with None, as before: nothing moved.
+            return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop (the "
+                    "turnstile has no row in this PC's list), before any delete -- kept on hold, "
+                    f"the terminal holds the {terminal} scheme's pins: {what}")
         if now == run_scheme:
             return None
         return (f"HELD_SCHEME_MOVED: the pin scheme moved from {run_scheme} to {now} during the run, "
@@ -1337,7 +1346,8 @@ class EraseWizard:
         """The turnstile's row was read and is not there any more (deleted in MonClub). A row
         that does not read is NOT gone: the caller then keeps the hold durable (fail closed).
         Nor is a row missing while the list cannot say so (lane 1f, review C1): the PC signed out,
-        or its list empty -- a logout empties it (``db._device_list_is_authoritative``)."""
+        or its list empty or not written whole since -- a logout empties it, and a fast patch may
+        put one row back before the first full sync (``db._device_list_is_authoritative``)."""
         try:
             from app.core.db import device_list_is_authoritative, get_sync_device_payload
             return get_sync_device_payload(int(did)) is None and device_list_is_authoritative()
@@ -1387,11 +1397,16 @@ class EraseWizard:
             reason = (row_reason if row_reason in (_db.HOLD_REASON_ERASE,
                                                    _db.HOLD_REASON_SCHEME_MOVED) else None)
         if reason == _db.HOLD_REASON_ERASE:
-            # Held at ``erase`` by an earlier run that may have deleted (lane 1e): « Remplir »
-            # is the normal next step there (it is refused on ``erase-scheme-moved`` rows only),
-            # so not a note that says it is refused -- ``_refill``'s own HELD_BEFORE.
-            return ("HELD_BEFORE: on hold since an earlier erase that may have deleted -- this run "
-                    "stopped before any delete, after the pin scheme moved: press Refill")
+            # Held at ``erase`` by an earlier run that may have deleted (lane 1e): no code refuses
+            # « Remplir » there (``_refill_marked`` guards ``erase-scheme-moved`` and scheme-recording
+            # ``erase-prep`` rows only), but the scheme moved (or could not be read) during this
+            # run -- « Remplir » under another scheme writes its pins beside whatever a partial
+            # erase left. Its own code (lane 1g, review C2 of lane 1f), not ``_refill``'s
+            # HELD_BEFORE ("press Refill", right for a DONE run).
+            return ("HELD_BEFORE_SCHEME_MOVED: on hold since an earlier erase that may have deleted "
+                    "-- this run stopped before any delete, after the pin scheme moved or could not "
+                    "be read: Refill only while the scheme is step 1's again; else set it back, "
+                    "then erase again with 'hold'")
         if reason and reason != _db.HOLD_REASON_ERASE_PREP:
             return note
         _log.error("[ERASE] run %s: the hold of turnstile %s was not recorded as kept -- a restart "
