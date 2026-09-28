@@ -1195,6 +1195,12 @@ class EraseWizard:
             # Who the refill will not put back, from the backup: only the people accepted at
             # step 1, and their backup kept for good (lane 1c, review C0).
             left = self._bind_not_refilled(worker, run, proto, tables, backup, check)
+            # The row's phase before the erase record (lane 1f, review C2): what a keep mark that
+            # cannot be written puts back. Not read: nothing is put back (the run ends INCOMPLETE).
+            try:
+                prior = (device_hold.holds_detail().get(did) or {}).get("reason")
+            except Exception:
+                prior = None
             # The erase record, durable: the hold moves to ERASE (a restart keeps it from here)
             # and every recorded pin's last push result becomes unknown -- the erase is an attempt
             # start for all of them (review F12). No write, no erase.
@@ -1205,13 +1211,31 @@ class EraseWizard:
                                 f"the erase could not be recorded before its first delete: {exc}")
             self._step("erase_recorded", True, resultsReset=int(reset), kept=len(kept))
             erase_started = True
-            self._update(erased=True)
             # The keep mark, AFTER the erase record (lane 1e, master review F8): a mark on disk now
             # means "a delete may have run", as the ERASE row does. Written before it, a run cut
             # between the two kept a biometric backup for good although it erased nobody -- and on
             # a turnstile already held at ``erase`` no start-up could tell (the row never was
             # ``erase-prep``). The last durable write before the first delete.
-            self._write_keep_mark(run, left)
+            try:
+                self._write_keep_mark(run, left)
+            except Exception as exc:
+                # No delete was issued (lane 1f, review C2): the erase record is put back, so the
+                # row says so again -- the start-up release and Refill's scheme guard then apply,
+                # and the run ends FAILED as any stop before a delete.
+                if self._undo_erase_record(did, run_id, prior):
+                    erase_started = False
+                    raise StepError("KEEP_MARK_NOT_WRITTEN",
+                                    "the mark that keeps this backup for good could not be written "
+                                    f"({exc}), and the backup is the only copy of the people the "
+                                    "refill does not put back: the erase record was undone before "
+                                    "any delete")
+                raise StepError("KEEP_MARK_NOT_WRITTEN_HELD",
+                                "the mark that keeps this backup for good could not be written "
+                                f"({exc}) -- nothing was erased; the erase was already recorded and "
+                                "could not be undone, so the turnstile stays held: Refill writes "
+                                "every member again, only while the scheme is the one of this "
+                                "erase's start -- otherwise erase it again with 'hold'")
+            self._update(erased=True)
             erase_error = None
             try:
                 self._erase(worker, did, proto, tables, backup, before)
@@ -1311,10 +1335,12 @@ class EraseWizard:
     @staticmethod
     def _device_gone(did: int) -> bool:
         """The turnstile's row was read and is not there any more (deleted in MonClub). A row
-        that does not read is NOT gone: the caller then keeps the hold durable (fail closed)."""
+        that does not read is NOT gone: the caller then keeps the hold durable (fail closed).
+        Nor is a row missing while the list cannot say so (lane 1f, review C1): the PC signed out,
+        or its list empty -- a logout empties it (``db._device_list_is_authoritative``)."""
         try:
-            from app.core.db import get_sync_device_payload
-            return get_sync_device_payload(int(did)) is None
+            from app.core.db import device_list_is_authoritative, get_sync_device_payload
+            return get_sync_device_payload(int(did)) is None and device_list_is_authoritative()
         except Exception:
             return False
 
@@ -1356,7 +1382,10 @@ class EraseWizard:
         except Exception:
             _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable",
                        run_id, did, exc_info=True)
-            reason = None
+            # That write moves an ``erase-prep`` row only (lane 1f, review nit N1): a row read at
+            # ``erase`` or ``erase-scheme-moved`` is durable as it is -- its own note, not SESSION.
+            reason = (row_reason if row_reason in (_db.HOLD_REASON_ERASE,
+                                                   _db.HOLD_REASON_SCHEME_MOVED) else None)
         if reason == _db.HOLD_REASON_ERASE:
             # Held at ``erase`` by an earlier run that may have deleted (lane 1e): « Remplir »
             # is the normal next step there (it is refused on ``erase-scheme-moved`` rows only),
@@ -1476,20 +1505,33 @@ class EraseWizard:
     def _write_keep_mark(self, run: Dict[str, Any], left: List[str]) -> None:
         """The run folder's ``KEEP_MARK`` when the erase removes people the refill does not put
         back (lane 1c, review C0), written durably AFTER the erase record and before the first
-        delete command (lane 1e, master review F8). A failure raises before any delete -- with
-        the erase already recorded the run ends INCOMPLETE: held, every record to be written again
-        (lane 1c ended it FAILED and released, when the mark came first)."""
+        delete command (lane 1e, master review F8). A failure raises, before any delete: the caller
+        puts the erase record back (``_undo_erase_record``) and the run ends FAILED; when it cannot,
+        INCOMPLETE -- held, every record to be written again (lane 1f, review C2)."""
         if not left:
             return
+        _write_file_durably(self._run_dir(run) / KEEP_MARK, json.dumps(
+            {"count": len(left), "pins": left, "at": _now_text()}).encode("utf-8"))
+
+    def _undo_erase_record(self, did: int, run_id: str, prior: Optional[str]) -> bool:
+        """Put this run's erase record back when no delete followed it (lane 1f, review C2: the keep
+        mark could not be written). Only a row that was at ``erase-prep`` or ``erase-scheme-moved``
+        before the record -- a row already at ``erase`` came from a run that may have deleted, and
+        stays so. ``db.undo_device_erase_record``, durable. The push results the record reset stay
+        unknown (their earlier values are not kept): "unknown", never a false "on the turnstile".
+        Returns whether the row was put back; False keeps the ERASE row (fail closed)."""
+        if prior not in (device_hold.REASON_ERASE_PREP, device_hold.REASON_SCHEME_MOVED):
+            return False
+        from app.core import db as _db
         try:
-            _write_file_durably(self._run_dir(run) / KEEP_MARK, json.dumps(
-                {"count": len(left), "pins": left, "at": _now_text()}).encode("utf-8"))
+            undone = bool(_db.undo_device_erase_record(device_id=did, run_id=run_id, reason=prior))
         except Exception as exc:
-            raise StepError("KEEP_MARK_NOT_WRITTEN",
-                            f"the mark that keeps this backup for good could not be written "
-                            f"({exc}): the backup is the only copy of the people the refill does "
-                            "not put back -- nothing was erased; the erase was already recorded, "
-                            "so the turnstile stays held and Refill writes every member again")
+            _log.error("[ERASE] run %s: the erase record of turnstile %s could not be undone -- it "
+                       "stays held at erase", run_id, did, exc_info=True)
+            self._step("erase_record_undone", False, error=str(exc)[:200])
+            return False
+        self._step("erase_record_undone", undone, reason=prior)
+        return undone
 
     def _drop_keep_mark(self, run: Dict[str, Any]) -> None:
         """A run that failed before any delete removed nobody: its backup is prunable as usual."""

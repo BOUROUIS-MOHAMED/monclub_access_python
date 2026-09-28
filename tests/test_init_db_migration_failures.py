@@ -265,6 +265,46 @@ def test_a_pin_scheme_column_that_fails_after_the_token_drop_rolls_the_drop_back
     assert _raw(path, "SELECT device_id, first_scheme FROM device_pin_scheme_seen") == [(42, "MEMBERSHIP")]
 
 
+def test_the_hold_column_that_fails_stops_the_start_and_the_next_start_adds_it(db, monkeypatch):
+    """Lane 1f (review of lane 1e, nit C3): the inline ``device_write_hold.pin_scheme`` ALTER is a
+    fifth hard step, on purpose not ``_ensure_column`` (whose swallowed failure would make every
+    hold read fail -- and hold every turnstile). A lanes 1-1d table with a held row: the ALTER
+    fails, init_db raises, the row is untouched; the next start adds the column and keeps it."""
+    db_module, path = db
+    _start(db_module)
+    _seed(path,
+          ("DROP TABLE device_write_hold", ()),
+          ("CREATE TABLE device_write_hold (device_id INTEGER PRIMARY KEY, reason TEXT NOT NULL, "
+           "run_id TEXT, created_at TEXT NOT NULL)", ()),
+          ("INSERT INTO device_write_hold VALUES (5, 'erase', 'r0', '2026-09-28 01:00:00')", ()))
+    _fail_once(db_module, monkeypatch, "ALTER TABLE device_write_hold ADD COLUMN pin_scheme")
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        _start(db_module)
+    assert "pin_scheme" not in _columns(path, "device_write_hold")
+    assert _raw(path, "SELECT device_id, reason FROM device_write_hold") == [(5, "erase")]
+
+    _start(db_module)
+    assert "pin_scheme" in _columns(path, "device_write_hold")
+    assert _raw(path, "SELECT device_id, reason, pin_scheme FROM device_write_hold") == [
+        (5, "erase", None)]
+
+
+def test_a_hold_column_read_that_fails_stops_the_start_as_itself(db, monkeypatch):
+    """The column check reads with a PRAGMA that raises (lane 1f, nit C3): a read error stops the
+    start as its own error -- ``_table_columns`` answered [] there, which turned it into the ALTER's
+    misleading 'duplicate column name'."""
+    db_module, path = db
+    _start(db_module)
+    _fail_once(db_module, monkeypatch, "PRAGMA table_info(device_write_hold)")
+
+    with pytest.raises(sqlite3.OperationalError, match="injected at: PRAGMA table_info"):
+        _start(db_module)
+
+    _start(db_module)
+    assert "pin_scheme" in _columns(path, "device_write_hold")
+
+
 def test_the_stale_lock_resets_still_log_through_the_module_logging(db, monkeypatch, caplog):
     """The two blocks that used to import logging locally still log -- warnings on a reset,
     errors on a failure -- and a failure there does not stop startup."""

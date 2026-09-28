@@ -64,6 +64,14 @@ def _scheme(monkeypatch, value):
     monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda d: value)
 
 
+def _signed_in(db, *listed):
+    """This PC signed in to MonClub (a gym token) with the turnstiles ``listed`` in its list: only
+    then does a missing device row mean "deleted in MonClub" (lane 1f, review C1)."""
+    db.save_auth_token(email="gym@example.test", token="tok-lane1f")
+    for did in listed:
+        _device_row(db, did, "MEMBERSHIP")
+
+
 def _device_row(db, did, scheme):
     """A ``sync_devices`` row, as the sync writes one (the start-up release reads this table)."""
     def _write(conn, profile):
@@ -254,6 +262,7 @@ class TestTheHoldColumnMigration:
             dbmod.set_device_write_hold(device_id=6, reason="erase-prep", run_id="r1",
                                         pin_scheme="ACCOUNT")
             assert dbmod.list_device_write_holds()[6]["terminalScheme"] == "ACCOUNT"
+            _device_row(dbmod, 6, "ACCOUNT")                   # unchanged: released (lane 1f)
             assert device_hold.load(release_unstarted=True) == frozenset({5})
         finally:
             device_hold.reset_for_tests()
@@ -288,7 +297,9 @@ class TestTheStartUpKeepsAHoldWhoseSchemeMoved:
         assert not device_hold.is_held(5) and _hold_row(db, 5) is None
 
     def test_a_turnstile_no_longer_in_monclub_is_released(self, sqlite_db):
+        """Signed in, with a list that no longer has it (lane 1f: only such a list says so)."""
         db = sqlite_db
+        _signed_in(db, 5)
         db.set_device_write_hold(device_id=7, reason=db.HOLD_REASON_ERASE_PREP, run_id="r-cut",
                                  pin_scheme="MEMBERSHIP")
         _restart()
@@ -411,6 +422,20 @@ class _Killed(BaseException):
     pass
 
 
+def _mark_fails(monkeypatch, then=None):
+    """The run folder's KEEP_MARK cannot be written (a full disk, an antivirus lock); ``then`` runs
+    first -- something landing between the erase record and the mark."""
+    real = ew._write_file_durably
+
+    def _write(path, data):
+        if Path(path).name == ew.KEEP_MARK:
+            if then is not None:
+                then()
+            raise OSError("disk full")
+        return real(path, data)
+    monkeypatch.setattr(ew, "_write_file_durably", _write)
+
+
 class TestTheKeepMarkComesAfterTheEraseRecord:
 
     def test_a_run_cut_before_its_erase_record_leaves_no_mark(self, sqlite_db, monkeypatch,
@@ -459,26 +484,128 @@ class TestTheKeepMarkComesAfterTheEraseRecord:
         assert seen and seen[0][1] is True and seen[0][2] == sqlite_db.HOLD_REASON_ERASE, seen
         assert (_run_dir(wiz) / ew.KEEP_MARK).exists()
 
-    def test_a_mark_that_cannot_be_written_erases_nothing_and_keeps_the_hold(
+    def test_a_mark_that_cannot_be_written_puts_the_erase_record_back(
             self, sqlite_db, monkeypatch, tmp_path):
-        """After the erase record the run can no longer end FAILED-and-released: it ends
-        INCOMPLETE, held, every record marked to be written again -- nothing deleted."""
-        real = ew._write_file_durably
+        """Lane 1f (review of lane 1e, C2): no delete was issued, so the erase record is undone and
+        the run ends as any stop before a delete -- FAILED, released (the scheme did not move, the
+        turnstile was not held before). Lane 1e left it INCOMPLETE and held at ``erase``, where
+        « Remplir » has no scheme guard."""
+        _mark_fails(monkeypatch)
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED", run
+        assert run["error"].startswith("KEEP_MARK_NOT_WRITTEN:") and "undone" in run["error"]
+        assert not run.get("erased"), "erased=True only once the mark is written"
+        undone = [s for s in run["steps"] if s["step"] == "erase_record_undone"]
+        assert undone and undone[0]["ok"] is True and undone[0]["reason"] == "erase-prep", undone
+        assert not [c for c in panel.calls if c[0] == "erase"]
+        assert not device_hold.is_held(5) and _hold_row(sqlite_db, 5) is None
+        assert not (_run_dir(wiz) / ew.KEEP_MARK).exists()
 
-        def _write(path, data):
-            if Path(path).name == ew.KEEP_MARK:
-                raise OSError("disk full")
-            return real(path, data)
-        monkeypatch.setattr(ew, "_write_file_durably", _write)
+    def test_a_scheme_move_then_a_mark_failure_keeps_the_scheme_guard(
+            self, sqlite_db, monkeypatch, tmp_path):
+        """The review's case: the switch lands just before the mark, whose write then fails. The
+        record put back to ``erase-prep``, the stop keeps the hold as ``erase-scheme-moved`` --
+        « Remplir » is refused under the new scheme, after a restart too."""
+        _mark_fails(monkeypatch, then=lambda: _account(monkeypatch, 5, _device()))
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        _scheme(monkeypatch, "MEMBERSHIP")
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and _note(wiz).startswith("HELD_SCHEME_MOVED:"), run
+        assert not [c for c in panel.calls if c[0] == "erase"]
+        assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_SCHEME_MOVED
+        _restart()
+        status, out = _refill(wiz, "ACCOUNT")
+        assert (status, out["code"]) == (409, "HELD_SCHEME_MOVED"), out
+
+    def test_a_scheme_moved_row_taken_over_is_put_back_as_it_was(
+            self, sqlite_db, monkeypatch, tmp_path):
+        """The redo of C6 (the scheme set back, erase again with « Attendre… »): its erase record
+        moved the ``erase-scheme-moved`` row to ``erase``; a mark failure puts it back there."""
+        wiz, _w, panel = _held_scheme_moved(monkeypatch, tmp_path, sqlite_db)
+        panel.read_table_strict = panel.read_table_strict.real
+        staff = _staff_panel()                                   # a cleaner: the redo writes a mark
+        panel.tables["user"] = staff.tables["user"]
+        panel.tables["userauthorize"] = staff.tables["userauthorize"]
+        _devices(monkeypatch, _device())
+        _scheme(monkeypatch, "MEMBERSHIP")                      # the owner set it back
+        _mark_fails(monkeypatch)
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "FAILED" and run["error"].startswith("KEEP_MARK_NOT_WRITTEN:"), run
+        assert not [c for c in panel.calls if c[0] == "erase"]
+        assert device_hold.is_held(5), "held before: the hold stays"
+        assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_SCHEME_MOVED
+        _scheme(monkeypatch, "ACCOUNT")
+        _account(monkeypatch, 5, _device())
+        status, out = _refill(wiz, "ACCOUNT")
+        assert (status, out["code"]) == (409, "HELD_SCHEME_MOVED"), out
+
+    def test_a_row_already_at_erase_is_never_put_back(self, sqlite_db, monkeypatch, tmp_path):
+        """Held at ``erase`` by an earlier run that may have deleted (« Incomplet », run again):
+        nothing to put back -- INCOMPLETE and held, under the code that says « Remplir » only under
+        the scheme of the erase's start."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        device_hold.hold(5, reason=device_hold.REASON_ERASE, run_id="r-incomplete",
+                         pin_scheme="MEMBERSHIP")
+        _mark_fails(monkeypatch)
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "INCOMPLETE", run
+        assert run["error"].startswith("KEEP_MARK_NOT_WRITTEN_HELD:"), run["error"]
+        assert "nothing was erased" in run["error"]
+        assert not [s for s in run["steps"] if s["step"] == "erase_record_undone"]
+        assert not [c for c in panel.calls if c[0] == "erase"]
+        assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_ERASE
+
+    def test_an_undo_that_cannot_be_written_stays_incomplete_and_held(
+            self, sqlite_db, monkeypatch, tmp_path):
+        """Fail closed: the record stays at ``erase`` when putting it back fails."""
+        def _undo_fails(**kw):
+            raise sqlite3.OperationalError("disk I/O error")
+        monkeypatch.setattr(dbmod, "undo_device_erase_record", _undo_fails)
+        _mark_fails(monkeypatch)
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
         pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "INCOMPLETE", run
-        assert run["error"].startswith("KEEP_MARK_NOT_WRITTEN:") and "nothing was erased" in run["error"]
+        assert run["error"].startswith("KEEP_MARK_NOT_WRITTEN_HELD:"), run["error"]
+        undone = [s for s in run["steps"] if s["step"] == "erase_record_undone"]
+        assert undone and undone[0]["ok"] is False, undone
         assert not [c for c in panel.calls if c[0] == "erase"]
         assert device_hold.is_held(5)
         assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_ERASE
+
+    def test_the_undo_touches_only_that_runs_row_at_erase(self, sqlite_db):
+        db = sqlite_db
+        db.set_device_write_hold(device_id=5, reason=db.HOLD_REASON_ERASE_PREP, run_id="r1",
+                                 pin_scheme="MEMBERSHIP")
+        assert db.undo_device_erase_record(device_id=5, run_id="r1",
+                                           reason=db.HOLD_REASON_ERASE_PREP) is False
+        db.begin_device_erase(device_id=5, run_id="r1")
+        assert db.undo_device_erase_record(device_id=5, run_id="r-other",
+                                           reason=db.HOLD_REASON_ERASE_PREP) is False
+        assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
+        assert db.undo_device_erase_record(device_id=5, run_id="r1",
+                                           reason=db.HOLD_REASON_ERASE_PREP) is True
+        row = _hold_row(db, 5)
+        assert row["reason"] == db.HOLD_REASON_ERASE_PREP and row["terminalScheme"] == "MEMBERSHIP"
+        with pytest.raises(ValueError):
+            db.undo_device_erase_record(device_id=5, run_id="r1", reason=db.HOLD_REASON_ERASE)
+
+    def test_a_written_mark_still_sets_erased(self, sqlite_db, monkeypatch, tmp_path):
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        pv = _preview(wiz, 5)
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        run = wiz.status()["run"]
+        assert run["state"] == "DONE" and run["erased"] is True, run
 
 
 # ─────────────────────── a turnstile deleted during the run ───────────────────────
@@ -489,6 +616,7 @@ class TestATurnstileRemovedDuringTheRun:
         """Master review nit: the session-only note told the operator to erase again or press
         « Remplir » -- impossible for a turnstile MonClub no longer has."""
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _signed_in(sqlite_db, 6)                               # the list still has panel 6
         _scheme(monkeypatch, "MEMBERSHIP")
         pv = _preview(wiz, 5)
         real = panel.read_table_strict

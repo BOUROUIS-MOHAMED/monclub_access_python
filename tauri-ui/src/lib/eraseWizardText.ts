@@ -169,6 +169,8 @@ const fr = {
     erase_fingerprints: "Empreintes effacées (administrateurs conservés)",
     counts_after: "Comptage après et vérification",
     erase_recorded: "Effacement enregistré : le dernier résultat d'écriture de chaque membre devient « inconnu »",
+    // Lane 1f (review C2): the keep mark could not be written, and no delete was issued.
+    erase_record_undone: "Enregistrement de l'effacement annulé : aucune suppression n'a été faite",
     not_refilled: "Personnes hors de la liste du remplissage vérifiées sur la sauvegarde",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
@@ -212,7 +214,9 @@ const fr = {
       "Pas d'Internet : le serveur MonClub doit vérifier le mot de passe (pour effacer comme pour « Remplir »). Rétablissez la connexion, puis réessayez.",
     ADMIN_PASSWORD: "Mot de passe incorrect.",
     ADMIN_PASSWORD_REQUIRED: "Saisissez le mot de passe administrateur.",
-    PC_NOT_SIGNED_IN: "Ce PC n'est pas connecté à MonClub : le mot de passe ne peut pas être vérifié. Reconnectez ce PC, puis réessayez.",
+    // Lane 1f (review C4): never "reconnect" on its own -- a logout empties this PC's member and
+    // turnstile lists until its next sync (the cutover runbook says to call the developer).
+    PC_NOT_SIGNED_IN: "Ce PC n'est pas connecté à MonClub : le mot de passe ne peut pas être vérifié, et rien n'a été modifié. Appelez le développeur avant de déconnecter ou de reconnecter ce PC.",
     ADMIN_PASSWORD_CHECK_FAILED: "Le serveur MonClub n'a pas pu vérifier le mot de passe : réessayez dans un instant.",
     PREVIEW_EXPIRED: "La lecture de l'étape 1 date de plus de 15 minutes : revenez à l'étape 1 et relisez.",
     WRONG_DEVICE: "Cette lecture concerne un autre tourniquet : relisez l'étape 1.",
@@ -269,8 +273,11 @@ const fr = {
       "Des personnes de ce tourniquet ne seront pas remises par le remplissage : cochez la case qui le confirme (étape 4).",
     NOT_REFILLED_CHANGED:
       "Au moment d'effacer, le tourniquet portait des personnes hors de la liste du remplissage qui n'étaient pas affichées à l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
+    // Lane 1f (review C2): the erase record is put back (FAILED); when it cannot be, _HELD (INCOMPLETE).
     KEEP_MARK_NOT_WRITTEN:
-      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé. L'effacement était déjà enregistré : le tourniquet reste en attente, et « Remplir » réécrit tout le monde.",
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : l'effacement a été annulé avant toute suppression, rien n'a été effacé. Réessayez ; si cela recommence, appelez le développeur (le disque de ce PC est peut-être plein).",
+    KEEP_MARK_NOT_WRITTEN_HELD:
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé. L'effacement était déjà enregistré et n'a pas pu être annulé : le tourniquet reste en attente. « Remplir » réécrit tout le monde — seulement si le schéma de numérotation est toujours celui de l'étape 1 ; s'il a changé, effacez à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
     HELD_SCHEME_MOVED:
       "« Remplir » refusé : rien n'a été effacé sur ce tourniquet, et il porte encore les numéros d'un autre schéma que celui enregistré maintenant. Remettez ce schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou réessayez « Remplir » pour le libérer sans rien effacer).",
     TLS_CLOCK:
@@ -493,6 +500,7 @@ const en: typeof fr = {
     erase_fingerprints: "Fingerprints erased (administrators kept)",
     counts_after: "Counts after, and check",
     erase_recorded: "Erase recorded: each member's last write result becomes 'unknown'",
+    erase_record_undone: "Erase record undone: no delete was made",
     not_refilled: "People outside the refill's list checked against the backup",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
@@ -533,7 +541,7 @@ const en: typeof fr = {
       "No internet: the MonClub server must check the password (to erase and to Refill). Restore the connection, then try again.",
     ADMIN_PASSWORD: "Wrong password.",
     ADMIN_PASSWORD_REQUIRED: "Enter the administrator password.",
-    PC_NOT_SIGNED_IN: "This PC is not signed in to MonClub: the password cannot be checked. Sign this PC in again, then try again.",
+    PC_NOT_SIGNED_IN: "This PC is not signed in to MonClub: the password cannot be checked, and nothing was changed. Call the developer before signing this PC out or in again.",
     ADMIN_PASSWORD_CHECK_FAILED: "The MonClub server could not check the password: try again in a moment.",
     PREVIEW_EXPIRED: "Step 1 was read more than 15 minutes ago: go back to step 1 and read again.",
     WRONG_DEVICE: "This reading is of another turnstile: read step 1 again.",
@@ -591,7 +599,9 @@ const en: typeof fr = {
     NOT_REFILLED_CHANGED:
       "When the erase was about to start, the turnstile held people outside the refill's list who were not shown at step 1: nothing was erased. Read step 1 again.",
     KEEP_MARK_NOT_WRITTEN:
-      "The mark that keeps the backup with no time limit could not be written: nothing was erased. The erase was already recorded: the turnstile stays on hold, and Refill writes everyone again.",
+      "The mark that keeps the backup with no time limit could not be written: the erase was undone before any delete, nothing was erased. Try again; if it happens again, call the developer (this PC's disk may be full).",
+    KEEP_MARK_NOT_WRITTEN_HELD:
+      "The mark that keeps the backup with no time limit could not be written: nothing was erased. The erase was already recorded and could not be undone: the turnstile stays on hold. Refill writes everyone again — only while the numbering scheme is still the one of step 1; if it changed, erase again with 'Hold until I press Refill'.",
     HELD_SCHEME_MOVED:
       "Refill refused: nothing was erased on this turnstile, and it still holds the numbers of another scheme than the one recorded now. Set that scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or press Refill again to release it without erasing anything).",
     TLS_CLOCK:

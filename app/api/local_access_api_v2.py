@@ -1357,19 +1357,24 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
     (it read "Mot de passe incorrect" before); a TLS failure answers 502 -- ``TLS_CLOCK`` for a
     certificate not yet valid or expired (this PC's date and time), ``ADMIN_PASSWORD_CHECK_FAILED``
     otherwise -- with a French text, not lane 1d's English one; a handshake the network cut is the
-    no-internet 503, as before lane 1d.
+    no-internet 503, as before lane 1d. Lane 1f (review of lane 1e): no password and no gym token
+    answer in French too, and ``PC_NOT_SIGNED_IN`` asks for the developer before any logout (C4).
     """
     body = ctx.body()
     password = _safe_str(body.get("password"), "")
     if not password:
+        # French, as every other refusal here (lane 1f, review nit N5).
         ctx.send_json(400, {"ok": False, "code": "ADMIN_PASSWORD_REQUIRED",
-                            "error": "password is required"})
+                            "error": "Saisissez le mot de passe administrateur."})
         return
 
     from access.store import load_auth_token
     auth = load_auth_token()
     if not auth or not auth.token:
-        ctx.send_json(401, {"ok": False, "code": "PC_NOT_SIGNED_IN", "error": "Not authenticated"})
+        ctx.send_json(401, {"ok": False, "code": "PC_NOT_SIGNED_IN",
+                            "error": "Ce PC n'est pas connecté à MonClub : le mot de passe ne peut "
+                                     "pas être vérifié, et rien n'a été modifié. Appelez le "
+                                     "développeur avant de déconnecter ou de reconnecter ce PC."})
         return
 
     try:
@@ -1381,12 +1386,15 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
             ctx.send_json(401, {"ok": False, "code": "ADMIN_PASSWORD",
                                 "error": "Mot de passe incorrect"})
     except MonClubTokenRejectedError as e:
-        # The server refused this PC's gym login, before the password route (lane 1e, F5).
+        # The server refused this PC's gym login, before the password route (lane 1e, F5). Never
+        # "reconnect" on its own (lane 1f, review C4): a logout empties this PC's member and
+        # turnstile lists until its next sync -- the cutover runbook says to call the developer.
         ctx.app.logger.warning("verify_admin_password: the gym login was refused: %s", e)
         ctx.send_json(401, {"ok": False, "code": "PC_NOT_SIGNED_IN",
                             "error": "Ce PC n'est plus connecté à MonClub : le serveur a refusé sa "
-                                     "connexion, le mot de passe ne peut pas être vérifié. "
-                                     "Reconnectez ce PC à MonClub, puis réessayez."})
+                                     "connexion, le mot de passe ne peut pas être vérifié, et rien "
+                                     "n'a été modifié. Appelez le développeur avant de déconnecter "
+                                     "ou de reconnecter ce PC."})
     except MonClubApiHttpError as e:
         ctx.app.logger.warning("verify_admin_password: HTTP %s", e.status_code)
         ctx.send_json(e.status_code, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",

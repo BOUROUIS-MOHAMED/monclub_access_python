@@ -31,6 +31,11 @@ turnstile's scheme moved since -- a run cut before it saw the move: it keeps it 
 ``REASON_SCHEME_MOVED`` (``db.release_unstarted_erase_holds``). And Refill releases a
 ``REASON_SCHEME_MOVED`` row only while the scheme recorded now is that one again
 (``EraseWizard._refill_marked``).
+
+Lane 1f (review of lane 1e, C1): an ``erase-prep`` row whose turnstile has no ``sync_devices`` row
+is released at start-up only while that list can say the turnstile was deleted in MonClub -- the PC
+signed in, the list not empty (``db._device_list_is_authoritative``). A logout empties the list: the
+row is then left at ``erase-prep``, held, until a start that can read the scheme (or Refill).
 """
 from __future__ import annotations
 
@@ -87,14 +92,18 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
 
     released: Dict[int, Optional[str]] = {}
     kept: Dict[int, Dict[str, Optional[str]]] = {}
+    undecided: Dict[int, Optional[str]] = {}
     # Under the lock for the read AND the install: a hold() or release() landing between the
     # two would otherwise be overwritten by a stale read (review round 2, R2-5).
     with _lock:
         if release_unstarted:
             try:
                 kept_out: Dict[int, Dict[str, Optional[str]]] = {}
-                released = dict(release_unstarted_erase_holds(kept_out=kept_out) or {})
+                undecided_out: Dict[int, Optional[str]] = {}
+                released = dict(release_unstarted_erase_holds(
+                    kept_out=kept_out, undecided_out=undecided_out) or {})
                 kept = kept_out
+                undecided = undecided_out
             except Exception:
                 _log.error("[HOLD] holds of runs stopped before any erase NOT released: they stay "
                            "held until Refill", exc_info=True)
@@ -127,8 +136,21 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
                        step="kept_at_start", ok=True, pin_scheme=str(info.get("scheme") or ""))
         except Exception:
             pass
+    for did, run_id in sorted(undecided.items()):
+        _log.warning("[HOLD] turnstile %s kept on hold at start-up: its erase run %s stopped before "
+                     "any delete command, and this PC cannot tell whether its pin scheme moved "
+                     "since -- signed out of MonClub, or no turnstile list (a logout empties it) -- "
+                     "nothing was erased; held until a start signed in with the list, or Refill",
+                     did, run_id)
+        try:
+            from app.core import telemetry as _tel
+            _tel.event("ERASE_STEP", run=str(run_id or ""), device_id=did,
+                       step="undecided_at_start", ok=True)
+        except Exception:
+            pass
     stopped = dict(released)
     stopped.update({did: info.get("runId") for did, info in kept.items()})
+    stopped.update(undecided)
     if stopped:
         # Nobody was erased by those runs -- released or kept, none had left ``erase-prep``: a keep
         # mark one left behind goes (review F3).

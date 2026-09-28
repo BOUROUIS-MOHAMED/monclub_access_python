@@ -55,7 +55,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
 | Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
-| What happens when an `init_db` step fails — the four schema migrations that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
+| What happens when an `init_db` step fails — the four schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
 | Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `app.py::ultra_devices_for_this_pc`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
@@ -1405,8 +1405,12 @@ stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone
 
 **A failing migration stops startup — on purpose (owner's decision, 2026-09-25).** `init_db` calls
 `_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
-`_ensure_main_account_id_column` and `_ensure_pin_scheme_column` with no `try`. When one of them
-fails, its own exception leaves `init_db` and `get_conn` closes the connection uncommitted. Neither
+`_ensure_main_account_id_column` and `_ensure_pin_scheme_column` with no `try` -- and, since lane 1e, runs the
+inline `ALTER TABLE device_write_hold ADD COLUMN pin_scheme` with none either (§3.2h; its column check is a `PRAGMA`
+read that raises since lane 1f, not `_table_columns`, which answers `[]` on a read error and so turned that error into
+a misleading "duplicate column name") `[TEST: test_init_db_migration_failures.py::
+test_the_hold_column_that_fails_stops_the_start_and_the_next_start_adds_it, ::test_a_hold_column_read_that_fails_stops_the_start_as_itself]`.
+When one of them fails, its own exception leaves `init_db` and `get_conn` closes the connection uncommitted. Neither
 `access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
 or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
 `%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`;
@@ -1833,6 +1837,11 @@ lock screen 401 `PC_NOT_SIGNED_IN` `[TEST: test_erase_wizard_lane1e.py::TestARef
 backend answers is `[UNVERIFIED]`: the runbook keeps a step for « Mot de passe incorrect » with a right password);
 503 `ADMIN_PASSWORD_UNCHECKABLE` (offline), or `PC_NOT_SIGNED_IN` when this PC has no gym
 token (the verifier answered 401 "Not authenticated" for that before review round 1) or the server refused it (lane 1e);
+its text asks for the developer before any logout, never "reconnect this PC" (lane 1f, review of lane 1e, C4: a logout
+empties this PC's member and turnstile lists until its next sync, and the cutover runbook says to call the developer),
+on the lock screen's two branches and in the wizard's FR/EN code texts; the lock screen's no-password and no-token
+refusals are French since lane 1f (nit N5: "password is required" and "Not authenticated" before) `[TEST:
+test_erase_wizard_lane1f.py::TestTheLockScreenTexts]`;
 400 `ADMIN_PASSWORD_REQUIRED`; the verifier's `TLS_CLOCK_TEXT` (a certificate not yet valid or expired, below) is
 `TLS_CLOCK` since lane 1e;
 any other status (a proxy's 502/504, a 5xx) `ADMIN_PASSWORD_CHECK_FAILED`, shown with the server's words. `[TEST: test_erase_wizard_gaps.py::TestTheRefillRoute]` The page ticks and locks the C3
@@ -1972,8 +1981,16 @@ Since lane 1c `[CODE]`:
 - **Never a backup holding people the refill does not put back** (review C0): a run whose erase removes any of them writes
   `keep_not_refilled.txt` (`KEEP_MARK`: their count and pins, never a name) into its folder, durably, before its first
   delete -- since lane 1e AFTER its erase record (`_write_keep_mark`, master review F8; lanes 1c-1d wrote it before) — no
-  mark written, no delete (`KEEP_MARK_NOT_WRITTEN`: `INCOMPLETE` since lane 1e, held and every record written again
-  at Refill, nothing erased; `FAILED` and released before) — and the prune never deletes a marked folder,
+  mark written, no delete. Since lane 1f (review of lane 1e, C2) the erase record is then put back: the row returns to
+  the phase it had before `begin_device_erase` (`erase-prep` or `erase-scheme-moved`; `db.undo_device_erase_record`,
+  durable, that run's row at `erase` only; step `erase_record_undone`), and the run ends `FAILED` as any stop before a
+  delete (`KEEP_MARK_NOT_WRITTEN`) -- released, or kept with its scheme guard when the scheme moved or the turnstile was
+  held before. A row that was already at `erase` (an earlier run may have deleted), or an undo that fails, ends
+  `INCOMPLETE` and held (`KEEP_MARK_NOT_WRITTEN_HELD`: « Remplir » writes everyone, only under the scheme of the erase's
+  start -- no code guards an `erase` row, which C13b's normal « Remplir » needs). `erased` is set only once the mark is
+  written. Residual `[CODE]`: the push results `begin_device_erase` reset stay unknown after an undo (their earlier
+  values are not kept) -- "unknown", never a false "on the turnstile". `[TEST: test_erase_wizard_lane1e.py::
+  TestTheKeepMarkComesAfterTheEraseRecord; mutation checked: no undo]` — and the prune never deletes a marked folder,
   whatever its `run.json` says. A run that fails before any delete removes its mark (nobody was erased), and since
   lane 1d so does the start-up release of a run a power cut or a kill stopped before its erase record (below, "A run
   stopped before any delete leaves no hold") -- for folders an earlier build wrote: this one writes none before the
@@ -2141,7 +2158,11 @@ run folder's `run.json`):
      last through a restart of Access …` since lane 1e -- the next start keeps the row while the scheme then differs, below; lane 1d
      review round 1: the page's line for the plain code promises a hold that outlives a restart). So does a turnstile
      whose row is gone (deleted in MonClub: its scheme reads None, `EraseWizard._device_gone`) -- no « Remplir » could be
-     pressed for it; a row that does not READ is not gone, and keeps the durable hold (fail closed). Residual `[CODE]`: like any hold, it blocks every member write, revocations included,
+     pressed for it; a row that does not READ is not gone, and keeps the durable hold (fail closed). Since lane 1f
+     (review of lane 1e, C1) neither is a row missing while the list cannot say so -- the PC signed out, or its list
+     empty (`db.device_list_is_authoritative`: a logout deletes the token and empties `sync_devices`; the TV logout
+     deletes the token alone): the hold is then made durable (`erase-scheme-moved`). `[TEST:
+     test_erase_wizard_lane1f.py::TestARunStoppedWhileSignedOut]` Residual `[CODE]`: like any hold, it blocks every member write, revocations included,
      across restarts until « Remplir » — the page's note says so. `[TEST: test_erase_wizard_lane1d.py::
      TestAHoldKeptAfterASchemeMoveSurvivesARestart — both notes reloaded with release_unstarted=True, the unchanged-scheme
      control, the row rules, Refill releases it, a failed write]` With the scheme unchanged a `FAILED` run releases as
@@ -2166,7 +2187,9 @@ run folder's `run.json`):
      durable too (F7: lane 1d skipped `held_before` runs, and a row taken over at `erase-prep` stayed releasable) --
      except that on a row at `erase` (an earlier run may have deleted) the note is `HELD_BEFORE`: « Remplir » is the
      normal step there. A turnstile deleted in MonClub during the run, its row at `erase-prep`, gets `HELD_DEVICE_GONE`
-     (nothing to do; the next start releases it). The finish note names the scheme the ROW records for the terminal (a run
+     (nothing to do; the next start releases it -- signed in with its list, lane 1f). Since lane 1f (nit N1) a durable
+     write that fails on a row read at `erase` or `erase-scheme-moved` keeps that row's own note (`HELD_BEFORE`, the
+     plain one): that write moves `erase-prep` rows only, so only they get the `_SESSION` note. The finish note names the scheme the ROW records for the terminal (a run
      that took an earlier hold over keeps the first run's) and one recovery: set that scheme back, then erase again with
      "hold" (or « Remplir », erasing nothing). `[TEST: test_erase_wizard_lane1e.py::TestRemplirOnASchemeMovedHold,
      ::TestASchemeMovedStopOnATurnstileHeldBefore, ::TestATurnstileRemovedDuringTheRun, ::TestTheHoldColumnMigration;
@@ -2307,8 +2330,18 @@ test_erase_wizard_lane1b.py::TestAHoldThatNeverErased]`
 (`db.release_unstarted_erase_holds(kept_out=…)`): that run was cut before it could see the move, the terminal holds
 every old-scheme pin, and a released pass would write the new scheme's beside them. Logged `[HOLD] turnstile N kept on
 hold at start-up …`, `[T] ERASE_STEP step=kept_at_start`; its keep mark goes as a released run's does (it erased
-nobody). A row that records no scheme (written before lane 1e) and a turnstile with no device row (deleted in MonClub)
-are released as before; a read that fails releases nothing (every row stays held, retried at the next load). Residual
+nobody). A row that records no scheme (written before lane 1e) is released as before; a read that fails releases
+nothing (every row stays held, retried at the next load). A turnstile with no device row is released only while the
+list can say it was deleted in MonClub (lane 1f, review of lane 1e, C1: `db._device_list_is_authoritative` -- a gym
+token in `auth_state` AND at least one `sync_devices` row). A logout deletes the token and empties that list
+(`_handle_auth_logout` → `save_sync_cache(None)`), the TV logout deletes the token alone: a start then leaves the row
+at `erase-prep` (`release_unstarted_erase_holds(undecided_out=…)`, `[HOLD] turnstile N kept on hold at start-up … cannot
+tell whether its pin scheme moved`, `[T] ERASE_STEP step=undecided_at_start`), held until a start signed in with the
+list decides, or « Remplir » (its guard reads the scheme the row records). Residual `[CODE]`: after a re-login the
+turnstile stays held until the next start or « Remplir », however long -- no sync re-decides it; the Devices page shows
+it with « Remplir » and no "nothing erased" line (the scheme unchanged). `[TEST:
+test_erase_wizard_lane1f.py::TestAStartThatCannotReadTheListKeepsTheRow -- the logout, restart, login path end to end
+with the real `clear_auth_token` and `save_sync_cache(None)`; mutation checked: the old rule]` Residual
 `[CODE]`: the rule sees only a move already in THIS PC's database -- it runs before the first sync tick; a run cut after
 the dashboard saved the switch but before a sync brought it to the PC is released, and the first sync then applies the new
 scheme (the runbook's guard: a panel whose run did not end « Terminé » is never switched, C6 / C12). `[TEST:
@@ -5138,7 +5171,7 @@ releases, restores, read-backs, loss checks); none is a `[T]` event.
 
 | Event | Where | Carries |
 |---|---|---|
-| `ERASE_STEP` | `erase_wizard.py::EraseWizard._step`, `::refill` | `run device_id step ok` + the step's own scalar fields: `n_<table>` counts (before/after; `-1` = unreadable), `path sha256 rows` (backup), `code error uncertain` (a failed erase), `verified why`, `state holdKept note` (`finish`; `note` `PIN_SCHEME_CHANGED…` when a refill was held back, and since lane 1c `HELD_SCHEME_MOVED…` / `HELD_SCHEME_UNREADABLE…` when a run that stopped before its first delete kept the hold after the scheme moved or did not read -- since lane 1d that hold row reads `erase-scheme-moved` and survives a restart, and when that durable write failed the note's code is `HELD_SCHEME_MOVED_SESSION` / `HELD_SCHEME_UNREADABLE_SESSION` and it ends `-- the hold could not be recorded as kept: it may NOT last through a restart of Access …` (lane 1d: `-- NOT kept across a restart …`); since lane 1e a turnstile deleted during the run gives `HELD_DEVICE_GONE…`, and a row already at `erase` gives `HELD_BEFORE…`; the `error` codes of a `FAILED` run gain `NOT_REFILLED_UNKNOWN`, `NOT_REFILLED_CHANGED` and `PIN_SCHEME_CHANGED`, and `KEEP_MARK_NOT_WRITTEN` -- an `INCOMPLETE` run's since lane 1e), `mode pinScheme` (refill), `state/intents/mirror/readd/results/removals_logged/kept` (forget), `invalidated kept` (keep_records), `invalidated` (records_invalidated, after an `INCOMPLETE`), `resultsReset kept` (`erase_recorded`, lane 1b), `skipped=empty` (an `erase_<table>` that counted 0, lane 1b), `count` (`not_refilled`, lane 1c: the people the erase removes and the refill does not put back — a count, never a pin or a name). `step` ∈ `hold`, `idle`, `counts_before`, `backup`, `not_refilled`, `erase_recorded`, `erase_<table>`, `erase_users`, `erase_fingerprints`, `erase`, `counts_after`, `forget`, `keep_records`, `records_invalidated`, `wipe_reported`, `refill`, `finish` (`note` also `HELD_BEFORE…`), `refill_pressed` (`run=refill`, the Refill button: `pin_scheme requested invalidated`), `released_at_start` (`device_hold.load`, lane 1b: `run` = the run that stopped before any delete), `kept_at_start` (`device_hold.load`, lane 1e: the same, its row kept as `erase-scheme-moved` because the scheme moved; `pin_scheme` = the scheme recorded now), and `backup_deleted` (`prune_erase_backups`, owner decision 2026-09-27: `run` = the run whose folder went, `state`). One line per step; the same step is written to the run folder's `run.json` (§3.2h) — except `released_at_start`, `kept_at_start` and `backup_deleted`, which have no run in this process. No member name, card or template. The `error` / `why` texts may carry up to 5 member pins (`ERASE_FAILED`, `NOT_VERIFIED`, `NOT_REFILLED_CHANGED` since lane 1c, `ADMIN_PIN_IN_ROSTER` up to 3 admin pins) — never a listed value that failed the pin check: `BACKUP_UNTRUSTED` carries a count only since lane 1b (a wrong out-param order lists names as pins; review F29). |
+| `ERASE_STEP` | `erase_wizard.py::EraseWizard._step`, `::refill` | `run device_id step ok` + the step's own scalar fields: `n_<table>` counts (before/after; `-1` = unreadable), `path sha256 rows` (backup), `code error uncertain` (a failed erase), `verified why`, `state holdKept note` (`finish`; `note` `PIN_SCHEME_CHANGED…` when a refill was held back, and since lane 1c `HELD_SCHEME_MOVED…` / `HELD_SCHEME_UNREADABLE…` when a run that stopped before its first delete kept the hold after the scheme moved or did not read -- since lane 1d that hold row reads `erase-scheme-moved` and survives a restart, and when that durable write failed the note's code is `HELD_SCHEME_MOVED_SESSION` / `HELD_SCHEME_UNREADABLE_SESSION` and it ends `-- the hold could not be recorded as kept: it may NOT last through a restart of Access …` (lane 1d: `-- NOT kept across a restart …`); since lane 1e a turnstile deleted during the run gives `HELD_DEVICE_GONE…`, and a row already at `erase` gives `HELD_BEFORE…`; the `error` codes of a `FAILED` run gain `NOT_REFILLED_UNKNOWN`, `NOT_REFILLED_CHANGED` and `PIN_SCHEME_CHANGED`, and `KEEP_MARK_NOT_WRITTEN` -- an `INCOMPLETE` run's in lane 1e, a `FAILED` run's again since lane 1f, whose `INCOMPLETE` one is `KEEP_MARK_NOT_WRITTEN_HELD`), `mode pinScheme` (refill), `state/intents/mirror/readd/results/removals_logged/kept` (forget), `invalidated kept` (keep_records), `invalidated` (records_invalidated, after an `INCOMPLETE`), `resultsReset kept` (`erase_recorded`, lane 1b), `reason` or `error` (`erase_record_undone`, lane 1f: the keep mark could not be written and the erase record was put back), `skipped=empty` (an `erase_<table>` that counted 0, lane 1b), `count` (`not_refilled`, lane 1c: the people the erase removes and the refill does not put back — a count, never a pin or a name). `step` ∈ `hold`, `idle`, `counts_before`, `backup`, `not_refilled`, `erase_recorded`, `erase_record_undone`, `erase_<table>`, `erase_users`, `erase_fingerprints`, `erase`, `counts_after`, `forget`, `keep_records`, `records_invalidated`, `wipe_reported`, `refill`, `finish` (`note` also `HELD_BEFORE…`), `refill_pressed` (`run=refill`, the Refill button: `pin_scheme requested invalidated`), `released_at_start` (`device_hold.load`, lane 1b: `run` = the run that stopped before any delete), `kept_at_start` (`device_hold.load`, lane 1e: the same, its row kept as `erase-scheme-moved` because the scheme moved; `pin_scheme` = the scheme recorded now), `undecided_at_start` (`device_hold.load`, lane 1f: the same, its row left at `erase-prep` because the PC was signed out or its turnstile list empty), and `backup_deleted` (`prune_erase_backups`, owner decision 2026-09-27: `run` = the run whose folder went, `state`). One line per step; the same step is written to the run folder's `run.json` (§3.2h) — except `released_at_start`, `kept_at_start`, `undecided_at_start` and `backup_deleted`, which have no run in this process. No member name, card or template. The `error` / `why` texts may carry up to 5 member pins (`ERASE_FAILED`, `NOT_VERIFIED`, `NOT_REFILLED_CHANGED` since lane 1c, `ADMIN_PIN_IN_ROSTER` up to 3 admin pins) — never a listed value that failed the pin check: `BACKUP_UNTRUSTED` carries a count only since lane 1b (a wrong out-param order lists names as pins; review F29). |
 
 `REVOKE_DONE pins` now counts only what the removal step removed first; held old pins removed after
 the push are in `RENEWAL_HOLD removed_after_push` (§3.4f). `REVOKE_ABORTED` has a new `path`,
