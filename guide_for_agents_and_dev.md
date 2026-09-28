@@ -1845,8 +1845,9 @@ Since lane 1b (2026-09-27, the master review), an erase (not a backup-only rehea
   `LeaseSnapshot.allows()` answers True for every turnstile and `app.py::ultra_devices_for_this_pc` starts a worker for
   every ULTRA turnstile — so every Access PC of the gym writes to this turnstile during the erase and refills it right
   after, under ITS records. **No local check can see another PC**: with v2 off this PC keeps no list of its gym's PCs;
-  the verify only catches rows another PC wrote back before the counts after (`INCOMPLETE`). The runbook's "Access quit
-  on every PC" covers the cutover night; this box covers every other use. `[TEST: test_erase_wizard_lane1b.py::TestEveryOtherPcMustBeClosed]`
+  the verify only catches rows another PC wrote back before the counts after (`INCOMPLETE`). The box covers every use;
+  on the cutover night its "stays closed until the refill" is kept by the cables instead: runbook C10 starts the other
+  gym 58 PCs before « Remplir », and from C8 to C14 (D8 to D16 at gym 45) no PC reaches the turnstiles. `[TEST: test_erase_wizard_lane1b.py::TestEveryOtherPcMustBeClosed]`
 - **A refill that can refill** (review C1, `EraseWizard._refill_check`): what the refill pass would write, from THE SAME
   source and filter both passes use (`erase_wizard.refill_roster`: the sync cache's rows through
   `DeviceSyncEngine._filter_users_for_device(quiet=True)`, on a copy of the device row — no withheld WARNING, no
@@ -1909,7 +1910,17 @@ server's words as a detail line). The switch is OFF by default on the server: un
 (`GET /api/v1/manager/gym/access/erase-wizard`) is deployed EVERY start is refused `ERASE_SWITCH_MISSING` (today's
 production backend's 404), and once it is, the owner switches the wizard on per gym on /access-pcs. `[CODE]` `[TEST:
 test_erase_wizard_lane1b.py::TestTheGymsServerSwitch]` The route shape was given by the master session; the backend is
-`[UNVERIFIED]` here (not in this repo). The page's start timeout is 60 s, and after a start
+`[UNVERIFIED]` here (not in this repo).
+**The 48 h window (lane 3d, 2026-09-28)** `[COMMENT: lane 3d report and the master review of lanes 1c/3d -- backend and
+dashboard branch `claude/erase-wizard-switch-expiry`, not in this repo]`: the route answers `{"enabled", "updatedAt",
+"expiresAt"}`; an ON reads `false` from 48 h after it was turned on (computed at every read, nothing scheduled); asking for
+ON while it still reads ON changes nothing and keeps its end -- to restart the 48 h, OFF then ON; the /access-pcs card shows
+« Activé jusqu'au … » (the server's Tunis time) and is re-read only when the page is reloaded (its page's own refresh does
+not reach it). Access reads `enabled` only and ignores the other fields `[CODE: check_erase_switch]`, and asks at START
+only, so an erase already started goes on past the end. Operator rules (runbook B2c, A7, E7): ON on the cutover evening,
+not earlier; check that « Activé jusqu'au » covers the whole night, else OFF then ON; OFF after a survey-evening
+rehearsal and after the night -- checked on the card after a reload, never with a START on a live turnstile (step 1 alone
+runs full reads on the worker, "What the wizard does to the door"). The page's start timeout is 60 s, and after a start
 that got no answer it watches `/erase/status` for another minute: `requests`' `timeout=15` applies to the connect and to
 each read, so the password check and the switch check can each take about 30 s or more.
 
@@ -2139,8 +2150,10 @@ run folder's `run.json`):
 `/erase/holds` (never the run's start value), shows it, and sends it back as `expectedPinScheme`; the server
 refuses a missing one (400 `PIN_SCHEME_REQUIRED`), one that moved since (409 `PIN_SCHEME_CHANGED` with the
 scheme now — the page re-reads and shows it) and an unreadable one (503). Then the admin password, checked
-by the server: **Refill needs the internet** — offline it answers 503 and the turnstile stays held (an
-owner question, lane report). Then it **always resets the turnstile's records first**
+by the server: **Refill needs the internet** — offline it answers 503 and the turnstile stays held (owner decision
+2026-09-27: online only; it is the only release of a hold whose erase started -- `device_hold.release` has no other
+caller for it and a start releases only `erase-prep` rows; what the night does meanwhile: runbook part F, "Held, and
+« Remplir » cannot check the password"). Then it **always resets the turnstile's records first**
 (`invalidate_device_records(fingers_erased=False)`, durable) — a hold can come from an `INCOMPLETE` run or
 from a restart mid-run, which leaves no run record — and only then releases the hold, drops the scheduler's
 roster hash, sets the worker's "N waiting" to the refill roster (lane 1b) and requests a full pass. A reset that fails
@@ -2196,13 +2209,20 @@ delete may have run. The upsert never downgrades `erase` to `erase-prep` (a seco
 have emptied). A failure to release is logged and the rows stay held (fail closed). `[TEST:
 test_erase_wizard_lane1b.py::TestAHoldThatNeverErased]`
 
-**Uninstall and reinstall delete the hold and the backups** (lane 1b, review C2, verified): `installer/MonClubAccess.iss`
+**An uninstall deletes the hold and the backups** (lane 1b, review C2, verified): `installer/MonClubAccess.iss`
 `[UninstallDelete]` removes `{commonappdata}\MonClub Access` (and the LocalAppData / AppData copies), which is the data
 root (`app/core/utils.py::_candidate_data_roots`: `%ProgramData%\MonClub Access`, else `%LOCALAPPDATA%\MonClub
-Access`) holding `access.db` — the `device_write_hold` row — and `access\erase_backups\`. A reinstalled Access has no
-hold: its first pass refills the turnstile under whatever scheme the server then sends, and the only backup of the
-erased content is gone. **Never uninstall or reinstall Access while a turnstile is held**: press Refill first (or
+Access`) holding `access.db` — the `device_write_hold` row — and `access\erase_backups\`. An Access installed after an
+uninstall has no hold: its first pass refills the turnstile under whatever scheme the server then sends, and the only
+backup of the erased content is gone. **Never uninstall Access while a turnstile is held**: press Refill first (or
 finish the switch). Runbook A7 already says "never uninstall first" for another reason. `[CODE]`
+An installer run OVER the install is another matter (the master review of lane 1c, F5; runbook part F): it replaces only
+the program folder (`PrepareToInstall` → `DeleteTreeIfExists({app}\current)`) and keeps the data root `[CODE]` -- the
+SAME version then honours the hold (the repair of the autostart checklist §6, never tried on a gym PC `[UNVERIFIED]`); an
+OLDER version has no hold code and refills the turnstile at its first pass (every tag up to 1.4.33 with membership pins),
+so never over a held turnstile's data root. The runbook's rollback rows that go back to an older version move the whole
+data root aside first -- the hold and the backups leave with it -- and restore a copy taken before the new Access, which
+holds no hold: they may run on the held PC.
 
 **What the wizard does to the door** (lane 1b, review F9/F10; the module docstring's "short commands" was wrong for the
 whole-table ones). Every wizard device call runs as ONE `request_run_sdk` command on the worker thread, and

@@ -257,3 +257,9 @@ times in any hour, logging `NOT restarting` in between). Nothing repairs it on i
 3. Start Access and check `App started` in the newest log; then the watchdog's state (section 3).
 
 Details: `packaging/watchdog/README.md`, "Power lost during an update".
+
+The same repair is option 1 of the runbook's part F note "P1 does not start while a turnstile is held"
+(a turnstile the Erase wizard holds, « Remplir » on the Devices page): it replaces only
+`%LOCALAPPDATA%\MonClubAccess\current` and leaves `%ProgramData%\MonClub Access` -- the hold, the records
+and the erase backups -- as it is (`MonClubAccess.iss::PrepareToInstall`) `[CODE]`. Only with the
+installer of the version the PC runs: an older one ignores the hold (runbook part F).
