@@ -184,7 +184,11 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         nobody could press. Held for the session, as before lane 1d, with the session note."""
         import app.core.db as dbmod
         from tests.test_erase_wizard import _devices
+        from tests.test_erase_wizard_lane1e import _signed_in
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        # Lane 1f (review C1): only a list that can say so -- signed in, not empty -- makes a
+        # missing row "deleted in MonClub".
+        _signed_in(sqlite_db, 6)
         monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda d: "MEMBERSHIP")
         pv = _preview(wiz, 5)
         real = panel.read_table_strict

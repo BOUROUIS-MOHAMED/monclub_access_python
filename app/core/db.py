@@ -2627,8 +2627,12 @@ def init_db() -> None:
         # when the hold began (``set_device_write_hold``). Not through ``_ensure_column``, which
         # swallows a failure: every hold read names this column, and a table without it would make
         # the start-up load fail -- which holds EVERY turnstile. A failure here stops the start
-        # instead, as any failed migration does (owner decision 2026-09-25).
-        if "pin_scheme" not in set(_table_columns(conn, "device_write_hold")):
+        # instead, as any failed migration does (owner decision 2026-09-25). The columns are read
+        # with a PRAGMA that raises (lane 1f, review nit C3): ``_table_columns`` answers [] on a
+        # read error, which turned it into an ALTER failing with a misleading "duplicate column".
+        hold_columns = {str(r[1]) for r in conn.execute(
+            "PRAGMA table_info(device_write_hold)").fetchall()}
+        if "pin_scheme" not in hold_columns:
             conn.execute("ALTER TABLE device_write_hold ADD COLUMN pin_scheme TEXT")
 
         # -----------------------------
@@ -9807,6 +9811,27 @@ def begin_device_erase(*, device_id: int, run_id: str, keep_pins: Iterable[str] 
     return int(_run_db_write_sync("begin_device_erase", _write, durable=True))
 
 
+def undo_device_erase_record(*, device_id: int, run_id: str, reason: str) -> bool:
+    """Lane 1f (review of lane 1e, C2): put back the erase record of a run that issued no delete
+    after all -- its keep mark could not be written. That run's row returns from ERASE to the phase
+    it had before ``begin_device_erase`` (ERASE_PREP or SCHEME_MOVED), durably, so what the row says
+    is true again: no delete ran. The start-up release and Refill's scheme guard then read it as
+    any stop before a delete. Only that run's row, only while at ERASE. The push results
+    ``begin_device_erase`` reset stay unknown: their earlier values are not kept. Returns whether
+    the row was put back."""
+    if reason not in (HOLD_REASON_ERASE_PREP, HOLD_REASON_SCHEME_MOVED):
+        raise ValueError(f"an erase record is put back to erase-prep or erase-scheme-moved only, "
+                         f"not {reason!r}")
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> bool:
+        return int(conn.execute(
+            "UPDATE device_write_hold SET reason=? WHERE device_id=? AND run_id=? AND reason=?",
+            (str(reason), did, str(run_id), HOLD_REASON_ERASE)).rowcount or 0) == 1
+
+    return bool(_run_db_write_sync("undo_device_erase_record", _write, durable=True))
+
+
 def keep_erase_hold_after_scheme_move(*, device_id: int, run_id: str) -> Optional[str]:
     """Lane 1d (master review F0): a run that stops before its first delete once the pin scheme
     moved, or could not be read, keeps its hold (``EraseWizard._scheme_moved_note``): the terminal
@@ -9829,8 +9854,28 @@ def keep_erase_hold_after_scheme_move(*, device_id: int, run_id: str) -> Optiona
     return _run_db_write_sync("keep_erase_hold_after_scheme_move", _write, durable=True)
 
 
+def _device_list_is_authoritative(conn: sqlite3.Connection) -> bool:
+    """Whether a turnstile missing from ``sync_devices`` was deleted in MonClub (lane 1f, review
+    C1): only while this PC is signed in (a gym token in ``auth_state``) AND its turnstile list holds
+    at least one row. The Access logout deletes the token, then empties the list
+    (``_handle_auth_logout`` -> ``save_sync_cache(None)``, whose failure it swallows); the TV logout
+    deletes the token alone. Either way a missing row then says nothing about the turnstile. Read
+    errors propagate."""
+    signed_in = conn.execute(
+        "SELECT 1 FROM auth_state WHERE id=1 AND COALESCE(token_protected, '') <> '' LIMIT 1"
+    ).fetchone() is not None
+    return signed_in and conn.execute("SELECT 1 FROM sync_devices LIMIT 1").fetchone() is not None
+
+
+def device_list_is_authoritative() -> bool:
+    """``_device_list_is_authoritative`` on its own connection (``EraseWizard._device_gone``)."""
+    with get_conn() as conn:
+        return _device_list_is_authoritative(conn)
+
+
 def release_unstarted_erase_holds(
         *, kept_out: Optional[Dict[int, Dict[str, Optional[str]]]] = None,
+        undecided_out: Optional[Dict[int, Optional[str]]] = None,
 ) -> Dict[int, Optional[str]]:
     """Start-up only (lane 1b, review F1): delete every hold still at ERASE_PREP -- a run that
     stopped (power cut, crash, kill) before its first delete command, a backup-only rehearsal
@@ -9847,20 +9892,32 @@ def release_unstarted_erase_holds(
     every pin of the old scheme, and a pass released now would write the new scheme's pins beside
     them. Such a row moves to SCHEME_MOVED, in the same write, and is reported in ``kept_out``
     ({device_id: {runId, terminalScheme, scheme}}). A row that records no scheme (written before
-    lane 1e) and a turnstile with no device row (deleted in MonClub) are released as before. A
-    read that fails raises: nothing is released (the caller keeps every row held -- fail closed)."""
+    lane 1e) is released as before. A read that fails raises: nothing is released (the caller keeps
+    every row held -- fail closed).
+
+    A turnstile with no device row (lane 1f, review C1) is released only while the list can say it
+    was deleted in MonClub (``_device_list_is_authoritative``: signed in, the list not empty). A
+    logout empties that list and deletes the token, and the scheme may have moved meanwhile: the row
+    is then left as it is, at ERASE_PREP -- held, and read again by the next start (which releases
+    or keeps it once the PC is signed in and its list not empty), or released by Refill, which checks
+    the scheme it records. Reported in ``undecided_out`` ({device_id: run_id}). Residual: a list
+    that is not empty is not checked for freshness -- a switch saved while this PC was off is not in
+    it yet, and the row is released (guide §3.2h)."""
     with get_conn() as conn:
         if conn.execute("SELECT 1 FROM device_write_hold WHERE reason=? LIMIT 1",
                         (HOLD_REASON_ERASE_PREP,)).fetchone() is None:
             return {}
 
     def _write(conn: sqlite3.Connection, profile: Dict[str, Any]
-               ) -> Tuple[Dict[int, Optional[str]], Dict[int, Dict[str, Optional[str]]]]:
+               ) -> Tuple[Dict[int, Optional[str]], Dict[int, Dict[str, Optional[str]]],
+                          Dict[int, Optional[str]]]:
         rows = conn.execute(
             "SELECT device_id, run_id, pin_scheme FROM device_write_hold WHERE reason=?",
             (HOLD_REASON_ERASE_PREP,)).fetchall()
         released: Dict[int, Optional[str]] = {}
         kept: Dict[int, Dict[str, Optional[str]]] = {}
+        undecided: Dict[int, Optional[str]] = {}
+        authoritative: Optional[bool] = None
         for r in rows:
             did, run_id, held = int(r[0]), (None if r[1] is None else str(r[1])), r[2]
             device = conn.execute("SELECT pin_scheme FROM sync_devices WHERE id=? LIMIT 1",
@@ -9871,17 +9928,27 @@ def release_unstarted_erase_holds(
                              (HOLD_REASON_SCHEME_MOVED, did, HOLD_REASON_ERASE_PREP))
                 kept[did] = {"runId": run_id, "terminalScheme": normalize_pin_scheme(held),
                              "scheme": now}
-            else:
-                conn.execute("DELETE FROM device_write_hold WHERE device_id=? AND reason=?",
-                             (did, HOLD_REASON_ERASE_PREP))
-                released[did] = run_id
+                continue
+            if held is not None and device is None:
+                if authoritative is None:
+                    authoritative = _device_list_is_authoritative(conn)
+                if not authoritative:
+                    undecided[did] = run_id          # signed out, or no list: left as it is
+                    continue
+            conn.execute("DELETE FROM device_write_hold WHERE device_id=? AND reason=?",
+                         (did, HOLD_REASON_ERASE_PREP))
+            released[did] = run_id
         profile["released"] = len(released)
         profile["kept"] = len(kept)
-        return released, kept
+        profile["undecided"] = len(undecided)
+        return released, kept, undecided
 
-    released, kept = _run_db_write_sync("release_unstarted_erase_holds", _write, durable=True)
+    released, kept, undecided = _run_db_write_sync("release_unstarted_erase_holds", _write,
+                                                   durable=True)
     if kept_out is not None:
         kept_out.update(kept)
+    if undecided_out is not None:
+        undecided_out.update(undecided)
     return dict(released)
 
 
