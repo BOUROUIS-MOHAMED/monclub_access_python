@@ -169,24 +169,6 @@ class TestTheMarker:
         assert db.device_list_is_authoritative() is False, "the TV logout: the token alone"
 
 
-class TestTheUpgradeOneShot:
-
-    def test_an_upgraded_database_drops_devices_version_once(self, sqlite_db):
-        """An upgraded database has its list but no marker: one device re-send brings it."""
-        db = sqlite_db
-        with db.get_conn() as conn:
-            conn.execute("DELETE FROM local_one_shot_steps WHERE name=?",
-                         (db._DEVICE_LIST_MARKER_REFRESH_STEP,))
-            conn.commit()
-        db.save_version_tokens({"devicesVersion": "v7", "membersVersion": "m3"})
-        db.init_db()
-        tokens = db.load_version_tokens()
-        assert "devicesVersion" not in tokens and tokens.get("membersVersion") == "m3", tokens
-        db.save_version_tokens({"devicesVersion": "v8"})
-        db.init_db()
-        assert db.load_version_tokens().get("devicesVersion") == "v8", "once only"
-
-
 # ─────────────────────── C6: the start-up side fails closed ───────────────────────
 
 class TestTheStartUpReadThatRaises:

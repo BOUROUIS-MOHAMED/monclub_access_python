@@ -831,7 +831,6 @@ _DEVICE_LIST_STATE_DDL = """
         replaced_at TEXT NOT NULL
     );
 """
-_DEVICE_LIST_MARKER_REFRESH_STEP = "devices_refresh_for_full_list_marker"
 
 
 def _mark_device_list_replaced(cur: Any) -> None:
@@ -841,55 +840,6 @@ def _mark_device_list_replaced(cur: Any) -> None:
         "ON CONFLICT(id) DO UPDATE SET replaced_at=excluded.replaced_at",
         (now_iso(),),
     )
-
-
-def _force_one_device_refresh_for_list_marker(conn: sqlite3.Connection) -> bool:
-    """Drop ``devicesVersion`` ONCE, on the first start of a build with the full-list marker.
-
-    WHY. A database upgraded from an earlier build has its turnstile list but no marker, and the
-    backend re-sends the device section only when ``devicesVersion`` moves -- upgrading the client
-    does not move it. Until then no missing row could read as "deleted in MonClub": fail closed,
-    but for days. Without the token the next ``getSyncData`` sends the section in full
-    (``_ensure_pin_scheme_column`` relies on the same), and that replace writes the marker.
-
-    ONE-SHOT and ATOMIC like ``_force_one_credentials_resend``: the DELETE before the step's row,
-    both in the transaction ``init_db`` commits. A fresh database runs it too (an empty DELETE).
-    Returns True when the step ran (its row was written by this call)."""
-    conn.execute(_ONE_SHOT_STEPS_DDL)
-    if conn.execute(
-        "SELECT 1 FROM local_one_shot_steps WHERE name = ?", (_DEVICE_LIST_MARKER_REFRESH_STEP,),
-    ).fetchone():
-        return False
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sync_version_tokens (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """
-    )
-    dropped = int(conn.execute(
-        "DELETE FROM sync_version_tokens WHERE key = ?", ("devicesVersion",),
-    ).rowcount or 0)
-    written = int(conn.execute(
-        "INSERT OR IGNORE INTO local_one_shot_steps (name, done_at) VALUES (?, ?)",
-        (_DEVICE_LIST_MARKER_REFRESH_STEP, now_iso()),
-    ).rowcount or 0)
-    if dropped:
-        logging.getLogger(__name__).warning(
-            "[DB] dropped the stored devicesVersion once so the next getSyncData re-sends the "
-            "whole turnstile list and records it as whole (guide §3.2h, lane 1g)."
-        )
-    return bool(written)
-
-
-def _run_one_shot_device_refresh_for_list_marker(conn: sqlite3.Connection) -> None:
-    """``init_db``'s call: a failure is logged and startup goes on (the marker then comes with the
-    next device change in MonClub; until then a missing row is never read as deleted)."""
-    try:
-        _force_one_device_refresh_for_list_marker(conn)
-    except Exception as exc:
-        logging.getLogger(__name__).error("[DB] one-shot device list refresh failed: %s", exc)
 
 
 def _member_main_account_id(u: Dict[str, Any]) -> Any:
@@ -3274,10 +3224,10 @@ def init_db() -> None:
         # One full credentials re-send, so the grant-aware diff rewrites the grant lists the
         # previous build left stale. Once per database. guide §3.1b "The upgrade window".
         _run_one_shot_credentials_resend(conn)
-        # The turnstile list's "written whole" marker (lane 1g), and one device re-send so an
-        # upgraded database gets it at its next sync.
+        # The turnstile list's "written whole" marker (lane 1g). An upgraded database gets it at
+        # its next device refresh (a device change in MonClub, or a login): until then no missing
+        # turnstile reads as deleted (fail closed).
         conn.execute(_DEVICE_LIST_STATE_DDL)
-        _run_one_shot_device_refresh_for_list_marker(conn)
 
         # Phase 2: firmware profile cache
         # Keyed by device_id (stable int) — not IP (DHCP can reassign IPs).

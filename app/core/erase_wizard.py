@@ -1326,11 +1326,12 @@ class EraseWizard:
             return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop, "
                     f"before any delete -- kept on hold, the terminal holds the {terminal} scheme's "
                     f"pins: {what}")
-        if now is None:
+        if now is None and run_scheme is not None:
             # No device row (lane 1g, review C3 of lane 1f): not a scheme. A logout during the run
             # empties the list, and a list that cannot say "deleted" keeps the row (``_device_gone``,
             # checked after this note) -- "moved from MEMBERSHIP to None" told the operator the
-            # scheme had changed when it had not.
+            # scheme had changed when it had not. A run that recorded no scheme (no row at its
+            # start either) compares None with None, as before: nothing moved.
             return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop (the "
                     "turnstile has no row in this PC's list), before any delete -- kept on hold, "
                     f"the terminal holds the {terminal} scheme's pins: {what}")
