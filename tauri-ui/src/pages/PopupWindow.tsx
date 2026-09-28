@@ -866,12 +866,15 @@ function AStage({ background, children }: { background: string; children: ReactN
 }
 
 // Screen-level component: standby / verdict / wall from the active lanes.
-function EntryScreen({ lanes, idle, gymName, linkUp, todayCount, onImageError }: {
+function EntryScreen({ lanes, idle, gymName, linkUp, todayCount, readersUp, readersTotal, creds, onImageError }: {
   lanes: ActiveLane[];
   idle: boolean;
   gymName: string;
   linkUp: boolean;
   todayCount: number;
+  readersUp: number | null;
+  readersTotal: number | null;
+  creds: ACreds;
   onImageError: (laneId: string) => void;
 }) {
   const [now, setNow] = useState<Date>(() => new Date());
@@ -1342,6 +1345,9 @@ export default function PopupWindow() {
         gymName={gymName}
         linkUp={linkUp}
         todayCount={todayCount}
+        readersUp={readersUp}
+        readersTotal={readersTotal}
+        creds={creds}
         onImageError={handleImageError}
       />
       <style>{globalKeyframes}</style>
