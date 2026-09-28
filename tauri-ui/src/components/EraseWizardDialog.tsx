@@ -349,7 +349,10 @@ export default function EraseWizardDialog({
 
   // Nothing was erased on a hold kept because the scheme moved: « Remplir » only under the scheme
   // its terminal holds (the server refuses otherwise: HELD_SCHEME_MOVED).
-  const schemeMoved = holdReason === "erase-scheme-moved";
+  // Also a row still at "erase-prep" that records a scheme (review round 1 of lane 1e): a stop whose
+  // durable move failed, held for this session -- its terminal holds that scheme too.
+  const schemeMoved = holdReason === "erase-scheme-moved"
+    || (holdReason === "erase-prep" && holdTerminal !== null && holdTerminal !== holdScheme);
   const schemeMovedBlocked = schemeMoved && (holdTerminal === null || holdTerminal !== holdScheme);
 
   const doRefill = useCallback(async () => {

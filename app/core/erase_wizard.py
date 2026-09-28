@@ -1274,19 +1274,32 @@ class EraseWizard:
         rule). Their own codes, not PIN_SCHEME_CHANGED: that note (a run that DID erase) says
         "press Refill", which after a move here would write the new scheme beside every old pin.
         ``start()`` refuses a switch saved between step 1 and START, so the run's start scheme is
-        step 1's."""
+        step 1's.
+
+        The scheme the terminal holds -- the one Refill accepts -- is the hold ROW's
+        (``terminalScheme``: a run that took an earlier hold over keeps the first run's), else the
+        run's start scheme (review round 1 of lane 1e). One recovery sentence, the runbook's: set
+        that scheme back, then erase again with 'hold' (or Refill to release it, erasing nothing)."""
+        terminal = run_scheme
+        try:
+            recorded = (device_hold.holds_detail().get(did) or {}).get("terminalScheme")
+            if recorded is not None:
+                terminal = recorded
+        except Exception:
+            pass
+        what = (f"Refill is accepted only under {terminal} -- set the scheme back to {terminal}, then "
+                "erase it again with 'hold' (or Refill to release it, erasing nothing)")
         try:
             now = self._pin_scheme_strict(did)
         except Exception:
             return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop, "
-                    f"before any delete -- kept on hold: Refill releases it only under {run_scheme}, "
-                    "the scheme the run started under; if the scheme changed, erase again with 'hold'")
+                    f"before any delete -- kept on hold, the terminal holds the {terminal} scheme's "
+                    f"pins: {what}")
         if now == run_scheme:
             return None
         return (f"HELD_SCHEME_MOVED: the pin scheme moved from {run_scheme} to {now} during the run, "
-                f"before any delete -- kept on hold, the terminal still holds the {run_scheme} "
-                f"scheme's pins: Refill is refused until the scheme is {run_scheme} again; to go on "
-                f"under {now}, erase it again with 'hold'")
+                f"before any delete -- kept on hold, the terminal still holds the {terminal} "
+                f"scheme's pins: {what}")
 
     @staticmethod
     def _device_gone(did: int) -> bool:
@@ -1317,7 +1330,14 @@ class EraseWizard:
         still keeps that row when the turnstile's scheme then differs from the one it records
         (``db.release_unstarted_erase_holds``) -- hence "may not last", not "will not"."""
         from app.core import db as _db
-        if EraseWizard._device_gone(did):
+        try:
+            row_reason = (device_hold.holds_detail().get(did) or {}).get("reason")
+        except Exception:
+            row_reason = None
+        # Only a row this run held at ``erase-prep`` (review round 1 of lane 1e): one at ``erase``
+        # or ``erase-scheme-moved`` may come from an earlier run that erased, and no start
+        # releases it -- "nothing was erased" would be false there.
+        if row_reason == _db.HOLD_REASON_ERASE_PREP and EraseWizard._device_gone(did):
             _log.warning("[ERASE] run %s: turnstile %s was deleted in MonClub during the run -- "
                          "nothing was erased; held for this session only, a restart releases it",
                          run_id, did)
@@ -1342,7 +1362,7 @@ class EraseWizard:
                    "of Access may release it", run_id, did)
         code, sep, rest = note.partition(":")
         return (f"{code}_SESSION{sep}{rest} -- the hold could not be recorded as kept: it may NOT "
-                "last through a restart of Access; erase again or press Refill before any restart")
+                "last through a restart of Access; do not restart Access before it is done")
 
     @staticmethod
     def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:
@@ -1896,12 +1916,17 @@ class EraseWizard:
         except Exception as exc:
             return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
                          "error": f"the erase holds could not be read: {exc}"}
-        if detail.get("reason") == device_hold.REASON_SCHEME_MOVED:
-            terminal = detail.get("terminalScheme")
+        # Also a row still at ``erase-prep`` (review round 1 of lane 1e): no run is running (checked
+        # above), so it is a stop whose durable move failed -- held this session, and its terminal
+        # holds the scheme it records. With no recorded scheme it refills as before.
+        reason = detail.get("reason")
+        terminal = detail.get("terminalScheme")
+        if (reason == device_hold.REASON_SCHEME_MOVED
+                or (reason == device_hold.REASON_ERASE_PREP and terminal is not None)):
             if terminal is None or terminal != scheme:
                 held = (f"it still holds the pins of the {terminal} scheme, and {scheme} is recorded "
                         f"now: a refill would write {scheme} pins beside them -- set the scheme back "
-                        f"to {terminal}, then Refill; or erase it again with 'hold'"
+                        f"to {terminal}, then erase it again with 'hold' (or Refill, erasing nothing)"
                         if terminal is not None else
                         "which scheme its pins were written under is not recorded -- erase it again "
                         "with 'hold'")

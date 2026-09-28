@@ -697,3 +697,80 @@ class TestThePage:
         page = _ts("pages/DevicesPage.tsx")
         assert "erase-scheme-moved" in page
         assert re.search(r"rien n'a été effacé", page)
+
+
+# ─────────────────────── review round 1 of lane 1e ───────────────────────
+
+class TestReviewRound1:
+
+    def test_a_leftover_erase_prep_row_whose_scheme_moved_is_refused_too(self, sqlite_db,
+                                                                         monkeypatch, tmp_path):
+        """Finding 1: the durable write failed, the row stays ``erase-prep`` (recording the
+        terminal's scheme) and the session keeps the hold -- Refill must refuse it until the
+        scheme is back, before any restart, as for ``erase-scheme-moved``."""
+        def _fails(*a, **k):
+            raise RuntimeError("disk I/O error")
+        monkeypatch.setattr(dbmod, "keep_erase_hold_after_scheme_move", _fails)
+        wiz, _w, _p = _held_scheme_moved(monkeypatch, tmp_path, sqlite_db)
+        assert _note(wiz).startswith("HELD_SCHEME_MOVED_SESSION:")
+        assert "or press Refill" not in _note(wiz)
+        row = _hold_row(sqlite_db, 5)
+        assert row["reason"] == sqlite_db.HOLD_REASON_ERASE_PREP and row["terminalScheme"] == "MEMBERSHIP"
+        status, out = _refill(wiz, "ACCOUNT")
+        assert (status, out["code"]) == (409, "HELD_SCHEME_MOVED"), out
+        assert device_hold.is_held(5)
+        _devices(monkeypatch, _device())
+        _scheme(monkeypatch, "MEMBERSHIP")
+        assert _refill(wiz, "MEMBERSHIP")[0] == 200
+
+    def test_a_leftover_erase_prep_row_with_no_scheme_or_the_same_scheme_refills(self, sqlite_db,
+                                                                                 monkeypatch, tmp_path):
+        db = sqlite_db
+        wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, db)
+        _scheme(monkeypatch, "ACCOUNT")
+        device_hold.hold(5, reason=device_hold.REASON_ERASE_PREP, run_id="r0")
+        assert _refill(wiz, "ACCOUNT")[0] == 200
+        device_hold.hold(5, reason=device_hold.REASON_ERASE_PREP, run_id="r1", pin_scheme="ACCOUNT")
+        assert _refill(wiz, "ACCOUNT")[0] == 200
+
+    def test_the_note_names_the_scheme_the_row_records(self, sqlite_db, monkeypatch, tmp_path):
+        """Finding 2: a second run started under « Par personne » on a row that records
+        « Par abonnement », the owner switches back mid-run: the note must name the terminal's
+        scheme (the row's), which Refill then accepts -- not the second run's start scheme."""
+        wiz, _w, panel = _held_scheme_moved(monkeypatch, tmp_path, sqlite_db)
+        panel.read_table_strict = panel.read_table_strict.real
+        pv = _preview(wiz, 5)                                   # under ACCOUNT
+        real = panel.read_table_strict
+
+        def _back(*, table, fields="*"):
+            _devices(monkeypatch, _device())
+            _scheme(monkeypatch, "MEMBERSHIP")
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _back
+        wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
+        note = _note(wiz)
+        assert note.startswith("HELD_SCHEME_MOVED:"), note
+        assert "holds the MEMBERSHIP scheme's pins" in note and "accepted only under MEMBERSHIP" in note, note
+        panel.read_table_strict = real
+        assert _refill(wiz, "MEMBERSHIP")[0] == 200
+
+    def test_a_deleted_turnstile_held_at_erase_is_not_told_nothing_was_erased(self, sqlite_db,
+                                                                              monkeypatch, tmp_path):
+        """Finding 6: HELD_DEVICE_GONE only for a row this run held at ``erase-prep``."""
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        _scheme(monkeypatch, "MEMBERSHIP")
+        device_hold.hold(5, reason=device_hold.REASON_ERASE, run_id="r-erased", pin_scheme="MEMBERSHIP")
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            _devices(monkeypatch)
+            _scheme(monkeypatch, None)
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        assert not _note(wiz).startswith("HELD_DEVICE_GONE:"), _note(wiz)
+
+    def test_the_page_blocks_a_leftover_erase_prep_row_too(self):
+        dialog = _ts("components/EraseWizardDialog.tsx")
+        assert '"erase-prep"' in dialog and "holdTerminal !== holdScheme" in dialog

@@ -191,7 +191,7 @@ const fr = {
   // the hold row (/erase/holds: reason, terminalScheme), so it shows after a restart too.
   schemeMovedHold: (terminal: string | null, now: string) =>
     (terminal
-      ? `Rien n'a été effacé sur ce tourniquet : le schéma de numérotation a changé pendant un effacement, avant toute suppression. Il porte encore les numéros « ${terminal} », et le schéma enregistré maintenant est « ${now} ». « Remplir » est refusé tant que le schéma n'est pas revenu à « ${terminal} » : remettez-le dans le tableau de bord, ou effacez à nouveau le tourniquet avec « Attendre que j'appuie sur « Remplir » ».`
+      ? `Rien n'a été effacé sur ce tourniquet : le schéma de numérotation a changé pendant un effacement, avant toute suppression. Il porte encore les numéros « ${terminal} », et le schéma enregistré maintenant est « ${now} ». « Remplir » est refusé tant que le schéma n'est pas revenu à « ${terminal} » : remettez-le dans le tableau de bord, puis effacez à nouveau le tourniquet avec « Attendre que j'appuie sur « Remplir » » (ou, le schéma remis, « Remplir » pour le libérer sans rien effacer).`
       : "Rien n'a été effacé sur ce tourniquet, et le schéma avec lequel ses numéros ont été écrits n'est pas enregistré : « Remplir » est refusé. Effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » »."),
   schemeMovedBack: (terminal: string) =>
     `Rien n'a été effacé sur ce tourniquet : le schéma avait changé pendant un effacement, avant toute suppression. Il est revenu à « ${terminal} », celui de ses numéros : « Remplir » le libère et remet tout le monde, sans rien effacer. Pour continuer la bascule, effacez-le plutôt à nouveau avec « Attendre que j'appuie sur « Remplir » ».`,
@@ -272,7 +272,7 @@ const fr = {
     KEEP_MARK_NOT_WRITTEN:
       "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé. L'effacement était déjà enregistré : le tourniquet reste en attente, et « Remplir » réécrit tout le monde.",
     HELD_SCHEME_MOVED:
-      "« Remplir » refusé : rien n'a été effacé sur ce tourniquet, et il porte encore les numéros d'un autre schéma que celui enregistré maintenant. Remettez ce schéma dans le tableau de bord, puis réessayez ; ou effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » ».",
+      "« Remplir » refusé : rien n'a été effacé sur ce tourniquet, et il porte encore les numéros d'un autre schéma que celui enregistré maintenant. Remettez ce schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou réessayez « Remplir » pour le libérer sans rien effacer).",
     TLS_CLOCK:
       "Le serveur MonClub a refusé la connexion sécurisée : la date ou l'heure de ce PC est sans doute fausse (ou le certificat du serveur a expiré). Vérifiez la date et l'heure de Windows ; si elles sont justes, appelez le développeur. Rien n'a été modifié.",
     PIN_SCHEME_CHANGED:
@@ -512,7 +512,7 @@ const en: typeof fr = {
     `The scheme changed since it was shown: it is now ${s}. Check it, then press Refill again.`,
   schemeMovedHold: (terminal: string | null, now: string) =>
     (terminal
-      ? `Nothing was erased on this turnstile: the pin scheme changed during an erase, before any delete. It still holds '${terminal}' numbers, and the scheme recorded now is '${now}'. Refill is refused until the scheme is '${terminal}' again: set it back in the dashboard, or erase the turnstile again with 'Hold until I press Refill'.`
+      ? `Nothing was erased on this turnstile: the pin scheme changed during an erase, before any delete. It still holds '${terminal}' numbers, and the scheme recorded now is '${now}'. Refill is refused until the scheme is '${terminal}' again: set it back in the dashboard, then erase the turnstile again with 'Hold until I press Refill' (or, once it is set back, Refill to release it without erasing anything).`
       : "Nothing was erased on this turnstile, and the scheme its numbers were written under is not recorded: Refill is refused. Erase it again with 'Hold until I press Refill'."),
   schemeMovedBack: (terminal: string) =>
     `Nothing was erased on this turnstile: the scheme changed during an erase, before any delete. It is back to '${terminal}', the scheme of its numbers: Refill releases it and puts everyone back, without erasing anything. To go on with the switch, erase it again with 'Hold until I press Refill' instead.`,
@@ -593,7 +593,7 @@ const en: typeof fr = {
     KEEP_MARK_NOT_WRITTEN:
       "The mark that keeps the backup with no time limit could not be written: nothing was erased. The erase was already recorded: the turnstile stays on hold, and Refill writes everyone again.",
     HELD_SCHEME_MOVED:
-      "Refill refused: nothing was erased on this turnstile, and it still holds the numbers of another scheme than the one recorded now. Set that scheme back in the dashboard, then try again; or erase it again with 'Hold until I press Refill'.",
+      "Refill refused: nothing was erased on this turnstile, and it still holds the numbers of another scheme than the one recorded now. Set that scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or press Refill again to release it without erasing anything).",
     TLS_CLOCK:
       "The MonClub server refused the secure connection: this PC's date or time is probably wrong (or the server's certificate has expired). Check Windows' date and time; if they are right, call the developer. Nothing was changed.",
     PIN_SCHEME_CHANGED:
