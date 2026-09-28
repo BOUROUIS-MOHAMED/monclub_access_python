@@ -16,6 +16,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import EraseWizardDialog from "@/components/EraseWizardDialog";
+import { ERASE_TEXT, loadLang } from "@/lib/eraseWizardText";
 import { liveEraseApi } from "@/api/erase";
 import {
   RefreshCw, Router, Wifi, WifiOff, DoorOpen, Info, LockOpen, Loader2, AlertCircle,
@@ -668,8 +669,8 @@ export default function DevicesPage() {
                             </TooltipTrigger>
                             <TooltipContent>
                               {nothingErasedIds.has(Number(did))
-                                ? "En attente : le schéma de numérotation a changé pendant un effacement, avant toute suppression — rien n'a été effacé. « Remplir » n'est accepté que sous le schéma d'avant (la fenêtre l'explique)."
-                                : "En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir »."}
+                                ? ERASE_TEXT[loadLang()].rowHoldNothingErased
+                                : ERASE_TEXT[loadLang()].rowHoldBanner}
                             </TooltipContent>
                           </Tooltip>
                         )}

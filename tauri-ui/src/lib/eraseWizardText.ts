@@ -205,6 +205,12 @@ const fr = {
   // not record which.
   schemeMovedBack: (terminal: string) =>
     `Rien n'a été effacé sur ce tourniquet : le schéma avait changé, ou n'avait pas pu être relu, pendant un effacement, avant toute suppression. Il est maintenant « ${terminal} », celui de ses numéros : « Remplir » le libère et remet tout le monde, sans rien effacer. Pour continuer la bascule, effacez-le plutôt à nouveau avec « Attendre que j'appuie sur « Remplir » ».`,
+  // The Devices page's « Remplir » tooltip (lane 1i, review C1 of lane 1h): the same rows as
+  // schemeMovedBack's (erase-scheme-moved holds, erase-prep rows off the scheme), so neutral about
+  // the cause too.
+  rowHoldNothingErased:
+    "En attente : le schéma de numérotation a changé, ou n'a pas pu être relu, pendant un effacement, avant toute suppression — rien n'a été effacé. « Remplir » n'est accepté que sous le schéma d'avant (la fenêtre l'explique).",
+  rowHoldBanner: "En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir ».",
   holdsUnknown:
     "Access n'a pas pu relire les mises en attente : tous les tourniquets restent en attente jusqu'à la prochaine lecture réussie.",
   refillNeedsInternet: "Le remplissage demande Internet : le serveur vérifie le mot de passe.",
@@ -534,6 +540,9 @@ const en: typeof fr = {
       : "Nothing was erased on this turnstile, and the scheme its numbers were written under is not recorded: Refill is refused. Erase it again with 'Hold until I press Refill'."),
   schemeMovedBack: (terminal: string) =>
     `Nothing was erased on this turnstile: the scheme changed, or could not be read, during an erase, before any delete. It is now '${terminal}', the scheme of its numbers: Refill releases it and puts everyone back, without erasing anything. To go on with the switch, erase it again with 'Hold until I press Refill' instead.`,
+  rowHoldNothingErased:
+    "On hold: the pin scheme changed, or could not be read, during an erase, before any delete — nothing was erased. Refill is accepted only under the earlier scheme (the window explains it).",
+  rowHoldBanner: "On hold since an erase: MonClub writes nothing to this turnstile until Refill.",
   holdsUnknown:
     "Access could not read the holds back: every turnstile stays on hold until the next successful read.",
   refillNeedsInternet: "Refill needs the internet: the server checks the password.",
