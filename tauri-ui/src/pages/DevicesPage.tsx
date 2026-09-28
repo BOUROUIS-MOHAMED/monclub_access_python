@@ -192,12 +192,19 @@ export default function DevicesPage() {
   // Erase-content wizard (lane 1, 2026-09-27) and the turnstiles an erase left on hold.
   const [eraseDialog, setEraseDialog] = useState<{ deviceId: number; deviceName: string; mode: "erase" | "refill" } | null>(null);
   const [heldIds, setHeldIds] = useState<Set<number>>(new Set());
+  // The holds where NOTHING was erased (lane 1e): kept because the scheme moved before any delete --
+  // "erase-scheme-moved", or a leftover "erase-prep" row whose recorded scheme is not the one now.
+  const [nothingErasedIds, setNothingErasedIds] = useState<Set<number>>(new Set());
   // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.
   const [holdsUnknown, setHoldsUnknown] = useState(false);
   const reloadHolds = useCallback(async () => {
     try {
       const res = await liveEraseApi.holds();
-      setHeldIds(new Set((res.holds ?? []).map((h) => Number(h.deviceId)).filter((n) => Number.isFinite(n))));
+      const held = (res.holds ?? []).filter((h) => Number.isFinite(Number(h.deviceId)));
+      setHeldIds(new Set(held.map((h) => Number(h.deviceId))));
+      setNothingErasedIds(new Set(held.filter((h) => h.reason === "erase-scheme-moved"
+        || (h.reason === "erase-prep" && h.terminalScheme != null && h.terminalScheme !== h.pinScheme))
+        .map((h) => Number(h.deviceId))));
       setHoldsUnknown(!!res.loadFailed);
     } catch { /* an older Access API without the wizard: no hold is shown */ }
   }, []);
@@ -660,7 +667,9 @@ export default function DevicesPage() {
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>
-                              En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir ».
+                              {nothingErasedIds.has(Number(did))
+                                ? "En attente : le schéma de numérotation a changé pendant un effacement, avant toute suppression — rien n'a été effacé. « Remplir » n'est accepté que sous le schéma d'avant (la fenêtre l'explique)."
+                                : "En attente depuis un effacement : MonClub n'écrit rien sur ce tourniquet jusqu'à « Remplir »."}
                             </TooltipContent>
                           </Tooltip>
                         )}

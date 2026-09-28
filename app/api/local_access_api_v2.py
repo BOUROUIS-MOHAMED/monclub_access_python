@@ -42,7 +42,7 @@ _LEGACY_DASHBOARD_AVATAR_RE = re.compile(
     re.IGNORECASE,
 )
 
-from app.api.monclub_api import MonClubApiError, MonClubApiHttpError
+from app.api.monclub_api import MonClubApiError, MonClubApiHttpError, MonClubTokenRejectedError
 from app.core.app_const import MONCLUB_BASE_URL
 from app.core import telemetry as _tel
 
@@ -1352,7 +1352,12 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
     Body: { "password": "<plain-text>" }
     Returns 200 { ok: true } on success, 401 { ok: false, error: "..." } on wrong password.
     Every refusal carries a ``code`` the Erase wizard's lock screen translates (lane 1c, review
-    F6); the statuses and texts are unchanged for the other callers.
+    F6). The ``error`` texts are French: the Local DB page shows them as they are. Since lane 1e
+    (master review of lane 1d): a gym login the server refused answers 401 ``PC_NOT_SIGNED_IN``
+    (it read "Mot de passe incorrect" before); a TLS failure answers 502 -- ``TLS_CLOCK`` for a
+    certificate not yet valid or expired (this PC's date and time), ``ADMIN_PASSWORD_CHECK_FAILED``
+    otherwise -- with a French text, not lane 1d's English one; a handshake the network cut is the
+    no-internet 503, as before lane 1d.
     """
     body = ctx.body()
     password = _safe_str(body.get("password"), "")
@@ -1375,6 +1380,13 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
         else:
             ctx.send_json(401, {"ok": False, "code": "ADMIN_PASSWORD",
                                 "error": "Mot de passe incorrect"})
+    except MonClubTokenRejectedError as e:
+        # The server refused this PC's gym login, before the password route (lane 1e, F5).
+        ctx.app.logger.warning("verify_admin_password: the gym login was refused: %s", e)
+        ctx.send_json(401, {"ok": False, "code": "PC_NOT_SIGNED_IN",
+                            "error": "Ce PC n'est plus connecté à MonClub : le serveur a refusé sa "
+                                     "connexion, le mot de passe ne peut pas être vérifié. "
+                                     "Reconnectez ce PC à MonClub, puis réessayez."})
     except MonClubApiHttpError as e:
         ctx.app.logger.warning("verify_admin_password: HTTP %s", e.status_code)
         ctx.send_json(e.status_code, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
@@ -1382,11 +1394,24 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
     except MonClubApiError as e:
         # A TLS failure got an answer (a certificate that does not check out): the server's check
         # failed -- not "no internet" (lane 1d, review round 2; the Erase wizard's lock screen).
-        from app.core.erase_wizard import is_tls_failure
-        if is_tls_failure(e):
+        # Its kind (lane 1e): a certificate not yet valid or expired is this PC's clock; a
+        # handshake the network cut is no internet (below).
+        from app.core.erase_wizard import tls_kind
+        kind = tls_kind(e)
+        if kind == "clock":
+            ctx.app.logger.warning("verify_admin_password: certificate not yet valid or expired: %s", e)
+            ctx.send_json(502, {"ok": False, "code": "TLS_CLOCK",
+                                "error": "Le serveur MonClub a refusé la connexion sécurisée : la date "
+                                         "ou l'heure de ce PC est sans doute fausse (ou le certificat "
+                                         "du serveur a expiré). Vérifiez la date et l'heure de "
+                                         "Windows ; si elles sont justes, appelez le développeur."})
+            return
+        if kind == "other":
             ctx.app.logger.warning("verify_admin_password: TLS failure: %s", e)
             ctx.send_json(502, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED",
-                                "error": f"the admin password could not be checked (TLS): {e}"})
+                                "error": "Le serveur MonClub n'a pas pu vérifier le mot de passe : "
+                                         "la connexion sécurisée a échoué. Réessayez dans un "
+                                         "instant ; si cela continue, appelez le développeur."})
             return
         # The server could not be reached (MonClubApiError is the PARENT of the HTTP error, so
         # this is the no-answer case): not a wrong password -- say that the internet is needed,
@@ -4690,14 +4715,23 @@ def _erase_password_verifier(ctx: _Ctx):
             return False, 503, f"{NOT_SIGNED_IN}: the password cannot be checked"
         try:
             valid = ctx.app._api().validate_statistics_password(token=auth.token, password=password)
+        except MonClubTokenRejectedError as e:
+            # The server refused this PC's gym login, before the password route: not a wrong
+            # password (lane 1e, master review F5) -- PC_NOT_SIGNED_IN.
+            from app.core.erase_wizard import NOT_SIGNED_IN
+            return False, 503, f"{NOT_SIGNED_IN}: the MonClub server refused its gym login ({e})"
         except MonClubApiHttpError as e:
             return False, int(getattr(e, "status_code", 0) or 503), str(e)
         except Exception as e:
             # A TLS failure got an answer (a certificate that does not check out): the server's
             # check failed -- not "no internet" (lane 1d, review round 1). 502 reads
-            # ADMIN_PASSWORD_CHECK_FAILED (erase_wizard._password_refusal).
-            from app.core.erase_wizard import is_tls_failure
-            if is_tls_failure(e):
+            # ADMIN_PASSWORD_CHECK_FAILED (erase_wizard._password_refusal); a certificate not yet
+            # valid or expired reads TLS_CLOCK (lane 1e); a handshake the network cut is offline.
+            from app.core.erase_wizard import TLS_CLOCK_TEXT, tls_kind
+            kind = tls_kind(e)
+            if kind == "clock":
+                return False, 502, f"{TLS_CLOCK_TEXT}: {e}"
+            if kind == "other":
                 return False, 502, f"the admin password could not be checked (TLS): {e}"
             # Offline or the server failing: the password cannot be checked -- no erase.
             return False, 503, f"the admin password could not be checked: {e}"

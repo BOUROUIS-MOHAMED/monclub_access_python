@@ -712,8 +712,11 @@ class TestPeopleTheRefillWillNotPutBack:
         pv = _preview(wiz, 5)
         wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
         run = wiz.status()["run"]
-        assert run["state"] == "FAILED" and "KEEP_MARK_NOT_WRITTEN" in run["error"]
-        assert not [c for c in panel.calls if c[0] == "erase"] and not device_hold.is_held(5)
+        # Lane 1e (master review F8): the mark now comes AFTER the erase record, so its failure
+        # ends the run INCOMPLETE and held (every record written again at Refill) -- still with
+        # nothing erased. Lane 1c's order ended it FAILED and released.
+        assert run["state"] == "INCOMPLETE" and "KEEP_MARK_NOT_WRITTEN" in run["error"]
+        assert not [c for c in panel.calls if c[0] == "erase"] and device_hold.is_held(5)
 
     def test_someone_new_outside_the_roster_at_the_backup_stops_the_run(self, sqlite_db,
                                                                        monkeypatch, tmp_path):

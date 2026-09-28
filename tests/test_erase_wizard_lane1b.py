@@ -1038,7 +1038,8 @@ class TestReviewRound1:
         since = sqlite_db.list_device_write_holds()[5]["since"]
         device_hold.hold(5, reason=device_hold.REASON_ERASE_PREP, run_id="b")
         row = sqlite_db.list_device_write_holds()[5]
-        assert row == {"reason": "erase", "runId": "b", "since": since}
+        # terminalScheme since lane 1e (the scheme the first hold recorded; none here).
+        assert row == {"reason": "erase", "runId": "b", "since": since, "terminalScheme": None}
 
     def test_an_agent_line_is_never_reported_held(self, sqlite_db, monkeypatch, refill_cache):
         """Finding 9: no engine writes a pin to an AGENT turnstile."""

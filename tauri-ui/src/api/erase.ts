@@ -20,10 +20,16 @@ export interface EraseCounts {
 
 export interface EraseHold {
   deviceId?: number;
+  /** "erase-prep", "erase", or "erase-scheme-moved": held because the pin scheme moved before any
+   *  delete -- « Remplir » is refused until the scheme is ``terminalScheme`` again (lane 1e). */
   reason?: string;
   runId?: string | null;
   since?: string | null;
+  /** The scheme MonClub records now (what « Remplir » would write). */
   pinScheme?: string | null;
+  /** Lane 1e: the scheme the terminal's pins were written under when the hold began; null when
+   *  the row does not record it (written before lane 1e). */
+  terminalScheme?: string | null;
 }
 
 export interface EraseStep {

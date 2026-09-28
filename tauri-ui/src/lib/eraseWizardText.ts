@@ -78,16 +78,21 @@ const fr = {
     HELD_BEFORE: "Le tourniquet était déjà en attente depuis un effacement précédent : il le reste. Appuyez sur « Remplir ».",
     PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
     PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
+    // Lane 1e (master review C0): « Remplir » is refused on these holds until the scheme is the
+    // terminal's again -- the server checks it from the hold row, which a restart keeps.
     HELD_SCHEME_MOVED:
-      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, même après un redémarrage d'Access, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, même après un redémarrage d'Access, car il porte encore tous les numéros de l'ancien schéma. « Remplir » est refusé tant que le schéma enregistré n'est pas revenu à l'ancien. Pour continuer : remettez l'ancien schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou « Remplir » pour le libérer sans rien effacer).",
     HELD_SCHEME_UNREADABLE:
-      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
-    // The same holds, kept for this session only (lane 1d): the durable write failed, or the
-    // turnstile is no longer in MonClub.
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). « Remplir » n'est accepté que sous le schéma de l'étape 1 : vérifiez le schéma dans le tableau de bord ; inchangé, « Remplir » remet tout le monde ; changé, remettez-le, ou effacez à nouveau avec « Attendre… ».",
+    // The same holds, not recorded as kept (lane 1d; "may not" since lane 1e: the next start
+    // still keeps the row when the scheme then differs).
     HELD_SCHEME_MOVED_SESSION:
-      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, mais cette attente ne tiendra PAS après un redémarrage d'Access. N'appuyez pas sur « Remplir » tel quel, et ne redémarrez pas Access : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, mais cette attente n'a pas pu être enregistrée et risque de ne PAS tenir après un redémarrage d'Access. Ne redémarrez pas Access : remettez l'ancien schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou « Remplir » pour le libérer sans rien effacer).",
     HELD_SCHEME_UNREADABLE_SESSION:
-      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé), mais cette attente ne tiendra PAS après un redémarrage d'Access. Vérifiez le schéma dans le tableau de bord avant tout redémarrage, puis « Remplir » (ou effacez à nouveau avec « Attendre… » s'il a changé).",
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé), mais cette attente n'a pas pu être enregistrée et risque de ne PAS tenir après un redémarrage d'Access. Vérifiez le schéma dans le tableau de bord avant tout redémarrage, puis « Remplir » (ou effacez à nouveau avec « Attendre… » s'il a changé).",
+    // Lane 1e (master review nit): the turnstile deleted in MonClub during the run.
+    HELD_DEVICE_GONE:
+      "Ce tourniquet a été supprimé dans MonClub pendant l'opération, avant tout effacement : rien n'a été effacé. Il reste en attente jusqu'au prochain redémarrage d'Access ; rien à faire.",
   } as Record<string, string>,
   // The people the refill will NOT put back (lane 1c, review C0).
   notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
@@ -182,6 +187,14 @@ const fr = {
     `Le remplissage écrira les membres selon le schéma enregistré maintenant : ${s}.`,
   schemeChanged: (s: string) =>
     `Le schéma a changé depuis l'affichage : c'est maintenant ${s}. Vérifiez-le, puis appuyez de nouveau sur « Remplir ».`,
+  // A hold kept because the scheme moved before any delete (lane 1e, master review C0): read from
+  // the hold row (/erase/holds: reason, terminalScheme), so it shows after a restart too.
+  schemeMovedHold: (terminal: string | null, now: string) =>
+    (terminal
+      ? `Rien n'a été effacé sur ce tourniquet : le schéma de numérotation a changé pendant un effacement, avant toute suppression. Il porte encore les numéros « ${terminal} », et le schéma enregistré maintenant est « ${now} ». « Remplir » est refusé tant que le schéma n'est pas revenu à « ${terminal} » : remettez-le dans le tableau de bord, puis effacez à nouveau le tourniquet avec « Attendre que j'appuie sur « Remplir » » (ou, le schéma remis, « Remplir » pour le libérer sans rien effacer).`
+      : "Rien n'a été effacé sur ce tourniquet, et le schéma avec lequel ses numéros ont été écrits n'est pas enregistré : « Remplir » est refusé. Effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » »."),
+  schemeMovedBack: (terminal: string) =>
+    `Rien n'a été effacé sur ce tourniquet : le schéma avait changé pendant un effacement, avant toute suppression. Il est revenu à « ${terminal} », celui de ses numéros : « Remplir » le libère et remet tout le monde, sans rien effacer. Pour continuer la bascule, effacez-le plutôt à nouveau avec « Attendre que j'appuie sur « Remplir » ».`,
   holdsUnknown:
     "Access n'a pas pu relire les mises en attente : tous les tourniquets restent en attente jusqu'à la prochaine lecture réussie.",
   refillNeedsInternet: "Le remplissage demande Internet : le serveur vérifie le mot de passe.",
@@ -257,7 +270,11 @@ const fr = {
     NOT_REFILLED_CHANGED:
       "Au moment d'effacer, le tourniquet portait des personnes hors de la liste du remplissage qui n'étaient pas affichées à l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     KEEP_MARK_NOT_WRITTEN:
-      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé.",
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé. L'effacement était déjà enregistré : le tourniquet reste en attente, et « Remplir » réécrit tout le monde.",
+    HELD_SCHEME_MOVED:
+      "« Remplir » refusé : rien n'a été effacé sur ce tourniquet, et il porte encore les numéros d'un autre schéma que celui enregistré maintenant. Remettez ce schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou réessayez « Remplir » pour le libérer sans rien effacer).",
+    TLS_CLOCK:
+      "Le serveur MonClub a refusé la connexion sécurisée : la date ou l'heure de ce PC est sans doute fausse (ou le certificat du serveur a expiré). Vérifiez la date et l'heure de Windows ; si elles sont justes, appelez le développeur. Rien n'a été modifié.",
     PIN_SCHEME_CHANGED:
       "Le schéma de numérotation du tourniquet a changé depuis l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
@@ -392,13 +409,15 @@ const en: typeof fr = {
     PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
     PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
     HELD_SCHEME_MOVED:
-      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, even after Access restarts, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, even after Access restarts, because it still holds every number of the old scheme. Refill is refused until the recorded scheme is the old one again. To go on: set the old scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or Refill to release it without erasing anything).",
     HELD_SCHEME_UNREADABLE:
-      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Refill is accepted only under step 1's scheme: check the scheme in the dashboard; unchanged, Refill puts everyone back; changed, set it back, or erase again with 'Hold…'.",
     HELD_SCHEME_MOVED_SESSION:
-      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, but this hold will NOT last through a restart of Access. Do not press Refill as it is, and do not restart Access: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, but this hold could not be recorded and may NOT last through a restart of Access. Do not restart Access: set the old scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or Refill to release it without erasing anything).",
     HELD_SCHEME_UNREADABLE_SESSION:
-      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased), but this hold will NOT last through a restart of Access. Check the scheme in the dashboard before any restart, then Refill (or erase again with 'Hold…' if it changed).",
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased), but this hold could not be recorded and may NOT last through a restart of Access. Check the scheme in the dashboard before any restart, then Refill (or erase again with 'Hold…' if it changed).",
+    HELD_DEVICE_GONE:
+      "This turnstile was deleted in MonClub during the run, before anything was erased: nothing was erased. It stays on hold until Access restarts; nothing to do.",
   },
   notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
     `${n} person(s) on this turnstile ${{
@@ -491,6 +510,12 @@ const en: typeof fr = {
   schemeNote: (s: string) => `The refill writes the members under the scheme recorded now: ${s}.`,
   schemeChanged: (s: string) =>
     `The scheme changed since it was shown: it is now ${s}. Check it, then press Refill again.`,
+  schemeMovedHold: (terminal: string | null, now: string) =>
+    (terminal
+      ? `Nothing was erased on this turnstile: the pin scheme changed during an erase, before any delete. It still holds '${terminal}' numbers, and the scheme recorded now is '${now}'. Refill is refused until the scheme is '${terminal}' again: set it back in the dashboard, then erase the turnstile again with 'Hold until I press Refill' (or, once it is set back, Refill to release it without erasing anything).`
+      : "Nothing was erased on this turnstile, and the scheme its numbers were written under is not recorded: Refill is refused. Erase it again with 'Hold until I press Refill'."),
+  schemeMovedBack: (terminal: string) =>
+    `Nothing was erased on this turnstile: the scheme changed during an erase, before any delete. It is back to '${terminal}', the scheme of its numbers: Refill releases it and puts everyone back, without erasing anything. To go on with the switch, erase it again with 'Hold until I press Refill' instead.`,
   holdsUnknown:
     "Access could not read the holds back: every turnstile stays on hold until the next successful read.",
   refillNeedsInternet: "Refill needs the internet: the server checks the password.",
@@ -566,7 +591,11 @@ const en: typeof fr = {
     NOT_REFILLED_CHANGED:
       "When the erase was about to start, the turnstile held people outside the refill's list who were not shown at step 1: nothing was erased. Read step 1 again.",
     KEEP_MARK_NOT_WRITTEN:
-      "The mark that keeps the backup with no time limit could not be written: nothing was erased.",
+      "The mark that keeps the backup with no time limit could not be written: nothing was erased. The erase was already recorded: the turnstile stays on hold, and Refill writes everyone again.",
+    HELD_SCHEME_MOVED:
+      "Refill refused: nothing was erased on this turnstile, and it still holds the numbers of another scheme than the one recorded now. Set that scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or press Refill again to release it without erasing anything).",
+    TLS_CLOCK:
+      "The MonClub server refused the secure connection: this PC's date or time is probably wrong (or the server's certificate has expired). Check Windows' date and time; if they are right, call the developer. Nothing was changed.",
     PIN_SCHEME_CHANGED:
       "The turnstile's pin scheme changed since step 1: nothing was erased. Read step 1 again.",
     NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",

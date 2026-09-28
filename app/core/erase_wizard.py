@@ -233,40 +233,98 @@ def refill_roster(device: Dict[str, Any], cache: Any, *,
             "pins": frozenset(str(p) for p in by_pin)}
 
 
-# The verifier's text when this PC has no gym token (local_access_api_v2._erase_password_verifier).
+# The verifier's text when this PC has no gym token, or when the server refused it
+# (local_access_api_v2._erase_password_verifier).
 NOT_SIGNED_IN = "this PC is not signed in to MonClub"
+# The verifier's text when the TLS handshake failed on the certificate's dates (``tls_kind`` "clock").
+TLS_CLOCK_TEXT = "the secure connection to MonClub was refused: the certificate is not yet valid or expired"
 
 
 def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
     """The refusal of a password check, with a code the page translates. A 401 is a wrong password
-    (``validate_statistics_password`` answers False on a 401 alone; whether the backend also answers
-    401 for a rejected gym token is [UNVERIFIED]); a 503 is "could not be asked" (offline) or, with
-    the verifier's ``NOT_SIGNED_IN`` text, a PC with no gym token; a 400 is no password; any other
-    status is the server failing the check (a proxy's 502/504, a 5xx) -- never "wrong password"
-    (lane 1b review rounds 1-2)."""
+    (``validate_statistics_password`` answers False on the backend's own "Wrong password" 401; a
+    gym login its JWT filter refuses -- a 401 whose JSON ``code`` is ``UNAUTHORIZED`` -- raises
+    ``MonClubTokenRejectedError`` since lane 1e, which the verifier sends as ``NOT_SIGNED_IN``); a
+    503 is "could not be asked" (offline) or, with the verifier's ``NOT_SIGNED_IN`` text, a PC with
+    no gym token or a refused one; a 400 is no password; the verifier's ``TLS_CLOCK_TEXT`` is a
+    certificate not yet valid or expired (this PC's clock, lane 1e); any other status is the server
+    failing the check (a proxy's 502/504, a 5xx) -- never "wrong password" (lane 1b review rounds
+    1-2)."""
     code = {401: "ADMIN_PASSWORD", 400: "ADMIN_PASSWORD_REQUIRED",
             503: "ADMIN_PASSWORD_UNCHECKABLE"}.get(int(status or 0), "ADMIN_PASSWORD_CHECK_FAILED")
     if code == "ADMIN_PASSWORD_UNCHECKABLE" and str(error or "").startswith(NOT_SIGNED_IN):
         code = "PC_NOT_SIGNED_IN"                  # not "no internet": the PC has no gym token
+    if str(error or "").startswith(TLS_CLOCK_TEXT):
+        code = "TLS_CLOCK"                         # not "try again": this PC's date and time
     return int(status or 503), {"ok": False, "code": code, "error": error}
 
 
-def is_tls_failure(exc: BaseException) -> bool:
-    """The exception or its cause is a TLS failure: ``ssl``'s own SSLError (an OSError) or
-    ``requests``' SSLError (a ConnectionError). Something answered, with a certificate that does
-    not check out -- never "no internet" (lane 1d, review nits)."""
-    import ssl
-    try:
-        from requests.exceptions import SSLError as _ReqSSLError
-    except Exception:
-        _ReqSSLError = None                                   # type: ignore[assignment]
-    for err in (exc, getattr(exc, "__cause__", None)):
-        if err is None:
+# OpenSSL's X509_V_ERR_CERT_NOT_YET_VALID and X509_V_ERR_CERT_HAS_EXPIRED: what a PC clock that is
+# wrong by more than the certificate's margin gives -- and also a server certificate that really
+# expired, which this PC cannot tell apart.
+_CLOCK_VERIFY_CODES = frozenset({9, 10})
+_CLOCK_TEXTS = ("certificate is not yet valid", "certificate has expired")
+_EOF_TEXTS = ("eof occurred in violation of protocol", "unexpected_eof_while_reading")
+
+
+def _exception_chain(exc: BaseException, limit: int = 16) -> List[BaseException]:
+    """``exc`` and what it wraps: ``__cause__``, ``__context__``, urllib3's ``MaxRetryError.reason``
+    and exception ``args`` -- ``requests`` raises its SSLError around urllib3's MaxRetryError around
+    urllib3's SSLError around the ``ssl`` exception, and ``MonClubApi`` wraps that ``from`` it."""
+    out: List[BaseException] = []
+    seen: set = set()
+    todo: List[Any] = [exc]
+    while todo and len(out) < limit:
+        err = todo.pop(0)
+        if not isinstance(err, BaseException) or id(err) in seen:
             continue
-        if isinstance(err, ssl.SSLError) or (_ReqSSLError is not None
-                                             and isinstance(err, _ReqSSLError)):
-            return True
-    return False
+        seen.add(id(err))
+        out.append(err)
+        todo.extend([getattr(err, "__cause__", None), getattr(err, "__context__", None),
+                     getattr(err, "reason", None)])
+        todo.extend(a for a in getattr(err, "args", ()) if isinstance(a, BaseException))
+    return out
+
+
+def tls_kind(exc: BaseException) -> Optional[str]:
+    """What kind of TLS failure ``exc`` is, read through the whole chain (``_exception_chain``);
+    None when it is not one (lane 1e, master review nits):
+
+    * ``"eof"`` -- the connection was cut during the handshake (``ssl.SSLEOFError``, "EOF occurred
+      in violation of protocol"): a network drop, so "check the internet" (``_no_answer``);
+    * ``"clock"`` -- the certificate is not yet valid or has expired (verify codes 9 / 10): this
+      PC's date and time, or a server certificate that expired -- "check the clock", never "try
+      again in a moment";
+    * ``"other"`` -- any other TLS failure: something answered with a certificate that does not
+      check out -- the server's check failed, not "no internet" (lane 1d)."""
+    import ssl
+    kinds: List[type] = [ssl.SSLError]
+    for mod, name in (("requests.exceptions", "SSLError"), ("urllib3.exceptions", "SSLError")):
+        try:
+            kinds.append(getattr(__import__(mod, fromlist=[name]), name))
+        except Exception:
+            pass
+    chain = _exception_chain(exc)
+    if not any(isinstance(err, tuple(kinds)) for err in chain):
+        return None
+    if any(isinstance(err, ssl.SSLCertVerificationError)
+           and getattr(err, "verify_code", None) in _CLOCK_VERIFY_CODES for err in chain):
+        return "clock"
+    if any(isinstance(err, ssl.SSLEOFError) for err in chain):
+        return "eof"
+    text = " ".join(str(err) for err in chain).lower()
+    if any(t in text for t in _CLOCK_TEXTS):
+        return "clock"
+    if any(t in text for t in _EOF_TEXTS):
+        return "eof"
+    return "other"
+
+
+def is_tls_failure(exc: BaseException) -> bool:
+    """The exception, or anything it wraps, is a TLS failure (``tls_kind``): ``ssl``'s own SSLError
+    (an OSError), ``requests``' or urllib3's SSLError (lane 1d, review nits; the whole chain since
+    lane 1e)."""
+    return tls_kind(exc) is not None
 
 
 def _no_answer(exc: BaseException) -> bool:
@@ -276,8 +334,12 @@ def _no_answer(exc: BaseException) -> bool:
     DID get an answer. A TLS failure (``requests``' SSLError, a ConnectionError, or ``ssl``'s own,
     an OSError) is not "no answer" either: something answered with a certificate that does not
     check out -- "check the internet" would send the technician the wrong way (lane 1d, review
-    nit, ``is_tls_failure``). A proxy that does not answer (ProxyError) stays no answer."""
-    if is_tls_failure(exc):
+    nit, ``is_tls_failure``) -- EXCEPT a handshake the network cut (``tls_kind`` "eof", lane 1e),
+    which is no answer. A proxy that does not answer (ProxyError) stays no answer."""
+    kind = tls_kind(exc)
+    if kind == "eof":
+        return True
+    if kind is not None:
         return False
     try:
         from requests.exceptions import ConnectionError as _ConnErr, RequestException, Timeout
@@ -298,10 +360,11 @@ def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
     guide §3.2h). ``(enabled, code, why)``: ONLY a 200 whose JSON ``enabled`` is the boolean
     ``true`` enables. ``false`` is ``ERASE_NOT_ENABLED``. The refusals say why (lane 1c, review
     F4): a 404 or 405 is ``ERASE_SWITCH_MISSING`` -- a backend without the route, which retrying
-    cannot change; no answer at all (a failed connection, a timeout) is
-    ``ERASE_SWITCH_UNREACHABLE``; anything else -- no token, 401/403, 5xx, a body that is not
-    JSON or not that boolean (the string ``"true"`` included) -- is ``ERASE_SWITCH_UNCHECKED``.
-    Never raises."""
+    cannot change; no answer at all (a failed connection, a timeout, a handshake the network cut)
+    is ``ERASE_SWITCH_UNREACHABLE``; a certificate not yet valid or expired is ``TLS_CLOCK`` (this
+    PC's date and time, lane 1e); anything else -- no token, 401/403, 5xx, another TLS failure, a
+    body that is not JSON or not that boolean (the string ``"true"`` included) -- is
+    ``ERASE_SWITCH_UNCHECKED``. Never raises."""
     try:
         from access.store import load_auth_token
         auth = load_auth_token()
@@ -312,6 +375,9 @@ def check_erase_switch(app: Any) -> Tuple[bool, Optional[str], str]:
         status = getattr(exc, "status_code", None)
         if status in (404, 405):
             return False, "ERASE_SWITCH_MISSING", str(exc)[:200]
+        if status is None and tls_kind(exc) == "clock":
+            # A certificate not yet valid or expired: this PC's date and time (lane 1e).
+            return False, "TLS_CLOCK", str(exc)[:200]
         if status is None and _no_answer(exc):
             return False, "ERASE_SWITCH_UNREACHABLE", str(exc)[:200]
         return False, "ERASE_SWITCH_UNCHECKED", str(exc)[:200]
@@ -983,6 +1049,9 @@ class EraseWizard:
                                         "is updated -- retrying will not help",
                 "ERASE_SWITCH_UNREACHABLE": f"the MonClub server did not answer the switch check "
                                             f"({why}): check the internet, then try again",
+                "TLS_CLOCK": f"the secure connection to MonClub was refused -- the certificate is "
+                             f"not yet valid or expired ({why}): check this PC's date and time; if "
+                             "they are right, call the developer",
             }.get(str(code), f"whether the erase is enabled for this gym could not be checked: "
                              f"{why}")
             return (403 if code == "ERASE_NOT_ENABLED" else 503), {
@@ -1100,8 +1169,11 @@ class EraseWizard:
             # A rehearsal on a turnstile already held leaves its hold row as it is: the row names
             # the run that may have erased (review round 1, finding 4). A real erase takes it over
             # (its first delete must find ITS run id there, db.begin_device_erase).
+            # A new row records the scheme the terminal's pins are under: the run's start scheme
+            # (lane 1e, master review C0) -- a row taken over keeps the one it recorded.
             if not (held_before and backup_only):
-                device_hold.hold(did, reason=device_hold.REASON_ERASE_PREP, run_id=run_id)
+                device_hold.hold(did, reason=device_hold.REASON_ERASE_PREP, run_id=run_id,
+                                 pin_scheme=run.get("pinScheme"))
             self._step("hold", True, heldBefore=held_before)
             worker = self._wait_idle(did)
             moved = self._address_refusal(worker, run["device"])
@@ -1122,10 +1194,10 @@ class EraseWizard:
             check = self._recheck_before_delete(did, str(run["refill"]), kept)
             # Who the refill will not put back, from the backup: only the people accepted at
             # step 1, and their backup kept for good (lane 1c, review C0).
-            self._bind_not_refilled(worker, run, proto, tables, backup, check)
-            # The last durable write before the first delete: the hold moves to ERASE (a restart
-            # keeps it from here) and every recorded pin's last push result becomes unknown --
-            # the erase is an attempt start for all of them (review F12). No write, no erase.
+            left = self._bind_not_refilled(worker, run, proto, tables, backup, check)
+            # The erase record, durable: the hold moves to ERASE (a restart keeps it from here)
+            # and every recorded pin's last push result becomes unknown -- the erase is an attempt
+            # start for all of them (review F12). No write, no erase.
             try:
                 reset = _begin_erase(did, run_id, kept)
             except Exception as exc:
@@ -1134,6 +1206,12 @@ class EraseWizard:
             self._step("erase_recorded", True, resultsReset=int(reset), kept=len(kept))
             erase_started = True
             self._update(erased=True)
+            # The keep mark, AFTER the erase record (lane 1e, master review F8): a mark on disk now
+            # means "a delete may have run", as the ERASE row does. Written before it, a run cut
+            # between the two kept a biometric backup for good although it erased nobody -- and on
+            # a turnstile already held at ``erase`` no start-up could tell (the row never was
+            # ``erase-prep``). The last durable write before the first delete.
+            self._write_keep_mark(run, left)
             erase_error = None
             try:
                 self._erase(worker, did, proto, tables, backup, before)
@@ -1165,9 +1243,10 @@ class EraseWizard:
                 # Nothing erased: nobody lost, the backup is prunable as any other.
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
-                if note and not held_before:
-                    note = self._keep_hold_across_restarts(did, run_id, note,
-                                                           durable=not self._device_gone(did))
+                if note:
+                    # Held before or not (lane 1e, master review F7): a row this run took over at
+                    # ``erase-prep`` is released by the next start like its own.
+                    note = self._keep_hold_across_restarts(did, run_id, note)
                 # Not on a worker the run just saw connected to ANOTHER address: no pass through it.
                 self._finish("FAILED", release=not (held_before or note),
                              error=f"{exc.code}: {exc.message} -- nothing was erased",
@@ -1181,9 +1260,8 @@ class EraseWizard:
             else:
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
-                if note and not held_before:
-                    note = self._keep_hold_across_restarts(did, run_id, note,
-                                                           durable=not self._device_gone(did))
+                if note:
+                    note = self._keep_hold_across_restarts(did, run_id, note)
             self._finish("INCOMPLETE" if erase_started else "FAILED",
                          release=(not erase_started and not held_before and not note),
                          error=f"UNEXPECTED: {type(exc).__name__}: {exc}", note=note)
@@ -1196,17 +1274,39 @@ class EraseWizard:
         rule). Their own codes, not PIN_SCHEME_CHANGED: that note (a run that DID erase) says
         "press Refill", which after a move here would write the new scheme beside every old pin.
         ``start()`` refuses a switch saved between step 1 and START, so the run's start scheme is
-        step 1's."""
+        step 1's.
+
+        The scheme the terminal holds -- the one Refill accepts -- is the hold ROW's
+        (``terminalScheme``: a run that took an earlier hold over keeps the first run's), else the
+        run's start scheme (review round 1 of lane 1e). One recovery sentence, the runbook's: set
+        that scheme back, then erase again with 'hold' (or Refill to release it, erasing nothing)."""
+        terminal = run_scheme
+        unrecorded = False
+        try:
+            row = device_hold.holds_detail().get(did) or {}
+            if row.get("terminalScheme") is not None:
+                terminal = row["terminalScheme"]
+            else:
+                # A row an earlier build wrote at erase-scheme-moved records none: Refill refuses it
+                # whatever the scheme (review round 2 of lane 1e, nit).
+                unrecorded = row.get("reason") == device_hold.REASON_SCHEME_MOVED
+        except Exception:
+            pass
+        what = ("Refill is refused: which scheme the terminal's pins were written under is not "
+                "recorded -- erase it again with 'hold'" if unrecorded else
+                f"Refill is accepted only under {terminal} -- set the scheme back to {terminal}, then "
+                "erase it again with 'hold' (or Refill to release it, erasing nothing)")
         try:
             now = self._pin_scheme_strict(did)
         except Exception:
             return ("HELD_SCHEME_UNREADABLE: the pin scheme could not be read after the stop, "
-                    "before any delete -- kept on hold: check the scheme, then press Refill")
+                    f"before any delete -- kept on hold, the terminal holds the {terminal} scheme's "
+                    f"pins: {what}")
         if now == run_scheme:
             return None
         return (f"HELD_SCHEME_MOVED: the pin scheme moved from {run_scheme} to {now} during the run, "
-                "before any delete -- kept on hold, the terminal still holds the old scheme's pins: "
-                "erase again with 'hold', or set the scheme back, before pressing Refill")
+                f"before any delete -- kept on hold, the terminal still holds the {terminal} "
+                f"scheme's pins: {what}")
 
     @staticmethod
     def _device_gone(did: int) -> bool:
@@ -1219,33 +1319,57 @@ class EraseWizard:
             return False
 
     @staticmethod
-    def _keep_hold_across_restarts(did: int, run_id: str, note: str, *,
-                                   durable: bool = True) -> str:
+    def _keep_hold_across_restarts(did: int, run_id: str, note: str) -> str:
         """The hold a scheme-moved stop keeps must outlive a restart (lane 1d, master review F0):
         its row is still at ``erase-prep``, which the next start releases -- and the gyms power
         off every night. Moved durably to ``erase-scheme-moved`` (``db.
-        keep_erase_hold_after_scheme_move``: that run's own row only). Not for a turnstile whose
-        row is gone (``durable`` False: no Refill could be pressed for it; review round 1 of lane
-        1d), and a write that fails: the hold then lasts this session only, and the note says so
-        under its own code, ``HELD_SCHEME_MOVED_SESSION`` / ``HELD_SCHEME_UNREADABLE_SESSION`` --
-        the page's line for the plain code promises a hold that outlives a restart."""
+        keep_erase_hold_after_scheme_move``: that run's own row only; a row already at ``erase``
+        or ``erase-scheme-moved`` stays as it is, and the note is the plain one).
+
+        A turnstile whose row is gone (deleted in MonClub, ``_device_gone``) keeps no durable
+        hold -- no Refill could be pressed for it (review round 1 of lane 1d) -- and its note is
+        ``HELD_DEVICE_GONE``: nothing to do, the next start releases it (lane 1e, master review
+        nit: the session note told the operator to erase again or press Refill, impossible there).
+
+        A write that fails keeps the hold for this session, and the note says so under its own
+        code, ``HELD_SCHEME_MOVED_SESSION`` / ``HELD_SCHEME_UNREADABLE_SESSION``: the page's line
+        for the plain code promises a hold that outlives a restart. Since lane 1e the next start
+        still keeps that row when the turnstile's scheme then differs from the one it records
+        (``db.release_unstarted_erase_holds``) -- hence "may not last", not "will not"."""
         from app.core import db as _db
-        why = "the turnstile is no longer in MonClub"
-        if durable:
-            try:
-                reason = _db.keep_erase_hold_after_scheme_move(device_id=did, run_id=run_id)
-            except Exception:
-                _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable",
-                           run_id, did, exc_info=True)
-                reason = None
-            if reason and reason != _db.HOLD_REASON_ERASE_PREP:
-                return note
-            why = "the hold could not be made durable"
-        _log.error("[ERASE] run %s: turnstile %s is held for this session only (%s) -- a restart "
-                   "of Access releases it", run_id, did, why)
+        try:
+            row_reason = (device_hold.holds_detail().get(did) or {}).get("reason")
+        except Exception:
+            row_reason = None
+        # Only a row this run held at ``erase-prep`` (review round 1 of lane 1e): one at ``erase``
+        # or ``erase-scheme-moved`` may come from an earlier run that erased, and no start
+        # releases it -- "nothing was erased" would be false there.
+        if row_reason == _db.HOLD_REASON_ERASE_PREP and EraseWizard._device_gone(did):
+            _log.warning("[ERASE] run %s: turnstile %s was deleted in MonClub during the run -- "
+                         "nothing was erased; held for this session only, a restart releases it",
+                         run_id, did)
+            return ("HELD_DEVICE_GONE: the turnstile was deleted in MonClub during the run, before "
+                    "any delete -- nothing was erased; it stays held until Access restarts, "
+                    "nothing to do")
+        try:
+            reason = _db.keep_erase_hold_after_scheme_move(device_id=did, run_id=run_id)
+        except Exception:
+            _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable",
+                       run_id, did, exc_info=True)
+            reason = None
+        if reason == _db.HOLD_REASON_ERASE:
+            # Held at ``erase`` by an earlier run that may have deleted (lane 1e): « Remplir »
+            # is the normal next step there (it is refused on ``erase-scheme-moved`` rows only),
+            # so not a note that says it is refused -- ``_refill``'s own HELD_BEFORE.
+            return ("HELD_BEFORE: on hold since an earlier erase that may have deleted -- this run "
+                    "stopped before any delete, after the pin scheme moved: press Refill")
+        if reason and reason != _db.HOLD_REASON_ERASE_PREP:
+            return note
+        _log.error("[ERASE] run %s: the hold of turnstile %s was not recorded as kept -- a restart "
+                   "of Access may release it", run_id, did)
         code, sep, rest = note.partition(":")
-        return (f"{code}_SESSION{sep}{rest} -- NOT kept across a restart of Access ({why}): "
-                "erase again or press Refill before any restart")
+        return (f"{code}_SESSION{sep}{rest} -- the hold could not be recorded as kept: it may NOT "
+                "last through a restart of Access; do not restart Access before it is done")
 
     @staticmethod
     def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:
@@ -1301,18 +1425,18 @@ class EraseWizard:
 
     def _bind_not_refilled(self, worker: Any, run: Dict[str, Any], proto: str,
                            tables: List[str], backup: Dict[str, Any],
-                           check: Dict[str, Any]) -> None:
+                           check: Dict[str, Any]) -> List[str]:
         """Right before the first delete (lane 1c, review C0): the people this erase removes and
         the refill does not write back, from the BACKUP (what is really erased) against the roster
         now. Only the pins the operator accepted at step 1 may be among them -- or a member step 1
         saw in the roster who left it since (a right that ended at the midnight date flip during a
         long MB2000 backup: a normal pass would remove them too; review round 1 of lane 1c). Anyone
         else -- a user enrolled on the terminal since step 1 -- stops the run
-        (``NOT_REFILLED_CHANGED``, FAILED, nothing erased). When some remain, their run
-        folder gets ``KEEP_MARK`` (durably, or no erase): the backup is their only copy, and the
-        prune never deletes a marked folder. A C3 erase without the ``user`` table has no user
-        rows in its backup: the list is read once more here. Pins only -- never a name -- in the
-        run record, the mark and the log (review F29)."""
+        (``NOT_REFILLED_CHANGED``, FAILED, nothing erased). Returns their pins: when some remain,
+        the run folder gets ``KEEP_MARK`` after the erase record (``_write_keep_mark``, lane 1e):
+        the backup is their only copy, and the prune never deletes a marked folder. A C3 erase
+        without the ``user`` table has no user rows in its backup: the list is read once more here.
+        Pins only -- never a name -- in the run record, the mark and the log (review F29)."""
         with self._lock:
             step1_roster = set(self._run_step1_roster)
             step1_scheme = self._run_step1_scheme
@@ -1347,15 +1471,25 @@ class EraseWizard:
                             "would not put them back -- read step 1 again")
         self._update(notRefilled={"count": len(left), "pins": left})
         self._step("not_refilled", True, count=len(left))
-        if left:
-            try:
-                _write_file_durably(self._run_dir(run) / KEEP_MARK, json.dumps(
-                    {"count": len(left), "pins": left, "at": _now_text()}).encode("utf-8"))
-            except Exception as exc:
-                raise StepError("KEEP_MARK_NOT_WRITTEN",
-                                f"the mark that keeps this backup for good could not be written "
-                                f"({exc}): the backup is the only copy of the people the refill "
-                                "does not put back")
+        return left
+
+    def _write_keep_mark(self, run: Dict[str, Any], left: List[str]) -> None:
+        """The run folder's ``KEEP_MARK`` when the erase removes people the refill does not put
+        back (lane 1c, review C0), written durably AFTER the erase record and before the first
+        delete command (lane 1e, master review F8). A failure raises before any delete -- with
+        the erase already recorded the run ends INCOMPLETE: held, every record to be written again
+        (lane 1c ended it FAILED and released, when the mark came first)."""
+        if not left:
+            return
+        try:
+            _write_file_durably(self._run_dir(run) / KEEP_MARK, json.dumps(
+                {"count": len(left), "pins": left, "at": _now_text()}).encode("utf-8"))
+        except Exception as exc:
+            raise StepError("KEEP_MARK_NOT_WRITTEN",
+                            f"the mark that keeps this backup for good could not be written "
+                            f"({exc}): the backup is the only copy of the people the refill does "
+                            "not put back -- nothing was erased; the erase was already recorded, "
+                            "so the turnstile stays held and Refill writes every member again")
 
     def _drop_keep_mark(self, run: Dict[str, Any]) -> None:
         """A run that failed before any delete removed nobody: its backup is prunable as usual."""
@@ -1707,9 +1841,12 @@ class EraseWizard:
         """The Refill button: reset the turnstile's records, release its hold, push it now.
 
         The page sends the pin scheme it showed (``expectedPinScheme``, read from /erase/holds);
-        a scheme that moved since is refused. The records are ALWAYS reset first (the hard-reset
-        UPDATE, durable): a hold can come from a run that ended INCOMPLETE or was cut by a
-        restart, and then every pin must be written again. A reset that fails keeps the hold."""
+        a scheme that moved since is refused. A hold kept because the scheme moved before any
+        delete (``erase-scheme-moved``) is refused (409 ``HELD_SCHEME_MOVED``) until the scheme
+        recorded now is the one its row records for the terminal (lane 1e, master review C0). The
+        records are ALWAYS reset first (the hard-reset UPDATE, durable): a hold can come from a run
+        that ended INCOMPLETE or was cut by a restart, and then every pin must be written again. A
+        reset that fails keeps the hold."""
         did = int(device_id)
         body = dict(body or {})
         if device_hold.load_failed():
@@ -1777,6 +1914,32 @@ class EraseWizard:
         if scheme != expected:
             return 409, {"ok": False, "code": "PIN_SCHEME_CHANGED", "pinScheme": scheme,
                          "error": f"the pin scheme is {scheme} now, the page showed {expected}"}
+        # A hold kept because the scheme moved before any delete (lane 1e, master review C0): the
+        # terminal still holds every pin of the scheme the row records, and a full pass under
+        # another one would write its pins beside them. Only under that scheme again -- from the
+        # row, which a restart keeps (the run's finish note that said so does not survive one).
+        try:
+            detail = dict(device_hold.holds_detail().get(did) or {})
+        except Exception as exc:
+            return 503, {"ok": False, "code": "HOLDS_UNKNOWN",
+                         "error": f"the erase holds could not be read: {exc}"}
+        # Also a row still at ``erase-prep`` (review round 1 of lane 1e): no run is running (checked
+        # above), so it is a stop whose durable move failed -- held this session, and its terminal
+        # holds the scheme it records. With no recorded scheme it refills as before.
+        reason = detail.get("reason")
+        terminal = detail.get("terminalScheme")
+        if (reason == device_hold.REASON_SCHEME_MOVED
+                or (reason == device_hold.REASON_ERASE_PREP and terminal is not None)):
+            if terminal is None or terminal != scheme:
+                held = (f"it still holds the pins of the {terminal} scheme, and {scheme} is recorded "
+                        f"now: a refill would write {scheme} pins beside them -- set the scheme back "
+                        f"to {terminal}, then erase it again with 'hold' (or Refill, erasing nothing)"
+                        if terminal is not None else
+                        "which scheme its pins were written under is not recorded -- erase it again "
+                        "with 'hold'")
+                return 409, {"ok": False, "code": "HELD_SCHEME_MOVED", "pinScheme": scheme,
+                             "terminalScheme": terminal,
+                             "error": f"nothing was erased on this turnstile since its hold: {held}"}
         # What this refill will write, under the scheme it pushes (lane 1c, review F1): the erase
         # was checked under the scheme of its start, and the switch's own sync, or a switch during
         # a now/auto run, can change the roster since. Reported, never refused -- refusing leaves
@@ -2117,12 +2280,15 @@ def prune_erase_backups_at_startup(root: Optional[Path] = None, *,
 def drop_keep_marks_of_unstarted_runs(released: Dict[int, Optional[str]],
                                       root: Optional[Path] = None) -> List[str]:
     """The start-up release of the holds (``device_hold.load``) names the runs that stopped before
-    their first delete command -- their hold row was still ``erase-prep``. Such a run erased
-    nobody, yet a power cut or a kill between its keep mark (``_bind_not_refilled``) and its
-    erase record (``_begin_erase``) left the mark, and the prune never deletes a marked folder: a
-    biometric backup kept for good for no one (lane 1d, master review F3). The mark goes; the
-    30 days apply as to any run. The release is the only proof that no delete ran -- never
-    ``run.json``, whose writes are best effort. Returns the run ids whose mark went. Never raises."""
+    their first delete command -- their hold row was still ``erase-prep``, whether the start
+    released it or kept it because the scheme moved (lane 1e). Such a run erased nobody, yet
+    under lanes 1c-1d the keep mark came BEFORE the erase record (``_begin_erase``), and a power
+    cut or a kill between the two left it; the prune never deletes a marked folder: a biometric
+    backup kept for good for no one (lane 1d, master review F3). The mark goes; the 30 days apply
+    as to any run. The release is the only proof that no delete ran -- never ``run.json``, whose
+    writes are best effort. Since lane 1e the mark is written after the erase record
+    (``_write_keep_mark``), so a run of this build leaves none there: this is for folders an
+    earlier build wrote. Returns the run ids whose mark went. Never raises."""
     dropped: List[str] = []
     try:
         base = Path(root) if root is not None else _default_backup_root()

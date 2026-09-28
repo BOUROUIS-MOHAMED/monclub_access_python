@@ -420,9 +420,17 @@ Started as they are, each would record the switch, re-push every account pin onc
 removal step like §2; on 1.4.32/1.4.33 it pushes membership pins onto the account terminals `[CODE]`.
 For each PC that D2 brings back, with the gym closed and its §5.2 block still on:
 1. Access stopped on it (untick start-with-Windows, Quit, watchdog off, the §5.1 rename test).
-2. Retire its rows for 8 and 10. With D3 = (b): **on the version it runs** (1.4.33:
-   `device_sync_state` and `device_content_mirror` only, §5.1), then step 3. With D3 = (a): do step 3
-   first (its action exists only in 1.4.35), run the action in its no-engine mode, then step 4.
+2. Retire its rows for 8 and 10. **D3 was decided on 2026-09-27 as the Erase wizard's « forget »**
+   (runbook D10 (a)), which retires only the PC that runs the erase -- P1. P2 and P3 run no erase, so
+   for them it is one of (lane 1e, master review F6):
+   - §5.1's SQL (D3 (b), runbook D10 (b)), **on the version it runs** (1.4.33: `device_sync_state`
+     and `device_content_mirror` only), then step 3;
+   - or a fresh data folder (runbook D10 (c): the old folder renamed and kept, `data\app.db` moved
+     into it too), after step 3 and before step 4 -- step 4's line then reads `previous=UNKNOWN
+     scheme=ACCOUNT cleared_rows=0 first_sighting=True` (runbook D14).
+
+   The no-engine "forget" action that D3 (a) below described was never built -- the wizard replaced
+   it. Never erase a live terminal again only to get a « forget » for P2 or P3.
 3. Install 1.4.35 with the installer's last box **"Launch MonClub Access" unticked** (it is ticked by
    default and would start Access before the retire otherwise `[CODE: installer/MonClubAccess.iss [Run]
    postinstall]`) -- and **"Keep MonClub Access running" unticked** (ticked, it registers the watchdog,
@@ -514,7 +522,10 @@ privilege (E5b).
   new Access connects to every terminal until the server answers `[CODE: runtime.py::load_cached_roles]`;
   before the block comes off, its « Pilote / Lecteur » page must read « PC lecteur ». Never tried on a
   gym PC `[UNVERIFIED — FIELD-TEST]`.
-- **D3 -- how the retire is done.** (a) Recommended: a small operator-confirmed "forget this terminal's
+- **D3 -- how the retire is done.** **Decided 2026-09-27: the Erase wizard's « forget », on the PC that
+  runs the erase (runbook D10 (a)) -- not the (a) below, which was never built; a PC that runs Access
+  without having run the erase uses (b), or a fresh data folder (runbook D10 (c), §5.3).** As first
+  written: (a) Recommended: a small operator-confirmed "forget this terminal's
   MonClub state after a verified wipe" action in 1.4.35, one device at a time, runnable only with the
   ULTRA engine not started, with tests and guide §3.2e updated; (b) a technician runs §5.1 with the
   official SQLite command-line tool; (c) not retiring is **not an option**: departures would never be

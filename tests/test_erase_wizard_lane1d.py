@@ -141,7 +141,12 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         db.begin_device_erase(device_id=5, run_id="r2")
         assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
 
-    def test_refill_releases_it(self, sqlite_db, monkeypatch, tmp_path):
+    def test_refill_waits_for_the_terminals_scheme(self, sqlite_db, monkeypatch, tmp_path):
+        """Lane 1d released it here, under the new scheme -- the master review of lane 1d (C0):
+        nothing was erased, and that pass would write « Par personne » pins beside every old one.
+        Since lane 1e Refill is refused until the scheme is the terminal's again
+        (tests/test_erase_wizard_lane1e.py::TestRemplirOnASchemeMovedHold, which also sets it
+        back); this run started with no scheme recorded, so only an erase clears it."""
         wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         pv = _preview(wiz, 5)
         self._moved_during_backup(monkeypatch, panel)
@@ -149,8 +154,8 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         _restart()
         status, out = wiz.refill(5, {"password": "pw", "expectedPinScheme": "ACCOUNT"},
                                  verify_password=_pw_ok)
-        assert status == 200, out
-        assert not device_hold.is_held(5) and _hold_row(sqlite_db, 5) is None
+        assert (status, out["code"]) == (409, "HELD_SCHEME_MOVED"), out
+        assert device_hold.is_held(5) and _hold_row(sqlite_db, 5) is not None
 
     def test_a_row_that_cannot_be_kept_says_so(self, sqlite_db, monkeypatch, tmp_path):
         """The durable write fails: the hold is kept for this session (as before lane 1d), and
@@ -166,8 +171,10 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         run = wiz.status()["run"]
         note = [s for s in run["steps"] if s["step"] == "finish"][0]["note"]
         # Its own code (review round 1 of lane 1d): the page's translated line for
-        # HELD_SCHEME_MOVED promises the hold outlives a restart -- this one says it does not.
-        assert note.startswith("HELD_SCHEME_MOVED_SESSION:") and "NOT kept across a restart" in note
+        # HELD_SCHEME_MOVED promises the hold outlives a restart -- this one says it may not
+        # ("may": since lane 1e the next start still keeps the row while the scheme differs).
+        assert note.startswith("HELD_SCHEME_MOVED_SESSION:"), note
+        assert "may NOT last through a restart" in note, note
         assert device_hold.is_held(5) and run["holdKept"] is True
 
     def test_a_turnstile_removed_during_the_run_keeps_no_durable_hold(self, sqlite_db,
@@ -189,7 +196,8 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         panel.read_table_strict = _read
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         note = [s for s in wiz.status()["run"]["steps"] if s["step"] == "finish"][0]["note"]
-        assert note.startswith("HELD_SCHEME_MOVED_SESSION:"), note
+        # Its own note since lane 1e (master review nit): nothing to do for a deleted turnstile.
+        assert note.startswith("HELD_DEVICE_GONE:"), note
         assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_ERASE_PREP
         _restart()
         assert not device_hold.is_held(5)
@@ -199,10 +207,13 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         for code in ("HELD_SCHEME_MOVED", "HELD_SCHEME_UNREADABLE", "HELD_SCHEME_MOVED_SESSION",
                      "HELD_SCHEME_UNREADABLE_SESSION"):
             said = re.findall(r"\b" + code + r':\s*\n?\s*"([^"]+)"', text)
-            assert len(said) == 2, (code, said)                  # French and English
-            assert "redémarrage" in said[0] and "restart" in said[1], said
+            # The finish notes, French and English (since lane 1e HELD_SCHEME_MOVED is also a
+            # refusal code of « Remplir », whose texts do not speak of a restart).
+            fr = [s for s in said if "redémarrage" in s]
+            en = [s for s in said if "restart" in s]
+            assert len(fr) == 1 and len(en) == 1, (code, said)
             if code.endswith("_SESSION"):
-                assert "PAS" in said[0] and "NOT" in said[1], said
+                assert "PAS" in fr[0] and "NOT" in en[0], said
 
 
 # ─────────────────────────── F1: the start-up prune and the server clock ───────────────────────────
@@ -293,7 +304,9 @@ class TestAKeepMarkOfARunThatNeverErasedIsDroppedAtStartUp:
 
     def test_a_kill_between_the_mark_and_the_erase_record(self, sqlite_db, monkeypatch, tmp_path):
         """The power goes off after the keep mark is written and before the erase is recorded:
-        the hold row is still erase-prep, so the start releases it -- and drops the mark."""
+        the hold row is still erase-prep, so the start releases it -- and drops the mark.
+        Since lane 1e (master review F8) the mark comes after the erase record, so this build
+        leaves none there: the mark below is one an earlier build (lanes 1c-1d) wrote."""
         class _Killed(BaseException):
             pass
 
@@ -306,7 +319,8 @@ class TestAKeepMarkOfARunThatNeverErasedIsDroppedAtStartUp:
         with pytest.raises(_Killed):
             wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
         folder = _run_dir(wiz)
-        assert (folder / ew.KEEP_MARK).exists(), "the kill left the mark"
+        assert not (folder / ew.KEEP_MARK).exists(), "this build writes no mark before the record"
+        (folder / ew.KEEP_MARK).write_text("{}", encoding="utf-8")        # an earlier build's
         assert not [c for c in panel.calls if c[0] == "erase"]
         _restart()
         assert not device_hold.is_held(5)
@@ -318,18 +332,15 @@ class TestAKeepMarkOfARunThatNeverErasedIsDroppedAtStartUp:
 
     def test_a_run_whose_erase_was_recorded_keeps_its_mark(self, sqlite_db, monkeypatch,
                                                             tmp_path):
-        """Killed after the erase record: a delete may have run -- the hold (erase) stays, and
-        so does the mark."""
-        real = ew._begin_erase
-
+        """Killed at its first delete command: a delete may have run -- the hold (erase) stays,
+        and so does the mark (written after the erase record since lane 1e, before that command)."""
         class _Killed(BaseException):
             pass
 
-        def _recorded_then_killed(*a, **k):
-            real(*a, **k)
+        def _killed_at_the_first_delete(table):
             raise _Killed()
-        monkeypatch.setattr(ew, "_begin_erase", _recorded_then_killed)
         wiz, _w, _p, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db, panel=_staff_panel())
+        _p.on_erase = _killed_at_the_first_delete
         monkeypatch.setattr(ew, "_default_backup_root", lambda: Path(wiz.backup_root()))
         pv = _preview(wiz, 5)
         with pytest.raises(_Killed):
