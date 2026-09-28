@@ -2157,14 +2157,18 @@ run folder's `run.json`):
      comes by a plain `ALTER TABLE` in `init_db` (a failure stops the start, as any failed migration; `_ensure_column`
      would swallow it, and every hold read names the column). **« Remplir » on an `erase-scheme-moved` row is refused,
      409 `HELD_SCHEME_MOVED`, until the scheme recorded now equals the row's** (a row that records none is refused: erase
-     again) `[CODE: EraseWizard._refill_marked]` -- before, only the run's in-memory finish note forbade it, and after a
+     again) `[CODE: EraseWizard._refill_marked]` -- and so is a row still at `erase-prep` that records a scheme other than
+     the one now (review round 1 of lane 1e: a stop whose durable move failed, held this session; no run is running when
+     Refill gets there) -- before, only the run's in-memory finish note forbade it, and after a
      restart the route released the hold and asked a full pass under the new scheme, beside every old pin. The recovery
      (runbook C6): set the scheme back, then erase again with "hold" (its erase record moves the row to `erase`); or
      « Remplir » under the old scheme to release it without erasing. A run on a turnstile already held makes its stop
      durable too (F7: lane 1d skipped `held_before` runs, and a row taken over at `erase-prep` stayed releasable) --
      except that on a row at `erase` (an earlier run may have deleted) the note is `HELD_BEFORE`: « Remplir » is the
-     normal step there. A turnstile deleted in MonClub during the run gets `HELD_DEVICE_GONE` (nothing to do; the next
-     start releases it). `[TEST: test_erase_wizard_lane1e.py::TestRemplirOnASchemeMovedHold,
+     normal step there. A turnstile deleted in MonClub during the run, its row at `erase-prep`, gets `HELD_DEVICE_GONE`
+     (nothing to do; the next start releases it). The finish note names the scheme the ROW records for the terminal (a run
+     that took an earlier hold over keeps the first run's) and one recovery: set that scheme back, then erase again with
+     "hold" (or « Remplir », erasing nothing). `[TEST: test_erase_wizard_lane1e.py::TestRemplirOnASchemeMovedHold,
      ::TestASchemeMovedStopOnATurnstileHeldBefore, ::TestATurnstileRemovedDuringTheRun, ::TestTheHoldColumnMigration;
      mutations checked: no guard, a takeover that overwrites the scheme, the old F7 condition]`
    - *The erase is recorded* (`db.begin_device_erase`, one durable transaction, review F12 + F1): the run's hold row
@@ -2304,7 +2308,10 @@ test_erase_wizard_lane1b.py::TestAHoldThatNeverErased]`
 every old-scheme pin, and a released pass would write the new scheme's beside them. Logged `[HOLD] turnstile N kept on
 hold at start-up …`, `[T] ERASE_STEP step=kept_at_start`; its keep mark goes as a released run's does (it erased
 nobody). A row that records no scheme (written before lane 1e) and a turnstile with no device row (deleted in MonClub)
-are released as before; a read that fails releases nothing (every row stays held, retried at the next load). `[TEST:
+are released as before; a read that fails releases nothing (every row stays held, retried at the next load). Residual
+`[CODE]`: the rule sees only a move already in THIS PC's database -- it runs before the first sync tick; a run cut after
+the dashboard saved the switch but before a sync brought it to the PC is released, and the first sync then applies the new
+scheme (the runbook's guard: a panel whose run did not end « Terminé » is never switched, C6 / C12). `[TEST:
 test_erase_wizard_lane1e.py::TestTheStartUpKeepsAHoldWhoseSchemeMoved]`
 **The keep mark of a released run goes too** (lane 1d, master review F3): `_bind_not_refilled` writes `KEEP_MARK`
 durably before `_begin_erase`, and only the in-process failure handlers dropped it -- a power cut or a kill between the
