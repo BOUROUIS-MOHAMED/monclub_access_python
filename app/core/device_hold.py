@@ -19,7 +19,11 @@ switch. ``ensure_loaded`` (every sync tick) retries until the read succeeds.
 The hold's phase (lane 1b, review F1): a run holds with ``REASON_ERASE_PREP`` (reads and the backup)
 and moves the row to ``REASON_ERASE`` durably before its first delete command
 (``db.begin_device_erase``). The start-up load releases a row still at ``REASON_ERASE_PREP``: that run
-stopped before any delete -- nothing to refill, and the hold would block every revocation.
+stopped before any delete -- nothing to refill, and the hold would block every revocation. A run that
+stopped before any delete AFTER the pin scheme moved (or could not be read) keeps its hold on purpose
+-- the terminal still holds the old scheme's pins -- and moves its row to ``REASON_SCHEME_MOVED``,
+which no start releases (lane 1d, master review F0). The rows a start does release had their erase
+backup's keep mark dropped too (``erase_wizard.drop_keep_marks_of_unstarted_runs``, review F3).
 """
 from __future__ import annotations
 
@@ -36,6 +40,7 @@ _load_failed = False
 # The phases a hold row records (the same literals as db.HOLD_REASON_*).
 REASON_ERASE_PREP = "erase-prep"   # a run's reads and backup: no delete issued yet
 REASON_ERASE = "erase"             # a delete may have run: kept until Refill
+REASON_SCHEME_MOVED = "erase-scheme-moved"   # no delete, but the scheme moved: kept until Refill
 
 
 def _as_id(value: Any) -> Optional[int]:
@@ -99,6 +104,13 @@ def load(*, release_unstarted: bool = False) -> FrozenSet[int]:
                        step="released_at_start", ok=True)
         except Exception:
             pass
+    if released:
+        # Nobody was erased by those runs: a keep mark one left behind goes (review F3).
+        try:
+            from app.core.erase_wizard import drop_keep_marks_of_unstarted_runs
+            drop_keep_marks_of_unstarted_runs(released)
+        except Exception:
+            _log.warning("[HOLD] keep marks of the released runs not checked", exc_info=True)
     if ids:
         _log.warning("[HOLD] turnstile(s) on hold since an erase, nothing is written to them "
                      "until Refill: %s", ",".join(str(d) for d in sorted(ids)))

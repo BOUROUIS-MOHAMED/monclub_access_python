@@ -15,7 +15,7 @@ import { ApiError } from "@/api/client";
 import {
   liveEraseApi, type EraseApi, type ErasePreview, type EraseRun, type RefillOption,
 } from "@/api/erase";
-import { ERASE_TEXT, loadLang, saveLang, type Lang } from "@/lib/eraseWizardText";
+import { ERASE_TEXT, loadLang, saveLang, type Lang, type NotRefilledWhat } from "@/lib/eraseWizardText";
 
 type Props = {
   open: boolean;
@@ -263,6 +263,11 @@ export default function EraseWizardDialog({
   const leftOut = preview?.notRefilled ?? null;
   const leftOutUnknown = !!preview && leftOut === null;
   const leftOutCount = leftOut?.count ?? 0;
+  // What the erase takes from them (lane 1d, review nit): the user, or only door rights and / or
+  // fingerprints (their user and card stay).
+  const leftOutFingers = ["templatev10", "template", "fingerprints"].some((k) => chosen.has(k));
+  const leftOutWhat: NotRefilledWhat = chosen.has(usersKey) ? "users"
+    : chosen.has("userauthorize") ? (leftOutFingers ? "rightsFingers" : "rights") : "fingers";
   useEffect(() => { setAcceptNotRefilled(false); }, [preview]);
 
   const optionsReady = backupOnly || (forget !== null && refill !== null && (!needFaces || acceptFaces));
@@ -437,7 +442,7 @@ export default function EraseWizardDialog({
     <p className="text-[12px] text-muted-foreground">{t.notRefilledNone}</p>
   ) : (
     <div className="flex flex-col gap-1.5 rounded-xl border border-amber-500/50 bg-amber-500/[0.06] p-2.5 text-[12px]">
-      <p className="font-semibold text-amber-800">{t.notRefilledTitle(leftOutCount, schemeName(leftOut?.scheme))}</p>
+      <p className="font-semibold text-amber-800">{t.notRefilledTitle(leftOutCount, schemeName(leftOut?.scheme), leftOutWhat)}</p>
       <ul className="max-h-[120px] overflow-y-auto rounded-lg border border-border bg-background px-2 py-1 font-mono text-[11.5px]">
         {(leftOut?.people ?? []).map((p) => <li key={p.pin}>{p.pin} — {p.name || t.unknown}</li>)}
       </ul>

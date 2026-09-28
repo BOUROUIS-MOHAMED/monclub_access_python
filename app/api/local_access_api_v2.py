@@ -1390,7 +1390,8 @@ def _handle_auth_verify_admin_password(ctx: _Ctx) -> None:
                                      "réessayez."})
     except Exception as e:
         ctx.app.logger.exception("verify_admin_password failed")
-        ctx.send_json(500, {"ok": False, "error": str(e)})
+        # The password could not be checked: never read as a wrong one (lane 1d, review nit).
+        ctx.send_json(500, {"ok": False, "code": "ADMIN_PASSWORD_CHECK_FAILED", "error": str(e)})
 
 
 # ==================== 3) CONFIG ====================

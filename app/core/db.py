@@ -9726,6 +9726,10 @@ def clear_all_device_sync_hashes() -> int:
 # ERASE, or a row written before this rule -- means "a delete may have run": kept until Refill.
 HOLD_REASON_ERASE_PREP = "erase-prep"
 HOLD_REASON_ERASE = "erase"
+# Lane 1d (master review F0): a run that stopped before its first delete after the pin scheme moved
+# (or could not be read) keeps its hold -- the terminal still holds every old-scheme pin. Not
+# ERASE (no delete ran), and never released by a start: only Refill, or a later run's erase record.
+HOLD_REASON_SCHEME_MOVED = "erase-scheme-moved"
 
 
 def set_device_write_hold(*, device_id: int, reason: str, run_id: Optional[str] = None) -> None:
@@ -9784,6 +9788,28 @@ def begin_device_erase(*, device_id: int, run_id: str, keep_pins: Iterable[str] 
         return len(pins)
 
     return int(_run_db_write_sync("begin_device_erase", _write, durable=True))
+
+
+def keep_erase_hold_after_scheme_move(*, device_id: int, run_id: str) -> Optional[str]:
+    """Lane 1d (master review F0): a run that stops before its first delete once the pin scheme
+    moved, or could not be read, keeps its hold (``EraseWizard._scheme_moved_note``): the terminal
+    may hold every pin of the old scheme, and a pass released now would write the new scheme's
+    pins beside them. Its row is still at ERASE_PREP, which the next start releases
+    (``release_unstarted_erase_holds``). Move THAT run's ERASE_PREP row, durably, to
+    SCHEME_MOVED, which no start releases -- only Refill (or a later run's ``begin_device_erase``,
+    which moves it on to ERASE). Never an ERASE row (a delete may have run) and never another run's.
+    Returns the row's reason after the write (None: the turnstile has no hold row)."""
+    did = int(device_id)
+
+    def _write(conn: sqlite3.Connection, profile: Dict[str, Any]) -> Optional[str]:
+        conn.execute(
+            "UPDATE device_write_hold SET reason=? WHERE device_id=? AND run_id=? AND reason=?",
+            (HOLD_REASON_SCHEME_MOVED, did, str(run_id), HOLD_REASON_ERASE_PREP))
+        row = conn.execute("SELECT reason FROM device_write_hold WHERE device_id=?",
+                           (did,)).fetchone()
+        return None if row is None else str(row[0] or "")
+
+    return _run_db_write_sync("keep_erase_hold_after_scheme_move", _write, durable=True)
 
 
 def release_unstarted_erase_holds() -> Dict[int, Optional[str]]:
