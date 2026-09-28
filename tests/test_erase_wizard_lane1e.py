@@ -838,7 +838,16 @@ class TestThePage:
     def test_the_devices_page_no_longer_says_erased_for_it(self):
         page = _ts("pages/DevicesPage.tsx")
         assert "erase-scheme-moved" in page
-        assert re.search(r"rien n'a été effacé", page)
+        # Lane 1i: the tooltip's text lives in eraseWizardText.ts (French and English), and the
+        # page picks the « rien n'a été effacé » one for those rows.
+        assert re.search(r"nothingErasedIds\.has\([^)]*\)\)\s*\?\s*ERASE_TEXT\[loadLang\(\)\]\.rowHoldNothingErased",
+                         page)
+        text = _ts("lib/eraseWizardText.ts")
+        assert len(re.findall(r"\browHoldNothingErased:", text)) == 2
+        fr = re.search(r"rowHoldNothingErased:\s*\n\s*\"([^\"]*)\"", text).group(1)
+        assert "rien n'a été effacé" in fr
+        # Neutral about the cause, as schemeMovedBack: the row does not record which happened.
+        assert "ou n'a pas pu être relu" in fr
 
 
 # ─────────────────────── review round 1 of lane 1e ───────────────────────
