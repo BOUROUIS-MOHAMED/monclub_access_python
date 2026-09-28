@@ -9899,8 +9899,10 @@ def release_unstarted_erase_holds(
     was deleted in MonClub (``_device_list_is_authoritative``: signed in, the list not empty). A
     logout empties that list and deletes the token, and the scheme may have moved meanwhile: the row
     is then left as it is, at ERASE_PREP -- held, and read again by the next start (which releases
-    or keeps it once the PC is signed in and its list synced), or released by Refill, which checks
-    the scheme it records. Reported in ``undecided_out`` ({device_id: run_id})."""
+    or keeps it once the PC is signed in and its list not empty), or released by Refill, which checks
+    the scheme it records. Reported in ``undecided_out`` ({device_id: run_id}). Residual: a list
+    that is not empty is not checked for freshness -- a switch saved while this PC was off is not in
+    it yet, and the row is released (guide §3.2h)."""
     with get_conn() as conn:
         if conn.execute("SELECT 1 FROM device_write_hold WHERE reason=? LIMIT 1",
                         (HOLD_REASON_ERASE_PREP,)).fetchone() is None:

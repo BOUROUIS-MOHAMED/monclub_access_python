@@ -516,6 +516,8 @@ class TestTheKeepMarkComesAfterTheEraseRecord:
         wiz.start(5, _body(pv["previewId"], acceptNotRefilled=True), verify_password=_pw_ok)
         run = wiz.status()["run"]
         assert run["state"] == "FAILED" and _note(wiz).startswith("HELD_SCHEME_MOVED:"), run
+        assert run["error"].startswith("KEEP_MARK_NOT_WRITTEN:"), run["error"]
+        assert [s["ok"] for s in run["steps"] if s["step"] == "erase_record_undone"] == [True]
         assert not [c for c in panel.calls if c[0] == "erase"]
         assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_SCHEME_MOVED
         _restart()

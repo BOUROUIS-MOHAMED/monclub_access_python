@@ -181,6 +181,26 @@ class TestADurableWriteThatFailsOnARowAlreadyKept:
         assert _note(wiz).startswith("HELD_BEFORE:"), _note(wiz)
         assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_ERASE
 
+    def test_a_row_at_erase_scheme_moved_keeps_the_plain_note(self, sqlite_db, monkeypatch,
+                                                              tmp_path):
+        db = sqlite_db
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, db)
+        _scheme(monkeypatch, "MEMBERSHIP")
+        db.set_device_write_hold(device_id=5, reason=db.HOLD_REASON_ERASE_PREP, run_id="r-moved",
+                                 pin_scheme="MEMBERSHIP")
+        db.keep_erase_hold_after_scheme_move(device_id=5, run_id="r-moved")
+        device_hold.load()
+
+        def _boom(**kw):
+            raise RuntimeError("disk I/O error")
+        monkeypatch.setattr(dbmod, "keep_erase_hold_after_scheme_move", _boom)
+        pv = _preview(wiz, 5)
+        _moved_during_backup(monkeypatch, panel)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        note = _note(wiz)
+        assert note.startswith("HELD_SCHEME_MOVED:") and "_SESSION" not in note, note
+        assert _hold_row(db, 5)["reason"] == db.HOLD_REASON_SCHEME_MOVED
+
     def test_an_erase_prep_row_still_gets_the_session_note(self, sqlite_db, monkeypatch, tmp_path):
         db = sqlite_db
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, db)
