@@ -82,6 +82,12 @@ const fr = {
       "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, même après un redémarrage d'Access, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
     HELD_SCHEME_UNREADABLE:
       "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
+    // The same holds, kept for this session only (lane 1d): the durable write failed, or the
+    // turnstile is no longer in MonClub.
+    HELD_SCHEME_MOVED_SESSION:
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, mais cette attente ne tiendra PAS après un redémarrage d'Access. N'appuyez pas sur « Remplir » tel quel, et ne redémarrez pas Access : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+    HELD_SCHEME_UNREADABLE_SESSION:
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé), mais cette attente ne tiendra PAS après un redémarrage d'Access. Vérifiez le schéma dans le tableau de bord avant tout redémarrage, puis « Remplir » (ou effacez à nouveau avec « Attendre… » s'il a changé).",
   } as Record<string, string>,
   // The people the refill will NOT put back (lane 1c, review C0).
   notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
@@ -389,6 +395,10 @@ const en: typeof fr = {
       "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, even after Access restarts, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
     HELD_SCHEME_UNREADABLE:
       "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
+    HELD_SCHEME_MOVED_SESSION:
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, but this hold will NOT last through a restart of Access. Do not press Refill as it is, and do not restart Access: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+    HELD_SCHEME_UNREADABLE_SESSION:
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased), but this hold will NOT last through a restart of Access. Check the scheme in the dashboard before any restart, then Refill (or erase again with 'Hold…' if it changed).",
   },
   notRefilledTitle: (n: number, s: string, what: NotRefilledWhat) =>
     `${n} person(s) on this turnstile ${{

@@ -251,6 +251,24 @@ def _password_refusal(status: int, error: str) -> Tuple[int, Dict[str, Any]]:
     return int(status or 503), {"ok": False, "code": code, "error": error}
 
 
+def is_tls_failure(exc: BaseException) -> bool:
+    """The exception or its cause is a TLS failure: ``ssl``'s own SSLError (an OSError) or
+    ``requests``' SSLError (a ConnectionError). Something answered, with a certificate that does
+    not check out -- never "no internet" (lane 1d, review nits)."""
+    import ssl
+    try:
+        from requests.exceptions import SSLError as _ReqSSLError
+    except Exception:
+        _ReqSSLError = None                                   # type: ignore[assignment]
+    for err in (exc, getattr(exc, "__cause__", None)):
+        if err is None:
+            continue
+        if isinstance(err, ssl.SSLError) or (_ReqSSLError is not None
+                                             and isinstance(err, _ReqSSLError)):
+            return True
+    return False
+
+
 def _no_answer(exc: BaseException) -> bool:
     """A request that got no answer at all -- the exception or its cause is a connection that
     failed or timed out: ``requests``' ConnectionError / Timeout, or a socket error. Any other
@@ -258,19 +276,16 @@ def _no_answer(exc: BaseException) -> bool:
     DID get an answer. A TLS failure (``requests``' SSLError, a ConnectionError, or ``ssl``'s own,
     an OSError) is not "no answer" either: something answered with a certificate that does not
     check out -- "check the internet" would send the technician the wrong way (lane 1d, review
-    nit). A proxy that does not answer (ProxyError) stays no answer."""
-    import ssl
+    nit, ``is_tls_failure``). A proxy that does not answer (ProxyError) stays no answer."""
+    if is_tls_failure(exc):
+        return False
     try:
         from requests.exceptions import ConnectionError as _ConnErr, RequestException, Timeout
-        from requests.exceptions import SSLError as _ReqSSLError
     except Exception:
-        _ConnErr = RequestException = Timeout = _ReqSSLError = None   # type: ignore[assignment]
+        _ConnErr = RequestException = Timeout = None         # type: ignore[assignment]
     for err in (exc, getattr(exc, "__cause__", None)):
         if err is None:
             continue
-        if isinstance(err, ssl.SSLError) or (_ReqSSLError is not None
-                                             and isinstance(err, _ReqSSLError)):
-            return False
         if RequestException is not None and isinstance(err, RequestException):
             return isinstance(err, (_ConnErr, Timeout))
         if isinstance(err, OSError):
@@ -1151,7 +1166,8 @@ class EraseWizard:
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
                 if note and not held_before:
-                    note = self._keep_hold_across_restarts(did, run_id, note)
+                    note = self._keep_hold_across_restarts(did, run_id, note,
+                                                           durable=not self._device_gone(did))
                 # Not on a worker the run just saw connected to ANOTHER address: no pass through it.
                 self._finish("FAILED", release=not (held_before or note),
                              error=f"{exc.code}: {exc.message} -- nothing was erased",
@@ -1166,7 +1182,8 @@ class EraseWizard:
                 self._drop_keep_mark(run)
                 note = self._scheme_moved_note(did, run.get("pinScheme"))
                 if note and not held_before:
-                    note = self._keep_hold_across_restarts(did, run_id, note)
+                    note = self._keep_hold_across_restarts(did, run_id, note,
+                                                           durable=not self._device_gone(did))
             self._finish("INCOMPLETE" if erase_started else "FAILED",
                          release=(not erase_started and not held_before and not note),
                          error=f"UNEXPECTED: {type(exc).__name__}: {exc}", note=note)
@@ -1192,25 +1209,43 @@ class EraseWizard:
                 "erase again with 'hold', or set the scheme back, before pressing Refill")
 
     @staticmethod
-    def _keep_hold_across_restarts(did: int, run_id: str, note: str) -> str:
+    def _device_gone(did: int) -> bool:
+        """The turnstile's row was read and is not there any more (deleted in MonClub). A row
+        that does not read is NOT gone: the caller then keeps the hold durable (fail closed)."""
+        try:
+            from app.core.db import get_sync_device_payload
+            return get_sync_device_payload(int(did)) is None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _keep_hold_across_restarts(did: int, run_id: str, note: str, *,
+                                   durable: bool = True) -> str:
         """The hold a scheme-moved stop keeps must outlive a restart (lane 1d, master review F0):
         its row is still at ``erase-prep``, which the next start releases -- and the gyms power
         off every night. Moved durably to ``erase-scheme-moved`` (``db.
-        keep_erase_hold_after_scheme_move``: that run's own row only). A write that fails keeps
-        the hold for this session only, and the note says so."""
+        keep_erase_hold_after_scheme_move``: that run's own row only). Not for a turnstile whose
+        row is gone (``durable`` False: no Refill could be pressed for it; review round 1 of lane
+        1d), and a write that fails: the hold then lasts this session only, and the note says so
+        under its own code, ``HELD_SCHEME_MOVED_SESSION`` / ``HELD_SCHEME_UNREADABLE_SESSION`` --
+        the page's line for the plain code promises a hold that outlives a restart."""
         from app.core import db as _db
-        try:
-            reason = _db.keep_erase_hold_after_scheme_move(device_id=did, run_id=run_id)
-        except Exception:
-            _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable", run_id,
-                       did, exc_info=True)
-            reason = None
-        if reason and reason != _db.HOLD_REASON_ERASE_PREP:
-            return note
-        _log.error("[ERASE] run %s: turnstile %s is held for this session only -- a restart of "
-                   "Access releases it", run_id, did)
-        return (note + " -- NOT kept across a restart of Access (the hold could not be made "
-                "durable): erase again or press Refill before any restart")
+        why = "the turnstile is no longer in MonClub"
+        if durable:
+            try:
+                reason = _db.keep_erase_hold_after_scheme_move(device_id=did, run_id=run_id)
+            except Exception:
+                _log.error("[ERASE] run %s: the hold of turnstile %s could not be made durable",
+                           run_id, did, exc_info=True)
+                reason = None
+            if reason and reason != _db.HOLD_REASON_ERASE_PREP:
+                return note
+            why = "the hold could not be made durable"
+        _log.error("[ERASE] run %s: turnstile %s is held for this session only (%s) -- a restart "
+                   "of Access releases it", run_id, did, why)
+        code, sep, rest = note.partition(":")
+        return (f"{code}_SESSION{sep}{rest} -- NOT kept across a restart of Access ({why}): "
+                "erase again or press Refill before any restart")
 
     @staticmethod
     def _kept_admins(proto: str, backup: Dict[str, Any]) -> List[str]:

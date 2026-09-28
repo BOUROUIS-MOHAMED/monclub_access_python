@@ -165,15 +165,44 @@ class TestAHoldKeptAfterASchemeMoveSurvivesARestart:
         wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         run = wiz.status()["run"]
         note = [s for s in run["steps"] if s["step"] == "finish"][0]["note"]
-        assert note.startswith("HELD_SCHEME_MOVED:") and "NOT kept across a restart" in note
+        # Its own code (review round 1 of lane 1d): the page's translated line for
+        # HELD_SCHEME_MOVED promises the hold outlives a restart -- this one says it does not.
+        assert note.startswith("HELD_SCHEME_MOVED_SESSION:") and "NOT kept across a restart" in note
         assert device_hold.is_held(5) and run["holdKept"] is True
+
+    def test_a_turnstile_removed_during_the_run_keeps_no_durable_hold(self, sqlite_db,
+                                                                      monkeypatch, tmp_path):
+        """Review round 1 of lane 1d: the device row gone (its scheme reads None) is not a scheme
+        move to protect -- no hold for a turnstile MonClub no longer has, kept until a Refill
+        nobody could press. Held for the session, as before lane 1d, with the session note."""
+        import app.core.db as dbmod
+        from tests.test_erase_wizard import _devices
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
+        monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda d: "MEMBERSHIP")
+        pv = _preview(wiz, 5)
+        real = panel.read_table_strict
+
+        def _read(*, table, fields="*"):
+            _devices(monkeypatch)                              # the turnstile deleted in MonClub
+            monkeypatch.setattr(dbmod, "get_device_pin_scheme", lambda d: None)
+            return real(table=table, fields=fields)
+        panel.read_table_strict = _read
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        note = [s for s in wiz.status()["run"]["steps"] if s["step"] == "finish"][0]["note"]
+        assert note.startswith("HELD_SCHEME_MOVED_SESSION:"), note
+        assert _hold_row(sqlite_db, 5)["reason"] == sqlite_db.HOLD_REASON_ERASE_PREP
+        _restart()
+        assert not device_hold.is_held(5)
 
     def test_the_page_says_it_stays_held_after_a_restart(self):
         text = (REPO / "tauri-ui" / "src" / "lib" / "eraseWizardText.ts").read_text(encoding="utf-8")
-        for code in ("HELD_SCHEME_MOVED", "HELD_SCHEME_UNREADABLE"):
-            said = re.findall(code + r':\s*\n?\s*"([^"]+)"', text)
+        for code in ("HELD_SCHEME_MOVED", "HELD_SCHEME_UNREADABLE", "HELD_SCHEME_MOVED_SESSION",
+                     "HELD_SCHEME_UNREADABLE_SESSION"):
+            said = re.findall(r"\b" + code + r':\s*\n?\s*"([^"]+)"', text)
             assert len(said) == 2, (code, said)                  # French and English
             assert "redémarrage" in said[0] and "restart" in said[1], said
+            if code.endswith("_SESSION"):
+                assert "PAS" in said[0] and "NOT" in said[1], said
 
 
 # ─────────────────────────── F1: the start-up prune and the server clock ───────────────────────────
@@ -374,6 +403,29 @@ class TestTheNits:
         assert status == 200 and pv["notRefilled"] is None, pv
         status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         assert (status, out["code"]) == (409, "NOT_REFILLED_UNKNOWN")
+
+    @pytest.mark.parametrize("cause, status, code", [
+        (__import__("requests").exceptions.SSLError("certificate verify failed"), 502,
+         "ADMIN_PASSWORD_CHECK_FAILED"),
+        (__import__("requests").exceptions.ConnectionError("no route"), 503,
+         "ADMIN_PASSWORD_UNCHECKABLE"),
+    ])
+    def test_a_tls_failure_of_the_password_check_is_not_no_internet(self, monkeypatch, cause,
+                                                                    status, code):
+        """Review round 1 of lane 1d: the erase and Refill password check read every exception as
+        offline (« Pas d'Internet »). A TLS failure got an answer: the server check failed."""
+        from types import SimpleNamespace
+        from app.api import local_access_api_v2 as api_mod
+        from app.api.monclub_api import MonClubApiError
+
+        class _Api:
+            def validate_statistics_password(self, **k):
+                raise MonClubApiError(f"validate_statistics_password failed: {cause}") from cause
+        monkeypatch.setattr("access.store.load_auth_token", lambda: SimpleNamespace(token="t"))
+        ctx = SimpleNamespace(app=SimpleNamespace(_api=lambda: _Api()))
+        ok, got_status, error = api_mod._erase_password_verifier(ctx)("pw")
+        assert (ok, got_status) == (False, status), error
+        assert ew._password_refusal(got_status, error)[1]["code"] == code
 
     def test_the_lock_screens_generic_500_carries_a_code(self, monkeypatch):
         import logging
