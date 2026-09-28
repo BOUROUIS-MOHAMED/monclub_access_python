@@ -87,7 +87,7 @@ const fr = {
     HELD_SCHEME_MOVED:
       "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, même après un redémarrage d'Access, car il porte encore tous les numéros de l'ancien schéma. « Remplir » est refusé tant que le schéma enregistré n'est pas revenu à l'ancien. Pour continuer : remettez l'ancien schéma dans le tableau de bord, puis effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » » (ou « Remplir » pour le libérer sans rien effacer).",
     HELD_SCHEME_UNREADABLE:
-      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). « Remplir » n'est accepté que sous le schéma de l'étape 1 : vérifiez le schéma dans le tableau de bord ; inchangé, « Remplir » remet tout le monde ; changé, remettez-le, ou effacez à nouveau avec « Attendre… ».",
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence, même après un redémarrage d'Access (rien n'a été effacé). « Remplir » n'est accepté que sous le schéma de l'étape 1 : vérifiez le schéma dans le tableau de bord ; inchangé, « Remplir » remet tout le monde ; changé, remettez-le, ou effacez à nouveau avec « Attendre… ». Si ce PC a été déconnecté de MonClub pendant l'opération : appelez le développeur, puis attendez une synchronisation avant « Remplir ».",
     // The same holds, not recorded as kept (lane 1d; "may not" since lane 1e: the next start
     // still keeps the row when the scheme then differs).
     HELD_SCHEME_MOVED_SESSION:
@@ -424,7 +424,7 @@ const en: typeof fr = {
     HELD_SCHEME_MOVED:
       "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, even after Access restarts, because it still holds every number of the old scheme. Refill is refused until the recorded scheme is the old one again. To go on: set the old scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or Refill to release it without erasing anything).",
     HELD_SCHEME_UNREADABLE:
-      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Refill is accepted only under step 1's scheme: check the scheme in the dashboard; unchanged, Refill puts everyone back; changed, set it back, or erase again with 'Hold…'.",
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution, even after Access restarts (nothing was erased). Refill is accepted only under step 1's scheme: check the scheme in the dashboard; unchanged, Refill puts everyone back; changed, set it back, or erase again with 'Hold…'. If this PC was signed out of MonClub during the run: call the developer, then wait for a sync before Refill.",
     HELD_SCHEME_MOVED_SESSION:
       "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, but this hold could not be recorded and may NOT last through a restart of Access. Do not restart Access: set the old scheme back in the dashboard, then erase it again with 'Hold until I press Refill' (or Refill to release it without erasing anything).",
     HELD_SCHEME_UNREADABLE_SESSION:

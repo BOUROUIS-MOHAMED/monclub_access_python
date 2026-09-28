@@ -5500,7 +5500,10 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
         # devices + synced door presets
         for d in devices:
             _insert_device_row(cur, d)
-        _mark_device_list_replaced(cur)                     # lane 1g: the list is whole
+        if isinstance(data.get("devices"), list):
+            # lane 1g: the list is whole -- only when the answer carried one (a payload with no
+            # device list empties the table and says nothing about it).
+            _mark_device_list_replaced(cur)
 
         # infrastructures
         for inf in infrastructures:
@@ -6926,7 +6929,8 @@ def save_sync_cache_delta(data: dict, refresh: dict) -> Dict[str, Any]:
                 cur.execute("DELETE FROM sync_device_door_presets")
                 for d in (data.get("devices") or []):
                     _insert_device_row(cur, d)
-                _mark_device_list_replaced(cur)                 # lane 1g: the list is whole
+                if isinstance(data.get("devices"), list):
+                    _mark_device_list_replaced(cur)             # lane 1g: the list is whole
 
         creds_summary: Dict[str, Any] | None = None
         # Conditional: credentials

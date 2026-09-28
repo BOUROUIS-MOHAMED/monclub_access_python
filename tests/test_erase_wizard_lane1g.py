@@ -136,6 +136,16 @@ class TestTheMarker:
         db.save_sync_cache_delta({"devices": [_device_payload(5)]}, dict(refresh, devices=True))
         assert _marker(db) and _device_ids(db) == [5]
 
+    def test_an_answer_without_a_device_list_writes_none(self, sqlite_db):
+        """Review of lane 1g: a payload with no ``devices`` key empties the table but says nothing
+        about the list -- no marker (a later fast patch's single row would count as whole)."""
+        db = sqlite_db
+        db.save_sync_cache({"users": []})
+        assert not _marker(db)
+        refresh = {"members": False, "devices": True, "credentials": False, "settings": False}
+        db.save_sync_cache_delta({}, refresh)
+        assert not _marker(db) and _device_ids(db) == []
+
     def test_a_fast_patch_leaves_it_as_it_was(self, sqlite_db):
         db = sqlite_db
         db.save_sync_cache({"users": [], "devices": [_device_payload(5)]})
