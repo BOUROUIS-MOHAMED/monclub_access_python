@@ -730,6 +730,10 @@ class MainApp:
         # H-005: Real sync telemetry for /status endpoint
         self._last_sync_at: Optional[str] = None
         self._last_sync_ok: bool = False
+        # The monotonic time of the last SUCCESSFUL getSyncData (None until one): the Erase
+        # wizard's age limit on the member list (lane 1c, owner decision 2026-09-27). Monotonic,
+        # so a change of the PC clock cannot make an old list look recent (guide §3.2h).
+        self._last_sync_ok_mono: Optional[float] = None
         self._last_sync_error: Optional[str] = None
         self._last_device_sync_at: Optional[str] = None
         self._last_device_sync_ok: bool = True
@@ -3622,6 +3626,7 @@ class MainApp:
                 sync_online = True
                 self._last_sync_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 self._last_sync_ok = True
+                self._last_sync_ok_mono = time.monotonic()
                 self._last_sync_error = None
                 self._sync_fail_count = 0  # reset the retry schedule on success
                 self._sync_retry_after_sec = None

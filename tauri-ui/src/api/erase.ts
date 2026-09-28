@@ -54,6 +54,10 @@ export interface EraseRun {
   erased: boolean;
   pinScheme: string | null;
   otherPcsClosed?: boolean | null;
+  /** Lane 1c: the pins accepted at step 1, and the people the run really left out (from its
+   *  backup, before the first delete) -- pins only, never a name. */
+  notRefilledAccepted?: string[] | null;
+  notRefilled?: { count: number; pins: string[] } | null;
 }
 
 export interface ErasePreview {
@@ -69,6 +73,16 @@ export interface ErasePreview {
   /** What the refill would write (lane 1b): the server refuses an erase on a ``problem``
    *  (and, for "hold", on an ``accountProblem``). */
   refill?: EraseRefillCheck;
+  /** Lane 1c (review C0): the people on the turnstile that the refill will NOT put back (not in
+   *  its roster under ``scheme``; MB2000 administrators excluded -- the erase keeps them). null:
+   *  the user list did not read, and the server refuses an erase. */
+  notRefilled?: ErasePeopleLeftOut | null;
+}
+
+export interface ErasePeopleLeftOut {
+  count: number;
+  scheme: string | null;
+  people: { pin: string; name: string | null }[];
 }
 
 export interface EraseRefillCheck {
@@ -81,6 +95,13 @@ export interface EraseRefillCheck {
   cacheUpdatedAt: string | null;
   problem: string | null;
   accountProblem: string | null;
+  /** Lane 1c: why the member list is stale (REFILL_SOURCE_STALE) -- the last sync failed, none
+   *  succeeded since Access started, or the last success is older than ``syncMaxAgeSec``. */
+  staleWhy?: "NO_SYNC_YET" | "LAST_SYNC_FAILED" | "TOO_OLD" | null;
+  /** Seconds since the last successful sync (monotonic clock); null when none. */
+  lastSyncAgeSec?: number | null;
+  /** max(3 x the sync interval, 10 min), in seconds. */
+  syncMaxAgeSec?: number;
 }
 
 export interface EraseStartBody {
@@ -94,6 +115,8 @@ export interface EraseStartBody {
   backupOnly?: boolean;
   /** Required (true) for an erase: the hold binds this PC only (lane 1b, review C0). */
   otherPcsClosed?: boolean;
+  /** Required (true) for an erase when ``notRefilled.count`` > 0 (lane 1c, review C0). */
+  acceptNotRefilled?: boolean;
 }
 
 export interface EraseHolds {
@@ -110,6 +133,15 @@ export interface RefillResult {
   invalidated?: number;
   /** Lane 1b: the backups' 30 days now count from this Refill (false: a mark could not be written). */
   backupsMarked?: boolean;
+  /** Lane 1c (review F1): what this refill writes, under the scheme it pushes -- reported, never a
+   *  refusal (``problem``: REFILL_SOURCE_MISSING / _STALE / _EMPTY, REFILL_WITHHELD). */
+  refill?: {
+    scheme: string | null; members: number | null; withheld: number | null; problem: string | null;
+    staleWhy?: string | null; lastSyncAgeSec?: number | null; syncMaxAgeSec?: number;
+  };
+  /** MB2000 administrators the refill writes members over (confirmed with ``confirmAdminPins``). */
+  adminPins?: string[];
+  adminCheck?: "CHECKED" | "NOT_APPLICABLE" | "UNREADABLE";
 }
 
 export interface EraseApi {
@@ -118,8 +150,10 @@ export interface EraseApi {
   start(deviceId: number, body: EraseStartBody): Promise<{ ok: boolean; runId: string }>;
   status(): Promise<{ ok: boolean; running: boolean; run: EraseRun | null }>;
   /** ``expectedPinScheme``: the scheme the page SHOWED (read from holds()); the server refuses
-   *  with 409 PIN_SCHEME_CHANGED when it moved since. */
-  refill(deviceId: number, password: string, expectedPinScheme: string | null): Promise<RefillResult>;
+   *  with 409 PIN_SCHEME_CHANGED when it moved since. ``confirmAdminPins``: the administrator
+   *  pins a 409 ADMIN_PIN_IN_ROSTER named, confirmed by the operator (lane 1c). */
+  refill(deviceId: number, password: string, expectedPinScheme: string | null,
+         confirmAdminPins?: string[]): Promise<RefillResult>;
   holds(): Promise<EraseHolds>;
 }
 
@@ -131,7 +165,8 @@ export const liveEraseApi: EraseApi = {
     // The server checks the password AND the gym's switch (15 s each at worst) before it answers.
     post<{ ok: boolean; runId: string }>(`/devices/${deviceId}/erase`, body, 60_000),
   status: () => get<{ ok: boolean; running: boolean; run: EraseRun | null }>("/erase/status"),
-  refill: (deviceId, password, expectedPinScheme) =>
-    post<RefillResult>(`/devices/${deviceId}/erase/refill`, { password, expectedPinScheme }, 30_000),
+  refill: (deviceId, password, expectedPinScheme, confirmAdminPins) =>
+    post<RefillResult>(`/devices/${deviceId}/erase/refill`,
+      { password, expectedPinScheme, ...(confirmAdminPins ? { confirmAdminPins } : {}) }, 30_000),
   holds: () => get<EraseHolds>("/erase/holds"),
 };

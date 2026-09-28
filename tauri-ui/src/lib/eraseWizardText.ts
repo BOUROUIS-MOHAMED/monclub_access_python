@@ -39,6 +39,20 @@ const fr = {
   heldAlready:
     "Ce tourniquet est déjà en attente depuis un effacement : seul le bouton « Remplir » le libère. Choisissez « Attendre que j'appuie sur « Remplir » ».",
   refillWillWrite: (n: number, s: string) => `Le remplissage écrira ${n} membre(s) sur ce tourniquet (schéma ${s}).`,
+  // The list's time, in the refill line (lane 1c): the last SUCCESSFUL sync, and the limit.
+  listAge: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+    (ageSec === null || ageSec === undefined
+      ? "Liste des membres : aucune synchronisation réussie depuis le démarrage d'Access."
+      : `Liste des membres reçue de MonClub ${ageSec < 60 ? "il y a moins d'une minute" : `il y a ${Math.floor(ageSec / 60)} min`}`
+        + (maxSec ? ` (elle doit dater de moins de ${Math.round(maxSec / 60)} min).` : ".")),
+  stale: {
+    TOO_OLD: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+      `La liste des membres n'est pas récente : la dernière synchronisation réussie date de ${Math.floor((ageSec ?? 0) / 60)} min (limite ${Math.round((maxSec ?? 600) / 60)} min). Attendez la prochaine synchronisation, puis relisez : rien n'est effacé.`,
+    LAST_SYNC_FAILED: () =>
+      "La dernière synchronisation avec MonClub n'a pas réussi : la liste des membres peut être incomplète. Attendez la prochaine synchronisation réussie, puis relisez : rien n'est effacé.",
+    NO_SYNC_YET: () =>
+      "Aucune synchronisation avec MonClub n'a encore réussi depuis le démarrage d'Access : la liste des membres peut être incomplète. Attendez la prochaine synchronisation, puis relisez : rien n'est effacé.",
+  } as Record<string, (ageSec: number | null | undefined, maxSec: number | null | undefined) => string>,
   refillIfAccount: (n: number, w: number) =>
     w > 0
       ? `En « Par personne » : ${n} membre(s), et ${w} sans numéro de compte, qui ne seraient pas écrits.`
@@ -50,10 +64,37 @@ const fr = {
     "Après cet effacement, AUCUN membre ne passe au tourniquet par carte ou par empreinte tant que « Remplir » n'est pas fait (Internet requis).",
   lockoutRefill:
     "Pendant l'effacement et jusqu'à la fin du remplissage, les membres ne passent pas au tourniquet par carte ou par empreinte.",
+  // Fingerprints only (lane 1c, review nit): the cards keep working.
+  lockoutFingersHold:
+    "Après cet effacement, les membres qui passent par empreinte ne passent plus tant que « Remplir » n'est pas fait (Internet requis). Les cartes continuent de fonctionner.",
+  lockoutFingersRefill:
+    "Pendant l'effacement et jusqu'à la fin du remplissage, les membres qui passent par empreinte ne passent pas. Les cartes continuent de fonctionner.",
+  // Why a finished run kept its hold (the run's finish note, lane 1c review nit).
+  finishNotes: {
+    HELD_BEFORE: "Le tourniquet était déjà en attente depuis un effacement précédent : il le reste. Appuyez sur « Remplir ».",
+    PIN_SCHEME_CHANGED: "Le schéma de numérotation a changé pendant l'effacement : le tourniquet reste en attente. Vérifiez le schéma, puis appuyez sur « Remplir ».",
+    PIN_SCHEME_UNREADABLE: "Le schéma de numérotation n'a pas pu être relu à la fin : le tourniquet reste en attente. Appuyez sur « Remplir ».",
+    HELD_SCHEME_MOVED:
+      "Le schéma de numérotation a changé pendant l'opération, avant tout effacement : le tourniquet reste en attente, car il porte encore tous les numéros de l'ancien schéma. N'appuyez pas sur « Remplir » tel quel : effacez-le à nouveau avec « Attendre que j'appuie sur « Remplir » », ou remettez l'ancien schéma, puis « Remplir ».",
+    HELD_SCHEME_UNREADABLE:
+      "Le schéma de numérotation n'a pas pu être relu après l'arrêt : le tourniquet reste en attente par prudence (rien n'a été effacé). Vérifiez le schéma dans le tableau de bord : inchangé depuis l'étape 1, « Remplir » remet tout le monde ; changé, effacez à nouveau avec « Attendre… » avant « Remplir ».",
+  } as Record<string, string>,
+  // The people the refill will NOT put back (lane 1c, review C0).
+  notRefilledTitle: (n: number, s: string) =>
+    `${n} personne(s) de ce tourniquet ne seront PAS remises par le remplissage : elles ne sont pas dans la liste des membres de MonClub pour ce tourniquet (schéma ${s}) — personnel ou agents d'entretien enregistrés sur le tourniquet, utilisateurs d'un autre système, membres qui n'y ont plus droit. Ce que l'effacement leur retire (utilisateur, carte, droits, empreintes) ne revient pas.`,
+  notRefilledBackup:
+    "Leur seule copie est la sauvegarde de cet effacement : elle est gardée sans limite de durée (jamais supprimée après 30 jours).",
+  notRefilledTick: (n: number) =>
+    `J'ai lu la liste : ces ${n} personne(s) ne seront pas remises par le remplissage.`,
+  notRefilledNone: "Chaque personne de ce tourniquet est dans la liste du remplissage.",
+  notRefilledUnknown:
+    "La liste des utilisateurs du tourniquet n'a pas pu être lue : on ne sait pas qui le remplissage ne remettrait pas. Relisez l'étape 1.",
+  notRefilledKept: (n: number) =>
+    `${n} personne(s) effacée(s) ne sont pas dans la liste du remplissage : la sauvegarde de cet effacement est gardée sans limite de durée.`,
   otherPcsTitle:
-    "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet.",
+    "Fermez MonClub Access sur tous les autres PC de cette salle et gardez-le fermé jusqu'au remplissage (« Remplir ») : la mise en attente ne vaut que pour CE PC, les autres continueraient d'écrire sur ce tourniquet. Quitter ne suffit pas : le watchdog d'Access le relance en quelques minutes, et le démarrage avec Windows à la prochaine ouverture de session.",
   otherPcsTick:
-    "MonClub Access est fermé sur tous les autres PC de cette salle, et le restera jusqu'au remplissage.",
+    "MonClub Access est fermé sur tous les autres PC de cette salle — sur chacun : « Ouvrir MonClub Access avec Windows » décoché, watchdog désactivé (Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'), puis Quitter — et le restera jusqu'au remplissage.",
   deviceLine: (name: string, ip: string, port: string, sdk: string) =>
     `Tourniquet : ${name} — adresse ${ip}:${port} — ${sdk}. L'effacement est lié à cette adresse.`,
   sdkNames: { ZK_PULLSDK: "PullSDK (contrôleur C3)", ZK_STANDALONE: "zkemkeeper (terminal autonome)" } as Record<string, string>,
@@ -108,6 +149,7 @@ const fr = {
     erase_fingerprints: "Empreintes effacées (administrateurs conservés)",
     counts_after: "Comptage après et vérification",
     erase_recorded: "Effacement enregistré : le dernier résultat d'écriture de chaque membre devient « inconnu »",
+    not_refilled: "Personnes hors de la liste du remplissage vérifiées sur la sauvegarde",
     forget: "Enregistrements de MonClub oubliés",
     keep_records: "Enregistrements gardés : tout sera réécrit",
     records_invalidated: "Enregistrements gardés, marqués à réécrire",
@@ -174,13 +216,14 @@ const fr = {
     RUN_NOT_STARTED: "L'effacement n'a pas pu démarrer : rien n'a été effacé. Réessayez.",
     NOT_ON_HOLD: "Ce tourniquet n'est plus en attente.",
     RECORDS_NOT_RESET: "Les enregistrements de MonClub n'ont pas pu être remis à zéro : le tourniquet reste en attente. Réessayez.",
-    OTHER_PCS_NOT_CONFIRMED: "Confirmez que MonClub Access est fermé sur tous les autres PC de cette salle.",
+    OTHER_PCS_NOT_CONFIRMED:
+      "Confirmez que MonClub Access est fermé sur tous les autres PC de cette salle (watchdog désactivé, « Ouvrir MonClub Access avec Windows » décoché).",
     HELD_USE_REFILL:
       "Ce tourniquet est déjà en attente depuis un effacement : choisissez « Attendre que j'appuie sur « Remplir » », puis appuyez sur « Remplir ».",
     REFILL_SOURCE_MISSING:
       "Ce PC n'a pas de liste des membres pour remplir le tourniquet : rien n'est effacé. Synchronisez, puis relisez.",
     REFILL_SOURCE_STALE:
-      "La dernière synchronisation avec MonClub n'a pas réussi (ou aucune depuis le démarrage d'Access) : la liste des membres peut être incomplète. Synchronisez, puis relisez.",
+      "La liste des membres de ce PC n'est pas récente (dernière synchronisation en échec, trop ancienne, ou aucune depuis le démarrage d'Access) : attendez la prochaine synchronisation, puis relisez. Rien n'est effacé.",
     REFILL_SOURCE_EMPTY: "Le remplissage n'écrirait aucun membre sur ce tourniquet : rien n'est effacé.",
     REFILL_WITHHELD:
       "Des membres n'ont pas de numéro de compte dans la liste de ce PC : en « Par personne », le remplissage ne les écrirait pas. La liste des membres doit d'abord être relue en entier.",
@@ -192,6 +235,16 @@ const fr = {
     RESULTS_NOT_RESET: "L'effacement n'a pas pu être enregistré avant la première suppression : rien n'a été effacé.",
     ADMIN_PIN_IN_ROSTER:
       "Un administrateur du terminal a le même numéro qu'un membre : le remplissage l'écraserait. Changez le numéro de cet administrateur sur le terminal : rien n'a été effacé.",
+    NOT_REFILLED_UNKNOWN:
+      "La liste des utilisateurs du tourniquet n'a pas pu être lue : on ne sait pas qui le remplissage ne remettrait pas. Relisez l'étape 1 : rien n'est effacé.",
+    NOT_REFILLED_UNCONFIRMED:
+      "Des personnes de ce tourniquet ne seront pas remises par le remplissage : cochez la case qui le confirme (étape 4).",
+    NOT_REFILLED_CHANGED:
+      "Au moment d'effacer, le tourniquet portait des personnes hors de la liste du remplissage qui n'étaient pas affichées à l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
+    KEEP_MARK_NOT_WRITTEN:
+      "La marque qui garde la sauvegarde sans limite de durée n'a pas pu être écrite : rien n'a été effacé.",
+    PIN_SCHEME_CHANGED:
+      "Le schéma de numérotation du tourniquet a changé depuis l'étape 1 : rien n'a été effacé. Relisez l'étape 1.",
     NOT_VERIFIED: "L'effacement n'a pas pu être vérifié : des lignes restent, ou un comptage ou une liste n'a pas répondu.",
     ERASE_FAILED: "Une commande d'effacement a échoué : une partie a peut-être été effacée.",
     NO_ANSWER: "Une commande a été envoyée sans réponse : elle a peut-être agi.",
@@ -201,7 +254,11 @@ const fr = {
     ERASE_NOT_ENABLED:
       "L'effacement n'est pas activé pour cette salle — le propriétaire peut l'activer dans le tableau de bord (page PC d'accès).",
     ERASE_SWITCH_UNCHECKED:
-      "L'activation de l'effacement pour cette salle n'a pas pu être vérifiée : rien n'est effacé. Réessayez (Internet requis).",
+      "L'activation de l'effacement pour cette salle n'a pas pu être vérifiée : le serveur MonClub a répondu autre chose que prévu. Rien n'est effacé.",
+    ERASE_SWITCH_MISSING:
+      "Le serveur MonClub ne propose pas encore l'activation de l'effacement : l'effacement n'est pas disponible avant sa mise à jour. Rien n'est effacé ; réessayer ne change rien d'ici là.",
+    ERASE_SWITCH_UNREACHABLE:
+      "Le serveur MonClub n'a pas répondu à la vérification de l'activation : vérifiez Internet, puis réessayez. Rien n'est effacé.",
   } as Record<string, string>,
   schemes: { ACCOUNT: "Par personne", MEMBERSHIP: "Par abonnement" } as Record<string, string>,
   mbPasses: (n: number) =>
@@ -212,6 +269,25 @@ const fr = {
   refilledWith: (s: string) => `Remplissage lancé, schéma ${s}.`,
   backupsNotMarked:
     "Attention : la date du remplissage n'a pas pu être notée dans les sauvegardes ; elles seront supprimées 30 jours après l'effacement.",
+  // What « Remplir » reports (lane 1c, review F1): warnings, never a refusal.
+  refillWarn: {
+    REFILL_WITHHELD: (n: number, s: string) =>
+      `Attention : ${n} membre(s) n'ont pas de numéro de compte dans la liste de ce PC : en « ${s} », ils ne sont pas écrits sur le tourniquet.`,
+    REFILL_SOURCE_STALE: () =>
+      "Attention : la liste des membres de ce PC n'est pas récente : le remplissage écrit la liste qu'il a ; la prochaine synchronisation réussie apportera les changements.",
+    REFILL_SOURCE_MISSING: () =>
+      "Attention : ce PC n'a pas de liste des membres : le tourniquet reste vide jusqu'à ce qu'une synchronisation en apporte une.",
+    REFILL_SOURCE_EMPTY: () =>
+      "Attention : la liste des membres de ce PC ne contient aucun membre pour ce tourniquet : rien n'y est écrit.",
+  } as Record<string, (n: number, s: string) => string>,
+  adminClash: (pins: string[], s: string) =>
+    `D'après la sauvegarde de l'effacement, ${pins.length} administrateur(s) du terminal ont le même numéro qu'un membre en « ${s} » (${pins.join(", ")}) : le remplissage écrirait ces membres à leur place, sans droits d'administrateur. « Remplir » ne relit pas le terminal : changez leur numéro sur le terminal puis confirmez ci-dessous, ou confirmez pour qu'ils soient remplacés.`,
+  confirmAdminOverwrite: (pins: string[]) =>
+    `Je confirme pour les administrateurs ${pins.join(", ")} : leur numéro a été changé sur le terminal, ou ils seront remplacés par les membres du même numéro.`,
+  refillWarnAdmins: (pins: string[]) =>
+    `Administrateurs confirmés (numéro changé sur le terminal, ou remplacés par le membre du même numéro) : ${pins.join(", ")}.`,
+  refillWarnAdminsUnchecked:
+    "Les administrateurs du terminal n'ont pas pu être vérifiés (sauvegarde illisible) : un administrateur qui a le numéro d'un membre sera remplacé par ce membre.",
   notOnHold: "Ce tourniquet n'est plus en attente.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {
@@ -268,6 +344,19 @@ const en: typeof fr = {
   heldAlready:
     "This turnstile is already on hold after an erase: only the Refill button releases it. Choose 'Hold until I press Refill'.",
   refillWillWrite: (n: number, s: string) => `The refill will write ${n} member(s) to this turnstile (scheme ${s}).`,
+  listAge: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+    (ageSec === null || ageSec === undefined
+      ? "Member list: no successful sync since Access started."
+      : `Member list received from MonClub ${ageSec < 60 ? "less than a minute ago" : `${Math.floor(ageSec / 60)} min ago`}`
+        + (maxSec ? ` (it must be less than ${Math.round(maxSec / 60)} min old).` : ".")),
+  stale: {
+    TOO_OLD: (ageSec: number | null | undefined, maxSec: number | null | undefined) =>
+      `The member list is not recent: the last successful sync was ${Math.floor((ageSec ?? 0) / 60)} min ago (limit ${Math.round((maxSec ?? 600) / 60)} min). Wait for the next sync, then read again: nothing is erased.`,
+    LAST_SYNC_FAILED: () =>
+      "The last sync with MonClub did not succeed: the member list may be incomplete. Wait for the next successful sync, then read again: nothing is erased.",
+    NO_SYNC_YET: () =>
+      "No sync with MonClub has succeeded since Access started: the member list may be incomplete. Wait for the next sync, then read again: nothing is erased.",
+  },
   refillIfAccount: (n: number, w: number) =>
     w > 0
       ? `Under 'Par personne': ${n} member(s), and ${w} without an account number, who would not be written.`
@@ -279,10 +368,34 @@ const en: typeof fr = {
     "After this erase NO member gets through the turnstile by card or fingerprint until Refill is pressed (the internet is needed).",
   lockoutRefill:
     "During the erase and until the refill has finished, members do not get through the turnstile by card or fingerprint.",
+  lockoutFingersHold:
+    "After this erase, members who pass by fingerprint do not get through until Refill is pressed (the internet is needed). Cards keep working.",
+  lockoutFingersRefill:
+    "During the erase and until the refill has finished, members who pass by fingerprint do not get through. Cards keep working.",
+  finishNotes: {
+    HELD_BEFORE: "The turnstile was already on hold after an earlier erase: it stays on hold. Press Refill.",
+    PIN_SCHEME_CHANGED: "The pin scheme changed during the erase: the turnstile stays on hold. Check the scheme, then press Refill.",
+    PIN_SCHEME_UNREADABLE: "The pin scheme could not be read again at the end: the turnstile stays on hold. Press Refill.",
+    HELD_SCHEME_MOVED:
+      "The pin scheme changed during the run, before anything was erased: the turnstile stays on hold, because it still holds every number of the old scheme. Do not press Refill as it is: erase it again with 'Hold until I press Refill', or set the old scheme back, then Refill.",
+    HELD_SCHEME_UNREADABLE:
+      "The pin scheme could not be read after the stop: the turnstile stays on hold as a precaution (nothing was erased). Check the scheme in the dashboard: unchanged since step 1, Refill puts everyone back; changed, erase again with 'Hold…' before Refill.",
+  },
+  notRefilledTitle: (n: number, s: string) =>
+    `${n} person(s) on this turnstile will NOT be put back by the refill: they are not in MonClub's member list for this turnstile (scheme ${s}) — staff or cleaners enrolled on the turnstile, another system's users, members no longer allowed there. What the erase takes from them (user, card, door rights, fingerprints) does not come back.`,
+  notRefilledBackup:
+    "Their only copy is this erase's backup: it is kept with no time limit (never deleted after 30 days).",
+  notRefilledTick: (n: number) =>
+    `I have read the list: these ${n} person(s) will not be put back by the refill.`,
+  notRefilledNone: "Everyone on this turnstile is in the refill's list.",
+  notRefilledUnknown:
+    "The turnstile's user list could not be read: who the refill would not put back is unknown. Read step 1 again.",
+  notRefilledKept: (n: number) =>
+    `${n} erased person(s) are not in the refill's list: this erase's backup is kept with no time limit.`,
   otherPcsTitle:
-    "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile.",
+    "Close MonClub Access on every other PC of this gym and keep it closed until Refill: the hold binds THIS PC only, the others would keep writing to this turnstile. Quitting is not enough: Access's watchdog starts it again within minutes, and the start with Windows at the next logon.",
   otherPcsTick:
-    "MonClub Access is closed on every other PC of this gym, and stays closed until the refill.",
+    "MonClub Access is closed on every other PC of this gym — on each: 'Ouvrir MonClub Access avec Windows' unticked, the watchdog switched off (Disable-ScheduledTask -TaskName 'MonClub Access Watchdog'), then Quit — and stays closed until the refill.",
   deviceLine: (name: string, ip: string, port: string, sdk: string) =>
     `Turnstile: ${name} — address ${ip}:${port} — ${sdk}. The erase is tied to this address.`,
   sdkNames: { ZK_PULLSDK: "PullSDK (C3 controller)", ZK_STANDALONE: "zkemkeeper (standalone terminal)" },
@@ -337,6 +450,7 @@ const en: typeof fr = {
     erase_fingerprints: "Fingerprints erased (administrators kept)",
     counts_after: "Counts after, and check",
     erase_recorded: "Erase recorded: each member's last write result becomes 'unknown'",
+    not_refilled: "People outside the refill's list checked against the backup",
     forget: "MonClub's records forgotten",
     keep_records: "Records kept: everyone will be written again",
     records_invalidated: "Records kept, marked to be written again",
@@ -402,13 +516,14 @@ const en: typeof fr = {
     RUN_NOT_STARTED: "The erase could not start: nothing was erased. Try again.",
     NOT_ON_HOLD: "This turnstile is no longer on hold.",
     RECORDS_NOT_RESET: "MonClub's records could not be reset: the turnstile stays on hold. Try again.",
-    OTHER_PCS_NOT_CONFIRMED: "Confirm that MonClub Access is closed on every other PC of this gym.",
+    OTHER_PCS_NOT_CONFIRMED:
+      "Confirm that MonClub Access is closed on every other PC of this gym (watchdog switched off, 'Ouvrir MonClub Access avec Windows' unticked).",
     HELD_USE_REFILL:
       "This turnstile is already on hold after an erase: choose 'Hold until I press Refill', then press Refill.",
     REFILL_SOURCE_MISSING:
       "This PC has no member list to refill the turnstile from: nothing is erased. Synchronize, then read again.",
     REFILL_SOURCE_STALE:
-      "The last sync with MonClub did not succeed (or none ran since Access started): the member list may be incomplete. Synchronize, then read again.",
+      "This PC's member list is not recent (the last sync failed, is too old, or none succeeded since Access started): wait for the next sync, then read again. Nothing is erased.",
     REFILL_SOURCE_EMPTY: "The refill would write no member to this turnstile: nothing is erased.",
     REFILL_WITHHELD:
       "Some members have no account number in this PC's list: under 'Par personne' the refill would not write them. The member list must be read again in full first.",
@@ -420,6 +535,16 @@ const en: typeof fr = {
     RESULTS_NOT_RESET: "The erase could not be recorded before its first delete: nothing was erased.",
     ADMIN_PIN_IN_ROSTER:
       "A terminal administrator has the same number as a member: the refill would overwrite it. Change that administrator's number on the terminal: nothing was erased.",
+    NOT_REFILLED_UNKNOWN:
+      "The turnstile's user list could not be read: who the refill would not put back is unknown. Read step 1 again: nothing is erased.",
+    NOT_REFILLED_UNCONFIRMED:
+      "Some people on this turnstile will not be put back by the refill: tick the box that confirms it (step 4).",
+    NOT_REFILLED_CHANGED:
+      "When the erase was about to start, the turnstile held people outside the refill's list who were not shown at step 1: nothing was erased. Read step 1 again.",
+    KEEP_MARK_NOT_WRITTEN:
+      "The mark that keeps the backup with no time limit could not be written: nothing was erased.",
+    PIN_SCHEME_CHANGED:
+      "The turnstile's pin scheme changed since step 1: nothing was erased. Read step 1 again.",
     NOT_VERIFIED: "The erase could not be verified: rows remain, or a count or a listing did not answer.",
     ERASE_FAILED: "An erase command failed: part of it may have been erased.",
     NO_ANSWER: "A command was sent and got no answer: it may have acted.",
@@ -429,7 +554,11 @@ const en: typeof fr = {
     ERASE_NOT_ENABLED:
       "Erasing is not enabled for this gym — the owner can enable it in the dashboard (access PCs page).",
     ERASE_SWITCH_UNCHECKED:
-      "Whether erasing is enabled for this gym could not be checked: nothing is erased. Try again (the internet is needed).",
+      "Whether erasing is enabled for this gym could not be checked: the MonClub server answered something unexpected. Nothing is erased.",
+    ERASE_SWITCH_MISSING:
+      "The MonClub server does not offer the erase switch yet: erasing is not available until the server is updated. Nothing is erased; trying again changes nothing until then.",
+    ERASE_SWITCH_UNREACHABLE:
+      "The MonClub server did not answer the switch check: check the internet, then try again. Nothing is erased.",
   },
   schemes: { ACCOUNT: "Par personne (per person)", MEMBERSHIP: "Par abonnement (per membership)" },
   mbPasses: (n: number) =>
@@ -440,6 +569,24 @@ const en: typeof fr = {
   refilledWith: (s: string) => `Refill started, scheme ${s}.`,
   backupsNotMarked:
     "Warning: the refill date could not be noted in the backups; they will be deleted 30 days after the erase.",
+  refillWarn: {
+    REFILL_WITHHELD: (n: number, s: string) =>
+      `Warning: ${n} member(s) have no account number in this PC's list: under ${s} they are not written to the turnstile.`,
+    REFILL_SOURCE_STALE: () =>
+      "Warning: this PC's member list is not recent: the refill writes the list it has; the next successful sync brings the changes.",
+    REFILL_SOURCE_MISSING: () =>
+      "Warning: this PC has no member list: the turnstile stays empty until a sync brings one.",
+    REFILL_SOURCE_EMPTY: () =>
+      "Warning: this PC's member list holds no member for this turnstile: nothing is written to it.",
+  },
+  adminClash: (pins: string[], s: string) =>
+    `According to the erase's backup, ${pins.length} terminal administrator(s) have the same number as a member under '${s}' (${pins.join(", ")}): the refill would write those members over them, without administrator rights. Refill does not read the terminal again: change their number on the terminal then confirm below, or confirm to have them replaced.`,
+  confirmAdminOverwrite: (pins: string[]) =>
+    `I confirm for administrators ${pins.join(", ")}: their number was changed on the terminal, or they will be replaced by the members with the same number.`,
+  refillWarnAdmins: (pins: string[]) =>
+    `Administrators confirmed (number changed on the terminal, or replaced by the member with the same number): ${pins.join(", ")}.`,
+  refillWarnAdminsUnchecked:
+    "The terminal's administrators could not be checked (backup unreadable): an administrator who has a member's number will be replaced by that member.",
   notOnHold: "This turnstile is no longer on hold.",
   progress: (d: number, t: number) => `${d} / ${t}`,
   tableLabels: {

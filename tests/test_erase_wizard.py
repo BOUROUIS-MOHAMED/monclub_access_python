@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -117,9 +118,11 @@ class FakeSched:
 
 
 def _app(workers):
+    # A getSyncData that succeeded just now (lane 1c: the member list's age limit reads the
+    # monotonic stamp app.py records with the success).
     return SimpleNamespace(_ultra_engine=SimpleNamespace(running=True, _workers=workers,
                                                          _sync_scheduler=FakeSched()),
-                           _last_sync_ok=True)
+                           _last_sync_ok=True, _last_sync_ok_mono=time.monotonic())
 
 
 # What the refill would write (lane 1b, review C1): the sync cache's members. Membership pins
@@ -217,7 +220,8 @@ class TestPreview:
         assert rows["transaction"]["count"] == 1
         assert rows["transaction"]["erasable"] is False
         assert rows["transaction"]["reason"] == "DOOR_LOG_NOT_SUPPORTED"
-        assert {c[0] for c in panel.calls} == {"count"}, "step 1 only counts"
+        # Step 1 counts, and reads the user list (lane 1c: who the refill will not put back).
+        assert {c for c in panel.calls if c[0] != "count"} == {("read", "user")}, panel.calls
         assert not device_hold.is_held(5)
 
     def test_a_turnstile_this_pc_does_not_drive_is_refused(self, sqlite_db, monkeypatch, tmp_path):
@@ -241,6 +245,7 @@ class TestNothingIsErasedWithout:
     def test_the_admin_password(self, sqlite_db, monkeypatch, tmp_path):
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         _, pv = wiz.preview(5)
+        panel.calls.clear()                       # step 1's own reads (lane 1c) are not the point
         status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_bad)
         assert status == 401 and out["code"] == "ADMIN_PASSWORD"
         assert all(c[0] == "count" for c in panel.calls) and panel.tables["user"]
@@ -540,8 +545,10 @@ def _terminal():
 
 
 def _mb_body(pid, **kw):
+    # "Old system" (777) is on the terminal and not in the refill roster: accepted (lane 1c, C0).
     b = {"previewId": pid, "tables": ["users"], "forget": True, "refill": "hold",
-         "typedName": "Sortie", "password": "pw", "otherPcsClosed": True}
+         "typedName": "Sortie", "password": "pw", "otherPcsClosed": True,
+         "acceptNotRefilled": True}
     b.update(kw)
     return b
 
@@ -1076,6 +1083,7 @@ class TestC3UsersNeedsRightsAndFingers:
             self, sqlite_db, monkeypatch, tmp_path, tables, forget):
         wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         _, pv = wiz.preview(5)
+        panel.calls.clear()                       # step 1's own reads (lane 1c) are not the point
         status, out = wiz.start(5, _body(pv["previewId"], tables=tables, forget=forget),
                                 verify_password=_pw_ok)
         assert status == 400 and out["code"] == "USER_NEEDS_RIGHTS_AND_FINGERS"
@@ -1524,6 +1532,7 @@ class TestTheWorkerMustBeOnTheRecordedAddress:
         assert status == 409 and out["code"] == "ADDRESS_CHANGED" and panel.calls == []
         worker._connected_addr = ("192.168.0.202", 4370)
         _, pv = wiz.preview(5)
+        panel.calls.clear()                       # step 1's own reads (lane 1c) are not the point
         worker._connected_addr = ("192.168.0.203", 4370)
         status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
         assert status == 409 and out["code"] == "ADDRESS_CHANGED"
@@ -1554,6 +1563,7 @@ class TestTheWorkerMustBeOnTheRecordedAddress:
     def test_the_address_is_checked_before_the_backup(self, sqlite_db, monkeypatch, tmp_path):
         wiz, worker, panel, _ = _setup_c3(monkeypatch, tmp_path, sqlite_db)
         _, pv = wiz.preview(5)
+        panel.calls.clear()                       # step 1's own reads (lane 1c) are not the point
         real = wiz._wait_idle
 
         def _idle_then_moved(did):
@@ -1608,6 +1618,7 @@ def test_a_run_thread_that_cannot_start_leaves_no_run_behind(sqlite_db, monkeypa
 
     wiz._spawn = _boom
     _, pv = wiz.preview(5)
+    panel.calls.clear()                           # step 1's own reads (lane 1c) are not the point
     status, out = wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
     assert status == 503 and out["code"] == "RUN_NOT_STARTED"
     assert wiz.status()["running"] is False and wiz.running_device() is None
