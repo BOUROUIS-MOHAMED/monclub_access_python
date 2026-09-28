@@ -774,3 +774,25 @@ class TestReviewRound1:
     def test_the_page_blocks_a_leftover_erase_prep_row_too(self):
         dialog = _ts("components/EraseWizardDialog.tsx")
         assert '"erase-prep"' in dialog and "holdTerminal !== holdScheme" in dialog
+
+
+class TestReviewRound2:
+
+    def test_a_row_that_records_no_scheme_gets_a_note_that_matches_the_refusal(self, sqlite_db,
+                                                                               monkeypatch, tmp_path):
+        db = sqlite_db
+        wiz, _w, panel, _ = _setup_c3(monkeypatch, tmp_path, db)
+        db.set_device_write_hold(device_id=5, reason=db.HOLD_REASON_ERASE_PREP, run_id="r0")
+        db.keep_erase_hold_after_scheme_move(device_id=5, run_id="r0")      # an earlier build's row
+        device_hold.load()
+        _scheme(monkeypatch, "MEMBERSHIP")
+        pv = _preview(wiz, 5)
+        _moved_during_backup(monkeypatch, panel)
+        wiz.start(5, _body(pv["previewId"]), verify_password=_pw_ok)
+        note = _note(wiz)
+        assert note.startswith("HELD_SCHEME_MOVED:") and "Refill is refused" in note, note
+        assert "accepted only under" not in note
+
+    def test_the_devices_page_tooltip_covers_a_leftover_erase_prep_row(self):
+        page = _ts("pages/DevicesPage.tsx")
+        assert 'h.reason === "erase-prep" && h.terminalScheme != null' in page

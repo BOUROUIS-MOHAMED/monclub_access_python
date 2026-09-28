@@ -1281,13 +1281,20 @@ class EraseWizard:
         run's start scheme (review round 1 of lane 1e). One recovery sentence, the runbook's: set
         that scheme back, then erase again with 'hold' (or Refill to release it, erasing nothing)."""
         terminal = run_scheme
+        unrecorded = False
         try:
-            recorded = (device_hold.holds_detail().get(did) or {}).get("terminalScheme")
-            if recorded is not None:
-                terminal = recorded
+            row = device_hold.holds_detail().get(did) or {}
+            if row.get("terminalScheme") is not None:
+                terminal = row["terminalScheme"]
+            else:
+                # A row an earlier build wrote at erase-scheme-moved records none: Refill refuses it
+                # whatever the scheme (review round 2 of lane 1e, nit).
+                unrecorded = row.get("reason") == device_hold.REASON_SCHEME_MOVED
         except Exception:
             pass
-        what = (f"Refill is accepted only under {terminal} -- set the scheme back to {terminal}, then "
+        what = ("Refill is refused: which scheme the terminal's pins were written under is not "
+                "recorded -- erase it again with 'hold'" if unrecorded else
+                f"Refill is accepted only under {terminal} -- set the scheme back to {terminal}, then "
                 "erase it again with 'hold' (or Refill to release it, erasing nothing)")
         try:
             now = self._pin_scheme_strict(did)
