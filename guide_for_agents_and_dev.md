@@ -786,8 +786,9 @@ Backend branch `claude/heartbeat-os-platform` adds `HeartbeatRequest.platform`, 
 `gym_access_pc.os_arch / os_version / os_release / python_bits / platform_reported_at` (compare-and-set after the
 liveness write; a heartbeat without the key leaves the last report; adoption clears it; hand-run
 `V125__add_gym_access_pc_platform.sql`) and returns it as `PcSummary.platform`; dashboard branch
-`claude/heartbeat-os-platform` shows it on `/access-pcs`. `[UNVERIFIED]` none of the three branches is merged or
-deployed, and no PC has been seen sending the key to a backend that stores it.
+`claude/heartbeat-os-platform` shows it on `/access-pcs`. All three branches were merged on 2026-09-29 (Access master
+a3307bb, backend main 74697bf3, dashboard main f916d35c). `[UNVERIFIED]` not deployed yet, and no PC has been seen
+sending the key to a backend that stores it.
 
 **What does not change.** Card checks (`verify_card`), the staff-RFID rescue, and the staff QR
 re-entry exemption: the exemption reads `user["membershipId"]`, and `user` was already `None`
@@ -4859,8 +4860,10 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
 - **Windows 10 or newer is required**: Python 3.14 supports Windows 10+ only (3.13 was the last
   for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Updates apply by
   zip (`MonClubAccessUpdater`), which the installer check does not cover; the owner confirmed on
-  2026-09-29 that every client PC runs Windows 10+, and the heartbeat's Windows version (Access PCs
-  page) is how to re-check it. `[FIELD: owner statement]`
+  2026-09-29 that every client PC runs Windows 10+. The heartbeat's Windows version (Access PCs
+  page) is reported only by builds from 1.4.35 on, the same build that needs Windows 10, so it
+  cannot survey the fleet beforehand: a PC that never shows 1.4.35 after the update window is the
+  signal to check. `[FIELD: owner statement]`
 - **`zkemkeeper` is a COM server — shipping the DLL is not enough.** It must be
   **registered** (`regsvr32`, elevated, 32-bit) along with its dependencies.
   `[FIELD: an unregistered COM server was one of the two root causes of the MB2000
