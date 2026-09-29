@@ -2,7 +2,7 @@
     "component":  "tv",
     "displayName":  "MonClub TV",
     "productArtifact":  "MonClubTV",
-    "sourceExe":  "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\src-tauri\\target\\release\\monclub-access-ui.exe",
-    "stagedExe":  "C:\\Users\\mohaa\\Desktop\\monclub_access_python\\tauri-ui\\component-shells\\MonClubTV\\monclub-tv-ui.exe",
-    "builtAtUtc":  "2026-09-09T22:48:50.9871901Z"
+    "sourceExe":  "D:\\Monclub\\monclub_access_python\\tauri-ui\\src-tauri\\target\\release\\monclub-access-ui.exe",
+    "stagedExe":  "D:\\Monclub\\monclub_access_python\\tauri-ui\\component-shells\\MonClubTV\\monclub-tv-ui.exe",
+    "builtAtUtc":  "2026-09-29T14:40:35.6754560Z"
 }
