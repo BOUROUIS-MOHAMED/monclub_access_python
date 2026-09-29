@@ -85,7 +85,7 @@ export function AccessFeedbackProvider({ children }: { children: ReactNode }) {
     }
 
     if (eventType === "device_push_success" && config.push_success_repeat_mode === "per_run") {
-      const syncRunId = Number(payload.syncRunId || 0);
+      const syncRunId = Number(("syncRunId" in payload ? payload.syncRunId : 0) || 0);
       if (syncRunId > 0) {
         if (seenPushRunsRef.current.has(syncRunId)) {
           return;
