@@ -170,8 +170,9 @@ if ($RecreateVenv -and (Test-Path ".\.venv")) {
 
 # The release is built with exactly this Python minor version, taken through the py launcher
 # rather than whatever `python` is first on PATH (that is how 3.11 stayed in use unnoticed).
-# Python 3.14 runs on Windows 10 and newer only: do not publish a 3.14 build before every
-# gym PC's heartbeat reports Windows 10+ (the Access PCs page shows it).
+# Python 3.14 runs on Windows 10 and newer only. The owner confirmed on 2026-09-29 that every
+# client PC runs Windows 10+; the heartbeat's Windows version (Access PCs page) keeps checking it,
+# and both installers refuse older Windows (MinVersion=10.0).
 $RequiredPythonMinor = "3.14"
 $pyTag = if ($meta.Requires32BitPython) { "-$RequiredPythonMinor-32" } else { "-$RequiredPythonMinor" }
 
