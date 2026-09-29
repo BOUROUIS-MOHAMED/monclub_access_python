@@ -447,7 +447,7 @@ more detail:
   (plan G9) `[CODE: ultra_engine.py::_drain_finger_sweep, ::_sweep_check, _FINGER_SWEEP_DAILY_CAP]` -- a
   member in the `member_terminal_only_finger` rows who was not re-enrolled (N2) loses that finger at
   the door. Either you keep P1 on the new Access and its log is read every day as plan Phase D2 says
-  (`[T] TEMPLATE_VERSION_MISMATCH` → stop, call the developer, as plan E11's fail column -- not plan D2's « go back »: the night takes no D0 copy, and the old Access comes back only as the next sentence allows; eleventh round; `[T] FINGER_SWEEP … cleared=` above 0 on a
+  (`[T] TEMPLATE_VERSION_MISMATCH` → stop, call the developer, as plan E11's fail column -- not plan D2's rollback: the night takes no D0 copy, and the old Access comes back only as the next sentence allows; eleventh round; `[T] FINGER_SWEEP … cleared=` above 0 on a
   pin of the detail CSV → re-enrol that member; `REVOKE_ABORTED`, `CAPACITY_FULL` → the developer), with
   the desk re-enrolling the listed members as they come (E2) -- or P1 gets its old Access back with
   part F's gym 45 row "The new Access does not start -- before the erase" (its D3 copy and previous
