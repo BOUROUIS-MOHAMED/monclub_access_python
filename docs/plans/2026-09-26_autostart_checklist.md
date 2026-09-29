@@ -9,7 +9,7 @@ Three things are needed, all three: the PC switches itself on when power returns
 opens the session by itself (auto-logon), and MonClub Access starts in that session (watchdog, or the
 "Ouvrir MonClub Access avec Windows" box). The installer's own default for the watchdog: **ticked for a
 new install** from the release that contains branch `claude/installer-watchdog-fix` (built 2026-09-27,
-merged into `master` as `3835ae3`; its later hardening, `2f3d5bd` and after, not merged yet; not
+merged into `master` as `3835ae3`; its later hardening, `2f3d5bd` and after, merged as `aa3445d`; not
 released); an existing install keeps its previous choice, and one whose version
 predates the box gets it unticked (section 3). **Until that release, and on any existing install, tick
 it by hand** -- except during the cutover night, when every install leaves it **unticked** and the
@@ -100,9 +100,9 @@ the turnstiles). Windows Update may restart the PC at night: with auto-logon it 
   -- over a task that exists and is disabled, it keeps it disabled: use `Enable-ScheduledTask` then.
   Check: `Get-ScheduledTask -TaskName 'MonClub Access Watchdog'`, and
   `Get-ScheduledTaskInfo 'MonClub Access Watchdog' | Select NextRunTime` -- empty means no check will
-  run before the next Windows logon. The script on `master` `d3725fa` has only a logon trigger, so right
-  after an install that is expected; the owner's edit (committed 2026-09-27 as `b30ef60` on that branch,
-  not merged) adds a second trigger that starts at once, and with it an empty `NextRunTime` right after
+  run before the next Windows logon. The script before `3835ae3` (`master` `d3725fa`) has only a logon trigger, so
+  right after an install of it that is expected; the owner's edit (committed 2026-09-27 as `b30ef60`, merged
+  into `master` with `3835ae3`, not released) adds a second trigger that starts at once, and with it an empty `NextRunTime` right after
   the install is a fault for an **enabled** task (`packaging/watchdog/README.md`; a disabled task has
   none).
 - **What the watchdog does not know:** a tray Quit. It restarts Access after two missed checks in a

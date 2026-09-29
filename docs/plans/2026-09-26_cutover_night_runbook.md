@@ -12,9 +12,9 @@ For the owner. Plain steps, in the order of the night. The evidence behind each 
 >    `master` since `804f4d2`; the installer and the watchdog -- on `master` since `3835ae3` and
 >    `aa3445d`; none of it released) and its version and shell gates (§2).
 > 2. **The erase** -- **decided 2026-09-27:** the "Erase content" wizard in Access, for C3-400 and MB2000
->    (release checklist §3a). It is on `master` (lanes 1 to 1h, `257aa45`; lane 1h's last code commit `7693289`);
->    lane 1i's fixes are on branch `claude/lane1i-runbook-fixes` (last code commit `2004f76`), to be merged by
->    the master session. **C6 and D6 below now use it**, in the
+>    (release checklist §3a). It is on `master` (lanes 1 to 1i: lane 1h `257aa45`; lane 1i merged as `31f9a0a`, its last code
+>    commit `2004f76`; the popup idle-screen fix merged after it as `e900799`), not released.
+>    **C6 and D6 below now use it**, in the
 >    owner's order (fifth round, 2026-09-27): the wizard switched ON for the gym in the dashboard **on the
 >    cutover evening** (it switches itself off 48 h later, lane 3d), erase with "hold until Refill", switch the
 >    turnstile to « Par personne », restart, Refill, the wizard switched OFF after the night. **It needs the
