@@ -5409,7 +5409,8 @@ _popup_today_cache: Dict[str, Any] = {"day": "", "value": 0, "at": 0.0}
 
 _POPUP_CREDS_TTL_SEC = 60.0
 _popup_creds_lock = threading.Lock()
-_popup_creds_cache: Dict[str, Any] = {"value": None, "at": 0.0}
+# "valid" tells a cached None (no devices, or the read failed) from nothing cached yet.
+_popup_creds_cache: Dict[str, Any] = {"valid": False, "value": None, "at": 0.0}
 
 
 def _popup_enabled_credentials() -> Optional[Dict[str, bool]]:
@@ -5422,11 +5423,14 @@ def _popup_enabled_credentials() -> Optional[Dict[str, bool]]:
     existing wording rather than being told something equally unfounded.
 
     TTL-cached: the popup polls every ~1.5s and these flags change at sync speed.
+    The None result is cached too (a PC with no devices, or a failed read): it
+    would otherwise query the DB on every poll.
     """
     now = time.time()
     with _popup_creds_lock:
-        if _popup_creds_cache["value"] is not None and now - float(_popup_creds_cache["at"]) < _POPUP_CREDS_TTL_SEC:
-            return dict(_popup_creds_cache["value"])
+        if _popup_creds_cache.get("valid") and now - float(_popup_creds_cache["at"]) < _POPUP_CREDS_TTL_SEC:
+            cached = _popup_creds_cache["value"]
+            return dict(cached) if cached else None
 
     value: Optional[Dict[str, bool]] = None
     try:
@@ -5449,6 +5453,7 @@ def _popup_enabled_credentials() -> Optional[Dict[str, bool]]:
     with _popup_creds_lock:
         _popup_creds_cache["value"] = value
         _popup_creds_cache["at"] = now
+        _popup_creds_cache["valid"] = True
     return dict(value) if value else None
 
 
