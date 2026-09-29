@@ -320,8 +320,11 @@ through MonClub, re-enable a template MonClub has but does not deliver
 *Not on the cutover night (the banner at the top): the runbook installs on P1 on the night, before the
 erase (D6). D2's log checks still apply to a P1 left on the new Access (runbook N3), but not D2's rollback:
 the night takes no D0 copy, so `TEMPLATE_VERSION_MISMATCH` then means stop, call the developer (E11's fail column),
-and the old Access comes back only as runbook N3 allows -- no « Effacer » pressed on either terminal that night, else
-only on the developer's word, after that terminal's D16 completion lines (runbook D6).*
+and the old Access comes back only as runbook N3 and D6 allow -- no « Effacer » pressed on either terminal that night,
+else only on the developer's word, after that terminal's D16 completion (runbook D6): a pass without
+`[T] FULL_SYNC_CAPPED` that ends with `[T] ZKEM_PUSH_DONE … failed=0 … tpl_failed=0` and `[T] FULL_SYNC_DONE … ok=True`,
+then a Quit and restart whose start-up pass logs `all N desired pins already on the terminal -- nothing to push`,
+with no `[T] SYNC_RETRY_BACKOFF` (E11: N counts members held in retry backoff too).*
 D0. Just before installing: Quit Access on P1 and copy its data folder (as B4). This copy is Phase
 D's rollback.
 D1. Install 1.4.35 on P1 (and on P2/P3 only if D2 brings them back). Check /access-pcs.
