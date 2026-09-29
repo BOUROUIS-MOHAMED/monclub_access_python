@@ -765,6 +765,30 @@ dashboard tests/gym-access-pc-qr-roster.test.ts, tests/gym-access-pc-model.test.
 none of the three branches is merged or deployed, and no PC has yet been seen sending the key to a
 backend that stores it.
 
+**The heartbeat's `platform` (2026-09-29).** The heartbeat also carries `platform`: `{osArch, osVersion,
+osRelease, pythonBits}` = `platform.machine()`, `platform.version()`, `platform.release()` and 32/64 from
+`app/core/arch.py::is_64bit_python`. Why: a Python 3.14 / 64-bit Access build cannot start on 32-bit Windows or on
+Windows older than 10 (3.14 drops 8.1), so the fleet must be known before one ships. `platform.machine()` honours
+`PROCESSOR_ARCHITEW6432`: the 32-bit Access Python on 64-bit Windows sends `AMD64`, `x86` means 32-bit Windows.
+`osVersion` is `major.minor.build` (build >= 22000 is Windows 11, `6.3.x` 8.1, `6.1.x` 7); Python 3.11's `osRelease`
+says `10` on Windows 11, so readers use `osVersion`. On 3.11 both go through `platform.uname()`, which runs
+`cmd /c ver` once per process and caches it (the start-up `platform_summary()` log line in `app.py` already
+triggers it); measured on a dev PC, `ver` gives build 26200 where `sys.getwindowsversion().platform_version` gives
+26100. Each field is read on its own (one that raises or is empty is left out), trimmed and cut to 32 characters; a
+complete report is cached for the process, a failed or partial one is not; nothing readable leaves the key out and
+the rest of the heartbeat unchanged. `[CODE: pc_identity.py::_platform_report, ::_read_platform]` `[TEST:
+test_pc_identity.py::test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots,
+::test_heartbeat_platform_is_this_pcs_real_windows_and_python, ::test_heartbeat_platform_is_read_once_and_cached,
+::test_heartbeat_platform_failure_leaves_the_key_out_and_is_retried,
+::test_heartbeat_platform_field_that_raises_is_left_out_and_not_cached,
+::test_heartbeat_platform_strings_are_trimmed_and_bounded]` A backend without the field ignores the key, as above.
+Backend branch `claude/heartbeat-os-platform` adds `HeartbeatRequest.platform`, keeps the latest report per PC in
+`gym_access_pc.os_arch / os_version / os_release / python_bits / platform_reported_at` (compare-and-set after the
+liveness write; a heartbeat without the key leaves the last report; adoption clears it; hand-run
+`V125__add_gym_access_pc_platform.sql`) and returns it as `PcSummary.platform`; dashboard branch
+`claude/heartbeat-os-platform` shows it on `/access-pcs`. `[UNVERIFIED]` none of the three branches is merged or
+deployed, and no PC has been seen sending the key to a backend that stores it.
+
 **What does not change.** Card checks (`verify_card`), the staff-RFID rescue, and the staff QR
 re-entry exemption: the exemption reads `user["membershipId"]`, and `user` was already `None`
 for a code whose grants are not listed, so a staff member off the list got no exemption before

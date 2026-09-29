@@ -418,8 +418,13 @@ def test_network_failure_is_swallowed_and_retried_later() -> None:
     assert service.heartbeat_once() is True
 
 
+_PLATFORM = {"osArch": "AMD64", "osVersion": "10.0.26200", "osRelease": "10", "pythonBits": 32}
+
+
 def test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots(monkeypatch) -> None:
     identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    monkeypatch.setattr(identity, "_read_platform", lambda: dict(_PLATFORM))
     cached = SimpleNamespace(
         devices=[
             {"id": 1, "accessDataMode": "AGENT"},
@@ -464,6 +469,7 @@ def test_heartbeat_payload_uses_existing_version_sync_and_worker_snapshots(monke
             "rosterBehind": 1,
             "refused": 1,
         },
+        "platform": _PLATFORM,
     }
 
 
@@ -560,6 +566,7 @@ def test_heartbeat_without_readable_roster_counts_leaves_the_key_out(monkeypatch
     identity = _identity_module()
     monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
     monkeypatch.setattr("app.core.access_verification.totp_roster_check_counts", counts)
+    monkeypatch.setattr(identity, "_platform_report", lambda: None)
 
     payload = identity.build_heartbeat_payload(_bare_app())
 
@@ -570,6 +577,96 @@ def test_heartbeat_without_readable_roster_counts_leaves_the_key_out(monkeypatch
         "lastSyncOk": False,
         "turnstiles": [],
     }
+
+
+def test_heartbeat_platform_is_this_pcs_real_windows_and_python(monkeypatch) -> None:
+    # The real readers on the machine running the tests: the shape the backend stores.
+    import re
+    import struct
+
+    identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+
+    report = identity.build_heartbeat_payload(_bare_app())["platform"]
+
+    assert set(report) == {"osArch", "osVersion", "osRelease", "pythonBits"}
+    assert report["pythonBits"] == struct.calcsize("P") * 8
+    if sys.platform == "win32":
+        assert report["osArch"] in {"AMD64", "x86", "ARM64"}
+        assert re.fullmatch(r"\d+\.\d+\.\d+", report["osVersion"])
+    assert all(len(report[key]) <= 32 for key in ("osArch", "osVersion", "osRelease"))
+
+
+def test_heartbeat_platform_is_read_once_and_cached(monkeypatch) -> None:
+    identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    calls = []
+    monkeypatch.setattr(identity, "_read_platform", lambda: calls.append(1) or dict(_PLATFORM))
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+
+    first = identity.build_heartbeat_payload(_bare_app())["platform"]
+    first["osArch"] = "mutated by a caller"
+    second = identity.build_heartbeat_payload(_bare_app())["platform"]
+
+    assert calls == [1]
+    assert second == _PLATFORM
+
+
+def test_heartbeat_platform_failure_leaves_the_key_out_and_is_retried(monkeypatch) -> None:
+    # A heartbeat that raises sends nothing: a failed read must cost only this key, and must
+    # not be cached, so the next beat tries again.
+    identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    results = [RuntimeError("uname"), dict(_PLATFORM)]
+
+    def _read():
+        result = results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(identity, "_read_platform", _read)
+
+    payload = identity.build_heartbeat_payload(_bare_app())
+    assert "platform" not in payload
+    assert payload["appVersion"] == "1.4.34"
+    assert identity.build_heartbeat_payload(_bare_app())["platform"] == _PLATFORM
+
+
+def test_heartbeat_platform_field_that_raises_is_left_out_and_not_cached(monkeypatch) -> None:
+    import platform
+
+    identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    monkeypatch.setattr(platform, "machine", lambda: (_ for _ in ()).throw(OSError("no env")))
+    monkeypatch.setattr(platform, "version", lambda: "6.3.9600")
+    monkeypatch.setattr(platform, "release", lambda: "8.1")
+
+    report = identity.build_heartbeat_payload(_bare_app())["platform"]
+
+    assert "osArch" not in report
+    assert report["osVersion"] == "6.3.9600" and report["osRelease"] == "8.1"
+    assert identity._platform_cache is None
+
+
+def test_heartbeat_platform_strings_are_trimmed_and_bounded(monkeypatch) -> None:
+    import platform
+
+    identity = _identity_module()
+    monkeypatch.setattr(identity, "_platform_cache", None)
+    monkeypatch.setattr("app.core.db.peek_sync_cache", lambda: SimpleNamespace(devices=[]))
+    monkeypatch.setattr(platform, "machine", lambda: "  x86  ")
+    monkeypatch.setattr(platform, "version", lambda: "1" * 40)
+    monkeypatch.setattr(platform, "release", lambda: "")
+
+    report = identity.build_heartbeat_payload(_bare_app())["platform"]
+
+    assert report["osArch"] == "x86"
+    assert report["osVersion"] == "1" * 32
+    assert "osRelease" not in report
 
 
 def test_heartbeat_worker_is_a_dedicated_daemon_with_five_minute_default() -> None:
