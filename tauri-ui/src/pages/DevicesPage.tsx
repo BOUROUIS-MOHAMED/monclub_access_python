@@ -193,7 +193,7 @@ export default function DevicesPage() {
   // Erase-content wizard (lane 1, 2026-09-27) and the turnstiles an erase left on hold.
   const [eraseDialog, setEraseDialog] = useState<{ deviceId: number; deviceName: string; mode: "erase" | "refill" } | null>(null);
   const [heldIds, setHeldIds] = useState<Set<number>>(new Set());
-  // The holds where NOTHING was erased (lane 1e): kept because the scheme moved before any delete --
+  // The holds where NOTHING was erased (lane 1e): kept because the scheme moved, or could not be read, before any delete --
   // "erase-scheme-moved", or a leftover "erase-prep" row whose recorded scheme is not the one now.
   const [nothingErasedIds, setNothingErasedIds] = useState<Set<number>>(new Set());
   // The start-up read of the holds failed: Access then holds EVERY turnstile until it reads.

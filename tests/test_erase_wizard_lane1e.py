@@ -839,15 +839,22 @@ class TestThePage:
         page = _ts("pages/DevicesPage.tsx")
         assert "erase-scheme-moved" in page
         # Lane 1i: the tooltip's text lives in eraseWizardText.ts (French and English), and the
-        # page picks the « rien n'a été effacé » one for those rows.
-        assert re.search(r"nothingErasedIds\.has\([^)]*\)\)\s*\?\s*ERASE_TEXT\[loadLang\(\)\]\.rowHoldNothingErased",
-                         page)
+        # page picks the « rien n'a été effacé » one for those rows, and rowHoldBanner for every
+        # other held row (a delete may have run there) -- both branches pinned (lane 1i review 5).
+        assert re.search(r"nothingErasedIds\.has\([^)]*\)\)\s*\?\s*ERASE_TEXT\[loadLang\(\)\]\.rowHoldNothingErased"
+                         r"\s*:\s*ERASE_TEXT\[loadLang\(\)\]\.rowHoldBanner", page)
         text = _ts("lib/eraseWizardText.ts")
         assert len(re.findall(r"\browHoldNothingErased:", text)) == 2
+        assert len(re.findall(r"\browHoldBanner:", text)) == 2
         fr = re.search(r"rowHoldNothingErased:\s*\n\s*\"([^\"]*)\"", text).group(1)
         assert "rien n'a été effacé" in fr
         # Neutral about the cause, as schemeMovedBack: the row does not record which happened.
         assert "ou n'a pas pu être relu" in fr
+        # The runbook's C6 quotes this string as the operator's « a delete may have run » signal:
+        # byte for byte (plain spaces around the guillemets, as the file has them).
+        banner_fr = re.search(r"\browHoldBanner:\s*\"([^\"]*)\"", text).group(1)
+        assert banner_fr == ("En attente depuis un effacement : MonClub n'\u00e9crit rien sur ce tourniquet "
+                             "jusqu'\u00e0 \u00ab Remplir \u00bb.")
 
 
 # ─────────────────────── review round 1 of lane 1e ───────────────────────
