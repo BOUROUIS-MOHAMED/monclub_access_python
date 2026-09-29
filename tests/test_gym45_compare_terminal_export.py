@@ -314,6 +314,13 @@ class TestInputsAndCli:
         with pytest.raises(ValueError):
             cte.load_export(str(p), 8)
 
+    def test_the_help_renders_the_sha_threshold_as_a_percentage(self, capsys):
+        # argparse %-formats help text: a bare "%" crashed --help on 3.11 and every run on 3.14
+        with pytest.raises(SystemExit) as exit_:
+            cte.main(["--help"])
+        assert exit_.value.code == 0
+        assert f"{cte.SHA_TRUST_THRESHOLD:.0%}, else by finger number" in " ".join(capsys.readouterr().out.split())
+
     def test_the_cli_prints_aggregates_and_no_names(self, gym, capsys):
         db, ex = gym
         assert cte.main(["--export", f"8={ex}", "--access-db", str(db)]) == 0
