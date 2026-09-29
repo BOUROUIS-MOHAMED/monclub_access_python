@@ -627,7 +627,78 @@ def build_heartbeat_payload(app: Any) -> dict[str, Any]:
     clock_offset = _clock_offset_report()
     if clock_offset is not None:
         payload["clockOffset"] = clock_offset
+    try:
+        platform_report = _platform_report()
+    except Exception:
+        platform_report = None
+    if platform_report is not None:
+        payload["platform"] = platform_report
     return payload
+
+
+# The longest string ``_platform_report`` sends per field; the backend keeps up to 32 characters.
+_PLATFORM_FIELD_MAX = 32
+# The last COMPLETE report (all four keys). A failed or partial read is never cached, so one
+# transient failure does not silence the report for the life of the process.
+_platform_cache: dict[str, Any] | None = None
+
+
+def _bounded_platform_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text[:_PLATFORM_FIELD_MAX] if text else None
+
+
+def _read_platform() -> dict[str, Any]:
+    """The Windows this PC runs and the bitness of this Python, each field read on its own:
+    one that raises or is empty is left out, the others still go.
+
+    ``platform.machine()`` honours ``PROCESSOR_ARCHITEW6432``, so the 32-bit Access Python on
+    64-bit Windows reports ``AMD64``; ``x86`` means 32-bit Windows. ``platform.version()`` is
+    ``major.minor.build`` (``10.0.26200``; build >= 22000 is Windows 11, ``6.3.x`` Windows 8.1).
+    On Python 3.11 both go through ``platform.uname()``, which runs ``cmd /c ver`` once per
+    process and caches it; ``app.py``'s start-up ``platform_summary()`` log line already does."""
+    import platform
+
+    from app.core.arch import is_64bit_python
+
+    report: dict[str, Any] = {}
+    for key, reader in (
+        ("osArch", platform.machine),
+        ("osVersion", platform.version),
+        ("osRelease", platform.release),
+    ):
+        try:
+            value = _bounded_platform_text(reader())
+        except Exception:
+            value = None
+        if value is not None:
+            report[key] = value
+    try:
+        report["pythonBits"] = 64 if is_64bit_python() else 32
+    except Exception:
+        pass
+    return report
+
+
+def _platform_report() -> dict[str, Any] | None:
+    """``{osArch, osVersion, osRelease, pythonBits}`` for the heartbeat, or None when nothing
+    could be read (the key is then left out). Why: a Python 3.14 / 64-bit Access build cannot
+    start on 32-bit Windows or on Windows older than 10, and this is how the fleet is known
+    before one ships. Names the machine's software only. A backend without the field ignores
+    the key (Jackson's default, guide §3.1b)."""
+    global _platform_cache
+    cached = _platform_cache
+    if cached is not None:
+        return dict(cached)
+    try:
+        report = _read_platform()
+    except Exception:
+        return None
+    if not report:
+        return None
+    if len(report) == 4:
+        _platform_cache = dict(report)
+    return report
 
 
 def _clock_offset_report() -> dict[str, Any] | None:
