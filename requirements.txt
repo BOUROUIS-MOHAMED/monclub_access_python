@@ -1,3 +1,8 @@
+# HTTP to the MonClub backend (app/core, access/); certifi is the CA bundle
+# app/core/v2 verifies TLS with and MonClubAccess.spec ships as data
+requests>=2.32
+certifi
+
 pystray
 pillow
 winotify
@@ -7,3 +12,6 @@ pyzk>=0.9
 pywinusb>=0.4
 pywin32>=306
 comtypes>=1.4
+
+# Optional, not listed on purpose: psutil (app/core/telemetry.py falls back to ctypes).
+# psutil after 7.1.1 ships no win32 wheels; 7.1.1 is the last 32-bit one.

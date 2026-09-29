@@ -1084,7 +1084,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="name of the environment variable holding the password")
     ap.add_argument("--match-by", choices=("auto", "sha", "finger"), default="auto",
                     help="auto = by template hash when the self-check reaches "
-                         f"{SHA_TRUST_THRESHOLD:.0%}, else by finger number")
+                         f"{SHA_TRUST_THRESHOLD * 100:.0f}%%, else by finger number")  # %% : argparse %-formats help
     ap.add_argument("--json-out")
     ap.add_argument("--detail-csv", help="per-person rows WITH NAMES - personal data")
     args = ap.parse_args(argv)
