@@ -32,6 +32,8 @@
 #define WizardSmall "assets\wizard_small.bmp"
 
 [Setup]
+; Built with Python 3.14, which runs on Windows 10 and newer only.
+MinVersion=10.0
 AppId={{9B77A9C2-2B97-4F62-A9E8-4B4C65F3A9B1}
 AppName={#AppName}
 AppVersion={#AppVersion}

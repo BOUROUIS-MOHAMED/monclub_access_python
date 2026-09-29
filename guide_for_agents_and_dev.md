@@ -4826,6 +4826,17 @@ scenario (a store another system fills), not as a re-diagnosis of that incident.
   throws when `Requires32BitPython` is set and the interpreter is not 32-bit. Both
   `plcommpro.dll` and `zkemkeeper` are 32-bit.
   `[CODE: build_release.ps1, app/core/arch.py::require_32bit_python_for_32bit_dll]`
+- **The build's Python is pinned to 3.14 (32-bit)** (2026-09-29): `build_release.ps1` creates
+  `.venv` with `py -3.14-32` and throws when an existing `.venv` is another minor version (rerun
+  with `-RecreateVenv`). Before that it used whatever `python` came first on PATH, which kept
+  releases on 3.11.0. `[CODE: build_release.ps1]` On 3.14.7 32-bit the suite passed 3613/3613, the
+  PyInstaller build ran and the frozen app started (DLLs resolved, local API up) on the dev PC.
+  `[TEST — 2026-09-29, dev PC; no gym hardware attached]`
+- **Windows 10 or newer is required**: Python 3.14 supports Windows 10+ only (3.13 was the last
+  for 8.1). Both Inno installers carry `MinVersion=10.0`. `[CODE: installer/*.iss]` Updates apply by
+  zip (`MonClubAccessUpdater`), which the installer check does not cover; the owner confirmed on
+  2026-09-29 that every client PC runs Windows 10+, and the heartbeat's Windows version (Access PCs
+  page) is how to re-check it. `[FIELD: owner statement]`
 - **`zkemkeeper` is a COM server — shipping the DLL is not enough.** It must be
   **registered** (`regsvr32`, elevated, 32-bit) along with its dependencies.
   `[FIELD: an unregistered COM server was one of the two root causes of the MB2000

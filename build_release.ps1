@@ -168,18 +168,33 @@ if ($RecreateVenv -and (Test-Path ".\.venv")) {
   Remove-Item -Recurse -Force ".\.venv"
 }
 
+# The release is built with exactly this Python minor version, taken through the py launcher
+# rather than whatever `python` is first on PATH (that is how 3.11 stayed in use unnoticed).
+# Python 3.14 runs on Windows 10 and newer only. The owner confirmed on 2026-09-29 that every
+# client PC runs Windows 10+; the heartbeat's Windows version (Access PCs page) keeps checking it,
+# and both installers refuse older Windows (MinVersion=10.0).
+$RequiredPythonMinor = "3.14"
+$pyTag = if ($meta.Requires32BitPython) { "-$RequiredPythonMinor-32" } else { "-$RequiredPythonMinor" }
+
 if (-not (Test-Path ".\.venv")) {
-  Write-Host "Creating venv (.venv)..." -ForegroundColor Yellow
-  python -m venv .venv
+  Write-Host "Creating venv (.venv) with py $pyTag..." -ForegroundColor Yellow
+  py $pyTag -m venv .venv
+  if ($LASTEXITCODE -ne 0) {
+    throw "Could not create .venv with 'py $pyTag'. Install Python $RequiredPythonMinor$(if ($meta.Requires32BitPython) { ' (32-bit)' }) from python.org."
+  }
 }
 
 Write-Host "Activating venv..." -ForegroundColor Yellow
 . ".\.venv\Scripts\Activate.ps1"
 
-Write-Host "Checking Python architecture..." -ForegroundColor Yellow
-python -c "import struct; print('Python bits:', struct.calcsize('P')*8)"
+Write-Host "Checking Python version and architecture..." -ForegroundColor Yellow
+python -c "import struct, sys; print('Python', sys.version.split()[0], '|', struct.calcsize('P')*8, 'bit')"
 if ($LASTEXITCODE -ne 0) {
   throw "Unable to determine Python architecture."
+}
+python -c "import sys; sys.exit(0 if '%d.%d' % sys.version_info[:2] == '$RequiredPythonMinor' else 1)"
+if ($LASTEXITCODE -ne 0) {
+  throw "The existing .venv is not Python $RequiredPythonMinor. Rerun with -RecreateVenv."
 }
 if ($meta.Requires32BitPython) {
   python -c "import struct, sys; sys.exit(0 if struct.calcsize('P')*8 == 32 else 1)"

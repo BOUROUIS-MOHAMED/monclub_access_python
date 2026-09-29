@@ -21,11 +21,13 @@ This is a Windows desktop app (Tkinter) that:
    - the template encoding matches what the panel expects (often base64-like text, but verify by reading back an enrolled template first).
 
 ## Setup (recommended)
-1) Install Python 3.10/3.11 (32-bit) on Windows
+1) Install Python 3.14 (32-bit, "Windows installer (32-bit)" on python.org). The release build
+   (`build_release.ps1`) creates `.venv` with `py -3.14-32` and refuses any other version.
+   Python 3.14 runs on Windows 10 and newer only.
 2) Put plcommpro.dll (and required PullSDK DLL dependencies) in a known folder.
 3) Put ZKFinger SDK DLL (often zkfp.dll) in a known folder.
 4) Open PowerShell or cmd.exe in this folder and run:
-   - python -m venv .venv
+   - py -3.14-32 -m venv .venv
    - PowerShell: `.\.venv\Scripts\Activate.ps1`
    - cmd.exe: `.venv\Scripts\activate.bat`
    - Runtime only: `pip install -r requirements.txt`
