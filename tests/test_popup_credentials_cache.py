@@ -3,6 +3,8 @@
 /popup/poll runs every ~1.5 s while a popup window is open. Before this fix a None result
 (a PC with no devices, or a failed read) was never cached, so every poll queried the DB.
 """
+import time as _real_time
+
 import pytest
 
 import app.api.local_access_api_v2 as v2
@@ -28,6 +30,19 @@ class _Clock:
         return self.t
 
 
+class _TimeWithClock:
+    """The real time module, except monotonic(): patched on v2 only, never process-wide."""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def monotonic(self):
+        return self._clock()
+
+    def __getattr__(self, name):
+        return getattr(_real_time, name)
+
+
 def _install(monkeypatch, devices_or_exc):
     calls = {"n": 0}
 
@@ -39,7 +54,7 @@ def _install(monkeypatch, devices_or_exc):
 
     monkeypatch.setattr(dbmod, "list_sync_devices_payload", _list)
     clock = _Clock()
-    monkeypatch.setattr(v2.time, "time", clock)
+    monkeypatch.setattr(v2, "time", _TimeWithClock(clock))
     return calls, clock
 
 

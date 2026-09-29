@@ -5424,9 +5424,10 @@ def _popup_enabled_credentials() -> Optional[Dict[str, bool]]:
 
     TTL-cached: the popup polls every ~1.5s and these flags change at sync speed.
     The None result is cached too (a PC with no devices, or a failed read): it
-    would otherwise query the DB on every poll.
+    would otherwise query the DB on every poll. The TTL runs on time.monotonic(),
+    so a wall clock stepped back after the night power-off cannot pin a stale entry.
     """
-    now = time.time()
+    now = time.monotonic()
     with _popup_creds_lock:
         if _popup_creds_cache.get("valid") and now - float(_popup_creds_cache["at"]) < _POPUP_CREDS_TTL_SEC:
             cached = _popup_creds_cache["value"]

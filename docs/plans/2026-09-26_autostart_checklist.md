@@ -227,7 +227,8 @@ night, and its row **E6** proves one power cycle (section 5) the next evening.
    section 3.
 6. Write **t3**, "turnstile updated", from the same log:
    - an MB2000 (gym 45): `full sync (reason=startup): all N desired pins already on the terminal -- nothing to push`;
-   - a C3-400 (gym 58): `[DeviceSync] Device id=5: device_pins=N desired=N to_sync=0 stale=0` (and id=6).
+   - a C3-400 (gym 58): `[DeviceSync] Device id=5: device_pins=N desired=N to_sync=0 stale=0` (and id=6), with the same
+     pass's earlier `[DeviceSync] Device id=5 name=… ip=… desired=… to_sync=… backoff_skipped=0 …` line.
 7. Check "Postes de réception" shows the PC seen a moment ago. Test one card (or finger) at the door.
 8. **Result:** t1 − t0, t2 − t0, t3 − t0 on the sheet. Compare t3 with the gym's opening time: the whole
    chain must finish before the first member.
