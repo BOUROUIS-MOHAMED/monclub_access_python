@@ -2145,8 +2145,8 @@ class AgentRealtimeEngine:
             except Exception as e:
                 self.logger.error("[RT] NotificationService restart FAILED: %s", e)
 
-        # HistoryService (only checked if it was started)
-        if self._hist is not None and hasattr(self._hist, 'is_alive') and not self._hist.is_alive():
+        # HistoryService (only checked if it was started: AGENT mode never starts it; ident=None)
+        if self._hist is not None and getattr(self._hist, 'ident', None) and not self._hist.is_alive():
             g = self.get_global_settings()
             if bool(g.get("history_service_enabled", False)):
                 self.logger.error("[RT] HistoryService died — restarting")
