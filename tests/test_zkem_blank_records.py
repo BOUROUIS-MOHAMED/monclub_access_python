@@ -76,3 +76,39 @@ def test_the_dashboard_warns_once_per_junk_time_not_every_poll(caplog):
                                                fallback="2026-09-30 15:48:14") == "2026-09-30T15:48:14"
     lines = [r for r in caplog.records if "unparseable event time" in r.getMessage()]
     assert [r.levelno for r in lines] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+
+class TestBlankRowsAlreadyStored:
+    """Rows recorded before this fix stay in the gym's access.db (never deleted); they are no
+    longer shown on the dashboard feeds nor uploaded."""
+
+    @pytest.fixture
+    def db(self, tmp_path, monkeypatch):
+        import app.core.db as dbmod
+        monkeypatch.setattr(dbmod, "_DB_PATH", str(tmp_path / "blank-rows.db"), raising=False)
+        dbmod.init_db()
+        yield dbmod
+        dbmod._shutdown_db_writer_for_tests()
+
+    def _insert(self, db, event):
+        db.insert_access_history(
+            event_id=event["eventId"], device_id=10, door_id=1, card_no=event["cardNo"],
+            event_time=event["eventTime"], event_type=event["eventType"], allowed=True,
+            reason="DEVICE_ALLOWED", poll_ms=None, decision_ms=None, cmd_ms=None, cmd_ok=None,
+            cmd_error=None, raw=event["rawRow"], history_source="DEVICE", backend_sync_state="PENDING")
+
+    def test_they_are_neither_listed_nor_uploaded_and_still_stored(self, db):
+        real = _evt(10, pin="69048", when=(2026, 9, 30, 15, 56, 55), verify=1)
+        self._insert(db, real)
+        for seq in (7, 9, 11):
+            self._insert(db, _evt(seq))
+        refused = _evt(12, when=(2026, 9, 30, 16, 0, 0), verify=1, invalid=1)   # no pin, real date
+        self._insert(db, refused)
+
+        shown = [r.event_id for r in db.get_recent_access_history(limit=40)]
+        assert shown == [refused["eventId"], real["eventId"]]
+        pending = [r.event_id for r in db.list_pending_access_history_for_sync(limit=200)]
+        assert pending == [real["eventId"], refused["eventId"]]
+        with db.get_conn() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM access_history").fetchone()[0] == 5, (
+                "nothing is deleted")

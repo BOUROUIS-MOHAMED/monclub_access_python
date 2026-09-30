@@ -10943,16 +10943,13 @@ def prune_offline_creation_queue(*, retention_days: int = 30) -> int:
 
 @_tel.timed("DB_READ_get_recent_access_history", slow_ms=50, warn_ms=1000)
 def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
-    lim = int(limit)
-    if lim < 1:
-        lim = 1
-    if lim > 500:
-        lim = 500
+    from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL   # stored blank MB2000 rows: not shown
+    lim = max(1, min(int(limit), 500))
     with get_conn() as conn:
         rows = conn.execute(
             """
             SELECT *
-            FROM access_history
+            FROM access_history WHERE NOT """ + BLANK_HISTORY_SQL + """
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -10966,11 +10963,8 @@ def get_recent_access_history(*, limit: int = 10) -> List[AccessHistoryRow]:
 
 
 def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHistoryRow]:
-    lim = int(limit)
-    if lim < 1:
-        lim = 1
-    if lim > 1000:
-        lim = 1000
+    from app.core.zkem_rtlog_filter import BLANK_HISTORY_SQL   # stored blank MB2000 rows: never sent
+    lim = max(1, min(int(limit), 1000))
     now = now_iso()
     with get_conn() as conn:
         rows = conn.execute(
@@ -10979,6 +10973,7 @@ def list_pending_access_history_for_sync(*, limit: int = 200) -> List[AccessHist
             FROM access_history
             WHERE backend_sync_state IN (?, ?)
               AND (backend_next_retry_at IS NULL OR backend_next_retry_at = '' OR backend_next_retry_at <= ?)
+              AND NOT """ + BLANK_HISTORY_SQL + """
             ORDER BY id ASC
             LIMIT ?
             """,

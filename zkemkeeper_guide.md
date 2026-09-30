@@ -1042,7 +1042,10 @@ VerifyMethod 0 and the date `2000-00-00 00:00:00` (282 of them; AttState/WorkCod
 found" with a popup and a history row. The same filter drops a zkemkeeper record with no pin
 AND no real calendar date, one DEBUG line each; no pin with a real date is still processed.
 `[CODE: zkem_rtlog_filter.is_blank]` `[TEST: test_zkem_blank_records.py]` What the firmware
-means by them is `[UNKNOWN]`.
+means by them is `[UNKNOWN]`. Blank rows stored before that fix are kept (never deleted) but
+filtered on read (`zkem_rtlog_filter.BLANK_HISTORY_SQL` in `db.get_recent_access_history` and
+`db.list_pending_access_history_for_sync`): not shown, never uploaded; still PENDING rows
+are therefore never pruned either. `[CODE]` `[TEST: test_zkem_blank_records.py]`
 
 Event queue backpressure is **newest-wins**: when the 4096-slot queue is full it drops
 the **oldest** event and inserts the new one, with a warning. `[CODE]`

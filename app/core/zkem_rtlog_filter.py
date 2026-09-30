@@ -38,6 +38,12 @@ _log = logging.getLogger("zkapp.zkem_rtlog")
 # on 2026-09-30 no connection's event counter went past 40 (blank records included).
 MAX_KEYS = 512
 
+# The blank records ALREADY stored in access_history before the drop above (rows are never
+# deleted): the dashboard feeds and the history upload read access_history WHERE NOT this.
+# Exactly the stored shape: device time 2000-00-00 00:00:00, no card, no pin in the event id.
+BLANK_HISTORY_SQL = ("(event_time = '2000-00-00 00:00:00' AND COALESCE(card_no, '') = '' "
+                     "AND event_id LIKE '2000-00-00 00:00:00||%||zkem|%')")
+
 _lock = threading.Lock()
 _seen: Dict[int, "OrderedDict[Tuple[str, str, str, str], None]"] = {}
 
