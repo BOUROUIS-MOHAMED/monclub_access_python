@@ -59,3 +59,108 @@ def test_the_update_manager_schedules_the_configured_interval():
     assert mgr._interval_ms() == THREE_HOURS * 1000
     mgr.cfg = SimpleNamespace(update_check_interval_sec=0)
     assert mgr._interval_ms() == THREE_HOURS * 1000
+
+
+# ---- A failed check is retried soon, not after 3 hours (review, 2026-09-30) ----
+class _FakeApp:
+    """Tk's after/after_cancel, run by hand: the scheduled delays are what is under test."""
+
+    def __init__(self):
+        self.scheduled: list[tuple[str, int, object]] = []
+        self._n = 0
+
+    def after(self, delay_ms, fn):
+        self._n += 1
+        aid = f"after#{self._n}"
+        self.scheduled.append((aid, int(delay_ms), fn))
+        return aid
+
+    def after_cancel(self, aid):
+        self.scheduled = [s for s in self.scheduled if s[0] != aid]
+
+    def on_update_error(self, msg):
+        pass
+
+    def on_update_status_changed(self, st):
+        pass
+
+
+class _Api:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+
+    def get_latest_software_release(self, **kwargs):
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _manager(outcomes):
+    import logging
+    import threading
+
+    from shared.update_runtime import ComponentUpdateManager
+
+    app = _FakeApp()
+    api = _Api(outcomes)
+    mgr = ComponentUpdateManager.__new__(ComponentUpdateManager)
+    mgr.cfg = AppConfig()
+    mgr.app = app
+    mgr.logger = logging.getLogger("test.update")
+    mgr._api_factory = lambda: api
+    mgr._lock = threading.RLock()
+    mgr._running = True
+    mgr._after_id = None
+    mgr._worker_running = False
+    mgr._token = "tok"
+    mgr._force_download_once = False
+    mgr._check_fail_streak = 0
+    from shared.component_identity import get_component_identity
+    from shared.update_runtime import UpdateStatus
+
+    mgr.component = get_component_identity("access")
+    mgr.status = UpdateStatus()
+    mgr.get_current_version = lambda: "1.4.35"
+    mgr.get_current_release_id = lambda: "rid"
+    mgr.get_current_codename = lambda: ""
+    mgr._set_update_available = lambda *a, **k: None
+    return mgr, app
+
+
+def _run_tick(mgr, app, monkeypatch):
+    """One _tick with the worker thread run inline; returns the delay now scheduled."""
+    import shared.update_runtime as ur
+
+    class _Inline:
+        def __init__(self, target, **kwargs):
+            self._t = target
+
+        def start(self):
+            self._t()
+
+    monkeypatch.setattr(ur.threading, "Thread", _Inline)
+    mgr._tick()
+    # Retries are handed back to the Tk thread through after(0, ...): run those.
+    while any(d == 0 for _, d, _ in app.scheduled):
+        aid, _, fn = next(s for s in app.scheduled if s[1] == 0)
+        app.scheduled = [s for s in app.scheduled if s[0] != aid]
+        fn()
+    assert len(app.scheduled) == 1, app.scheduled
+    return app.scheduled[0][1]
+
+
+def test_a_failed_check_is_retried_after_60s_then_5min_then_15min_then_the_interval(monkeypatch):
+    boom = RuntimeError("network down")
+    mgr, app = _manager([boom, boom, boom, boom, {"version": "1.4.35"}, boom])
+    assert _run_tick(mgr, app, monkeypatch) == 60 * 1000
+    assert _run_tick(mgr, app, monkeypatch) == 5 * 60 * 1000
+    assert _run_tick(mgr, app, monkeypatch) == 15 * 60 * 1000
+    assert _run_tick(mgr, app, monkeypatch) == 15 * 60 * 1000  # capped
+    assert _run_tick(mgr, app, monkeypatch) == THREE_HOURS * 1000  # success: back to normal
+    assert _run_tick(mgr, app, monkeypatch) == 60 * 1000  # a new failure starts over
+
+
+def test_a_successful_check_keeps_the_normal_interval(monkeypatch):
+    mgr, app = _manager([{"version": "1.4.35"}])
+    assert _run_tick(mgr, app, monkeypatch) == THREE_HOURS * 1000

@@ -236,6 +236,10 @@ class UpdateStatus:
     progress: Optional[int] = None
 
 
+# Delays before retrying a FAILED update check: 60 s, 5 min, then 15 min until one succeeds.
+_CHECK_RETRY_DELAYS_SEC = (60, 5 * 60, 15 * 60)
+
+
 class ComponentUpdateManager:
     """Component-aware updater engine with independent runtime state."""
 
@@ -260,6 +264,9 @@ class ComponentUpdateManager:
         self._worker_running = False
         self._token: Optional[str] = None
         self._force_download_once = False
+        # Consecutive failed checks. With a 3-hour interval a failed check must not wait 3 hours
+        # for the next try: _after_check brings it forward (_CHECK_RETRY_DELAYS_SEC).
+        self._check_fail_streak = 0
         self._session = requests.Session()
         self.install_root = _resolve_install_root(component)
         self.status = UpdateStatus(
@@ -421,11 +428,13 @@ class ComponentUpdateManager:
             force_download = self._consume_force_download()
 
         def work() -> None:
+            ok = False
             try:
-                self._run_check_and_download(token=token, force_download=force_download)
+                ok = self._run_check_and_download(token=token, force_download=force_download) is not False
             finally:
                 with self._lock:
                     self._worker_running = False
+                self._after_check(ok)
 
         threading.Thread(
             target=work,
@@ -433,7 +442,23 @@ class ComponentUpdateManager:
             name=f"{self.component.component_id}-update-check",
         ).start()
 
-    def _run_check_and_download(self, *, token: str, force_download: bool = False) -> None:
+    def _after_check(self, ok: bool) -> None:
+        """After a failed check, try again soon (60 s, 5 min, then every 15 min) instead of
+        waiting the whole interval _tick already scheduled; a success resets the streak."""
+        with self._lock:
+            self._check_fail_streak = 0 if ok else self._check_fail_streak + 1
+            streak = self._check_fail_streak
+        if not streak:
+            return
+        delay_sec = _CHECK_RETRY_DELAYS_SEC[min(streak, len(_CHECK_RETRY_DELAYS_SEC)) - 1]
+        delay_ms = min(delay_sec * 1000, self._interval_ms())
+        try:
+            self.app.after(0, lambda: self._schedule_next(delay_ms))
+        except Exception:
+            pass
+
+    def _run_check_and_download(self, *, token: str, force_download: bool = False) -> Optional[bool]:
+        """False when the check failed (logged); None otherwise."""
         try:
             current_version = self.get_current_version()
             current_release_id = self.get_current_release_id()
@@ -548,6 +573,7 @@ class ComponentUpdateManager:
                 self.app.after(0, lambda: self.app.on_update_error(msg))
             except Exception:
                 pass
+            return False
         finally:
             self._set_downloading(False, None)
 
