@@ -96,3 +96,13 @@ def test_pullsdk_events_are_untouched(worker):
     worker._process_event(dict(pull))
     worker._process_event(dict(pull, eventId="2026-09-30 15:56:55|555|0|1|b"))
     assert len(worker.handled) == 2, "C3 events keep their own event-id dedupe only"
+
+
+def test_a_broken_device_clock_never_makes_later_scans_look_replayed(worker):
+    """A time that does not parse is no identity: two scans of the same pin at the same broken
+    time are both processed (e.g. a denied staff card that must reach the staff rescue)."""
+    worker._process_event(_scan(1, pin="85", when=(2000, 0, 0, 0, 0, 0)))
+    worker._process_event(_scan(2, pin="85", when=(2000, 0, 0, 0, 0, 0), invalid=1))
+    worker._process_event(_scan(3, pin="85", when=(2000, 0, 0, 0, 0, 0), invalid=1))
+    assert len(worker.handled) == 3
+    assert rf._seen.get(worker._device_id, {}) == {}, "nothing remembered"

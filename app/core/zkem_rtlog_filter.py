@@ -17,7 +17,8 @@ the driver's per-connection counter (``zk_standalone.normalize_att_event``, ``_e
 for every new driver), so the worker's ``_is_seen`` never matched, and each replay was a second
 ALLOW, popup and history row. A replay is recognised here by its CONTENT -- pin, device time,
 door, verify method -- in a bounded memory per turnstile; a real re-scan carries another device
-time (one-second resolution) and passes. The pin, not ``cardNo``: the pin->card map is re-read on
+time (one-second resolution) and passes; an event whose device time does not parse is never
+checked for a replay. The pin, not ``cardNo``: the pin->card map is re-read on
 every connect. PullSDK events (no ``table == "zkem"``) are never touched.
 
 Limits: the memory is this process's, so a replay delivered at the first connect after an app
@@ -50,15 +51,17 @@ def content_key(evt: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
             str(evt.get("doorId")), str(raw.get("verifyMethod")))
 
 
+def _real_time(text: str) -> bool:
+    try:
+        datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+        return True
+    except ValueError:
+        return False
+
+
 def is_blank(key: Tuple[str, str, str, str]) -> bool:
     """No pin AND no real calendar date (the 2000-00-00 00:00:00 records)."""
-    if key[0]:
-        return False
-    try:
-        datetime.strptime(key[1], "%Y-%m-%d %H:%M:%S")
-        return False
-    except ValueError:
-        return True
+    return not key[0] and not _real_time(key[1])
 
 
 def skip(device_id: Any, evt: Dict[str, Any], prefix: str) -> bool:
@@ -71,6 +74,10 @@ def skip(device_id: Any, evt: Dict[str, Any], prefix: str) -> bool:
         _log.debug("%s SKIP blank zkemkeeper record (no pin, no date %r, verify=%s): not an access "
                    "-- event_id=%s", prefix, key[1], key[3], evt.get("eventId"))
         return True
+    if not _real_time(key[1]):
+        # A device time that does not parse is no identity (a terminal with a broken clock):
+        # neither remembered nor matched, so it can never make a later scan look replayed.
+        return False
     try:
         did = int(device_id or 0)
     except (TypeError, ValueError):

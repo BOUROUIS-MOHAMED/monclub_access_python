@@ -1030,7 +1030,8 @@ reset for every new driver), so it cannot recognise an event delivered twice. Af
 `...|zkem|1` at 16:08:08; also 16:38:12) `[FIELD]`. The ULTRA worker drops a zkemkeeper
 event whose (pin, device time, door, verify method) it already processed on that turnstile
 (`app/core/zkem_rtlog_filter.py`, 512 keys per turnstile, process memory only) before
-`_is_seen`, the cooldown and the age check. `[CODE]` `[TEST: test_zkem_rtlog_replay.py]`
+`_is_seen`, the cooldown and the age check; an event whose device time does not parse is
+never checked for a replay. `[CODE]` `[TEST: test_zkem_rtlog_replay.py]`
 Why the firmware re-delivers, and whether it does so at the first connect after an app
 restart (not seen on 2026-09-30), is `[UNVERIFIED]`.
 
