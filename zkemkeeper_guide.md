@@ -1034,6 +1034,15 @@ event whose (pin, device time, door, verify method) it already processed on that
 Why the firmware re-delivers, and whether it does so at the first connect after an app
 restart (not seen on 2026-09-30), is `[UNVERIFIED]`.
 
+**Blank records.** On gym 45's two MB2000s (2026-09-30) every real verification was followed,
+in the same `GetRTLog` drain, by an `OnAttTransactionEx` with EnrollNumber `''`, IsInValid 0,
+VerifyMethod 0 and the date `2000-00-00 00:00:00` (282 of them; AttState/WorkCode not logged)
+`[FIELD]`. `normalize_att_event` makes them `eventType "0"`; 66 became "ALLOW, user NOT
+found" with a popup and a history row. The same filter drops a zkemkeeper record with no pin
+AND no real calendar date, one DEBUG line each; no pin with a real date is still processed.
+`[CODE: zkem_rtlog_filter.is_blank]` `[TEST: test_zkem_blank_records.py]` What the firmware
+means by them is `[UNKNOWN]`.
+
 Event queue backpressure is **newest-wins**: when the 4096-slot queue is full it drops
 the **oldest** event and inserts the new one, with a warning. `[CODE]`
 

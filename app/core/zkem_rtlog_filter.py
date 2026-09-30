@@ -1,4 +1,13 @@
-"""MB2000 (zkemkeeper) RTLog events the ULTRA worker must not process a second time.
+"""MB2000 (zkemkeeper) RTLog events the ULTRA worker must not process: blank records, replays.
+
+Blank records (gym 45, 2026-09-30). 282 ``OnAttTransactionEx`` callbacks carried EnrollNumber '',
+IsInValid 0, VerifyMethod 0 and the date 2000-00-00 00:00:00 (AttState and WorkCode are not
+logged); each came in the same GetRTLog drain right after a real verification on that terminal.
+What the firmware means by them is [UNVERIFIED]; what they are not is proven by their fields: no
+user and no calendar date, so no access. ``normalize_att_event`` made them ALLOW events (66
+processed: "ALLOW, user NOT found", a popup, a history row the dashboard then re-warned about on
+every poll). They are dropped with one DEBUG line each. A record with no pin but a real date (a
+finger the terminal refused) is still processed.
 
 Replays (gym 45, 2026-09-30). After the 30-min safety refresh reconnect the terminal delivered
 again the last event the worker had already processed: device 10 read
@@ -19,6 +28,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import OrderedDict
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 _log = logging.getLogger("zkapp.zkem_rtlog")
@@ -40,12 +50,27 @@ def content_key(evt: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
             str(evt.get("doorId")), str(raw.get("verifyMethod")))
 
 
+def is_blank(key: Tuple[str, str, str, str]) -> bool:
+    """No pin AND no real calendar date (the 2000-00-00 00:00:00 records)."""
+    if key[0]:
+        return False
+    try:
+        datetime.strptime(key[1], "%Y-%m-%d %H:%M:%S")
+        return False
+    except ValueError:
+        return True
+
+
 def skip(device_id: Any, evt: Dict[str, Any], prefix: str) -> bool:
-    """True (and one DEBUG line) when this zkemkeeper event was already processed on this
-    turnstile; otherwise it is remembered and False."""
+    """True (and one DEBUG line) for a blank zkemkeeper record, or one already processed on
+    this turnstile; otherwise it is remembered and False."""
     key = content_key(evt)
     if key is None:
         return False
+    if is_blank(key):
+        _log.debug("%s SKIP blank zkemkeeper record (no pin, no date %r, verify=%s): not an access "
+                   "-- event_id=%s", prefix, key[1], key[3], evt.get("eventId"))
+        return True
     try:
         did = int(device_id or 0)
     except (TypeError, ValueError):

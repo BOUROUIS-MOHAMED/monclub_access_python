@@ -6245,7 +6245,7 @@ class UltraDeviceWorker(threading.Thread):
         if not event_id:
             event_id = f"{self._device_id}:{event_time}:{card_no}"
 
-        if _zkem_rtlog.skip(self._device_id, evt, self._prefix):   # MB2000 reconnect replay
+        if _zkem_rtlog.skip(self._device_id, evt, self._prefix):   # MB2000 blank record / replay
             return
         if self._is_seen(event_id):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
