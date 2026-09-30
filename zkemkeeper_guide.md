@@ -1023,6 +1023,17 @@ runs unchanged. `eventTime` is `"%04d-%02d-%02d %02d:%02d:%02d"`. `[CODE]`
 Standalone rows additionally carry **`rawRow["scan_mode_hint"]`**, which PullSDK rows
 do not. `[CODE]`
 
+**Reconnect replays.** `eventId` ends in the driver's per-connection counter (`_event_seq`,
+reset for every new driver), so it cannot recognise an event delivered twice. After the
+30-min safety-refresh reconnect the terminal re-delivered the last event already processed
+(gym 45, 2026-09-30: `...15:56:55|ZKPIN:69048|0|1|69048|zkem|10` at 15:56:54, then
+`...|zkem|1` at 16:08:08; also 16:38:12) `[FIELD]`. The ULTRA worker drops a zkemkeeper
+event whose (pin, device time, door, verify method) it already processed on that turnstile
+(`app/core/zkem_rtlog_filter.py`, 512 keys per turnstile, process memory only) before
+`_is_seen`, the cooldown and the age check. `[CODE]` `[TEST: test_zkem_rtlog_replay.py]`
+Why the firmware re-delivers, and whether it does so at the first connect after an app
+restart (not seen on 2026-09-30), is `[UNVERIFIED]`.
+
 Event queue backpressure is **newest-wins**: when the 4096-slot queue is full it drops
 the **oldest** event and inserts the new one, with a warning. `[CODE]`
 

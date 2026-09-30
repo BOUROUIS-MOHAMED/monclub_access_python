@@ -46,6 +46,7 @@ from app.core.v2 import lease_gate as _lease_gate
 from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
 from app.core.v2 import removed_pins as _removed_pins
+from app.core import zkem_rtlog_filter as _zkem_rtlog
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
@@ -6244,6 +6245,8 @@ class UltraDeviceWorker(threading.Thread):
         if not event_id:
             event_id = f"{self._device_id}:{event_time}:{card_no}"
 
+        if _zkem_rtlog.skip(self._device_id, evt, self._prefix):   # MB2000 reconnect replay
+            return
         if self._is_seen(event_id):
             logger.debug(f"{self._prefix} SKIP duplicate event_id={event_id}")
             return
