@@ -159,6 +159,10 @@ def _dt_from_any(value: Any) -> Optional[datetime]:
     return None
 
 
+# Event-time texts already warned about (bounded).
+_unparseable_times_warned: set[str] = set()
+
+
 def _normalize_datetime_text(value: Any, fallback: str | None = None) -> str:
     dt_value = _dt_from_any(value)
     if dt_value is not None:
@@ -172,7 +176,13 @@ def _normalize_datetime_text(value: Any, fallback: str | None = None) -> str:
         # batch with HTTP 400. Use the fallback (the PC's own receive time) and say
         # so, rather than send something no parser can accept. Hardening of a
         # proven gap; not asserted to be the cause of any specific field 400.
-        logging.getLogger("zkapp").warning(
+        # WARNING once per distinct text, then DEBUG: the 5-s dashboard poll re-reads the same
+        # rows (gym 45, 2026-09-30: 8403 warnings for blank MB2000 records' 2000-00-00).
+        first = txt[:40] not in _unparseable_times_warned
+        if first and len(_unparseable_times_warned) < 256:
+            _unparseable_times_warned.add(txt[:40])
+        logging.getLogger("zkapp").log(
+            logging.WARNING if first else logging.DEBUG,
             "[DeviceAttendance] unparseable event time %r -- using fallback %r", txt[:40], fallback,
         )
     fb = _safe_str(fallback, "").strip()

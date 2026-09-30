@@ -21,6 +21,10 @@ from app.core.v2.server_clock import ServerClock
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
+    # The reporter re-checks SKIPPED_NOT_OWNED pins against the local record: none here (and
+    # no database is opened; test_problem_skip_resolution covers it on a real temp one).
+    from app.core.v2 import removed_pins
+    monkeypatch.setattr(removed_pins, "pin_states", lambda device_id, pins: {})
     lg.reset_for_tests()
     pr.registry.reset_for_tests()
     yield

@@ -1,7 +1,8 @@
 """The turnstile problem report (P2c-2 §2): one snapshot per turnstile this PC drives.
 
 A snapshot REPLACES this PC's previous one for that turnstile on the server (a code left out
-is resolved). It is sent when its content changes, and again every hour while it has
+is resolved: a SKIPPED_NOT_OWNED pin MonClub re-pushed or removed since leaves it, see
+removed_pins.settle_skipped). It is sent when its content changes, and again every hour while it has
 problems (the server empties a report not refreshed for 30 days). ``observedAt`` is the
 server-corrected "now" (owner decision 5a); ``sentAt`` is stamped per attempt by the API.
 Only turnstiles whose removal step ran in this process are reported, so a restart never
@@ -15,7 +16,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
-from app.core.v2 import lease_gate, timefmt
+from app.core.v2 import lease_gate, removed_pins, timefmt
 from app.core.v2.api import V2ApiError
 from app.core.v2.problems import registry
 
@@ -45,6 +46,7 @@ class ProblemReporter:
             return None
 
     def send(self, did: int, *, force: bool = False) -> Optional[Dict[str, Any]]:
+        removed_pins.settle_skipped(did)     # resolved SKIPPED_NOT_OWNED pins leave this snapshot
         problems = registry.snapshot(did)
         key = hashlib.sha1(json.dumps(problems, sort_keys=True).encode()).hexdigest()
         prev = self._sent.get(did)

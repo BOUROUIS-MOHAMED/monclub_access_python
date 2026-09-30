@@ -77,6 +77,15 @@ def _reapply_suite_db_path_after_reload(_suite_db_path):
     _apply_suite_db_path(_suite_db_path)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_zkem_replay_memory():
+    # Process-wide per-turnstile memory (app/core/zkem_rtlog_filter.py): one test's events
+    # must never read as another test's replays.
+    import app.core.zkem_rtlog_filter as zkem_rtlog
+    zkem_rtlog.reset_for_tests()
+    yield
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _never_write_the_default_config(tmp_path_factory):
     import shared.config as shared_config
