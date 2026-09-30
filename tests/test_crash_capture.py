@@ -116,9 +116,12 @@ def test_no_marker_no_report(tmp_path):
     assert crash_capture.previous_run_report(tmp_path, wall=time.time(), mono=1.0) is None
 
 
-def test_setup_logging_reports_the_previous_run_once_its_handlers_exist(monkeypatch):
+def test_setup_logging_reports_the_previous_run_once_its_handlers_exist(monkeypatch, tmp_path):
     from app.core import logger as logger_mod
 
+    # The real file handler prunes old logs in LOG_DIR: never the installed app's folder.
+    monkeypatch.setattr(logger_mod, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(logger_mod, "ensure_dirs", lambda: None)
     seen: list[int] = []
     monkeypatch.setattr(crash_capture, "report_previous",
                         lambda lg: seen.append(len(lg.handlers)))
