@@ -164,3 +164,38 @@ def test_access_main_installs_the_capture_after_the_single_instance_guard(monkey
     access_main.main()
 
     assert order == ["guard", "install", "run", "release"]
+
+
+_MAIN_WITH_FAILING_APP = """
+    import access.bootstrap, access.main, shared.dev_dependency_sync, shared.single_instance
+    class _Guard:
+        def release(self):
+            pass
+    shared.dev_dependency_sync.ensure_local_requirements_synced = lambda **k: None
+    shared.single_instance.acquire_single_instance_guard = lambda **k: _Guard()
+    crash_capture.default_state_dir = lambda: STATE
+    def _boom():
+        raise RuntimeError("member Jane Example 555-0100")  # data that must not be uploaded
+    access.bootstrap.run_access_app = _boom
+    access.main.main()
+"""
+
+
+def test_an_unhandled_exception_in_the_app_is_reported_at_the_next_start(tmp_path):
+    # The exception unwinds through atexit (a "normal" interpreter exit): the marker must survive
+    # it, and the evidence must not depend on the app logger, which may not exist yet (init_db
+    # runs before setup_logging) or on sys.excepthook (the windowed bootloader may bypass it).
+    died = _run(_MAIN_WITH_FAILING_APP, tmp_path)
+    assert died.returncode != 0
+    assert "RuntimeError" in (tmp_path / "fatal.txt").read_text(encoding="utf-8")
+
+    nxt = _run("""
+        crash_capture.install(STATE)
+        crash_capture.report_previous(log)
+    """, tmp_path)
+
+    out = nxt.stdout
+    assert "ERROR [CRASH] previous run" in out, out + nxt.stderr
+    assert "unhandled RuntimeError" in out
+    assert "<string>:" in out  # the frames' file:line
+    assert "Jane Example" not in out  # never the message: the app log is uploaded

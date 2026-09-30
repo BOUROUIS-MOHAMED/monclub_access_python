@@ -52,6 +52,9 @@ def main() -> None:
 
     try:
         run_access_app()
+    except BaseException as exc:
+        crash_capture.record_fatal(exc)  # kept for the next start, even through atexit
+        raise
     finally:
         try:
             guard.release()

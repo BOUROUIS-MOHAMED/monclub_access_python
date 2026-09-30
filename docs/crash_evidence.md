@@ -25,6 +25,15 @@ things:
 - It logs unhandled exceptions of the main thread (`sys.excepthook`) and of every other thread
   (`threading.excepthook`) to the app log. The previous hooks still run after it.
 
+**An exception out of the app itself** (`run_access_app`) unwinds through `atexit` -- a "normal"
+interpreter exit that would remove the marker -- and may come before the app log exists (`init_db`,
+`app.py:477`, runs before `setup_logging`, `:510`) or bypass `sys.excepthook` (a windowed
+bootloader). So `access/main.py::main` catches it (`except BaseException`, a zero/None `SystemExit`
+excepted), calls `crash_capture.record_fatal` and re-raises. `record_fatal` writes the full traceback
+to `crash/fatal.txt` on the PC, adds `safe_summary` (type + frames, never the message) to the
+marker and keeps the marker through `atexit`. The next start reports it at ERROR: a recorded
+exception is proof of a crash. `[TEST: test_crash_capture.py::test_an_unhandled_exception_in_the_app_is_reported_at_the_next_start]`
+
 `setup_logging` then calls `report_previous` once. A marker left behind becomes ONE `[CRASH] previous
 run … ended WITHOUT a clean exit` line in the app log, which the uploader ships. The line carries the
 last 16 KB of that run's faulthandler output. Its level depends on the case:

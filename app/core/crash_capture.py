@@ -30,24 +30,40 @@ import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 _LOGGER_NAME = "zkapp"
 _DUMP_NAME = "faulthandler.txt"
 _MARKER_NAME = "running.json"
+_FATAL_NAME = "fatal.txt"
 _DUMP_TAIL_BYTES = 16 * 1024
 # A boot is estimated as wall time minus monotonic time. NTP steps move the estimate by seconds;
 # a restart of Windows moves it by at least the reboot time.
 _SAME_BOOT_TOLERANCE_SEC = 300.0
 
-_state: dict[str, Any] = {"dump_file": None, "marker": None, "pending": None}
+_state: dict[str, Any] = {"dump_file": None, "marker": None, "pending": None, "keep_marker": False}
 
 
 def default_state_dir() -> Path:
     from app.core.utils import ACCESS_DATA_DIR
 
     return ACCESS_DATA_DIR / "crash"
+
+
+def _short_path(filename: str) -> str:
+    parts = Path(str(filename)).parts
+    return "/".join(parts[-2:]) if len(parts) > 1 else str(filename)
+
+
+def safe_summary(exc_type: Any, tb: Any, *, limit: int = 12) -> str:
+    """The exception TYPE and its frames (file:line in function), innermost first -- never the
+    message: an exception text can carry member data, and the app log is uploaded."""
+    name = getattr(exc_type, "__name__", None) or str(exc_type)
+    frames = traceback.extract_tb(tb)[-limit:] if tb is not None else []
+    where = " <- ".join(f"{_short_path(f.filename)}:{f.lineno} in {f.name}" for f in reversed(frames))
+    return f"{name} at {where}" if where else name
 
 
 def _boot_epoch(wall: float, mono: float) -> float:
@@ -85,7 +101,12 @@ def previous_run_report(state_dir: Path, *, wall: float, mono: float) -> Optiona
         f"[CRASH] previous run pid={prev.get('pid', '?')} "
         f"started={prev.get('started', '?')} ended WITHOUT a clean exit"
     )
-    if same_boot:
+    fatal = prev.get("fatal")
+    if fatal:
+        why = (f"with an unhandled {fatal} (full traceback in "
+               f"{Path(state_dir) / _FATAL_NAME} on this PC)")
+        level = logging.ERROR
+    elif same_boot:
         why = ("while Windows kept running: a native crash, a fatal Python error, or an external "
                "kill (Task Manager, taskkill, an installer)")
         level = logging.ERROR
@@ -107,6 +128,8 @@ def _log() -> logging.Logger:
 
 def _on_clean_exit() -> None:
     marker = _state.get("marker")
+    if _state.get("keep_marker"):
+        return  # record_fatal ran: the marker is the evidence the next start reports
     try:
         _log().info("[CRASH] interpreter exiting normally pid=%s", os.getpid())
     except Exception:
@@ -170,6 +193,34 @@ def install(state_dir: Optional[Path] = None) -> bool:
         except Exception:
             pass
         return False
+
+
+def record_fatal(exc: BaseException) -> None:
+    """The app's main function raised: keep the marker for the next start and write the
+    traceback to the crash folder directly -- not through logging, which may not be set up yet
+    (``init_db`` runs before ``setup_logging``), nor through ``sys.excepthook``, which a windowed
+    bootloader may bypass. The full traceback stays in ``fatal.txt`` on the PC; the marker, which
+    the next start reports into the uploaded app log, gets only ``safe_summary``. Never raises."""
+    if isinstance(exc, SystemExit) and exc.code in (None, 0):
+        return
+    try:
+        marker = Path(_state["marker"]) if _state.get("marker") else None
+        d = marker.parent if marker is not None else default_state_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / _FATAL_NAME).write_text(
+            time.strftime("%Y-%m-%d %H:%M:%S ") + f"pid={os.getpid()}\n"
+            + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+            encoding="utf-8")
+        if marker is not None:
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8") or "{}")
+            except Exception:
+                data = {}
+            data["fatal"] = safe_summary(type(exc), exc.__traceback__)
+            marker.write_text(json.dumps(data), encoding="utf-8")
+            _state["keep_marker"] = True
+    except Exception:
+        pass
 
 
 def report_previous(logger: logging.Logger) -> None:
