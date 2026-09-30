@@ -309,10 +309,9 @@ class ComponentUpdateManager:
         return _safe_str(getattr(self.cfg, "update_channel", "stable"), "stable").lower()
 
     def _interval_ms(self) -> int:
-        sec = int(getattr(self.cfg, "update_check_interval_sec", 3 * 60 * 60) or (3 * 60 * 60))
-        if sec < 60:
-            sec = 60
-        return sec * 1000
+        from app.core.config import update_check_interval_sec
+
+        return update_check_interval_sec(getattr(self.cfg, "update_check_interval_sec", None)) * 1000
 
     def _auto_download(self) -> bool:
         return bool(getattr(self.cfg, "update_auto_download_zip", True))

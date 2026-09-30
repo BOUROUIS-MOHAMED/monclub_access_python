@@ -8,6 +8,7 @@ from typing import Any, Dict, Literal, Optional
 
 from app.core.config import AppConfig as LegacyAppConfig
 from app.core.config import offline_revoke_grace_days as _offline_revoke_grace_days
+from app.core.config import update_check_interval_sec as _update_check_interval_sec
 from app.core.utils import load_json, save_json
 from shared.api.monclub_api import ApiEndpoints
 from shared.component_identity import get_component_identity
@@ -391,7 +392,7 @@ def _build_access_section_from_cfg(cfg: AppConfig) -> AccessConfigSection:
         update_enabled=bool(getattr(cfg, "update_enabled", True)),
         update_platform=str(getattr(cfg, "update_platform", "WINDOWS") or "WINDOWS"),
         update_channel=str(getattr(cfg, "update_channel", "stable") or "stable"),
-        update_check_interval_sec=int(getattr(cfg, "update_check_interval_sec", 30) or 30),
+        update_check_interval_sec=_update_check_interval_sec(getattr(cfg, "update_check_interval_sec", None)),
         update_auto_download_zip=bool(getattr(cfg, "update_auto_download_zip", True)),
         template_version=int(getattr(cfg, "template_version", 10) or 10),
         template_encoding=str(getattr(cfg, "template_encoding", "base64") or "base64"),
@@ -438,7 +439,7 @@ def _build_tv_section_from_cfg(cfg: AppConfig) -> TvConfigSection:
         update_enabled=bool(getattr(cfg, "update_enabled", True)),
         update_platform=str(getattr(cfg, "update_platform", "WINDOWS") or "WINDOWS"),
         update_channel=str(getattr(cfg, "update_channel", "stable") or "stable"),
-        update_check_interval_sec=int(getattr(cfg, "update_check_interval_sec", 30) or 30),
+        update_check_interval_sec=_update_check_interval_sec(getattr(cfg, "update_check_interval_sec", None)),
         update_auto_download_zip=bool(getattr(cfg, "update_auto_download_zip", True)),
         minimize_to_tray_on_close=bool(getattr(cfg, "minimize_to_tray_on_close", True)),
         start_on_system_startup=bool(getattr(cfg, "start_on_system_startup", False)),
