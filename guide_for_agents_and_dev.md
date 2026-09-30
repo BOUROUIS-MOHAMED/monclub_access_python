@@ -46,6 +46,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
+| The crash evidence of a process that ends without "App shutting down" (`app/core/crash_capture.py`; `access/main.py::main`'s `install`, after the single-instance guard; `logger.py::setup_logging`'s `report_previous`) | §3.2i |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, field cheatsheet §6, and zkemkeeper_guide §4 (Door) |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
@@ -1439,9 +1440,10 @@ When one of them fails, its own exception leaves `init_db` and `get_conn` closes
 `access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
 or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
 `%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`;
-`app/main.py` redirects to the same file; no `sys.excepthook` is installed anywhere in the repo,
-grep 2026-09-26). The next start runs the migration again. `[CODE: db.py::init_db;
-access/store.py::init_db; app.py::MainApp.__init__, ::run_app; access/main.py::main]`
+`app/main.py` redirects to the same file). Since 2026-09-30 `app/core/crash_capture.py` also installs a
+`sys.excepthook` that logs it to the `zkapp` logger first (§3.2i). The next start runs the migration
+again. `[CODE: db.py::init_db; access/store.py::init_db; app.py::MainApp.__init__, ::run_app;
+access/main.py::main]`
 
 What rolls back is the transaction, and Python's `sqlite3` opens it at the first INSERT, UPDATE or
 DELETE, not at DDL. A `CREATE`, `DROP` or `ALTER` that ran before that is already committed. So a
@@ -2611,6 +2613,44 @@ the verified backup and the verified erase. `[CODE]`
     `test_it_survives_a_restart`; a failing re-erase of a held turnstile rewrites the hold row's `run_id`; the START's two
     network calls against the page's 60 s (the page already watches `/erase/status` a minute more); the AST allowlist does
     not see a device reached through a captured object; the server-side proof that the F12 null overrides a stored `true`.
+
+### 3.2i A process that ends without "App shutting down" — the crash evidence (2026-09-30)
+
+**Field.** Gym 45, PC "Accueil", 1.4.35: the app log stops at 07:50:31, mid-way through its 5-second
+dashboard cadence. A new process starts at 07:50:48 (`startup_arg=False`) on the SAME Windows boot:
+`monotonic_s` is 1040069, which continues the previous run's 1011100 + uptime. There is no shutdown
+line, no traceback and no watchdog line. The last `PROC_HB` (07:49:41) shows `private_mb=107.8`,
+`sys_avail_mb=728`, `sys_avail_pagefile_mb=2921`. The 285 MB low of that day came at 09:10, after the
+restart. The cause is `[UNKNOWN]`. `[FIELD]`
+
+**What existed.** `access/main.py` enables faulthandler at start, and a windowed build points
+stderr at `%TEMP%\MonClubAccess.log` (`_ensure_console_streams`). So a native crash already left a
+dump, but only in a temp file that nobody collects, that is never truncated, and that also receives a
+full DEBUG copy of the app log (the console `StreamHandler` in `logger.py::setup_logging`). `[CODE]`
+
+**What `crash_capture` adds.** `install()` is called once by `access/main.py::main`, AFTER the
+single-instance guard (a second start must not wipe the running instance's files). It does three
+things:
+- It moves faulthandler to `<data root>/access/crash/faulthandler.txt`, truncated at each start
+  once the previous content has been read.
+- It writes a run marker, `running.json` (pid, start time, boot estimate = wall time minus
+  monotonic). Only a normal interpreter exit (`atexit`) removes it, and it logs
+  `[CRASH] interpreter exiting normally`.
+- It logs unhandled exceptions of the main thread (`sys.excepthook`) and of every other thread
+  (`threading.excepthook`) to the app log. The previous hooks still run after it.
+
+`setup_logging` then calls `report_previous` once. A marker left behind becomes ONE `[CRASH] previous
+run … ended WITHOUT a clean exit` line in the app log, which the uploader ships. The line carries the
+last 16 KB of that run's faulthandler output. Its level depends on the case:
+- ERROR when the boot estimate matches, i.e. Windows kept running: a native crash, a fatal Python
+  error, or an external kill.
+- WARNING (with a dump) or INFO (without one) when Windows restarted since. This is the daily
+  power-off at most gyms.
+
+On Windows faulthandler also prints first-chance exceptions that were handled later, so a dump alone is
+not proof of a crash; the marker is. An external kill (Task Manager, `taskkill`) or `os._exit` (the
+15-s shutdown fallback in `quit_app`) leaves the marker and no dump.
+`[TEST: test_crash_capture.py]` (subprocess `faulthandler._sigsegv()`, then a second start.)
 
 ### 3.3 How ULTRA pushes to a *PullSDK* device (non-obvious)
 

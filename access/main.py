@@ -42,6 +42,12 @@ def main() -> None:
         print("MonClub Access is already running — exiting this instance.", file=sys.stderr)
         raise SystemExit(0)
 
+    # Only the instance that holds the guard: a second start must not wipe the running
+    # instance's crash evidence. Moves faulthandler from stderr to its own file.
+    from app.core import crash_capture
+
+    crash_capture.install()
+
     from access.bootstrap import run_access_app
 
     try:

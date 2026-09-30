@@ -268,4 +268,9 @@ def setup_logging(level: str = "DEBUG", ui_queue: Optional["queue.Queue[str]"] =
         qh.setFormatter(fmt)
         logger.addHandler(qh)
 
+    # A previous run that ended without a clean exit is reported here, now that the app log --
+    # the file the uploader ships -- exists. No-op unless access/main.py installed the capture.
+    from app.core.crash_capture import report_previous
+
+    report_previous(logger)
     return logger
