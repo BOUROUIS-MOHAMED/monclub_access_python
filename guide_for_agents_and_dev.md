@@ -4306,7 +4306,7 @@ each signal already exists: `check_bulk_removal` records every refused pin of th
 PullSDK stale step (never a table clear or a renewal release; a step that runs with nothing refused resolves
 it); `_capacity_admit` sets/clears `CAPACITY_FULL`; every push adds/removes `TEMPLATE_VERSION_MISMATCH` pins
 (from the driver's new aggregate `failed_reasons`); the targeted and full-sync skips add `SKIPPED_NOT_OWNED`
-(7-day expiry); a trusted listing sets `MISSING_OWNED`. `reports.py::ProblemReporter` posts one snapshot per
+(resolved, 2026-09-30, once MonClub owns the pin again or removed it since -- `removed_pins.settle_skipped` before each report -- or a COMPLETE listing shows it absent, `loss.evaluate_listing`; else a 7-day expiry `[TEST: test_problem_skip_resolution.py]`); a trusted listing sets `MISSING_OWNED`. `reports.py::ProblemReporter` posts one snapshot per
 driven turnstile when it changes and hourly while it has problems, only after that turnstile's removal step
 (the standalone revoke pass or the PullSDK stale step) ran in this process — a `CAPACITY_FULL` clear, a table
 clear or a targeted skip alone does not count (review R9) — so a restart never sends a snapshot that hides a

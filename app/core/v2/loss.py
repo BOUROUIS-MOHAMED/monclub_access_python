@@ -68,6 +68,10 @@ def evaluate_listing(device_id: int, *, on_device: Iterable[str], owned: Iterabl
         _problems.registry.set_code(device_id, _problems.MISSING_OWNED, missing, count=len(missing))
     else:
         _problems.registry.clear_code(device_id, _problems.MISSING_OWNED)
+        # A COMPLETE listing (every owned pin shown) proves absence: a SKIPPED_NOT_OWNED pin
+        # it does not show is not on the terminal, so nothing is left to revoke.
+        _problems.registry.resolve_skipped(
+            device_id, [p for p in _problems.registry.skipped_pins(device_id) if p not in on])
     if not trusted or desired is None or not _enabled:
         if missing and not trusted:
             _log.warning("[V2] loss check turnstile %s: %d owned pin(s) absent -- more than the "

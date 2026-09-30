@@ -20,7 +20,9 @@ Each code is resolved where its own step runs: a removal step that runs with not
 clears its ``REVOKE_ABORTED``; a capacity check that admits everything clears
 ``CAPACITY_FULL``; a push removes the pins it wrote without a version mismatch from
 ``TEMPLATE_VERSION_MISMATCH``; each trusted read-back replaces ``MISSING_OWNED``;
-``SKIPPED_NOT_OWNED`` entries expire after ``SKIPPED_TTL_SEC``.
+a ``SKIPPED_NOT_OWNED`` pin is resolved once MonClub owns it again or removed it since
+(``removed_pins.settle_skipped``, before each report) or a complete listing of the terminal
+shows it absent (``loss.evaluate_listing``), and expires after ``SKIPPED_TTL_SEC`` otherwise.
 
 The pin-set hash is the server's canonical one (``AccessPinSets.canonicalHash``): trimmed,
 de-duplicated, sorted as strings, joined by ``\\n``, SHA-256, lower-case hex.
@@ -121,6 +123,28 @@ class _Registry:
                 if s and s not in cur:
                     cur[s] = now
                     self._changed_at[did] = now
+
+    def skipped_pins(self, device_id: Any) -> Dict[str, float]:
+        """The SKIPPED_NOT_OWNED pins of a turnstile -> when each was recorded (time.time())."""
+        did = _did(device_id)
+        with self._lock:
+            return dict(self._skipped.get(did, {})) if did is not None else {}
+
+    def resolve_skipped(self, device_id: Any, pins: Iterable[Any], *,
+                        recorded_before: Optional[float] = None) -> None:
+        """Drop SKIPPED_NOT_OWNED pins shown to be resolved. ``recorded_before``: only entries
+        recorded before then (the moment the proof was read), so a skip that lands meanwhile stays."""
+        did = _did(device_id)
+        if did is None:
+            return
+        with self._lock:
+            cur = self._skipped.get(did, {})
+            gone = [s for s in {str(p).strip() for p in pins} if s in cur
+                    and (recorded_before is None or cur[s] < recorded_before)]
+            for s in gone:
+                cur.pop(s, None)
+            if gone:
+                self._changed_at[did] = time.time()
 
     def update_code_pins(self, device_id: Any, code: str, *, add: Iterable[Any] = (),
                          remove: Iterable[Any] = ()) -> None:

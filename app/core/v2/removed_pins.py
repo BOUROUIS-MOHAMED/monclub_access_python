@@ -3,7 +3,8 @@
 A pin is ``REMOVED`` on a turnstile when MonClub itself removed it (``v2_removal_log``, written
 in the removal's own transaction) and has not written it since -- no state row, no write-ahead
 intent -- under the device's current pin scheme (``ownership.local_facts``, the same fact the
-ownership upload sends the server).
+ownership upload sends the server). It also settles SKIPPED_NOT_OWNED turnstile problems
+(``settle_skipped``).
 
 The same revocation often reaches a worker twice (gym 45, 2026-09-30): a fast-patch bundle,
 then the pull delta that re-derives the deletion; a date-flip pass removes the departed, then
@@ -15,7 +16,8 @@ MonClub never wrote is still never touched, and still reported.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Set
+import time
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from app.core import telemetry as _tel
 
@@ -87,3 +89,29 @@ def settle_unowned(device_id: Any, prefix: str, tel_wid: str, not_owned: Dict[in
         except Exception:
             pass
     return skipped
+
+
+def settle_skipped(device_id: Any) -> List[str]:
+    """Resolve the turnstile's SKIPPED_NOT_OWNED pins the local record now settles: MonClub owns
+    the pin again (``APPLIED``: re-pushed and confirmed, or proven by the intent read-back) or
+    removed it since (``REMOVED``). Run before each problem report, so the next one tells the
+    server (a code left out of a snapshot is resolved there). An unreadable record resolves
+    nothing. Returns the resolved pins."""
+    from app.core.v2.problems import registry
+
+    checked_at = time.time()
+    pins = registry.skipped_pins(device_id)
+    if not pins:
+        return []
+    try:
+        states = pin_states(device_id, pins)
+    except Exception:
+        _log.debug("[V2] turnstile %s: SKIPPED_NOT_OWNED not re-checked (record unreadable)",
+                   device_id, exc_info=True)
+        return []
+    done = sorted(p for p in pins if states.get(p) in ("APPLIED", "REMOVED"))
+    if done:
+        registry.resolve_skipped(device_id, done, recorded_before=checked_at)
+        _log.info("[V2] turnstile %s: SKIPPED_NOT_OWNED resolved for %d pin(s) MonClub re-pushed "
+                  "or removed since: %s", device_id, len(done), ",".join(done[:20]))
+    return done
