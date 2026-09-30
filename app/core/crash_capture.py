@@ -119,9 +119,10 @@ def previous_run_report(state_dir: Path, *, wall: float, mono: float,
     try:
         dump_path = Path(state_dir) / _DUMP_NAME
         if dump_path.exists():
-            data = dump_path.read_bytes()
-            size = len(data)
-            dump = data[-_DUMP_TAIL_BYTES:].decode("utf-8", errors="replace").strip()
+            with open(dump_path, "rb") as fh:  # the tail only: a noisy dump can be large
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, size - _DUMP_TAIL_BYTES))
+                dump = fh.read().decode("utf-8", errors="replace").strip()
     except Exception:
         dump = ""
     prev_boot = prev.get("boot_epoch")
@@ -144,6 +145,10 @@ def previous_run_report(state_dir: Path, *, wall: float, mono: float,
         why = (f"with an unhandled {fatal} (full traceback in "
                f"{Path(state_dir) / _FATAL_NAME} on this PC)")
         level = logging.ERROR
+    elif prev.get("forced_exit"):
+        why = ("by the forced exit after the 15 s shutdown timeout of quit_app (the app log has "
+               "'Shutdown timed out'), not a crash")
+        level = logging.INFO
     elif same_boot and slept_sec is not None and slept_sec > _SLEEP_TOLERANCE_SEC:
         why = (f"on what looks like the same Windows boot, but the PC slept or hibernated "
                f"{slept_sec:.0f} s in between: most likely a shutdown with Windows Fast Startup "
@@ -195,10 +200,12 @@ def _install_exception_hooks() -> None:
     prev_sys_hook = sys.excepthook
     prev_thread_hook = threading.excepthook
 
+    # The app log is uploaded: type and frames only (safe_summary), never the message, which can
+    # carry member data. The previous hooks still print the full traceback to the local stderr.
     def _sys_hook(exc_type, exc, tb):
         try:
-            _log().critical("[CRASH] unhandled exception in the main thread",
-                            exc_info=(exc_type, exc, tb))
+            _log().critical("[CRASH] unhandled exception in the main thread: %s",
+                            safe_summary(exc_type, tb))
         except Exception:
             pass
         prev_sys_hook(exc_type, exc, tb)
@@ -207,8 +214,8 @@ def _install_exception_hooks() -> None:
         if args.exc_type is not SystemExit:
             try:
                 name = getattr(args.thread, "name", "?")
-                _log().error("[CRASH] unhandled exception in thread %s", name,
-                             exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+                _log().error("[CRASH] unhandled exception in thread %s: %s", name,
+                             safe_summary(args.exc_type, args.exc_traceback))
             except Exception:
                 pass
         prev_thread_hook(args)
@@ -273,6 +280,20 @@ def record_fatal(exc: BaseException) -> None:
             _state["keep_marker"] = True
     except Exception:
         pass
+
+
+def forced_exit(code: int = 1) -> None:
+    """``os._exit`` for ``quit_app``'s 15-s shutdown fallback: marks the run so the next start
+    reports a forced exit, not a crash (``os._exit`` skips ``atexit``). Does not return."""
+    try:
+        marker = Path(_state["marker"]) if _state.get("marker") else None
+        if marker is not None and marker.exists():
+            data = json.loads(marker.read_text(encoding="utf-8") or "{}")
+            data["forced_exit"] = True
+            marker.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
+    os._exit(code)
 
 
 def report_previous(logger: logging.Logger) -> None:

@@ -98,8 +98,8 @@ def test_an_unhandled_thread_exception_reaches_the_app_log(tmp_path):
         t = threading.Thread(target=boom, name="worker-x")
         t.start(); t.join()
     """, tmp_path)
-    assert "ERROR [CRASH] unhandled exception in thread worker-x" in res.stdout, res.stdout
-    assert "RuntimeError: thread blew up" in res.stdout
+    assert "ERROR [CRASH] unhandled exception in thread worker-x: RuntimeError at <string>:" in res.stdout, res.stdout
+    assert "thread blew up" not in res.stdout  # never the message: the app log is uploaded
 
 
 def test_a_marker_from_another_boot_says_windows_restarted(tmp_path):
@@ -248,3 +248,39 @@ def test_the_interrupt_time_sleep_total_is_readable_on_windows():
         assert isinstance(value, int) and value >= 0
     else:
         assert value is None
+
+
+def test_the_quit_fallback_os_exit_is_reported_as_a_forced_exit_not_a_crash(tmp_path):
+    first = _run("""
+        crash_capture.install(STATE)
+        crash_capture.forced_exit(1)
+    """, tmp_path)
+    assert first.returncode == 1
+
+    nxt = _run("""
+        crash_capture.install(STATE)
+        crash_capture.report_previous(log)
+    """, tmp_path)
+
+    assert "INFO [CRASH] previous run" in nxt.stdout, nxt.stdout
+    assert "forced exit after the 15 s shutdown timeout" in nxt.stdout
+
+
+def test_quit_app_force_exit_goes_through_crash_capture():
+    import inspect
+
+    from app.ui.app import MainApp
+
+    src = inspect.getsource(MainApp.quit_app)
+    assert "forced_exit(1)" in src and "os._exit(" not in src
+
+
+def test_only_the_tail_of_a_large_dump_is_read(tmp_path):
+    wall, mono = time.time(), 5000.0
+    (tmp_path / "running.json").write_text(json.dumps({"pid": 1}), encoding="utf-8")
+    (tmp_path / "faulthandler.txt").write_bytes(b"x" * (1024 * 1024) + b" THE-END")
+
+    _level, message = crash_capture.previous_run_report(tmp_path, wall=wall, mono=mono)
+
+    assert f"last {16 * 1024} of {1024 * 1024 + 8} bytes" in message
+    assert message.rstrip().endswith("THE-END")

@@ -23,7 +23,9 @@ things:
   monotonic). Only a normal interpreter exit (`atexit`) removes it, and it logs
   `[CRASH] interpreter exiting normally`.
 - It logs unhandled exceptions of the main thread (`sys.excepthook`) and of every other thread
-  (`threading.excepthook`) to the app log. The previous hooks still run after it.
+  (`threading.excepthook`) to the app log -- type and frames only (`safe_summary`), never the
+  message, which can carry member data; the previous hooks still print the full traceback to the
+  local stderr file.
 
 **An exception out of the app itself** (`run_access_app`) unwinds through `atexit` -- a "normal"
 interpreter exit that would remove the marker -- and may come before the app log exists (`init_db`,
@@ -53,6 +55,8 @@ last 16 KB of that run's faulthandler output. Its level depends on the case:
   power-off at most gyms.
 
 On Windows faulthandler also prints first-chance exceptions that were handled later, so a dump alone is
-not proof of a crash; the marker is. An external kill (Task Manager, `taskkill`) or `os._exit` (the
-15-s shutdown fallback in `quit_app`) leaves the marker and no dump.
+not proof of a crash. An external kill (Task Manager, `taskkill`) leaves the marker and no dump.
+`quit_app`'s 15-s shutdown fallback calls `crash_capture.forced_exit(1)` (in `app.py`, same line
+count), which marks the marker before `os._exit`: the next start reports it at INFO as a forced
+exit, not a crash. Only the last 16 KB of the dump is read (a seek, not the whole file).
 `[TEST: test_crash_capture.py]` (subprocess `faulthandler._sigsegv()`, then a second start.)
