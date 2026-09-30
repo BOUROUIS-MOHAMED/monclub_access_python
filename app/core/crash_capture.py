@@ -42,6 +42,9 @@ _DUMP_TAIL_BYTES = 16 * 1024
 # A boot is estimated as wall time minus monotonic time. NTP steps move the estimate by seconds;
 # a restart of Windows moves it by at least the reboot time.
 _SAME_BOOT_TOLERANCE_SEC = 300.0
+# Growth of the sleep/hibernation total (interrupt_sleep_100ns) above which the PC slept or
+# hibernated between two runs.
+_SLEEP_TOLERANCE_SEC = 60.0
 
 _state: dict[str, Any] = {"dump_file": None, "marker": None, "pending": None, "keep_marker": False}
 
@@ -70,10 +73,39 @@ def _boot_epoch(wall: float, mono: float) -> float:
     return float(wall) - float(mono)
 
 
-def previous_run_report(state_dir: Path, *, wall: float, mono: float) -> Optional[Tuple[int, str]]:
+def interrupt_sleep_100ns() -> Optional[int]:
+    """Time this Windows boot has spent asleep or hibernated, in 100-ns units, else None.
+
+    ``QueryInterruptTime`` counts sleep and hibernation, ``QueryUnbiasedInterruptTime`` does not
+    (Microsoft's documentation); the difference grows by the length of every sleep or hibernation.
+    A Windows "shutdown" with Fast Startup hibernates the kernel session, so it should show up
+    here even when the boot estimate says "same boot" -- ``[UNVERIFIED]`` on a real Fast Startup
+    PC. Both take a ULONGLONG pointer, which is 32-bit safe. None off Windows, before Windows 10
+    (no ``QueryInterruptTime``) or on any error.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        biased, unbiased = ctypes.c_ulonglong(), ctypes.c_ulonglong()
+        query_interrupt_time = ctypes.WinDLL("KernelBase").QueryInterruptTime
+        query_interrupt_time.restype = None
+        query_interrupt_time(ctypes.byref(biased))
+        if not ctypes.WinDLL("kernel32").QueryUnbiasedInterruptTime(ctypes.byref(unbiased)):
+            return None
+        return max(0, int(biased.value) - int(unbiased.value))
+    except Exception:
+        return None
+
+
+def previous_run_report(state_dir: Path, *, wall: float, mono: float,
+                        sleep_100ns: Optional[int] = None) -> Optional[Tuple[int, str]]:
     """``(log level, message)`` for a previous run that did not exit cleanly, else None.
 
-    Reads only: the marker and the dump of the previous run are left as they are.
+    Reads only: the marker and the dump of the previous run are left as they are. ERROR only
+    for a RECORDED exception (``record_fatal``): neither a dump (first-chance exceptions) nor
+    "same boot" (Fast Startup) proves a crash.
     """
     marker_path = Path(state_dir) / _MARKER_NAME
     if not marker_path.exists():
@@ -101,15 +133,33 @@ def previous_run_report(state_dir: Path, *, wall: float, mono: float) -> Optiona
         f"[CRASH] previous run pid={prev.get('pid', '?')} "
         f"started={prev.get('started', '?')} ended WITHOUT a clean exit"
     )
+    prev_sleep = prev.get("sleep_100ns")
+    slept_sec: Optional[float] = None
+    if isinstance(prev_sleep, int) and isinstance(sleep_100ns, int):
+        slept_sec = (sleep_100ns - prev_sleep) / 1e7
+        if slept_sec < 0:  # the counter started again: a new boot
+            same_boot = False
     fatal = prev.get("fatal")
     if fatal:
         why = (f"with an unhandled {fatal} (full traceback in "
                f"{Path(state_dir) / _FATAL_NAME} on this PC)")
         level = logging.ERROR
+    elif same_boot and slept_sec is not None and slept_sec > _SLEEP_TOLERANCE_SEC:
+        why = (f"on what looks like the same Windows boot, but the PC slept or hibernated "
+               f"{slept_sec:.0f} s in between: most likely a shutdown with Windows Fast Startup "
+               f"(or a sleep), or a crash before it")
+        level = logging.WARNING if dump else logging.INFO
+    elif same_boot and slept_sec is not None:
+        why = ("while Windows appears to have kept running (same boot estimate, no sleep or "
+               "hibernation recorded in between): a native crash, a fatal Python error, or an "
+               "external kill (Task Manager, taskkill, an installer) -- not yet verified on a PC "
+               "with Fast Startup")
+        level = logging.WARNING
     elif same_boot:
-        why = ("while Windows kept running: a native crash, a fatal Python error, or an external "
-               "kill (Task Manager, taskkill, an installer)")
-        level = logging.ERROR
+        why = ("on what looks like the same Windows boot: a native crash, a fatal Python error, "
+               "an external kill -- or a shutdown with Windows Fast Startup, which this check "
+               "cannot tell apart")
+        level = logging.WARNING
     else:
         why = "and Windows has restarted since: a shutdown or power loss (or a crash before it)"
         level = logging.WARNING if dump else logging.INFO
@@ -173,7 +223,8 @@ def install(state_dir: Optional[Path] = None) -> bool:
         d = Path(state_dir) if state_dir is not None else default_state_dir()
         d.mkdir(parents=True, exist_ok=True)
         wall, mono = time.time(), time.monotonic()
-        _state["pending"] = previous_run_report(d, wall=wall, mono=mono)
+        sleep_100ns = interrupt_sleep_100ns()
+        _state["pending"] = previous_run_report(d, wall=wall, mono=mono, sleep_100ns=sleep_100ns)
         dump_file = open(d / _DUMP_NAME, "w", encoding="utf-8", buffering=1)
         faulthandler.enable(file=dump_file, all_threads=True)
         _state["dump_file"] = dump_file  # faulthandler keeps only the fd: keep the object alive
@@ -182,6 +233,7 @@ def install(state_dir: Optional[Path] = None) -> bool:
             "pid": os.getpid(),
             "started": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(wall)),
             "boot_epoch": round(_boot_epoch(wall, mono), 1),
+            "sleep_100ns": sleep_100ns,
         }), encoding="utf-8")
         _state["marker"] = str(marker)
         atexit.register(_on_clean_exit)

@@ -54,8 +54,11 @@ def test_a_native_crash_is_reported_at_the_next_start_with_its_dump(tmp_path):
     """, tmp_path)
 
     out = nxt.stdout
-    assert "ERROR [CRASH] previous run" in out, out + nxt.stderr
-    assert "ended WITHOUT a clean exit while Windows kept running" in out
+    # A dump is not proof (first-chance exceptions print too) and "same boot" is not proof either
+    # (Windows Fast Startup): WARNING, never ERROR, without a recorded exception.
+    assert "WARNING [CRASH] previous run" in out, out + nxt.stderr
+    assert "ERROR [CRASH]" not in out
+    assert "ended WITHOUT a clean exit" in out
     assert "Segmentation fault" in out or "access violation" in out, out
     assert "_sigsegv" in out or "<string>" in out  # the Python stack of the crashing thread
 
@@ -199,3 +202,49 @@ def test_an_unhandled_exception_in_the_app_is_reported_at_the_next_start(tmp_pat
     assert "unhandled RuntimeError" in out
     assert "<string>:" in out  # the frames' file:line
     assert "Jane Example" not in out  # never the message: the app log is uploaded
+
+
+def _marker(tmp_path, **fields):
+    (tmp_path / "running.json").write_text(json.dumps({"pid": 1, "started": "x", **fields}),
+                                           encoding="utf-8")
+
+
+def test_same_boot_without_sleep_data_is_a_hedged_warning_naming_fast_startup(tmp_path):
+    wall, mono = time.time(), 5000.0
+    _marker(tmp_path, boot_epoch=wall - mono)
+
+    level, message = crash_capture.previous_run_report(tmp_path, wall=wall, mono=mono,
+                                                       sleep_100ns=None)
+
+    assert level == logging.WARNING
+    assert "Fast Startup" in message
+
+
+def test_same_boot_with_a_sleep_in_between_says_the_pc_slept_or_hibernated(tmp_path):
+    wall, mono = time.time(), 5000.0
+    _marker(tmp_path, boot_epoch=wall - mono, sleep_100ns=10 * 10**7)
+
+    level, message = crash_capture.previous_run_report(
+        tmp_path, wall=wall, mono=mono, sleep_100ns=(10 + 8 * 3600) * 10**7)
+
+    assert level == logging.INFO  # no dump: the nightly shutdown, not an alarm
+    assert "slept or hibernated" in message and "Fast Startup" in message
+
+
+def test_same_boot_and_no_sleep_is_still_only_a_warning(tmp_path):
+    wall, mono = time.time(), 5000.0
+    _marker(tmp_path, boot_epoch=wall - mono, sleep_100ns=10 * 10**7)
+
+    level, message = crash_capture.previous_run_report(tmp_path, wall=wall, mono=mono,
+                                                       sleep_100ns=10 * 10**7)
+
+    assert level == logging.WARNING  # [UNVERIFIED] on a Fast Startup PC: never ERROR
+    assert "no sleep or hibernation recorded" in message
+
+
+def test_the_interrupt_time_sleep_total_is_readable_on_windows():
+    value = crash_capture.interrupt_sleep_100ns()
+    if os.name == "nt":
+        assert isinstance(value, int) and value >= 0
+    else:
+        assert value is None

@@ -37,8 +37,18 @@ exception is proof of a crash. `[TEST: test_crash_capture.py::test_an_unhandled_
 `setup_logging` then calls `report_previous` once. A marker left behind becomes ONE `[CRASH] previous
 run … ended WITHOUT a clean exit` line in the app log, which the uploader ships. The line carries the
 last 16 KB of that run's faulthandler output. Its level depends on the case:
-- ERROR when the boot estimate matches, i.e. Windows kept running: a native crash, a fatal Python
-  error, or an external kill.
+- ERROR only for an exception `record_fatal` recorded (below): that is proof of a crash.
+- WARNING when the boot estimate matches ("same boot"). This is NOT proof that Windows kept running:
+  with Fast Startup (`HiberbootEnabled=1`, the Windows default) a "shutdown" hibernates the kernel
+  session, and the QPC-based `time.monotonic()` may continue across it `[UNVERIFIED]`. The Accueil
+  PC's `monotonic_s=1011100` (11.7 days) at 29-09 23:47, at a gym whose PCs are said to be off
+  every night, is consistent with that `[UNVERIFIED]`. So the marker also stores the time this boot
+  spent asleep or hibernated (`interrupt_sleep_100ns`: `QueryInterruptTime` minus
+  `QueryUnbiasedInterruptTime`, which Microsoft documents as excluding sleep and hibernation). The
+  message says "the PC slept or hibernated N s in between" when that total grew by more than 60 s,
+  and it is then INFO without a dump. Whether a Fast Startup shutdown really grows this total is
+  `[UNVERIFIED]` on a real PC: until it is, "same boot, no sleep recorded" stays a WARNING whose
+  text says so.
 - WARNING (with a dump) or INFO (without one) when Windows restarted since. This is the daily
   power-off at most gyms.
 
