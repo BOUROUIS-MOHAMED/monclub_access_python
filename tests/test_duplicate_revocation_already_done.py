@@ -23,6 +23,7 @@ import app.core.db as dbmod
 import app.core.telemetry as tel
 from app.core.v2 import lease_gate as lg
 from app.core.v2 import problems as pr
+from tests.test_account_pin_device_sites import sqlite_db  # noqa: F401  (fixture)
 from tests.test_standalone_incremental_sync import _user, _worker
 from tests.test_standalone_revoked_pin_removal import RevokeDriver, _authoritative_full_sync
 
@@ -254,3 +255,58 @@ class TestOnlyARecentStandingRemovalCounts:
         assert w._run_standalone_member_revoke(int(PIN)) is True
         assert _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED") == []
         assert _named(tel_log, "MEMBER_REVOKE_DONE")[-1]["mode"] == "already_removed"
+
+
+class TestPullSdkTargetedRevokeTwice:
+    """The C3 path (device_sync.sync_member_on_connected_sdk) had the same shape: its delete
+    clears the ownership row, so a duplicate revocation logged CRITICAL SKIPPED_NOT_OWNED and
+    raised a turnstile problem. Same rule; an unowned pin is still never deleted."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        lg.reset_for_tests()
+        pr.registry.reset_for_tests()
+        yield
+        pr.registry.reset_for_tests()
+        lg.reset_for_tests()
+
+    def _revoke(self, sqlite_db, sdk):
+        from tests.test_account_pin_device_sites import _engine, _pullsdk_device
+        eng = _engine()
+        ok = eng.sync_member_on_connected_sdk(sdk=sdk, device=_pullsdk_device(pinScheme="ACCOUNT"),
+                                              member_id=5, revocation=True)
+        return eng, ok
+
+    def _setup(self, sqlite_db):
+        from tests.test_account_pin_device_sites import _ali_gym, _cache, _sonia
+        _cache(sqlite_db, [_ali_gym(), _sonia()])
+        _cache(sqlite_db, [], valid_ids=[31000])               # Sonia (person pin 777) revoked
+        sqlite_db.save_device_sync_state(device_id=1, pin="777", desired_hash="h", ok=True, error=None)
+
+    def test_the_second_revocation_is_done(self, sqlite_db, tel_log):
+        from tests.test_account_pin_device_sites import _deleted_pins, _removed_pins, _sdk
+        self._setup(sqlite_db)
+        sdk1, sdk2 = _sdk(), _sdk()
+        eng, ok = self._revoke(sqlite_db, sdk1)
+        assert ok is True and _removed_pins(sdk1) == {"777"}
+        eng, ok = self._revoke(sqlite_db, sdk2)
+        assert ok is True, "the revocation is finished"
+        assert eng._last_member_sync_outcome == "ALREADY_REMOVED"
+        assert _deleted_pins(sdk2) == [], "nothing deleted a second time"
+        assert _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED") == []
+        assert [d["mode"] for d in _named(tel_log, "MEMBER_REVOKE_DONE")] == ["already_removed"]
+        assert _skipped_problem(1) == []
+
+    def test_an_old_removal_is_still_reported_and_nothing_deleted(self, sqlite_db, tel_log):
+        from tests.test_account_pin_device_sites import _deleted_pins, _sdk
+        self._setup(sqlite_db)
+        self._revoke(sqlite_db, _sdk())
+        with sqlite_db.get_conn() as conn:
+            conn.execute("UPDATE v2_removal_log SET removed_at = removed_at - ?", (25 * 3600,))
+            conn.commit()
+        sdk2 = _sdk()
+        eng, ok = self._revoke(sqlite_db, sdk2)
+        assert ok is False and eng._last_member_sync_outcome == "SKIPPED_NOT_OWNED"
+        assert _deleted_pins(sdk2) == []
+        assert [s["pin"] for s in _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED")] == ["777"]
+        assert _skipped_problem(1)[0]["pins"] == ["777"]

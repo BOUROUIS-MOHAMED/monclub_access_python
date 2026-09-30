@@ -127,6 +127,36 @@ def settle_unowned(device_id: Any, prefix: str, tel_wid: str, not_owned: Dict[in
     return skipped
 
 
+def settle_unowned_pullsdk(device_id: Any, device_name: Any, pin: str, member_id: Any,
+                           pin_scheme: Any, source: Any) -> bool:
+    """The PullSDK targeted revoke's not-owned pin (``device_sync.sync_member_on_connected_sdk``);
+    nothing is deleted either way. True: MonClub already removed it (as ``already_removed``) --
+    done, one INFO line. False: SKIPPED_NOT_OWNED reported as before (CRITICAL line, telemetry,
+    the turnstile problem)."""
+    if pin in already_removed(device_id, [pin]):
+        _log.info("[DeviceSync] targeted member delete: device_id=%s pin=%s membership=%s was "
+                  "already removed by MonClub -- nothing left to delete, revocation finished. "
+                  "source=%s", device_id, pin, member_id, source)
+        _tel.event("MEMBER_REVOKE_DONE", device_id=device_id, member_id=member_id, pin=pin,
+                   mode="already_removed", ok=True, protocol="ZK_PULLSDK", source=source)
+        return True
+    try:
+        from app.core.v2 import problems as _problems
+        _problems.registry.skipped_not_owned(device_id, [pin])
+    except Exception:
+        pass
+    _log.critical("[DeviceSync] targeted member delete SKIPPED_NOT_OWNED: device_id=%s "
+                  "device_name=%r pin=%s membership=%s pinScheme=%s -- MonClub has no proof it "
+                  "wrote this device user, so it is never deleted. source=%s",
+                  device_id, device_name, pin, member_id, pin_scheme, source)
+    try:
+        _tel.warn("MEMBER_REVOKE_SKIPPED_NOT_OWNED", device_id=device_id, member_id=member_id,
+                  pin=pin, pin_scheme=pin_scheme or None, protocol="ZK_PULLSDK", source=source)
+    except Exception:
+        pass
+    return False
+
+
 def settle_skipped(device_id: Any) -> List[str]:
     """Resolve the turnstile's SKIPPED_NOT_OWNED pins the local record now settles: MonClub owns
     the pin again (``APPLIED``: re-pushed and confirmed, or proven by the intent read-back) or

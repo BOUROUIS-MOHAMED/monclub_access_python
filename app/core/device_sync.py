@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, Iterable, List, Set, Tuple
 from app.core.v2 import lease_gate as _lease_gate
 from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
+from app.core.v2 import removed_pins as _removed_pins
 from app.core.db import (
     record_push_results,
     list_device_pin_scheme_switches,
@@ -123,6 +124,7 @@ _PUSH_POLICY_ADDITIVE_ONLY = "ADDITIVE_ONLY"  # push changed/new (delete-then-in
 MEMBER_SYNC_DELETED = "DELETED"
 MEMBER_SYNC_DELETE_FAILED = "DELETE_FAILED"
 MEMBER_SYNC_SKIPPED_NOT_OWNED = "SKIPPED_NOT_OWNED"      # final: never ours to delete
+MEMBER_SYNC_ALREADY_REMOVED = "ALREADY_REMOVED"          # final: MonClub removed it moments ago
 MEMBER_SYNC_OWNERSHIP_UNREADABLE = "OWNERSHIP_UNREADABLE"  # retry: cannot tell yet
 MEMBER_SYNC_DEFERRED = "DEFERRED"   # cannot be decided now (incomplete roster, unnameable
                                     # pin); a fast retry changes nothing (review R2-23)
@@ -1661,26 +1663,12 @@ class DeviceSyncEngine:
                     return False
                 owned = proof
             if not owned:
+                # FINAL, nothing deleted: SKIPPED_NOT_OWNED reported -- unless MonClub itself removed
+                # the pin moments ago (a duplicate revocation): then it is done (v2/removed_pins).
+                if _removed_pins.settle_unowned_pullsdk(did, dev_name, pin, member_id, pin_scheme, source):
+                    self._last_member_sync_outcome = MEMBER_SYNC_ALREADY_REMOVED
+                    return True
                 self._last_member_sync_outcome = MEMBER_SYNC_SKIPPED_NOT_OWNED
-                try:
-                    from app.core.v2 import problems as _v2_problems
-                    _v2_problems.registry.skipped_not_owned(did, [pin])
-                except Exception:
-                    pass
-                self.logger.critical(
-                    "[DeviceSync] targeted member delete SKIPPED_NOT_OWNED: device_id=%s "
-                    "device_name=%r pin=%s membership=%s pinScheme=%s -- MonClub has no "
-                    "proof it wrote this device user, so it is never deleted. source=%s",
-                    did, dev_name, pin, member_id, pin_scheme, source,
-                )
-                try:
-                    _tel.warn(
-                        "MEMBER_REVOKE_SKIPPED_NOT_OWNED", device_id=did, member_id=member_id,
-                        pin=pin, pin_scheme=pin_scheme or None, protocol="ZK_PULLSDK",
-                        source=source,
-                    )
-                except Exception:
-                    pass
                 return False
             deleted = self._delete_pin_unconditional(
                 sdk=sdk, pin=pin, fingerprint_enabled=fingerprint_enabled,
