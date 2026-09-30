@@ -155,3 +155,38 @@ def test_a_removal_older_than_the_skip_does_not_resolve_it(db):
     pr.registry.skipped_not_owned(DEVICE, ["105"])
     assert removed_pins.settle_skipped(DEVICE) == []
     assert _skipped() == [["105"]]
+
+
+def test_the_record_is_read_for_the_pins_checked_only(db, monkeypatch):
+    """settle_skipped runs every 30 s while a skip stands (up to 7 days) and a not-owned
+    revocation on the worker thread: neither may read a turnstile's whole record."""
+    import contextlib
+    from app.core.v2 import ownership
+
+    for i in range(50):
+        db.save_device_sync_state(device_id=DEVICE, pin=str(200 + i), desired_hash="h", ok=True, error=None)
+    db.clear_device_revocation_state(device_id=DEVICE, pin="201")
+    full = ownership.local_facts(DEVICE)
+    statements: list[str] = []
+    real = db.get_conn
+
+    @contextlib.contextmanager
+    def traced():
+        with real() as conn:
+            conn.set_trace_callback(statements.append)
+            try:
+                yield conn
+            finally:
+                conn.set_trace_callback(None)
+
+    monkeypatch.setattr(db, "get_conn", traced)
+    monkeypatch.setattr(db, "list_push_results",
+                        lambda **kw: (_ for _ in ()).throw(AssertionError("whole-table read")))
+    states = removed_pins.pin_states(DEVICE, ["201", "202", "999"])
+    assert {p: f["state"] for p, f in states.items()} == {"201": "REMOVED", "202": "APPLIED"}
+    assert ownership.local_facts(DEVICE, pins=["201", "202"]) == {
+        p: full[p] for p in ("201", "202")}, "same facts as the full read, for those pins"
+    reads = [s for s in statements if s.lstrip().upper().startswith("SELECT")
+             and any(t in s for t in ("device_sync_state", "device_push_intent",
+                                      "v2_removal_log", "device_push_result"))]
+    assert reads and all("pin IN" in s for s in reads), reads

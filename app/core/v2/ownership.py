@@ -94,13 +94,18 @@ def _local_to_epoch(text: Any) -> Optional[float]:
     return time.mktime(moment.timetuple())
 
 
-def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, Any]]:
+def local_facts(device_id: int, *, offset: float = 0.0,
+                pins: Optional[Iterable[Any]] = None) -> Dict[str, Dict[str, Any]]:
     """pin -> {state, pushedHash, pushedFingerIds, pc_epoch, corrected} for one turnstile.
 
     ``offset``: the server clock's current offset (server - PC, s). A corrected removal time
     is on the server's clock; it is moved back by ``offset`` before it is compared with the
-    switch time, which is the PC's."""
-    from app.core.db import get_conn, list_device_pin_scheme_switches
+    switch time, which is the PC's. ``pins``: only those pins' facts, every table read
+    filtered by them (``removed_pins`` checks a few pins, often); the same facts as a full
+    read restricted to them."""
+    from app.core import db as _db
+    get_conn = _db.get_conn
+    from app.core.db import list_device_pin_scheme_switches
 
     did = int(device_id)
     try:
@@ -109,15 +114,27 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
         switches = []
     cutoff = _local_to_epoch(switches[-1].get("switched_at")) if switches else None
     facts: Dict[str, Dict[str, Any]] = {}
+    want = None if pins is None else sorted({str(p).strip() for p in pins if str(p).strip()})
+    if want is not None and not want:
+        return facts
+    only = "" if want is None else f" AND pin IN ({','.join('?' * len(want))})"
+    args = (did,) if want is None else (did, *want)
     try:
-        from app.core.db import list_push_results
-        results = list_push_results(device_id=did)
+        if want is None:
+            results = _db.list_push_results(device_id=did)
+        else:
+            with get_conn() as conn:
+                results = {str(r[0]): (None if r[1] is None else bool(int(r[1])),
+                                       None if r[2] is None else float(r[2]), bool(int(r[3] or 0)),
+                                       None if r[4] is None else str(r[4])) for r in conn.execute(
+                    "SELECT pin, ok, at, corrected, error FROM device_push_result WHERE device_id = ?"
+                    + only, args).fetchall()}
     except Exception:
         results = {}
     with get_conn() as conn:
         for pin, h, fingers, owned, updated in conn.execute(
                 "SELECT pin, desired_hash, pushed_finger_ids, ownership_confirmed, updated_at "
-                "FROM device_sync_state WHERE device_id = ?", (did,)).fetchall():
+                "FROM device_sync_state WHERE device_id = ?" + only, args).fetchall():
             at = _local_to_epoch(updated)
             if at is None or (cutoff is not None and at < cutoff):
                 continue
@@ -126,7 +143,7 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
                                "at": at, "corrected": False,
                                "lastPush": results.get(str(pin))}
         for pin, updated in conn.execute(
-                "SELECT pin, updated_at FROM device_push_intent WHERE device_id = ?", (did,)).fetchall():
+                "SELECT pin, updated_at FROM device_push_intent WHERE device_id = ?" + only, args).fetchall():
             if str(pin) in facts and facts[str(pin)]["state"] == "APPLIED":
                 continue
             at = _local_to_epoch(updated)
@@ -136,7 +153,8 @@ def local_facts(device_id: int, *, offset: float = 0.0) -> Dict[str, Dict[str, A
                                "at": at, "corrected": False,
                                "lastPush": results.get(str(pin))}
         for pin, removed_at, corrected in conn.execute(
-                "SELECT pin, removed_at, corrected FROM v2_removal_log WHERE device_id = ?", (did,)).fetchall():
+                "SELECT pin, removed_at, corrected FROM v2_removal_log WHERE device_id = ?" + only,
+                args).fetchall():
             if str(pin) in facts:
                 continue          # written again after the removal: the current state wins
             at = float(removed_at)

@@ -57,7 +57,7 @@ def pin_states(device_id: Any, pins: Iterable[Any]) -> Dict[str, Dict[str, Any]]
     if not want:
         return {}
     offset = _offset()
-    facts = ownership.local_facts(int(device_id), offset=offset)
+    facts = ownership.local_facts(int(device_id), offset=offset, pins=want)
     out = {p: {"state": str(facts[p].get("state")), "removedAt": None} for p in want if p in facts}
     removed = [p for p, f in out.items() if f["state"] == "REMOVED"]
     if removed:
