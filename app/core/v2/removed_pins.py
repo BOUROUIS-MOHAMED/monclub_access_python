@@ -1,0 +1,89 @@
+"""Revocations MonClub has already carried out (the ownership backup's ``REMOVED`` fact).
+
+A pin is ``REMOVED`` on a turnstile when MonClub itself removed it (``v2_removal_log``, written
+in the removal's own transaction) and has not written it since -- no state row, no write-ahead
+intent -- under the device's current pin scheme (``ownership.local_facts``, the same fact the
+ownership upload sends the server).
+
+The same revocation often reaches a worker twice (gym 45, 2026-09-30): a fast-patch bundle,
+then the pull delta that re-derives the deletion; a date-flip pass removes the departed, then
+the change detector revokes them. The first removal erases the ownership row the second one
+checks, which then read "no MonClub ownership proof" (SKIPPED_NOT_OWNED, a false turnstile
+problem). A revocation of a ``REMOVED`` pin is DONE. Nothing is deleted either way: a pin
+MonClub never wrote is still never touched, and still reported.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, Iterable, Optional, Set
+
+from app.core import telemetry as _tel
+
+_log = logging.getLogger("zkapp.v2.removed_pins")
+
+
+def pin_states(device_id: Any, pins: Iterable[Any]) -> Dict[str, str]:
+    """pin -> its ownership-backup state (APPLIED/FAILED/INTENT/REMOVED); a pin with no fact is
+    left out. Raises when the local record cannot be read."""
+    from app.core.v2 import ownership, server_clock
+
+    want = {str(p).strip() for p in pins if str(p).strip()}
+    if not want:
+        return {}
+    clock = server_clock.get_default()
+    offset = (clock.offset() if clock is not None else None) or 0.0
+    facts = ownership.local_facts(int(device_id), offset=offset)
+    return {p: str(facts[p].get("state")) for p in want if p in facts}
+
+
+def already_removed(device_id: Any, pins: Iterable[Any]) -> Set[str]:
+    """The pins MonClub already removed from this turnstile. An unreadable record proves
+    nothing: empty, so the caller reports the pin as before."""
+    try:
+        return {p for p, s in pin_states(device_id, pins).items() if s == "REMOVED"}
+    except Exception:
+        _log.warning("[V2] turnstile %s: removal record unreadable -- not-owned pins are reported "
+                     "as usual", device_id, exc_info=True)
+        return set()
+
+
+def settle_unowned(device_id: Any, prefix: str, tel_wid: str, not_owned: Dict[int, str], *,
+                   rows_seen: Optional[Set[str]] = None) -> Dict[int, str]:
+    """Finish revocations of pins MonClub does not own ({membership: pin}); none is deleted.
+
+    Already removed by MonClub: DONE, one INFO line + ``MEMBER_REVOKE_DONE mode=already_removed``
+    each. Every other one is SKIPPED_NOT_OWNED as before (P3a-2 item 4): CRITICAL line, telemetry
+    and the turnstile problem. ``rows_seen``: the full-sync pass's state rows (its line names an
+    "unconfirmed" or "absent" row); None for a targeted revoke. Returns the SKIPPED ones.
+    """
+    done = already_removed(device_id, not_owned.values())
+    skipped: Dict[int, str] = {}
+    for member_id, pin in sorted(not_owned.items()):
+        if pin in done:
+            _log.info("%s revocation of membership %s: pin %s was already removed by MonClub -- "
+                      "nothing left to delete, revocation finished", prefix, member_id, pin)
+            _tel.event("MEMBER_REVOKE_DONE", worker=tel_wid, member_id=member_id, pin=pin,
+                       mode="already_removed", ok=True)
+            continue
+        skipped[member_id] = pin
+        extra: Dict[str, Any] = {}
+        if rows_seen is None:
+            _log.critical("%s member revoke SKIPPED_NOT_OWNED: no MonClub ownership proof for pin %s "
+                          "-- nothing deleted, revocation finished", prefix, pin)
+        else:
+            extra["row"] = "unconfirmed" if pin in rows_seen else "absent"
+            _log.critical("%s revocation SKIPPED_NOT_OWNED: membership %s pin %s (%s row) -- MonClub "
+                          "has no proof it wrote this device user, so it is never deleted; the rest "
+                          "of the pass continues", prefix, member_id, pin, extra["row"])
+        try:
+            _tel.warn("MEMBER_REVOKE_SKIPPED_NOT_OWNED", worker=tel_wid, member_id=member_id,
+                      pin=pin, protocol="ZK_STANDALONE", **extra)
+        except Exception:
+            pass
+    if skipped:
+        try:
+            from app.core.v2 import problems as _problems
+            _problems.registry.skipped_not_owned(device_id, skipped.values())
+        except Exception:
+            pass
+    return skipped

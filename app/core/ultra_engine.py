@@ -45,6 +45,7 @@ from app.sdk.pullsdk import PullSDKDevice
 from app.core.v2 import lease_gate as _lease_gate
 from app.core import device_hold as _device_hold
 from app.core.v2 import problems as _v2_problems
+from app.core.v2 import removed_pins as _removed_pins
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 
@@ -3697,8 +3698,10 @@ class UltraDeviceWorker(threading.Thread):
         skipped_unchanged = 0
         skipped_note = ""
         # Explicit revocations of pins MonClub cannot prove it owns: dropped from this
-        # pass as SKIPPED_NOT_OWNED (final). {membership_id: pin}. P3a-2 item 4.
+        # pass (final). {membership_id: pin}. P3a-2 item 4. Only those MonClub did not
+        # already remove itself are reported SKIPPED_NOT_OWNED (reported_skips).
         skipped_revokes: Dict[int, str] = {}
+        reported_skips: Dict[int, str] = {}
         # Pins left for a later pass on purpose (CAPACITY_FULL now; the daytime cap in
         # item 6): the pass reports ok but withholds the roster hash, so the scheduler
         # does not stamp the device as in sync and the rest is pushed later.
@@ -3758,7 +3761,7 @@ class UltraDeviceWorker(threading.Thread):
                             and _pin not in owned_for_revokes):
                         skipped_revokes[_m] = _pin
                 if skipped_revokes:
-                    self._skip_unowned_revocations(skipped_revokes, revoke_rows_seen)
+                    reported_skips = self._skip_unowned_revocations(skipped_revokes, revoke_rows_seen)
             # EnableDevice bracketing is DELIBERATELY OFF, including for an explicit
             # full reconcile. Plan decision D6 said the nightly/manual reconcile would
             # bracket, but it never once executed (the condition was a dead reason
@@ -4196,9 +4199,9 @@ class UltraDeviceWorker(threading.Thread):
                             "standalone_revoke",
                         ) if getattr(self, "_last_revoke_aborted", 0) else "",
                         _push_safety.outcome_note(
-                            _push_safety.SKIPPED_NOT_OWNED, len(skipped_revokes),
-                            "pins " + ",".join(sorted(skipped_revokes.values())[:20]),
-                        ) if skipped_revokes else "",
+                            _push_safety.SKIPPED_NOT_OWNED, len(reported_skips),
+                            "pins " + ",".join(sorted(reported_skips.values())[:20]),
+                        ) if reported_skips else "",
                         _push_safety.outcome_note(
                             _push_safety.CAPACITY_FULL,
                             len(capacity_skipped) + len(capacity_withheld),
@@ -4306,35 +4309,20 @@ class UltraDeviceWorker(threading.Thread):
             guard.pop(member_id, None)
         return {int(m) for m in guard}
 
-    def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> None:
+    def _skip_unowned_revocations(self, skipped: Dict[int, str], rows_seen: set[str]) -> Dict[int, str]:
         """Drop explicit revocations of pins MonClub cannot prove it owns (FINAL).
 
         Never deletes, never neutralises: those pins may be another system's users on a
         shared terminal. The physical-revoke phase is finalised as done so no later
         full sync retries it; the roster exclusion stays with the pass, so the member is
         still never re-pushed from a stale snapshot. Contrast REVOKE_ABORTED (retryable).
+        A pin MonClub itself already removed is done, not reported (removed_pins).
+        Returns the ones reported SKIPPED_NOT_OWNED.
         """
-        for member_id, pin in sorted(skipped.items()):
-            row = "unconfirmed" if pin in rows_seen else "absent"
-            logger.critical(
-                "%s revocation SKIPPED_NOT_OWNED: membership %s pin %s (%s row) -- MonClub "
-                "has no proof it wrote this device user, so it is never deleted; the rest "
-                "of the pass continues",
-                self._prefix, member_id, pin, row,
-            )
-            try:
-                _tel.warn(
-                    "MEMBER_REVOKE_SKIPPED_NOT_OWNED", worker=self._tel_wid,
-                    member_id=member_id, pin=pin, row=row, protocol="ZK_STANDALONE",
-                )
-            except Exception:
-                pass
-        try:
-            from app.core.v2 import problems as _v2_problems
-            _v2_problems.registry.skipped_not_owned(getattr(self, "_device_id", None), skipped.values())
-        except Exception:
-            pass
+        reported = _removed_pins.settle_unowned(getattr(self, "_device_id", None), self._prefix,
+                                                self._tel_wid, skipped, rows_seen=rows_seen)
         self._finalize_full_sync_revokes(set(skipped), ok=True, excluded_ids=set())
+        return reported
 
     def _member_row_in_db(self, member_id: int) -> list[Dict[str, Any]] | None:
         """The member's own row, read straight from sync_users. None = read failed.
@@ -4971,26 +4959,11 @@ class UltraDeviceWorker(threading.Thread):
             # FINAL (P3a-2 item 4): MonClub cannot prove it wrote this pin, so it never
             # deletes it -- on a shared terminal it may be another system's user. It used
             # to escalate into a full sync that then refused (or aborted its whole revoke
-            # pass) on every run, forever. The revocation is finished and reported.
-            logger.critical(
-                "%s member revoke SKIPPED_NOT_OWNED: no MonClub ownership proof for pin %s "
-                "-- nothing deleted, revocation finished",
-                self._prefix,
-                pin,
-            )
-            _tel.warn(
-                "MEMBER_REVOKE_SKIPPED_NOT_OWNED",
-                worker=self._tel_wid,
-                member_id=member_id,
-                pin=pin,
-                protocol="ZK_STANDALONE",
-            )
-            self._note_revoke_skipped(member_id)
-            try:
-                from app.core.v2 import problems as _v2_problems
-                _v2_problems.registry.skipped_not_owned(getattr(self, "_device_id", None), [pin])
-            except Exception:
-                pass
+            # pass) on every run, forever. The revocation is finished and reported -- unless
+            # MonClub itself removed the pin already (a duplicate revocation): then it is done.
+            if _removed_pins.settle_unowned(getattr(self, "_device_id", None), self._prefix,
+                                            self._tel_wid, {member_id: pin}):
+                self._note_revoke_skipped(member_id)
             return True
 
         outcome = self._remove_standalone_pins(

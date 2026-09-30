@@ -71,6 +71,8 @@ class FingerState:
         self.rows: Dict[str, tuple] = {}
         self.save_calls: List[list] = []
         self.owned: set[str] = set()
+        # pins MonClub removed and has not written since (the v2_removal_log REMOVED fact)
+        self.removed: set[str] = set()
 
     @staticmethod
     def _decode(raw):
@@ -101,6 +103,7 @@ class FingerState:
         self.save_calls.append(rows)
         for row in rows:
             pin, h, ok, _err = row[0], row[1], row[2], row[3]
+            self.removed.discard(pin)
             fingers = row[4] if len(row) > 4 else None
             prev = self.rows.get(pin, ("", False, None))
             self.rows[pin] = (
@@ -124,6 +127,7 @@ class FingerState:
     def delete(self, *, device_id, pin):
         self.rows.pop(str(pin), None)
         self.owned.discard(str(pin))
+        self.removed.add(str(pin))
 
 
 @pytest.fixture
@@ -141,6 +145,10 @@ def fstate(monkeypatch) -> FingerState:
     monkeypatch.setattr(dbmod, "record_push_intents",
                         lambda *, device_id, rows, protocol: len(list(rows)), raising=False)
     monkeypatch.setattr(dbmod, "list_push_intents", lambda **kw: {}, raising=False)
+    # The REMOVED fact is read from the database by removed_pins: modelled here too.
+    from app.core.v2 import removed_pins
+    monkeypatch.setattr(removed_pins, "already_removed",
+                        lambda device_id, pins: {str(p) for p in pins} & st.removed)
     # The targeted member read must be stubbed too, or _load_member_roster reaches
     # the REAL C:\ProgramData\MonClub Access\access\access.db and these tests start
     # asserting against a live gym's data. Empty here means "no sync_users row", so
