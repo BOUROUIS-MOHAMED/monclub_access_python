@@ -145,3 +145,13 @@ class TestAbsentFromACompleteListing:
         pr.registry.skipped_not_owned(DEVICE, ["85"])
         self._listing({"9"})                    # shows none of MonClub's pins
         assert _skipped() == [["85"]]
+
+
+def test_a_removal_older_than_the_skip_does_not_resolve_it(db):
+    """The skip was decided with that removal already on record: it proves nothing new."""
+    db.save_device_sync_state(device_id=DEVICE, pin="105", desired_hash="h", ok=True, error=None)
+    db.clear_device_revocation_state(device_id=DEVICE, pin="105")
+    time.sleep(0.01)
+    pr.registry.skipped_not_owned(DEVICE, ["105"])
+    assert removed_pins.settle_skipped(DEVICE) == []
+    assert _skipped() == [["105"]]

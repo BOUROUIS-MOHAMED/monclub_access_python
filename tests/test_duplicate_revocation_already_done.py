@@ -199,3 +199,58 @@ class TestUnderTheAccountScheme:
         assert [(d["pin"], d["mode"]) for d in _named(tel_log, "MEMBER_REVOKE_DONE")] == [
             ("777", "deleted"), ("777", "already_removed")]
         assert _skipped_problem() == []
+
+
+class TestOnlyARecentStandingRemovalCounts:
+    """v2_removal_log rows are never deleted and a vanished state row reads REMOVED whatever
+    happened after (review 2026-09-30): an OLD removal, or one followed by another write of the
+    pin, proves nothing about the terminal now -- another PC may have written it after a
+    handover, or the terminal was refilled after a retire. Those are still reported."""
+
+    def _removed(self, db, monkeypatch):
+        drv = RevokeDriver()
+        w, _c = _worker(monkeypatch, driver=drv, users=[])
+        _own(db)
+        assert w._run_standalone_member_revoke(int(PIN)) is True
+        return w, drv
+
+    def test_a_removal_older_than_a_day_is_not_proof(self, db, monkeypatch, tel_log):
+        w, drv = self._removed(db, monkeypatch)
+        with db.get_conn() as conn:
+            conn.execute("UPDATE v2_removal_log SET removed_at = removed_at - ?", (25 * 3600,))
+            conn.commit()
+        assert w._run_standalone_member_revoke(int(PIN)) is True
+        assert drv.delete_calls == [[PIN]], "still nothing deleted"
+        assert [s["pin"] for s in _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED")] == [PIN]
+
+    def test_removed_then_written_again_then_the_row_gone_is_not_proof(self, db, monkeypatch,
+                                                                         tel_log):
+        import time as _t
+        w, drv = self._removed(db, monkeypatch)
+        _t.sleep(0.02)
+        db.record_push_results(device_id=DEVICE, rows=[(PIN, True, None)])   # a later write
+        with db.get_conn() as conn:                                           # its row vanished
+            conn.execute("DELETE FROM device_sync_state WHERE device_id=? AND pin=?", (DEVICE, PIN))
+            conn.commit()
+        assert w._run_standalone_member_revoke(int(PIN)) is True
+        assert drv.delete_calls == [[PIN]]
+        assert [s["pin"] for s in _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED")] == [PIN]
+
+    def test_the_age_of_a_server_clock_removal_is_read_on_that_clock(self, db, monkeypatch,
+                                                                      tel_log):
+        """Removal stamped on the server clock (corrected=1), server 2 h behind this PC: 23 h
+        old on its own clock (recent), 25 h if compared with the PC's clock."""
+        import time as _t
+        from app.core.v2 import server_clock
+        clock = server_clock.ServerClock()
+        now = _t.time()
+        clock.add_sample(now - 7200, now, now, source="t")
+        monkeypatch.setattr(server_clock, "_default", clock)
+        w, drv = self._removed(db, monkeypatch)
+        with db.get_conn() as conn:
+            assert conn.execute("SELECT corrected FROM v2_removal_log").fetchone()[0] == 1
+            conn.execute("UPDATE v2_removal_log SET removed_at = removed_at - ?", (23 * 3600,))
+            conn.commit()
+        assert w._run_standalone_member_revoke(int(PIN)) is True
+        assert _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED") == []
+        assert _named(tel_log, "MEMBER_REVOKE_DONE")[-1]["mode"] == "already_removed"

@@ -12,6 +12,13 @@ the change detector revokes them. The first removal erases the ownership row the
 checks, which then read "no MonClub ownership proof" (SKIPPED_NOT_OWNED, a false turnstile
 problem). A revocation of a ``REMOVED`` pin is DONE. Nothing is deleted either way: a pin
 MonClub never wrote is still never touched, and still reported.
+
+Only a RECENT removal that still STANDS counts (review 2026-09-30): ``v2_removal_log`` rows are
+never deleted and a vanished state row reads ``REMOVED`` whatever happened after, so an old
+removal (another PC may have written the pin after a handover; a retired terminal may have been
+refilled from outside MonClub) or one followed by a push attempt of the pin
+(``device_push_result.at`` later) proves nothing about the terminal now. Times are compared on
+the PC's clock: a ``corrected`` time (the server's clock) is moved back by the current offset.
 """
 from __future__ import annotations
 
@@ -23,26 +30,55 @@ from app.core import telemetry as _tel
 
 _log = logging.getLogger("zkapp.v2.removed_pins")
 
+# A removal older than this is no proof: the duplicate revocations seen on gym 45 came 7 s to
+# 65 s after the removal (18:03:37 -> 18:03:44; 00:00:08 -> 00:01:13).
+RECENT_SEC = 24 * 3600.0
 
-def pin_states(device_id: Any, pins: Iterable[Any]) -> Dict[str, str]:
-    """pin -> its ownership-backup state (APPLIED/FAILED/INTENT/REMOVED); a pin with no fact is
-    left out. Raises when the local record cannot be read."""
-    from app.core.v2 import ownership, server_clock
 
-    want = {str(p).strip() for p in pins if str(p).strip()}
+def _offset() -> float:
+    from app.core.v2 import server_clock
+
+    clock = server_clock.get_default()
+    return (clock.offset() if clock is not None else None) or 0.0
+
+
+def _pc_time(at: Any, corrected: Any, offset: float) -> float:
+    return float(at) - offset if corrected else float(at)
+
+
+def pin_states(device_id: Any, pins: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
+    """pin -> its ownership-backup fact (``state`` APPLIED/FAILED/INTENT/REMOVED; ``removedAt``,
+    the PC-clock time of a REMOVED fact whose removal still stands -- no push attempt of the pin
+    recorded after it -- else None). A pin with no fact is left out. Raises when unreadable."""
+    from app.core.db import get_conn
+    from app.core.v2 import ownership
+
+    want = sorted({str(p).strip() for p in pins if str(p).strip()})
     if not want:
         return {}
-    clock = server_clock.get_default()
-    offset = (clock.offset() if clock is not None else None) or 0.0
+    offset = _offset()
     facts = ownership.local_facts(int(device_id), offset=offset)
-    return {p: str(facts[p].get("state")) for p in want if p in facts}
+    out = {p: {"state": str(facts[p].get("state")), "removedAt": None} for p in want if p in facts}
+    removed = [p for p, f in out.items() if f["state"] == "REMOVED"]
+    if removed:
+        with get_conn() as conn:
+            attempts = {str(r[0]): _pc_time(r[1], r[2], offset) for r in conn.execute(
+                f"SELECT pin, at, corrected FROM device_push_result WHERE device_id = ? AND at IS NOT "
+                f"NULL AND pin IN ({','.join('?' * len(removed))})", (int(device_id), *removed))}
+        for p in removed:
+            at = _pc_time(facts[p]["at"], facts[p].get("corrected"), offset)
+            if p not in attempts or attempts[p] <= at:
+                out[p]["removedAt"] = at
+    return out
 
 
 def already_removed(device_id: Any, pins: Iterable[Any]) -> Set[str]:
-    """The pins MonClub already removed from this turnstile. An unreadable record proves
-    nothing: empty, so the caller reports the pin as before."""
+    """The pins MonClub removed from this turnstile within ``RECENT_SEC`` and has not tried to
+    write since. An unreadable record proves nothing: empty, so the caller reports as before."""
     try:
-        return {p for p, s in pin_states(device_id, pins).items() if s == "REMOVED"}
+        now = time.time()
+        return {p for p, f in pin_states(device_id, pins).items()
+                if f["removedAt"] is not None and now - f["removedAt"] <= RECENT_SEC}
     except Exception:
         _log.warning("[V2] turnstile %s: removal record unreadable -- not-owned pins are reported "
                      "as usual", device_id, exc_info=True)
@@ -94,7 +130,8 @@ def settle_unowned(device_id: Any, prefix: str, tel_wid: str, not_owned: Dict[in
 def settle_skipped(device_id: Any) -> List[str]:
     """Resolve the turnstile's SKIPPED_NOT_OWNED pins the local record now settles: MonClub owns
     the pin again (``APPLIED``: re-pushed and confirmed, or proven by the intent read-back) or
-    removed it since (``REMOVED``). Run before each problem report, so the next one tells the
+    removed it AFTER the skip was recorded (a standing ``REMOVED``; an older removal was already
+    on record when the skip was decided). Run before each problem report, so the next one tells the
     server (a code left out of a snapshot is resolved there). An unreadable record resolves
     nothing. Returns the resolved pins."""
     from app.core.v2.problems import registry
@@ -109,7 +146,8 @@ def settle_skipped(device_id: Any) -> List[str]:
         _log.debug("[V2] turnstile %s: SKIPPED_NOT_OWNED not re-checked (record unreadable)",
                    device_id, exc_info=True)
         return []
-    done = sorted(p for p in pins if states.get(p) in ("APPLIED", "REMOVED"))
+    done = sorted(p for p, f in states.items() if f["state"] == "APPLIED"
+                  or (f["removedAt"] is not None and f["removedAt"] > pins[p]))
     if done:
         registry.resolve_skipped(device_id, done, recorded_before=checked_at)
         _log.info("[V2] turnstile %s: SKIPPED_NOT_OWNED resolved for %d pin(s) MonClub re-pushed "
