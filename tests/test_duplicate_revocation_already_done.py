@@ -177,3 +177,25 @@ class TestTheSafetyRuleIsUnchanged:
         self._second_revoke(w)
         assert drv.delete_calls == [[PIN]]
         assert [s["pin"] for s in _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED")] == [PIN]
+
+
+class TestUnderTheAccountScheme:
+    """Gym 45 runs pinScheme=ACCOUNT: membership 34439 was revoked as person pin 85. The
+    removal record is keyed by that person pin, which the second revocation maps to again."""
+
+    def test_the_second_revocation_of_a_removed_person_pin_is_done(self, db, monkeypatch, tel_log):
+        from tests.test_account_pin_device_sites import _People, _account_worker, _ali_gym, _sonia
+        people = _People(monkeypatch, [_ali_gym(), _sonia()])     # membership 5 -> person pin 777
+        _own(db, pin="777")
+        _own(db, pin="5")                                          # the other person's pin 5
+        drv = RevokeDriver()
+        w, _c = _account_worker(monkeypatch, users=people.users, driver=drv)
+        people.revoke(5)
+
+        assert w._run_standalone_member_revoke(5) is True
+        assert w._run_standalone_member_revoke(5) is True
+        assert drv.delete_calls == [["777"]], "the person pin, once; never pin 5"
+        assert _named(tel_log, "MEMBER_REVOKE_SKIPPED_NOT_OWNED") == []
+        assert [(d["pin"], d["mode"]) for d in _named(tel_log, "MEMBER_REVOKE_DONE")] == [
+            ("777", "deleted"), ("777", "already_removed")]
+        assert _skipped_problem() == []
