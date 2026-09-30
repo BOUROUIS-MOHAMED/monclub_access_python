@@ -1365,10 +1365,10 @@ class MainApp:
             pass
         # Force-exit after 15s if anything is still stuck
         def _force_exit():
-            import time, os
+            from app.core.crash_capture import forced_exit  # time is imported at module level
             time.sleep(15)
             self.logger.error("Shutdown timed out after 15s — forcing exit")
-            os._exit(1)
+            forced_exit(1)  # os._exit, marked as a forced exit for the next start's crash report
         _t = threading.Thread(target=_force_exit, daemon=True)
         _t.start()
 

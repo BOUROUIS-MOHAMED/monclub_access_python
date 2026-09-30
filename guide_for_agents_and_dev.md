@@ -46,6 +46,7 @@ This file is only useful while it is true. If you change any of the following, y
 | What the optional-content scheduler fetches, stores or sends (`app/core/optional_content_sync.py`) | §3.7 Optional content sync |
 | The removal ceiling or any path that removes device users in bulk (`app/core/push_safety.py`, `device_sync.py::_sync_one_device` stale/clear step, `ultra_engine.py::_neutralise_revoked_pins`) | §3.2g |
 | The finger-slot sweep — who qualifies, the daily batch, `finger_slots_swept` (`ultra_engine.py::_finger_sweep_plan`, `::_sweep_pin`, `::_drain_finger_sweep`; `zk_standalone.py::sweep_finger_slots`, `::_clear_finger_slot`) | §3.4c, and zkemkeeper_guide §5/§11 |
+| The crash evidence of a process that ends without "App shutting down" (`app/core/crash_capture.py`; `access/main.py::main`'s `install`, after the single-instance guard; `logger.py::setup_logging`'s `report_previous`) | `docs/crash_evidence.md` |
 | The write-ahead push intent — when it is written, what resolves it, the read-back promotion, the daily maintenance slot (`db.py::record_push_intents` and siblings, `_run_db_write_sync(durable=)`, `ultra_engine.py::_record_push_intents`, `::_push_with_chunk_recording`, `::_promote_intents_by_readback`, `::_drain_daily_maintenance`, `device_sync.py::_settle_pullsdk_intents`, `::_prove_pullsdk_intent`) | §3.4a |
 | The ULTRA operator queues — door-open and control-panel SDK calls — their deadline or their claim (`ultra_engine.py::request_door_open`, `::_drain_commands`, `::request_run_sdk`, `::_drain_sdk_commands`, `::_CommandClaim`; the `sent, no answer` text in `local_access_api_v2.py::_door_open_error_fr` and its `500_sent_no_answer` branch in `::_handle_device_door_open`; `zk_standalone.py::last_open_door_result`; the 503 group in `local_access_api_v2.py::_run_on_device_sdk`) | §3.1a, §7 (`ACUnlock` on the MB2000), §10.2a, field cheatsheet §6, and zkemkeeper_guide §4 (Door) |
 | What runs between the chunks of a standalone push, the per-pass cap, superseded pins (`ultra_engine.py::_standalone_push_yield`, `::_note_push_superseded`, `::_prioritise_for_cap`, `_FULL_SYNC_MAX_PINS_PER_PASS`; `zk_standalone.py::push_roster(between_chunks=)` and the `push_roster` STA op's event pump) | §3.4e, and zkemkeeper_guide §5 |
@@ -1439,9 +1440,8 @@ When one of them fails, its own exception leaves `init_db` and `get_conn` closes
 `access/store.py::init_db` nor `MainApp.__init__` catches it, and neither does `access/main.py::main`
 or `app.py::run_app`, so the process exits. The traceback goes to stderr, which is
 `%TEMP%\MonClubAccess.log` when the process has no console (`access/main.py::_ensure_console_streams`;
-`app/main.py` redirects to the same file; no `sys.excepthook` is installed anywhere in the repo,
-grep 2026-09-26). The next start runs the migration again. `[CODE: db.py::init_db;
-access/store.py::init_db; app.py::MainApp.__init__, ::run_app; access/main.py::main]`
+`app/main.py` redirects to the same file); since 2026-09-30 it is also recorded by `crash_capture` (`docs/crash_evidence.md`).
+The next start runs the migration again. `[CODE: db.py::init_db; access/store.py::init_db; app.py::MainApp.__init__, ::run_app; access/main.py::main]`
 
 What rolls back is the transaction, and Python's `sqlite3` opens it at the first INSERT, UPDATE or
 DELETE, not at DDL. A `CREATE`, `DROP` or `ALTER` that ran before that is already committed. So a
@@ -2967,7 +2967,7 @@ only while no door command, member update or full sync waits, and never during a
 clears a slot that is desired in the last full sync's snapshot OR recorded now (a targeted push may
 have added a finger since), and it skips a pin pushed in the last 10 min (the MIRROR grace window).
 Budget: ≤ 100 × 10 calls × 171 ms ≈ 171 s of terminal time a day, in ≤ 0.5 s slices; a fully
-unswept 928-pin terminal is done in ~10 days. `[T] FINGER_SWEEP worker pin source ok cleared empty
+unswept 928-pin terminal is done in ~10 days (the cap is per PROCESS-day; 2026-09-30 field notes: `docs/field/2026-09-30_mb2000_finger_sweep.md`). `[T] FINGER_SWEEP worker pin source ok cleared empty
 raised dur_ms` (`abandoned=True` when a plan was dropped mid-way, below).
 
 *Review round 1 (R1-18/R1-19/R1-27).* A pin's plan was built once and resumed across run-loop

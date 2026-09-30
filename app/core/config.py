@@ -6,6 +6,22 @@ from typing import Any, Dict, Optional
 
 from app.core.utils import CONFIG_PATH, load_json, save_json
 
+# How often the update manager asks the server for the latest release. The dataclass default was
+# a leftover 30 (the 3-hour line sat commented out above it, commit 0548a1d), clamped to 60: the
+# field log of 2026-09-30 shows a check every 60 s. Every install persisted that 30, so a stored
+# value below the floor -- never honoured anyway -- means "the default", not "60".
+DEFAULT_UPDATE_CHECK_INTERVAL_SEC = 3 * 60 * 60
+MIN_UPDATE_CHECK_INTERVAL_SEC = 60
+
+
+def update_check_interval_sec(value: Any) -> int:
+    """A stored update-check interval, or the default when it is unreadable or below the floor."""
+    try:
+        sec = int(str(value).strip())
+    except Exception:
+        return DEFAULT_UPDATE_CHECK_INTERVAL_SEC
+    return sec if sec >= MIN_UPDATE_CHECK_INTERVAL_SEC else DEFAULT_UPDATE_CHECK_INTERVAL_SEC
+
 
 def _safe_int(v, default: int) -> int:
     try:
@@ -171,7 +187,7 @@ class AppConfig:
     update_enabled: bool = True
     update_platform: str = "WINDOWS"  # request param (server returns "windows")
     update_channel: str = "stable"
-    update_check_interval_sec: int = 30
+    update_check_interval_sec: int = DEFAULT_UPDATE_CHECK_INTERVAL_SEC
     update_auto_download_zip: bool = True
 
     # -------------------------
@@ -614,12 +630,9 @@ class AppConfig:
         cfg.update_platform = _safe_str(getattr(cfg, "update_platform", "WINDOWS"), "WINDOWS").strip().upper() or "WINDOWS"
         cfg.update_channel = _safe_str(getattr(cfg, "update_channel", "stable"), "stable").strip().lower() or "stable"
 
-        try:
-            cfg.update_check_interval_sec = int(getattr(cfg, "update_check_interval_sec", 30) or 30)
-        except Exception:
-            cfg.update_check_interval_sec = 3 * 60 * 60
-        if cfg.update_check_interval_sec < 60:
-            cfg.update_check_interval_sec = 60
+        cfg.update_check_interval_sec = update_check_interval_sec(
+            getattr(cfg, "update_check_interval_sec", None)
+        )
 
         cfg.update_auto_download_zip = _ensure_bool(getattr(cfg, "update_auto_download_zip", True), True)
 
