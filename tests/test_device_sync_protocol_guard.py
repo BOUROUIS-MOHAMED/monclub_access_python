@@ -719,13 +719,16 @@ class TestUltraPopulatesBirthday:
         """A parameter nothing passes is the same bug in a new place."""
         import inspect
 
-        from app.core import ultra_engine
+        from app.core import ultra_engine, ultra_pc_entry
 
         src = inspect.getsource(ultra_engine)
-        # Every notification built from a resolved user must forward it.
-        assert src.count("user_birthday=(str(user.get(\"birthday\")") >= 3, (
+        # Every notification built from a resolved user must forward it: _handle_allow and the QR
+        # rescue in ultra_engine; the card verdicts (staff rescue, PC cards) through
+        # ultra_pc_entry.member_popup_fields (ULTRA merge plan 2, Task 8).
+        assert src.count("user_birthday=(str(user.get(\"birthday\")") >= 2, (
             "expected the resolved-user notification call sites to pass birthday"
         )
+        assert '"user_birthday": str(user.get("birthday") or "")' in inspect.getsource(ultra_pc_entry)
 
 
 class TestMirrorDeleteIsRecorded:

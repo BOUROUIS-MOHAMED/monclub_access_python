@@ -49,6 +49,9 @@ from app.core.v2 import removed_pins as _removed_pins
 from app.core import zkem_rtlog_filter as _zkem_rtlog
 from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
+from app.core import card_decision as _card_decision
+from app.core import device_service_gate as _service_gate
+from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
 
 logger = logging.getLogger("zkapp")
 
@@ -528,7 +531,7 @@ def _set_shared_totp_index(value, gen) -> None:
         pass
 
 
-class UltraDeviceWorker(threading.Thread):
+class UltraDeviceWorker(PcEntryMixin, threading.Thread):
     """Per-device thread: polls RTLog, classifies events, TOTP rescue."""
 
     def __init__(
@@ -6147,6 +6150,14 @@ class UltraDeviceWorker(threading.Thread):
         """The C3 event-burst window (_ULTRA_CARD_DEBOUNCE_SEC). A method so a test can turn it off."""
         return float(_ULTRA_CARD_DEBOUNCE_SEC)
 
+    def _staff_membership_ids(self):
+        """The cached STAFF plan ids (never a DB read on the door path; ultra_pc_entry and the
+        QR verdict read them through here)."""
+        try:
+            return get_staff_membership_ids_cached()
+        except Exception:
+            return frozenset()
+
     # ------------------------------------------------------------------ #
     # Event classification (core ULTRA logic)
     # ------------------------------------------------------------------ #
@@ -6866,120 +6877,6 @@ class UltraDeviceWorker(threading.Thread):
     # ------------------------------------------------------------------ #
     # DENY handler (passive observation)
     # ------------------------------------------------------------------ #
-
-    def _handle_rfid_rescue(
-        self, card_no: str, event_time: str, event_id: str,
-        door_id: Optional[int], event_type: str, raw_row: Dict[str, Any],
-    ):
-        """PC-side STAFF rescue for a denied RFID card.
-
-        The device denied this card (unknown, or — the common case — its
-        punch-interval re-entry block fired). If the card is a VALID member whose
-        plan is STAFF, the PC re-opens the door so staff skip the re-entry delay.
-        Every other denied card falls through to _handle_deny, so the device's
-        decision (including the interval block) stands for non-staff.
-
-        SECURITY: opens ONLY when verify_card validates the card (RFID enabled,
-        format/length, exactly one active-member match) AND the member's plan is
-        in the cached STAFF set. Never opens a non-staff, unknown, or invalid card.
-        Runs on the worker thread; opens via the held SDK socket (no 2nd Connect).
-        """
-        if not bool(self._settings.get("ultra_rfid_staff_rescue_enabled", True)):
-            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
-            return
-
-        t0 = time.monotonic()
-        _creds, _uam, users_by_card = self._get_cached_local_state()
-        vr = verify_card(scanned=card_no, settings=self._settings, users_by_card=users_by_card)
-        user = vr.get("user") if vr.get("allowed") else None
-        plan_id = user.get("membershipId") if isinstance(user, dict) else None
-        is_staff = False
-        staff_n = -1
-        try:
-            staff_ids = get_staff_membership_ids_cached()
-            staff_n = len(staff_ids)
-            is_staff = plan_id is not None and int(plan_id) in staff_ids
-        except Exception:
-            is_staff = False
-
-        # Observability for the staff blind spot (rare — only on RFID deny events):
-        # valid=is the card a recognised active member, staff_n=size of the STAFF
-        # plan set (0 => backend membersType not deployed), staff=matched. Lets the
-        # next gym test tell "backend not deployed" (staff_n=0) from "plan mismatch"
-        # (staff_n>0, valid=1, staff=0) from "unknown card" (valid=0).
-        _tel.event(
-            "RFID_RESCUE_EVAL", worker=self._tel_wid, valid=bool(vr.get("allowed")),
-            staff=is_staff, staff_n=staff_n, plan=plan_id, event_id=event_id,
-        )
-
-        if not (vr.get("allowed") and is_staff):
-            # Not a valid staff card — respect the device's deny.
-            self._handle_deny(card_no, event_time, event_id, door_id, event_type, raw_row)
-            return
-
-        masked = card_no[0] + "*" * (len(card_no) - 2) + card_no[-1] if len(card_no) > 2 else card_no
-        user_name = str(user.get("fullName", user.get("full_name", user.get("name", ""))) or "")
-        logger.info(
-            f"{self._prefix} RFID_STAFF_RESCUE opening: card={masked} user={user_name!r} "
-            f"plan={plan_id} door={door_id} event_id={event_id}"
-        )
-        t_cmd = time.monotonic()
-        door_opened = self._open_door_with_retry(door_id=door_id)
-        cmd_ms = (time.monotonic() - t_cmd) * 1000
-        _tel.event(
-            "RFID_STAFF_RESCUE", worker=self._tel_wid, ok=door_opened,
-            plan=plan_id, cmd_ms=round(cmd_ms), event_id=event_id,
-        )
-
-        # Enrich popup/history from the member (mirror _handle_allow).
-        user_image = str(user.get("image", "") or "")
-        user_profile_image = str(user.get("userProfileImage", "") or "")
-        image_source = str(user.get("imageSource", "") or "")
-        user_image_status = str(user.get("userImageStatus", "") or "")
-        user_phone = str(user.get("phone", "") or "")
-        user_valid_from = str(user.get("validFrom", user.get("valid_from", "")) or "")
-        user_valid_to = str(user.get("validTo", user.get("valid_to", "")) or "")
-        user_membership_id: Optional[int] = None
-        raw_am_id = user.get("activeMembershipId")
-        if raw_am_id is not None:
-            try:
-                user_membership_id = int(str(raw_am_id).strip())
-            except (ValueError, TypeError):
-                pass
-
-        reason = "ALLOW_STAFF_RFID" if door_opened else "DOOR_CMD_FAILED"
-        self._enqueue_notification(
-            event_id=event_id,
-            allowed=door_opened,
-            reason=reason,
-            scan_mode=_scan_mode_for_event(raw_row),
-            user_full_name=user_name,
-            user_image=user_image,
-            user_membership_id=user_membership_id,
-            user_membership_plan_id=plan_id,
-            user_phone=user_phone,
-            user_valid_from=user_valid_from,
-            user_valid_to=user_valid_to,
-            user_birthday=(str(user.get("birthday") or "") if isinstance(user, dict) else ""),
-            image_source=image_source,
-            user_image_status=user_image_status,
-            user_profile_image=user_profile_image,
-            # for the frequent-pass visual alert only
-            user_id=_uid_for_alert(user),
-            door_id=door_id,
-        )
-        self._enqueue_history(
-            event_id=event_id,
-            allowed=door_opened,
-            reason=reason,
-            event_type=event_type,
-            card_no=card_no,
-            event_time=event_time,
-            door_id=door_id,
-            raw=raw_row,
-        )
-        if (time.monotonic() - t0) * 1000 >= 250:
-            _tel.warn("RFID_RESCUE_SLOW", worker=self._tel_wid, dur_ms=round((time.monotonic() - t0) * 1000))
 
     def _handle_deny(
         self, card_no: str, event_time: str, event_id: str,
@@ -8444,42 +8341,6 @@ class UltraSyncScheduler:
 # ---------------------------------------------------------------------------
 # UltraEngine (orchestrator)
 # ---------------------------------------------------------------------------
-
-
-def _scan_mode_for_event(raw_row: Any, default: str = "RFID_CARD") -> str:
-    """Popup/history scan_mode for one device event.
-
-    ZK_STANDALONE (zkemkeeper / MB2000) reports the verify modality per punch and
-    the driver publishes it as rawRow["scan_mode_hint"] (app/sdk/zk_standalone.py).
-    PullSDK/C3 rows carry no such key, so C2-400 behaviour is byte-identical.
-
-    CONFIDENT OVERRIDE ONLY: only FINGERPRINT is honoured. PASSWORD/UNKNOWN have no
-    branch in the popup's method mapper and would render as "Carte" anyway, so
-    emitting them buys nothing while leaking unmapped values into the scan_mode
-    space that /door-history also consumes.
-    """
-    try:
-        if isinstance(raw_row, dict):
-            if str(raw_row.get("scan_mode_hint") or "").strip().upper() == "FINGERPRINT":
-                return "FINGERPRINT"
-    except Exception:
-        pass
-    return default
-
-
-def _uid_for_alert(user: Any) -> Optional[int]:
-    """userId out of a cached member dict, for the frequent-pass VISUAL alert only.
-
-    Returns None whenever the member could not be resolved, which switches the
-    alert off for that scan. Never raises and never participates in the access
-    decision.
-    """
-    try:
-        if isinstance(user, dict) and user.get("userId") not in (None, ""):
-            return int(str(user.get("userId")).strip())
-    except (ValueError, TypeError):
-        pass
-    return None
 
 
 class UltraEngine:
