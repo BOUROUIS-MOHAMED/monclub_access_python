@@ -237,7 +237,8 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
   is at most 300 ms (`PC_DECIDED_MAX_IDLE_POLL_MS`). Scan-to-open ≤ 2 s on a real turnstile is a
   release gate not yet measured `[UNVERIFIED]` (spec §4). A turnstile switched from TURNSTILE to
   PC or OFF keeps the cards MonClub wrote until it is wiped: a bulk removal against an empty roster is
-  refused (`push_safety.check_bulk_removal`, `empty_roster`) — they stay until the Erase wizard or a D13 card-removal request (plan 3) removes them.
+  refused (`push_safety.check_bulk_removal`, `empty_roster`) — they stay until the Erase wizard or a D13 card-removal request removes them ("Removal requests"
+  below).
 - **In service** (`active` and `accessDevice`, `app/core/device_service_gate.py`): off = no worker
   (`UltraEngine.start`, `ultra_worker_pool.py::reconcile`), no push (`device_sync.py`), and
   `_process_event` drops the device's events as a second check. **Keep entry history** off:
@@ -253,6 +254,52 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
   pushes the bits 1, 2, 4, 8; empty keeps the presets, else all doors; a value outside 1-4 is ignored
   with one warning. The C3 door timing and repeat block (`::panel_param_items`) are written by the push
   AND covered by the device hash, so a change is pushed at once. `[TEST: test_device_push_rules.py]`
+- **Desk alerts** (`app/core/desk_alerts.py`, ULTRA merge plan 3, 2026-10-02). Every decided scan
+  passes `UltraDeviceWorker._enqueue_notification` once; it calls `desk_alerts.after_scan` BEFORE
+  the popup switch, so a device whose popup is off still alerts (AGENT emitted its sounds before
+  its own popup switch):
+  - the Windows toast, one per scan when the device's `win_notify_enabled` is on, shown on the
+    `desk-toasts` thread with winotify; the backend's `notification_service_enabled` switches every
+    toast off. ULTRA never showed it before plan 3; the stored flag defaults to on (plan 3 OD-1);
+  - the daily pass alert: an allowed entry that takes the member's count today on this device and
+    door above `anti_fraude_daily_pass_limit` emits `anti_fraud_daily_limit`. The count is
+    `db.count_today_for_user_door` plus the scan in flight (ULTRA writes history after the popup,
+    asynchronously). Keep entry history off: no count, no alert. It never blocks;
+  - the repeat-block sound: a refusal with reason `DENY_REPEAT_BLOCK` emits `anti_fraud_duration`.
+    No other refusal rings in release 1 (plan 3 OD-2).
+  The desk plays the two sound events by their per-PC switches (Configuration, "Anti-fraude durée"
+  and the daily-limit sound). The feedback bus is `desk_alerts.FeedbackBus`, installed by
+  `MainApp.__init__`; `publish_feedback_event` / `get_feedback_events_since` delegate to it. ULTRA
+  history rows of a member the PC knows (a card or finger the turnstile allowed, a card the PC
+  opened) carry `user_id` since plan 3 -- the daily count and the frequent-pass badge count them;
+  before, only QR rows did. `[TEST: test_desk_alerts.py, test_ultra_desk_alerts.py]`
+- **Removal requests** (`app/core/removal_requests.py`, `removal_executors.py`, plan 3; spec D11,
+  D13; backend plan 1 Task 9). The server records a one-shot request and sends its id in the device
+  payload (`fingerprintEraseRequestId`, `cardRemovalRequestId`) until a PC acknowledges it or a save
+  cancels it. `UltraEngine.start` starts one runner thread (`removal-requests`, every 30 s) over its
+  workers. A request runs ONCE, on the PC that drives the turnstile, at the earliest 120 s after the
+  runner first saw it (an immediate undo cancels it on the server first), and when: the lease allows it, no
+  handover freeze, no add-only state, no Erase-wizard hold, the latest stored payload still names
+  the same id under the same key (else it was cancelled), the switch still says what the request is
+  for, the worker is connected to the recorded address, and no pass runs. Every write re-checks the
+  lease, the hold and the payload on the worker thread. Fingerprints first, then cards.
+  - D11 (`FINGERPRINTS`): C3, `templatev10` and `template` erased whole and recounted to 0; MB2000,
+    the 10 finger slots of every non-administrator swept, the terminal's counter checked against the
+    administrators' templates (administrators keep their fingers, plan 3 OD-3), and the swept pins
+    recorded as holding no finger.
+  - D13 (`CARDS`): only the pins MonClub wrote (`ownership_confirmed`) are deleted -- never a user
+    added by hand, never an MB2000 administrator -- then the turnstile's users are re-read; the state
+    rows of the pins that are gone are deleted and logged in `v2_removal_log`, except a row a pass
+    rewrote during the run.
+  - After ANY run that queued a write, done or stopped halfway, every per-pin hash of the turnstile is
+    cleared and a full pass requested, so the members are rewritten by the switches as they are then
+    (a stopped D13 or a reverted D11 would otherwise stay wrong: no hash of theirs changed).
+  - A run that ended is recorded durably (`removal_request_runs`) BEFORE
+    `MonClubApi.ack_removal_request` posts the acknowledgement: 200 or 404
+    `REMOVAL_REQUEST_NOT_FOUND` stop it; anything else is retried every 5 min, never the run. A
+    failed run waits 10 min. A device without a running worker on this PC never runs its request.
+  `[TEST: test_removal_requests.py, test_removal_executors.py, test_removal_ack_client.py]` On a real
+  turnstile: `docs/field/ultra_merge_release1_field_tests.md` F3, F4 `[UNVERIFIED — hardware]`.
 - ULTRA is the **only** mode that can drive a ZK_STANDALONE terminal. See §3.2.
 
 ### 3.1 Every door-open call site in the app
@@ -5487,6 +5534,19 @@ tests/test_protocol2_save_and_flip.py]`
 | `PC_DECISION` | `ultra_pc_entry.py::_open_for_verdict` (a card the PC decides: door command sent) and `::_note_pc_refusal` (every refusal a `card_decision.py` check added: a PC card; a QR refused on the device's plans or by the member block; a staff card refused on the plans) | `worker kind allowed reason door` — `kind` = `card` / `qr` / `staff`; `allowed=False reason=DOOR_CMD_FAILED` = allowed, but the door command failed. No member id, name or card number |
 
 `[TEST: test_ultra_pc_entry.py::test_a_pc_device_opens_for_a_known_card, ::test_a_pc_card_refusal_is_reported_once]`
+
+### 10.2f Desk alerts and removal requests (ULTRA merge plan 3, added 2026-10-02)
+
+| Event | Where | Carries |
+|---|---|---|
+| `DESK_SOUND` | `desk_alerts.py::refusal_sound` | `device reason door` |
+| `DESK_DAILY_ALERT` | `desk_alerts.py::daily_alert` | `device door count limit` |
+| `TOAST_SHOW` / `TOAST_FAILED` / `TOAST_QUEUE_FULL` | `desk_alerts.py::ToastService` (the first two were AGENT's names, kept) | `title has_icon` / `err` / none |
+| `REMOVAL_REQUEST_DONE` / `REMOVAL_REQUEST_FAILED` | `removal_requests.py::RemovalRequestRunner._one` | `device kind code` |
+| `REMOVAL_REQUEST_ACK` | `removal_requests.py::RemovalRequestRunner._send_ack` | `device outcome` |
+
+No member name, card number or request id in any of them (the `[REMOVAL]` log lines carry the
+request id).
 
 ### 10.3 Three rules this instrumentation follows — keep them
 
