@@ -474,6 +474,13 @@ class MainApp:
             pass
 
         ensure_dirs()
+        self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.cfg = load_access_app_config()
+        # The app log exists BEFORE init_db, so what init_db logs reaches the file: the
+        # WAL_CHECKPOINT_STARTUP and DISK_SELFTEST telemetry and the stale-lock resets were
+        # written while no handler existed and never appeared in any gym log (2026-10-02).
+        # The config is JSON and needs no database.
+        self.logger = setup_logging(self.cfg.log_level, ui_queue=self.log_queue)
         init_db()
 
         # Cleanup stale IN_PROGRESS sync runs from the previous session
@@ -488,9 +495,6 @@ class MainApp:
                 )
         except Exception:
             pass
-
-        self.log_queue: "queue.Queue[str]" = queue.Queue()
-        self.cfg = load_access_app_config()
 
         # Resolve SDK DLLs
         try:
@@ -507,7 +511,6 @@ class MainApp:
             print(f"Architecture error: {e}\nPlatform: {platform_summary()}")
             raise
 
-        self.logger = setup_logging(self.cfg.log_level, ui_queue=self.log_queue)
         # --- Log upload queue (marker-file based, daemon thread) ---
         try:
             from app.core.log_uploader import LogUploadQueue

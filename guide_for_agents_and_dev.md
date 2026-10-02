@@ -62,6 +62,7 @@ This file is only useful while it is true. If you change any of the following, y
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
 | What a turnstile's heartbeat line reports as waiting (`device_sync.py::count_waiting_pins`, `ultra_engine.py::_count_waiting_pins` and the snapshot's `failed_pins`, `_sync_one_device`'s `_last_waiting_pins`, `realtime_agent.py::get_status_snapshot`'s `failedPins`, `pc_identity.py::build_heartbeat_payload`, `::_report_held_turnstiles` and its `held` key, `erase_wizard.py::held_waiting_count`, the wizard's `_set_waiting`) | §3.10 |
+| Who writes to `access.db` — the DbWriter, `_run_db_write_sync` (its lanes, `priority=`, the inline nested call, the 60 s wait), a write outside it, the tripwire's allowlist (`tests/test_db_single_writer.py::ALLOWED_DIRECT`), which writes are in the door lane (`db.py::insert_access_history`, `::save_agent_rtlog_state`), the AGENT history claim (`realtime_agent.py::DecisionService.run`'s `F-013` block) | §3.11 |
 | The test / verification commands | §9 Verifying this guide |
 
 **Rules for editing this file:**
@@ -4500,6 +4501,134 @@ could not write and keeps for its next try") never appeared. `[CODE]`
   (`AccessDeviceStatusService.cleanFailedPins`: any value ≥ 0) `[CODE: backend read with git show, not
   run]`. The dashboard therefore sees "N waiting", not "held"; a held flag there is not built.
 
+### 3.11 One writer — the DbWriter, its door lane, and the AGENT history claim (2026-10-02)
+
+**The rule.** Every application write to `access.db` is a job on the `DbWriter` thread:
+`db.py::_run_db_write_sync(label, operation, durable=, priority=)` runs `operation(conn, profile)` in
+one `BEGIN IMMEDIATE` transaction on the writer's own connection, commits on a normal return and
+rolls back on a raise. A call made from inside a job runs inline, in that job's transaction (a
+`durable=True` call there raises). The caller waits at most `_DB_WRITE_WAIT_TIMEOUT_SEC` (60 s), then
+gets `TimeoutError`. A job its caller abandoned before it started is **skipped** by the writer (nothing
+written, a `DB_WRITE_ABANDONED` warning); only a job already running when the wait ended may still
+commit, and the message says which (`(not written)` / `(it was already running and may still commit)`).
+`[CODE: db.py::_DbWriteJob.started/.abandoned, ::_run_db_write_sync, ::_db_writer_loop]` `[TEST:
+test_db_single_writer.py::test_a_job_whose_caller_timed_out_before_it_started_writes_nothing — red
+before the skip, ::test_a_job_already_running_when_its_caller_timed_out_still_completes]`
+
+**What it replaced.** Up to `aeb8682`, 64 `db.py` functions wrote on their own `get_conn()`
+connection and called `commit()` — each one a second writer contending with the DbWriter for SQLite's
+single write lock (`timeout=30` on every connection). Branch `claude/access-db-writer-only` made each
+one a job (label = the function name) with the same signature, return value, raised types and commit
+boundary, and `durable=` where it already was (none added). `[TEST:
+test_db_single_writer.py::test_every_converted_function_returns_as_before_on_the_db_writer]` — all 64:
+the return value, and the job on the `DbWriter` thread. What changed with it:
+
+- **A converted function called from inside a write job now joins it.** Before, it opened its own
+  connection on the writer thread, waited 30 s for the lock its own job held, and raised `database is
+  locked`. No application code made such a call at the time of the change (AST check of every job
+  body in `db.py`). `[TEST: ::test_a_converted_write_called_inside_a_write_job_runs_inline_in_its_transaction
+  — red on aeb8682: OperationalError]`
+- **A read-modify-write inside one former `with get_conn()` block is now atomic.** Before, it was not:
+  Python's sqlite3 opens its implicit (deferred) transaction at the first INSERT/UPDATE/DELETE, so the
+  SELECT ran outside it and two threads could both pass the check. `apply_fast_patch_bundle` (the
+  duplicate-bundle check: the second thread raised `IntegrityError`, now it gets
+  `ignored: duplicate_bundle`) `[TEST: ::test_apply_fast_patch_bundle_is_atomic_check_and_insert —
+  red on aeb8682]`, and `create_device_door_preset` (the per-device cap count and the insert are one
+  job now) `[CODE]` — its concurrency is not pinned by a test.
+- **Not made atomic, unchanged.** Functions that read the row BEFORE the write, through another
+  function, still do: `mark_offline_creation_failure`, `mark_offline_mutation_failure`
+  (`failure_count`), `mark_offline_subresource_failed` (`attempt_count`),
+  `update_offline_creation_payload`, `set_offline_creation_try_to_create`, `cancel_offline_creation`,
+  `archive_offline_creation` (their state gate), `prune_fingerprint_push_status` (reads, then a job),
+  and the 500-row queue cap of `insert_offline_creation` / `insert_offline_mutation`
+  (`count_offline_*_active()` runs before the job). Two concurrent calls can lose an increment or both
+  pass the cap, as before. Moving the read in would widen their
+  transaction; not done. `[CODE]`
+- **A stalled write fails differently:** before, `sqlite3.OperationalError: database is locked` after
+  30 s and nothing written; now `TimeoutError` after 60 s, and nothing written unless the job had
+  already started (above). No caller
+  outside `db.py` catches a sqlite exception type (grep at the change). `[CODE]`
+
+**Left direct, and why** (the tripwire's allowlist, `test_db_single_writer.py::ALLOWED_DIRECT`):
+`db.py::init_db` — the schema and its migrations, one transaction of its own at startup (§3.2d "A
+failing migration stops startup"; its two `reset_stale_*` calls come after its commit and are jobs);
+`::_db_writer_loop` — the writer; `shared/storage_migration.py` — the startup copy of legacy tables,
+run by `access/store.py::init_db` between its two `init_db()` calls, before any engine starts;
+`app/core/tv_local_cache.py` — the TV app's own database file (`tv.store.get_conn`). `[CODE]`
+`db.py::checkpoint_wal_truncate` runs `PRAGMA wal_checkpoint(TRUNCATE)` on a `get_conn()` connection
+at startup: a checkpoint, not a data write, so it is not a writer in this sense.
+
+**The tripwire.** `test_db_single_writer.py::test_no_direct_write_outside_the_db_writer` parses every
+module under `app/`, `access/` and `shared/` and fails, outside the allowlist, on: a `.commit()` or
+`.executescript()`; an `isolation_level =`; a `sqlite3.connect()` (besides the two connection
+factories); and inside a `with get_conn() as conn:` block (job bodies excluded) an
+INSERT/UPDATE/DELETE/REPLACE/CREATE/DROP/ALTER/BEGIN/COMMIT/... literal — f-strings and `+` included —
+or a `with conn:`. A `get_conn()` connection is rolled back when its block ends, so a direct write
+without a commit is lost, not committed: the `.commit()` rule is the one that matters most.
+`::test_the_tripwire_fires_on_a_direct_write` feeds it each case. `[TEST]`
+
+**The door lane.** The writer's queue is a `queue.PriorityQueue` of `(lane, seq, job)`. A
+`priority=True` job runs before every QUEUED normal job; the job already running is never
+interrupted; FIFO inside each lane; the test shutdown sentinel sorts last.
+`[CODE: db.py::_DB_WRITE_LANE_DOOR]` `[TEST: ::test_door_lane_runs_before_queued_normal_jobs_never_before_the_running_one]`
+Two functions use it, both one-row writes something waits on:
+
+| Function | Who waits on it |
+|---|---|
+| `insert_access_history` | AGENT `DecisionService.run` — the claim, before the door opens (below); AGENT `HistoryService`; ULTRA's `hist-writer-<device>` thread |
+| `save_agent_rtlog_state` | the AGENT `DeviceWorker.run` poll loop (`_maybe_flush_state`: at most once a second, or every 10 events) — the next poll waits on it |
+
+The profile of such a job carries `priority: True`. Not in the lane, deliberately: the per-pin writes
+of a push on the ULTRA/DEVICE threads (`upsert_device_mirror_pin`, `delete_device_mirror_pin`,
+`insert_fingerprint`, the firmware-profile writes, `mirror_reconcile_record_plan`) — the door does not
+wait on them (§3.4e). No other write is on `DecisionService`'s path (`access_verification` writes
+nothing). `[CODE]`
+
+**The AGENT history claim** (`realtime_agent.py::DecisionService.run`, the `F-013` block). The row is
+inserted BEFORE the door opens; `INSERT OR IGNORE` on `UNIQUE(event_id)` returns 1 to the one worker
+that claimed the event and 0 to a duplicate, and only a 1 opens the door (when `save_history` is on).
+Through the writer this is unchanged: one writer serialises the inserts and the job returns the
+rowcount. `[TEST: ::test_concurrent_claims_of_one_event_have_exactly_one_winner — 8 threads, one 1]`
+What changed is the wait. Measured with `tools/bench_door_history_claim.py` (development PC, 32-bit
+Python 3.14.7, 2026-10-02): K threads keep the writer busy with jobs that hold the write transaction
+D ms and pause `idle` ms between jobs; one claim every 120 ms; `failed` = the call raised (the door is
+denied). Base = `aeb8682` (the claim a direct write): 3 claims a case at idle 0, 10 at idle 20/100.
+Lane and no-lane (the same job forced into the normal lane) = this branch, 20 claims a case, 0 failed.
+
+| K | D ms | idle ms | base p50 / max, failed | lane p50 / max | no-lane p50 / max |
+|---|---|---|---|---|---|
+| 0 | — | — | 1.4 / 49 ms, 0/3 | 1.5 / 3.0 ms | 1.8 / 3.6 ms |
+| 2 | 50 | 0 | 32.7 / 33.0 s, 2/3 | 33 / 36 ms | 83 / 85 ms |
+| 2 | 50 | 100 | 33 / 70 ms, 0/10 | 31 / 62 ms | 31 / 49 ms |
+| 2 | 400 | 0 | 32.8 / 32.8 s, 3/3 | 281 / 284 ms | 682 / 684 ms |
+| 2 | 400 | 100 | 32.7 / 38.7 s, 8/10 | 281 / 284 ms | 682 / 683 ms |
+| 4 | 50 | 0 | 32.7 / 32.8 s, 3/3 | 32 / 33 ms | 185 / 191 ms |
+| 4 | 400 | 0 | 32.8 / 32.8 s, 3/3 | 281 / 284 ms | 1483 / 1488 ms |
+| 4 | 400 | 100 | 32.6 / 32.8 s, 8/10 | 281 / 403 ms | 1484 / 1578 ms |
+
+The other base cases read the same (K=2, D=50, idle 20: 3/10 failed; K=4, D=50, idle 20 and 100:
+6/10 each; K=2 and K=4, D=400, idle 20: 9/10). `[TEST: re-run the tool — a measurement, not a pass/fail test]` Under a busy writer the
+direct claim mostly never got the lock — SQLite's busy handler polls, and the DbWriter re-takes the
+lock between its jobs — and failed after ~32 s with the door denied. In the lane it waits for the job
+in hand (≤ D); without
+the lane it would wait about K × D. `[TEST: ::test_the_door_claim_answers_while_the_writer_is_saturated
+— red on aeb8682, 5.25 s in one run]` How busy the writer is at a gym, and how long its jobs hold it
+there, is not in this measurement: `save_sync_cache_delta` was logged up to 35 s on 1.4.32 and
+~0.4 s on 1.4.35, and a claim that arrives during such a job waits for its end, as the direct write
+waited for the lock. The effect at a gym is `[UNVERIFIED — FIELD]`.
+
+Residuals `[CODE]`: a claim stalled behind a job that runs longer than 60 s now blocks
+`DecisionService` 60 s (was 30 s), then raises, so the door stays shut. The claim job was still
+queued, so it is skipped: no row, and a later replay can claim the event, as before the change. Only a
+claim whose job had already started when the 60 s ran out can still land (allowed, `cmd_ok` NULL).
+
+**ULTRA's history write** is the same `insert_access_history` job (`history_source="ULTRA"`), on the
+worker's `hist-writer-<device>` thread (`ultra_engine.py::_enqueue_history` → `_history_writer_loop` →
+`_write_history_item`): the live loop only enqueues, dropping the oldest on overflow
+(`HIST_WRITE_Q_FULL`), and never waits on the database. Only a rowcount of 1 goes on to the backend
+history queue. The lane shortens that thread's wait; the door never waited on it (the terminal opens
+on its own in ULTRA, §3). `[CODE]`
+
 ---
 
 ## 4. Protocol resolution — how a device gets its driver
@@ -4909,7 +5038,7 @@ packages whose own tests break collection. There is no `pytest.ini`, so the flag
 applied for you. The two `--ignore-glob` flags skip the `tests/pytest_tmp_*` /
 `tests/.tmp_pytest*` scratch directories that stale permission-denied temp folders leave
 under `tests/` in some working copies; they are not part of the suite. Unhandled
-background-thread exceptions are promoted to failures. Last run: **3612 passed, 0 failed** (2026-09-29, branch `claude/lane1i-runbook-fixes` at `2004f76`, its last code commit -- lane 1i, lane 1h's review findings: the Devices page's « Remplir » tooltip on a hold kept before any delete is neutral about the cause, as the hold panel's line, and both its tooltips move to `eraseWizardText.ts` with an English version; `test_erase_wizard_lane1e.py`'s pin of that tooltip follows the text there; the rest is the cutover runbook, the gym 45 plan and the release checklist -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `257aa45` counts 3612 (the master session's figure, not re-run here), and the branch adds no test; at `3c565d5`, before the pin followed the text, 1 failed, 3611 passed (that pin); tauri-ui `npm test` 3 passed and `npx tsc --noEmit -p .` only the 4 errors already on master (`PopupWindow.tsx`, `AccessFeedbackProvider.tsx`), none added; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3612 passed, 0 failed** (2026-09-28, branch `claude/lane1h-review-fixes` at `7693289`, its last code commit, after one review round -- lane 1h, the independent review of lane 1g: a sync answer that carries no device list deletes the whole-list marker in both writers; the undecided start-up log names a list not written whole since the last logout or upgrade; the upgrade path pinned; the hold panel's scheme-back line neutral about the cause; the lane 1e `erase`-row test names the gap it pins; the HELD_BEFORE_SCHEME_MOVED screen points at this PC's scheme line -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `04bb308` counts 3603 (the master session's figure, not re-run here); the branch adds the 9 tests of `tests/test_erase_wizard_lane1h.py`; 3612 also at `855b2d0` before the review round; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3593 passed, 0 failed** (2026-09-28, branch `claude/lane1g-review-fixes` at `1cbef17`, its last code commit, after one review round -- lane 1g, the independent review of lane 1f: a missing turnstile reads as deleted only when the device list was written whole since the logout (`sync_device_list_state`); no device row reads as unreadable, not "moved to None"; `HELD_BEFORE_SCHEME_MOVED`; the held keep-mark screen and the undo label; the start-up read that raises releases nothing -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `1cd886c` counts 3579 (the master session's figure, not re-run here); the branch adds the 14 tests of `tests/test_erase_wizard_lane1g.py`; 3592 at `1e1e2b3` before the review round's marker check; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3579 passed, 0 failed** (2026-09-28, branch `claude/lane1f-review-fixes` at `7cdcbeb`, its last code commit, after one review round -- lane 1f, the independent review of lane 1e: a missing device row releases an unstarted hold only while the PC is signed in with a non-empty list; a keep mark that cannot be written puts the erase record back; the hold column's migration reads strictly; `PC_NOT_SIGNED_IN` never invites a logout; nits N1, N5 -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `5e9cd94` counts 3554 (lane 1e's figure at `3bbaf82`, the master session's, not re-run here); the branch adds the 17 tests of `tests/test_erase_wizard_lane1f.py`, 6 net in `test_erase_wizard_lane1e.py` and 2 in `test_init_db_migration_failures.py`; `tools/check_sql_arity.py` PASS, 73 files, 401 literal statements; at `d6d0107` the lighter `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider` gave 3578). Before it: **3554 passed, 0 failed** (2026-09-28, branch `claude/cutover-final-polish` at `3bbaf82`, its last code commit, after two review rounds -- lane 1e, the master review of lanes 1d and 2c: « Remplir » on a hold kept after a scheme move waits for the terminal's scheme, from the hold row; a start keeps an unstarted hold whose scheme moved; F7; the keep mark after the erase record; a refused gym login is not a wrong password; the TLS kinds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `c89e80d` gave **3494** on the same PC the same day, measured on a clean checkout; the branch adds the 60 tests of `tests/test_erase_wizard_lane1e.py`; `tools/check_sql_arity.py` PASS, 73 files, 400 literal statements; before the review rounds 3547 at `78b859c`). Before it: **3494 passed, 0 failed** (2026-09-28, branch `claude/cutover-runbook-pass` at `8ea3437`, last code commit `c4ceb63` -- lane 1d, the master review of lanes 1c and 3d: a kept hold survives a restart, the start-up prune waits for the server clock, a keep mark of a run that never erased goes at start-up, review nits, and the cutover runbook's sixth round, after three review rounds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; earlier on the branch 3489 at `5327275` (the same with the lighter `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider`) and 3492 at `54521d4`; its base master `aa015e5` counts 3466 (the master session's figure, not re-run here), and the branch adds the 28 tests of `tests/test_erase_wizard_lane1d.py`; `tools/check_sql_arity.py` PASS, 73 files, 398 literal statements). Before it: **3466 passed, 0 failed** (2026-09-28, branch `claude/erase-wizard-final` at `c09d917`, last code commit `7723310` -- lane 1c, the Erase wizard's last review fixes and the owner's age limit, after six review rounds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `e5e3328` gave **3386** on the same PC the same day; `tools/check_sql_arity.py` PASS, 73 files, 396 literal statements). Before it: **3343 passed, 0 failed** (2026-09-27, branch `claude/erase-wizard-and-v2-gaps` at `4ff85aa` -- lane 1b, the Erase wizard's review fixes and the owner's two decisions -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base `337f1bb` gave 3203; `tools/check_sql_arity.py` PASS, 73 files, 396 literal statements). Before it: **3023 passed, 0 failed** (2026-09-27, branch `claude/v2-safety-sync` — lane B, the v2 safety sync — on the guide as of its final measurement note, code as of `591ca69`; the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `aeeef69` gave 2914; `tools/check_sql_arity.py` PASS, 71 files — `device_worker.py` removed). Before it on master: **2914 passed, 0 failed** (2026-09-26, master after merging `claude/p3b2-realtime-leases` onto the cutover-runbook round-2 master `2f6b96e`; same command and data-root rule; `tools/check_sql_arity.py` PASS). The branches alone: P3b-2 -- **2876 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 final, after review round 7 and the restore-dating fix; after round 6, 2875; `cargo check` of `tauri-ui/src-tauri` clean; before that 2874, 2873; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Branch `claude/cutover-runbook-round2` (2026-09-26; `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider` with `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder -- a lighter command than this one): `master` `dbf865f` **2656 passed**; the branch **2672 passed, 0 failed**. One earlier full run of the branch had **1 failed, 2671 passed**: `test_db_hot_path_writer.py::test_db_writer_serializes_concurrent_write_jobs`, which asserts the order of two threads' `results.append` after the writer released them -- a race in the test (15/15 passes alone, passed on the rerun; the branch changes no app code); `tools/check_sql_arity.py` PASS. Last run on master: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
+background-thread exceptions are promoted to failures. Last run: **3702 passed, 3 failed** (2026-10-02, branch `claude/access-db-writer-only` at `0479121`, its last code commit -- the single writer and the door lane, §3.11 -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.14.7; the branch adds the 9 tests of `tests/test_db_single_writer.py`; the 3 failures are `test_logging_reaches_the_app_log.py::test_own_module_warnings_reach_the_file_once_and_their_info_stays_out`, `::test_a_second_setup_attaches_nothing_twice` and `::test_init_db_telemetry_reaches_the_file_once_logging_is_up`, which pass when that file runs alone (5 passed) and fail the same way on the base `aeb8682` in a full run on the same PC the same day (**3693 passed, 3 failed**, the same three) -- an order dependence that comes with `aeb8682`, not this branch; `tools/check_sql_arity.py` PASS, 76 files, 397 literal statements). Before it: **3612 passed, 0 failed** (2026-09-29, branch `claude/lane1i-runbook-fixes` at `2004f76`, its last code commit -- lane 1i, lane 1h's review findings: the Devices page's « Remplir » tooltip on a hold kept before any delete is neutral about the cause, as the hold panel's line, and both its tooltips move to `eraseWizardText.ts` with an English version; `test_erase_wizard_lane1e.py`'s pin of that tooltip follows the text there; the rest is the cutover runbook, the gym 45 plan and the release checklist -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `257aa45` counts 3612 (the master session's figure, not re-run here), and the branch adds no test; at `3c565d5`, before the pin followed the text, 1 failed, 3611 passed (that pin); tauri-ui `npm test` 3 passed and `npx tsc --noEmit -p .` only the 4 errors already on master (`PopupWindow.tsx`, `AccessFeedbackProvider.tsx`), none added; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3612 passed, 0 failed** (2026-09-28, branch `claude/lane1h-review-fixes` at `7693289`, its last code commit, after one review round -- lane 1h, the independent review of lane 1g: a sync answer that carries no device list deletes the whole-list marker in both writers; the undecided start-up log names a list not written whole since the last logout or upgrade; the upgrade path pinned; the hold panel's scheme-back line neutral about the cause; the lane 1e `erase`-row test names the gap it pins; the HELD_BEFORE_SCHEME_MOVED screen points at this PC's scheme line -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `04bb308` counts 3603 (the master session's figure, not re-run here); the branch adds the 9 tests of `tests/test_erase_wizard_lane1h.py`; 3612 also at `855b2d0` before the review round; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3593 passed, 0 failed** (2026-09-28, branch `claude/lane1g-review-fixes` at `1cbef17`, its last code commit, after one review round -- lane 1g, the independent review of lane 1f: a missing turnstile reads as deleted only when the device list was written whole since the logout (`sync_device_list_state`); no device row reads as unreadable, not "moved to None"; `HELD_BEFORE_SCHEME_MOVED`; the held keep-mark screen and the undo label; the start-up read that raises releases nothing -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `1cd886c` counts 3579 (the master session's figure, not re-run here); the branch adds the 14 tests of `tests/test_erase_wizard_lane1g.py`; 3592 at `1e1e2b3` before the review round's marker check; `tools/check_sql_arity.py` PASS, 73 files, 402 literal statements). Before it: **3579 passed, 0 failed** (2026-09-28, branch `claude/lane1f-review-fixes` at `7cdcbeb`, its last code commit, after one review round -- lane 1f, the independent review of lane 1e: a missing device row releases an unstarted hold only while the PC is signed in with a non-empty list; a keep mark that cannot be written puts the erase record back; the hold column's migration reads strictly; `PC_NOT_SIGNED_IN` never invites a logout; nits N1, N5 -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `5e9cd94` counts 3554 (lane 1e's figure at `3bbaf82`, the master session's, not re-run here); the branch adds the 17 tests of `tests/test_erase_wizard_lane1f.py`, 6 net in `test_erase_wizard_lane1e.py` and 2 in `test_init_db_migration_failures.py`; `tools/check_sql_arity.py` PASS, 73 files, 401 literal statements; at `d6d0107` the lighter `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider` gave 3578). Before it: **3554 passed, 0 failed** (2026-09-28, branch `claude/cutover-final-polish` at `3bbaf82`, its last code commit, after two review rounds -- lane 1e, the master review of lanes 1d and 2c: « Remplir » on a hold kept after a scheme move waits for the terminal's scheme, from the hold row; a start keeps an unstarted hold whose scheme moved; F7; the keep mark after the erase record; a refused gym login is not a wrong password; the TLS kinds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `c89e80d` gave **3494** on the same PC the same day, measured on a clean checkout; the branch adds the 60 tests of `tests/test_erase_wizard_lane1e.py`; `tools/check_sql_arity.py` PASS, 73 files, 400 literal statements; before the review rounds 3547 at `78b859c`). Before it: **3494 passed, 0 failed** (2026-09-28, branch `claude/cutover-runbook-pass` at `8ea3437`, last code commit `c4ceb63` -- lane 1d, the master review of lanes 1c and 3d: a kept hold survives a restart, the start-up prune waits for the server clock, a keep mark of a run that never erased goes at start-up, review nits, and the cutover runbook's sixth round, after three review rounds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; earlier on the branch 3489 at `5327275` (the same with the lighter `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider`) and 3492 at `54521d4`; its base master `aa015e5` counts 3466 (the master session's figure, not re-run here), and the branch adds the 28 tests of `tests/test_erase_wizard_lane1d.py`; `tools/check_sql_arity.py` PASS, 73 files, 398 literal statements). Before it: **3466 passed, 0 failed** (2026-09-28, branch `claude/erase-wizard-final` at `c09d917`, last code commit `7723310` -- lane 1c, the Erase wizard's last review fixes and the owner's age limit, after six review rounds -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `e5e3328` gave **3386** on the same PC the same day; `tools/check_sql_arity.py` PASS, 73 files, 396 literal statements). Before it: **3343 passed, 0 failed** (2026-09-27, branch `claude/erase-wizard-and-v2-gaps` at `4ff85aa` -- lane 1b, the Erase wizard's review fixes and the owner's two decisions -- the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base `337f1bb` gave 3203; `tools/check_sql_arity.py` PASS, 73 files, 396 literal statements). Before it: **3023 passed, 0 failed** (2026-09-27, branch `claude/v2-safety-sync` — lane B, the v2 safety sync — on the guide as of its final measurement note, code as of `591ca69`; the command above plus `-p no:cacheprovider`, `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder, the 32-bit `.venv` Python 3.11; its base master `aeeef69` gave 2914; `tools/check_sql_arity.py` PASS, 71 files — `device_worker.py` removed). Before it on master: **2914 passed, 0 failed** (2026-09-26, master after merging `claude/p3b2-realtime-leases` onto the cutover-runbook round-2 master `2f6b96e`; same command and data-root rule; `tools/check_sql_arity.py` PASS). The branches alone: P3b-2 -- **2876 passed, 0 failed** (2026-09-26, branch `claude/p3b2-realtime-leases`, P3b-2 final, after review round 7 and the restore-dating fix; after round 6, 2875; `cargo check` of `tauri-ui/src-tauri` clean; before that 2874, 2873; after round 4, 2865; after round 3, 2864; after round 2, 2861; one earlier run of the same commit failed `test_worker_link_recovery.py::test_an_abandoned_sta_thread_is_rebuilt_by_the_worker` once on its 10 s wait under full-suite load -- 3/3 alone and the rerun passed; `tools/check_sql_arity.py` PASS). Branch `claude/cutover-runbook-round2` (2026-09-26; `python -m pytest tests/ -q --ignore=tests/_pydeps -p no:cacheprovider` with `MONCLUB_ACCESS_DATA_ROOT` pointed at an empty temp folder -- a lighter command than this one): `master` `dbf865f` **2656 passed**; the branch **2672 passed, 0 failed**. One earlier full run of the branch had **1 failed, 2671 passed**: `test_db_hot_path_writer.py::test_db_writer_serializes_concurrent_write_jobs`, which asserts the order of two threads' `results.append` after the writer released them -- a race in the test (15/15 passes alone, passed on the rerun; the branch changes no app code); `tools/check_sql_arity.py` PASS. Last run on master: **2634 passed, 0 failed** (2026-09-26, master after also merging `claude/card-cooldown-boot` and `claude/test-dataroot-files`; before those, **2633 passed** after merging `claude/heuristic-dirac-3b96e7` and `claude/init-db-logging-fix`, same command and data-root rule; `tools/check_sql_arity.py` PASS). Before those two: **2616 passed, 0 failed**
 (2026-09-26, master after merging `claude/p3b1-power-on-dates` `5094150` onto master `84bcfb7`, which
 already held the access integration (QR grants diff, heartbeat `qrRosterCheck`, operator-queue claim)
 and the gym 45 cutover tools; the CLAUDE.md command, 32-bit `.venv` Python 3.11, `MONCLUB_ACCESS_DATA_ROOT`
@@ -5128,6 +5257,27 @@ grep -rn "\.open_door(" app/ --include=*.py
 logger: `… | INFO | [T] NAME k=v k=v`. The field guide for an operator is
 [`docs/field/fingerprint_telemetry_cheatsheet.md`](docs/field/fingerprint_telemetry_cheatsheet.md)
 — **update it in the same change as this table.**
+
+**What reaches the app log (2026-10-02).** `MainApp.__init__` loads the config and calls
+`setup_logging` **before** `init_db`, so `init_db`'s lines reach the file: `WAL_CHECKPOINT_STARTUP`,
+`DISK_SELFTEST` and the stale-lock resets. Before, `init_db` ran first, while no handler existed, and
+none of them appeared in any gym log (gym 45, 1.4.32-1.4.35: 0 over every start). The handlers sit
+on `zkapp` (`propagate=False`); the app's other logger names -- `logging.getLogger(__name__)` in 34
+modules (`app.*`, `access.*`, `shared.*`), `db`, `device_driver`, `settings_reader`, `PullSDKDevice`,
+`ZKStandaloneDevice` (`logger.py::OWN_PACKAGE_LOGGERS`) -- had none, so their warnings went to stderr
+only. They now reach the same handlers, **WARNING and above only**; their INFO lines are still not
+written (never were). `[TEST: tests/test_logging_reaches_the_app_log.py]` `[FIELD: gym 45 logs, 0 of
+either telemetry line before]`
+
+**`DB_CONN_OPEN_WARM` -- the read connections are pooled (2026-10-02).** An outer `get_conn()` borrows an
+idle warm connection from a process-wide pool (`db.py::_read_pool`, at most `_READ_POOL_MAX_IDLE` = 8
+idle) and returns it after a rollback; a block that raises closes its connection instead, and a nested
+`get_conn()` still gets its own fresh connection. Before, each thread kept its own and lost it when the
+thread ended, and the local API runs one thread per request: gym 45 opened 1,235 warm connections for
+1,238 history reads (1.4.32), median ~90 ms each on 1.4.35. On a copy of that gym's database, 300
+one-thread requests opened 1 connection instead of 300 (dev PC: 0.52 ms instead of 1.62 ms each).
+`[TEST: tests/test_db_read_pool.py]` `[FIELD: gym 45 logs; the gain on a gym PC is UNVERIFIED until a
+release with it runs there]`
 
 There is **no runtime registry** of event names: no `EVENT_NAMES` symbol, no test over
 the whole set. This table is the only index, so an event missing from it is invisible.

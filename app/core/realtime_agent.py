@@ -1284,6 +1284,9 @@ class DecisionService(threading.Thread):
             # F-013: INSERT OR IGNORE into access_history BEFORE opening door.
             # rowcount==1 means this worker claimed the event; rowcount==0 means another worker already inserted it.
             # This prevents TOCTOU double door-open: the INSERT is atomic on the UNIQUE(event_id) constraint.
+            # The insert is a job in the DbWriter's door lane (guide §3.11): it waits for the write job
+            # already running, never for queued sync jobs. A raise (incl. the writer's 60 s TimeoutError,
+            # after which the row may still land) leaves _history_claimed at 0: the door stays shut.
             _history_claimed = 0
             if bool(settings.get("save_history", True)):
                 try:
