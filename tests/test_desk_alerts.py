@@ -182,3 +182,24 @@ def test_after_scan_rings_and_toasts_a_repeat_block_once(bus, monkeypatch):
     assert [e["type"] for e in bus.since(0)] == [da.EVENT_REPEAT]
     assert svc.drain_once() == 1
 
+
+
+# ------------------------------------------------------------------ Task 2: MainApp delegates
+def test_main_app_publishes_and_reads_through_its_bus():
+    from app.ui.app import MainApp
+
+    app = MainApp.__new__(MainApp)            # no __init__: only the bus is needed
+    app._feedback_bus = da.FeedbackBus()
+    event = app.publish_feedback_event("sync_completed_success", {"syncRunId": 3})
+    assert event["seq"] == 1 and event["syncRunId"] == 3
+    assert app.get_feedback_events_since(0) == [event]
+    assert app.get_feedback_events_since(1) == []
+
+
+def test_main_app_installs_its_bus_for_the_ultra_workers():
+    from pathlib import Path
+
+    source = Path("app/ui/app.py").read_text(encoding="utf-8")
+    assert "self._feedback_bus = _desk_alerts.FeedbackBus()" in source
+    assert "_desk_alerts.install_bus(self._feedback_bus)" in source
+    assert "_feedback_events_cond" not in source
