@@ -7,6 +7,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_erase_holds():
+    """device_hold is process-wide: a start-up load that failed in ANY earlier test (another
+    file's, too) reads every turnstile as held, and _sync_one_device then pushes nothing."""
+    from app.core import device_hold
+
+    device_hold.reset_for_tests()
+    yield
+    device_hold.reset_for_tests()
+
+
 def _reload_db_module(tmp_path, monkeypatch):
     import app.core.db as db_module
 
@@ -289,6 +300,7 @@ def test_request_sync_now_stores_pending_context_and_schedules():
 
 def test_main_app_initializes_scheduler_before_first_after(monkeypatch):
     import app.ui.app as app_module
+    from app.core import device_hold
 
     class StopInit(Exception):
         pass
@@ -317,6 +329,10 @@ def test_main_app_initializes_scheduler_before_first_after(monkeypatch):
     monkeypatch.setattr(app_module, "AgentRealtimeEngine", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(app_module, "UltraEngine", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(app_module.MainApp, "_sync_startup_registration", lambda self: None)
+    # init_db is stubbed, so the real start-up load reads a database with no device_write_hold
+    # table, raises, and fails closed: device_hold then reads EVERY turnstile as held for the rest
+    # of the process, and the device-sync tests below push nothing.
+    monkeypatch.setattr(device_hold, "load", lambda **kw: frozenset())
 
     def assert_scheduler_initialized(self, delay_ms, callback):
         assert self._scheduled == []
