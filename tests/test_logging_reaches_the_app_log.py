@@ -36,6 +36,10 @@ def isolated_logging(monkeypatch, tmp_path):
         saved[n] = (list(lg.handlers), lg.level, lg.propagate, lg.__dict__.get("_monclub_handlers_attached"))
         lg.handlers = []
         lg.__dict__.pop("_monclub_handlers_attached", None)
+        # setup_logging leaves "zkapp" propagate=False; pytest then attaches its capture handler to
+        # every non-propagating logger when the call phase starts, and setup_logging, seeing a
+        # handler, returns early. Start each test from a propagating logger, as a fresh process does.
+        lg.propagate = True
     yield tmp_path
     for n in names:
         lg = logging.getLogger(n)
