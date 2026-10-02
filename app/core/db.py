@@ -43,12 +43,12 @@ _db_writer_db_path: str | None = None
 _db_writer_local = threading.local()
 
 # ---------------------------------------------------------------------------
-# Per-thread WARM read connection (mitigation for a pathologically slow disk /
+# WARM read connections, pooled (mitigation for a pathologically slow disk /
 # antivirus on the deployment PC). Measured: the gym's 2MB DB answers
 # `SELECT * FROM sync_users` in 8ms on healthy hardware but 0.8-80s on the gym PC
 # — the OS file cache isn't serving it (a fresh connection-per-op closes its
 # cache each time, and/or AV re-scans the file on every open). A persistent
-# per-thread connection with a small private page cache holds the ENTIRE 2MB DB
+# warm connection with a small private page cache holds the ENTIRE 2MB DB
 # warm in RAM, so reads come from memory instead of the slow disk, and the file
 # is opened far less often (fewer AV scans). mmap is disabled so this is safe on
 # 32-bit. Disable with MONCLUB_DB_REUSE_CONN=0. Nested get_conn() calls on the
@@ -56,6 +56,16 @@ _db_writer_local = threading.local()
 # ---------------------------------------------------------------------------
 _conn_local = threading.local()
 _REUSE_CONN_ENABLED = os.environ.get("MONCLUB_DB_REUSE_CONN", "1") != "0"
+
+# The warm connections are POOLED across threads (2026-10-02). Kept per thread, they died with
+# their thread, and the local API starts one thread per request (ThreadingHTTPServer): gym 45
+# opened 1,235 warm connections for 1,238 history reads (1.4.32), each open ~90-160 ms (up to
+# 12.5 s at start-up on 1.4.35). An outer get_conn() now BORROWS an idle warm connection (any
+# thread) and gives it back after a rollback; at most _READ_POOL_MAX_IDLE stay open. A borrowed
+# connection is used by one thread at a time (check_same_thread=False is already set).
+_READ_POOL_MAX_IDLE = 8
+_read_pool_lock = threading.Lock()
+_read_pool: List[Tuple[str, sqlite3.Connection]] = []  # idle (db_path, connection), newest last
 
 # ---------------------------------------------------------------------------
 # Local-state generation counter. Bumped whenever a sync actually changes the
@@ -257,8 +267,53 @@ def _open_read_connection(db_path, *, timeout: float = 30.0) -> sqlite3.Connecti
     return conn
 
 
+def _borrow_read_connection(db_path: str) -> sqlite3.Connection:
+    """An idle warm connection to ``db_path`` from the pool, or a new one. Never shared."""
+    stale: List[sqlite3.Connection] = []
+    found: Optional[sqlite3.Connection] = None
+    with _read_pool_lock:
+        while _read_pool:
+            path, conn = _read_pool.pop()
+            if path == db_path:
+                found = conn
+                break
+            stale.append(conn)  # a connection to a previous DB path (tests): close it
+    for c in stale:
+        try:
+            c.close()
+        except Exception:
+            pass
+    return found if found is not None else _open_read_connection(db_path)
+
+
+def _return_read_connection(db_path: str, conn: sqlite3.Connection) -> None:
+    """Give a clean (rolled-back) warm connection back, or close it when the pool is full."""
+    with _read_pool_lock:
+        if len(_read_pool) < _READ_POOL_MAX_IDLE:
+            _read_pool.append((db_path, conn))
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _close_read_pool() -> None:
+    """Close every idle pooled warm connection (test teardown / DB path change)."""
+    with _read_pool_lock:
+        idle = [c for _, c in _read_pool]
+        _read_pool.clear()
+    for c in idle:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
 def _close_thread_local_conn() -> None:
-    """Close + drop this thread's warm connection (test teardown / path change)."""
+    """Close + drop this thread's borrowed warm connection and the idle pool (test teardown /
+    path change)."""
+    _close_read_pool()
     try:
         c = getattr(_conn_local, "conn", None)
         if c is not None:
@@ -551,34 +606,38 @@ def get_conn() -> Iterator[sqlite3.Connection]:
                 pass
         return
 
-    # Reuse (or lazily create) this thread's warm read connection.
-    conn = getattr(_conn_local, "conn", None)
-    if conn is None or getattr(_conn_local, "path", None) != db_path:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        conn = _open_read_connection(db_path)
-        _conn_local.conn = conn
-        _conn_local.path = db_path
-
+    # Borrow a warm connection from the pool (see _read_pool); this thread holds it until the
+    # block ends.
+    conn = _borrow_read_connection(db_path)
+    _conn_local.conn = conn
+    _conn_local.path = db_path
     _conn_local.in_use = True
+    healthy = True
     try:
         yield conn
     except Exception:
         # The connection may be in a bad state (e.g. mid-transaction error) —
-        # discard it so the next call gets a clean one.
-        _close_thread_local_conn()
+        # it is closed below, never pooled, so the next call gets a clean one.
+        healthy = False
         raise
     finally:
         _conn_local.in_use = False
-        # Leave no open transaction behind for the next reuse. If rollback fails
-        # the connection is suspect → discard it.
-        try:
-            conn.rollback()
-        except Exception:
-            _close_thread_local_conn()
+        _conn_local.conn = None
+        _conn_local.path = None
+        # Leave no open transaction behind for the next borrower. If rollback fails
+        # the connection is suspect → close it instead of pooling it.
+        if healthy:
+            try:
+                conn.rollback()
+            except Exception:
+                healthy = False
+        if healthy:
+            _return_read_connection(db_path, conn)
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # -----------------------------

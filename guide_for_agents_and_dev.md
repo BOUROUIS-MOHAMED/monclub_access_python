@@ -5140,6 +5140,16 @@ only. They now reach the same handlers, **WARNING and above only**; their INFO l
 written (never were). `[TEST: tests/test_logging_reaches_the_app_log.py]` `[FIELD: gym 45 logs, 0 of
 either telemetry line before]`
 
+**`DB_CONN_OPEN_WARM` -- the read connections are pooled (2026-10-02).** An outer `get_conn()` borrows an
+idle warm connection from a process-wide pool (`db.py::_read_pool`, at most `_READ_POOL_MAX_IDLE` = 8
+idle) and returns it after a rollback; a block that raises closes its connection instead, and a nested
+`get_conn()` still gets its own fresh connection. Before, each thread kept its own and lost it when the
+thread ended, and the local API runs one thread per request: gym 45 opened 1,235 warm connections for
+1,238 history reads (1.4.32), median ~90 ms each on 1.4.35. On a copy of that gym's database, 300
+one-thread requests opened 1 connection instead of 300 (dev PC: 0.52 ms instead of 1.62 ms each).
+`[TEST: tests/test_db_read_pool.py]` `[FIELD: gym 45 logs; the gain on a gym PC is UNVERIFIED until a
+release with it runs there]`
+
 There is **no runtime registry** of event names: no `EVENT_NAMES` symbol, no test over
 the whole set. This table is the only index, so an event missing from it is invisible.
 
