@@ -6165,6 +6165,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
     def _process_event(self, evt: Dict[str, Any]):
         """Classify RTLog event and route to appropriate handler."""
         t0 = time.monotonic()
+        if not _service_gate.in_service(self._settings):
+            return  # In service off: no decision, no popup, no history (spec section 3)
         if not hasattr(self, "_card_cooldown") or not isinstance(self._card_cooldown, dict):
             self._card_cooldown = {}
 
@@ -6327,6 +6329,10 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             self._handle_allow(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         elif self._is_totp_format(card_no):
             self._handle_totp_rescue(card_no, event_time, event_id, door_id, raw_row, scan_epoch)
+        elif self._settings.get("card_decision") == "PC":
+            # Cards decided by the PC (spec section 4, C3 only): the turnstile holds no card,
+            # refused this one and reported it; the PC decides (ultra_pc_entry._handle_pc_card).
+            self._handle_pc_card(card_no, event_time, event_id, door_id, str(event_type_raw), raw_row)
         else:
             # Denied, non-TOTP = a denied RFID card. If it is a VALID STAFF
             # member the PC re-opens (staff skip the device re-entry interval);
@@ -7118,6 +7124,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         OLDEST queued record is dropped so the worker never blocks (history is a
         best-effort audit record, and the device's own log retains the event).
         """
+        if not _service_gate.keeps_history(self._settings):
+            return  # Keep entry history off: no row for this device (spec section 3)
         item = {
             "event_id": event_id,
             "door_id": door_id,

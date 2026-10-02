@@ -128,3 +128,116 @@ def test_a_failed_door_command_arms_no_block():
         _rescue_qr(w, "91234567", "q1", _qr_result())
     assert w._member_guard().size() == 0
     assert w._enqueue_notification.call_args.kwargs["reason"] == "DOOR_CMD_FAILED"
+
+
+# ------------------------------------------------------------------ Task 10: PC cards and gates
+def _evt(card, eid, etype="27"):
+    return {"cardNo": card, "eventType": etype, "eventTime": "2026-10-02T10:00:00",
+            "eventId": eid, "doorId": 1, "rawRow": {}}
+
+
+def test_a_pc_device_opens_for_a_known_card():
+    w = _worker(card_decision="PC")
+    with _staff_ids(STAFF_PLAN), patch("app.core.ultra_pc_entry._tel") as tel:
+        w._process_event(_evt(ANNA_CARD, "c1"))
+    w._open_door_with_retry.assert_called_once_with(door_id=1)
+    kw = w._enqueue_notification.call_args.kwargs
+    assert (kw["allowed"], kw["reason"], kw["user_full_name"]) == (True, cd.ALLOW_PC_CARD, "Anna")
+    assert w._enqueue_history.call_args.kwargs["allowed"] is True
+    events = [c.kwargs for c in tel.event.call_args_list if c.args and c.args[0] == "PC_DECISION"]
+    assert events == [{"worker": "ULTRA:1", "kind": "card", "allowed": True,
+                       "reason": cd.ALLOW_PC_CARD, "door": 1}]
+
+
+def test_a_pc_card_refusal_is_reported_once():
+    w = _worker(card_decision="PC")
+    with _staff_ids(), patch("app.core.ultra_pc_entry._tel") as tel:
+        w._process_event(_evt("55555555", "c2"))
+    w._open_door_with_retry.assert_not_called()
+    kw = w._enqueue_notification.call_args.kwargs
+    assert (kw["allowed"], kw["reason"]) == (False, "DENY_NO_CARD_MATCH")
+    hist = w._enqueue_history.call_args.kwargs
+    assert (hist["allowed"], hist["reason"], hist["card_no"]) == (False, "DENY_NO_CARD_MATCH", "55555555")
+    events = [c for c in tel.event.call_args_list if c.args and c.args[0] == "PC_DECISION"]
+    assert len(events) == 1 and events[0].kwargs["allowed"] is False
+
+
+def test_the_member_block_refuses_a_repeat_card_with_its_reason():
+    w = _worker(card_decision="PC", member_block_seconds=30)
+    w._burst_debounce_sec = lambda: 0.0
+    with _staff_ids():
+        w._process_event(_evt(ANNA_CARD, "c3"))
+        w._process_event(_evt(ANNA_CARD, "c4"))
+    assert w._open_door_with_retry.call_count == 1
+    assert [c.kwargs["reason"] for c in w._enqueue_notification.call_args_list] == \
+        [cd.ALLOW_PC_CARD, cd.DENY_REPEAT_BLOCK]
+
+
+def test_a_non_card_record_on_a_pc_device_takes_the_deny_path():
+    w = _worker(card_decision="PC")
+    w._handle_deny = MagicMock()
+    w._process_event(_evt("", "c5"))
+    w._handle_deny.assert_called_once()
+    w._open_door_with_retry.assert_not_called()
+
+
+def test_a_turnstile_device_keeps_the_staff_rescue_route():
+    w = _worker()
+    w._handle_rfid_rescue = MagicMock()
+    w._handle_pc_card = MagicMock()
+    w._process_event(_evt(ANNA_CARD, "c6"))
+    w._handle_rfid_rescue.assert_called_once()
+    w._handle_pc_card.assert_not_called()
+
+
+def test_a_turnstile_decided_card_is_never_blocked():
+    w = _worker(card_decision="PC", member_block_seconds=30)
+    w._member_guard().arm("acc:700", 30, now=time.monotonic())
+    w._process_event(_evt(ANNA_CARD, "c7", etype=0))
+    kw = w._enqueue_notification.call_args.kwargs
+    assert (kw["allowed"], kw["reason"]) == (True, "DEVICE_ALLOWED")
+
+
+def test_in_service_off_decides_nothing():
+    w = _worker(card_decision="PC", enabled=False)
+    w._process_event(_evt(ANNA_CARD, "c8"))
+    w._process_event(_evt(STAFF_CARD, "c9", etype=0))
+    w._open_door_with_retry.assert_not_called()
+    w._enqueue_notification.assert_not_called()
+    w._enqueue_history.assert_not_called()
+    assert w._events_processed == 0
+
+
+def test_history_off_writes_no_row():
+    w = _worker(save_history=False)
+    del w._enqueue_history                      # the real method
+    with patch("app.core.ultra_engine.insert_access_history", return_value=1) as insert:
+        w._process_event(_evt(ANNA_CARD, "c10", etype=0))
+    insert.assert_not_called()
+    w._enqueue_notification.assert_called_once()
+
+
+def test_history_on_writes_the_row():
+    w = _worker()
+    del w._enqueue_history
+    with patch("app.core.ultra_engine.insert_access_history", return_value=1) as insert:
+        w._process_event(_evt(ANNA_CARD, "c11", etype=0))
+    insert.assert_called_once()
+
+
+def test_a_refused_finger_on_a_pc_device_is_not_read_as_a_card():
+    w = _worker(card_decision="PC")
+    w._handle_deny = MagicMock()
+    evt = _evt(ANNA_CARD, "c12")
+    evt["rawRow"] = {"cardno": "", "pin": ANNA_CARD}       # PullSDK puts the PIN in cardNo
+    w._process_event(evt)
+    w._handle_deny.assert_called_once()
+    w._open_door_with_retry.assert_not_called()
+
+
+def test_a_card_number_of_zeros_is_no_card():
+    w = _worker(card_decision="PC")
+    w._handle_deny = MagicMock()
+    w._process_event(_evt("0", "c13"))
+    w._handle_deny.assert_called_once()
+    w._open_door_with_retry.assert_not_called()
