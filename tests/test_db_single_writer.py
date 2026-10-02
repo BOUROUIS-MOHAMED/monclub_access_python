@@ -284,9 +284,9 @@ _HISTORY = dict(
 
 def test_the_door_claim_answers_while_the_writer_is_saturated(db):
     """Two threads keep the writer busy back to back (each job holds the write transaction
-    100 ms). On the base commit the claim, a direct write, never won the lock and raised
-    "database is locked" after ~32 s (tools/bench_door_history_claim.py, 11 of 12 claims).
-    In the door lane it waits for the job in hand only."""
+    100 ms). In the door lane the claim waits for the job in hand only. Red on aeb8682 (the
+    claim a direct write): 5.25 s in the one run made; tools/bench_door_history_claim.py on
+    aeb8682 shows such claims mostly failing with "database is locked" after ~32 s."""
     db._run_db_write_sync("mk", lambda conn, _p: conn.execute("CREATE TABLE IF NOT EXISTS bulk (x REAL)"))
     stop = threading.Event()
 
