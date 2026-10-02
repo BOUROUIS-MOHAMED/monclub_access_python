@@ -296,6 +296,10 @@ def _close_thread_local_conn() -> None:
             pass
 
 
+# How long a caller waits for its write job before raising TimeoutError (see _DbWriteJob).
+_DB_WRITE_WAIT_TIMEOUT_SEC = 60.0
+
+
 @dataclass
 class _DbWriteJob:
     label: str
@@ -310,6 +314,13 @@ class _DbWriteJob:
     durable: bool = False
     # Door-path lane (see _DB_WRITE_LANE_DOOR): runs before queued normal jobs.
     priority: bool = False
+    # A caller that stopped waiting (timeout) abandons a job that has not started: the writer
+    # skips it, so a TimeoutError means "not written" unless the job was already running.
+    # Without this, a door claim that timed out could still land later as an allowed entry
+    # whose door never opened. Both flags change only under state_lock.
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    started: bool = False
+    abandoned: bool = False
 
 
 def _record_db_write_profile(label: str, profile: Dict[str, Any]) -> None:
@@ -391,6 +402,15 @@ def _db_writer_loop(
             _lane, _seq, job = work_q.get()
             if job is None:
                 break
+            with job.state_lock:
+                if not job.abandoned:
+                    job.started = True
+            if not job.started:
+                # Its caller already raised TimeoutError: write nothing (see _DbWriteJob).
+                _tel.warn("DB_WRITE_ABANDONED", label=job.label,
+                          queue_wait_ms=round((time.perf_counter() - job.submitted_at) * 1000.0, 3))
+                job.done.set()
+                continue
 
             total_started = time.perf_counter()
             profile: Dict[str, Any] = {
@@ -540,8 +560,15 @@ def _run_db_write_sync(
                       priority=bool(priority))
     lane = _DB_WRITE_LANE_DOOR if job.priority else _DB_WRITE_LANE_NORMAL
     work_q.put((lane, _next_db_write_seq(), job))
-    if not job.done.wait(timeout=60.0):
-        raise TimeoutError(f"Timed out waiting for DB writer job '{label}'")
+    if not job.done.wait(timeout=_DB_WRITE_WAIT_TIMEOUT_SEC):
+        with job.state_lock:
+            if not job.started:
+                job.abandoned = True  # the writer will skip it: nothing is written
+            running = job.started
+        raise TimeoutError(
+            f"Timed out waiting for DB writer job '{label}'"
+            + (" (it was already running and may still commit)" if running else " (not written)")
+        )
     if job.error is not None:
         raise job.error
     return job.result

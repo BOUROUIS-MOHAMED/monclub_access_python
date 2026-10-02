@@ -598,3 +598,47 @@ def test_every_converted_function_returns_as_before_on_the_db_writer(db, monkeyp
     assert W("archive_offline_mutation", lambda: db.archive_offline_mutation(mid2))["state"] == "archived"
 
     assert set(CONVERTED) <= set(seen), sorted(set(CONVERTED) - set(seen))
+
+
+def test_a_job_whose_caller_timed_out_before_it_started_writes_nothing(db, monkeypatch):
+    """A door claim that timed out must not land later as an allowed entry whose door never
+    opened: the writer skips a job abandoned before it started (2026-10-02 review)."""
+    gate = threading.Event()
+    started = threading.Event()
+
+    def blocker(conn, _p):
+        started.set()
+        assert gate.wait(10)
+
+    t = threading.Thread(target=db._run_db_write_sync, args=("blocker", blocker))
+    t.start()
+    assert started.wait(5)
+    monkeypatch.setattr(db, "_DB_WRITE_WAIT_TIMEOUT_SEC", 0.2)
+    with pytest.raises(TimeoutError, match="not written"):
+        db.insert_access_history(event_id="evt-abandoned", **{**_HISTORY, "event_time": "2026-10-02 11:00:00"})
+    gate.set()
+    t.join(10)
+    db._run_db_write_sync("flush", lambda conn, _p: None)  # the writer has passed the abandoned job
+    with db.get_conn() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM access_history WHERE event_time = ?",
+                         ("2026-10-02 11:00:00",)).fetchone()[0]
+    assert n == 0
+
+
+def test_a_job_already_running_when_its_caller_timed_out_still_completes(db, monkeypatch):
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow(conn, _p):
+        started.set()
+        assert gate.wait(10)
+        conn.execute("CREATE TABLE IF NOT EXISTS late (x)")
+
+    monkeypatch.setattr(db, "_DB_WRITE_WAIT_TIMEOUT_SEC", 0.2)
+    with pytest.raises(TimeoutError, match="already running"):
+        threading.Timer(0.5, gate.set).start()
+        db._run_db_write_sync("slow", slow)
+    monkeypatch.setattr(db, "_DB_WRITE_WAIT_TIMEOUT_SEC", 10.0)
+    db._run_db_write_sync("flush", lambda conn, _p: None)
+    with db.get_conn() as conn:
+        assert conn.execute("SELECT name FROM sqlite_master WHERE name='late'").fetchone() is not None

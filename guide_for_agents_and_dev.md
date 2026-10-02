@@ -4507,8 +4507,13 @@ could not write and keeps for its next try") never appeared. `[CODE]`
 `db.py::_run_db_write_sync(label, operation, durable=, priority=)` runs `operation(conn, profile)` in
 one `BEGIN IMMEDIATE` transaction on the writer's own connection, commits on a normal return and
 rolls back on a raise. A call made from inside a job runs inline, in that job's transaction (a
-`durable=True` call there raises). The caller waits at most 60 s, then gets `TimeoutError` — the job
-stays queued and may still commit. `[CODE: db.py::_run_db_write_sync, ::_db_writer_loop]`
+`durable=True` call there raises). The caller waits at most `_DB_WRITE_WAIT_TIMEOUT_SEC` (60 s), then
+gets `TimeoutError`. A job its caller abandoned before it started is **skipped** by the writer (nothing
+written, a `DB_WRITE_ABANDONED` warning); only a job already running when the wait ended may still
+commit, and the message says which (`(not written)` / `(it was already running and may still commit)`).
+`[CODE: db.py::_DbWriteJob.started/.abandoned, ::_run_db_write_sync, ::_db_writer_loop]` `[TEST:
+test_db_single_writer.py::test_a_job_whose_caller_timed_out_before_it_started_writes_nothing — red
+before the skip, ::test_a_job_already_running_when_its_caller_timed_out_still_completes]`
 
 **What it replaced.** Up to `aeb8682`, 64 `db.py` functions wrote on their own `get_conn()`
 connection and called `commit()` — each one a second writer contending with the DbWriter for SQLite's
@@ -4540,7 +4545,8 @@ the return value, and the job on the `DbWriter` thread. What changed with it:
   pass the cap, as before. Moving the read in would widen their
   transaction; not done. `[CODE]`
 - **A stalled write fails differently:** before, `sqlite3.OperationalError: database is locked` after
-  30 s and nothing written; now `TimeoutError` after 60 s, and the row may land later. No caller
+  30 s and nothing written; now `TimeoutError` after 60 s, and nothing written unless the job had
+  already started (above). No caller
   outside `db.py` catches a sqlite exception type (grep at the change). `[CODE]`
 
 **Left direct, and why** (the tripwire's allowlist, `test_db_single_writer.py::ALLOWED_DIRECT`):
@@ -4612,9 +4618,9 @@ there, is not in this measurement: `save_sync_cache_delta` was logged up to 35 s
 waited for the lock. The effect at a gym is `[UNVERIFIED — FIELD]`.
 
 Residuals `[CODE]`: a claim stalled behind a job that runs longer than 60 s now blocks
-`DecisionService` 60 s (was 30 s), then raises, so the door stays shut — and the row may still land
-afterwards, so the event reads allowed in the history with `cmd_ok` NULL and a replay of it is a
-duplicate (before: no row, and a later replay could claim it).
+`DecisionService` 60 s (was 30 s), then raises, so the door stays shut. The claim job was still
+queued, so it is skipped: no row, and a later replay can claim the event, as before the change. Only a
+claim whose job had already started when the 60 s ran out can still land (allowed, `cmd_ok` NULL).
 
 **ULTRA's history write** is the same `insert_access_history` job (`history_source="ULTRA"`), on the
 worker's `hist-writer-<device>` thread (`ultra_engine.py::_enqueue_history` → `_history_writer_loop` →
