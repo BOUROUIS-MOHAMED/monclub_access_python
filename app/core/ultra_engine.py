@@ -52,6 +52,7 @@ from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_pro
 from app.core import card_decision as _card_decision
 from app.core import device_service_gate as _service_gate
 from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
+from app.core import ultra_worker_pool as _worker_pool
 
 logger = logging.getLogger("zkapp")
 
@@ -8481,6 +8482,8 @@ class UltraEngine:
         ultra_devices = [d for d in devices if _adm(d) == "ULTRA"]
         # P3b-2: never start a worker for a turnstile another PC drives (reader / lease).
         ultra_devices = _lease_gate.filter_devices(ultra_devices)
+        # In service off (active or accessDevice off): no worker, no scheduler push (spec section 3).
+        ultra_devices = _worker_pool.in_service_only(ultra_devices, self._logger)
 
         all_device_count = len(devices)
         non_ultra = [d for d in devices if _adm(d) != "ULTRA"]
@@ -8540,24 +8543,7 @@ class UltraEngine:
 
         # Start per-device workers first so scheduler can route work to them
         for d, settings in prepared_devices:
-            device_id = int(d.get("id", 0))
-
-            worker = UltraDeviceWorker(
-                device=d,
-                settings=settings,
-                popup_q=self._popup_q,
-                history_q=self._history_q,
-                stop_event=self._stop_event,
-                cfg=self._cfg,
-                on_full_sync_started=self._sync_scheduler._handle_worker_full_sync_started,
-                on_full_sync_finished=self._sync_scheduler._handle_worker_full_sync_finished,
-            )
-            self._workers[device_id] = worker
-            try:
-                worker.start()
-                self._logger.info("[ULTRA] Worker thread started for device id=%s name=%r", device_id, d.get("name"))
-            except Exception as _w_exc:
-                self._logger.error("[ULTRA] Worker thread start FAILED for device id=%s: %s", device_id, _w_exc)
+            _worker_pool.start_worker(self, d, settings)
 
         # Start sync scheduler with worker references so it can route timed work
         self._sync_scheduler.set_workers(self._workers)
@@ -8573,119 +8559,37 @@ class UltraEngine:
         self._watchdog_thread.start()
 
     def refresh_devices(self, devices: List[Dict[str, Any]], *, update_scheduler: bool = True) -> int:
-        """Refresh each running ULTRA worker's device snapshot in place.
+        """Refresh each running worker's device row in place (ultra_worker_pool.refresh_copies):
+        workers keep their device dict (allowedMemberships, doorIds, pinScheme, the card choice...)
+        and a sync or a fast patch makes the database newer. Returns the number refreshed."""
+        return _worker_pool.refresh_copies(self, devices, update_scheduler=update_scheduler)
 
-        Workers cache the device dict at construction (self._device), which is
-        used to filter members against allowedMemberships at push time. When
-        the dashboard edits a device (adds memberships, changes doorIds, etc.)
-        a sync brings the new payload into local SQLite — but the in-memory
-        worker snapshots stay stale, so newly-allowed members get filtered out
-        and pin-deleted instead of pushed. Call this after every sync that
-        returned a refreshed devices section.
+    def reconcile_devices(
+        self, devices: List[Dict[str, Any]], *, stop_undriven: bool, refresh_copies: bool = True,
+    ) -> Dict[str, int]:
+        """Start the worker of each ULTRA device in service this PC drives that has none, stop the
+        worker of a device that left ULTRA or went out of service (and, with stop_undriven, of one
+        this PC no longer drives), then refresh the copies -- without restarting the engine (spec
+        section 6 "Taking effect"). See ultra_worker_pool.reconcile."""
+        return _worker_pool.reconcile(
+            self, devices, stop_undriven=stop_undriven, refresh_copies_too=refresh_copies,
+        )
 
-        ``update_scheduler=False`` refreshes the workers' copies only and leaves the scheduler's
-        device list as it is (the app's refresh while not every worker is driven, review R2-4).
-
-        Returns the number of workers refreshed.
-        """
-        if not self._running:
-            return 0
-
-        from app.core.settings_reader import normalize_device_settings
-
-        def _adm(d):
-            return str(d.get("accessDataMode") or d.get("access_data_mode") or "").strip().upper()
-
-        ultra_all = [d for d in (devices or []) if _adm(d) == "ULTRA"]
-        # The scheduler's list follows the lease (a turnstile this PC does not drive is never
-        # pushed); a worker's device COPY does not: it is data, and a worker left with an old
-        # copy while its lease was away would have every later pass stopped by the pinScheme
-        # guard once the lease came back (review R1-F5, guide §3.2e). Writes stay lease-gated.
-        ultra_devices = _lease_gate.filter_devices(ultra_all)
-
-        refreshed = 0
-        for d in ultra_all:
-            try:
-                device_id = int(d.get("id", 0))
-            except (TypeError, ValueError):
-                continue
-            if device_id <= 0:
-                continue
-            worker = self._workers.get(device_id)
-            if worker is None:
-                continue
-            try:
-                settings = normalize_device_settings(d)
-                d["_settings"] = settings
-                worker.update_device(d, settings)
-                refreshed += 1
-            except Exception as exc:
-                self._logger.warning(
-                    "[ULTRA:%s] refresh_devices failed: %s", device_id, exc
-                )
-
-        if refreshed > 0:
-            self._logger.info(
-                "[ULTRA] refreshed %d worker device snapshot(s) in place", refreshed
-            )
-
-        if self._sync_scheduler is not None and update_scheduler:
-            try:
-                self._sync_scheduler.update_devices(ultra_devices)
-            except Exception as exc:
-                self._logger.warning(
-                    "[ULTRA] sync_scheduler.update_devices failed: %s", exc
-                )
-
-        return refreshed
+    def _new_worker(self, **kwargs: Any) -> "UltraDeviceWorker":
+        """The worker factory, resolved at call time (tests patch UltraDeviceWorker or this)."""
+        return UltraDeviceWorker(**kwargs)
 
     def _watchdog_loop(self):
         """Restart dead UltraDeviceWorker threads every _watchdog_interval_sec seconds.
 
-        This is the SOLE restart mechanism: every restart goes through this watchdog, to
-        avoid races between restarters.
+        This is the SOLE restart mechanism: every restart goes through this watchdog, to avoid
+        races between restarters. A worker removed on purpose (ultra_worker_pool.reconcile) is no
+        longer in _workers and is never restarted.
         """
         self._logger.info("[ULTRA] Watchdog started (interval=%.0fs)", self._watchdog_interval_sec)
         while not self._stop_event.wait(self._watchdog_interval_sec):
             for device_id, worker in list(self._workers.items()):
-                if worker.is_alive():
-                    continue
-                with self._worker_restart_lock:
-                    # Double-check inside lock: another thread may have restarted it
-                    current = self._workers.get(device_id)
-                    if current is not None and current.is_alive():
-                        continue
-                    self._logger.error(
-                        "[ULTRA:%s] watchdog: worker thread is dead — restarting", device_id
-                    )
-                    try:
-                        new_worker = UltraDeviceWorker(
-                            device=worker._device,
-                            settings=worker._settings,
-                            popup_q=self._popup_q,
-                            history_q=self._history_q,
-                            stop_event=self._stop_event,
-                            cfg=self._cfg,
-                            on_full_sync_started=(
-                                self._sync_scheduler._handle_worker_full_sync_started
-                                if self._sync_scheduler
-                                else None
-                            ),
-                            on_full_sync_finished=(
-                                self._sync_scheduler._handle_worker_full_sync_finished
-                                if self._sync_scheduler
-                                else None
-                            ),
-                        )
-                        new_worker.start()
-                        self._workers[device_id] = new_worker
-                        if self._sync_scheduler is not None:
-                            self._sync_scheduler.wake_pending_sync()
-                        self._logger.info("[ULTRA:%s] watchdog: worker restarted OK", device_id)
-                    except Exception as exc:
-                        self._logger.error(
-                            "[ULTRA:%s] watchdog: worker restart FAILED: %s", device_id, exc
-                        )
+                _worker_pool.restart_if_dead(self, device_id, worker)
         self._logger.info("[ULTRA] Watchdog stopped")
 
     def stop(self):
