@@ -531,6 +531,22 @@ def _set_shared_totp_index(value, gen) -> None:
         pass
 
 
+def _apply_poll_settings(worker: Any, settings: Dict[str, Any]) -> None:
+    """Busy pause, idle pause, back-off factor and ceiling of one worker, from normalized settings.
+
+    The idle ceiling is the WORST-CASE wait of a scan in the panel's RTLog before the PC sees it
+    (an owner measured 1.8-2.3 s at 2000 ms). settings_reader caps it at 300 ms for a device whose
+    cards the PC decides (spec section 4). Called at construction and on every device refresh; a
+    module function so update_device also works on the bare objects some tests hand it.
+    """
+    worker._busy_min = int(settings.get("busy_sleep_min_ms", 0))
+    worker._busy_max = int(settings.get("busy_sleep_max_ms", 50))
+    worker._empty_min = int(settings.get("empty_sleep_min_ms", 200))
+    worker._empty_max = int(settings.get("empty_sleep_max_ms", 500))
+    worker._backoff = float(settings.get("empty_backoff_factor", 1.35))
+    worker._backoff_cap = int(settings.get("empty_backoff_max_ms", 300))
+
+
 class UltraDeviceWorker(PcEntryMixin, threading.Thread):
     """Per-device thread: polls RTLog, classifies events, TOTP rescue."""
 
@@ -623,18 +639,9 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         # C3 event-burst debounce state (see _process_event): card_no -> monotonic timestamp.
         self._card_cooldown: Dict[str, float] = {}
 
-        # Adaptive sleep settings (same as AGENT mode)
-        self._busy_min = int(settings.get("busy_sleep_min_ms", 0))
-        self._busy_max = int(settings.get("busy_sleep_max_ms", 50))
-        self._empty_min = int(settings.get("empty_sleep_min_ms", 200))
-        self._empty_max = int(settings.get("empty_sleep_max_ms", 500))
-        self._backoff = float(settings.get("empty_backoff_factor", 1.35))
-        # Idle RTLog poll cap. This is the WORST-CASE latency from "member scans the
-        # QR" to "MonClub sees it": the scan sits in the controller's RTLog until the
-        # next poll. The old 2000ms cap made an idle-period scan wait up to ~2s (the
-        # gym owner measured 1.8-2.3s). 300ms keeps it sub-second; the held persistent
-        # connection makes frequent GetRTLog cheap.
-        self._backoff_cap = int(settings.get("empty_backoff_max_ms", 300))
+        # Polling knobs (busy pause, idle pause, back-off factor, ceiling): read here and again
+        # on every device refresh (update_device), so a dashboard change applies live (spec 5).
+        _apply_poll_settings(self, settings)
         self._empty_sleep_ms = float(self._empty_min)
         # M-002: RTLog poll timeout configurable per-device (was hardcoded 15.0)
         self._poll_timeout_sec = float(settings.get("rtlog_poll_timeout_sec", 15.0))
@@ -751,6 +758,8 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         self._device = device
         self._settings = settings
         self._device_name = str(device.get("name", ""))
+        # Polling knobs apply live too (spec section 5); the next idle pause uses them.
+        _apply_poll_settings(self, settings)
         # Hot-window tunable can change from the dashboard without restarting
         # the worker — read it back on every device refresh.
         try:
