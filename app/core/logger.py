@@ -241,6 +241,56 @@ class HalfDaySizeRotatingFileHandler(logging.FileHandler):
             self.handleError(record)
 
 
+# Top-level logger names the app's own code uses besides "zkapp" (see setup_logging).
+OWN_PACKAGE_LOGGERS = (
+    "app", "access", "shared", "tv", "updater",
+    "db", "device_driver", "settings_reader", "PullSDKDevice", "ZKStandaloneDevice",
+)
+
+
+class _WarningAndAbove(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING
+
+
+_OWN_PACKAGE_FILTER = _WarningAndAbove()
+
+
+def _attach_own_package_loggers(handlers) -> None:
+    """Give each OWN_PACKAGE_LOGGERS logger the zkapp handlers behind a WARNING filter.
+
+    The handlers are shared with "zkapp" (one file, one rotation); the filter sits on a thin
+    wrapper per handler so the zkapp lines keep their own level. Idempotent. Never raises."""
+    for name in OWN_PACKAGE_LOGGERS:
+        try:
+            lg = logging.getLogger(name)
+            if getattr(lg, "_monclub_handlers_attached", False):
+                continue
+            for h in list(handlers):
+                lg.addHandler(_FilteredForward(h))
+            if lg.level == logging.NOTSET:
+                lg.setLevel(logging.WARNING)
+            lg._monclub_handlers_attached = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+class _FilteredForward(logging.Handler):
+    """Forwards WARNING+ records to one shared handler (which keeps its own lock and format)."""
+
+    def __init__(self, target: logging.Handler) -> None:
+        super().__init__(logging.WARNING)
+        self._target = target
+        self.addFilter(_OWN_PACKAGE_FILTER)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.levelno >= self._target.level:
+                self._target.handle(record)
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(level: str = "DEBUG", ui_queue: Optional["queue.Queue[str]"] = None) -> logging.Logger:
     ensure_dirs()
     logger = logging.getLogger("zkapp")
@@ -267,6 +317,13 @@ def setup_logging(level: str = "DEBUG", ui_queue: Optional["queue.Queue[str]"] =
         qh.setLevel(getattr(logging, level.upper(), logging.DEBUG))
         qh.setFormatter(fmt)
         logger.addHandler(qh)
+
+    # The app's own modules that log under a name outside "zkapp" (logging.getLogger(__name__)
+    # in 34 modules -- "app.*", "access.*", "shared.*" -- and the "db" / driver loggers) had no
+    # handler at all: their warnings and errors went to stderr, which a windowed PC never shows,
+    # and never into this file (proven 2026-10-02). They now reach the same handlers, WARNING and
+    # above only, so their INFO lines (never logged before) do not start filling the file.
+    _attach_own_package_loggers(logger.handlers)
 
     # A previous run that ended without a clean exit is reported here, now that the app log --
     # the file the uploader ships -- exists. No-op unless access/main.py installed the capture.

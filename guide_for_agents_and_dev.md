@@ -5129,6 +5129,17 @@ logger: `… | INFO | [T] NAME k=v k=v`. The field guide for an operator is
 [`docs/field/fingerprint_telemetry_cheatsheet.md`](docs/field/fingerprint_telemetry_cheatsheet.md)
 — **update it in the same change as this table.**
 
+**What reaches the app log (2026-10-02).** `MainApp.__init__` loads the config and calls
+`setup_logging` **before** `init_db`, so `init_db`'s lines reach the file: `WAL_CHECKPOINT_STARTUP`,
+`DISK_SELFTEST` and the stale-lock resets. Before, `init_db` ran first, while no handler existed, and
+none of them appeared in any gym log (gym 45, 1.4.32-1.4.35: 0 over every start). The handlers sit
+on `zkapp` (`propagate=False`); the app's other logger names -- `logging.getLogger(__name__)` in 34
+modules (`app.*`, `access.*`, `shared.*`), `db`, `device_driver`, `settings_reader`, `PullSDKDevice`,
+`ZKStandaloneDevice` (`logger.py::OWN_PACKAGE_LOGGERS`) -- had none, so their warnings went to stderr
+only. They now reach the same handlers, **WARNING and above only**; their INFO lines are still not
+written (never were). `[TEST: tests/test_logging_reaches_the_app_log.py]` `[FIELD: gym 45 logs, 0 of
+either telemetry line before]`
+
 There is **no runtime registry** of event names: no `EVENT_NAMES` symbol, no test over
 the whole set. This table is the only index, so an event missing from it is invisible.
 
