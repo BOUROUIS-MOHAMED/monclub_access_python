@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import math
 import json
 import logging
@@ -38,9 +39,29 @@ _db_write_profiles: Dict[str, Dict[str, Any]] = {}
 _db_write_profiles_order: List[str] = []
 _db_writer_state_lock = threading.Lock()
 _db_writer_thread: threading.Thread | None = None
-_db_writer_queue: "queue.Queue[_DbWriteJob | None] | None" = None
+_db_writer_queue: "queue.PriorityQueue[Tuple[int, int, _DbWriteJob | None]] | None" = None
 _db_writer_db_path: str | None = None
 _db_writer_local = threading.local()
+
+# ---------------------------------------------------------------------------
+# The DbWriter is the ONLY application writer (guide §3.11). Its queue has two
+# lanes: a door-path job (the AGENT history claim taken before the door opens,
+# the AGENT RTLog cursor written on the poll thread, ULTRA's history row) runs
+# before every queued normal job, FIFO within each lane. A job already running
+# is never interrupted, so a door-path write waits at most for the job in hand.
+# The shutdown sentinel sorts after both lanes. The sequence number keeps FIFO
+# order inside a lane and means two entries never compare their jobs.
+# ---------------------------------------------------------------------------
+_DB_WRITE_LANE_DOOR = 0
+_DB_WRITE_LANE_NORMAL = 1
+_DB_WRITE_LANE_STOP = 2
+_db_write_seq = itertools.count()
+_db_write_seq_lock = threading.Lock()
+
+
+def _next_db_write_seq() -> int:
+    with _db_write_seq_lock:
+        return next(_db_write_seq)
 
 # ---------------------------------------------------------------------------
 # Per-thread WARM read connection (mitigation for a pathologically slow disk /
@@ -287,6 +308,8 @@ class _DbWriteJob:
     # Commit with PRAGMA synchronous=FULL (see _run_db_write_sync). Only the
     # write-ahead push intents use it.
     durable: bool = False
+    # Door-path lane (see _DB_WRITE_LANE_DOOR): runs before queued normal jobs.
+    priority: bool = False
 
 
 def _record_db_write_profile(label: str, profile: Dict[str, Any]) -> None:
@@ -320,7 +343,7 @@ def _shutdown_db_writer_for_tests() -> None:
         _db_writer_queue = None
         _db_writer_db_path = None
     if work_q is not None:
-        work_q.put(None)
+        work_q.put((_DB_WRITE_LANE_STOP, _next_db_write_seq(), None))
     if thread is not None and thread.is_alive():
         thread.join(timeout=2.0)
     # Drop this thread's warm read connection too — tests swap _DB_PATH between
@@ -328,7 +351,7 @@ def _shutdown_db_writer_for_tests() -> None:
     _close_thread_local_conn()
 
 
-def _ensure_db_writer() -> "queue.Queue[_DbWriteJob | None]":
+def _ensure_db_writer() -> "queue.PriorityQueue[Tuple[int, int, _DbWriteJob | None]]":
     global _db_writer_thread, _db_writer_queue, _db_writer_db_path
 
     db_path = str(_resolve_db_path())
@@ -340,7 +363,7 @@ def _ensure_db_writer() -> "queue.Queue[_DbWriteJob | None]":
 
     _shutdown_db_writer_for_tests()
 
-    work_q = queue.Queue()
+    work_q = queue.PriorityQueue()
     thread = threading.Thread(
         target=_db_writer_loop,
         args=(db_path, work_q),
@@ -355,7 +378,9 @@ def _ensure_db_writer() -> "queue.Queue[_DbWriteJob | None]":
     return work_q
 
 
-def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> None:
+def _db_writer_loop(
+    db_path: str, work_q: "queue.PriorityQueue[Tuple[int, int, _DbWriteJob | None]]"
+) -> None:
     logger = logging.getLogger(__name__)
     conn = _open_sqlite_connection(db_path)
     _db_writer_local.connection = conn
@@ -363,7 +388,7 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
     _last_ckpt = time.monotonic()
     try:
         while True:
-            job = work_q.get()
+            _lane, _seq, job = work_q.get()
             if job is None:
                 break
 
@@ -373,6 +398,8 @@ def _db_writer_loop(db_path: str, work_q: "queue.Queue[_DbWriteJob | None]") -> 
                 "queue_wait_ms": round((total_started - job.submitted_at) * 1000.0, 3),
                 "writer_thread": threading.current_thread().name,
             }
+            if job.priority:
+                profile["priority"] = True
             try:
                 if job.durable:
                     # SQLite refuses to change the safety level inside a transaction
@@ -467,8 +494,16 @@ def _run_db_write_sync(
     operation: Callable[[sqlite3.Connection, Dict[str, Any]], Any],
     *,
     durable: bool = False,
+    priority: bool = False,
 ) -> Any:
     """Run ``operation`` in one transaction on the DbWriter thread.
+
+    The DbWriter is the only application writer: every write outside ``init_db`` goes
+    through here (``tests/test_db_single_writer.py`` fails on a new direct write).
+    ``priority=True`` puts the job in the door-path lane: it runs before every queued
+    normal job (never before the job already running). Only the writes a door or the
+    AGENT poll loop waits on use it -- ``insert_access_history`` and
+    ``save_agent_rtlog_state`` (guide §3.11).
 
     ``durable=True`` commits with ``PRAGMA synchronous=FULL`` for this job only.
     Every connection here runs WAL with ``synchronous=NORMAL``: in that mode a
@@ -501,8 +536,10 @@ def _run_db_write_sync(
         return result
 
     work_q = _ensure_db_writer()
-    job = _DbWriteJob(label=str(label), operation=operation, durable=bool(durable))
-    work_q.put(job)
+    job = _DbWriteJob(label=str(label), operation=operation, durable=bool(durable),
+                      priority=bool(priority))
+    lane = _DB_WRITE_LANE_DOOR if job.priority else _DB_WRITE_LANE_NORMAL
+    work_q.put((lane, _next_db_write_seq(), job))
     if not job.done.wait(timeout=60.0):
         raise TimeoutError(f"Timed out waiting for DB writer job '{label}'")
     if job.error is not None:
@@ -3541,7 +3578,7 @@ def save_firmware_profile(
     callers can save strategy fields without clobbering earlier discoveries.
     """
     name_val = None if name_supported is None else (1 if name_supported else 0)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO sync_firmware_profiles
@@ -3571,7 +3608,7 @@ def save_firmware_profile(
                 now_iso(),
             ),
         )
-        conn.commit()
+    return _run_db_write_sync("save_firmware_profile", _write)
 
 
 def load_firmware_profile(*, device_id: int) -> dict | None:
@@ -3614,7 +3651,7 @@ def reset_firmware_template_combo(*, device_id: int, template_version_bias: int)
     none of them depend on which template TABLE the device wants, so re-probing them
     would be pure cost.
     """
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO sync_firmware_profiles
@@ -3628,14 +3665,14 @@ def reset_firmware_template_combo(*, device_id: int, template_version_bias: int)
             """,
             (device_id, int(template_version_bias or 0), now_iso()),
         )
-        conn.commit()
+    return _run_db_write_sync("reset_firmware_template_combo", _write)
 
 
 def clear_firmware_profile(*, device_id: int) -> None:
     """Remove the cached firmware profile for a device (e.g., after firmware upgrade detected)."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM sync_firmware_profiles WHERE device_id = ?", (device_id,))
-        conn.commit()
+    return _run_db_write_sync("clear_firmware_profile", _write)
 
 
 # -----------------------------
@@ -3656,7 +3693,7 @@ def upsert_device_mirror_pin(
     """Write-through update after a successful per-pin push to a ZKTeco device."""
     import time as _time
     pushed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO device_content_mirror
@@ -3675,7 +3712,7 @@ def upsert_device_mirror_pin(
             (device_id, pin, full_name, card_no, door_bitmask, authorize_tz_id,
              fp_count, pushed_at, 1 if push_ok else 0),
         )
-        conn.commit()
+    return _run_db_write_sync("upsert_device_mirror_pin", _write)
 
 
 def upsert_device_mirror_batch(
@@ -3748,12 +3785,12 @@ def upsert_device_mirror_batch(
 
 def delete_device_mirror_pin(*, device_id: int, pin: str) -> None:
     """Remove a pin from the content mirror (called when pin is deleted from device)."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             "DELETE FROM device_content_mirror WHERE device_id=? AND pin=?",
             (device_id, pin),
         )
-        conn.commit()
+    return _run_db_write_sync("delete_device_mirror_pin", _write)
 
 
 @_tel.timed("DB_READ_list_device_mirror", slow_ms=50, warn_ms=1000)
@@ -3769,9 +3806,9 @@ def list_device_mirror(*, device_id: int) -> List[Dict[str, Any]]:
 
 def clear_device_mirror(*, device_id: int) -> None:
     """Wipe the entire mirror for a device (called on FULL_REPLACE before re-push)."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM device_content_mirror WHERE device_id=?", (device_id,))
-        conn.commit()
+    return _run_db_write_sync("clear_device_mirror", _write)
 
 
 # --------------------------------------------------------------------------- #
@@ -3796,7 +3833,7 @@ def mirror_reconcile_is_armed(*, device_id: int) -> bool:
 def mirror_reconcile_record_plan(*, device_id: int, count: int, sample: str) -> None:
     """Record the most recent dry-run deletion plan (for operator review before arming)."""
     at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO mirror_reconcile_ack (device_id, armed, last_plan_at, last_plan_count, last_plan_sample)
@@ -3808,13 +3845,13 @@ def mirror_reconcile_record_plan(*, device_id: int, count: int, sample: str) -> 
             """,
             (int(device_id), at, int(count), str(sample or "")),
         )
-        conn.commit()
+    return _run_db_write_sync("mirror_reconcile_record_plan", _write)
 
 
 def arm_mirror_reconcile(*, device_id: int) -> None:
     """Operator action: arm MIRROR deletions for a device (after reviewing the plan)."""
     at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO mirror_reconcile_ack (device_id, armed, last_plan_at)
@@ -3823,16 +3860,16 @@ def arm_mirror_reconcile(*, device_id: int) -> None:
             """,
             (int(device_id), at),
         )
-        conn.commit()
+    return _run_db_write_sync("arm_mirror_reconcile", _write)
 
 
 def disarm_mirror_reconcile(*, device_id: int) -> None:
     """Re-require operator review before the next MIRROR deletion (e.g. policy changed)."""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             "UPDATE mirror_reconcile_ack SET armed = 0 WHERE device_id=?", (int(device_id),)
         )
-        conn.commit()
+    return _run_db_write_sync("disarm_mirror_reconcile", _write)
 
 
 def get_mirror_reconcile_state(*, device_id: int) -> Dict[str, Any]:
@@ -4261,7 +4298,7 @@ def upsert_delta_users(users: list[dict]) -> None:
     """
     if not users:
         return
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         for u in users:
             if not isinstance(u, dict):
                 continue
@@ -4298,7 +4335,7 @@ def upsert_delta_users(users: list[dict]) -> None:
                 ),
             )
         _refresh_member_account_links(conn)
-        conn.commit()
+    return _run_db_write_sync("upsert_delta_users", _write)
 
 
 def delete_users_by_am_ids(am_ids: set[int]) -> None:
@@ -4309,7 +4346,7 @@ def delete_users_by_am_ids(am_ids: set[int]) -> None:
     """
     if not am_ids:
         return
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         placeholders = ",".join("?" * len(am_ids))
         conn.execute(
             f"DELETE FROM sync_users WHERE active_membership_id IN ({placeholders})",
@@ -4325,7 +4362,7 @@ def delete_users_by_am_ids(am_ids: set[int]) -> None:
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
-        conn.commit()
+    return _run_db_write_sync("delete_users_by_am_ids", _write)
 
 
 def get_all_cached_user_am_ids() -> list[int]:
@@ -4369,7 +4406,7 @@ def insert_fingerprint(
     template_data: str,
     template_size: int,
 ) -> int:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             INSERT INTO fingerprints
@@ -4378,8 +4415,8 @@ def insert_fingerprint(
             """,
             (now_iso(), label, pin, card_no, finger_id, template_version, template_encoding, template_data, template_size),
         )
-        conn.commit()
         return int(cur.lastrowid)
+    return _run_db_write_sync("insert_fingerprint", _write)
 
 
 def list_fingerprints() -> List[FingerprintRecord]:
@@ -4412,9 +4449,9 @@ def get_fingerprint(fp_id: int) -> Optional[FingerprintRecord]:
 
 
 def delete_fingerprint(fp_id: int) -> None:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM fingerprints WHERE id=?", (int(fp_id),))
-        conn.commit()
+    return _run_db_write_sync("delete_fingerprint", _write)
 
 
 def confirm_fingerprint_uploaded(fp_id: int) -> None:
@@ -4422,9 +4459,9 @@ def confirm_fingerprint_uploaded(fp_id: int) -> None:
     F-027: Mark a fingerprint as confirmed uploaded to backend.
     Call this after a successful backend upload to clear orphan status.
     """
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("UPDATE fingerprints SET backend_confirmed=1 WHERE id=?", (int(fp_id),))
-        conn.commit()
+    return _run_db_write_sync("confirm_fingerprint_uploaded", _write)
 
 
 def list_unconfirmed_fingerprints() -> List[FingerprintRecord]:
@@ -4497,7 +4534,7 @@ def create_device_door_preset(
     if not name:
         raise ValueError("Door name is required.")
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute("SELECT COUNT(*) AS c FROM device_door_presets WHERE device_id=?", (did,))
         c = int(cur.fetchone()["c"])  # type: ignore[index]
         if c >= int(max_per_device):
@@ -4512,8 +4549,8 @@ def create_device_door_preset(
             """,
             (did, dn, ps, name, now, now),
         )
-        conn.commit()
         return int(cur2.lastrowid)
+    return _run_db_write_sync("create_device_door_preset", _write)
 
 
 def update_device_door_preset(
@@ -4533,7 +4570,7 @@ def update_device_door_preset(
     if not name:
         raise ValueError("Door name is required.")
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         r = conn.execute("SELECT id, device_id FROM device_door_presets WHERE id=?", (pid,)).fetchone()
         if not r:
             raise ValueError("Preset not found.")
@@ -4553,14 +4590,14 @@ def update_device_door_preset(
             """,
             (did, dn, ps, name, now_iso(), pid),
         )
-        conn.commit()
+    return _run_db_write_sync("update_device_door_preset", _write)
 
 
 def delete_device_door_preset(preset_id: int) -> None:
     pid = int(preset_id)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM device_door_presets WHERE id=?", (pid,))
-        conn.commit()
+    return _run_db_write_sync("delete_device_door_preset", _write)
 
 
 # -----------------------------
@@ -4586,7 +4623,7 @@ def get_device_open_door_switch(device_id: int) -> Optional[bool]:
 def set_device_open_door_switch(device_id: int, enabled: Optional[bool]) -> None:
     """Persist the door switch; ``None`` clears it (back to the family default)."""
     did = int(device_id)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         if enabled is None:
             conn.execute(
                 "UPDATE device_local_settings SET open_door_enabled=NULL, updated_at=? WHERE device_id=?",
@@ -4603,7 +4640,7 @@ def set_device_open_door_switch(device_id: int, enabled: Optional[bool]) -> None
                 """,
                 (did, 1 if enabled else 0, now_iso()),
             )
-        conn.commit()
+    return _run_db_write_sync("set_device_open_door_switch", _write)
 
 
 def _load_device_open_door_switch_index() -> Dict[int, bool]:
@@ -4626,7 +4663,7 @@ def save_auth_token(*, email: str, token: str, last_login_at: str | None = None)
     last_login_at = last_login_at or now_iso()
     protected = protect_auth_token(token)
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO auth_state (id, email, token_protected, last_login_at)
@@ -4638,7 +4675,7 @@ def save_auth_token(*, email: str, token: str, last_login_at: str | None = None)
             """,
             (email, protected, last_login_at),
         )
-        conn.commit()
+    return _run_db_write_sync("save_auth_token", _write)
 
 
 def save_refresh_session_data(*, refresh_token: str, next_refresh_at: str) -> None:
@@ -4648,7 +4685,7 @@ def save_refresh_session_data(*, refresh_token: str, next_refresh_at: str) -> No
     to ensure save_auth_token() was invoked first (fixes first-login ordering bug).
     """
     protected = protect_auth_token(refresh_token) if refresh_token else ""
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         # Ensure the singleton row exists. All non-id columns are nullable so
         # INSERT OR IGNORE (id=1) is always valid per the CREATE TABLE schema.
         conn.execute("INSERT OR IGNORE INTO auth_state (id) VALUES (1)")
@@ -4661,7 +4698,7 @@ def save_refresh_session_data(*, refresh_token: str, next_refresh_at: str) -> No
             """,
             (protected, next_refresh_at),
         )
-        conn.commit()
+    return _run_db_write_sync("save_refresh_session_data", _write)
 
 
 def load_refresh_token() -> str | None:
@@ -4709,9 +4746,9 @@ def load_auth_token() -> AuthTokenState | None:
 
 
 def clear_auth_token() -> None:
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM auth_state WHERE id=1")
-        conn.commit()
+    return _run_db_write_sync("clear_auth_token", _write)
 
 
 # -----------------------------
@@ -5192,7 +5229,7 @@ def save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
 
 def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     if not data:
-        with get_conn() as conn:
+        def _clear(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> None:
             cur = conn.cursor()
             cur.execute("DELETE FROM sync_cache WHERE id=1")
             cur.execute("DELETE FROM sync_meta WHERE id=1")
@@ -5214,7 +5251,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                 "UPDATE access_v2_state SET trusted = 0, updated_at = ? WHERE id = 1", (now_iso(),),
             )
             _set_windows_version(cur, None)
-            conn.commit()
+        _run_db_write_sync("_save_sync_cache", _clear)
         return
 
     payload_json = json.dumps(data or {}, ensure_ascii=False)
@@ -5232,7 +5269,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
     gym_access_credentials = data.get("gymAccessCredentials") or data.get("gym_access_credentials") or []
     pc_received_epoch = _client_received_epoch(data)
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> None:
         cur = conn.cursor()
 
         # cache payload json (debug / fallback)
@@ -5282,7 +5319,6 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
                     cur, data, members_applied=False, full_mode=True, valid_ids=None,
                     incoming_ids=set(), pc_received_epoch=pc_received_epoch,
                 )
-                conn.commit()
                 return
 
         # clear normalized tables
@@ -5581,7 +5617,7 @@ def _save_sync_cache(data: Optional[Dict[str, Any]]) -> None:
             pc_received_epoch=pc_received_epoch,
         )
 
-        conn.commit()
+    _run_db_write_sync("_save_sync_cache", _write)
 
 
 def _normalize_sync_credential_payload_row(c: Dict[str, Any]) -> Dict[str, Any]:
@@ -6126,24 +6162,20 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(item, dict)
     ]
 
-    applied = 0
-    skipped = 0
-    applied_item_indexes: List[int] = []
-    forgot_protocol2 = False
-
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Dict[str, Any] | None:
+        # The duplicate check, the bundle row and the items are one writer transaction:
+        # two threads applying the same bundle cannot both pass the check.
+        applied = 0
+        skipped = 0
+        applied_item_indexes: List[int] = []
+        forgot_protocol2 = False
         cur = conn.cursor()
         duplicate = cur.execute(
             "SELECT 1 FROM fast_patch_bundles WHERE bundle_id = ?",
             (bundle_id,),
         ).fetchone()
         if duplicate:
-            return {
-                "applied": 0,
-                "skipped": 0,
-                "ignored": "duplicate_bundle",
-                "appliedItemIndexes": [],
-            }
+            return None
 
         cur.execute(
             """
@@ -6179,8 +6211,28 @@ def apply_fast_patch_bundle(bundle: Dict[str, Any]) -> Dict[str, Any]:
             applied_item_indexes.append(item_index)
 
         _refresh_member_account_links(cur)
-        conn.commit()
+        return {
+            "applied": applied,
+            "skipped": skipped,
+            "applied_item_indexes": applied_item_indexes,
+            "forgot_protocol2": forgot_protocol2,
+        }
 
+    outcome = _run_db_write_sync("apply_fast_patch_bundle", _write)
+    if outcome is None:
+        return {
+            "applied": 0,
+            "skipped": 0,
+            "ignored": "duplicate_bundle",
+            "appliedItemIndexes": [],
+        }
+    applied = int(outcome["applied"])
+    skipped = int(outcome["skipped"])
+    applied_item_indexes = list(outcome["applied_item_indexes"])
+    forgot_protocol2 = bool(outcome["forgot_protocol2"])
+
+    # After the commit, never inside the job: a cache that reloads on the new generation
+    # must find the new rows.
     if forgot_protocol2:
         # The QR date snapshot (access_verification.current_access_days) is keyed on the
         # local-state generation; the engines' own resets bump it too, but not on every mode.
@@ -7518,7 +7570,7 @@ def save_optional_sync_state(
     Only overwrites a version marker when the corresponding refresh flag was true,
     preserving unchanged markers.
     """
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO optional_sync_state (id, events_version_at, products_version_at, deals_version_at, last_sync_at)
@@ -7539,7 +7591,7 @@ def save_optional_sync_state(
                 1 if refresh_deals else 0,
             ),
         )
-        conn.commit()
+    return _run_db_write_sync("save_optional_sync_state", _write)
 
 
 def delete_passed_optional_events() -> int:
@@ -7548,18 +7600,18 @@ def delete_passed_optional_events() -> int:
     Returns the number of deleted rows. Called before each optional sync cycle.
     """
     now_iso = datetime.now().isoformat()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             "DELETE FROM optional_upcoming_events WHERE event_date < ?", (now_iso,)
         )
-        conn.commit()
         return cur.rowcount
+    return _run_db_write_sync("delete_passed_optional_events", _write)
 
 
 def replace_optional_events(events: List[Dict[str, Any]]) -> None:
     """Replace the full optional events cache."""
     now_ts = datetime.now().isoformat()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM optional_upcoming_events")
         for ev in events:
             conn.execute(
@@ -7585,13 +7637,13 @@ def replace_optional_events(events: List[Dict[str, Any]]) -> None:
                     now_ts,
                 ),
             )
-        conn.commit()
+    return _run_db_write_sync("replace_optional_events", _write)
 
 
 def replace_optional_products(products: List[Dict[str, Any]]) -> None:
     """Replace the full optional products cache."""
     now_ts = datetime.now().isoformat()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM optional_products")
         for p in products:
             conn.execute(
@@ -7615,13 +7667,13 @@ def replace_optional_products(products: List[Dict[str, Any]]) -> None:
                     now_ts,
                 ),
             )
-        conn.commit()
+    return _run_db_write_sync("replace_optional_products", _write)
 
 
 def replace_optional_deals(deals: List[Dict[str, Any]]) -> None:
     """Replace the full optional deals cache."""
     now_ts = datetime.now().isoformat()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute("DELETE FROM optional_deals")
         for d in deals:
             conn.execute(
@@ -7642,7 +7694,7 @@ def replace_optional_deals(deals: List[Dict[str, Any]]) -> None:
                     now_ts,
                 ),
             )
-        conn.commit()
+    return _run_db_write_sync("replace_optional_deals", _write)
 
 
 def list_optional_upcoming_events() -> List[Dict[str, Any]]:
@@ -10472,7 +10524,7 @@ def list_push_batches(
 
 def prune_sync_run_history(*, retention_days: int = 30) -> int:
     days = max(int(retention_days), 1)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             DELETE FROM sync_run_history
@@ -10480,13 +10532,13 @@ def prune_sync_run_history(*, retention_days: int = 30) -> int:
             """,
             (days,),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("prune_sync_run_history", _write)
 
 
 def prune_push_batch_history(*, retention_days: int = 30) -> int:
     days = max(int(retention_days), 1)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             DELETE FROM push_batch_history
@@ -10494,8 +10546,8 @@ def prune_push_batch_history(*, retention_days: int = 30) -> int:
             """,
             (days,),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("prune_push_batch_history", _write)
 
 
 def cleanup_stale_in_progress_sync_runs() -> int:
@@ -10504,7 +10556,7 @@ def cleanup_stale_in_progress_sync_runs() -> int:
     Called once at application startup to prevent phantom IN_PROGRESS rows appearing
     in the historique page after a crash or force-quit.
     """
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             UPDATE sync_run_history
@@ -10513,8 +10565,8 @@ def cleanup_stale_in_progress_sync_runs() -> int:
              WHERE status = 'IN_PROGRESS'
             """
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("cleanup_stale_in_progress_sync_runs", _write)
 
 
 # Realtime RTLog cursor/state
@@ -10546,7 +10598,7 @@ def load_agent_rtlog_state(device_id: int) -> Optional[AgentRtlogState]:
 
 def save_agent_rtlog_state(*, device_id: int, last_event_at: str, last_event_id: str) -> None:
     did = int(device_id)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO agent_rtlog_state (device_id, last_event_at, last_event_id, updated_at)
@@ -10558,7 +10610,7 @@ def save_agent_rtlog_state(*, device_id: int, last_event_at: str, last_event_id:
             """,
             (did, str(last_event_at or ""), str(last_event_id or ""), now_iso()),
         )
-        conn.commit()
+    return _run_db_write_sync("save_agent_rtlog_state", _write, priority=True)
 
 
 # -----------------------------
@@ -10736,7 +10788,7 @@ def insert_access_history(
     if not str(event_id or "").strip():
         return 0
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         try:
             cur = conn.execute(
                 """
@@ -10774,10 +10826,10 @@ def insert_access_history(
                     active_membership_id=active_membership_id,
                 ),
             )
-            conn.commit()
             return int(cur.rowcount or 0)
         except sqlite3.IntegrityError:
             return 0
+    return _run_db_write_sync("insert_access_history", _write, priority=True)
 
 
 def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
@@ -10812,7 +10864,7 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
         )
     if not batch:
         return 0
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.executemany(
             """
             INSERT OR IGNORE INTO access_history (
@@ -10830,8 +10882,8 @@ def insert_access_history_batch(*, rows: Iterable[Dict[str, Any]]) -> int:
             """,
             batch,
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("insert_access_history_batch", _write)
 
 
 def count_today_for_user_door(
@@ -10912,7 +10964,7 @@ def prune_access_history(*, retention_days: int) -> int:
     days = int(retention_days)
     if days < 1:
         days = 1
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             DELETE FROM access_history
@@ -10921,14 +10973,14 @@ def prune_access_history(*, retention_days: int) -> int:
             """,
             (days, ACCESS_HISTORY_SYNC_SYNCED, ACCESS_HISTORY_SYNC_FAILED_TERMINAL),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("prune_access_history", _write)
 
 
 def prune_offline_creation_queue(*, retention_days: int = 30) -> int:
     """M-008: Clean up succeeded/failed offline creations older than retention_days."""
     days = max(int(retention_days), 1)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             DELETE FROM offline_creation_queue
@@ -10937,8 +10989,8 @@ def prune_offline_creation_queue(*, retention_days: int = 30) -> int:
             """,
             (days,),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("prune_offline_creation_queue", _write)
 
 
 @_tel.timed("DB_READ_get_recent_access_history", slow_ms=50, warn_ms=1000)
@@ -10988,7 +11040,7 @@ def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None 
         return 0
     ts = str(synced_at or now_iso())
     placeholders = ",".join("?" for _ in ids)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             f"""
             UPDATE access_history
@@ -11002,8 +11054,8 @@ def mark_access_history_synced(*, row_ids: Iterable[int], synced_at: str | None 
             """,
             (ACCESS_HISTORY_SYNC_SYNCED, ts, ts, *ids),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("mark_access_history_synced", _write)
 
 
 def mark_access_history_sync_failure(
@@ -11033,7 +11085,7 @@ def mark_access_history_sync_failure(
     state = ACCESS_HISTORY_SYNC_FAILED_TERMINAL if terminal else ACCESS_HISTORY_SYNC_FAILED_RETRYABLE
     next_retry = None if terminal else retry_at
     placeholders = ",".join("?" for _ in ids)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             f"""
             UPDATE access_history
@@ -11047,8 +11099,8 @@ def mark_access_history_sync_failure(
             """,
             (state, ts, next_retry, str(error or "")[:2000], *ids),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("mark_access_history_sync_failure", _write)
 
 
 def mark_access_history_unresolved(
@@ -11083,7 +11135,7 @@ def mark_access_history_unresolved(
     base = max(30, int(base_retry_seconds or 300))
     cap = max(base, int(max_retry_seconds or base))
     placeholders = ",".join("?" for _ in ids)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         current = conn.execute(
             f"SELECT id, COALESCE(backend_unresolved_count, 0) AS n FROM access_history WHERE id IN ({placeholders})",
             ids,
@@ -11113,8 +11165,8 @@ def mark_access_history_unresolved(
             """,
             params,
         )
-        conn.commit()
         return len(params)
+    return _run_db_write_sync("mark_access_history_unresolved", _write)
 
 
 def expire_unresolved_access_history(*, retention_days: int, min_unresolved_verdicts: int) -> int:
@@ -11136,7 +11188,7 @@ def expire_unresolved_access_history(*, retention_days: int, min_unresolved_verd
     """
     days = max(1, int(retention_days))
     floor = max(1, int(min_unresolved_verdicts))
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             UPDATE access_history
@@ -11157,8 +11209,8 @@ def expire_unresolved_access_history(*, retention_days: int, min_unresolved_verd
                 days,
             ),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("expire_unresolved_access_history", _write)
 
 
 def mark_access_history_sync_attempt(
@@ -11171,7 +11223,7 @@ def mark_access_history_sync_attempt(
         return 0
     ts = str(attempted_at or now_iso())
     placeholders = ",".join("?" for _ in ids)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             f"""
             UPDATE access_history
@@ -11181,8 +11233,8 @@ def mark_access_history_sync_attempt(
             """,
             (ts, *ids),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("mark_access_history_sync_attempt", _write)
 
 
 def load_device_attendance_state(device_id: int) -> Optional[DeviceAttendanceState]:
@@ -11232,7 +11284,7 @@ def save_device_attendance_state(
     last_purge_error: str | None = None,
 ) -> None:
     did = int(device_id)
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         existing = conn.execute(
             """
             SELECT
@@ -11284,7 +11336,7 @@ def save_device_attendance_state(
                 now_iso(),
             ),
         )
-        conn.commit()
+    return _run_db_write_sync("save_device_attendance_state", _write)
 
 
 
@@ -11323,7 +11375,7 @@ def reset_stale_processing_locks(now_iso: Optional[str] = None) -> int:
     if now_iso is None:
         from datetime import datetime, timezone as _tz
         now_iso = datetime.now(tz=_tz.utc).isoformat()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11335,8 +11387,8 @@ def reset_stale_processing_locks(now_iso: Optional[str] = None) -> int:
             """,
             (now_iso,),
         )
-        conn.commit()
         return cur.rowcount
+    return _run_db_write_sync("reset_stale_processing_locks", _write)
 
 
 def _utc_now_iso() -> str:
@@ -11488,7 +11540,8 @@ def insert_offline_creation(
     payload_json = json.dumps(payload_obj, ensure_ascii=False)
     payload_hash = _hash_payload(payload_obj)
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> str | None:
+        """None = inserted; else the local_id of the row already holding this request id."""
         try:
             conn.execute(
                 """
@@ -11528,7 +11581,7 @@ def insert_offline_creation(
                     now,
                 ),
             )
-            conn.commit()
+            return None
         except sqlite3.IntegrityError:
             # Stable client_request_id should return the existing logical row.
             ex = conn.execute(
@@ -11536,12 +11589,16 @@ def insert_offline_creation(
                 (rid,),
             ).fetchone()
             if ex:
-                existing_id = str(ex["local_id"])  # type: ignore[index]
-                existing = get_offline_creation(existing_id)
-                if existing:
-                    return existing
+                return str(ex["local_id"])  # type: ignore[index]
             raise
 
+    existing_id = _run_db_write_sync("insert_offline_creation", _write)
+    if existing_id is not None:
+        existing = get_offline_creation(existing_id)
+        if existing:
+            return existing
+        # The row holding this request id vanished in between: same type as before.
+        raise sqlite3.IntegrityError(f"offline creation request id {rid} already used")
     row = get_offline_creation(lid)
     if not row:
         raise RuntimeError("Failed to insert offline creation row")
@@ -11664,7 +11721,7 @@ def update_offline_creation_payload(
 
     payload_obj = payload if isinstance(payload, dict) else {}
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11693,7 +11750,7 @@ def update_offline_creation_payload(
                 lid,
             ),
         )
-        conn.commit()
+    _run_db_write_sync("update_offline_creation_payload", _write)
     return get_offline_creation(lid)
 
 
@@ -11714,7 +11771,7 @@ def set_offline_creation_try_to_create(local_id: str, enabled: bool) -> Dict[str
     if not enabled and new_state not in OFFLINE_QUEUE_FINAL_STATES:
         if row.get("state") == "blocked_auth":
             new_state = "blocked_auth"
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11727,7 +11784,7 @@ def set_offline_creation_try_to_create(local_id: str, enabled: bool) -> Dict[str
             """,
             (1 if enabled else 0, _normalize_queue_state(new_state), now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("set_offline_creation_try_to_create", _write)
     return get_offline_creation(lid)
 
 
@@ -11742,7 +11799,7 @@ def cancel_offline_creation(local_id: str, *, reason: str | None = None) -> Dict
         return None
 
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11759,7 +11816,7 @@ def cancel_offline_creation(local_id: str, *, reason: str | None = None) -> Dict
             """,
             (now, _norm_text(reason)[:1000] or None, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("cancel_offline_creation", _write)
     return get_offline_creation(lid)
 
 
@@ -11772,7 +11829,7 @@ def archive_offline_creation(local_id: str) -> Dict[str, Any] | None:
         return None
 
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11787,7 +11844,7 @@ def archive_offline_creation(local_id: str) -> Dict[str, Any] | None:
             """,
             (now, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("archive_offline_creation", _write)
     return get_offline_creation(lid)
 
 
@@ -11824,7 +11881,7 @@ def claim_offline_creation_for_processing(local_id: str, *, lock_ttl_sec: int = 
     if not force:
         where += " AND try_to_create=1 AND state IN ('pending','failed_retryable','blocked_auth')"
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             f"""
             UPDATE offline_creation_queue
@@ -11839,9 +11896,10 @@ def claim_offline_creation_for_processing(local_id: str, *, lock_ttl_sec: int = 
             """,
             (now, now, token, expires, now, *args),
         )
-        conn.commit()
-        if int(cur.rowcount or 0) <= 0:
-            return None
+        return int(cur.rowcount or 0)
+
+    if int(_run_db_write_sync("claim_offline_creation_for_processing", _write)) <= 0:
+        return None
 
     row = get_offline_creation(lid)
     if not row:
@@ -11899,7 +11957,7 @@ def mark_offline_creation_success(
             result_json = json.dumps(result, ensure_ascii=False)[:4000]
         except Exception:
             result_json = None
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -11928,7 +11986,7 @@ def mark_offline_creation_success(
             (state, am_id, user_id, account_id, account_username, result_json,
              state, now, state, now, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_creation_success", _write)
     return get_offline_creation(lid)
 
 
@@ -11969,7 +12027,7 @@ def mark_offline_creation_failure(
         nr = None
 
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_creation_queue
@@ -12003,7 +12061,7 @@ def mark_offline_creation_failure(
                 lid,
             ),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_creation_failure", _write)
     return get_offline_creation(lid)
 
 
@@ -12043,7 +12101,7 @@ def insert_offline_subresource(
     sid = str(sub_id or uuid.uuid4())
     payload_obj = payload if isinstance(payload, dict) else {}
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             INSERT INTO offline_subresource_queue (
@@ -12054,7 +12112,7 @@ def insert_offline_subresource(
             """,
             (sid, cid, k, json.dumps(payload_obj, ensure_ascii=False), now, now),
         )
-        conn.commit()
+    _run_db_write_sync("insert_offline_subresource", _write)
     return get_offline_subresource(sid)  # type: ignore[return-value]
 
 
@@ -12103,7 +12161,7 @@ def mark_offline_subresource_done(sub_id: str, *, server_ref: str | None = None)
     if not sid:
         return None
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_subresource_queue
@@ -12113,7 +12171,7 @@ def mark_offline_subresource_done(sub_id: str, *, server_ref: str | None = None)
             """,
             (_norm_text(server_ref) or None, now, sid),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_subresource_done", _write)
     return get_offline_subresource(sid)
 
 
@@ -12131,7 +12189,7 @@ def mark_offline_subresource_failed(
     state = "failed_terminal" if terminal else "failed_retryable"
     nr = None if terminal else _next_retry_iso(int(retry_delay_min or 15))
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_subresource_queue
@@ -12140,7 +12198,7 @@ def mark_offline_subresource_failed(
             """,
             (state, attempts, _norm_text(message)[:1000] or None, now, nr, now, sid),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_subresource_failed", _write)
     return get_offline_subresource(sid)
 
 
@@ -12151,7 +12209,7 @@ def cancel_offline_subresources_for(creation_local_id: str) -> int:
     if not cid:
         return 0
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             UPDATE offline_subresource_queue
@@ -12160,8 +12218,8 @@ def cancel_offline_subresources_for(creation_local_id: str) -> int:
             """,
             (now, cid),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("cancel_offline_subresources_for", _write)
 
 
 # ---------------------------------------------------------------------------
@@ -12252,7 +12310,8 @@ def insert_offline_mutation(
     dep = _norm_text(depends_on_local_id) or None
     now = _utc_now_iso()
 
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> str | None:
+        """None = inserted; else the local_id of the row already holding this request id."""
         try:
             conn.execute(
                 """
@@ -12265,17 +12324,22 @@ def insert_offline_mutation(
                 """,
                 (lid, rid, ok, tk, tid, ev, payload_json, payload_hash, money_v, dep, now, now),
             )
-            conn.commit()
+            return None
         except sqlite3.IntegrityError:
             ex = conn.execute(
                 "SELECT local_id FROM offline_mutation_queue WHERE client_request_id=? LIMIT 1", (rid,)
             ).fetchone()
             if ex:
-                existing = get_offline_mutation(str(ex["local_id"]))  # type: ignore[index]
-                if existing:
-                    return existing
+                return str(ex["local_id"])  # type: ignore[index]
             raise
 
+    existing_id = _run_db_write_sync("insert_offline_mutation", _write)
+    if existing_id is not None:
+        existing = get_offline_mutation(existing_id)
+        if existing:
+            return existing
+        # The row holding this request id vanished in between: same type as before.
+        raise sqlite3.IntegrityError(f"offline mutation request id {rid} already used")
     row = get_offline_mutation(lid)
     if not row:
         raise RuntimeError("Failed to insert offline mutation row")
@@ -12371,7 +12435,7 @@ def claim_offline_mutation_for_processing(local_id: str, *, lock_ttl_sec: int = 
     args: List[Any] = [lid, now]
     if not force:
         where += " AND try_to_apply=1 AND state IN ('pending','failed_retryable','blocked_auth')"
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> int:
         cur = conn.execute(
             f"""
             UPDATE offline_mutation_queue
@@ -12383,9 +12447,10 @@ def claim_offline_mutation_for_processing(local_id: str, *, lock_ttl_sec: int = 
             """,
             (now, now, token, expires, now, *args),
         )
-        conn.commit()
-        if int(cur.rowcount or 0) <= 0:
-            return None
+        return int(cur.rowcount or 0)
+
+    if int(_run_db_write_sync("claim_offline_mutation_for_processing", _write)) <= 0:
+        return None
     row = get_offline_mutation(lid)
     if row:
         row["processing_lock_token"] = token
@@ -12427,7 +12492,7 @@ def mark_offline_mutation_success(
             result_json = json.dumps(result, ensure_ascii=False)[:4000]
         except Exception:
             result_json = None
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_mutation_queue
@@ -12455,7 +12520,7 @@ def mark_offline_mutation_success(
                 """,
                 (new_version, now, lid),
             )
-        conn.commit()
+    _run_db_write_sync("mark_offline_mutation_success", _write)
     return get_offline_mutation(lid)
 
 
@@ -12482,7 +12547,7 @@ def mark_offline_mutation_failure(
     delay = int(retry_delay_min) if retry_delay_min is not None else _failure_retry_delay_minutes(ft)
     nr = None if next_state == "failed_terminal" else _next_retry_iso(delay)
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_mutation_queue
@@ -12500,7 +12565,7 @@ def mark_offline_mutation_failure(
                 nr, now, lid,
             ),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_mutation_failure", _write)
     return get_offline_mutation(lid)
 
 
@@ -12520,7 +12585,7 @@ def mark_offline_mutation_conflict(
             server_json = json.dumps(server_state, ensure_ascii=False)[:4000]
         except Exception:
             server_json = None
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_mutation_queue
@@ -12537,7 +12602,7 @@ def mark_offline_mutation_conflict(
                 _norm_text(message)[:1000] or None, now, server_json, now, lid,
             ),
         )
-        conn.commit()
+    _run_db_write_sync("mark_offline_mutation_conflict", _write)
     return get_offline_mutation(lid)
 
 
@@ -12546,7 +12611,7 @@ def cancel_offline_mutation(local_id: str, *, reason: str | None = None) -> Dict
     if not lid:
         return None
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             """
             UPDATE offline_mutation_queue
@@ -12558,7 +12623,7 @@ def cancel_offline_mutation(local_id: str, *, reason: str | None = None) -> Dict
             """,
             (_norm_text(reason)[:1000] or None, now, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("cancel_offline_mutation", _write)
     return get_offline_mutation(lid)
 
 
@@ -12567,12 +12632,12 @@ def archive_offline_mutation(local_id: str) -> Dict[str, Any] | None:
     if not lid:
         return None
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             "UPDATE offline_mutation_queue SET state='archived', archived_at=?, updated_at=? WHERE local_id=?",
             (now, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("archive_offline_mutation", _write)
     return get_offline_mutation(lid)
 
 
@@ -12581,18 +12646,18 @@ def set_offline_mutation_try(local_id: str, *, enabled: bool) -> Dict[str, Any] 
     if not lid:
         return None
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         conn.execute(
             "UPDATE offline_mutation_queue SET try_to_apply=?, updated_at=? WHERE local_id=? AND state IN ('pending','failed_retryable','blocked_auth')",
             (1 if enabled else 0, now, lid),
         )
-        conn.commit()
+    _run_db_write_sync("set_offline_mutation_try", _write)
     return get_offline_mutation(lid)
 
 
 def reset_stale_offline_mutation_locks() -> int:
     now = _utc_now_iso()
-    with get_conn() as conn:
+    def _write(conn: sqlite3.Connection, _profile: Dict[str, Any]) -> Any:
         cur = conn.execute(
             """
             UPDATE offline_mutation_queue
@@ -12602,8 +12667,8 @@ def reset_stale_offline_mutation_locks() -> int:
             """,
             (now, now),
         )
-        conn.commit()
         return int(cur.rowcount or 0)
+    return _run_db_write_sync("reset_stale_offline_mutation_locks", _write)
 
 
 def classify_failure(*, http_status: int | None, message: str | None) -> Dict[str, Any]:
