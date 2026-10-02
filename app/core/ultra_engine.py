@@ -27,7 +27,6 @@ from app.core.access_verification import (
 from app.core.db import (
     get_recent_access_history,
     insert_access_history,
-    count_recent_for_user_door,
     load_sync_cache,
     invalidate_sync_cache,
     get_local_state_generation,
@@ -51,6 +50,7 @@ from app.core.v2 import loss as _v2_loss
 from app.sdk.device_driver import DeviceProtocol, get_driver, resolve_device_protocol
 from app.core import card_decision as _card_decision
 from app.core import device_service_gate as _service_gate
+from app.core import desk_alerts as _desk_alerts
 from app.core.ultra_pc_entry import PcEntryMixin, _scan_mode_for_event, _uid_for_alert
 from app.core import ultra_worker_pool as _worker_pool
 
@@ -6564,6 +6564,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
             event_time=event_time,
             door_id=door_id,
             raw=raw_row,
+            user_id=_uid_for_alert(user),
         )
 
         if (time.monotonic() - t0) * 1000 >= 250:
@@ -6972,6 +6973,13 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         door_id: Optional[int] = None,
     ):
         t0 = time.monotonic()
+        # The desk alerts (desk_alerts.py: Windows toast, daily pass alert, repeat-block sound),
+        # once per decided scan and whether or not the popup is on (spec section 5, D4).
+        _desk_alerts.after_scan(
+            self._settings, device_id=self._device_id, device_name=self._device_name,
+            allowed=allowed, reason=reason, user_id=user_id, user_full_name=user_full_name,
+            user_image=user_image, door_id=door_id, prefix=self._prefix,
+        )
         popup_enabled = self._settings.get("popup_enabled", True)
         if not popup_enabled:
             return
@@ -7014,44 +7022,12 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         if reason == "DOOR_CMD_FAILED":
             message = "Valid code but door did not open -- try again or use card"
 
-        # ── Frequent-pass VISUAL alert (X passages inside Y minutes) ──
-        # Tells the entry screen that this member already came through recently, so
-        # the front desk can compare the face to the photo.
-        #
-        # THIS NEVER BLOCKS. `allowed`, the door pulse and the access decision were
-        # all settled by the caller before we got here; nothing below is read back
-        # into the decision. Blocking re-entry is the member block (repeat_guard.py, PC entries)
-        # and the panel's Intertime.
-        _rep_count = 0
-        _rep_limit = 0
-        _rep_window = 0
-        _prev_at = ""
-        try:
-            _rep_limit = int(self._settings.get("frequent_pass_limit") or 0)
-            _rep_window = int(self._settings.get("frequent_pass_window_minutes") or 0)
-            if (
-                allowed
-                and _rep_limit > 1
-                and _rep_window > 0
-                and user_id is not None
-                and door_id is not None
-            ):
-                _prior, _prev_raw = count_recent_for_user_door(
-                    user_id=int(user_id),
-                    device_id=int(self._device_id),
-                    door_id=int(door_id),
-                    window_minutes=_rep_window,
-                )
-                # ULTRA persists history asynchronously (_enqueue_history is drained
-                # on a later tick), so the scan being handled right now is NOT in
-                # access_history yet. Count it explicitly.
-                _total = int(_prior) + 1
-                if _total >= _rep_limit:
-                    _rep_count = _total
-                    _prev_at = str(_prev_raw or "")
-        except Exception as exc:
-            _rep_count, _prev_at = 0, ""
-            logger.warning(f"{self._prefix} frequent-pass alert check failed: {exc}")
+        # Frequent-pass VISUAL alert (X passages inside Y minutes; desk_alerts.frequent_pass).
+        # Never blocks: `allowed` and the door were settled by the caller.
+        rep = _desk_alerts.frequent_pass(
+            self._settings, allowed=allowed, user_id=user_id, device_id=self._device_id,
+            door_id=door_id, prefix=self._prefix,
+        )
 
         try:
             req = NotificationRequest(
@@ -7080,10 +7056,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
                 popup_duration_sec=int(self._settings.get("popup_duration_sec", 3)),
                 popup_enabled=True,
                 win_notify_enabled=bool(self._settings.get("win_notify_enabled", False)),
-                repeat_count=_rep_count,
-                repeat_limit=(_rep_limit if _rep_count else 0),
-                repeat_window_min=(_rep_window if _rep_count else 0),
-                previous_entry_at=_prev_at,
+                **rep,
             )
             self._popup_q.put_nowait(req)
             logger.debug(

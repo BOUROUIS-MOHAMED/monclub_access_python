@@ -10,7 +10,8 @@ UltraDeviceWorker mixes this in. The verdicts are card_decision.py (pure); this 
 Allowed: open the door with the relay pulse (_open_door_with_retry: the door preset's pulse, else
 pulse_time_ms), popup, history, then arm the member block (repeat_guard.py; never for staff).
 Refused: the turnstile's refusal stands, the reason goes to the popup and the history, and
-_note_pc_refusal records it -- plan 3 (desk_alerts.py) plays the refusal sound from there.
+_note_pc_refusal records it. The desk alerts (desk_alerts.py, plan 3) come from the popup funnel,
+UltraDeviceWorker._enqueue_notification, which every decided scan passes exactly once.
 
 The worker provides: _settings, _prefix, _tel_wid, _get_cached_local_state, _open_door_with_retry,
 _enqueue_notification, _enqueue_history, _handle_deny and _staff_membership_ids.
@@ -134,7 +135,8 @@ class PcEntryMixin:
     def _note_pc_refusal(self, verdict: "_cd.Verdict", *, kind: str, door_id: Optional[int]) -> None:
         """Every refusal a card_decision check added -- a PC card, a QR refused on the device's
         plans or by the member block, a staff card refused on the plans: one log line and
-        [T] PC_DECISION. Plan 3 (desk_alerts.py) adds the refusal sound here."""
+        [T] PC_DECISION. The repeat-block sound comes from _enqueue_notification (desk_alerts),
+        not from here, so a refusal rings once."""
         logger.info(f"{self._prefix} PC_REFUSED: kind={kind} reason={verdict.reason} door={door_id}")
         _tel.event("PC_DECISION", worker=self._tel_wid, kind=kind, allowed=False,
                    reason=verdict.reason, door=door_id)
@@ -170,6 +172,7 @@ class PcEntryMixin:
         self._enqueue_history(
             event_id=event_id, allowed=door_opened, reason=reason, event_type=event_type,
             card_no=card_no, event_time=event_time, door_id=door_id, raw=raw_row,
+            user_id=fields["user_id"],
         )
         return door_opened
 
