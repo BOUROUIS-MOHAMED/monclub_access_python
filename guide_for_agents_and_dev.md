@@ -34,7 +34,7 @@ This file is only useful while it is true. If you change any of the following, y
 | `app/sdk/device_driver.py` — protocol enum, aliases, resolution order | §4 Protocol resolution |
 | A `supports_*` / capability class attribute on any driver | §5 Capability flags |
 | Which engine services which `accessDataMode` | §3 The three modes |
-| The ULTRA re-scan cooldown — its window, its default for a never-seen card, the staff exemption (`ultra_engine.py::_process_event`'s cooldown block, `::_effective_card_cooldown_sec`) | §3 ULTRA |
+| The ULTRA event-burst debounce (`ultra_engine.py::_process_event`'s debounce block, `_ULTRA_CARD_DEBOUNCE_SEC`, `::_burst_debounce_sec`); the PC verdicts (`app/core/card_decision.py`, `app/core/ultra_pc_entry.py`, `ultra_engine.py::_handle_totp_rescue`'s verdict step); the member block (`app/core/repeat_guard.py`); In service and Keep entry history (`app/core/device_service_gate.py`); the card choice (`settings_reader.py::effective_card_decision`, `app/core/device_push_rules.py`); live worker changes (`app/core/ultra_worker_pool.py`, `app/core/access_mode_refresh.py`, `ultra_engine.py::_apply_poll_settings`); doors and the panel parameters (`device_push_rules.py`) | §3 ULTRA, §3.1 |
 | How a sync request is classified explicit vs automatic (`full_reconcile`) | §3.2c Reconcile reachability |
 | `DeviceSyncEngine._normalize_device` allowlist | §6.2 The inert-patch rule |
 | How a member becomes a device pin or a pin becomes a member (`pinScheme`, `derive_member_pin`, the collapse, revoke, push report, inbound); the `sync_users.main_account_id` cache and its forced refresh; pinScheme switches, the worker refresh on a device change and the push passes' scheme re-check (`app.py::_refresh_running_ultra_devices`, `device_sync.py::pin_scheme_superseded`, `ultra_engine.py::_pass_scheme_stopped`); local API handlers carrying a member or pin | §3.2b What a device PIN actually is, §3.2d, §3.2e, §3.2f |
@@ -56,8 +56,8 @@ This file is only useful while it is true. If you change any of the following, y
 | The QR allowed-days step (`access_verification.py::verify_totp`'s date step, `::current_access_days`, `access_dates.py::qr_date_verdict`, `::effective_credentials`) | §3.1b "Allowed days" |
 | Renewal ordering — which old pins are held, when they are removed (`ultra_engine.py::_neutralise_revoked_pins`, `::_remove_released_holds`, `device_sync.py::_sync_one_device` holds) | §3.4f, §3.2g |
 | The one-shot credentials re-send at startup — what it drops, its marker table, its place and catch in `init_db` (`db.py::_force_one_credentials_resend`, `::_run_one_shot_credentials_resend`, `local_one_shot_steps`; `tools/bench_credential_resend.py`) | §3.1b "The upgrade window" |
-| What happens when an `init_db` step fails — the four schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
-| Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `app.py::ultra_devices_for_this_pc`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
+| What happens when an `init_db` step fails — the five schema migrations and the inline `device_write_hold.pin_scheme` `ALTER` that stop startup, the steps that log and go on, a `try` or an `import logging` added inside `init_db` (`db.py::init_db`, `::_relax_firmware_profiles_not_null`, `::_rebuild_sync_users_without_legacy_fingerprint`, `::_ensure_main_account_id_column`, `::_ensure_pin_scheme_column`, `sync_device_store.py::ensure_ultra_merge_device_columns`, `::_run_one_shot_credentials_resend`) | §3.2d "A failing migration stops startup", §3.1b "The upgrade window" |
+| Anything in `app/core/v2/` (the server clock, the v2 client, the notice socket, leases, commands, ownership backup, problem reports, loss re-add), `access/v2_routes.py`, or a lease-gate call site (`ultra_engine.py::_v2_writes_blocked` and the `_lease_gate` calls, `device_sync.py`, `realtime_agent.py`, `device_attendance.py`, `ultra_worker_pool.py::devices_to_drive`, `access/local_api_routes.py::LEASE_GATED_HANDLERS` / `SCANNER_GATED_HANDLERS`) | §3.9 |
 | What `push_safety.check_bulk_removal` defers (`add_only`, `handover_release`) or lets through (a Confirm-removal approval) | §3.2g, §3.9 |
 | The removal log (`db.py::_log_v2_removal` in `clear_device_revocation_state` / `delete_device_sync_state`) | §3.4a, §3.9 |
 | The Erase-content wizard or the write hold (`app/core/erase_wizard.py` — incl. `::refill_roster`, `::held_waiting_count`, `EraseWizard._refill_check`, and since lane 1c `::_sync_staleness` / `::_sync_max_age_sec` with `app.py`'s `_last_sync_ok_mono` stamp, `::terminal_people` / `::not_refilled` / `::_bind_not_refilled` / `KEEP_MARK`, `::_refill_recheck`, `::_prune_now` / `::_folder_times`, `::_no_answer`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s codes —, `app/core/device_hold.py` — incl. `load(release_unstarted=)` and the `erase-prep`/`erase` phases —, `db.py::set_device_write_hold` / `::clear_device_write_hold` / `::list_device_write_holds`, `::begin_device_erase`, `::release_unstarted_erase_holds`, `::undo_device_erase_record` / `::device_list_is_authoritative` (lane 1f), `erase_wizard.py::check_erase_switch` / `monclub_api.py::get_erase_wizard_switch` (the gym's server switch), `erase_wizard.py::prune_erase_backups` (30-day retention), `::retire_device_records`, `::invalidate_device_records`, `device_sync.py::_filter_users_for_device(quiet=)`, `PullSDKDevice.ERASABLE_TABLES`, `local_access_api_v2.py::_handle_auth_verify_admin_password`'s offline answer, the hold in `ultra_engine.py::_v2_writes_blocked`, the worker's `_connected_addr` (`::_connect` / `::_disconnect`), `device_sync.py`'s three hold checks, `v2/handlers.py::device_reconcile`, `app.py`'s start-up `device_hold.load()` and `_sync_tick`'s `device_hold.ensure_loaded()`, `ownership.py::OwnershipSync._worker_idle`, the `erase` routes and handlers, `local_access_api_v2.py::_refuse_held_or_frozen`, `PullSDKDevice.count_table_strict` / `::read_table_strict` / `::erase_table`, `ZKStandaloneDevice.read_device_status` / `::read_user_templates` and the listing's `privilege`, `tauri-ui/src/components/EraseWizardDialog.tsx`) | §3.2h, pullsdk_guide §5, zkemkeeper_guide §4 |
@@ -179,17 +179,23 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
   `[CODE: ultra_engine.py::_handle_allow — "Device already opened door."]`
 - On a **denied** event the PC may override:
   - card matches the TOTP/QR format → `_handle_totp_rescue` → `_open_door_with_retry`
-  - denied RFID belonging to a valid **STAFF** member → `_handle_rfid_rescue` →
+  - denied RFID belonging to a valid **STAFF** member → `ultra_pc_entry.py::_handle_rfid_rescue` →
     `_open_door_with_retry` (staff skip the device's re-entry interval)
+  - on a device whose cards the PC decides (`card_decision` = PC), every denied card →
+    `ultra_pc_entry.py::_handle_pc_card` instead (below)
   - every other denial stands — including the device's punch-interval block.
   `[CODE: ultra_engine.py::_process_event]`
-- **The PC's re-scan cooldown runs before all of the above.** A card/QR scanned again
-  inside its window returns early: no popup, no history, no rescue.
-  - The window is `_effective_card_cooldown_sec`: a 3 s debounce, or
-    `anti_fraude_duration` when anti-fraud is on for that scan kind. The duration is
-    clamped to 5–300 s by `settings_reader.py::normalize_device_settings`.
-  - A staff RFID card past the debounce still goes through to the rescue.
-    `[CODE: ultra_engine.py::_process_event — the cooldown block]`
+- **The C3 event-burst debounce runs before all of the above, and it is the only drop before a
+  decision** (ULTRA merge plan 2, 2026-10-02). The same scanned string inside
+  `_ULTRA_CARD_DEBOUNCE_SEC` (3.0 s, the value ULTRA always used) returns early: no popup, no history,
+  no rescue. It never reads `anti_fraude_*`. Its right length is a field measurement still to make
+  `[UNVERIFIED]` (spec 2026-10-02 §12).
+  `[CODE: ultra_engine.py::_process_event — the debounce block, ::_burst_debounce_sec]`
+  `[TEST: test_ultra_engine.py::TestCardCooldown]`
+  - Before plan 2 the window was `anti_fraude_duration` when anti-fraud was on for the scan kind,
+    keyed on the scanned string: a QR was blocked at most one 30 s code period, and the repeat of a
+    card the turnstile decided lost its popup and history. Both are gone, with the staff exemption
+    that only existed to get staff past that window (`_staff_codes`, `_is_staff_rfid_card`).
   - A card never seen by this worker is **not** in cooldown. Up to master `3b28bd2`
     it defaulted to `last_seen = 0.0`, as in every tagged release checked (`access_1.4.24`,
     `.25`, `.26`, `.30`, `.31`, `.33`; 1.4.27–1.4.29 and 1.4.32 have no tag).
@@ -210,6 +216,43 @@ adding evidence. Full grading in [`pullsdk_guide.md`](pullsdk_guide.md) §2.
     line now carries `monotonic_s=`. Read against the known power-on time, a future
     field log answers both questions.
     `[CODE: app/ui/app.py]`
+- **The member block** (`app/core/repeat_guard.py`, plan 2). After the PC opened the door for a
+  member (QR rescue, a card the PC decides), that member is refused on this device for
+  `member_block_seconds` (`settings_reader.py::member_block_seconds`: the server's
+  `memberBlockSeconds` clamped 0-3600, else the spec §3 derivation) — reason
+  `DENY_REPEAT_BLOCK`, popup and history, never a silent drop. Keyed by the person (main account,
+  else user, else membership): a QR then a card of one person is one member. Staff are exempt. A card
+  or finger the turnstile decided never arms it and is never blocked by it. Per device, in memory.
+  `[TEST: test_repeat_guard.py, test_ultra_pc_entry.py]`
+- **Every PC verdict is `app/core/card_decision.py`** (pure): In service; the credential and its
+  member on today's list; the device's plans (`allowed_memberships`, D6 — a QR whose plan the PC
+  cannot resolve is allowed, a card's is refused, as the push filter refuses it; staff included);
+  the card length; the member block. `[TEST: test_card_decision.py]`
+- **Cards decided by the PC** (`cardDecision` = PC; `settings_reader.py::effective_card_decision`).
+  PullSDK panels only: on any other driver PC reads as TURNSTILE (D10). The turnstile holds no card
+  (`device_push_rules.py::roster_for_card_mode`, applied on the four paths that write: OFF and PC
+  write members without cards when fingerprints are on, nothing otherwise), refuses
+  the card and reports it. Allowed: `_open_door_with_retry` (door preset pulse, else
+  `pulse_time_ms`), popup `ALLOW_PC_CARD`, history, block armed. The idle poll ceiling of such a device
+  is at most 300 ms (`PC_DECIDED_MAX_IDLE_POLL_MS`). Scan-to-open ≤ 2 s on a real turnstile is a
+  release gate not yet measured `[UNVERIFIED]` (spec §4). A turnstile switched from TURNSTILE to
+  PC or OFF keeps the cards MonClub wrote until it is wiped: a bulk removal against an empty roster is
+  refused (`push_safety.check_bulk_removal`, `empty_roster`) — they stay until the Erase wizard or a D13 card-removal request (plan 3) removes them.
+- **In service** (`active` and `accessDevice`, `app/core/device_service_gate.py`): off = no worker
+  (`UltraEngine.start`, `ultra_worker_pool.py::reconcile`), no push (`device_sync.py`), and
+  `_process_event` drops the device's events as a second check. **Keep entry history** off:
+  `_enqueue_history` writes no row for that device. Operator actions from the local UI (manual door
+  open, control panel, Erase wizard) stay available `[CODE: local_access_api_v2.py, not gated]`.
+  `[TEST: test_ultra_pc_entry.py, test_ultra_worker_pool.py, test_device_push_rules.py]`
+- **Changes apply without a restart.** Polling knobs: `_apply_poll_settings` on every
+  `update_device`. A mode or In-service change: `access_mode_refresh.py` refreshes the AGENT engine
+  first, then starts or stops single ULTRA workers (`UltraEngine.reconcile_devices`); the engine is no
+  longer stopped and restarted while it runs. `[TEST: test_ultra_live_settings.py,
+  test_access_mode_refresh.py, test_ultra_worker_pool.py]`
+- **Doors** are door numbers 1-4 (spec §8.4): `device_push_rules.py::door_numbers_and_bitmask`
+  pushes the bits 1, 2, 4, 8; empty keeps the presets, else all doors; a value outside 1-4 is ignored
+  with one warning. The C3 door timing and repeat block (`::panel_param_items`) are written by the push
+  AND covered by the device hash, so a change is pushed at once. `[TEST: test_device_push_rules.py]`
 - ULTRA is the **only** mode that can drive a ZK_STANDALONE terminal. See §3.2.
 
 ### 3.1 Every door-open call site in the app
@@ -220,7 +263,7 @@ Regenerate with `grep -rn "\.open_door(" app/ --include=*.py`. `[CODE]`
 | Call site | Trigger | Applies to |
 |---|---|---|
 | `realtime_agent.py::DecisionService` (→ `DeviceCommandBus.open_door`) | **Automatic** — the AGENT access decision | AGENT only (workers are only built for AGENT devices) |
-| `ultra_engine.py::_open_door_with_retry` | **Automatic** — ULTRA TOTP/QR and staff-RFID rescues only | ULTRA only |
+| `ultra_engine.py::_open_door_with_retry` | **Automatic** — ULTRA TOTP/QR and staff-RFID rescues, and cards the PC decides (`ultra_pc_entry.py::_handle_pc_card`), after `card_decision.py`'s verdict | ULTRA only |
 | `ultra_engine.py::_drain_commands` (command queue, fed only by `request_door_open`) | Queued **operator** door command executed on the ULTRA worker's connection; skipped once its caller has given up or its deadline has passed (§3.1a) | ULTRA only |
 | `realtime_agent.py::DeviceCommandBus` / `DeviceWorker.open_door` | Plumbing beneath the two above | — |
 | `device_actor_runtime.py::_handle_message` (`OPEN_DOOR`) | Actor-message plumbing | — |
@@ -1432,7 +1475,7 @@ stays NULL: MEMBERSHIP devices are unaffected, ACCOUNT devices withhold everyone
 
 **A failing migration stops startup — on purpose (owner's decision, 2026-09-25).** `init_db` calls
 `_relax_firmware_profiles_not_null`, `_rebuild_sync_users_without_legacy_fingerprint`,
-`_ensure_main_account_id_column` and `_ensure_pin_scheme_column` with no `try` -- and, since lane 1e, runs the
+`_ensure_main_account_id_column`, `_ensure_pin_scheme_column` and `sync_device_store.py::ensure_ultra_merge_device_columns` (ULTRA merge plan 2: four device columns, `devicesVersion` dropped once on an upgrade) with no `try` -- and, since lane 1e, runs the
 inline `ALTER TABLE device_write_hold ADD COLUMN pin_scheme` with none either (§3.2h; its column check is a `PRAGMA`
 read that raises since lane 1f, not `_table_columns`, which answers `[]` on a read error and so turned that error into
 a misleading "duplicate column name") `[TEST: test_init_db_migration_failures.py::
@@ -1596,13 +1639,16 @@ the same gap: it saved the device section, then refreshed the workers only near 
 after the DeviceSync run, the fingerprint report and the attendance upload. `[TEST: red on aeeef69]`
 Now `[CODE]`:
 - **The copies follow the database first.** `MainApp._refresh_running_ultra_devices` (under
-  `_ultra_lock`, only while the engine runs) hands `UltraEngine.refresh_devices` the ULTRA rows of
-  `db.list_sync_devices_payload()` that already have a worker. `refresh_devices` updates those workers'
+  `_ultra_lock`, only while the engine runs; `app/core/access_mode_refresh.py` since the ULTRA merge)
+  refreshes the AGENT engine first, then hands `UltraEngine.reconcile_devices` the ULTRA rows of
+  `db.list_sync_devices_payload()`. It updates the workers'
   copies whatever their lease state, and gives the ULTRA scheduler only the lease-filtered list (review
   R1-F5: a copy left stale while a lease was away made the guard below stop every pass once it came
-  back). Devices without a worker are left out on purpose: `refresh_devices` also replaces the
-  scheduler's list, and the scheduler pushes a device with no worker over its own session (R1-F2); a
-  device added or switched to ULTRA gets its worker when the next tick restarts the engine, as before.
+  back). A device added or switched to ULTRA, in service and driven here, gets its worker in the same
+  call, BEFORE the scheduler's list is replaced, and one that left ULTRA or went out of service loses
+  it (`ultra_worker_pool.py::reconcile`): the scheduler pushes a device with no worker over its own
+  session (R1-F2), so its list never names one. With no engine running nothing is read; the tick
+  starts it. `[TEST: test_pin_scheme_worker_refresh.py::test_r1_the_refresh_gives_the_scheduler_no_device_without_a_worker]`
   The scheduler's list itself is replaced only when every worker is driven — the end-of-tick refresh's
   own condition — so a lease away during a refresh cannot empty it for good (review R2-4).
   `apply_fast_patch_bundle` calls it when any item of the bundle is `GYM_DEVICE` or carries
@@ -1886,7 +1932,7 @@ Since lane 1b (2026-09-27, the master review), an erase (not a backup-only rehea
   it back at the next logon; the order is runbook C1 / D1's) `[CODE]` `[TEST: test_erase_wizard_lane1c.py::
   TestTheOtherPcsTickNamesTheWatchdog]`. Why the box (review C0, verified): the hold is this PC's
   `device_write_hold` and in-memory set only; with no driver assignments (v2 off, or `gymUsesAssignments=false`)
-  `LeaseSnapshot.allows()` answers True for every turnstile and `app.py::ultra_devices_for_this_pc` starts a worker for
+  `LeaseSnapshot.allows()` answers True for every turnstile and `ultra_worker_pool.py::devices_to_drive` starts a worker for
   every ULTRA turnstile — so every Access PC of the gym writes to this turnstile during the erase and refills it right
   after, under ITS records. **No local check can see another PC**: with v2 off this PC keeps no list of its gym's PCs;
   the verify only catches rows another PC wrote back before the counts after (`INCOMPLETE`). The box covers every use;
@@ -4068,7 +4114,7 @@ site that connects to a turnstile: mode `ALL` (no lease information, v2 off, or 
 allows everything as before; mode `LEASED` allows only `drive[]` entries in state `DRIVE` plus `release[]`
 entries (the outgoing PC keeps serving the door until its release is acknowledged; the incoming PC does not
 connect while `WAIT_FOR_RELEASE`). A reader is allowed nothing. The filter sits at: the ULTRA device list
-(`app.py::ultra_devices_for_this_pc`), `UltraEngine.start`/`refresh_devices`, the worker's `_connect` (last
+(`ultra_worker_pool.py::devices_to_drive`), `UltraEngine.start`/`refresh_devices`, the worker's `_connect` (last
 line of defence), `AgentRealtimeEngine.refresh_devices`, `DeviceSyncEngine._sync_all_devices`,
 `_run_single_device_sync` (the ULTRA scheduler's PullSDK fallback) and `_sync_one_device`,
 `DeviceAttendanceMaintenanceEngine._list_device_candidates`, the local API's device-session handlers
@@ -4828,6 +4874,14 @@ raw `self._device`. Without the key, an ACCOUNT device would have received MEMBE
 the PullSDK paths and ACCOUNT pins on the standalone path — the mixing §3.2b exists to prevent.
 `[TEST: test_pin_scheme_gate.py::test_pin_scheme_survives_ingest_to_the_engine]`
 
+`cardDecision` is on the allowlist for the same reason (ULTRA merge plan 2, 2026-10-02):
+`device_push_rules.py::roster_for_card_mode`, applied by `_filter_users_for_device(apply_card_mode=True)` on the
+four paths that write (full pass, member sync, device hash, MB2000 roster), reads it from the normalized dict
+on the PullSDK paths and from the worker's raw `self._device` on the standalone path. Without it an OFF or PC
+device would receive every card. Callers that only name members keep the default (`apply_card_mode=False`).
+`[TEST: test_device_push_rules.py::test_normalize_device_keeps_the_card_decision,
+::test_the_push_filter_applies_the_card_choice_only_when_asked, ::test_every_push_path_asks_for_the_card_choice]`
+
 ---
 
 ## 7. Unverified and hardware-gated — do not treat these as known
@@ -5425,6 +5479,14 @@ the push are in `RENEWAL_HOLD removed_after_push` (§3.4f). `REVOKE_ABORTED` has
 ceiling (§3.2g).
 `[TEST: tests/test_p3b1_app_wiring.py, tests/test_qr_allowed_days.py, tests/test_renewal_ordering.py,
 tests/test_protocol2_save_and_flip.py]`
+
+### 10.2e PC decisions (ULTRA merge plan 2, added 2026-10-02)
+
+| Event | Where | Carries |
+|---|---|---|
+| `PC_DECISION` | `ultra_pc_entry.py::_open_for_verdict` (a card the PC decides: door command sent) and `::_note_pc_refusal` (every refusal a `card_decision.py` check added: a PC card; a QR refused on the device's plans or by the member block; a staff card refused on the plans) | `worker kind allowed reason door` — `kind` = `card` / `qr` / `staff`; `allowed=False reason=DOOR_CMD_FAILED` = allowed, but the door command failed. No member id, name or card number |
+
+`[TEST: test_ultra_pc_entry.py::test_a_pc_device_opens_for_a_known_card, ::test_a_pc_card_refusal_is_reported_once]`
 
 ### 10.3 Three rules this instrumentation follows — keep them
 

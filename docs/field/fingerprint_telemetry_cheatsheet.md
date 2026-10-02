@@ -650,6 +650,27 @@ grep -F "[HOLD]" app-*.log           # holds set, released, found at start-up --
 
 ---
 
+## 6e. Cards and QR codes the PC decided (ULTRA merge)
+
+On a device whose cards the PC decides, every card is decided by the PC; on every ULTRA device a QR
+code can be refused on the device's plans or by the member block (guide §3 ULTRA).
+
+```bash
+grep -F "[T] PC_DECISION" app-*.log
+grep -F "PC_REFUSED" app-*.log        # the same refusals, with the worker prefix
+```
+
+| `reason` | Means |
+|---|---|
+| `ALLOW_PC_CARD` | the PC opened the door for a card (`allowed=True`) |
+| `DENY_NO_CARD_MATCH` / `DENY_CARD_COLLISION` | the card is on nobody of today's list / on two members |
+| `INVALID_CARD_LENGTH` / `INVALID_CARD_FORMAT` | outside the device's card length / not digits |
+| `DENY_PLAN_NOT_ALLOWED` | none of the member's plans is allowed on this device |
+| `DENY_REPEAT_BLOCK` | the member came in through the PC less than the device's block ago |
+| `DOOR_CMD_FAILED` | allowed, but the door command failed |
+
+---
+
 ## 7. One-liners
 
 ```bash
