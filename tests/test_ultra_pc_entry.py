@@ -71,3 +71,60 @@ def test_a_rescued_staff_member_is_never_blocked():
         w._handle_rfid_rescue(STAFF_CARD, "t", "e3", 1, "20", {})
     w._open_door_with_retry.assert_called_once()
     assert w._member_guard().size() == 0
+
+
+# ------------------------------------------------------------------ Task 9: QR verdict
+def _qr_result(user=ANNA, account=700):
+    return {"allowed": True, "reason": "ALLOW", "user": user, "accountId": account,
+            "activeMembershipId": (user or {}).get("activeMembershipId")}
+
+
+def _rescue_qr(w, code, event_id, result):
+    with patch("app.core.ultra_engine.verify_totp_resilient", return_value=result), \
+            patch("app.core.ultra_engine.record_totp_roster_check"):
+        w._handle_totp_rescue(code, "2026-10-02T10:00:00", event_id, 1, {}, None)
+
+
+def test_a_qr_from_a_member_outside_the_device_plans_is_refused_d6():
+    w = _worker(allowed_memberships=[STAFF_PLAN])
+    with _staff_ids(STAFF_PLAN):
+        _rescue_qr(w, "91234567", "q1", _qr_result())
+    w._open_door_with_retry.assert_not_called()
+    kw = w._enqueue_notification.call_args.kwargs
+    assert (kw["allowed"], kw["reason"], kw["user_full_name"]) == (False, cd.DENY_PLAN_NOT_ALLOWED, "Anna")
+    assert w._enqueue_history.call_args.kwargs["reason"] == cd.DENY_PLAN_NOT_ALLOWED
+
+
+def test_the_member_block_refuses_a_second_qr_of_the_same_member():
+    w = _worker(member_block_seconds=30)
+    with _staff_ids(STAFF_PLAN):
+        _rescue_qr(w, "91234567", "q1", _qr_result())
+        _rescue_qr(w, "97654321", "q2", _qr_result())
+    assert w._open_door_with_retry.call_count == 1
+    assert [c.kwargs["reason"] for c in w._enqueue_notification.call_args_list] == ["ALLOW", cd.DENY_REPEAT_BLOCK]
+    assert [c.kwargs["allowed"] for c in w._enqueue_history.call_args_list] == [True, False]
+
+
+def test_a_zero_block_lets_the_second_qr_in():
+    w = _worker(member_block_seconds=0)
+    with _staff_ids():
+        _rescue_qr(w, "91234567", "q1", _qr_result())
+        _rescue_qr(w, "97654321", "q2", _qr_result())
+    assert w._open_door_with_retry.call_count == 2
+
+
+def test_staff_qr_codes_are_never_blocked():
+    w = _worker(member_block_seconds=30)
+    with _staff_ids(STAFF_PLAN):
+        _rescue_qr(w, "91234567", "q1", _qr_result(STAFF, 800))
+        _rescue_qr(w, "97654321", "q2", _qr_result(STAFF, 800))
+    assert w._open_door_with_retry.call_count == 2
+
+
+def test_a_failed_door_command_arms_no_block():
+    w = _worker(member_block_seconds=30)
+    w._open_door_with_retry = MagicMock(return_value=False)
+    with _staff_ids():
+        _rescue_qr(w, "91234567", "q1", _qr_result())
+    assert w._member_guard().size() == 0
+    assert w._enqueue_notification.call_args.kwargs["reason"] == "DOOR_CMD_FAILED"

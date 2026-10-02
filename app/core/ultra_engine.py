@@ -6680,8 +6680,17 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
         decision_ms = (time.monotonic() - t0) * 1000
         record_totp_roster_check(result, source=self._tel_wid)
 
-        allowed = result.get("allowed", False)
-        reason = result.get("reason", "DENY_TOTP_FAILED")
+        # The PC verdict on top of the matched code (spec section 4, card_decision.py): the
+        # device's plans (D6) and the member block; staff are exempt from the block.
+        verdict = _card_decision.decide_qr(
+            totp_result=result, settings=self._settings, users_by_am=users_by_am,
+            staff_ids=self._staff_membership_ids(), guard=self._member_guard(),
+            now=time.monotonic(),
+        )
+        if result.get("allowed") and not verdict.allowed:
+            self._note_pc_refusal(verdict, kind="qr", door_id=door_id)
+        allowed = verdict.allowed
+        reason = verdict.reason
         user = result.get("user")
         user_name = ""
         user_image = ""
@@ -6733,6 +6742,7 @@ class UltraDeviceWorker(PcEntryMixin, threading.Thread):
 
             if door_opened:
                 self._totp_rescues += 1
+                self._arm_member_block(verdict)
                 logger.info(
                     f"{self._prefix} TOTP_RESCUE door OPENED: code={masked_code} "
                     f"user={user_name!r} decision={decision_ms:.0f}ms cmd={cmd_ms:.0f}ms"
